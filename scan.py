@@ -24,61 +24,60 @@ def save_cpu_reg(para):
 # =============================================================================
 # [추가됨] CoreSight 스캔 로직 (새로 추가한 부분)
 # =============================================================================
-
 def scan_coresight_rom_table(jlink_obj, rom_base=0x80020000):
-    """
-    CoreSight ROM Table을 스캔하여 ETM/ETB/CTI 주소를 찾습니다.
-    """
-    logger.info(f"[*] Starting ROM Table Scan at 0x{rom_base:08X}...")
+    logger.info(">>> BRUTE FORCE SCAN MODE ACTIVATED <<<")
     valid_components = []
+    
+    # 검색 범위 설정: 0x80000000 ~ 0x80080000 (512KB 구간)
+    # 대부분의 CoreSight 블록은 코어 디버그 베이스 근처에 몰려 있음
+    start_addr = 0x80000000
+    end_addr   = 0x80060000 # 범위 조정 가능
+    step       = 0x1000     # 4KB 단위
 
-    try:
-        # 1. ROM Table Entry 읽기 (최대 32개 엔트리)
-        entries = jlink_obj.memory_read32(rom_base, 32)
-    except Exception as e:
-        logger.error(f"[!] Failed to read ROM table at 0x{rom_base:08X}: {e}")
-        return []
+    logger.info(f"Scanning range: 0x{start_addr:08X} - 0x{end_addr:08X}")
 
-    for i, entry in enumerate(entries):
-        if entry == 0x00000000:
-            logger.info(f"[-] End of ROM Table reached at index {i}.")
-            break
-            
-        if (entry & 0x1) == 0: continue # Present bit check
-
-        # 2. Base Address 계산
-        offset = (entry & 0xFFFFF000)
-        if offset & 0x80000000: offset -= 0x100000000
-        comp_base = rom_base + offset
-        
+    current_addr = start_addr
+    while current_addr < end_addr:
         try:
-            # 3. 컴포넌트 식별 (CIDR/PIDR)
-            cidr = jlink_obj.memory_read32(comp_base + 0xFF0, 4)
-            if cidr[0] == 0 and cidr[1] == 0:
-                logger.warning(f"[!] Component at 0x{comp_base:08X} inaccessible (0x00)")
+            # 1. CIDR (Component ID) 체크 - 가장 빠르고 안전함
+            # Offset 0xFF0 읽기
+            cidr = jlink_obj.memory_read32(current_addr + 0xFF0, 4)
+            
+            # 유효한 CoreSight Preamble인지 확인 (0xB105F00D 등)
+            # 보통 cidr[3]은 0xB1, cidr[2]는 0x05 ... 형태임
+            # 여기서는 단순히 "모두 0이 아닌지"만 체크
+            if cidr[0] == 0 and cidr[1] == 0 and cidr[2] == 0 and cidr[3] == 0:
+                current_addr += step
                 continue
 
-            pidr = jlink_obj.memory_read32(comp_base + 0xFE0, 4)
+            # 2. PIDR (Part Number) 읽기
+            pidr = jlink_obj.memory_read32(current_addr + 0xFE0, 4)
             part_num = (pidr[0] & 0xFF) | ((pidr[1] & 0x0F) << 8)
             
+            # 3. 이름 식별
             comp_name = "Unknown"
-            if part_num == 0x961: comp_name = "TMC-ETB (Trace Buffer)"
-            elif part_num == 0x9E8: comp_name = "TMC-ETR"
-            elif part_num == 0x95D: comp_name = "ETMv4 (Trace Source)"
+            if part_num == 0x961: comp_name = "TMC-ETB (Trace Buffer)"    # ★★★
+            elif part_num == 0x9E8: comp_name = "TMC-ETR"                 # ★★★
+            elif part_num == 0x95D: comp_name = "ETMv4 (Trace Source)"    # ★★★
+            elif part_num == 0x925: comp_name = "ETMv3"
             elif part_num == 0x906: comp_name = "CTI"
-            elif part_num == 0x100: comp_name = "Cortex-R Processor"
+            elif part_num == 0x100: comp_name = "Cortex-R"
+            elif part_num == 0x4C7: comp_name = "Debug"
             
-            logger.info(f"[+] Found {comp_name}: Base=0x{comp_base:08X}, PartNum=0x{part_num:03X}")
+            logger.info(f"[!] HIT at 0x{current_addr:08X} | Part: 0x{part_num:03X} | Name: {comp_name}")
             
             valid_components.append({
-                "base": comp_base, "part": part_num, "name": comp_name
+                "base": current_addr, "part": part_num, "name": comp_name
             })
-
-        except Exception as e:
-            logger.warning(f"[!] Error accessing 0x{comp_base:08X}: {e}")
-            continue
+            
+        except Exception:
+            # 읽기 실패 시 무시하고 다음 블록으로
+            pass
+            
+        current_addr += step
 
     return valid_components
+
 
 # =============================================================================
 # [수정됨] Main 실행부 (스캔 모드 분기 추가)
