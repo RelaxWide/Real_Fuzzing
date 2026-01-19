@@ -1,138 +1,118 @@
 import pylink
 import time
 import logging
-import sys
 from collections import Counter
 
-# =============================================================================
-# [설정] J-Link DLL 경로 (본인 환경에 맞게 수정 필수)
-# =============================================================================
+# DLL 경로 설정
 JLINK_DLL_PATH = r"C:\Program Files\SEGGER\JLink\JLink_x64.dll"
-# JLINK_DLL_PATH = r"C:\Program Files (x86)\SEGGER\JLink\JLinkARM.dll"
 
-# =============================================================================
-# [로깅 설정] 핵심 정보만 출력하도록 설정
-# =============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
-
-# Pylink 내부 로그는 시끄러우므로 끔
 logging.getLogger("pylink").setLevel(logging.WARNING)
 
 def run_poc():
-    # 1. J-Link 라이브러리 로드 & 연결
     try:
         lib = pylink.Library(dllpath=JLINK_DLL_PATH)
         jlink = pylink.JLink(lib=lib)
-    except Exception as e:
-        logger.error(f"DLL Load Failed: {e}")
-        logger.info("Trying default library load...")
-        try:
-            jlink = pylink.JLink()
-        except:
-            logger.error("Failed to load J-Link DLL. Check path.")
-            return
+    except:
+        jlink = pylink.JLink()
 
     try:
-        logger.info(">>> J-Link PoC Started <<<")
+        logger.info(">>> Connecting... <<<")
         jlink.open()
-        
-        # verbose=False로 설정하여 불필요한 J-Link 로그 제거
         jlink.connect('Cortex-R8', speed='auto', verbose=False)
         
-        if not jlink.connected():
-            logger.error("Connection failed.")
-            return
-            
-        logger.info(f"Connected to {jlink.core_name()} (SN: {jlink.serial_number})")
-
-        # 2. 핫스팟 찾기 (PC 샘플링)
-        logger.info("[-] Sampling PC to find Hotspot (Collecting 20 samples)...")
+        # ---------------------------------------------------------
+        # 1. 스마트 부팅 대기 (Smart Boot Wait)
+        # ---------------------------------------------------------
+        logger.info("[-] Waiting for Firmware Boot (Valid PC check)...")
         
-        pc_samples = []
-        for i in range(20):
-            jlink.halt()
+        booted = False
+        max_wait = 30 # 최대 30초 대기
+        
+        for i in range(max_wait * 2): # 0.5초 단위
+            if not jlink.halted():
+                jlink.halt()
+                
             pc = jlink.register_read(15)
-            pc_samples.append(pc)
-            jlink.restart()
-            time.sleep(0.05)
             
-        # 가장 많이 관측된 주소 분석
-        counter = Counter(pc_samples)
-        most_common_pc, count = counter.most_common(1)[0]
-        
-        if most_common_pc == 0:
-            logger.error("FATAL: PC read as 0. CPU might be in Reset.")
+            # 유효한 PC 기준: 0이 아니고, 너무 낮은 주소(벡터 테이블)가 아님
+            # 보통 펌웨어 메인 루프는 0x10000 이후에 있음 (덤프툴 로그: 0x17448)
+            if pc > 0x1000:
+                logger.info(f"[-] Boot Detected! PC=0x{pc:08X}")
+                booted = True
+                break
+            
+            # 아직 부팅 중이면 다시 실행
+            jlink.restart()
+            time.sleep(0.5)
+            
+        if not booted:
+            logger.error("FATAL: Firmware did not boot in time.")
             return
-            
-        logger.info(f"[-] Hotspot Found: 0x{most_common_pc:08X} (Frequency: {count}/20)")
-        logger.info(f"    Samples: {[hex(x) for x in pc_samples[:5]]} ...")
 
-        # 3. BP 설치
-        logger.info(f"[-] Setting Breakpoint at 0x{most_common_pc:08X}")
-        jlink.breakpoint_set(most_common_pc)
+        # ---------------------------------------------------------
+        # 2. 핫스팟 샘플링 (부팅 완료 후)
+        # ---------------------------------------------------------
+        logger.info("[-] Sampling Hotspots (Collecting 50 samples)...")
+        pc_samples = []
+        for _ in range(50):
+            jlink.halt()
+            pc_samples.append(jlink.register_read(15))
+            jlink.restart()
+            time.sleep(0.02)
+            
+        counter = Counter(pc_samples)
+        top_pc, count = counter.most_common(1)[0]
+        logger.info(f"[-] Target Hotspot: 0x{top_pc:08X} (Freq: {count}/50)")
+
+        # ---------------------------------------------------------
+        # 3. BP 설치 & Hit 테스트
+        # ---------------------------------------------------------
+        target_bps = {top_pc, top_pc - 4, top_pc + 4} # 그물망
+        logger.info(f"[-] Setting BPs at: {[hex(x) for x in target_bps]}")
         
-        # 4. Hit 테스트 (루프)
-        logger.info("[-] Running execution loop for Hit test...")
-        
+        for bp in target_bps:
+            try: jlink.breakpoint_set(bp)
+            except: pass
+            
         hit_total = 0
-        max_retries = 20  # 최대 시도 횟수
+        jlink.step() # 캐시 플러시용 스텝
         
-        for i in range(1, max_retries + 1):
+        for i in range(1, 21):
             jlink.restart()
             
-            # 0.5초 대기 (Hit 감지)
+            # Hit 대기
             start_t = time.time()
-            halted = False
-            while time.time() - start_t < 0.5:
-                if jlink.halted():
-                    halted = True
-                    break
+            while time.time() - start_t < 1.0:
+                if jlink.halted(): break
                 time.sleep(0.01)
-            
-            if halted:
+                
+            if jlink.halted():
                 curr_pc = jlink.register_read(15)
-                # PC가 BP 근처인지 확인 (±4 바이트 허용)
-                if abs(curr_pc - most_common_pc) <= 4:
+                # BP 근처에서 멈췄는지 확인
+                if any(abs(curr_pc - bp) <= 4 for bp in target_bps):
                     hit_total += 1
-                    logger.info(f"[+] HIT #{hit_total} Success! (PC=0x{curr_pc:08X})")
-                    
-                    # BP 탈출: Step 1회
+                    logger.info(f"[+] HIT #{hit_total} (PC=0x{curr_pc:08X})")
                     jlink.step()
-                    
                     if hit_total >= 5:
-                        logger.info(">>> PoC COMPLETE: Captured 5 Hits successfully. <<<")
+                        logger.info(">>> SUCCESS: PoC Complete! <<<")
                         break
                 else:
-                    logger.warning(f"[?] Stopped at unexpected PC: 0x{curr_pc:08X}")
-                    jlink.restart()
+                    jlink.restart() # 딴데서 멈추면 무시하고 계속
             else:
-                # 타임아웃 로그는 5번에 1번만 출력 (도배 방지)
-                if i % 5 == 0:
-                    logger.info(f"    (Still running... Attempt {i}/{max_retries})")
-                
-                # 강제로 멈춰서 상태 재설정
                 jlink.halt()
-        
+
         if hit_total == 0:
-            logger.warning("[-] No hits captured. CPU might be stuck in a different loop.")
+            logger.warning("[-] No hits. (Try increasing wait time or check BP limit)")
 
     except KeyboardInterrupt:
-        logger.info("[!] Stopped by user.")
-    except Exception as e:
-        logger.error(f"[!] Error: {e}")
+        logger.info("Stopped.")
     finally:
         try:
-            logger.info("[-] Cleaning up...")
             jlink.breakpoint_clear_all()
             jlink.close()
-        except:
-            pass
-        logger.info(">>> Disconnected <<<")
+        except: pass
 
 if __name__ == "__main__":
     run_poc()
