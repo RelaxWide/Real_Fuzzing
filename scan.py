@@ -170,27 +170,39 @@ def main(layoutcfginput, jlinksn, dumpfilepath):
                 return 1
                 
             logger.info("Connected successfully.")
-
             # 2. 스캔 수행
-            # scan_coresight_rom_table 함수는 파일 어딘가에 정의되어 있어야 함
-            # 만약 정의되지 않았다는 에러가 나면, 이 함수 정의를 파일 맨 위(import 직후)로 옮기세요.
             comps = scan_coresight_rom_table(jlink, 0x80020000)
             
-            # 3. 결과 출력
+            # 3. 결과 출력 (여기서 'id' 참조를 제거하여 에러 수정)
             print("\n" + "="*60)
-            print(" SCAN RESULT")
+            print(" SCAN RESULT (Found Components)")
             print("="*60)
             
-            etb = [c for c in comps if c['part'] in [0x961, 0x9E8]]
-            etm = [c for c in comps if c['part'] in [0x95D, 0x925]]
-            
-            if not comps: print("No components found.")
+            # 리스트가 비었는지 확인
+            if not comps: 
+                print("[!] No components found in range.")
             else:
-                for c in comps: 
-                    print(f"[{c['id']}] {c['name']} (0x{c['base']:X})")
+                # ★ 여기가 수정됨: c['id'] 제거
+                for i, c in enumerate(comps): 
+                    print(f"[{i}] {c['name']} (Base: 0x{c['base']:08X}, Part: 0x{c['part']:03X})")
             
-            if etb: print(f"\n[Command] CORESIGHT_SetETBBaseAddr = 0x{etb[0]['base']:X} ForceUnlock = 1")
-            if etm: print(f"[Command] CORESIGHT_SetETMBaseAddr = 0x{etm[0]['base']:X} ForceUnlock = 1")
+            # ETB/ETM 찾았으면 커맨드 출력
+            etb = [c for c in comps if c['part'] in [0x961, 0x9E8]] # 0x961=ETB
+            etm = [c for c in comps if c['part'] in [0x95D, 0x925]] # 0x95D=ETM
+            
+            print("\n" + "="*60)
+            print(" J-LINK COMMANDS (Copy & Paste)")
+            print("="*60)
+            
+            if etb: 
+                print(f"CORESIGHT_SetETBBaseAddr = 0x{etb[0]['base']:08X} ForceUnlock = 1")
+            else:
+                print("(No ETB found)")
+
+            if etm: 
+                print(f"CORESIGHT_SetETMBaseAddr = 0x{etm[0]['base']:08X} ForceUnlock = 1")
+            else:
+                print("(No ETM found)")
             
             # 4. 강제 종료
             return 0
