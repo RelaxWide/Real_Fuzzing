@@ -144,27 +144,37 @@ if __name__ == "__main__":
         pass 
         # (원래 파일의 if __name__ == "__main__": 아래 내용을 여기에 넣으세요)
 
-def main(layoutcfginput, jlinksn, dumpfilepath):  # 기존 함수 정의
-    
-    # [추가된 코드] SCAN 모드 강제 실행 (환경변수 또는 특정 파일 체크)
-    # 실행할 때: 기존 명령어 앞에 "set SCAN_MODE=1 &&" 만 붙이면 됨 (Windows CMD)
-    # 또는 그냥 코드에 True 박아넣고 한 번 실행 후 되돌리기
+def main(layoutcfginput, jlinksn, dumpfilepath):
+    # [수정됨] SCAN 모드 강제 실행
     if os.environ.get('SCAN_MODE') == '1':
         logging.basicConfig(level=logging.INFO)
         logger.info(">>> SCAN MODE ACTIVATED <<<")
         
         try:
-            # 1. J-Link 연결 (기존 덤프 로직 시작 전에 가로채기)
+            # 1. J-Link 연결 (직접 수행)
             global jlink
             jlink = pylink.JLink()
             
-            # 기존 jlinkattachcore 재사용 (core=0으로 연결)
-            # 인자로 받은 jlinksn 활용
-            if not jlinkattachcore(core=0, sn=jlinksn, reopen=True, reconnect=True):
-                logger.error("Scan connect failed")
+            # (1) Open
+            if jlinksn is not None:
+                jlink.open(serial_no=jlinksn)
+            else:
+                jlink.open()
+                
+            # (2) Connect (Core 0 기준)
+            # 기존 jlinkattachcore 함수 내용을 보면 'Cortex-R8', 'auto', verbose=True로 연결함
+            logger.info("Connecting to Cortex-R8...")
+            jlink.connect(chip_name='Cortex-R8', speed='auto', verbose=True)
+            
+            if not jlink.connected():
+                logger.error("Failed to connect to target.")
                 return 1
                 
+            logger.info("Connected successfully.")
+
             # 2. 스캔 수행
+            # scan_coresight_rom_table 함수는 파일 어딘가에 정의되어 있어야 함
+            # 만약 정의되지 않았다는 에러가 나면, 이 함수 정의를 파일 맨 위(import 직후)로 옮기세요.
             comps = scan_coresight_rom_table(jlink, 0x80020000)
             
             # 3. 결과 출력
@@ -183,13 +193,17 @@ def main(layoutcfginput, jlinksn, dumpfilepath):  # 기존 함수 정의
             if etb: print(f"\n[Command] CORESIGHT_SetETBBaseAddr = 0x{etb[0]['base']:X} ForceUnlock = 1")
             if etm: print(f"[Command] CORESIGHT_SetETMBaseAddr = 0x{etm[0]['base']:X} ForceUnlock = 1")
             
-            # 4. 강제 종료 (원래 덤프 로직 실행 안 함)
+            # 4. 강제 종료
             return 0
             
         except Exception as e:
             logger.error(f"Scan Error: {e}")
+            import traceback
+            traceback.print_exc()
             return 1
     
+    # ... (기존 main 로직 계속) ...
+
     # ---------------------------------------------------------
     # 기존 코드 (원래 덤프 로직)
     # ---------------------------------------------------------
