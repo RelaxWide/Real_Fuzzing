@@ -144,19 +144,52 @@ if __name__ == "__main__":
         pass 
         # (원래 파일의 if __name__ == "__main__": 아래 내용을 여기에 넣으세요)
 
-
-
-
-# 파일 맨 끝부분 수정
-if __name__ == "__main__":
-    # --- [추가된 부분] ---
-    if len(sys.argv) > 1 and sys.argv[1] == 'scan':
+def main(layoutcfginput, jlinksn, dumpfilepath):  # 기존 함수 정의
+    
+    # [추가된 코드] SCAN 모드 강제 실행 (환경변수 또는 특정 파일 체크)
+    # 실행할 때: 기존 명령어 앞에 "set SCAN_MODE=1 &&" 만 붙이면 됨 (Windows CMD)
+    # 또는 그냥 코드에 True 박아넣고 한 번 실행 후 되돌리기
+    if os.environ.get('SCAN_MODE') == '1':
         logging.basicConfig(level=logging.INFO)
-        sn = sys.argv[2] if len(sys.argv) > 2 else None
-        # main_scan_mode 함수는 위에 정의해둬야 함
-        sys.exit(main_scan_mode(sn))
-    # ---------------------
-
-    # ... 기존의 원래 실행 코드들 (argparse 등) ...
-    # main(layoutcfg, sn, dumpfilepath) 호출하는 부분
-
+        logger.info(">>> SCAN MODE ACTIVATED <<<")
+        
+        try:
+            # 1. J-Link 연결 (기존 덤프 로직 시작 전에 가로채기)
+            global jlink
+            jlink = pylink.JLink()
+            
+            # 기존 jlinkattachcore 재사용 (core=0으로 연결)
+            # 인자로 받은 jlinksn 활용
+            if not jlinkattachcore(core=0, sn=jlinksn, reopen=True, reconnect=True):
+                logger.error("Scan connect failed")
+                return 1
+                
+            # 2. 스캔 수행
+            comps = scan_coresight_rom_table(jlink, 0x80020000)
+            
+            # 3. 결과 출력
+            print("\n" + "="*60)
+            print(" SCAN RESULT")
+            print("="*60)
+            
+            etb = [c for c in comps if c['part'] in [0x961, 0x9E8]]
+            etm = [c for c in comps if c['part'] in [0x95D, 0x925]]
+            
+            if not comps: print("No components found.")
+            else:
+                for c in comps: 
+                    print(f"[{c['id']}] {c['name']} (0x{c['base']:X})")
+            
+            if etb: print(f"\n[Command] CORESIGHT_SetETBBaseAddr = 0x{etb[0]['base']:X} ForceUnlock = 1")
+            if etm: print(f"[Command] CORESIGHT_SetETMBaseAddr = 0x{etm[0]['base']:X} ForceUnlock = 1")
+            
+            # 4. 강제 종료 (원래 덤프 로직 실행 안 함)
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Scan Error: {e}")
+            return 1
+    
+    # ---------------------------------------------------------
+    # 기존 코드 (원래 덤프 로직)
+    # ---------------------------------------------------------
