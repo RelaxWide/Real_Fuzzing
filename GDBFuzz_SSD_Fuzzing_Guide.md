@@ -805,6 +805,107 @@ sudo nvme admin-passthru /dev/nvme0 --opcode=0xC0 --input-file=/tmp/input --data
 
 ---
 
+## 제공 파일
+
+이 레포지토리에 SSD Fuzzing을 위한 파일들이 포함되어 있습니다.
+
+### NVMeConnection.py
+
+NVMe CLI를 통해 SSD에 퍼징 데이터를 전송하는 Connection 클래스입니다.
+
+**설치 위치:**
+```bash
+cp NVMeConnection.py /path/to/gdbfuzz/src/GDBFuzz/connections/
+```
+
+**주요 기능:**
+- NVMe admin-passthru 명령으로 데이터 전송
+- 설정 가능한 opcode, device, timeout
+- GDBFuzz ConnectionBaseClass 상속
+
+### ssd_fuzz.cfg
+
+SSD Fuzzing용 설정 파일 템플릿입니다.
+
+**사용 방법:**
+```bash
+cp ssd_fuzz.cfg /path/to/gdbfuzz/
+# 파일을 열고 다음 항목 수정:
+# - binary_file_path: 펌웨어 바이너리 경로
+# - entrypoint: 동적 분석으로 찾은 함수 주소
+# - device: NVMe 장치 경로 (/dev/nvme0 등)
+# - opcode: 퍼징할 NVMe 커맨드 opcode
+```
+
+**수정 필수 항목:**
+
+| 항목 | 설명 | 예시 |
+|------|------|------|
+| `binary_file_path` | 펌웨어 바이너리 경로 | `/home/user/firmware.bin` |
+| `entrypoint` | 퍼징 시작 함수 주소 | `0x00012345` |
+| `device` | NVMe 장치 | `/dev/nvme0` |
+| `opcode` | NVMe 커맨드 opcode | `0xC0` |
+
+---
+
+## GDBFuzz 설정 구조
+
+GDBFuzz는 config.py가 아니라 **`.cfg` 파일** (INI 형식)을 사용합니다.
+
+```
+설정 파일 구조:
+├── [SUT]              # 타겟(SSD) 설정
+├── [SUTConnection]    # 입력 전송 방법 (NVMe)
+├── [GDB]              # GDB 연결 설정
+├── [Fuzzer]           # Fuzzer 파라미터
+├── [BreakpointStrategy]  # 브레이크포인트 전략
+├── [Dependencies]     # 의존성 경로
+└── [LogsAndVisualizations]  # 로그 설정
+```
+
+### BUFFER_ADDRESS가 필요 없는 이유
+
+GDBFuzz는 **BUFFER_ADDRESS가 필요 없습니다**.
+
+- GDBFuzz는 NVMe CLI를 통해 직접 커맨드 전송
+- SSD 내부에서 데이터가 어디에 저장되는지는 SSD가 처리
+- GDBFuzz는 **CFG 기반 브레이크포인트**로 커버리지만 측정
+
+---
+
+## 퀵 스타트 순서
+
+```
+[1] Entrypoint 찾기 (동적 분석)
+    │
+    │  JLinkGDBServer → GDB 연결 → NVMe 커맨드 전송 → bt로 콜스택 확인
+    │
+    ▼
+[2] 설정 파일 수정
+    │
+    │  ssd_fuzz.cfg에서 entrypoint, binary_file_path 등 수정
+    │
+    ▼
+[3] 파일 복사
+    │
+    │  NVMeConnection.py → gdbfuzz/src/GDBFuzz/connections/
+    │  ssd_fuzz.cfg → gdbfuzz/
+    │
+    ▼
+[4] 실행
+    │
+    │  터미널 1: JLinkGDBServer
+    │  터미널 2: Ghidra + Bridge 실행
+    │  터미널 3: ./src/GDBFuzz/main.py --config ./ssd_fuzz.cfg
+    │
+    ▼
+[5] 결과 확인
+    │
+    │  output/ssd_fuzz/trial-0/ 폴더 확인
+```
+
+---
+
 ## 참고
 
 - GDBFuzz GitHub: https://github.com/boschresearch/gdbfuzz
