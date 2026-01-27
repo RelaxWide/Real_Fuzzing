@@ -811,3 +811,64 @@ sudo nvme admin-passthru /dev/nvme0 --opcode=0xC0 --input-file=/tmp/input --data
 - Python 요구사항: >= 3.8.0
 - 테스트 환경: Ubuntu 20.04 LTS
 - NVMe Spec: https://nvmexpress.org/specifications/
+- 
+
+
+
+Ghidra 분석 완료)까지 되셨다면, 이제 "GDBFuzz가 내 SSD의 어디를 찌르고(Input), 어디서 멈춰야(Breakpoint) 하는지" 알려주는 설정 작업을 해야 합니다.
+
+가장 수정이 시급한 파일은 보통 프로젝트 루트에 있는 config.py (또는 gdbfuzz_config.py)입니다.
+
+텍스트 에디터(VS Code, vim 등)로 **config.py**를 열고, 아래 4가지 핵심 항목을 찾아 수정해주세요. (변수명은 코드 버전에 따라 조금 다를 수 있으나 의미는 같습니다.)
+
+1. 하드웨어 브레이크포인트 개수 제한 (HW_BP_LIMIT)
+예제(소프트웨어 시뮬레이션)에서는 브레이크포인트를 무한대로 걸 수 있지만, 실제 SSD(ARM Cortex-R 계열)는 하드웨어적으로 개수가 제한되어 있습니다. 이걸 설정하지 않으면 GDB 에러가 납니다.
+
+찾을 변수: HW_BREAKPOINT_LIMIT 또는 MAX_BREAKPOINTS
+
+수정 값: 4 (또는 6)
+
+설명: 보통 ARM Cortex-R8/R5는 4~8개를 지원하지만, GDB가 내부적으로 1~2개를 쓸 수 있으므로 안전하게 4로 설정하세요.
+
+2. GDB 접속 포트 변경 (GDB_PORT)
+예제는 보통 QEMU 포트(1234)를 쓰지만, 실장비(J-Link)는 포트가 다릅니다.
+
+찾을 변수: GDB_PORT 또는 TARGET_PORT
+
+수정 값: 2331
+
+설명: J-Link GDB Server의 기본 포트입니다. (만약 J-Link 실행 시 포트를 바꿨다면 그 번호를 넣으세요)
+
+3. 입력 버퍼 주소 (BUFFER_ADDRESS) [가장 중요]
+Fuzzer가 생성한 "랜덤 데이터(Payload)"를 SSD 메모리의 어디에 써넣을지 지정해야 합니다. 엉뚱한 곳에 쓰면 펌웨어가 죽습니다.
+
+찾을 변수: INPUT_BUFFER_ADDRESS 또는 PAYLOAD_ADDR
+
+값 찾는 법 (Ghidra):
+
+Ghidra에서 펌웨어가 NVMe Write 명령을 처리할 때, 호스트 데이터를 저장하는 DRAM 상의 버퍼 주소를 찾아야 합니다.
+
+보통 0x40000000이나 0x20000000 같은 램 영역 주소입니다.
+
+(모르겠다면?): 우선 임시로 사용되지 않는 RAM 영역(빈 공간) 주소를 넣어도 되지만, 펌웨어가 그 데이터를 읽어가도록 로직을 유도해야 합니다.
+
+4. 타겟 함수 범위 (Target Function)
+Fuzzing을 수행할 대상 함수(Entry)와 종료 지점(Exit)을 정해야 합니다.
+
+찾을 변수: TARGET_FUNCTION 또는 START_ADDRESS / END_ADDRESS
+
+수정 값: Ghidra에서 분석한 함수 이름 또는 주소(Hex)
+
+예시: 0x000104A0 (NVMe 커맨드 파싱 함수 시작점)
+
+[추가 수정] NVMe 입력 전달 방식 (interface.py 등)
+config.py 외에, 실제로 데이터를 쏘는 부분을 확인해야 합니다. 예제는 메모리에 직접 썼겠지만, SSD는 nvme-cli를 써야 할 수도 있습니다.
+
+확인할 파일: interface.py 또는 executor.py
+
+수정 내용: write_memory 방식이 아니라, NVMe Vendor Unique Command를 날리는 방식으로 되어 있는지 확인하세요.
+
+python
+# 예시: subprocess를 이용해 nvme 명령 실행
+subprocess.run(f"nvme admin-passthru /dev/nvme0n1 ...", shell=True)
+만약 이 부분이 구현 안 되어 있다면, 단순히 메모리에 값만 쓰고 펌웨어 루틴을 강제로 실행시키는 방식일 수 있습니다. (이 경우 3번의 버퍼 주소가 정확해야 합니다.)
