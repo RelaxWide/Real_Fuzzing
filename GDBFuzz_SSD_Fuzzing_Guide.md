@@ -67,7 +67,7 @@ GDBFuzz는 하드웨어 브레이크포인트를 활용한 coverage-guided fuzzi
 ## 전체 준비 단계
 
 ```
-[1] Ghidra에서 entrypoint 함수 찾기
+[1] Entrypoint 함수 찾기 (동적 분석)
               ↓
 [2] NVMe Connection 파일 작성
               ↓
@@ -82,50 +82,167 @@ GDBFuzz는 하드웨어 브레이크포인트를 활용한 coverage-guided fuzzi
 
 ---
 
-## [1] Ghidra에서 entrypoint 함수 찾기
+## [1] Entrypoint 함수 찾기
 
-Ghidra에서 분석한 프로젝트를 열고 NVMe 커맨드 처리 함수를 찾습니다.
+### 왜 심볼이 없는가?
 
-### 1-1. 문자열 검색으로 단서 찾기
-- 메뉴: **Search → For Strings**
-- 검색: `nvme`, `admin`, `command`, `opcode`
-- 찾은 문자열 더블클릭 → 참조하는 함수로 이동
+| 파일 형식 | 심볼 유무 |
+|----------|----------|
+| `.elf` (디버그 빌드) | 함수명, 변수명 있음 |
+| `.bin` (릴리즈) | 심볼 없음 (`FUN_00012345` 형태) |
 
-### 1-2. Opcode 상수 검색
-- 메뉴: **Search → For Scalars**
-- 값: `6` (Identify 명령) 또는 `192` (0xC0, Vendor Specific)
-- 이 값을 사용하는 함수 확인
+릴리즈용 펌웨어(.bin)는 심볼이 제거(stripped)되어 있어서 정적 분석만으로는 함수를 찾기 어렵습니다.
 
-### 1-3. 후보 함수 확인
-- switch문이나 if-else 체인이 있는 함수
-- opcode 값으로 분기하는 구조
-- **함수 이름 또는 주소 메모**
+---
 
-### NVMe SQE 구조체 참고 (64바이트)
+### 방법 A: 동적 분석으로 Entrypoint 찾기 (권장)
 
-```c
-struct nvme_command {
-    uint8_t  opcode;      // offset 0x00
-    uint8_t  flags;       // offset 0x01
-    uint16_t command_id;  // offset 0x02
-    uint32_t nsid;        // offset 0x04
-    ...
-};
+J-Link + GDB로 **실제 실행하면서** NVMe 커맨드 처리 함수를 찾습니다.
+
+#### 준비물
+- 터미널 3개
+- J-Link 연결된 SSD
+- NVMe CLI 설치됨
+
+#### 단계별 진행
+
+**[터미널 1] J-Link GDB Server 실행**
+```bash
+JLinkGDBServer -device Cortex-R8 -if JTAG -speed 4000
+```
+→ `Waiting for GDB connection...` 메시지 확인
+
+**[터미널 2] GDB 연결**
+```bash
+gdb-multiarch
+
+# GDB 프롬프트에서:
+(gdb) target remote localhost:2331
+(gdb) continue
+```
+→ SSD가 정상 실행 상태가 됨
+
+**[터미널 3] NVMe 커맨드 전송**
+```bash
+# Identify 명령 (opcode 0x06)
+sudo nvme admin-passthru /dev/nvme0 --opcode=0x06 -r
+
+# 또는 Get Log Page (opcode 0x02)
+sudo nvme admin-passthru /dev/nvme0 --opcode=0x02 -r
+
+# 또는 Vendor Specific (opcode 0xC0)
+sudo nvme admin-passthru /dev/nvme0 --opcode=0xC0 -r
 ```
 
-→ Ghidra에서 **offset 0x00에서 1바이트 읽고 switch하는 함수**를 찾으세요.
+**[터미널 2] GDB에서 실행 중단 및 분석**
+```bash
+# NVMe 커맨드 전송 직후 재빨리:
+Ctrl+C
 
-### 찾아야 할 함수 패턴
+# 현재 PC(Program Counter) 확인
+(gdb) info registers pc
+# 출력 예: pc  0x12345678
+
+# 콜스택 확인 (가장 중요!)
+(gdb) bt
+# 출력 예:
+# #0  0x12345678 in ?? ()
+# #1  0x11112222 in ?? ()  ← 커맨드 핸들러 후보
+# #2  0x11113333 in ?? ()  ← 디스패처 후보
+# #3  0x11114444 in ?? ()
+```
+
+#### 반복해서 정확한 함수 찾기
 
 ```
-[NVMe Submission Queue Entry 수신]
-         ↓
-[Command Dispatcher] ← 이 함수가 entrypoint 후보
-         ↓
-    ┌────┴────┐
-    ↓         ↓
-[Admin Cmd] [IO Cmd]
-Handler     Handler
+1. (gdb) continue
+2. [터미널 3] NVMe 커맨드 전송
+3. [터미널 2] Ctrl+C
+4. (gdb) bt
+5. 콜스택 기록
+6. 1~5 반복 (5~10회)
+```
+
+→ **콜스택에서 반복적으로 나타나는 주소** = 커맨드 처리 함수
+
+#### 콜스택 분석 예시
+
+```
+# 1차 시도 (Identify 명령)
+#0  0x00054321 in ?? ()
+#1  0x00012345 in ?? ()  ← 반복 출현
+#2  0x00011111 in ?? ()  ← 반복 출현
+#3  0x00010000 in ?? ()
+
+# 2차 시도 (Get Log Page 명령)
+#0  0x00054999 in ?? ()
+#1  0x00012345 in ?? ()  ← 반복 출현 (같은 주소!)
+#2  0x00011111 in ?? ()  ← 반복 출현 (같은 주소!)
+#3  0x00010000 in ?? ()
+
+# 3차 시도 (Vendor Specific 명령)
+#0  0x00058888 in ?? ()
+#1  0x00012345 in ?? ()  ← 반복 출현 (같은 주소!)
+#2  0x00011111 in ?? ()  ← 반복 출현 (같은 주소!)
+#3  0x00010000 in ?? ()
+```
+
+**분석 결과:**
+- `0x00012345` = Admin Command Handler (entrypoint 후보 1)
+- `0x00011111` = Command Dispatcher (entrypoint 후보 2)
+
+#### 찾은 주소를 Ghidra에서 확인
+
+```
+Ghidra → Navigation → Go To Address (단축키: G)
+→ 주소 입력: 0x00012345
+→ 함수 구조 확인 (switch문, 분기문 등)
+```
+
+#### 최종 Entrypoint 선택 기준
+
+| 함수 특성 | Entrypoint로 적합? |
+|----------|-------------------|
+| 여러 opcode로 분기하는 switch문 | O (적합) |
+| 단일 기능만 수행 | X (너무 구체적) |
+| 인터럽트 핸들러 최상위 | X (너무 광범위) |
+
+→ **커맨드별로 분기하는 디스패처 함수**가 가장 적합
+
+---
+
+### 방법 B: 정적 분석 (심볼 없을 때)
+
+동적 분석이 어려운 경우 Ghidra에서 정적으로 찾습니다.
+
+#### B-1. Scalar(상수) 검색
+- **Search → For Scalars**
+- 값: `6` (Identify), `2` (Get Log Page), `192` (0xC0, Vendor Specific)
+- 이 값을 비교하는 함수 확인
+
+#### B-2. 큰 함수 찾기
+- **Window → Functions**
+- **Function Size** 컬럼 클릭해서 정렬
+- 가장 큰 함수들 = switch문 많음 = 디스패처 가능성
+
+#### B-3. 함수 호출 그래프
+- **Window → Function Call Graph**
+- 많이 호출되는 함수 확인
+
+---
+
+### 방법 C: 브레이크포인트로 정밀 추적
+
+특정 주소에서 멈추고 싶을 때:
+
+```bash
+(gdb) break *0x00012345
+(gdb) continue
+
+# 브레이크포인트 도달 시
+(gdb) info registers
+(gdb) x/10i $pc          # 현재 위치 어셈블리 확인
+(gdb) x/20x $sp          # 스택 확인
 ```
 
 ---
@@ -178,8 +295,8 @@ nano my_ssd_fuzz.cfg
 
 ```ini
 [SUT]
-binary_file_path = /path/to/ssd_firmware.elf
-entrypoint = <찾은 함수명 또는 주소>
+binary_file_path = /path/to/ssd_firmware.bin
+entrypoint = 0x00012345
 until_rotate_breakpoints = 10
 max_breakpoints = 4
 ignore_functions =
@@ -215,6 +332,11 @@ output_directory = ./output
 enable_UI = False
 ```
 
+**주요 설정 설명:**
+- `entrypoint`: 동적 분석으로 찾은 주소 (예: `0x00012345`)
+- `max_breakpoints`: ARM Cortex-R8은 보통 하드웨어 BP 6~8개 지원, 안전하게 4개 사용
+- `opcode`: fuzzing할 NVMe 커맨드 opcode
+
 ---
 
 ## [4] J-Link GDB Server 실행
@@ -226,6 +348,11 @@ JLinkGDBServer -device Cortex-R8 -if JTAG -speed 4000
 ```
 
 → `localhost:2331`에서 대기
+
+**옵션 설명:**
+- `-device Cortex-R8`: 타겟 CPU
+- `-if JTAG`: 인터페이스 (SWD도 가능)
+- `-speed 4000`: JTAG 속도 (kHz)
 
 ---
 
@@ -366,6 +493,58 @@ source .venv/bin/activate
 pip install --no-index --find-links=~/gdbfuzz_offline/pip_packages -e .
 ```
 
+### GDB 연결 실패
+```
+Error: Cannot connect to target
+```
+
+확인사항:
+1. J-Link GDB Server가 실행 중인지 확인
+2. 포트 번호 확인 (기본 2331)
+3. J-Link USB 연결 상태 확인
+4. JTAG 케이블 연결 확인
+
+### 하드웨어 브레이크포인트 부족
+```
+Error: No more hardware breakpoints available
+```
+
+해결: `max_breakpoints` 값을 줄이기 (ARM Cortex-R8은 보통 6~8개 지원)
+
+---
+
+## NVMe Opcode 참고
+
+### Admin Commands
+| Opcode | 명령 |
+|--------|------|
+| 0x00 | Delete I/O Submission Queue |
+| 0x01 | Create I/O Submission Queue |
+| 0x02 | Get Log Page |
+| 0x04 | Delete I/O Completion Queue |
+| 0x05 | Create I/O Completion Queue |
+| 0x06 | Identify |
+| 0x08 | Abort |
+| 0x09 | Set Features |
+| 0x0A | Get Features |
+| 0x0C | Asynchronous Event Request |
+| 0x10 | Firmware Commit |
+| 0x11 | Firmware Image Download |
+| 0xC0-0xFF | Vendor Specific |
+
+### NVMe CLI 예시
+```bash
+# Identify
+sudo nvme admin-passthru /dev/nvme0 --opcode=0x06 -r
+
+# Get Log Page
+sudo nvme admin-passthru /dev/nvme0 --opcode=0x02 --cdw10=0x01 -r
+
+# Vendor Specific with data
+echo -n "test data" > /tmp/input
+sudo nvme admin-passthru /dev/nvme0 --opcode=0xC0 --input-file=/tmp/input --data-len=9 -r
+```
+
 ---
 
 ## 참고
@@ -373,3 +552,4 @@ pip install --no-index --find-links=~/gdbfuzz_offline/pip_packages -e .
 - GDBFuzz GitHub: https://github.com/boschresearch/gdbfuzz
 - Python 요구사항: >= 3.8.0
 - 테스트 환경: Ubuntu 20.04 LTS
+- NVMe Spec: https://nvmexpress.org/specifications/
