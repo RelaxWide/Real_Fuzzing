@@ -973,3 +973,28 @@ python
 # 예시: subprocess를 이용해 nvme 명령 실행
 subprocess.run(f"nvme admin-passthru /dev/nvme0n1 ...", shell=True)
 만약 이 부분이 구현 안 되어 있다면, 단순히 메모리에 값만 쓰고 펌웨어 루틴을 강제로 실행시키는 방식일 수 있습니다. (이 경우 3번의 버퍼 주소가 정확해야 합니다.)
+
+
+
+import gdb
+import time
+
+gdb.execute("target remote localhost:2331")
+gdb.execute("set pagination off")
+
+log = open("pc_log.txt", "w")
+
+print("Tracing started. Press Ctrl+C to stop.")
+
+try:
+    while True:
+        gdb.execute("continue&")  # 백그라운드 실행
+        time.sleep(0.01)  # 10ms마다 샘플링
+        gdb.execute("interrupt")  # 멈춤
+        pc = gdb.parse_and_eval("$pc")
+        log.write(f"0x{int(pc):08x}\n")
+        log.flush()
+except KeyboardInterrupt:
+    print("\nTrace stopped.")
+    log.close()
+
