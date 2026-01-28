@@ -363,12 +363,15 @@ class NVMeFuzzer:
 
         return stats
 
-    def _print_status(self, stats: dict):
-        print(f"\r[Stats] exec: {stats['executions']:,} | "
+    def _print_status(self, stats: dict, last_samples: int = 0):
+        # 줄바꿈으로 누적 출력
+        print(f"[Stats] exec: {stats['executions']:,} | "
               f"corpus: {stats['corpus_size']} | "
               f"crashes: {stats['crashes']} | "
               f"coverage: {stats['coverage_unique_pcs']:,} | "
-              f"exec/s: {stats['exec_per_sec']:.1f}", end='', flush=True)
+              f"samples: {stats['total_samples']:,} | "
+              f"last_run: {last_samples} | "
+              f"exec/s: {stats['exec_per_sec']:.1f}")
 
     def run(self):
         print("=" * 60)
@@ -407,8 +410,10 @@ class NVMeFuzzer:
 
                 # 샘플링 & 실행
                 self.sampler.start_sampling()
+                time.sleep(0.01)  # 샘플링 시작 후 10ms 대기
                 success = self._send_nvme_command(fuzz_data, cmd)
-                self.sampler.stop_sampling()
+                time.sleep(0.05)  # 명령 후 50ms 더 샘플링
+                last_samples = self.sampler.stop_sampling()
 
                 self.executions += 1
                 self.cmd_stats[cmd.name]["exec"] += 1
@@ -416,10 +421,21 @@ class NVMeFuzzer:
                 # 커버리지 평가
                 is_interesting, new_paths = self.sampler.evaluate_coverage()
 
+                # 첫 몇 번은 상세 디버그 출력
+                if self.executions <= 5:
+                    print(f"[Debug] exec={self.executions} cmd={cmd.name} "
+                          f"samples={last_samples} new_pcs={new_paths} "
+                          f"current_trace={len(self.sampler.current_trace)} "
+                          f"global={len(self.sampler.global_coverage)}")
+                    # 수집된 PC 몇 개 출력
+                    if self.sampler.current_trace:
+                        sample_pcs = list(self.sampler.current_trace)[:5]
+                        print(f"        PCs: {[hex(pc) for pc in sample_pcs]}")
+
                 if not success:
                     self.crash_inputs.append((fuzz_data, cmd))
                     self._save_input(fuzz_data, cmd, is_crash=True)
-                    print(f"\n[!] Crash/Timeout with {cmd.name}!")
+                    print(f"[!] Crash/Timeout with {cmd.name}!")
                     self.sampler.reconnect()
                     time.sleep(1)
                     continue
@@ -429,11 +445,12 @@ class NVMeFuzzer:
                     self.cmd_stats[cmd.name]["interesting"] += 1
                     self.corpus.append((fuzz_data, cmd))
                     self._save_input(fuzz_data, cmd)
+                    print(f"[+] New coverage! cmd={cmd.name} +{new_paths} PCs (total: {len(self.sampler.global_coverage)})")
 
                 # 주기적 출력
                 if self.executions % 10 == 0:
                     stats = self._save_stats()
-                    self._print_status(stats)
+                    self._print_status(stats, last_samples)
 
                 # 커버리지 주기적 저장
                 if self.executions % 100 == 0:
