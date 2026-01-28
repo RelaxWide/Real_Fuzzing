@@ -72,9 +72,9 @@ class FuzzConfig:
     # 예: ["VendorSpecific", "Read", "Write"]
     enabled_commands: List[str] = field(default_factory=list)
 
-    # 샘플링 설정
-    sample_interval_us: int = 100
-    max_samples_per_run: int = 500  # 기본값 줄임
+    # 샘플링 설정 (빠르게!)
+    sample_interval_us: int = 0     # 간격 없이 최대한 빠르게
+    max_samples_per_run: int = 1000  # 충분히 많이
 
     # 퍼징 설정
     max_input_len: int = 4096
@@ -157,7 +157,9 @@ class JLinkPCSampler:
                     self.current_trace.add(pc)
                 sample_count += 1
                 self.total_samples += 1
-            time.sleep(interval)
+            # 간격이 0보다 클 때만 sleep
+            if interval > 0:
+                time.sleep(interval)
 
     def start_sampling(self):
         self.stop_event.clear()
@@ -408,11 +410,9 @@ class NVMeFuzzer:
                     cmd = random.choice(self.commands)
                     fuzz_data = os.urandom(random.randint(64, 512))
 
-                # 샘플링 & 실행
+                # 샘플링 & 실행 (명령 실행 중에 빠르게 샘플링)
                 self.sampler.start_sampling()
-                time.sleep(0.01)  # 샘플링 시작 후 10ms 대기
                 success = self._send_nvme_command(fuzz_data, cmd)
-                time.sleep(0.05)  # 명령 후 50ms 더 샘플링
                 last_samples = self.sampler.stop_sampling()
 
                 self.executions += 1
