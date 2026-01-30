@@ -24,7 +24,7 @@
 │  │         │                                                                │  │
 │  │         ▼                                                                │  │
 │  │   ┌──────────────────────────────────────────────────────────────────┐   │  │
-│  │   │                  Coverage Backend (택 1)                         │   │  │
+│  │   │                  Coverage Monitor (택 1)                         │   │  │
 │  │   │                                                                  │   │  │
 │  │   │   ┌─────────────────────┐     ┌─────────────────────────────┐   │   │  │
 │  │   │   │ Option A: J-Link   │     │ Option B: Trace32           │   │   │  │
@@ -182,7 +182,7 @@ Fuzzer가 생성한 입력 (bytes)
 
 ---
 
-## 3. Coverage Backend 비교
+## 3. Coverage Monitor 비교
 
 ### 3.1 Option A: J-Link (PC Sampling)
 
