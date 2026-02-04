@@ -123,9 +123,10 @@ class FuzzConfig:
 
 
 def setup_logging(output_dir: str) -> logging.Logger:
-    """파일 + 콘솔 동시 로깅 설정"""
+    """파일 + 콘솔 동시 로깅 설정 (실행마다 날짜시간 로그 파일 생성)"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    log_file = os.path.join(output_dir, 'fuzzer.log')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = os.path.join(output_dir, f'fuzzer_{timestamp}.log')
 
     logger = logging.getLogger('pcfuzz')
     logger.setLevel(logging.DEBUG)
@@ -359,10 +360,7 @@ class NVMeFuzzer:
         self.crash_inputs: List[Tuple[bytes, NVMeCommand]] = []
 
         self.output_dir = Path(config.output_dir)
-        self.corpus_dir = self.output_dir / 'corpus'
         self.crashes_dir = self.output_dir / 'crashes'
-        self.stats_file = self.output_dir / 'stats.json'
-        self.coverage_file = self.output_dir / 'coverage.txt'
 
         self.executions = 0
         self.start_time: Optional[datetime] = None
@@ -370,7 +368,6 @@ class NVMeFuzzer:
         self.cmd_stats = {c.name: {"exec": 0, "interesting": 0} for c in self.commands}
 
     def _setup_directories(self):
-        self.corpus_dir.mkdir(parents=True, exist_ok=True)
         self.crashes_dir.mkdir(parents=True, exist_ok=True)
 
     def _load_seeds(self):
@@ -516,14 +513,10 @@ class NVMeFuzzer:
                 pass
             return False
           
-    def _save_input(self, data: bytes, cmd: NVMeCommand, is_crash: bool = False):
+    def _save_crash(self, data: bytes, cmd: NVMeCommand):
         input_hash = hashlib.md5(data).hexdigest()[:12]
-        filename = f"{cmd.name}_{hex(cmd.opcode)}_{input_hash}"
-
-        if is_crash:
-            filepath = self.crashes_dir / f'crash_{filename}'
-        else:
-            filepath = self.corpus_dir / f'input_{filename}'
+        filename = f"crash_{cmd.name}_{hex(cmd.opcode)}_{input_hash}"
+        filepath = self.crashes_dir / filename
 
         with open(filepath, 'wb') as f:
             f.write(data)
@@ -532,15 +525,9 @@ class NVMeFuzzer:
         with open(str(filepath) + '.json', 'w') as f:
             json.dump(meta, f)
 
-    def _save_coverage(self):
-        with open(self.coverage_file, 'w') as f:
-            for pc in sorted(self.sampler.global_coverage):
-                f.write(f"{hex(pc)}\n")
-
-    def _save_stats(self) -> dict:
+    def _collect_stats(self) -> dict:
         elapsed = (datetime.now() - self.start_time).total_seconds() if self.start_time else 0
-
-        stats = {
+        return {
             'executions': self.executions,
             'corpus_size': len(self.corpus),
             'crashes': len(self.crash_inputs),
@@ -550,13 +537,7 @@ class NVMeFuzzer:
             'elapsed_seconds': elapsed,
             'exec_per_sec': self.executions / elapsed if elapsed > 0 else 0,
             'command_stats': self.cmd_stats,
-            'timestamp': datetime.now().isoformat()
         }
-
-        with open(self.stats_file, 'w') as f:
-            json.dump(stats, f, indent=2)
-
-        return stats
 
     def _print_status(self, stats: dict, last_samples: int = 0):
         log.info(f"[Stats] exec: {stats['executions']:,} | "
@@ -650,7 +631,7 @@ class NVMeFuzzer:
 
                 if not success:
                     self.crash_inputs.append((fuzz_data, cmd))
-                    self._save_input(fuzz_data, cmd, is_crash=True)
+                    self._save_crash(fuzz_data, cmd)
                     log.warning(f"Crash/Timeout with {cmd.name}!")
                     if not self.sampler.reconnect():
                         log.error("Cannot reconnect to J-Link, stopping")
@@ -662,37 +643,39 @@ class NVMeFuzzer:
                     self.sampler.interesting_inputs += 1
                     self.cmd_stats[cmd.name]["interesting"] += 1
                     self.corpus.append((fuzz_data, cmd))
-                    self._save_input(fuzz_data, cmd)
                     log.info(f"[+] New coverage! cmd={cmd.name} "
                              f"+{new_paths} PCs (total: {len(self.sampler.global_coverage)})")
 
                 if self.executions % 10 == 0:
-                    stats = self._save_stats()
+                    stats = self._collect_stats()
                     self._print_status(stats, last_samples)
-
-                if self.executions % 100 == 0:
-                    self._save_coverage()
 
         except KeyboardInterrupt:
             log.info("Interrupted by user")
 
         finally:
+            stats = self._collect_stats()
+
             log.info("=" * 60)
             log.info(" Fuzzing Complete")
             log.info("=" * 60)
-            stats = self._save_stats()
-            self._save_coverage()
-
-            log.info(f"Total executions: {stats['executions']:,}")
-            log.info(f"Corpus size: {stats['corpus_size']}")
-            log.info(f"Crashes: {stats['crashes']}")
+            log.info(f"Total executions : {stats['executions']:,}")
+            log.info(f"Elapsed          : {stats['elapsed_seconds']:.1f}s")
+            log.info(f"Exec/s           : {stats['exec_per_sec']:.1f}")
+            log.info(f"Corpus size      : {stats['corpus_size']}")
+            log.info(f"Crashes          : {stats['crashes']}")
+            log.info(f"Total samples    : {stats['total_samples']:,}")
+            log.info(f"Interesting      : {stats['interesting_inputs']}")
             log.info(f"Coverage (unique PCs): {stats['coverage_unique_pcs']:,}")
             log.info("Per-command stats:")
             for cmd_name, cmd_stat in stats['command_stats'].items():
                 log.info(f"  {cmd_name}: exec={cmd_stat['exec']}, "
                          f"interesting={cmd_stat['interesting']}")
-            log.info(f"Output: {self.output_dir}")
-            log.info(f"Log file: {self.output_dir}/fuzzer.log")
+            if self.sampler.global_coverage:
+                sorted_pcs = sorted(self.sampler.global_coverage)
+                log.info(f"Coverage PCs ({len(sorted_pcs)}):")
+                for pc in sorted_pcs:
+                    log.info(f"  {hex(pc)}")
             log.info("=" * 60)
 
             self.sampler.close()
