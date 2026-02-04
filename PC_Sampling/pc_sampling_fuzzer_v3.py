@@ -245,7 +245,7 @@ class JLinkPCSampler:
                     return None
                 self.jlink.halt()
                 pc = self.jlink.register_read(15)
-                self.jlink.restart()
+                self.jlink.go()
                 return pc
         except Exception:
             return None
