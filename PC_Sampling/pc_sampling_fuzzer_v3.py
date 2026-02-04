@@ -45,7 +45,8 @@ NVME_TIMEOUT   = 5000         # ms
 
 # PC 샘플링 설정
 SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
-MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수
+MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수 (상한)
+SATURATION_LIMIT      = 30    # 연속 N회 새 unique PC 없으면 조기 종료
 POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 
 # 퍼징 설정
@@ -104,6 +105,7 @@ class FuzzConfig:
     # 샘플링 설정
     sample_interval_us: int = SAMPLE_INTERVAL_US
     max_samples_per_run: int = MAX_SAMPLES_PER_RUN
+    saturation_limit: int = SATURATION_LIMIT
 
     # NVMe 커맨드 완료 후 추가 샘플링 시간 (ms)
     post_cmd_delay_ms: int = POST_CMD_DELAY_MS
@@ -278,9 +280,12 @@ class JLinkPCSampler:
         self._out_of_range_count = 0   # 범위 밖 PC 수
         self._last_new_at = 0          # 마지막으로 새 unique PC가 발견된 샘플 번호
         self._unique_at_intervals = {} # {샘플수: 그 시점의 unique PC 수}
+        self._stopped_reason = ""      # 종료 사유
         sample_count = 0
         prev_unique = 0
+        since_last_new = 0             # 마지막 새 PC 이후 연속 중복 횟수
         interval = self.config.sample_interval_us / 1_000_000
+        sat_limit = self.config.saturation_limit
 
         while not self.stop_event.is_set() and sample_count < self.config.max_samples_per_run:
             pc = self._read_pc()
@@ -300,11 +305,25 @@ class JLinkPCSampler:
                 if cur_unique > prev_unique:
                     self._last_new_at = sample_count
                     prev_unique = cur_unique
+                    since_last_new = 0
+                else:
+                    since_last_new += 1
 
                 if sample_count in (10, 25, 50, 100, 200, 500):
                     self._unique_at_intervals[sample_count] = cur_unique
+
+                # 조기 종료: 연속 N회 새 PC 없으면 포화 판정
+                if sat_limit > 0 and since_last_new >= sat_limit:
+                    self._stopped_reason = f"saturated (no new PC for {sat_limit} consecutive samples)"
+                    break
             if interval > 0:
                 time.sleep(interval)
+
+        if not self._stopped_reason:
+            if self.stop_event.is_set():
+                self._stopped_reason = "stop_event"
+            else:
+                self._stopped_reason = f"max_samples ({self.config.max_samples_per_run})"
 
     def start_sampling(self):
         self.stop_event.clear()
@@ -624,7 +643,8 @@ class NVMeFuzzer:
                           f"raw_samples={raw_count} in_range={last_samples} "
                           f"out_of_range={oor_count} new_pcs={new_paths} "
                           f"global={len(self.sampler.global_coverage)} "
-                          f"last_new_at={self.sampler._last_new_at}")
+                          f"last_new_at={self.sampler._last_new_at} "
+                          f"stop={self.sampler._stopped_reason}")
                 if self.sampler._unique_at_intervals:
                     log.debug(f"  saturation: {self.sampler._unique_at_intervals}")
                 if self.sampler._last_raw_pcs:
