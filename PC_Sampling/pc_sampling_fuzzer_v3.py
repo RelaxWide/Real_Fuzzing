@@ -163,7 +163,7 @@ class JLinkPCSampler:
     def __init__(self, config: FuzzConfig):
         self.config = config
         self.jlink: Optional[pylink.JLink] = None
-        self._pc_reg_index: int = 15  # 기본값, connect()에서 실제 인덱스로 갱신
+        self._pc_reg_index: int = 9  # Cortex-R8: R15(PC)의 J-Link 레지스터 인덱스
         self.lock = threading.Lock()
         self.global_coverage: Set[int] = set()
         self.current_trace: Set[int] = set()
@@ -212,15 +212,9 @@ class JLinkPCSampler:
     def _resume(self):
         """halt 상태에서 실행을 재개한다 (CPU 리셋 없이)."""
         try:
-            # pylink에 go()가 있으면 사용
-            self.jlink.go()
-        except AttributeError:
-            # go()가 없는 pylink 버전: J-Link SDK DLL 직접 호출
-            try:
-                self.jlink._dll.JLINKARM_Go()
-            except Exception:
-                # 최후 수단: restart (CPU 리셋됨)
-                self.jlink.restart()
+            self.jlink._dll.JLINKARM_Go()
+        except Exception:
+            self.jlink.restart()
 
     def reconnect(self, max_retries: int = 5) -> bool:
         for attempt in range(1, max_retries + 1):
