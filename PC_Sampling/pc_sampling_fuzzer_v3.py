@@ -46,7 +46,7 @@ NVME_TIMEOUT   = 5000         # ms
 # PC 샘플링 설정
 SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
 MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수
-POST_CMD_DELAY_MS     = 5     # 커맨드 완료 후 tail 샘플링 (ms)
+POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 
 # 퍼징 설정
 MAX_INPUT_LEN     = 4096      # 최대 입력 바이트
@@ -276,7 +276,10 @@ class JLinkPCSampler:
         self.current_trace = set()
         self._last_raw_pcs = []       # 이번 실행에서 수집한 모든 raw PC
         self._out_of_range_count = 0   # 범위 밖 PC 수
+        self._last_new_at = 0          # 마지막으로 새 unique PC가 발견된 샘플 번호
+        self._unique_at_intervals = {} # {샘플수: 그 시점의 unique PC 수}
         sample_count = 0
+        prev_unique = 0
         interval = self.config.sample_interval_us / 1_000_000
 
         while not self.stop_event.is_set() and sample_count < self.config.max_samples_per_run:
@@ -292,6 +295,14 @@ class JLinkPCSampler:
                     self.current_trace.add(pc)
                 sample_count += 1
                 self.total_samples += 1
+
+                cur_unique = len(self.current_trace)
+                if cur_unique > prev_unique:
+                    self._last_new_at = sample_count
+                    prev_unique = cur_unique
+
+                if sample_count in (10, 25, 50, 100, 200, 500):
+                    self._unique_at_intervals[sample_count] = cur_unique
             if interval > 0:
                 time.sleep(interval)
 
@@ -460,11 +471,7 @@ class NVMeFuzzer:
             # 명령을 보내기 전에 샘플링을 먼저 시작하여, 명령 처리 초반부(헤더 파싱 등)를 놓치지 않게 함
             # =========================================================
             self.sampler.start_sampling()
-            
-            # [수정 2] 샘플링 스레드가 확실히 구동되고 J-Link가 첫 PC를 물어올 시간을 줌 (10ms)
-            time.sleep(0.01) 
 
-            # [수정 3] 이제 NVMe 명령 발사 (이미 J-Link는 감시 중)
             process = subprocess.Popen(
                 nvme_cmd,
                 stdout=subprocess.PIPE,
@@ -497,10 +504,6 @@ class NVMeFuzzer:
                 log.debug(f"[NVMe RET] stderr={stderr_str[:200]}")
             if rc != 0:
                 log.warning(f"[NVMe RET] {cmd.name} returned non-zero: rc={rc}")
-
-            # tail processing 샘플링 (옵션이 켜져있을 경우 추가 지연)
-            if self.config.post_cmd_delay_ms > 0:
-                time.sleep(self.config.post_cmd_delay_ms / 1000)
 
             return True
 
@@ -620,8 +623,10 @@ class NVMeFuzzer:
                 log.debug(f"exec={self.executions} cmd={cmd.name} "
                           f"raw_samples={raw_count} in_range={last_samples} "
                           f"out_of_range={oor_count} new_pcs={new_paths} "
-                          f"global={len(self.sampler.global_coverage)}")
-                # 수집된 raw PC 전체 기록 (파일에만)
+                          f"global={len(self.sampler.global_coverage)} "
+                          f"last_new_at={self.sampler._last_new_at}")
+                if self.sampler._unique_at_intervals:
+                    log.debug(f"  saturation: {self.sampler._unique_at_intervals}")
                 if self.sampler._last_raw_pcs:
                     all_pcs = [hex(pc) for pc in self.sampler._last_raw_pcs]
                     log.debug(f"  ALL raw PCs: {all_pcs}")
@@ -649,6 +654,8 @@ class NVMeFuzzer:
                 if self.executions % 10 == 0:
                     stats = self._collect_stats()
                     self._print_status(stats, last_samples)
+                    for h in log.handlers:
+                        h.flush()
 
         except KeyboardInterrupt:
             log.info("Interrupted by user")
