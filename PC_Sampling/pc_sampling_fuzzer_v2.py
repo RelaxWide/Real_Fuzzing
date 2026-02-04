@@ -203,6 +203,39 @@ class JLinkPCSampler:
         log.error("[J-Link] All reconnection attempts failed")
         return False
 
+    def diagnose(self, count: int = 20) -> bool:
+        """시작 전 PC 읽기 진단 — J-Link 동작 검증"""
+        log.info(f"[Diagnose] PC를 {count}회 읽어서 J-Link 상태를 확인합니다...")
+        pcs = []
+        failures = 0
+        for i in range(count):
+            pc = self._read_pc()
+            if pc is not None:
+                pcs.append(pc)
+                in_range = ""
+                if self.config.addr_range_start is not None and self.config.addr_range_end is not None:
+                    if self.config.addr_range_start <= pc <= self.config.addr_range_end:
+                        in_range = " [IN RANGE]"
+                    else:
+                        in_range = " [OUT OF RANGE]"
+                log.info(f"  [{i+1:2d}] PC = {hex(pc)}{in_range}")
+            else:
+                failures += 1
+                log.warning(f"  [{i+1:2d}] PC read FAILED")
+            time.sleep(0.05)
+
+        if not pcs:
+            log.error("[Diagnose] PC를 한 번도 읽지 못했습니다. JTAG 연결을 확인하세요.")
+            return False
+
+        unique_pcs = set(pcs)
+        log.info(f"[Diagnose] 결과: {len(pcs)}/{count} 성공, "
+                 f"failures={failures}, unique PCs={len(unique_pcs)}")
+        if len(unique_pcs) <= 1:
+            log.warning(f"[Diagnose] PC가 항상 같은 값입니다 ({hex(pcs[0])}). "
+                        f"CPU가 멈춰있거나 idle loop에 있을 수 있습니다.")
+        return True
+
     def _read_pc(self) -> Optional[int]:
         try:
             with self.lock:
@@ -217,15 +250,20 @@ class JLinkPCSampler:
 
     def _sampling_worker(self):
         self.current_trace = set()
+        self._last_raw_pcs = []       # 이번 실행에서 수집한 모든 raw PC
+        self._out_of_range_count = 0   # 범위 밖 PC 수
         sample_count = 0
         interval = self.config.sample_interval_us / 1_000_000
 
         while not self.stop_event.is_set() and sample_count < self.config.max_samples_per_run:
             pc = self._read_pc()
             if pc is not None:
+                self._last_raw_pcs.append(pc)
                 if self.config.addr_range_start is not None and self.config.addr_range_end is not None:
                     if self.config.addr_range_start <= pc <= self.config.addr_range_end:
                         self.current_trace.add(pc)
+                    else:
+                        self._out_of_range_count += 1
                 else:
                     self.current_trace.add(pc)
                 sample_count += 1
@@ -382,15 +420,7 @@ class NVMeFuzzer:
         return nvme_cmd
 
     def _send_nvme_command(self, data: bytes, cmd: NVMeCommand) -> bool:
-        """
-        NVMe 커맨드 전송 (Popen 기반 - 샘플링 타이밍 개선)
-
-        기존 subprocess.run()은 커맨드 전송 전부터 샘플링이 시작되어
-        무관한 PC가 수집되었음. Popen으로 변경하여:
-        1. 입력 파일 작성
-        2. Popen으로 NVMe 커맨드 launch
-        3. 호출자가 launch 후 샘플링 시작 가능
-        """
+        """NVMe 커맨드 전송 (Popen 기반 - 샘플링 타이밍 개선)"""
         input_file = '/tmp/nvme_fuzz_input'
 
         try:
@@ -399,33 +429,49 @@ class NVMeFuzzer:
 
             nvme_cmd = self._build_nvme_cmd(data, cmd, input_file)
 
-            # Popen: non-blocking launch → 호출 즉시 반환
+            # 커맨드라인 로깅
+            cmd_str = ' '.join(nvme_cmd)
+            log.debug(f"[NVMe CMD] {cmd_str}")
+            log.debug(f"[NVMe CMD] data_len={len(data)}, "
+                      f"data_hex={data[:32].hex()}{'...' if len(data) > 32 else ''}")
+
+            # Popen: non-blocking launch
             process = subprocess.Popen(
                 nvme_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
 
-            # 커맨드가 SSD에 도달할 시간 확보 (nvme-cli → kernel → PCIe)
+            # 커맨드가 SSD에 도달할 시간 확보
             time.sleep(0.001)
 
-            # 샘플링 시작 - 커맨드가 이미 SSD에서 처리 중인 시점
+            # 샘플링 시작
             self.sampler.start_sampling()
 
             # 커맨드 완료 대기
             timeout_sec = self.config.nvme_timeout_ms / 1000 + 5
             try:
-                process.wait(timeout=timeout_sec)
+                stdout, stderr = process.communicate(timeout=timeout_sec)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait()
-                # 타임아웃 발생 시에도 샘플링 중단 후 반환
+                stdout, stderr = process.communicate()
                 self.sampler.stop_sampling()
-                log.warning(f"Timeout: {cmd.name} (opcode={hex(cmd.opcode)})")
+                log.warning(f"[NVMe TIMEOUT] {cmd.name} (opcode={hex(cmd.opcode)})")
+                log.warning(f"  stdout: {stdout.decode(errors='replace').strip()}")
+                log.warning(f"  stderr: {stderr.decode(errors='replace').strip()}")
                 return False
 
-            # 커맨드 완료 후 tail processing 샘플링
-            # (펌웨어가 응답 후에도 cleanup/logging 등을 수행할 수 있음)
+            # 리턴값, stdout, stderr 로깅
+            rc = process.returncode
+            stdout_str = stdout.decode(errors='replace').strip()
+            stderr_str = stderr.decode(errors='replace').strip()
+            log.debug(f"[NVMe RET] rc={rc}, stdout={stdout_str[:200]}")
+            if stderr_str:
+                log.debug(f"[NVMe RET] stderr={stderr_str[:200]}")
+            if rc != 0:
+                log.warning(f"[NVMe RET] {cmd.name} returned non-zero: rc={rc}")
+
+            # tail processing 샘플링
             if self.config.post_cmd_delay_ms > 0:
                 time.sleep(self.config.post_cmd_delay_ms / 1000)
 
@@ -519,6 +565,11 @@ class NVMeFuzzer:
             log.error("J-Link connection failed, aborting")
             return
 
+        # J-Link PC 읽기 진단
+        if not self.sampler.diagnose():
+            log.error("J-Link PC read diagnosis failed, aborting")
+            return
+
         self.start_time = datetime.now()
 
         try:
@@ -547,13 +598,19 @@ class NVMeFuzzer:
                 is_interesting, new_paths = self.sampler.evaluate_coverage()
 
                 # 매 실행마다 DEBUG 로그 (파일에만 기록)
+                raw_count = len(self.sampler._last_raw_pcs)
+                oor_count = self.sampler._out_of_range_count
                 log.debug(f"exec={self.executions} cmd={cmd.name} "
-                          f"samples={last_samples} new_pcs={new_paths} "
-                          f"trace={len(self.sampler.current_trace)} "
+                          f"raw_samples={raw_count} in_range={last_samples} "
+                          f"out_of_range={oor_count} new_pcs={new_paths} "
                           f"global={len(self.sampler.global_coverage)}")
+                # 수집된 raw PC 전체 기록 (파일에만)
+                if self.sampler._last_raw_pcs:
+                    all_pcs = [hex(pc) for pc in self.sampler._last_raw_pcs]
+                    log.debug(f"  ALL raw PCs: {all_pcs}")
                 if self.sampler.current_trace:
-                    sample_pcs = list(self.sampler.current_trace)[:5]
-                    log.debug(f"  PCs: {[hex(pc) for pc in sample_pcs]}")
+                    in_range_pcs = sorted([hex(pc) for pc in self.sampler.current_trace])
+                    log.debug(f"  In-range unique PCs: {in_range_pcs}")
 
                 if not success:
                     self.crash_inputs.append((fuzz_data, cmd))
