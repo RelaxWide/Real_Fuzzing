@@ -46,7 +46,7 @@ NVME_TIMEOUT   = 5000         # ms
 # PC 샘플링 설정
 SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
 MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수 (상한)
-SATURATION_LIMIT      = 30    # 연속 N회 새 unique PC 없으면 조기 종료
+SATURATION_LIMIT      = 10    # 연속 N회 새 unique PC 없으면 조기 종료
 POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 
 # 퍼징 설정
@@ -167,7 +167,6 @@ class JLinkPCSampler:
         self.config = config
         self.jlink: Optional[pylink.JLink] = None
         self._pc_reg_index: int = 9  # Cortex-R8: R15(PC)의 J-Link 레지스터 인덱스
-        self.lock = threading.Lock()
         self.global_coverage: Set[int] = set()
         self.current_trace: Set[int] = set()
         self.stop_event = threading.Event()
@@ -194,6 +193,11 @@ class JLinkPCSampler:
             log.info(f"[J-Link] PC register index: {self._pc_reg_index} "
                      f"(name: {self.jlink.register_name(self._pc_reg_index)})")
 
+            # DLL 함수 참조 캐싱 (pylink wrapper 우회, 매 호출 attribute lookup 제거)
+            self._halt_func = self.jlink._dll.JLINKARM_Halt
+            self._read_reg_func = self.jlink._dll.JLINKARM_ReadReg
+            self._go_func = self.jlink._dll.JLINKARM_Go
+
             return True
         except Exception as e:
             log.error(f"[J-Link Error] {e}")
@@ -215,7 +219,7 @@ class JLinkPCSampler:
     def _resume(self):
         """halt 상태에서 실행을 재개한다 (CPU 리셋 없이)."""
         try:
-            self.jlink._dll.JLINKARM_Go()
+            self._go_func()
         except Exception:
             self.jlink.restart()
 
@@ -263,14 +267,13 @@ class JLinkPCSampler:
         return True
 
     def _read_pc(self) -> Optional[int]:
+        """halt → register read → resume を1サイクル実行.
+        DLL直接呼び出しでpylink wrapper overhead を回避."""
         try:
-            with self.lock:
-                if not self.jlink or not self.jlink.connected():
-                    return None
-                self.jlink.halt()
-                pc = self.jlink.register_read(self._pc_reg_index)
-                self._resume()
-                return pc
+            self._halt_func()
+            pc = self._read_reg_func(self._pc_reg_index)
+            self._go_func()
+            return pc
         except Exception:
             return None
 

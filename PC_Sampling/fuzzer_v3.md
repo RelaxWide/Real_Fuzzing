@@ -46,18 +46,43 @@ self.jlink._dll.JLINKARM_Go()                      # 리셋 없이 resume
 | `time.sleep(0.01)` (NVMe 전송 전) | 10ms | 샘플링 스레드 구동 대기 | 스레드 start는 즉시. `_read_pc()` 자체가 ~1ms | 제거 |
 | `post_cmd_delay_ms` | 5ms | 커맨드 후 추가 샘플링 | `stop_sampling()` 이후에 sleep하므로 샘플링이 안 됨 | 0으로 변경 |
 
-### 3. 샘플링 포화 감지 및 조기 종료
+### 3. `_read_pc()` 성능 최적화
+
+**문제**: 각 실행당 ~3초 소요. `_read_pc()`가 매 호출 ~50-100ms (USB Full-Speed RTT).
+
+**최적화 1 - DLL 함수 참조 캐싱**:
+`self.jlink._dll.JLINKARM_Halt` 등을 매번 attribute lookup하는 대신, `connect()` 시점에 한번만 참조를 저장.
+
+```python
+# connect() 에서 캐싱
+self._halt_func = self.jlink._dll.JLINKARM_Halt
+self._read_reg_func = self.jlink._dll.JLINKARM_ReadReg
+self._go_func = self.jlink._dll.JLINKARM_Go
+
+# _read_pc() 에서 직접 호출
+self._halt_func()
+pc = self._read_reg_func(self._pc_reg_index)
+self._go_func()
+```
+
+**최적화 2 - threading.Lock 제거**:
+샘플링 스레드 동작 중 메인 스레드는 `process.communicate()`에서 블로킹되므로 동시 접근이 없다. Lock acquire/release 오버헤드 제거.
+
+**최적화 3 - SATURATION_LIMIT 30→10**:
+실측 데이터에서 `last_new_at < 5`이므로, 연속 10회 중복이면 조기 종료해도 충분.
+
+### 4. 샘플링 포화 감지 및 조기 종료
 
 **문제**: `MAX_SAMPLES_PER_RUN=500`인데, 실측 결과 `last_new_at < 5`. 나머지 495회는 idle loop 중복.
 
-**해결**: 연속 N회(`SATURATION_LIMIT=30`) 새 unique PC가 없으면 조기 종료.
+**해결**: 연속 N회(`SATURATION_LIMIT=10`) 새 unique PC가 없으면 조기 종료.
 
 ```
-exec=1 cmd=Identify raw_samples=34 ... last_new_at=3 stop=saturated (no new PC for 30 consecutive samples)
-  saturation: {10: 3, 25: 3}
+exec=1 cmd=Identify raw_samples=14 ... last_new_at=3 stop=saturated (no new PC for 10 consecutive samples)
+  saturation: {10: 3}
 ```
 
-- 빠른 커맨드: ~33회에서 자동 종료 (기존 500회 대비 15배 빠름)
+- 빠른 커맨드: ~13회에서 자동 종료 (기존 500회 대비 38배 빠름)
 - 느린 커맨드: 새 PC가 계속 나오면 500회 상한까지 계속 샘플링
 - `SATURATION_LIMIT=0`으로 비활성화 가능
 
@@ -83,7 +108,7 @@ exec=1 cmd=Identify raw_samples=34 ... last_new_at=3 stop=saturated (no new PC f
 | `JLINK_DEVICE` | `Cortex-R8` | J-Link 타겟 디바이스 |
 | `JLINK_SPEED` | `12000` | JTAG 속도 (kHz) |
 | `MAX_SAMPLES_PER_RUN` | `500` | 1회 실행당 최대 PC 샘플 수 (상한) |
-| `SATURATION_LIMIT` | `30` | 연속 N회 새 PC 없으면 조기 종료 |
+| `SATURATION_LIMIT` | `10` | 연속 N회 새 PC 없으면 조기 종료 |
 | `SAMPLE_INTERVAL_US` | `0` | 샘플 간 대기 (0 = 최대 속도) |
 | `TOTAL_RUNTIME_SEC` | `3600` | 총 퍼징 시간 (초) |
 
@@ -104,7 +129,7 @@ sudo python3 pc_sampling_fuzzer_v3.py --addr-start 0x1000 --addr-end 0x50000
 
 | 병목 | 원인 | 개선 방향 |
 |------|------|-----------|
-| `_read_pc()` USB RTT | halt+read+resume = 3회 USB 트랜잭션 (~1-2ms/샘플) | J-Link V9 하드웨어 한계. J-Link Pro/Ultra+ 또는 ETM trace 필요 |
+| `_read_pc()` USB RTT | halt+read+resume = 3회 USB 트랜잭션 (~50-100ms/샘플). DLL 캐싱으로 wrapper 오버헤드는 제거했으나 USB Full-Speed 물리적 한계 | J-Link Pro/Ultra+ (USB Hi-Speed) 또는 ETM trace 필요 |
 | `subprocess.Popen` | 매 실행마다 nvme CLI 프로세스 fork | python-nvme 또는 ctypes ioctl로 직접 호출 |
 
 ## 파일 목록
