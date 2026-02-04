@@ -442,7 +442,7 @@ class NVMeFuzzer:
 
         return nvme_cmd
       
-  def _send_nvme_command(self, data: bytes, cmd: NVMeCommand) -> bool:
+    def _send_nvme_command(self, data: bytes, cmd: NVMeCommand) -> bool:
         """NVMe 커맨드 전송 (수정됨: 선제적 샘플링 적용)"""
         input_file = '/tmp/nvme_fuzz_input'
 
