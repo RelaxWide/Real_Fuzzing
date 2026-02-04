@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v2
+
+J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
+NVMe CLI를 통해 SSD에 퍼징 입력을 전달합니다.
+
+주의: J-Link V9는 완전한 Non-intrusive Trace를 지원하지 않습니다.
+     이 코드는 ~10us halt로 PC를 읽는 방식을 사용합니다.
+"""
+
+from __future__ import annotations
+
+import pylink
+import time
+import threading
+import subprocess
+import os
+import json
+import hashlib
+import random
+import logging
+from typing import Set, List, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from enum import Enum
+
+# =============================================================================
+# USER CONFIGURATION - 여기만 수정하세요
+# =============================================================================
+
+# Ghidra에서 확인한 펌웨어 코드(.text) 영역 주소
+FW_ADDR_START = 0x00000000
+FW_ADDR_END   = 0x00147FFF
+
+# J-Link / JTAG 설정
+JLINK_DEVICE  = 'Cortex-R8'
+JLINK_SPEED   = 4000          # kHz
+
+# NVMe 장치 설정
+NVME_DEVICE    = '/dev/nvme0'
+NVME_NAMESPACE = 1
+NVME_TIMEOUT   = 5000         # ms
+
+# PC 샘플링 설정
+SAMPLE_INTERVAL_US    = 100   # 샘플 간격 (us), 0이면 최대 속도
+MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수
+POST_CMD_DELAY_MS     = 5     # 커맨드 완료 후 tail 샘플링 (ms)
+
+# 퍼징 설정
+MAX_INPUT_LEN     = 4096      # 최대 입력 바이트
+TOTAL_RUNTIME_SEC = 3600      # 총 퍼징 시간 (초)
+OUTPUT_DIR        = './output/pc_sampling_v2/'
+SEED_DIR          = None      # 시드 폴더 경로 (없으면 None)
+RESUME_COVERAGE   = None      # 이전 coverage.txt 경로 (없으면 None)
+
+# =============================================================================
+
+
+class NVMeCommandType(Enum):
+    ADMIN = "admin-passthru"
+    IO = "io-passthru"
+
+
+@dataclass
+class NVMeCommand:
+    name: str
+    opcode: int
+    cmd_type: NVMeCommandType
+    needs_namespace: bool = True
+    needs_data: bool = True
+    description: str = ""
+
+
+NVME_COMMANDS = [
+    # Admin Commands
+    NVMeCommand("Identify", 0x06, NVMeCommandType.ADMIN, needs_data=False,
+                description="장치/네임스페이스 정보 조회"),
+    NVMeCommand("GetLogPage", 0x02, NVMeCommandType.ADMIN, needs_data=False,
+                description="로그 페이지 조회"),
+    NVMeCommand("GetFeatures", 0x0A, NVMeCommandType.ADMIN, needs_data=False,
+                description="기능 조회"),
+    # I/O Commands
+    NVMeCommand("Read", 0x02, NVMeCommandType.IO, needs_data=False,
+                description="데이터 읽기"),
+    NVMeCommand("Write", 0x01, NVMeCommandType.IO,
+                description="데이터 쓰기"),
+]
+
+
+@dataclass
+class FuzzConfig:
+    device_name: str = JLINK_DEVICE
+    interface: int = pylink.enums.JLinkInterfaces.JTAG
+    jtag_speed: int = JLINK_SPEED
+
+    nvme_device: str = NVME_DEVICE
+    nvme_namespace: int = NVME_NAMESPACE
+    nvme_timeout_ms: int = NVME_TIMEOUT
+
+    enabled_commands: List[str] = field(default_factory=list)
+
+    # 샘플링 설정
+    sample_interval_us: int = SAMPLE_INTERVAL_US
+    max_samples_per_run: int = MAX_SAMPLES_PER_RUN
+
+    # NVMe 커맨드 완료 후 추가 샘플링 시간 (ms)
+    post_cmd_delay_ms: int = POST_CMD_DELAY_MS
+
+    # 퍼징 설정
+    max_input_len: int = MAX_INPUT_LEN
+    total_runtime_sec: int = TOTAL_RUNTIME_SEC
+    seed_dir: Optional[str] = SEED_DIR
+    output_dir: str = OUTPUT_DIR
+
+    # 주소 필터 (펌웨어 .text 섹션 범위)
+    addr_range_start: Optional[int] = FW_ADDR_START
+    addr_range_end: Optional[int] = FW_ADDR_END
+
+    # 이전 세션 커버리지 파일 (resume용)
+    resume_coverage: Optional[str] = RESUME_COVERAGE
+
+
+def setup_logging(output_dir: str) -> logging.Logger:
+    """파일 + 콘솔 동시 로깅 설정"""
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    log_file = os.path.join(output_dir, 'fuzzer.log')
+
+    logger = logging.getLogger('pcfuzz')
+    logger.setLevel(logging.DEBUG)
+
+    # 이전 핸들러 제거 (중복 방지)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # 파일: DEBUG 이상 전부 기록
+    fh = logging.FileHandler(log_file)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    # 콘솔: INFO 이상만 출력
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    return logger
+
+
+# 모듈 레벨 로거 (setup_logging 호출 전까지 콘솔만 사용)
+log = logging.getLogger('pcfuzz')
+
+
+class JLinkPCSampler:
+    """J-Link Halt-Sample-Resume 기반 PC 수집기"""
+
+    def __init__(self, config: FuzzConfig):
+        self.config = config
+        self.jlink: Optional[pylink.JLink] = None
+        self.lock = threading.Lock()
+        self.global_coverage: Set[int] = set()
+        self.current_trace: Set[int] = set()
+        self.stop_event = threading.Event()
+        self.sample_thread: Optional[threading.Thread] = None
+        self.total_samples = 0
+        self.interesting_inputs = 0
+
+    def connect(self) -> bool:
+        try:
+            if self.jlink and self.jlink.opened():
+                self.jlink.close()
+
+            self.jlink = pylink.JLink()
+            self.jlink.open()
+            self.jlink.set_tif(self.config.interface)
+            self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
+
+            log.info(f"[J-Link] Connected: {self.config.device_name} @ {self.config.jtag_speed}kHz")
+
+            try:
+                self.jlink.restart()
+            except Exception:
+                pass
+
+            return True
+        except Exception as e:
+            log.error(f"[J-Link Error] {e}")
+            return False
+
+    def reconnect(self, max_retries: int = 5) -> bool:
+        for attempt in range(1, max_retries + 1):
+            delay = min(2 ** attempt, 30)
+            log.warning(f"[J-Link] Reconnect attempt {attempt}/{max_retries} (wait {delay}s)...")
+            time.sleep(delay)
+            if self.connect():
+                return True
+        log.error("[J-Link] All reconnection attempts failed")
+        return False
+
+    def _read_pc(self) -> Optional[int]:
+        try:
+            with self.lock:
+                if not self.jlink or not self.jlink.connected():
+                    return None
+                self.jlink.halt()
+                pc = self.jlink.register_read(15)
+                self.jlink.restart()
+                return pc
+        except Exception:
+            return None
+
+    def _sampling_worker(self):
+        self.current_trace = set()
+        sample_count = 0
+        interval = self.config.sample_interval_us / 1_000_000
+
+        while not self.stop_event.is_set() and sample_count < self.config.max_samples_per_run:
+            pc = self._read_pc()
+            if pc is not None:
+                if self.config.addr_range_start is not None and self.config.addr_range_end is not None:
+                    if self.config.addr_range_start <= pc <= self.config.addr_range_end:
+                        self.current_trace.add(pc)
+                else:
+                    self.current_trace.add(pc)
+                sample_count += 1
+                self.total_samples += 1
+            if interval > 0:
+                time.sleep(interval)
+
+    def start_sampling(self):
+        self.stop_event.clear()
+        self.sample_thread = threading.Thread(target=self._sampling_worker, daemon=True)
+        self.sample_thread.start()
+
+    def stop_sampling(self) -> int:
+        if self.sample_thread:
+            self.stop_event.set()
+            self.sample_thread.join(timeout=2.0)
+        return len(self.current_trace)
+
+    def evaluate_coverage(self) -> Tuple[bool, int]:
+        initial = len(self.global_coverage)
+        self.global_coverage.update(self.current_trace)
+        new_paths = len(self.global_coverage) - initial
+        return new_paths > 0, new_paths
+
+    def load_coverage(self, filepath: str) -> int:
+        """이전 세션의 커버리지 파일을 로드하여 global_coverage에 합산"""
+        loaded = 0
+        if not os.path.exists(filepath):
+            log.warning(f"[Coverage] File not found: {filepath}")
+            return 0
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        self.global_coverage.add(int(line, 16))
+                        loaded += 1
+                    except ValueError:
+                        pass
+        log.info(f"[Coverage] Loaded {loaded} PCs from {filepath} "
+                 f"(global coverage: {len(self.global_coverage)})")
+        return loaded
+
+    def close(self):
+        self.stop_event.set()
+        if self.sample_thread:
+            self.sample_thread.join(timeout=1.0)
+        if self.jlink:
+            try:
+                self.jlink.close()
+            except Exception:
+                pass
+
+
+class NVMeFuzzer:
+    """다중 Opcode 지원 NVMe 퍼저"""
+
+    def __init__(self, config: FuzzConfig):
+        self.config = config
+        self.sampler = JLinkPCSampler(config)
+
+        if config.enabled_commands:
+            self.commands = [c for c in NVME_COMMANDS if c.name in config.enabled_commands]
+        else:
+            self.commands = NVME_COMMANDS.copy()
+
+        log.info(f"[Fuzzer] Enabled commands: {[c.name for c in self.commands]}")
+
+        self.corpus: List[Tuple[bytes, NVMeCommand]] = []
+        self.crash_inputs: List[Tuple[bytes, NVMeCommand]] = []
+
+        self.output_dir = Path(config.output_dir)
+        self.corpus_dir = self.output_dir / 'corpus'
+        self.crashes_dir = self.output_dir / 'crashes'
+        self.stats_file = self.output_dir / 'stats.json'
+        self.coverage_file = self.output_dir / 'coverage.txt'
+
+        self.executions = 0
+        self.start_time: Optional[datetime] = None
+
+        self.cmd_stats = {c.name: {"exec": 0, "interesting": 0} for c in self.commands}
+
+    def _setup_directories(self):
+        self.corpus_dir.mkdir(parents=True, exist_ok=True)
+        self.crashes_dir.mkdir(parents=True, exist_ok=True)
+
+    def _load_seeds(self):
+        if self.config.seed_dir and os.path.isdir(self.config.seed_dir):
+            for seed_file in Path(self.config.seed_dir).iterdir():
+                if seed_file.is_file():
+                    with open(seed_file, 'rb') as f:
+                        data = f.read()
+                        for cmd in self.commands:
+                            self.corpus.append((data, cmd))
+            log.info(f"[Fuzzer] Loaded seeds for {len(self.commands)} commands")
+
+        if not self.corpus:
+            for cmd in self.commands:
+                self.corpus.append((b'\x00' * 64, cmd))
+                self.corpus.append((b'\xff' * 64, cmd))
+                self.corpus.append((os.urandom(64), cmd))
+
+    def _mutate(self, data: bytes) -> bytes:
+        data = bytearray(data)
+        mutation_type = random.randint(0, 5)
+
+        if mutation_type == 0 and data:
+            pos = random.randint(0, len(data) - 1)
+            data[pos] = random.randint(0, 255)
+        elif mutation_type == 1:
+            pos = random.randint(0, len(data))
+            data.insert(pos, random.randint(0, 255))
+        elif mutation_type == 2 and len(data) > 1:
+            del data[random.randint(0, len(data) - 1)]
+        elif mutation_type == 3 and data:
+            for _ in range(random.randint(1, min(10, len(data)))):
+                data[random.randint(0, len(data) - 1)] = random.randint(0, 255)
+        elif mutation_type == 4 and data:
+            data[random.randint(0, len(data) - 1)] = random.choice([0x00, 0xff, 0x7f, 0x80])
+        elif mutation_type == 5 and len(data) >= 4:
+            src = random.randint(0, len(data) - 4)
+            dst = random.randint(0, len(data) - 4)
+            data[dst:dst+4] = data[src:src+4]
+
+        return bytes(data[:self.config.max_input_len])
+
+    def _build_nvme_cmd(self, data: bytes, cmd: NVMeCommand, input_file: str) -> List[str]:
+        """NVMe CLI 커맨드 라인 구성"""
+        nvme_cmd = [
+            'nvme', cmd.cmd_type.value,
+            self.config.nvme_device,
+            f'--opcode={hex(cmd.opcode)}',
+            f'--timeout={self.config.nvme_timeout_ms}',
+        ]
+
+        if cmd.needs_namespace:
+            nvme_cmd.append(f'--namespace-id={self.config.nvme_namespace}')
+
+        if cmd.needs_data and data:
+            nvme_cmd.extend([
+                f'--input-file={input_file}',
+                f'--data-len={len(data)}',
+            ])
+
+        if cmd.name == "Read":
+            nvme_cmd.append('-r')
+
+        if cmd.cmd_type == NVMeCommandType.IO:
+            lba = random.randint(0, 1000)
+            nvme_cmd.append(f'--cdw10={lba & 0xFFFFFFFF}')
+            nvme_cmd.append(f'--cdw11={(lba >> 32) & 0xFFFFFFFF}')
+            nvme_cmd.append(f'--cdw12={0}')
+
+        return nvme_cmd
+
+    def _send_nvme_command(self, data: bytes, cmd: NVMeCommand) -> bool:
+        """
+        NVMe 커맨드 전송 (Popen 기반 - 샘플링 타이밍 개선)
+
+        기존 subprocess.run()은 커맨드 전송 전부터 샘플링이 시작되어
+        무관한 PC가 수집되었음. Popen으로 변경하여:
+        1. 입력 파일 작성
+        2. Popen으로 NVMe 커맨드 launch
+        3. 호출자가 launch 후 샘플링 시작 가능
+        """
+        input_file = '/tmp/nvme_fuzz_input'
+
+        try:
+            with open(input_file, 'wb') as f:
+                f.write(data)
+
+            nvme_cmd = self._build_nvme_cmd(data, cmd, input_file)
+
+            # Popen: non-blocking launch → 호출 즉시 반환
+            process = subprocess.Popen(
+                nvme_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            # 커맨드가 SSD에 도달할 시간 확보 (nvme-cli → kernel → PCIe)
+            time.sleep(0.001)
+
+            # 샘플링 시작 - 커맨드가 이미 SSD에서 처리 중인 시점
+            self.sampler.start_sampling()
+
+            # 커맨드 완료 대기
+            timeout_sec = self.config.nvme_timeout_ms / 1000 + 5
+            try:
+                process.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                # 타임아웃 발생 시에도 샘플링 중단 후 반환
+                self.sampler.stop_sampling()
+                log.warning(f"Timeout: {cmd.name} (opcode={hex(cmd.opcode)})")
+                return False
+
+            # 커맨드 완료 후 tail processing 샘플링
+            # (펌웨어가 응답 후에도 cleanup/logging 등을 수행할 수 있음)
+            if self.config.post_cmd_delay_ms > 0:
+                time.sleep(self.config.post_cmd_delay_ms / 1000)
+
+            return True
+
+        except Exception as e:
+            log.error(f"NVMe error ({cmd.name}): {e}")
+            return False
+
+    def _save_input(self, data: bytes, cmd: NVMeCommand, is_crash: bool = False):
+        input_hash = hashlib.md5(data).hexdigest()[:12]
+        filename = f"{cmd.name}_{hex(cmd.opcode)}_{input_hash}"
+
+        if is_crash:
+            filepath = self.crashes_dir / f'crash_{filename}'
+        else:
+            filepath = self.corpus_dir / f'input_{filename}'
+
+        with open(filepath, 'wb') as f:
+            f.write(data)
+
+        meta = {"command": cmd.name, "opcode": hex(cmd.opcode), "type": cmd.cmd_type.value}
+        with open(str(filepath) + '.json', 'w') as f:
+            json.dump(meta, f)
+
+    def _save_coverage(self):
+        with open(self.coverage_file, 'w') as f:
+            for pc in sorted(self.sampler.global_coverage):
+                f.write(f"{hex(pc)}\n")
+
+    def _save_stats(self) -> dict:
+        elapsed = (datetime.now() - self.start_time).total_seconds() if self.start_time else 0
+
+        stats = {
+            'executions': self.executions,
+            'corpus_size': len(self.corpus),
+            'crashes': len(self.crash_inputs),
+            'coverage_unique_pcs': len(self.sampler.global_coverage),
+            'total_samples': self.sampler.total_samples,
+            'interesting_inputs': self.sampler.interesting_inputs,
+            'elapsed_seconds': elapsed,
+            'exec_per_sec': self.executions / elapsed if elapsed > 0 else 0,
+            'command_stats': self.cmd_stats,
+            'timestamp': datetime.now().isoformat()
+        }
+
+        with open(self.stats_file, 'w') as f:
+            json.dump(stats, f, indent=2)
+
+        return stats
+
+    def _print_status(self, stats: dict, last_samples: int = 0):
+        log.info(f"[Stats] exec: {stats['executions']:,} | "
+                 f"corpus: {stats['corpus_size']} | "
+                 f"crashes: {stats['crashes']} | "
+                 f"coverage: {stats['coverage_unique_pcs']:,} | "
+                 f"samples: {stats['total_samples']:,} | "
+                 f"last_run: {last_samples} | "
+                 f"exec/s: {stats['exec_per_sec']:.1f}")
+
+    def run(self):
+        global log
+
+        self._setup_directories()
+        log = setup_logging(self.config.output_dir)
+
+        log.info("=" * 60)
+        log.info(" PC Sampling SSD Fuzzer v2")
+        log.info("=" * 60)
+        log.info(f"NVMe device : {self.config.nvme_device}")
+        log.info(f"Commands    : {[c.name for c in self.commands]}")
+        log.info(f"J-Link      : {self.config.device_name} @ {self.config.jtag_speed}kHz")
+        if self.config.addr_range_start is not None:
+            log.info(f"Addr filter : {hex(self.config.addr_range_start)}"
+                     f" - {hex(self.config.addr_range_end)}")
+        else:
+            log.warning("Addr filter : NONE (all PCs collected - noisy!)")
+        log.info(f"Sampling    : interval={self.config.sample_interval_us}us, "
+                 f"max={self.config.max_samples_per_run}/run, "
+                 f"post_cmd={self.config.post_cmd_delay_ms}ms")
+        log.info(f"Output      : {self.config.output_dir}")
+        log.info("=" * 60)
+
+        self._load_seeds()
+
+        # 이전 커버리지 로드 (resume)
+        if self.config.resume_coverage:
+            self.sampler.load_coverage(self.config.resume_coverage)
+
+        if not self.sampler.connect():
+            log.error("J-Link connection failed, aborting")
+            return
+
+        self.start_time = datetime.now()
+
+        try:
+            while True:
+                elapsed = (datetime.now() - self.start_time).total_seconds()
+                if elapsed >= self.config.total_runtime_sec:
+                    log.info("Runtime limit reached")
+                    break
+
+                # 코퍼스에서 선택 또는 새 커맨드 선택
+                if self.corpus and random.random() < 0.8:
+                    base_data, cmd = random.choice(self.corpus)
+                    fuzz_data = self._mutate(base_data)
+                else:
+                    cmd = random.choice(self.commands)
+                    fuzz_data = os.urandom(random.randint(64, 512))
+
+                # NVMe 커맨드 전송 (내부에서 Popen 후 샘플링 시작)
+                success = self._send_nvme_command(fuzz_data, cmd)
+                last_samples = self.sampler.stop_sampling()
+
+                self.executions += 1
+                self.cmd_stats[cmd.name]["exec"] += 1
+
+                # 커버리지 평가
+                is_interesting, new_paths = self.sampler.evaluate_coverage()
+
+                # 매 실행마다 DEBUG 로그 (파일에만 기록)
+                log.debug(f"exec={self.executions} cmd={cmd.name} "
+                          f"samples={last_samples} new_pcs={new_paths} "
+                          f"trace={len(self.sampler.current_trace)} "
+                          f"global={len(self.sampler.global_coverage)}")
+                if self.sampler.current_trace:
+                    sample_pcs = list(self.sampler.current_trace)[:5]
+                    log.debug(f"  PCs: {[hex(pc) for pc in sample_pcs]}")
+
+                if not success:
+                    self.crash_inputs.append((fuzz_data, cmd))
+                    self._save_input(fuzz_data, cmd, is_crash=True)
+                    log.warning(f"Crash/Timeout with {cmd.name}!")
+                    if not self.sampler.reconnect():
+                        log.error("Cannot reconnect to J-Link, stopping")
+                        break
+                    time.sleep(1)
+                    continue
+
+                if is_interesting:
+                    self.sampler.interesting_inputs += 1
+                    self.cmd_stats[cmd.name]["interesting"] += 1
+                    self.corpus.append((fuzz_data, cmd))
+                    self._save_input(fuzz_data, cmd)
+                    log.info(f"[+] New coverage! cmd={cmd.name} "
+                             f"+{new_paths} PCs (total: {len(self.sampler.global_coverage)})")
+
+                if self.executions % 10 == 0:
+                    stats = self._save_stats()
+                    self._print_status(stats, last_samples)
+
+                if self.executions % 100 == 0:
+                    self._save_coverage()
+
+        except KeyboardInterrupt:
+            log.info("Interrupted by user")
+
+        finally:
+            log.info("=" * 60)
+            log.info(" Fuzzing Complete")
+            log.info("=" * 60)
+            stats = self._save_stats()
+            self._save_coverage()
+
+            log.info(f"Total executions: {stats['executions']:,}")
+            log.info(f"Corpus size: {stats['corpus_size']}")
+            log.info(f"Crashes: {stats['crashes']}")
+            log.info(f"Coverage (unique PCs): {stats['coverage_unique_pcs']:,}")
+            log.info("Per-command stats:")
+            for cmd_name, cmd_stat in stats['command_stats'].items():
+                log.info(f"  {cmd_name}: exec={cmd_stat['exec']}, "
+                         f"interesting={cmd_stat['interesting']}")
+            log.info(f"Output: {self.output_dir}")
+            log.info(f"Log file: {self.output_dir}/fuzzer.log")
+            log.info("=" * 60)
+
+            self.sampler.close()
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description='PC Sampling SSD Fuzzer v2')
+    parser.add_argument('--device', default=JLINK_DEVICE, help='J-Link target')
+    parser.add_argument('--nvme', default=NVME_DEVICE, help='NVMe device')
+    parser.add_argument('--namespace', type=int, default=NVME_NAMESPACE)
+    parser.add_argument('--commands', nargs='+', default=[],
+                        help='Commands to use (e.g., Read Write GetFeatures)')
+    parser.add_argument('--speed', type=int, default=JLINK_SPEED, help='JTAG speed (kHz)')
+    parser.add_argument('--runtime', type=int, default=TOTAL_RUNTIME_SEC)
+    parser.add_argument('--output', default=OUTPUT_DIR, help='Output dir')
+    parser.add_argument('--samples', type=int, default=MAX_SAMPLES_PER_RUN)
+    parser.add_argument('--interval', type=int, default=SAMPLE_INTERVAL_US,
+                        help='Sample interval (us)')
+    parser.add_argument('--post-cmd-delay', type=int, default=POST_CMD_DELAY_MS,
+                        help='Post-command sampling delay (ms)')
+    parser.add_argument('--addr-start', type=lambda x: int(x, 0), default=FW_ADDR_START,
+                        help='Firmware .text start (hex)')
+    parser.add_argument('--addr-end', type=lambda x: int(x, 0), default=FW_ADDR_END,
+                        help='Firmware .text end (hex)')
+    parser.add_argument('--resume-coverage', default=RESUME_COVERAGE,
+                        help='Path to previous coverage.txt')
+
+    args = parser.parse_args()
+
+    print("Available commands:")
+    for cmd in NVME_COMMANDS:
+        print(f"  {cmd.name}: opcode={hex(cmd.opcode)}, type={cmd.cmd_type.value}")
+    print()
+
+    config = FuzzConfig(
+        device_name=args.device,
+        jtag_speed=args.speed,
+        nvme_device=args.nvme,
+        nvme_namespace=args.namespace,
+        enabled_commands=args.commands,
+        total_runtime_sec=args.runtime,
+        output_dir=args.output,
+        max_samples_per_run=args.samples,
+        sample_interval_us=args.interval,
+        post_cmd_delay_ms=args.post_cmd_delay,
+        addr_range_start=args.addr_start,
+        addr_range_end=args.addr_end,
+        resume_coverage=args.resume_coverage,
+    )
+
+    fuzzer = NVMeFuzzer(config)
+    fuzzer.run()
