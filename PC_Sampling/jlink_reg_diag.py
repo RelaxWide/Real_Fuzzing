@@ -104,11 +104,51 @@ except Exception as e:
 print()
 
 # =============================================================
-# TEST 6: go() → halt() 사이클 반복 — PC가 변하는지
+# TEST 5.5: resume 방법 탐색
 # =============================================================
-print("=== TEST 6: go() -> sleep -> halt() cycle (5 rounds) ===")
+print("=== TEST 5.5: Available resume methods ===")
+has_go = hasattr(jlink, 'go')
+has_restart = hasattr(jlink, 'restart')
+has_dll_go = hasattr(getattr(jlink, '_dll', None), 'JLINKARM_Go')
+print(f"  jlink.go()             : {'EXISTS' if has_go else 'NOT FOUND'}")
+print(f"  jlink.restart()        : {'EXISTS' if has_restart else 'NOT FOUND'}")
+print(f"  jlink._dll.JLINKARM_Go : {'EXISTS' if has_dll_go else 'NOT FOUND'}")
+
+def resume(jl):
+    """halt 후 실행 재개 (go() 없는 pylink 대응)"""
+    try:
+        jl.go()
+        return "go()"
+    except AttributeError:
+        pass
+    try:
+        jl._dll.JLINKARM_Go()
+        return "_dll.JLINKARM_Go()"
+    except Exception:
+        pass
+    jl.restart()
+    return "restart() [WARNING: resets CPU]"
+
+print()
+
+# =============================================================
+# TEST 6: resume → halt 사이클 반복 — PC가 변하는지
+# =============================================================
+print("=== TEST 6: resume -> sleep -> halt cycle (5 rounds) ===")
+
+# R15의 실제 인덱스 찾기
+pc_idx = 15  # fallback
+for idx in reg_indices:
+    name = jlink.register_name(idx)
+    if 'R15' in name or name.upper() == 'PC':
+        pc_idx = idx
+        break
+print(f"  Using PC register index: {pc_idx} ({jlink.register_name(pc_idx)})")
+
 for i in range(5):
-    jlink.go()
+    method = resume(jlink)
+    if i == 0:
+        print(f"  Resume method: {method}")
     time.sleep(0.2)  # CPU가 충분히 실행될 시간
     jlink.halt()
     # halt 완료 대기
@@ -116,22 +156,23 @@ for i in range(5):
         if jlink.halted():
             break
         time.sleep(0.001)
-    pc = jlink.register_read(15)
-    print(f"  Round {i+1}: PC = 0x{pc:08X}  halted={jlink.halted()}")
+    pc_correct = jlink.register_read(pc_idx)
+    pc_idx15 = jlink.register_read(15)
+    print(f"  Round {i+1}: reg[{pc_idx}]={jlink.register_name(pc_idx)}=0x{pc_correct:08X}"
+          f"  reg[15]=0x{pc_idx15:08X}  halted={jlink.halted()}")
 print()
 
 # =============================================================
-# TEST 7: JLINKARM_ReadMemU32로 현재 PC 주소의 명령어 읽기
+# TEST 7: 현재 PC 주소의 명령어 읽기
 # =============================================================
 print("=== TEST 7: Instruction at reported PC ===")
-pc_val = jlink.register_read(15)
+pc_val = jlink.register_read(pc_idx)
 try:
     insn = jlink.memory_read32(pc_val, 1)[0]
-    print(f"  PC = 0x{pc_val:08X}, instruction @ PC = 0x{insn:08X}")
+    print(f"  PC(reg[{pc_idx}]) = 0x{pc_val:08X}, instruction @ PC = 0x{insn:08X}")
 except Exception as e:
     print(f"  Failed to read memory at 0x{pc_val:08X}: {e}")
 
-# 비교: 0x5DD4 주소의 명령어도 읽어보기
 try:
     insn_expected = jlink.memory_read32(0x5DD4, 1)[0]
     print(f"  instruction @ 0x5DD4     = 0x{insn_expected:08X}")
@@ -139,6 +180,6 @@ except Exception as e:
     print(f"  Failed to read memory at 0x5DD4: {e}")
 print()
 
-jlink.go()
+resume(jlink)
 jlink.close()
 print("Done. CPU resumed.")

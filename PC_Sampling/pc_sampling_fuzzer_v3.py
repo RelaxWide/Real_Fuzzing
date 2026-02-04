@@ -163,6 +163,7 @@ class JLinkPCSampler:
     def __init__(self, config: FuzzConfig):
         self.config = config
         self.jlink: Optional[pylink.JLink] = None
+        self._pc_reg_index: int = 15  # 기본값, connect()에서 실제 인덱스로 갱신
         self.lock = threading.Lock()
         self.global_coverage: Set[int] = set()
         self.current_trace: Set[int] = set()
@@ -185,15 +186,41 @@ class JLinkPCSampler:
 
             log.info(f"[J-Link] Connected: {self.config.device_name} @ {self.config.jtag_speed}kHz")
 
-            try:
-                self.jlink.restart()
-            except Exception:
-                pass
+            # R15(PC)의 실제 레지스터 인덱스를 동적으로 탐색
+            self._pc_reg_index = self._find_pc_register_index()
+            log.info(f"[J-Link] PC register index: {self._pc_reg_index} "
+                     f"(name: {self.jlink.register_name(self._pc_reg_index)})")
 
             return True
         except Exception as e:
             log.error(f"[J-Link Error] {e}")
             return False
+
+    def _find_pc_register_index(self) -> int:
+        """register_list()에서 R15(PC)의 실제 인덱스를 찾는다.
+        Cortex-R8 등에서는 레지스터 인덱스가 0-15 순서가 아닐 수 있음."""
+        try:
+            for idx in self.jlink.register_list():
+                name = self.jlink.register_name(idx)
+                if 'R15' in name or name.upper() == 'PC':
+                    return idx
+        except Exception as e:
+            log.warning(f"[J-Link] register_list() 탐색 실패: {e}")
+        log.warning("[J-Link] R15 인덱스를 찾지 못함, 기본값 15 사용")
+        return 15
+
+    def _resume(self):
+        """halt 상태에서 실행을 재개한다 (CPU 리셋 없이)."""
+        try:
+            # pylink에 go()가 있으면 사용
+            self.jlink.go()
+        except AttributeError:
+            # go()가 없는 pylink 버전: J-Link SDK DLL 직접 호출
+            try:
+                self.jlink._dll.JLINKARM_Go()
+            except Exception:
+                # 최후 수단: restart (CPU 리셋됨)
+                self.jlink.restart()
 
     def reconnect(self, max_retries: int = 5) -> bool:
         for attempt in range(1, max_retries + 1):
@@ -244,8 +271,8 @@ class JLinkPCSampler:
                 if not self.jlink or not self.jlink.connected():
                     return None
                 self.jlink.halt()
-                pc = self.jlink.register_read(15)
-                self.jlink.go()
+                pc = self.jlink.register_read(self._pc_reg_index)
+                self._resume()
                 return pc
         except Exception:
             return None
