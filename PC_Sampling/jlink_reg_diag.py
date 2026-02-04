@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """J-Link 레지스터 읽기 진단 스크립트
-pylink에서 PC(R15)를 제대로 읽는지 확인
-
-JLinkExe에서는 0x5DD4로 읽히는데
-pylink register_read(15)는 0x27200이 나오는 문제 진단
+Cortex-R8에서 R15(PC) = index 9 확인 및 resume 동작 검증
 """
 
 import pylink
@@ -11,6 +8,16 @@ import time
 
 DEVICE = 'Cortex-R8'
 SPEED  = 12000
+PC_REG_INDEX = 9  # Cortex-R8: R15(PC)의 실제 J-Link 레지스터 인덱스
+
+def resume(jl):
+    """halt 후 실행 재개 (CPU 리셋 없이)"""
+    try:
+        jl._dll.JLINKARM_Go()
+        return "_dll.JLINKARM_Go()"
+    except Exception:
+        jl.restart()
+        return "restart() [WARNING: resets CPU]"
 
 jlink = pylink.JLink()
 jlink.open()
@@ -38,13 +45,12 @@ for idx in reg_indices:
 print()
 
 # =============================================================
-# TEST 2: halt() 상태 확인 — halt가 실제로 완료되는지
+# TEST 2: halt() 상태 확인
 # =============================================================
 print("=== TEST 2: halt() completion check ===")
 jlink.halt()
 print(f"  halted() right after halt(): {jlink.halted()}")
 
-# halted()가 False면 polling
 if not jlink.halted():
     print("  CPU not halted yet, polling...")
     for i in range(100):
@@ -59,24 +65,17 @@ print(f"  halted() final: {jlink.halted()}")
 print()
 
 # =============================================================
-# TEST 3: halt 후 즉시 읽기 vs 딜레이 후 읽기
+# TEST 3: index 9 (R15) vs index 15 비교
 # =============================================================
-print("=== TEST 3: register_read(15) timing ===")
-# 이미 halt 상태
-val_immediate = jlink.register_read(15)
-print(f"  Immediate read     : 0x{val_immediate:08X}")
-
-time.sleep(0.01)
-val_10ms = jlink.register_read(15)
-print(f"  After 10ms delay   : 0x{val_10ms:08X}")
-
-time.sleep(0.1)
-val_100ms = jlink.register_read(15)
-print(f"  After 100ms delay  : 0x{val_100ms:08X}")
+print("=== TEST 3: register_read(9) vs register_read(15) ===")
+val_idx9 = jlink.register_read(PC_REG_INDEX)
+val_idx15 = jlink.register_read(15)
+print(f"  register_read({PC_REG_INDEX})  [R15/PC] = 0x{val_idx9:08X}")
+print(f"  register_read(15) [wrong]  = 0x{val_idx15:08X}")
 print()
 
 # =============================================================
-# TEST 4: 전체 R0-R15 + CPSR 덤프
+# TEST 4: 전체 레지스터 덤프
 # =============================================================
 print("=== TEST 4: Full register dump (halted state) ===")
 for idx in reg_indices:
@@ -86,90 +85,43 @@ for idx in reg_indices:
 print()
 
 # =============================================================
-# TEST 5: register_read 대안 — memory_read로 DBGDSCR 확인
+# TEST 5: resume 방법 확인
 # =============================================================
-print("=== TEST 5: Debug status check ===")
-try:
-    # Cortex-R external debug base (common: 0x80030000, varies by SoC)
-    # 읽기 실패해도 괜찮음
-    dscr_candidates = [0x80030088, 0x80010088]  # DBGDSCR offsets
-    for addr in dscr_candidates:
-        try:
-            val = jlink.memory_read32(addr, 1)[0]
-            print(f"  mem32[{hex(addr)}] = 0x{val:08X}")
-        except Exception as e:
-            print(f"  mem32[{hex(addr)}] = FAILED ({e})")
-except Exception as e:
-    print(f"  Debug register read failed: {e}")
-print()
-
-# =============================================================
-# TEST 5.5: resume 방법 탐색
-# =============================================================
-print("=== TEST 5.5: Available resume methods ===")
+print("=== TEST 5: Available resume methods ===")
 has_go = hasattr(jlink, 'go')
 has_restart = hasattr(jlink, 'restart')
 has_dll_go = hasattr(getattr(jlink, '_dll', None), 'JLINKARM_Go')
 print(f"  jlink.go()             : {'EXISTS' if has_go else 'NOT FOUND'}")
 print(f"  jlink.restart()        : {'EXISTS' if has_restart else 'NOT FOUND'}")
 print(f"  jlink._dll.JLINKARM_Go : {'EXISTS' if has_dll_go else 'NOT FOUND'}")
-
-def resume(jl):
-    """halt 후 실행 재개 (go() 없는 pylink 대응)"""
-    try:
-        jl.go()
-        return "go()"
-    except AttributeError:
-        pass
-    try:
-        jl._dll.JLINKARM_Go()
-        return "_dll.JLINKARM_Go()"
-    except Exception:
-        pass
-    jl.restart()
-    return "restart() [WARNING: resets CPU]"
-
 print()
 
 # =============================================================
-# TEST 6: resume → halt 사이클 반복 — PC가 변하는지
+# TEST 6: resume → halt 사이클 (PC가 변하는지 확인)
 # =============================================================
 print("=== TEST 6: resume -> sleep -> halt cycle (5 rounds) ===")
-
-# R15의 실제 인덱스 찾기
-pc_idx = 15  # fallback
-for idx in reg_indices:
-    name = jlink.register_name(idx)
-    if 'R15' in name or name.upper() == 'PC':
-        pc_idx = idx
-        break
-print(f"  Using PC register index: {pc_idx} ({jlink.register_name(pc_idx)})")
-
 for i in range(5):
     method = resume(jlink)
     if i == 0:
         print(f"  Resume method: {method}")
-    time.sleep(0.2)  # CPU가 충분히 실행될 시간
+    time.sleep(0.2)
     jlink.halt()
-    # halt 완료 대기
     for _ in range(50):
         if jlink.halted():
             break
         time.sleep(0.001)
-    pc_correct = jlink.register_read(pc_idx)
-    pc_idx15 = jlink.register_read(15)
-    print(f"  Round {i+1}: reg[{pc_idx}]={jlink.register_name(pc_idx)}=0x{pc_correct:08X}"
-          f"  reg[15]=0x{pc_idx15:08X}  halted={jlink.halted()}")
+    pc = jlink.register_read(PC_REG_INDEX)
+    print(f"  Round {i+1}: PC(reg[{PC_REG_INDEX}]) = 0x{pc:08X}  halted={jlink.halted()}")
 print()
 
 # =============================================================
-# TEST 7: 현재 PC 주소의 명령어 읽기
+# TEST 7: PC 주소의 명령어 읽기
 # =============================================================
 print("=== TEST 7: Instruction at reported PC ===")
-pc_val = jlink.register_read(pc_idx)
+pc_val = jlink.register_read(PC_REG_INDEX)
 try:
     insn = jlink.memory_read32(pc_val, 1)[0]
-    print(f"  PC(reg[{pc_idx}]) = 0x{pc_val:08X}, instruction @ PC = 0x{insn:08X}")
+    print(f"  PC = 0x{pc_val:08X}, instruction @ PC = 0x{insn:08X}")
 except Exception as e:
     print(f"  Failed to read memory at 0x{pc_val:08X}: {e}")
 
