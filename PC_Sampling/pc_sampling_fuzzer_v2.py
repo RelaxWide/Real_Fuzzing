@@ -44,7 +44,7 @@ NVME_NAMESPACE = 1
 NVME_TIMEOUT   = 5000         # ms
 
 # PC 샘플링 설정
-SAMPLE_INTERVAL_US    = 100   # 샘플 간격 (us), 0이면 최대 속도
+SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
 MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수
 POST_CMD_DELAY_MS     = 5     # 커맨드 완료 후 tail 샘플링 (ms)
 
@@ -170,6 +170,8 @@ class JLinkPCSampler:
         self.sample_thread: Optional[threading.Thread] = None
         self.total_samples = 0
         self.interesting_inputs = 0
+        self._last_raw_pcs: List[int] = []
+        self._out_of_range_count = 0
 
     def connect(self) -> bool:
         try:
@@ -435,17 +437,12 @@ class NVMeFuzzer:
             log.debug(f"[NVMe CMD] data_len={len(data)}, "
                       f"data_hex={data[:32].hex()}{'...' if len(data) > 32 else ''}")
 
-            # Popen: non-blocking launch
+            # Popen: non-blocking launch → 즉시 샘플링 시작
             process = subprocess.Popen(
                 nvme_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-
-            # 커맨드가 SSD에 도달할 시간 확보
-            time.sleep(0.001)
-
-            # 샘플링 시작
             self.sampler.start_sampling()
 
             # 커맨드 완료 대기
@@ -537,6 +534,7 @@ class NVMeFuzzer:
 
         self._setup_directories()
         log = setup_logging(self.config.output_dir)
+        log.info(f"Log file: {os.path.join(self.config.output_dir, 'fuzzer.log')}")
 
         log.info("=" * 60)
         log.info(" PC Sampling SSD Fuzzer v2")
