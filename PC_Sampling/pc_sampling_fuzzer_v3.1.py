@@ -502,7 +502,7 @@ class NVMeFuzzer:
 
             # 커맨드라인 로깅 (nvme CLI 형태로 한 줄)
             cmd_str = ' '.join(nvme_cmd)
-            log.debug(f"[NVMe] {cmd_str}  # data_len={len(data)} data={data[:16].hex()}{'...' if len(data) > 16 else ''}")
+            log.info(f"[NVMe] {cmd_str}  # data_len={len(data)} data={data[:16].hex()}{'...' if len(data) > 16 else ''}")
 
             # =========================================================
             # [수정 1] "덫 놓기" 전략 적용
