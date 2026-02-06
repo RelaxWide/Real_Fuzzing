@@ -49,32 +49,55 @@ class SamplingResult:
 class JLinkSampler:
     def __init__(self):
         self.jlink: Optional[pylink.JLink] = None
+        self._pc_reg_index: int = PC_REG_INDEX
         self._halt_func = None
         self._read_reg_func = None
         self._go_func = None
 
     def connect(self) -> bool:
         try:
+            # 기존 연결이 있으면 닫기
+            if self.jlink and self.jlink.opened():
+                self.jlink.close()
+
             self.jlink = pylink.JLink()
             self.jlink.open()
             self.jlink.set_tif(pylink.enums.JLinkInterfaces.JTAG)
             self.jlink.connect(JLINK_DEVICE, speed=JLINK_SPEED)
+
+            print(f"[J-Link] Connected: {JLINK_DEVICE} @ {JLINK_SPEED}kHz")
+
+            # R15(PC)의 실제 레지스터 인덱스를 동적으로 탐색
+            self._pc_reg_index = self._find_pc_register_index()
+            print(f"[J-Link] PC register index: {self._pc_reg_index} "
+                  f"(name: {self.jlink.register_name(self._pc_reg_index)})")
 
             # DLL 함수 캐싱
             self._halt_func = self.jlink._dll.JLINKARM_Halt
             self._read_reg_func = self.jlink._dll.JLINKARM_ReadReg
             self._go_func = self.jlink._dll.JLINKARM_Go
 
-            print(f"[J-Link] Connected: {JLINK_DEVICE} @ {JLINK_SPEED}kHz")
             return True
         except Exception as e:
             print(f"[J-Link Error] {e}")
             return False
 
+    def _find_pc_register_index(self) -> int:
+        """register_list()에서 R15(PC)의 실제 인덱스를 찾는다."""
+        try:
+            for idx in self.jlink.register_list():
+                name = self.jlink.register_name(idx)
+                if 'R15' in name or name.upper() == 'PC':
+                    return idx
+        except Exception as e:
+            print(f"[J-Link] register_list() 탐색 실패: {e}")
+        print(f"[J-Link] R15 인덱스를 찾지 못함, 기본값 {PC_REG_INDEX} 사용")
+        return PC_REG_INDEX
+
     def _read_pc(self) -> Optional[int]:
         try:
             self._halt_func()
-            pc = self._read_reg_func(PC_REG_INDEX)
+            pc = self._read_reg_func(self._pc_reg_index)
             self._go_func()
             return pc
         except:
