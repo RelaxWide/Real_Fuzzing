@@ -715,10 +715,9 @@ class NVMeFuzzer:
                     log.info(f"[+] New coverage! cmd={cmd.name} "
                              f"+{new_paths} PCs (total: {len(self.sampler.global_coverage)})")
 
-                if self.executions % 10 == 0:
+                if self.executions % 100 == 0:
                     stats = self._collect_stats()
                     self._print_status(stats, last_samples)
-                    # 즉시 flush하여 로그 지연 방지
                     for h in log.handlers:
                         h.flush()
 
