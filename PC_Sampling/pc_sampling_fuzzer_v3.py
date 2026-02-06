@@ -485,11 +485,9 @@ class NVMeFuzzer:
 
             nvme_cmd = self._build_nvme_cmd(data, cmd, input_file)
 
-            # 커맨드라인 로깅
+            # 커맨드라인 로깅 (nvme CLI 형태로 한 줄)
             cmd_str = ' '.join(nvme_cmd)
-            log.debug(f"[NVMe CMD] {cmd_str}")
-            log.debug(f"[NVMe CMD] data_len={len(data)}, "
-                      f"data_hex={data[:32].hex()}{'...' if len(data) > 32 else ''}")
+            log.debug(f"[NVMe] {cmd_str}  # data_len={len(data)} data={data[:16].hex()}{'...' if len(data) > 16 else ''}")
 
             # =========================================================
             # [수정 1] "덫 놓기" 전략 적용
@@ -596,6 +594,7 @@ class NVMeFuzzer:
             log.warning("Addr filter : NONE (all PCs collected - noisy!)")
         log.info(f"Sampling    : interval={self.config.sample_interval_us}us, "
                  f"max={self.config.max_samples_per_run}/run, "
+                 f"saturation={self.config.saturation_limit}, "
                  f"post_cmd={self.config.post_cmd_delay_ms}ms")
         log.info(f"Output      : {self.config.output_dir}")
         log.info("=" * 60)
@@ -712,11 +711,6 @@ class NVMeFuzzer:
             for cmd_name, rc_dist in self.rc_stats.items():
                 rc_summary = ", ".join(f"rc={rc}:{cnt}" for rc, cnt in sorted(rc_dist.items()))
                 log.info(f"  {cmd_name}: {rc_summary}")
-            if self.sampler.global_coverage:
-                sorted_pcs = sorted(self.sampler.global_coverage)
-                log.info(f"Coverage PCs ({len(sorted_pcs)}):")
-                for pc in sorted_pcs:
-                    log.info(f"  {hex(pc)}")
             log.info("=" * 60)
 
             self.sampler.close()
@@ -745,6 +739,8 @@ if __name__ == "__main__":
                         help='Firmware .text end (hex)')
     parser.add_argument('--resume-coverage', default=RESUME_COVERAGE,
                         help='Path to previous coverage.txt')
+    parser.add_argument('--saturation-limit', type=int, default=SATURATION_LIMIT,
+                        help='Stop sampling after N consecutive duplicate PCs (0=disable, sample up to --samples)')
 
     args = parser.parse_args()
 
@@ -767,6 +763,7 @@ if __name__ == "__main__":
         addr_range_start=args.addr_start,
         addr_range_end=args.addr_end,
         resume_coverage=args.resume_coverage,
+        saturation_limit=args.saturation_limit,
     )
 
     fuzzer = NVMeFuzzer(config)
