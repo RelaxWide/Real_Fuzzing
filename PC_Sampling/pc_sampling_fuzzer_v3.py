@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v2
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v3
 
 J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 NVMe CLI를 통해 SSD에 퍼징 입력을 전달합니다.
 
-주의: J-Link V9는 완전한 Non-intrusive Trace를 지원하지 않습니다.
-     이 코드는 ~10us halt로 PC를 읽는 방식을 사용합니다.
 """
 
 from __future__ import annotations
@@ -53,7 +51,7 @@ POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 # 퍼징 설정
 MAX_INPUT_LEN     = 4096      # 최대 입력 바이트
 TOTAL_RUNTIME_SEC = 3600      # 총 퍼징 시간 (초)
-OUTPUT_DIR        = './output/pc_sampling_v2/'
+OUTPUT_DIR        = './output/pc_sampling_v3/'
 SEED_DIR          = None      # 시드 폴더 경로 (없으면 None)
 RESUME_COVERAGE   = None      # 이전 coverage.txt 경로 (없으면 None)
 
