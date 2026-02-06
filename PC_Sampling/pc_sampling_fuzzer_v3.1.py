@@ -195,11 +195,11 @@ class JLinkPCSampler:
             self.jlink.set_tif(self.config.interface)
             self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
 
-            log.info(f"[J-Link] Connected: {self.config.device_name} @ {self.config.jtag_speed}kHz")
+            log.warning(f"[J-Link] Connected: {self.config.device_name} @ {self.config.jtag_speed}kHz")
 
             # R15(PC)의 실제 레지스터 인덱스를 동적으로 탐색
             self._pc_reg_index = self._find_pc_register_index()
-            log.info(f"[J-Link] PC register index: {self._pc_reg_index} "
+            log.warning(f"[J-Link] PC register index: {self._pc_reg_index} "
                      f"(name: {self.jlink.register_name(self._pc_reg_index)})")
 
             # DLL 함수 참조 캐싱 (pylink wrapper 우회, 매 호출 attribute lookup 제거)
@@ -244,7 +244,7 @@ class JLinkPCSampler:
 
     def diagnose(self, count: int = 20) -> bool:
         """시작 전 PC 읽기 진단 — J-Link 동작 검증"""
-        log.info(f"[Diagnose] PC를 {count}회 읽어서 J-Link 상태를 확인합니다...")
+        log.warning(f"[Diagnose] PC를 {count}회 읽어서 J-Link 상태를 확인합니다...")
         pcs = []
         failures = 0
         for i in range(count):
@@ -257,7 +257,7 @@ class JLinkPCSampler:
                         in_range = " [IN RANGE]"
                     else:
                         in_range = " [OUT OF RANGE]"
-                log.info(f"  [{i+1:2d}] PC = {hex(pc)}{in_range}")
+                log.warning(f"  [{i+1:2d}] PC = {hex(pc)}{in_range}")
             else:
                 failures += 1
                 log.warning(f"  [{i+1:2d}] PC read FAILED")
@@ -268,7 +268,7 @@ class JLinkPCSampler:
             return False
 
         unique_pcs = set(pcs)
-        log.info(f"[Diagnose] 결과: {len(pcs)}/{count} 성공, "
+        log.warning(f"[Diagnose] 결과: {len(pcs)}/{count} 성공, "
                  f"failures={failures}, unique PCs={len(unique_pcs)}")
         if len(unique_pcs) <= 1:
             log.warning(f"[Diagnose] PC가 항상 같은 값입니다 ({hex(pcs[0])}). "
@@ -276,8 +276,6 @@ class JLinkPCSampler:
         return True
 
     def _read_pc(self) -> Optional[int]:
-        """halt → register read → resume を1サイクル実行.
-        DLL直接呼び出しでpylink wrapper overhead を回避."""
         try:
             self._halt_func()
             pc = self._read_reg_func(self._pc_reg_index)
@@ -615,26 +613,26 @@ class NVMeFuzzer:
 
         self._setup_directories()
         log = setup_logging(self.config.output_dir)
-        log.info(f"Log file: {os.path.join(self.config.output_dir, 'fuzzer.log')}")
+        log.warning(f"Log file: {os.path.join(self.config.output_dir, 'fuzzer.log')}")
 
-        log.info("=" * 60)
-        log.info(f" PC Sampling SSD Fuzzer v{self.VERSION}")
-        log.info("=" * 60)
-        log.info(f"NVMe device : {self.config.nvme_device}")
-        log.info(f"Commands    : {[c.name for c in self.commands]}")
-        log.info(f"J-Link      : {self.config.device_name} @ {self.config.jtag_speed}kHz")
+        log.warning("=" * 60)
+        log.warning(f" PC Sampling SSD Fuzzer v{self.VERSION}")
+        log.warning("=" * 60)
+        log.warning(f"NVMe device : {self.config.nvme_device}")
+        log.warning(f"Commands    : {[c.name for c in self.commands]}")
+        log.warning(f"J-Link      : {self.config.device_name} @ {self.config.jtag_speed}kHz")
         if self.config.addr_range_start is not None:
-            log.info(f"Addr filter : {hex(self.config.addr_range_start)}"
+            log.warning(f"Addr filter : {hex(self.config.addr_range_start)}"
                      f" - {hex(self.config.addr_range_end)}")
         else:
             log.warning("Addr filter : NONE (all PCs collected - noisy!)")
-        log.info(f"Sampling    : interval={self.config.sample_interval_us}us, "
+        log.warning(f"Sampling    : interval={self.config.sample_interval_us}us, "
                  f"max={self.config.max_samples_per_run}/run, "
                  f"saturation={self.config.saturation_limit}, "
                  f"post_cmd={self.config.post_cmd_delay_ms}ms")
-        log.info(f"Output      : {self.config.output_dir}")
-        log.info(f"Save interval: every {self.config.save_interval} executions")
-        log.info("=" * 60)
+        log.warning(f"Output      : {self.config.output_dir}")
+        log.warning(f"Save interval: every {self.config.save_interval} executions")
+        log.warning("=" * 60)
 
         self._load_seeds()
 
@@ -728,7 +726,7 @@ class NVMeFuzzer:
                     self._periodic_save()
 
         except KeyboardInterrupt:
-            log.info("Interrupted by user")
+            log.warning("Interrupted by user")
 
         finally:
             stats = self._collect_stats()
