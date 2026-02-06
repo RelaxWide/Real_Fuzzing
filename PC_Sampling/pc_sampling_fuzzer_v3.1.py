@@ -133,10 +133,11 @@ class FuzzConfig:
     save_interval: int = SAVE_INTERVAL
 
 
-def setup_logging(output_dir: str) -> logging.Logger:
-    """파일 + 콘솔 동시 로깅 설정 (하나의 fuzzer.log 파일에 append)"""
+def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
+    """파일 + 콘솔 동시 로깅 설정 (실행마다 날짜시간 로그 파일 생성)"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    log_file = os.path.join(output_dir, 'fuzzer.log')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = os.path.join(output_dir, f'fuzzer_{timestamp}.log')
 
     logger = logging.getLogger('pcfuzz')
     logger.setLevel(logging.DEBUG)
@@ -149,8 +150,8 @@ def setup_logging(output_dir: str) -> logging.Logger:
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # 파일: append 모드로 하나의 파일에 기록
-    fh = logging.FileHandler(log_file, mode='a')
+    # 파일: 매 실행마다 새 파일 생성
+    fh = logging.FileHandler(log_file)
     fh.setLevel(logging.INFO)
     #fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
@@ -162,7 +163,7 @@ def setup_logging(output_dir: str) -> logging.Logger:
     ch.setFormatter(fmt)
     logger.addHandler(ch)
 
-    return logger
+    return logger, log_file
 
 
 # 모듈 레벨 로거 (setup_logging 호출 전까지 콘솔만 사용)
@@ -612,8 +613,8 @@ class NVMeFuzzer:
         global log
 
         self._setup_directories()
-        log = setup_logging(self.config.output_dir)
-        log.warning(f"Log file: {os.path.join(self.config.output_dir, 'fuzzer.log')}")
+        log, log_file = setup_logging(self.config.output_dir)
+        log.warning(f"Log file: {log_file}")
 
         log.warning("=" * 60)
         log.warning(f" PC Sampling SSD Fuzzer v{self.VERSION}")
@@ -631,7 +632,6 @@ class NVMeFuzzer:
                  f"saturation={self.config.saturation_limit}, "
                  f"post_cmd={self.config.post_cmd_delay_ms}ms")
         log.warning(f"Output      : {self.config.output_dir}")
-        log.warning(f"Save interval: every {self.config.save_interval} executions")
         log.warning("=" * 60)
 
         self._load_seeds()
@@ -715,15 +715,12 @@ class NVMeFuzzer:
                     log.info(f"[+] New coverage! cmd={cmd.name} "
                              f"+{new_paths} PCs (total: {len(self.sampler.global_coverage)})")
 
-                if self.executions % 1000 == 0:
+                if self.executions % 10 == 0:
                     stats = self._collect_stats()
                     self._print_status(stats, last_samples)
+                    # 즉시 flush하여 로그 지연 방지
                     for h in log.handlers:
                         h.flush()
-
-                # 주기적 저장 (v3.1 추가)
-                if self.executions % self.config.save_interval == 0:
-                    self._periodic_save()
 
         except KeyboardInterrupt:
             log.warning("Interrupted by user")
@@ -762,12 +759,9 @@ class NVMeFuzzer:
             for line in summary_lines:
                 log.info(line)
 
-            # 최종 저장 (v3.1 추가)
-            self._save_coverage()
-            self._save_stats(stats)
-            save_msg = f"[Save] Final coverage and stats saved to {self.config.output_dir}"
-            print(save_msg)
-            log.info(save_msg)
+            # 최종 flush
+            for h in log.handlers:
+                h.flush()
 
             self.sampler.close()
 
