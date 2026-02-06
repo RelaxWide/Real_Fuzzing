@@ -718,8 +718,11 @@ class NVMeFuzzer:
                 if self.executions % 100 == 0:
                     stats = self._collect_stats()
                     self._print_status(stats, last_samples)
+                    # OS 버퍼까지 강제 flush
                     for h in log.handlers:
                         h.flush()
+                        if hasattr(h, 'stream') and h.stream:
+                            os.fsync(h.stream.fileno())
 
         except KeyboardInterrupt:
             log.warning("Interrupted by user")
@@ -758,9 +761,11 @@ class NVMeFuzzer:
             for line in summary_lines:
                 log.info(line)
 
-            # 최종 flush
+            # 최종 flush (OS 버퍼까지)
             for h in log.handlers:
                 h.flush()
+                if hasattr(h, 'stream') and h.stream:
+                    os.fsync(h.stream.fileno())
 
             self.sampler.close()
 
