@@ -20,6 +20,7 @@ import json
 import hashlib
 import random
 import logging
+from collections import defaultdict
 from typing import Set, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -399,6 +400,8 @@ class NVMeFuzzer:
         self.start_time: Optional[datetime] = None
 
         self.cmd_stats = {c.name: {"exec": 0, "interesting": 0} for c in self.commands}
+        # {cmd_name: {rc: count}} — 커맨드별 리턴코드 분포
+        self.rc_stats: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
 
     def _setup_directories(self):
         self.crashes_dir.mkdir(parents=True, exist_ok=True)
@@ -472,8 +475,8 @@ class NVMeFuzzer:
 
         return nvme_cmd
       
-    def _send_nvme_command(self, data: bytes, cmd: NVMeCommand) -> bool:
-        """NVMe 커맨드 전송 (수정됨: 선제적 샘플링 적용)"""
+    def _send_nvme_command(self, data: bytes, cmd: NVMeCommand) -> Optional[int]:
+        """NVMe 커맨드 전송. 성공 시 rc(int), 실패/타임아웃 시 None 반환."""
         input_file = '/tmp/nvme_fuzz_input'
 
         try:
@@ -510,9 +513,9 @@ class NVMeFuzzer:
                 stdout, stderr = process.communicate()
                 self.sampler.stop_sampling() # 타임아웃 시 샘플링 종료
                 log.warning(f"[NVMe TIMEOUT] {cmd.name} (opcode={hex(cmd.opcode)})")
-                log.warning(f"  stdout: {stdout.decode(errors='replace').strip()}")
-                log.warning(f"  stderr: {stderr.decode(errors='replace').strip()}")
-                return False
+                log.debug(f"  stdout: {stdout.decode(errors='replace').strip()}")
+                log.debug(f"  stderr: {stderr.decode(errors='replace').strip()}")
+                return None
 
             # 프로세스가 정상 종료되면 샘플링 중단
             self.sampler.stop_sampling()
@@ -525,9 +528,9 @@ class NVMeFuzzer:
             if stderr_str:
                 log.debug(f"[NVMe RET] stderr={stderr_str[:200]}")
             if rc != 0:
-                log.warning(f"[NVMe RET] {cmd.name} returned non-zero: rc={rc}")
+                log.debug(f"[NVMe RET] {cmd.name} returned non-zero: rc={rc}")
 
-            return True
+            return rc
 
         except Exception as e:
             log.error(f"NVMe error ({cmd.name}): {e}")
@@ -536,7 +539,7 @@ class NVMeFuzzer:
                 self.sampler.stop_sampling()
             except:
                 pass
-            return False
+            return None
           
     def _save_crash(self, data: bytes, cmd: NVMeCommand):
         input_hash = hashlib.md5(data).hexdigest()[:12]
@@ -630,11 +633,15 @@ class NVMeFuzzer:
                     fuzz_data = os.urandom(random.randint(64, 512))
 
                 # NVMe 커맨드 전송 (내부에서 Popen 후 샘플링 시작)
-                success = self._send_nvme_command(fuzz_data, cmd)
+                rc = self._send_nvme_command(fuzz_data, cmd)
                 last_samples = self.sampler.stop_sampling()
 
                 self.executions += 1
                 self.cmd_stats[cmd.name]["exec"] += 1
+
+                # rc 통계 (None = 타임아웃/에러)
+                if rc is not None:
+                    self.rc_stats[cmd.name][rc] += 1
 
                 # 커버리지 평가
                 is_interesting, new_paths = self.sampler.evaluate_coverage()
@@ -657,7 +664,7 @@ class NVMeFuzzer:
                     in_range_pcs = sorted([hex(pc) for pc in self.sampler.current_trace])
                     log.debug(f"  In-range unique PCs: {in_range_pcs}")
 
-                if not success:
+                if rc is None:
                     self.crash_inputs.append((fuzz_data, cmd))
                     self._save_crash(fuzz_data, cmd)
                     log.warning(f"Crash/Timeout with {cmd.name}!")
@@ -701,6 +708,10 @@ class NVMeFuzzer:
             for cmd_name, cmd_stat in stats['command_stats'].items():
                 log.info(f"  {cmd_name}: exec={cmd_stat['exec']}, "
                          f"interesting={cmd_stat['interesting']}")
+            log.info("Return code distribution:")
+            for cmd_name, rc_dist in self.rc_stats.items():
+                rc_summary = ", ".join(f"rc={rc}:{cnt}" for rc, cnt in sorted(rc_dist.items()))
+                log.info(f"  {cmd_name}: {rc_summary}")
             if self.sampler.global_coverage:
                 sorted_pcs = sorted(self.sampler.global_coverage)
                 log.info(f"Coverage PCs ({len(sorted_pcs)}):")
