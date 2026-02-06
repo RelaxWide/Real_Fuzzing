@@ -134,10 +134,9 @@ class FuzzConfig:
 
 
 def setup_logging(output_dir: str) -> logging.Logger:
-    """파일 + 콘솔 동시 로깅 설정 (실행마다 날짜시간 로그 파일 생성)"""
+    """파일 + 콘솔 동시 로깅 설정 (하나의 fuzzer.log 파일에 append)"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = os.path.join(output_dir, f'fuzzer_{timestamp}.log')
+    log_file = os.path.join(output_dir, 'fuzzer.log')
 
     logger = logging.getLogger('pcfuzz')
     logger.setLevel(logging.DEBUG)
@@ -150,14 +149,14 @@ def setup_logging(output_dir: str) -> logging.Logger:
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # 파일: DEBUG 이상 전부 기록
-    fh = logging.FileHandler(log_file)
+    # 파일: append 모드로 하나의 파일에 기록
+    fh = logging.FileHandler(log_file, mode='a')
     fh.setLevel(logging.INFO)
     #fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    # 콘솔: INFO 이상만 출력
+    # 콘솔
     ch = logging.StreamHandler()
     ch.setLevel(logging.WARNING)
     ch.setFormatter(fmt)
@@ -734,31 +733,43 @@ class NVMeFuzzer:
         finally:
             stats = self._collect_stats()
 
-            log.info("=" * 60)
-            log.info(" Fuzzing Complete")
-            log.info("=" * 60)
-            log.info(f"Total executions : {stats['executions']:,}")
-            log.info(f"Elapsed          : {stats['elapsed_seconds']:.1f}s")
-            log.info(f"Exec/s           : {stats['exec_per_sec']:.1f}")
-            log.info(f"Corpus size      : {stats['corpus_size']}")
-            log.info(f"Crashes          : {stats['crashes']}")
-            log.info(f"Total samples    : {stats['total_samples']:,}")
-            log.info(f"Interesting      : {stats['interesting_inputs']}")
-            log.info(f"Coverage (unique PCs): {stats['coverage_unique_pcs']:,}")
-            log.info("Per-command stats:")
+            # Summary 출력 (콘솔 + 파일 모두)
+            summary_lines = [
+                "=" * 60,
+                " Fuzzing Complete",
+                "=" * 60,
+                f"Total executions : {stats['executions']:,}",
+                f"Elapsed          : {stats['elapsed_seconds']:.1f}s",
+                f"Exec/s           : {stats['exec_per_sec']:.1f}",
+                f"Corpus size      : {stats['corpus_size']}",
+                f"Crashes          : {stats['crashes']}",
+                f"Total samples    : {stats['total_samples']:,}",
+                f"Interesting      : {stats['interesting_inputs']}",
+                f"Coverage (unique PCs): {stats['coverage_unique_pcs']:,}",
+                "Per-command stats:",
+            ]
             for cmd_name, cmd_stat in stats['command_stats'].items():
-                log.info(f"  {cmd_name}: exec={cmd_stat['exec']}, "
-                         f"interesting={cmd_stat['interesting']}")
-            log.info("Return code distribution:")
+                summary_lines.append(f"  {cmd_name}: exec={cmd_stat['exec']}, "
+                                     f"interesting={cmd_stat['interesting']}")
+            summary_lines.append("Return code distribution:")
             for cmd_name, rc_dist in self.rc_stats.items():
                 rc_summary = ", ".join(f"rc={rc}:{cnt}" for rc, cnt in sorted(rc_dist.items()))
-                log.info(f"  {cmd_name}: {rc_summary}")
-            log.info("=" * 60)
+                summary_lines.append(f"  {cmd_name}: {rc_summary}")
+            summary_lines.append("=" * 60)
+
+            # 콘솔에 직접 출력 (log level 무관)
+            for line in summary_lines:
+                print(line)
+            # 파일에도 기록
+            for line in summary_lines:
+                log.info(line)
 
             # 최종 저장 (v3.1 추가)
             self._save_coverage()
             self._save_stats(stats)
-            log.info(f"[Save] Final coverage and stats saved to {self.config.output_dir}")
+            save_msg = f"[Save] Final coverage and stats saved to {self.config.output_dir}"
+            print(save_msg)
+            log.info(save_msg)
 
             self.sampler.close()
 
