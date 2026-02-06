@@ -44,7 +44,7 @@ JLINK_SPEED   = 12000          # kHz
 # NVMe 장치 설정
 NVME_DEVICE    = '/dev/nvme0'
 NVME_NAMESPACE = 1
-NVME_TIMEOUT   = 5000         # ms
+NVME_TIMEOUT   = 8000         # ms
 
 # PC 샘플링 설정
 SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
@@ -152,13 +152,14 @@ def setup_logging(output_dir: str) -> logging.Logger:
 
     # 파일: DEBUG 이상 전부 기록
     fh = logging.FileHandler(log_file)
-    fh.setLevel(logging.DEBUG)
+    fh.setLevel(logging.INFO)
+    #fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
     # 콘솔: INFO 이상만 출력
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
+    ch.setLevel(logging.WARNING)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
 
@@ -539,11 +540,9 @@ class NVMeFuzzer:
             rc = process.returncode
             stdout_str = stdout.decode(errors='replace').strip()
             stderr_str = stderr.decode(errors='replace').strip()
-            log.debug(f"[NVMe RET] rc={rc}, stdout={stdout_str[:200]}")
+            log.info(f"[NVMe RET] rc={rc}, stdout={stdout_str[:200]}")
             if stderr_str:
-                log.debug(f"[NVMe RET] stderr={stderr_str[:200]}")
-            if rc != 0:
-                log.debug(f"[NVMe RET] {cmd.name} returned non-zero: rc={rc}")
+                log.info(f"[NVMe RET] stderr={stderr_str[:200]}")
 
             return rc
 
@@ -604,7 +603,7 @@ class NVMeFuzzer:
         log.info(f"[Save] Coverage ({len(self.sampler.global_coverage)} PCs) and stats saved")
 
     def _print_status(self, stats: dict, last_samples: int = 0):
-        log.info(f"[Stats] exec: {stats['executions']:,} | "
+        log.warning(f"[Stats] exec: {stats['executions']:,} | "
                  f"corpus: {stats['corpus_size']} | "
                  f"crashes: {stats['crashes']} | "
                  f"coverage: {stats['coverage_unique_pcs']:,} | "
@@ -687,7 +686,7 @@ class NVMeFuzzer:
                 # 매 실행마다 DEBUG 로그 (파일에만 기록)
                 raw_count = len(self.sampler._last_raw_pcs)
                 oor_count = self.sampler._out_of_range_count
-                log.debug(f"exec={self.executions} cmd={cmd.name} "
+                log.info(f"exec={self.executions} cmd={cmd.name} "
                           f"raw_samples={raw_count} in_range={last_samples} "
                           f"out_of_range={oor_count} new_pcs={new_paths} "
                           f"global={len(self.sampler.global_coverage)} "
@@ -705,7 +704,7 @@ class NVMeFuzzer:
                 if rc is None:
                     self.crash_inputs.append((fuzz_data, cmd))
                     self._save_crash(fuzz_data, cmd)
-                    log.warning(f"Crash/Timeout with {cmd.name}!")
+                    log.error(f"Crash/Timeout with {cmd.name}!")
                     if not self.sampler.reconnect():
                         log.error("Cannot reconnect to J-Link, stopping")
                         break
