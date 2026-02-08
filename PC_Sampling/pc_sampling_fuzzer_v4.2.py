@@ -433,22 +433,20 @@ class JLinkPCSampler:
                     cur_unique_edges = len(self.current_edges)
                     self._unique_at_intervals[sample_count] = cur_unique_edges
 
-                # v4.2: 조기 종료 조건
-                # 조건: 연속 N회 글로벌 기준 새 edge 없음 AND
-                #        연속 N회 idle PC에 머물러 있음
-                if sat_limit > 0 and since_last_global_new >= sat_limit:
-                    if idle_pc is not None and consecutive_idle >= sat_limit:
-                        self._stopped_reason = (
-                            f"idle_saturated (no global new edge for "
-                            f"{since_last_global_new} samples, "
-                            f"idle PC {hex(idle_pc)} x{consecutive_idle})"
-                        )
-                        break
-                    elif idle_pc is None:
-                        # idle PC 없으면 글로벌 포화만으로 중단
+                # v4.2: 조기 종료 조건 (OR)
+                # 조건1: 연속 20회 글로벌 기준 새 edge 없음
+                # 조건2: 연속 N회(sat_limit) idle PC에 머물러 있음
+                if sat_limit > 0:
+                    if since_last_global_new >= 20:
                         self._stopped_reason = (
                             f"global_saturated (no global new edge for "
                             f"{since_last_global_new} consecutive samples)"
+                        )
+                        break
+                    if idle_pc is not None and consecutive_idle >= sat_limit:
+                        self._stopped_reason = (
+                            f"idle_saturated (idle PC {hex(idle_pc)} "
+                            f"x{consecutive_idle} consecutive)"
                         )
                         break
 
