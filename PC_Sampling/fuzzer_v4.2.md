@@ -122,6 +122,38 @@ output/pc_sampling_v4/
 
 v4.1에서 `_send_nvme_command()` 내부와 메인 루프에서 `stop_sampling()`을 이중 호출하고 있었다. v4.2에서는 `_send_nvme_command()`에서 `start_sampling()`만 하고, `stop_sampling()`은 메인 루프에서만 호출한다.
 
+### 9. `_read_pc()` CPU halt 복구 보장
+
+v4.1에서 `_halt_func()` 성공 후 `_read_reg_func()` 예외 시 `_go_func()`가 호출되지 않아 **SSD CPU(Cortex-R8)가 halt 상태로 방치**되는 문제가 있었다. CPU가 halt되면 NVMe 명령 처리 불가 → 이후 모든 ioctl 타임아웃 → 퍼저 실질 데드락.
+
+v4.2에서는 `finally` 블록으로 `_go_func()`를 **항상 호출**하여 CPU resume을 보장한다.
+
+```python
+# v4.1: halt 후 예외 시 CPU 영구 halt
+def _read_pc(self):
+    try:
+        self._halt_func()
+        pc = self._read_reg_func(self._pc_reg_index)
+        self._go_func()       # ← 예외 시 실행 안 됨
+        return pc
+    except Exception:
+        return None            # ← CPU halt 상태 방치
+
+# v4.2: finally로 항상 resume 보장
+def _read_pc(self):
+    try:
+        self._halt_func()
+        pc = self._read_reg_func(self._pc_reg_index)
+        return pc
+    except Exception:
+        return None
+    finally:
+        try:
+            self._go_func()   # ← 성공/실패 무관하게 항상 실행
+        except Exception:
+            pass
+```
+
 ---
 
 ## v4.0 → v4.1 변경사항 (요약)

@@ -364,10 +364,14 @@ class JLinkPCSampler:
         try:
             self._halt_func()
             pc = self._read_reg_func(self._pc_reg_index)
-            self._go_func()
             return pc
         except Exception:
             return None
+        finally:
+            try:
+                self._go_func()
+            except Exception:
+                pass
 
     def _in_range(self, pc: int) -> bool:
         """PC가 펌웨어 주소 범위 내인지 확인"""
