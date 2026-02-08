@@ -236,7 +236,8 @@ class JLinkPCSampler:
         # v4: Edge 기반 커버리지
         self.global_edges: Set[Tuple[int, int]] = set()  # (prev_pc, cur_pc) 튜플
         self.current_edges: Set[Tuple[int, int]] = set()
-        self.prev_pc: int = 0  # 이전 실행의 마지막 샘플 PC
+        # sentinel: 유효 주소 범위 밖의 값으로 초기화하여 가짜 edge 방지
+        self.prev_pc: int = 0xFFFFFFFF
 
         # 기존 PC 기반 커버리지 (비교용으로 유지)
         self.global_coverage: Set[int] = set()
@@ -391,8 +392,11 @@ class JLinkPCSampler:
         sat_limit = self.config.saturation_limit
         idle_pc = self.idle_pc       # v4.2: 로컬 캐싱
 
-        # 글로벌 edge 스냅샷 (비교 기준)
-        global_edges_snapshot = len(self.global_edges)
+        # v4.2: 글로벌 edge의 frozenset 참조 (thread safety)
+        # 메인 스레드가 evaluate_coverage()에서 update()하더라도
+        # CPython set.__contains__는 GIL 하에서 안전하지만,
+        # 명시적 참조 캐싱으로 attribute lookup도 제거
+        global_edges_ref = self.global_edges
 
         # v4: 이전 실행의 마지막 PC에서 시작 (연속성)
         prev_pc = self.prev_pc
@@ -403,18 +407,23 @@ class JLinkPCSampler:
                 self._last_raw_pcs.append(pc)
 
                 if self._in_range(pc):
-                    # Edge 생성 (prev_pc, cur_pc)
-                    edge = (prev_pc, pc)
-                    self.current_edges.add(edge)
-                    self.current_trace.add(pc)
-                    prev_pc = pc
-
-                    # v4.2: 글로벌 기준으로 새로움 판단
-                    if edge not in self.global_edges:
-                        self._last_new_at = sample_count
-                        since_last_global_new = 0
+                    if prev_pc == 0xFFFFFFFF:
+                        # 첫 번째 in-range PC: sentinel이므로 edge 생성하지 않음
+                        prev_pc = pc
+                        self.current_trace.add(pc)
                     else:
-                        since_last_global_new += 1
+                        # Edge 생성 (prev_pc, cur_pc)
+                        edge = (prev_pc, pc)
+                        self.current_edges.add(edge)
+                        self.current_trace.add(pc)
+                        prev_pc = pc
+
+                        # v4.2: 글로벌 기준으로 새로움 판단
+                        if edge not in global_edges_ref:
+                            self._last_new_at = sample_count
+                            since_last_global_new = 0
+                        else:
+                            since_last_global_new += 1
 
                     # v4.2: idle PC 연속 카운터
                     if idle_pc is not None and pc == idle_pc:
@@ -488,30 +497,61 @@ class JLinkPCSampler:
         return new_edges > 0, new_edges
 
     def load_coverage(self, filepath: str) -> int:
-        """이전 세션의 커버리지 파일을 로드하여 global_coverage에 합산"""
-        loaded = 0
+        """이전 세션의 커버리지 파일을 로드하여 global_coverage + global_edges에 합산"""
+        loaded_pcs = 0
+        loaded_edges = 0
         if not os.path.exists(filepath):
             log.warning(f"[Coverage] File not found: {filepath}")
             return 0
         with open(filepath, 'r') as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    try:
-                        self.global_coverage.add(int(line, 16))
-                        loaded += 1
-                    except ValueError:
-                        pass
-        log.info(f"[Coverage] Loaded {loaded} PCs from {filepath} "
-                 f"(global coverage: {len(self.global_coverage)})")
-        return loaded
+                if not line:
+                    continue
+                try:
+                    self.global_coverage.add(int(line, 16))
+                    loaded_pcs += 1
+                except ValueError:
+                    pass
 
-    def save_coverage(self, filepath: str) -> int:
-        """현재 global_coverage를 파일로 저장"""
-        with open(filepath, 'w') as f:
+        # edge 파일도 같이 로드 (coverage_edges.txt)
+        edges_path = filepath.replace('coverage.txt', 'coverage_edges.txt')
+        if os.path.exists(edges_path):
+            with open(edges_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or ',' not in line:
+                        continue
+                    try:
+                        parts = line.split(',')
+                        prev_pc = int(parts[0], 16)
+                        cur_pc = int(parts[1], 16)
+                        self.global_edges.add((prev_pc, cur_pc))
+                        loaded_edges += 1
+                    except (ValueError, IndexError):
+                        pass
+            log.info(f"[Coverage] Loaded {loaded_edges} edges from {edges_path}")
+
+        log.info(f"[Coverage] Loaded {loaded_pcs} PCs from {filepath} "
+                 f"(global: {len(self.global_coverage)} PCs, {len(self.global_edges)} edges)")
+        return loaded_pcs
+
+    def save_coverage(self, output_dir: str):
+        """현재 global_coverage와 global_edges를 파일로 저장"""
+        # PCs
+        pc_path = os.path.join(output_dir, 'coverage.txt')
+        with open(pc_path, 'w') as f:
             for pc in sorted(self.global_coverage):
                 f.write(f"{hex(pc)}\n")
-        return len(self.global_coverage)
+
+        # Edges
+        edges_path = os.path.join(output_dir, 'coverage_edges.txt')
+        with open(edges_path, 'w') as f:
+            for prev_pc, cur_pc in sorted(self.global_edges):
+                f.write(f"{hex(prev_pc)},{hex(cur_pc)}\n")
+
+        log.info(f"[Coverage] Saved {len(self.global_coverage)} PCs → {pc_path}")
+        log.info(f"[Coverage] Saved {len(self.global_edges)} edges → {edges_path}")
 
     def close(self):
         self.stop_event.set()
@@ -1014,16 +1054,35 @@ class NVMeFuzzer:
         cmd = seed.cmd
 
         # 데이터 버퍼 준비 (ctypes로 커널에 전달할 주소 확보)
+        # NVMe 명령별 응답/입력 데이터 크기:
+        #   Identify: 4096B 응답, GetLogPage: 가변 응답, GetFeatures: 응답 없거나 소량
+        #   Read(IO): NLB*512 응답, Write(IO): NLB*512 입력
+        MAX_DATA_BUF = 2 * 1024 * 1024  # 2MB 상한 (mutation으로 인한 OOM 방지)
+
+        ADMIN_RESPONSE_SIZES = {
+            "Identify": 4096,
+            "GetLogPage": 4096,
+            "GetFeatures": 4096,
+        }
+
         if cmd.needs_data and data:
+            # Write 등 입력 데이터가 있는 명령어
             data_buf = ctypes.create_string_buffer(data, len(data))
             data_addr = ctypes.addressof(data_buf)
             data_len = len(data)
-        elif cmd.name == "Read":
-            # Read 명령: 응답 데이터를 받을 빈 버퍼
-            read_len = max(512, (seed.cdw12 + 1) * 512) if seed.cdw12 >= 0 else 512
+        elif cmd.cmd_type == NVMeCommandType.IO:
+            # I/O Read: NLB 기반 버퍼 크기 계산 (상한 적용)
+            nlb = seed.cdw12 & 0xFFFF  # NLB는 CDW12[15:0]만 유효
+            read_len = min(max(512, (nlb + 1) * 512), MAX_DATA_BUF)
             data_buf = ctypes.create_string_buffer(read_len)
             data_addr = ctypes.addressof(data_buf)
             data_len = read_len
+        elif cmd.name in ADMIN_RESPONSE_SIZES:
+            # Admin 명령어: 응답 데이터를 받을 버퍼 (Identify=4KB 등)
+            resp_len = ADMIN_RESPONSE_SIZES[cmd.name]
+            data_buf = ctypes.create_string_buffer(resp_len)
+            data_addr = ctypes.addressof(data_buf)
+            data_len = resp_len
         else:
             data_addr = 0
             data_len = 0
@@ -1065,13 +1124,12 @@ class NVMeFuzzer:
 
         ioctl_nr = NVME_IOCTL_ADMIN_CMD if cmd.cmd_type == NVMeCommandType.ADMIN else NVME_IOCTL_IO_CMD
 
+        # "덫 놓기" 전략: ioctl 전에 샘플링 시작
+        # NOTE: stop_sampling()은 메인 루프(run)에서 호출 — 여기서는 하지 않음
+        self.sampler.start_sampling()
+
         try:
-            # "덫 놓기" 전략: ioctl 전에 샘플링 시작
-            self.sampler.start_sampling()
-
             rc = fcntl.ioctl(self._nvme_fd, ioctl_nr, cmd_buf)
-
-            self.sampler.stop_sampling()
 
             # result 필드 추출 (offset 68, u32 LE)
             result = struct.unpack_from('<I', cmd_buf, 68)[0]
@@ -1080,7 +1138,6 @@ class NVMeFuzzer:
             return rc
 
         except OSError as e:
-            self.sampler.stop_sampling()
             # ioctl errno → NVMe status
             # EINVAL(22), EIO(5) 등은 SSD가 거부한 것 (정상적 에러 응답)
             if e.errno in (5, 22, 1):
@@ -1091,10 +1148,6 @@ class NVMeFuzzer:
             return None
 
         except Exception as e:
-            try:
-                self.sampler.stop_sampling()
-            except:
-                pass
             log.error(f"NVMe ioctl error ({cmd.name}): {e}")
             return None
 
@@ -1548,6 +1601,9 @@ class NVMeFuzzer:
                 print(line)
             for line in summary_lines:
                 log.info(line)
+
+            # 커버리지 저장 (resume용)
+            self.sampler.save_coverage(str(self.output_dir))
 
             # 명령어별 edge/PC 데이터 저장 + 그래프 생성
             self._save_per_command_data()
