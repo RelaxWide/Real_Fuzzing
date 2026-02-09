@@ -45,6 +45,9 @@ from datetime import datetime
 from pathlib import Path
 from enum import Enum
 
+# 버전
+FUZZER_VERSION = "4.2"
+
 # =============================================================================
 # USER CONFIGURATION - 여기만 수정하세요
 # =============================================================================
@@ -71,7 +74,7 @@ POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 # 퍼징 설정
 MAX_INPUT_LEN     = 4096      # 최대 입력 바이트
 TOTAL_RUNTIME_SEC = 3600      # 총 퍼징 시간 (초)
-OUTPUT_DIR        = './output/pc_sampling_v4/'
+OUTPUT_DIR        = f'./output/pc_sampling_v{FUZZER_VERSION}/'
 SEED_DIR          = None      # 시드 폴더 경로 (없으면 None)
 RESUME_COVERAGE   = None      # 이전 coverage.txt 경로 (없으면 None)
 
@@ -571,7 +574,7 @@ class JLinkPCSampler:
 class NVMeFuzzer:
     """다중 Opcode 지원 NVMe 퍼저 (v4.2: ioctl 직접 호출 + 글로벌 포화 판정)"""
 
-    VERSION = "4.2"
+    VERSION = FUZZER_VERSION
 
     def __init__(self, config: FuzzConfig):
         self.config = config
