@@ -92,13 +92,6 @@ MAX_ENERGY        = 16.0      # 최대 에너지 값
 
 # =============================================================================
 
-# ---------------------------------------------------------------------------
-# NVMe subprocess (nvme-cli) 설정
-# ---------------------------------------------------------------------------
-# subprocess 기반: 샘플링 스레드가 idle/포화 감지 시 프로세스 kill 가능
-# 폴링 간격 (초) — 샘플링 포화 감지 후 프로세스 kill까지의 최대 지연
-SUBPROCESS_POLL_INTERVAL = 0.001  # 1ms
-
 
 class NVMeCommandType(Enum):
     ADMIN = "admin"
@@ -1185,17 +1178,14 @@ class NVMeFuzzer:
 
         return new_seed
 
-    # 반환값 상수: crash/timeout/포화 kill을 구분
-    RC_SATURATED = -1000   # 샘플링 포화로 프로세스 kill (정상)
+    # 반환값 상수: timeout/error를 구분
     RC_TIMEOUT   = -1001   # NVMe 타임아웃 (의미 있는 이벤트)
     RC_ERROR     = -1002   # subprocess 에러 (내부 문제)
 
-    def _send_nvme_command(self, data: bytes, seed: Seed) -> Optional[int]:
-        """v4.2: subprocess(nvme-cli) 기반 NVMe passthru 명령 전송.
-        샘플링 스레드가 idle/포화를 감지하면 프로세스를 kill하고 즉시 다음으로 넘어감.
+    def _send_nvme_command(self, data: bytes, seed: Seed) -> int:
+        """subprocess(nvme-cli) 기반 NVMe passthru 명령 전송.
         반환값:
           >= 0: nvme-cli returncode (0=성공, 양수=NVMe 에러)
-          RC_SATURATED(-1000): 샘플링 포화로 kill (정상, crash 아님)
           RC_TIMEOUT(-1001): NVMe 타임아웃
           RC_ERROR(-1002): 내부 에러
         """
@@ -1314,47 +1304,25 @@ class NVMeFuzzer:
                 stderr=subprocess.PIPE,
             )
 
-            # 빠른 경로: 대부분의 NVMe 명령은 <10ms에 완료됨
-            # process.wait()으로 짧은 간격 블로킹 대기하며
-            # 샘플링 포화 감지 시 프로세스 kill
+            # v4.1 방식: communicate()로 블로킹 대기 — 지연 없음
             timeout_sec = timeout_ms / 1000.0 + 2.0
-            deadline = time.monotonic() + timeout_sec
-            killed = False
-
-            while True:
-                try:
-                    process.wait(timeout=SUBPROCESS_POLL_INTERVAL)
-                    break  # 프로세스 완료
-                except subprocess.TimeoutExpired:
-                    pass
-
-                # 샘플링 스레드가 idle/포화 감지로 자체 종료했는지 확인
-                # 샘플링 스레드가 idle/포화 감지로 자체 종료했는지 확인
-                if (self.sampler.sample_thread
-                        and not self.sampler.sample_thread.is_alive()
-                        and not self.sampler.stop_event.is_set()):
-                    log.debug(f"[NVMe] Sampling saturated → killing {cmd.name} "
-                              f"({self.sampler._stopped_reason})")
-                    process.kill()
-                    process.wait(timeout=2)
-                    return self.RC_SATURATED
-
-                if time.monotonic() >= deadline:
-                    log.warning(f"[NVMe TIMEOUT] {cmd.name} — killing subprocess")
-                    process.kill()
-                    process.wait(timeout=2)
-                    return self.RC_TIMEOUT
+            try:
+                stdout, stderr = process.communicate(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                log.warning(f"[NVMe TIMEOUT] {cmd.name} (>{timeout_sec:.0f}s)")
+                return self.RC_TIMEOUT
 
             rc = process.returncode
             log.info(f"[NVMe RET] rc={rc}")
             return rc
 
         except KeyboardInterrupt:
-            # Ctrl+C: subprocess 정리 후 상위로 전파
             if process:
                 try:
                     process.kill()
-                    process.wait(timeout=2)
+                    process.communicate(timeout=2)
                 except Exception:
                     pass
             raise
@@ -1364,7 +1332,7 @@ class NVMeFuzzer:
             if process:
                 try:
                     process.kill()
-                    process.wait(timeout=2)
+                    process.communicate(timeout=2)
                 except Exception:
                     pass
             return self.RC_ERROR
@@ -1886,18 +1854,9 @@ class NVMeFuzzer:
                 self.cmd_stats[cmd.name]["exec"] += 1
 
                 # --- rc 분류 ---
-                # RC_SATURATED: 샘플링 포화로 kill (정상, crash 아님)
                 # RC_TIMEOUT: NVMe 타임아웃 (의미 있는 이벤트)
                 # RC_ERROR: 내부 에러
                 # >= 0: nvme-cli returncode (0=성공)
-
-                if rc == self.RC_SATURATED:
-                    # 샘플링 포화 → 정상적 조기 중단, crash 아님
-                    self.sampler.stop_sampling()
-                    self.rc_stats[cmd.name]["saturated_kill"] += 1
-                    log.debug(f"exec={self.executions} cmd={cmd.name} "
-                              f"rc=SATURATED (sampling idle/saturated, skipped)")
-                    continue
 
                 if rc not in (self.RC_TIMEOUT, self.RC_ERROR):
                     self.rc_stats[cmd.name][rc] += 1
