@@ -1349,6 +1349,16 @@ class NVMeFuzzer:
             log.info(f"[NVMe RET] rc={rc}")
             return rc
 
+        except KeyboardInterrupt:
+            # Ctrl+C: subprocess 정리 후 상위로 전파
+            if process:
+                try:
+                    process.kill()
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+            raise
+
         except Exception as e:
             log.error(f"NVMe subprocess error ({cmd.name}): {e}")
             if process:
@@ -1992,53 +2002,64 @@ class NVMeFuzzer:
             log.warning("Interrupted by user")
 
         finally:
-            stats = self._collect_stats()
+            # 각 단계를 독립적으로 보호하여 하나가 실패해도 나머지 실행
+            try:
+                stats = self._collect_stats()
+                summary_lines = [
+                    "=" * 60,
+                    " Fuzzing Complete",
+                    "=" * 60,
+                    f"Total executions : {stats['executions']:,}",
+                    f"Elapsed          : {stats['elapsed_seconds']:.1f}s",
+                    f"Exec/s           : {stats['exec_per_sec']:.1f}",
+                    f"Corpus size      : {stats['corpus_size']}",
+                    f"Crashes          : {stats['crashes']}",
+                    f"Total samples    : {stats['total_samples']:,}",
+                    f"Interesting      : {stats['interesting_inputs']}",
+                    f"Coverage (edges) : {stats['coverage_unique_edges']:,}",
+                    f"Coverage (PCs)   : {stats['coverage_unique_pcs']:,}",
+                    "Per-command stats:",
+                ]
+                for cmd_name, cmd_stat in stats['command_stats'].items():
+                    summary_lines.append(f"  {cmd_name}: exec={cmd_stat['exec']}, "
+                                         f"interesting={cmd_stat['interesting']}")
+                summary_lines.append("Return code distribution:")
+                for cmd_name, rc_dist in self.rc_stats.items():
+                    rc_summary = ", ".join(f"rc={rc}:{cnt}" for rc, cnt in sorted(rc_dist.items()))
+                    summary_lines.append(f"  {cmd_name}: {rc_summary}")
+                summary_lines.append("=" * 60)
 
-            # Summary 출력 (콘솔 + 파일 모두)
-            summary_lines = [
-                "=" * 60,
-                " Fuzzing Complete",
-                "=" * 60,
-                f"Total executions : {stats['executions']:,}",
-                f"Elapsed          : {stats['elapsed_seconds']:.1f}s",
-                f"Exec/s           : {stats['exec_per_sec']:.1f}",
-                f"Corpus size      : {stats['corpus_size']}",
-                f"Crashes          : {stats['crashes']}",
-                f"Total samples    : {stats['total_samples']:,}",
-                f"Interesting      : {stats['interesting_inputs']}",
-                f"Coverage (edges) : {stats['coverage_unique_edges']:,}",
-                f"Coverage (PCs)   : {stats['coverage_unique_pcs']:,}",
-                "Per-command stats:",
-            ]
-            for cmd_name, cmd_stat in stats['command_stats'].items():
-                summary_lines.append(f"  {cmd_name}: exec={cmd_stat['exec']}, "
-                                     f"interesting={cmd_stat['interesting']}")
-            summary_lines.append("Return code distribution:")
-            for cmd_name, rc_dist in self.rc_stats.items():
-                rc_summary = ", ".join(f"rc={rc}:{cnt}" for rc, cnt in sorted(rc_dist.items()))
-                summary_lines.append(f"  {cmd_name}: {rc_summary}")
-            summary_lines.append("=" * 60)
+                for line in summary_lines:
+                    print(line)
+                for line in summary_lines:
+                    log.info(line)
+            except Exception as e:
+                print(f"\n[Summary error] {e}")
 
-            for line in summary_lines:
-                print(line)
-            for line in summary_lines:
-                log.info(line)
+            try:
+                self.sampler.save_coverage(str(self.output_dir))
+            except Exception as e:
+                log.error(f"Coverage save failed: {e}")
 
-            # 커버리지 저장 (resume용)
-            self.sampler.save_coverage(str(self.output_dir))
+            try:
+                self._save_per_command_data()
+                self._generate_graphs()
+                self._generate_heatmaps()
+            except Exception as e:
+                log.error(f"Graph/heatmap generation failed: {e}")
 
-            # 명령어별 edge/PC 데이터 저장 + 그래프/히트맵 생성
-            self._save_per_command_data()
-            self._generate_graphs()
-            self._generate_heatmaps()
+            try:
+                for h in log.handlers:
+                    h.flush()
+                    if isinstance(h, logging.FileHandler) and h.stream:
+                        os.fsync(h.stream.fileno())
+            except Exception:
+                pass
 
-            # 최종 flush (OS 버퍼까지, 파일 핸들러만)
-            for h in log.handlers:
-                h.flush()
-                if isinstance(h, logging.FileHandler) and h.stream:
-                    os.fsync(h.stream.fileno())
-
-            self.sampler.close()
+            try:
+                self.sampler.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
