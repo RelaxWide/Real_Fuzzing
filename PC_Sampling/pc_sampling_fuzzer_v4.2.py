@@ -1377,6 +1377,183 @@ class NVMeFuzzer:
         plt.close()
         log.info(f"[Graph] 명령어 비교 차트 → {chart_file}")
 
+    def _generate_heatmaps(self):
+        """1D 주소 커버리지 히트맵 + 2D edge 히트맵 생성"""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import numpy as np
+        except ImportError:
+            log.warning("[Heatmap] matplotlib/numpy 미설치 — 히트맵 생략. "
+                        "'pip install matplotlib numpy' 로 설치 가능")
+            return
+
+        graph_dir = self.output_dir / 'graphs'
+        graph_dir.mkdir(parents=True, exist_ok=True)
+
+        addr_start = self.config.addr_range_start if self.config.addr_range_start is not None else 0
+        addr_end = self.config.addr_range_end if self.config.addr_range_end is not None else 0x147FFF
+        addr_range = addr_end - addr_start + 1
+
+        # 데이터가 있는 명령어만 수집
+        active_cmds = [name for name in sorted(self.cmd_pcs.keys())
+                       if self.cmd_pcs[name] or self.cmd_edges[name]]
+        if not active_cmds:
+            log.warning("[Heatmap] No coverage data to visualize")
+            return
+
+        # Bin 크기 결정: 1D는 세밀하게, 2D는 조금 크게
+        bin_size_1d = max(256, addr_range // 512)
+        bin_size_2d = max(1024, addr_range // 256)
+        n_bins_1d = (addr_range + bin_size_1d - 1) // bin_size_1d
+        n_bins_2d = (addr_range + bin_size_2d - 1) // bin_size_2d
+
+        # =================================================================
+        # 1D Address Coverage Heatmap
+        # =================================================================
+        n_rows_1d = len(active_cmds) + 1  # +1 for global
+        fig, axes = plt.subplots(n_rows_1d, 1,
+                                 figsize=(18, 1.2 * n_rows_1d + 1.5),
+                                 gridspec_kw={'hspace': 0.6})
+        if n_rows_1d == 1:
+            axes = [axes]
+
+        fig.suptitle(f'Firmware Coverage Heatmap  (bin={bin_size_1d}B, '
+                     f'range=0x{addr_start:X}–0x{addr_end:X})',
+                     fontsize=13, fontweight='bold')
+
+        def _hex_formatter(x, pos):
+            return f'0x{int(x):X}'
+
+        # Global (전체 명령어 합산)
+        global_bins = np.zeros(n_bins_1d)
+        for pc in self.sampler.global_coverage:
+            if addr_start <= pc <= addr_end:
+                idx = (pc - addr_start) // bin_size_1d
+                if 0 <= idx < n_bins_1d:
+                    global_bins[idx] += 1
+
+        covered_bins = int(np.count_nonzero(global_bins))
+        ax = axes[0]
+        im = ax.imshow(global_bins.reshape(1, -1), aspect='auto', cmap='YlOrRd',
+                       extent=[addr_start, addr_end, 0, 1], interpolation='nearest')
+        ax.set_yticks([])
+        ax.set_title(f'ALL  —  {len(self.sampler.global_coverage)} PCs, '
+                     f'{covered_bins}/{n_bins_1d} bins covered '
+                     f'({100*covered_bins/n_bins_1d:.1f}%)',
+                     fontsize=9, loc='left')
+        ax.xaxis.set_major_formatter(plt.FuncFormatter(_hex_formatter))
+        ax.tick_params(axis='x', labelsize=7)
+
+        # Per-command
+        for i, cmd_name in enumerate(active_cmds):
+            cmd_bins = np.zeros(n_bins_1d)
+            for pc in self.cmd_pcs[cmd_name]:
+                if addr_start <= pc <= addr_end:
+                    idx = (pc - addr_start) // bin_size_1d
+                    if 0 <= idx < n_bins_1d:
+                        cmd_bins[idx] += 1
+
+            cmd_covered = int(np.count_nonzero(cmd_bins))
+            ax = axes[i + 1]
+            ax.imshow(cmd_bins.reshape(1, -1), aspect='auto', cmap='YlOrRd',
+                      extent=[addr_start, addr_end, 0, 1], interpolation='nearest')
+            ax.set_yticks([])
+            ax.set_title(f'{cmd_name}  —  {len(self.cmd_pcs[cmd_name])} PCs, '
+                         f'{len(self.cmd_edges[cmd_name])} edges, '
+                         f'{cmd_covered}/{n_bins_1d} bins ({100*cmd_covered/n_bins_1d:.1f}%)',
+                         fontsize=9, loc='left')
+            ax.xaxis.set_major_formatter(plt.FuncFormatter(_hex_formatter))
+            ax.tick_params(axis='x', labelsize=7)
+
+        heatmap_file = graph_dir / 'coverage_heatmap_1d.png'
+        plt.savefig(heatmap_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        log.info(f"[Heatmap] 1D coverage heatmap → {heatmap_file}")
+
+        # =================================================================
+        # 2D Edge Heatmap (prev_pc × cur_pc 인접 행렬)
+        # =================================================================
+        n_cols = min(3, len(active_cmds))
+        n_rows_2d = (len(active_cmds) + n_cols - 1) // n_cols
+
+        fig, axes_2d = plt.subplots(n_rows_2d, n_cols,
+                                    figsize=(6.5 * n_cols, 5.5 * n_rows_2d),
+                                    squeeze=False)
+        fig.suptitle(f'Edge Heatmap  prev_pc → cur_pc  (bin={bin_size_2d}B)',
+                     fontsize=13, fontweight='bold')
+
+        # 축 눈금 위치 (5개)
+        tick_positions = np.linspace(0, n_bins_2d - 1, 6)
+        tick_labels = [f'0x{int(addr_start + p * bin_size_2d):X}' for p in tick_positions]
+
+        for idx, cmd_name in enumerate(active_cmds):
+            row, col = divmod(idx, n_cols)
+            ax = axes_2d[row][col]
+
+            edges = self.cmd_edges[cmd_name]
+            if not edges:
+                ax.set_visible(False)
+                continue
+
+            # Edge 빈도 행렬 구성
+            # unique edge = 1, trace에서 반복 출현 시 가산
+            edge_matrix = np.zeros((n_bins_2d, n_bins_2d))
+
+            # 1) unique edge로 기본 구조
+            for prev_pc, cur_pc in edges:
+                if addr_start <= prev_pc <= addr_end and addr_start <= cur_pc <= addr_end:
+                    bx = (prev_pc - addr_start) // bin_size_2d
+                    by = (cur_pc - addr_start) // bin_size_2d
+                    if 0 <= bx < n_bins_2d and 0 <= by < n_bins_2d:
+                        edge_matrix[by][bx] += 1
+
+            # 2) trace에서 빈도 가산 (핫 edge 강조)
+            for trace in self.cmd_traces[cmd_name]:
+                for ti in range(len(trace) - 1):
+                    p, c = trace[ti], trace[ti + 1]
+                    if addr_start <= p <= addr_end and addr_start <= c <= addr_end:
+                        bx = (p - addr_start) // bin_size_2d
+                        by = (c - addr_start) // bin_size_2d
+                        if 0 <= bx < n_bins_2d and 0 <= by < n_bins_2d:
+                            edge_matrix[by][bx] += 1
+
+            # log 스케일로 표시 (빈도 차이가 큼)
+            edge_display = np.log1p(edge_matrix)
+
+            im = ax.imshow(edge_display, aspect='equal', cmap='inferno',
+                           origin='lower', interpolation='nearest')
+
+            ax.set_xticks(tick_positions)
+            ax.set_xticklabels(tick_labels, rotation=45, fontsize=6, ha='right')
+            ax.set_yticks(tick_positions)
+            ax.set_yticklabels(tick_labels, fontsize=6)
+            ax.set_xlabel('prev_pc (from)', fontsize=8)
+            ax.set_ylabel('cur_pc (to)', fontsize=8)
+
+            # 대각선 참조선 (순차 실행 영역)
+            ax.plot([0, n_bins_2d - 1], [0, n_bins_2d - 1],
+                    'w--', alpha=0.3, linewidth=0.5)
+
+            active_bins = int(np.count_nonzero(edge_matrix))
+            ax.set_title(f'{cmd_name}  —  {len(edges)} edges, '
+                         f'{active_bins} active bins',
+                         fontsize=9)
+            plt.colorbar(im, ax=ax, shrink=0.75, label='log(count+1)',
+                         pad=0.02)
+
+        # 빈 subplot 숨기기
+        for idx in range(len(active_cmds), n_rows_2d * n_cols):
+            row, col = divmod(idx, n_cols)
+            axes_2d[row][col].set_visible(False)
+
+        plt.tight_layout()
+        edge_heatmap_file = graph_dir / 'edge_heatmap_2d.png'
+        plt.savefig(edge_heatmap_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        log.info(f"[Heatmap] 2D edge heatmap → {edge_heatmap_file}")
+
     def _collect_stats(self) -> dict:
         elapsed = (datetime.now() - self.start_time).total_seconds() if self.start_time else 0
         return {
@@ -1609,9 +1786,10 @@ class NVMeFuzzer:
             # 커버리지 저장 (resume용)
             self.sampler.save_coverage(str(self.output_dir))
 
-            # 명령어별 edge/PC 데이터 저장 + 그래프 생성
+            # 명령어별 edge/PC 데이터 저장 + 그래프/히트맵 생성
             self._save_per_command_data()
             self._generate_graphs()
+            self._generate_heatmaps()
 
             # 최종 flush (OS 버퍼까지, 파일 핸들러만)
             for h in log.handlers:

@@ -154,6 +154,22 @@ def _read_pc(self):
             pass
 ```
 
+### 10. 히트맵 시각화 (1D 커버리지 + 2D Edge)
+
+기존 Graphviz DOT 그래프는 노드가 많아지면 가독성이 떨어지는 문제가 있었다. v4.2에서는 히트맵 기반 시각화를 추가한다.
+
+**1D 커버리지 히트맵** (`coverage_heatmap_1d.png`):
+- 펌웨어 주소 공간을 선형으로 펼쳐 bin별 히트 빈도를 색상으로 표현
+- 전체 합산 + 명령어별 행으로 나열 → 한눈에 커버리지 분포 비교
+- bin별 커버리지 비율(%) 표시
+
+**2D Edge 히트맵** (`edge_heatmap_2d.png`):
+- X축=prev_pc(출발), Y축=cur_pc(도착)의 인접 행렬
+- 대각선 근처 = 순차 실행, 대각선에서 먼 점 = 분기/함수 호출
+- 수평 밴드 = 공통 진입점, 수직 밴드 = 분기 지점
+- 명령어별 subplot으로 비교
+- log 스케일 색상 + inferno 컬러맵
+
 ---
 
 ## v4.0 → v4.1 변경사항 (요약)
@@ -208,7 +224,7 @@ sudo python3 pc_sampling_fuzzer_v4.2.py --addr-start 0x20000 --addr-end 0x147FFF
 - Python 3.8+
 - `pylink-square`: J-Link Python 인터페이스
 - `graphviz` (선택): DOT → PNG 렌더링 (`sudo apt install graphviz`)
-- `matplotlib` (선택): 명령어 비교 차트 (`pip install matplotlib`)
+- `matplotlib` + `numpy` (선택): 히트맵 및 비교 차트 (`pip install matplotlib numpy`)
 - root 권한: `/dev/nvme0` ioctl 접근
 
 ## 출력 구조
@@ -224,6 +240,8 @@ output/pc_sampling_v4/
 │   ├── crash_Write_0x1_def456
 │   └── crash_Write_0x1_def456.json
 ├── graphs/
+│   ├── coverage_heatmap_1d.png   # 1D 주소 커버리지 히트맵
+│   ├── edge_heatmap_2d.png       # 2D edge 인접 행렬 히트맵
 │   ├── Identify_cfg.dot          # Graphviz DOT
 │   ├── Identify_cfg.png          # 렌더링된 CFG
 │   ├── Identify_edges.json       # 원시 데이터
