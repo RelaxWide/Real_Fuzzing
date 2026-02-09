@@ -63,7 +63,18 @@ JLINK_SPEED   = 12000          # kHz
 # NVMe 장치 설정
 NVME_DEVICE    = '/dev/nvme0'
 NVME_NAMESPACE = 1
-NVME_TIMEOUT   = 8000         # ms
+
+# NVMe 명령어 그룹별 타임아웃 (ms)
+# 그룹에 속하지 않는 명령어는 모두 'command'에 해당
+NVME_TIMEOUTS = {
+    'command':      8_000,     # 일반 명령어 (Identify, GetLogPage, GetFeatures, Read, Write 등)
+    'format':       600_000,   # Format NVM — 전체 미디어 포맷, 수 분 소요 가능
+    'sanitize':     600_000,   # Sanitize — 보안 삭제, 수 분~수십 분 소요
+    'fw_commit':    120_000,   # Firmware Commit — 펌웨어 슬롯 활성화, 리셋 포함 가능
+    'telemetry':    30_000,    # Telemetry Host/Controller — 대용량 로그 수집
+    'dsm':          30_000,    # Dataset Management (TRIM/Deallocate)
+    'flush':        30_000,    # Flush — 캐시 플러시, 미디어 기록 완료 대기
+}
 
 # PC 샘플링 설정
 SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
@@ -116,22 +127,45 @@ class NVMeCommand:
     cmd_type: NVMeCommandType
     needs_namespace: bool = True
     needs_data: bool = True
+    timeout_group: str = "command"   # NVME_TIMEOUTS 키 참조
     description: str = ""
 
 
 NVME_COMMANDS = [
-    # Admin Commands
+    # ── Admin Commands ──
     NVMeCommand("Identify", 0x06, NVMeCommandType.ADMIN, needs_data=False,
                 description="장치/네임스페이스 정보 조회"),
     NVMeCommand("GetLogPage", 0x02, NVMeCommandType.ADMIN, needs_data=False,
                 description="로그 페이지 조회"),
     NVMeCommand("GetFeatures", 0x0A, NVMeCommandType.ADMIN, needs_data=False,
                 description="기능 조회"),
-    # I/O Commands
+    NVMeCommand("SetFeatures", 0x09, NVMeCommandType.ADMIN,
+                description="기능 설정"),
+    NVMeCommand("FWDownload", 0x11, NVMeCommandType.ADMIN,
+                description="펌웨어 이미지 다운로드"),
+    NVMeCommand("FWCommit", 0x10, NVMeCommandType.ADMIN,
+                timeout_group="fw_commit",
+                description="펌웨어 슬롯 활성화/커밋"),
+    NVMeCommand("FormatNVM", 0x80, NVMeCommandType.ADMIN,
+                timeout_group="format",
+                description="NVM 포맷 (미디어 초기화)"),
+    NVMeCommand("Sanitize", 0x84, NVMeCommandType.ADMIN, needs_namespace=False,
+                timeout_group="sanitize",
+                description="보안 삭제 (전체 미디어)"),
+    NVMeCommand("TelemetryHostInitiated", 0x02, NVMeCommandType.ADMIN, needs_data=False,
+                timeout_group="telemetry",
+                description="텔레메트리 로그 (호스트 개시)"),
+    # ── I/O Commands ──
     NVMeCommand("Read", 0x02, NVMeCommandType.IO, needs_data=False,
                 description="데이터 읽기"),
     NVMeCommand("Write", 0x01, NVMeCommandType.IO,
                 description="데이터 쓰기"),
+    NVMeCommand("Flush", 0x00, NVMeCommandType.IO, needs_data=False,
+                timeout_group="flush",
+                description="캐시 플러시"),
+    NVMeCommand("DatasetManagement", 0x09, NVMeCommandType.IO,
+                timeout_group="dsm",
+                description="데이터셋 관리 (TRIM/Deallocate)"),
 ]
 
 
@@ -163,7 +197,7 @@ class FuzzConfig:
 
     nvme_device: str = NVME_DEVICE
     nvme_namespace: int = NVME_NAMESPACE
-    nvme_timeout_ms: int = NVME_TIMEOUT
+    nvme_timeouts: dict = field(default_factory=lambda: NVME_TIMEOUTS.copy())
 
     enabled_commands: List[str] = field(default_factory=list)
 
@@ -658,6 +692,41 @@ class NVMeFuzzer:
                 dict(cdw10=0, cdw11=0, cdw12=0, data=b'\xAA' * 512, description="Write LBA 0, 1 block pattern"),
                 dict(cdw10=1000, cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 1000, 1 block"),
             ],
+            "SetFeatures": [
+                # CDW10[7:0]=FID, CDW10[31]=SV(Save)
+                dict(cdw10=0x07, cdw11=0x00010001, description="Set Number of Queues (1 SQ + 1 CQ)"),
+            ],
+            "FWDownload": [
+                # CDW10=NUMD (0-based dwords), CDW11=OFST (dword offset)
+                dict(cdw10=0xFF, cdw11=0, data=b'\x00' * 1024, description="FW Download offset=0, 1KB"),
+            ],
+            "FWCommit": [
+                # CDW10[2:0]=CA(Commit Action), CDW10[5:3]=FS(Firmware Slot)
+                dict(cdw10=0x01, description="Commit Action 1, Slot 0 (replace without activate)"),
+                dict(cdw10=0x09, description="Commit Action 1, Slot 1"),
+            ],
+            "FormatNVM": [
+                # CDW10[3:0]=LBAF, CDW10[11:9]=SES(Secure Erase)
+                dict(cdw10=0x00, description="Format LBAF 0, no secure erase"),
+            ],
+            "Sanitize": [
+                # CDW10[2:0]=SANACT(Sanitize Action), CDW10[3]=AUSE, CDW10[7:4]=OWPASS
+                dict(cdw10=0x01, description="Block Erase"),
+                dict(cdw10=0x02, description="Overwrite"),
+                dict(cdw10=0x04, description="Crypto Erase"),
+            ],
+            "TelemetryHostInitiated": [
+                # GetLogPage LID=0x07 + CDW10[8]=Create Telemetry
+                dict(cdw10=(0x1FF << 16) | 0x07, description="Telemetry Host-Initiated Log"),
+            ],
+            "Flush": [
+                dict(description="Flush (no parameters)"),
+            ],
+            "DatasetManagement": [
+                # CDW10[7:0]=NR (Number of Ranges, 0-based), CDW11[2]=AD(Attribute Deallocate)
+                dict(cdw10=0, cdw11=0x04, data=struct.pack('<IIIII', 0, 0, 0, 0, 8),
+                     description="TRIM LBA 0, 8 blocks"),
+            ],
         }
 
         for cmd in self.commands:
@@ -1070,6 +1139,7 @@ class NVMeFuzzer:
             "Identify": 4096,
             "GetLogPage": 4096,
             "GetFeatures": 4096,
+            "TelemetryHostInitiated": 4096,
         }
 
         if cmd.needs_data and data:
@@ -1096,6 +1166,12 @@ class NVMeFuzzer:
 
         nsid = self.config.nvme_namespace if cmd.needs_namespace else 0
 
+        # 명령어 그룹별 타임아웃 조회
+        timeout_ms = self.config.nvme_timeouts.get(
+            cmd.timeout_group,
+            self.config.nvme_timeouts.get('command', 8000)
+        )
+
         # struct nvme_passthru_cmd 패킹
         # fmt: 'BBH I I I Q Q I I I I I I I I I I'
         passthru_cmd = struct.pack(
@@ -1116,7 +1192,7 @@ class NVMeFuzzer:
             seed.cdw13,           # cdw13   (u32)
             seed.cdw14,           # cdw14   (u32)
             seed.cdw15,           # cdw15   (u32)
-            self.config.nvme_timeout_ms,  # timeout_ms (u32)
+            timeout_ms,           # timeout_ms (u32)
             0,                    # result  (u32) — 커널이 채워줌
         )
 
@@ -1124,6 +1200,7 @@ class NVMeFuzzer:
         cmd_buf = bytearray(passthru_cmd)
 
         log.info(f"[NVMe] ioctl {cmd.name} opcode=0x{cmd.opcode:02x} nsid={nsid} "
+                 f"timeout={timeout_ms}ms({cmd.timeout_group}) "
                  f"cdw10=0x{seed.cdw10:08x} cdw11=0x{seed.cdw11:08x} "
                  f"cdw12=0x{seed.cdw12:08x} data_len={data_len}"
                  f" data={data[:16].hex() if data else 'N/A'}"
@@ -1608,6 +1685,8 @@ class NVMeFuzzer:
                  f"post_cmd={self.config.post_cmd_delay_ms}ms")
         log.warning(f"Power Sched : max_energy={self.config.max_energy}")
         log.warning(f"NVMe I/O    : ioctl direct (no subprocess)")
+        timeout_str = ", ".join(f"{k}={v}ms" for k, v in self.config.nvme_timeouts.items())
+        log.warning(f"Timeouts    : {timeout_str}")
         log.warning(f"Output      : {self.config.output_dir}")
         log.warning("=" * 60)
 
@@ -1831,14 +1910,30 @@ if __name__ == "__main__":
                         help='Stop sampling after N consecutive duplicate edges (0=disable)')
     parser.add_argument('--max-energy', type=float, default=MAX_ENERGY,
                         help='Max energy for power schedule')
+    parser.add_argument('--timeout', nargs=2, action='append', metavar=('GROUP', 'MS'),
+                        help='Set timeout per group, e.g. --timeout command 8000 '
+                             '--timeout format 600000. '
+                             f'Groups: {", ".join(NVME_TIMEOUTS.keys())}')
 
     args = parser.parse_args()
 
+    # CLI에서 지정한 타임아웃으로 오버라이드
+    nvme_timeouts = NVME_TIMEOUTS.copy()
+    if args.timeout:
+        for group, ms in args.timeout:
+            if group not in nvme_timeouts:
+                parser.error(f"Unknown timeout group '{group}'. "
+                             f"Valid: {', '.join(nvme_timeouts.keys())}")
+            nvme_timeouts[group] = int(ms)
+
     print("Available commands:")
     for cmd in NVME_COMMANDS:
-        print(f"  {cmd.name}: opcode={hex(cmd.opcode)}, type={cmd.cmd_type.value}")
+        tg = cmd.timeout_group
+        tms = nvme_timeouts.get(tg, nvme_timeouts['command'])
+        print(f"  {cmd.name}: opcode={hex(cmd.opcode)}, type={cmd.cmd_type.value}, "
+              f"timeout={tg}({tms}ms)")
     print()
-    print("v4.2 Features:")
+    print(f"v{FUZZER_VERSION} Features:")
     print("  - ioctl direct NVMe passthru (no subprocess fork)")
     print("  - Global edge saturation + idle PC detection")
     print("  - AFL++ havoc/splice mutation engine")
@@ -1851,6 +1946,7 @@ if __name__ == "__main__":
         jtag_speed=args.speed,
         nvme_device=args.nvme,
         nvme_namespace=args.namespace,
+        nvme_timeouts=nvme_timeouts,
         enabled_commands=args.commands,
         total_runtime_sec=args.runtime,
         output_dir=args.output,
