@@ -1,41 +1,34 @@
 # PC Sampling Fuzzer v4.2 - Release Notes
 
-SSD 펌웨어 대상 Coverage-Guided Fuzzer. J-Link V9의 Halt-Sample-Resume 방식으로 Cortex-R8 CPU의 PC를 수집하고, **ioctl 직접 호출**로 NVMe 퍼징 입력을 전달한다.
+SSD 펌웨어 대상 Coverage-Guided Fuzzer. J-Link V9의 Halt-Sample-Resume 방식으로 Cortex-R8 CPU의 PC를 수집하고, **subprocess(nvme-cli)**를 통해 NVMe 퍼징 입력을 전달한다.
 
 ## v4.1 → v4.2 변경사항
 
-### 1. subprocess → ioctl 직접 호출
+### 1. subprocess + 샘플링 연동 (idle 감지 시 프로세스 kill)
 
-v4.1까지는 매 실행마다 `subprocess.Popen("nvme admin-passthru ...")`로 프로세스를 생성했다. v4.2에서는 `fcntl.ioctl()`로 NVMe passthru 명령을 커널에 직접 전달한다.
+subprocess(nvme-cli) 방식을 유지하되, **샘플링 스레드의 포화/idle 감지와 연동**하여 불필요한 대기를 제거한다.
 
-**변경 전 (v4.1)**:
+ioctl 직접 호출은 커널 블로킹이라 중단 불가하지만, subprocess는 `process.kill()`로 즉시 종료 가능하다.
+
 ```python
-process = subprocess.Popen(
-    ['nvme', 'admin-passthru', '/dev/nvme0', '--opcode=0x06', ...],
-    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-)
-stdout, stderr = process.communicate(timeout=...)
+process = subprocess.Popen(['nvme', 'admin-passthru', ...])
+
+# 50ms 간격으로 폴링
+while time.monotonic() < deadline:
+    if process.poll() is not None:
+        break  # 프로세스 정상 완료
+
+    # 샘플링 스레드가 idle/포화 감지로 자체 종료했는지 확인
+    if (not sampler.sample_thread.is_alive()
+            and not sampler.stop_event.is_set()):
+        process.kill()   # ← 즉시 다음 실행으로
+        break
 ```
 
-**변경 후 (v4.2)**:
-```python
-# NVMe 디바이스 fd를 한 번만 열어 유지
-self._nvme_fd = os.open('/dev/nvme0', os.O_RDWR)
-
-# struct nvme_passthru_cmd 직접 패킹
-cmd_buf = struct.pack('BBH I I I Q Q I I I I I I I I I I',
-    opcode, flags, rsvd1, nsid, cdw2, cdw3,
-    metadata, data_addr, metadata_len, data_len,
-    cdw10, cdw11, cdw12, cdw13, cdw14, cdw15,
-    timeout_ms, result)
-
-rc = fcntl.ioctl(self._nvme_fd, NVME_IOCTL_ADMIN_CMD, cmd_buf)
-```
-
-**성능 효과**:
-- fork()/exec() 오버헤드 제거 (~3-10ms/회)
-- 프로세스 생성/파이프 I/O/파일 쓰기 제거
-- NVMe 디바이스 열기/닫기 1회로 감소
+**효과**:
+- FormatNVM(600s), Sanitize(600s) 등 장시간 명령어도 SSD idle 감지 시 즉시 skip
+- 샘플링 포화(20회 연속 새 edge 없음) 시에도 프로세스 kill → 다음 실행
+- ioctl 방식 대비 ~3-10ms/회 오버헤드 있으나, 장시간 명령어 대기 제거로 상쇄
 
 ### 2. 글로벌 기준 포화 판정
 
@@ -225,7 +218,8 @@ sudo python3 pc_sampling_fuzzer_v4.2.py --addr-start 0x20000 --addr-end 0x147FFF
 - `pylink-square`: J-Link Python 인터페이스
 - `graphviz` (선택): DOT → PNG 렌더링 (`sudo apt install graphviz`)
 - `matplotlib` + `numpy` (선택): 히트맵 및 비교 차트 (`pip install matplotlib numpy`)
-- root 권한: `/dev/nvme0` ioctl 접근
+- `nvme-cli`: NVMe passthru 명령 전송 (`sudo apt install nvme-cli`)
+- root 권한: `/dev/nvme0` 접근
 
 ## 출력 구조
 

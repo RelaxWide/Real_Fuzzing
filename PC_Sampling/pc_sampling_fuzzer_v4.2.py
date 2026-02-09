@@ -3,10 +3,10 @@
 PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v4.2
 
 J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
-ioctl을 통해 SSD에 퍼징 입력을 직접 전달합니다.
+subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
 v4.2 변경사항:
-- subprocess(nvme-cli) → ioctl 직접 호출 (fork 오버헤드 제거)
+- subprocess + 샘플링 연동: idle/포화 감지 시 프로세스 kill → 즉시 다음 실행
 - 글로벌 기준 포화 판정 (global_edges 대비 새 edge 체크)
 - idle PC 감지: diagnose에서 가장 빈도 높은 PC를 idle로 설정,
   연속 N회 idle PC일 때만 샘플링 조기 중단
@@ -30,8 +30,6 @@ import struct
 import time
 import threading
 import subprocess
-import ctypes
-import fcntl
 import os
 import json
 import hashlib
@@ -95,24 +93,11 @@ MAX_ENERGY        = 16.0      # 최대 에너지 값
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# NVMe ioctl 상수 및 구조체 (linux/nvme_ioctl.h)
+# NVMe subprocess (nvme-cli) 설정
 # ---------------------------------------------------------------------------
-# struct nvme_passthru_cmd {
-#     __u8    opcode;      __u8  flags;    __u16 rsvd1;
-#     __u32   nsid;        __u32 cdw2;     __u32 cdw3;
-#     __u64   metadata;    __u64 addr;     __u32 metadata_len;
-#     __u32   data_len;    __u32 cdw10;    __u32 cdw11;
-#     __u32   cdw12;       __u32 cdw13;    __u32 cdw14;
-#     __u32   cdw15;       __u32 timeout_ms; __u32 result;
-# };
-# sizeof = 72 bytes
-NVME_PASSTHRU_CMD_FMT = 'BBH I I I Q Q I I I I I I I I I I'
-NVME_PASSTHRU_CMD_SIZE = struct.calcsize(NVME_PASSTHRU_CMD_FMT)  # 72
-
-# ioctl 번호: _IOWR('N', 0x41, struct nvme_passthru_cmd) = admin
-#             _IOWR('N', 0x43, struct nvme_passthru_cmd) = io
-NVME_IOCTL_ADMIN_CMD = 0xC0484E41
-NVME_IOCTL_IO_CMD    = 0xC0484E43
+# subprocess 기반: 샘플링 스레드가 idle/포화 감지 시 프로세스 kill 가능
+# 폴링 간격 (초) — 샘플링 포화 감지 후 프로세스 kill까지의 최대 지연
+SUBPROCESS_POLL_INTERVAL = 0.05  # 50ms
 
 
 class NVMeCommandType(Enum):
@@ -658,8 +643,8 @@ class NVMeFuzzer:
         self.cmd_pcs: dict[str, Set[int]] = {c.name: set() for c in self.commands}
         self.cmd_traces: dict[str, List[List[int]]] = {c.name: [] for c in self.commands}
 
-        # v4.2: NVMe device fd (ioctl 직접 호출용)
-        self._nvme_fd: Optional[int] = None
+        # v4.2: subprocess 입력 파일 경로 (재사용)
+        self._nvme_input_path: Optional[str] = None
 
     def _setup_directories(self):
         self.crashes_dir.mkdir(parents=True, exist_ok=True)
@@ -1200,20 +1185,9 @@ class NVMeFuzzer:
 
         return new_seed
 
-    def _open_nvme(self):
-        """NVMe 디바이스 fd를 열어둔다 (ioctl용, 한 번만 호출)"""
-        if self._nvme_fd is None:
-            self._nvme_fd = os.open(self.config.nvme_device, os.O_RDWR)
-            log.warning(f"[NVMe] Opened {self.config.nvme_device} (fd={self._nvme_fd})")
-
-    def _close_nvme(self):
-        """NVMe 디바이스 fd 닫기"""
-        if self._nvme_fd is not None:
-            os.close(self._nvme_fd)
-            self._nvme_fd = None
-
     def _send_nvme_command(self, data: bytes, seed: Seed) -> Optional[int]:
-        """v4.2: ioctl 직접 호출로 NVMe passthru 명령 전송.
+        """v4.2: subprocess(nvme-cli) 기반 NVMe passthru 명령 전송.
+        샘플링 스레드가 idle/포화를 감지하면 프로세스를 kill하고 즉시 다음으로 넘어감.
         성공 시 NVMe status code (int), 실패/타임아웃 시 None 반환."""
         cmd = seed.cmd
         MAX_DATA_BUF = 2 * 1024 * 1024  # 2MB 상한
@@ -1224,6 +1198,12 @@ class NVMeFuzzer:
             self.config.nvme_namespace if cmd.needs_namespace else 0
         )
 
+        # --- passthru 타입 결정 (admin vs io) ---
+        if seed.force_admin is not None:
+            passthru_type = "admin-passthru" if seed.force_admin else "io-passthru"
+        else:
+            passthru_type = "admin-passthru" if cmd.cmd_type == NVMeCommandType.ADMIN else "io-passthru"
+
         # Admin 명령어별 고정 응답 크기
         ADMIN_FIXED_RESPONSE = {
             "Identify": 4096,
@@ -1231,77 +1211,66 @@ class NVMeFuzzer:
             "TelemetryHostInitiated": 4096,
         }
 
-        # --- 데이터 버퍼 준비 ---
+        # --- data_len 결정 ---
+        data_len = 0
+        write_data = False  # 호스트→SSD 데이터 전송 여부
+
         if seed.data_len_override is not None:
-            # data_len 의도적 불일치 mutation: 커널은 이 크기로 DMA 버퍼 할당
-            override_len = min(max(0, seed.data_len_override), MAX_DATA_BUF)
-            if override_len > 0:
-                if cmd.needs_data and data:
-                    # 입력 데이터가 있으면 override 크기에 맞춰 패딩/트렁케이트
-                    padded = data[:override_len].ljust(override_len, b'\x00')
-                    data_buf = ctypes.create_string_buffer(padded, override_len)
-                else:
-                    data_buf = ctypes.create_string_buffer(override_len)
-                data_addr = ctypes.addressof(data_buf)
-                data_len = override_len
-            else:
-                data_addr = 0
-                data_len = 0
+            data_len = min(max(0, seed.data_len_override), MAX_DATA_BUF)
+            if cmd.needs_data and data:
+                write_data = True
         elif cmd.needs_data and data:
-            data_buf = ctypes.create_string_buffer(data, len(data))
-            data_addr = ctypes.addressof(data_buf)
             data_len = len(data)
+            write_data = True
         elif cmd.cmd_type == NVMeCommandType.IO and cmd.name not in ("Flush", "DatasetManagement"):
             nlb = seed.cdw12 & 0xFFFF
-            read_len = min(max(512, (nlb + 1) * 512), MAX_DATA_BUF)
-            data_buf = ctypes.create_string_buffer(read_len)
-            data_addr = ctypes.addressof(data_buf)
-            data_len = read_len
+            data_len = min(max(512, (nlb + 1) * 512), MAX_DATA_BUF)
         elif cmd.name == "GetLogPage":
             numdl = (seed.cdw10 >> 16) & 0x7FF
-            log_bytes = min(max(4, (numdl + 1) * 4), MAX_DATA_BUF)
-            data_buf = ctypes.create_string_buffer(log_bytes)
-            data_addr = ctypes.addressof(data_buf)
-            data_len = log_bytes
+            data_len = min(max(4, (numdl + 1) * 4), MAX_DATA_BUF)
         elif cmd.name in ADMIN_FIXED_RESPONSE:
-            resp_len = ADMIN_FIXED_RESPONSE[cmd.name]
-            data_buf = ctypes.create_string_buffer(resp_len)
-            data_addr = ctypes.addressof(data_buf)
-            data_len = resp_len
-        else:
-            data_addr = 0
-            data_len = 0
+            data_len = ADMIN_FIXED_RESPONSE[cmd.name]
 
-        # 명령어 그룹별 타임아웃 조회
+        # --- 입력 데이터 파일 준비 (Write 계열) ---
+        input_file = None
+        if write_data and data_len > 0:
+            if self._nvme_input_path is None:
+                self._nvme_input_path = str(self.output_dir / '.nvme_input.bin')
+            with open(self._nvme_input_path, 'wb') as f:
+                if seed.data_len_override is not None:
+                    f.write(data[:data_len].ljust(data_len, b'\x00'))
+                else:
+                    f.write(data)
+            input_file = self._nvme_input_path
+
+        # --- 타임아웃 ---
         timeout_ms = self.config.nvme_timeouts.get(
             cmd.timeout_group,
             self.config.nvme_timeouts.get('command', 8000)
         )
 
-        # struct nvme_passthru_cmd 패킹
-        passthru_cmd = struct.pack(
-            NVME_PASSTHRU_CMD_FMT,
-            actual_opcode & 0xFF, # opcode  (u8) — override 적용
-            0,                    # flags   (u8) — 커널이 non-zero 거부
-            0,                    # rsvd1   (u16)
-            actual_nsid,          # nsid    (u32) — override 적용
-            seed.cdw2,            # cdw2    (u32)
-            seed.cdw3,            # cdw3    (u32)
-            0,                    # metadata (u64)
-            data_addr,            # addr    (u64)
-            0,                    # metadata_len (u32)
-            data_len,             # data_len (u32)
-            seed.cdw10,           # cdw10   (u32)
-            seed.cdw11,           # cdw11   (u32)
-            seed.cdw12,           # cdw12   (u32)
-            seed.cdw13,           # cdw13   (u32)
-            seed.cdw14,           # cdw14   (u32)
-            seed.cdw15,           # cdw15   (u32)
-            timeout_ms,           # timeout_ms (u32)
-            0,                    # result  (u32)
-        )
+        # --- nvme CLI 명령 구성 ---
+        nvme_cmd = [
+            'nvme', passthru_type, self.config.nvme_device,
+            f'--opcode={actual_opcode:#x}',
+            f'--namespace-id={actual_nsid}',
+            f'--cdw2={seed.cdw2:#x}',
+            f'--cdw3={seed.cdw3:#x}',
+            f'--cdw10={seed.cdw10:#x}',
+            f'--cdw11={seed.cdw11:#x}',
+            f'--cdw12={seed.cdw12:#x}',
+            f'--cdw13={seed.cdw13:#x}',
+            f'--cdw14={seed.cdw14:#x}',
+            f'--cdw15={seed.cdw15:#x}',
+            f'--timeout={timeout_ms}',
+        ]
 
-        cmd_buf = bytearray(passthru_cmd)
+        if data_len > 0:
+            nvme_cmd.append(f'--data-len={data_len}')
+            if input_file:
+                nvme_cmd.extend([f'--input-file={input_file}', '-w'])
+            else:
+                nvme_cmd.append('-r')
 
         # 로그: mutation된 필드는 별도 표시
         mut_flags = []
@@ -1315,45 +1284,71 @@ class NVMeFuzzer:
             mut_flags.append(f"data_len={data_len}(override)")
         mut_str = f" MUT[{','.join(mut_flags)}]" if mut_flags else ""
 
-        log.info(f"[NVMe] ioctl {cmd.name} opcode=0x{actual_opcode:02x} nsid={actual_nsid} "
-                 f"timeout={timeout_ms}ms({cmd.timeout_group}) "
+        log.info(f"[NVMe] {passthru_type} {cmd.name} opcode=0x{actual_opcode:02x} "
+                 f"nsid={actual_nsid} timeout={timeout_ms}ms({cmd.timeout_group}) "
                  f"cdw10=0x{seed.cdw10:08x} cdw11=0x{seed.cdw11:08x} "
                  f"cdw12=0x{seed.cdw12:08x} data_len={data_len}"
                  f" data={data[:16].hex() if data else 'N/A'}"
                  f"{'...' if data and len(data) > 16 else ''}"
                  f"{mut_str}")
 
-        # ioctl 타입 결정: force_admin override 또는 정상 라우팅
-        if seed.force_admin is not None:
-            ioctl_nr = NVME_IOCTL_ADMIN_CMD if seed.force_admin else NVME_IOCTL_IO_CMD
-        else:
-            ioctl_nr = NVME_IOCTL_ADMIN_CMD if cmd.cmd_type == NVMeCommandType.ADMIN else NVME_IOCTL_IO_CMD
-
-        # "덫 놓기" 전략: ioctl 전에 샘플링 시작
+        # "덫 놓기" 전략: subprocess 전에 샘플링 시작
         # NOTE: stop_sampling()은 메인 루프(run)에서 호출 — 여기서는 하지 않음
         self.sampler.start_sampling()
 
+        process = None
         try:
-            rc = fcntl.ioctl(self._nvme_fd, ioctl_nr, cmd_buf)
+            process = subprocess.Popen(
+                nvme_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
 
-            # result 필드 추출 (offset 68, u32 LE)
-            result = struct.unpack_from('<I', cmd_buf, 68)[0]
-            log.info(f"[NVMe RET] rc={rc}, result=0x{result:08x}")
+            # 폴링 루프: 프로세스 완료 또는 샘플링 포화 감지 시 탈출
+            deadline = time.monotonic() + (timeout_ms / 1000.0) + 2.0
+            killed = False
 
+            while time.monotonic() < deadline:
+                ret = process.poll()
+                if ret is not None:
+                    break  # 프로세스 정상 완료
+
+                # 샘플링 스레드가 idle/포화 감지로 자체 종료했는지 확인
+                if (self.sampler.sample_thread
+                        and not self.sampler.sample_thread.is_alive()
+                        and not self.sampler.stop_event.is_set()):
+                    log.info(f"[NVMe] Sampling saturated → killing {cmd.name} "
+                             f"({self.sampler._stopped_reason})")
+                    process.kill()
+                    process.wait(timeout=2)
+                    killed = True
+                    break
+
+                time.sleep(SUBPROCESS_POLL_INTERVAL)
+            else:
+                # 데드라인 초과 (nvme-cli 타임아웃 + 여유시간도 넘김)
+                log.warning(f"[NVMe TIMEOUT] {cmd.name} — killing subprocess")
+                process.kill()
+                process.wait(timeout=2)
+                killed = True
+
+            if killed:
+                return None
+
+            # 프로세스 정상 완료 — 결과 수집
+            stdout, stderr = process.communicate(timeout=2)
+            rc = process.returncode
+            log.info(f"[NVMe RET] rc={rc}")
             return rc
 
-        except OSError as e:
-            # ioctl errno → NVMe status
-            # EINVAL(22), EIO(5) 등은 SSD가 거부한 것 (정상적 에러 응답)
-            if e.errno in (5, 22, 1):
-                log.info(f"[NVMe] {cmd.name} rejected: errno={e.errno} ({e.strerror})")
-                return e.errno
-            # 진짜 통신 에러
-            log.warning(f"[NVMe TIMEOUT/ERROR] {cmd.name}: {e}")
-            return None
-
         except Exception as e:
-            log.error(f"NVMe ioctl error ({cmd.name}): {e}")
+            log.error(f"NVMe subprocess error ({cmd.name}): {e}")
+            if process:
+                try:
+                    process.kill()
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
             return None
 
     def _seed_meta(self, seed: Seed) -> dict:
@@ -1842,8 +1837,6 @@ class NVMeFuzzer:
             log.warning("Idle PC     : not detected (saturation = global edge only)")
 
         # v4.2: NVMe 디바이스 fd 열기 (ioctl용)
-        self._open_nvme()
-
         self.start_time = datetime.now()
 
         try:
@@ -2014,7 +2007,6 @@ class NVMeFuzzer:
                 if isinstance(h, logging.FileHandler) and h.stream:
                     os.fsync(h.stream.fileno())
 
-            self._close_nvme()
             self.sampler.close()
 
 
