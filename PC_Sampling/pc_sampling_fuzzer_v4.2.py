@@ -97,7 +97,7 @@ MAX_ENERGY        = 16.0      # 최대 에너지 값
 # ---------------------------------------------------------------------------
 # subprocess 기반: 샘플링 스레드가 idle/포화 감지 시 프로세스 kill 가능
 # 폴링 간격 (초) — 샘플링 포화 감지 후 프로세스 kill까지의 최대 지연
-SUBPROCESS_POLL_INTERVAL = 0.05  # 50ms
+SUBPROCESS_POLL_INTERVAL = 0.001  # 1ms
 
 
 class NVMeCommandType(Enum):
@@ -1304,14 +1304,19 @@ class NVMeFuzzer:
                 stderr=subprocess.PIPE,
             )
 
-            # 폴링 루프: 프로세스 완료 또는 샘플링 포화 감지 시 탈출
-            deadline = time.monotonic() + (timeout_ms / 1000.0) + 2.0
+            # 빠른 경로: 대부분의 NVMe 명령은 <10ms에 완료됨
+            # process.wait()으로 짧은 간격 블로킹 대기하며
+            # 샘플링 포화 감지 시 프로세스 kill
+            timeout_sec = timeout_ms / 1000.0 + 2.0
+            deadline = time.monotonic() + timeout_sec
             killed = False
 
-            while time.monotonic() < deadline:
-                ret = process.poll()
-                if ret is not None:
-                    break  # 프로세스 정상 완료
+            while True:
+                try:
+                    process.wait(timeout=SUBPROCESS_POLL_INTERVAL)
+                    break  # 프로세스 완료
+                except subprocess.TimeoutExpired:
+                    pass
 
                 # 샘플링 스레드가 idle/포화 감지로 자체 종료했는지 확인
                 if (self.sampler.sample_thread
@@ -1324,19 +1329,16 @@ class NVMeFuzzer:
                     killed = True
                     break
 
-                time.sleep(SUBPROCESS_POLL_INTERVAL)
-            else:
-                # 데드라인 초과 (nvme-cli 타임아웃 + 여유시간도 넘김)
-                log.warning(f"[NVMe TIMEOUT] {cmd.name} — killing subprocess")
-                process.kill()
-                process.wait(timeout=2)
-                killed = True
+                if time.monotonic() >= deadline:
+                    log.warning(f"[NVMe TIMEOUT] {cmd.name} — killing subprocess")
+                    process.kill()
+                    process.wait(timeout=2)
+                    killed = True
+                    break
 
             if killed:
                 return None
 
-            # 프로세스 정상 완료 — 결과 수집
-            stdout, stderr = process.communicate(timeout=2)
             rc = process.returncode
             log.info(f"[NVMe RET] rc={rc}")
             return rc
