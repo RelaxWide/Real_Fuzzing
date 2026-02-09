@@ -131,14 +131,24 @@ class NVMeCommand:
     description: str = ""
 
 
-NVME_COMMANDS = [
-    # ── Admin Commands ──
+# 기본 활성화 (비파괴, 빠른 응답) — --commands 없이 실행 시 이것만 사용
+NVME_COMMANDS_DEFAULT = [
+    # ── Admin Commands (읽기 전용) ──
     NVMeCommand("Identify", 0x06, NVMeCommandType.ADMIN, needs_data=False,
                 description="장치/네임스페이스 정보 조회"),
     NVMeCommand("GetLogPage", 0x02, NVMeCommandType.ADMIN, needs_data=False,
                 description="로그 페이지 조회"),
     NVMeCommand("GetFeatures", 0x0A, NVMeCommandType.ADMIN, needs_data=False,
                 description="기능 조회"),
+    # ── I/O Commands ──
+    NVMeCommand("Read", 0x02, NVMeCommandType.IO, needs_data=False,
+                description="데이터 읽기"),
+    NVMeCommand("Write", 0x01, NVMeCommandType.IO,
+                description="데이터 쓰기"),
+]
+
+# 전체 명령어 (위험/파괴적 포함) — --commands 또는 --all-commands로 활성화
+NVME_COMMANDS_EXTENDED = [
     NVMeCommand("SetFeatures", 0x09, NVMeCommandType.ADMIN,
                 description="기능 설정"),
     NVMeCommand("FWDownload", 0x11, NVMeCommandType.ADMIN,
@@ -155,11 +165,6 @@ NVME_COMMANDS = [
     NVMeCommand("TelemetryHostInitiated", 0x02, NVMeCommandType.ADMIN, needs_data=False,
                 timeout_group="telemetry",
                 description="텔레메트리 로그 (호스트 개시)"),
-    # ── I/O Commands ──
-    NVMeCommand("Read", 0x02, NVMeCommandType.IO, needs_data=False,
-                description="데이터 읽기"),
-    NVMeCommand("Write", 0x01, NVMeCommandType.IO,
-                description="데이터 쓰기"),
     NVMeCommand("Flush", 0x00, NVMeCommandType.IO, needs_data=False,
                 timeout_group="flush",
                 description="캐시 플러시"),
@@ -167,6 +172,9 @@ NVME_COMMANDS = [
                 timeout_group="dsm",
                 description="데이터셋 관리 (TRIM/Deallocate)"),
 ]
+
+# 전체 명령어 (이름으로 조회용)
+NVME_COMMANDS = NVME_COMMANDS_DEFAULT + NVME_COMMANDS_EXTENDED
 
 
 @dataclass
@@ -205,6 +213,7 @@ class FuzzConfig:
     nvme_timeouts: dict = field(default_factory=lambda: NVME_TIMEOUTS.copy())
 
     enabled_commands: List[str] = field(default_factory=list)
+    all_commands: bool = False   # True면 위험(파괴적) 명령어 포함 전체 활성화
 
     # 샘플링 설정
     sample_interval_us: int = SAMPLE_INTERVAL_US
@@ -620,9 +629,14 @@ class NVMeFuzzer:
         self.sampler = JLinkPCSampler(config)
 
         if config.enabled_commands:
+            # --commands 지정 시: NVME_COMMANDS 전체에서 이름 매칭
             self.commands = [c for c in NVME_COMMANDS if c.name in config.enabled_commands]
-        else:
+        elif config.all_commands:
+            # --all-commands: 위험 명령어 포함 전체
             self.commands = NVME_COMMANDS.copy()
+        else:
+            # 기본: 안전(비파괴) 명령어만
+            self.commands = NVME_COMMANDS_DEFAULT.copy()
 
         log.info(f"[Fuzzer] Enabled commands: {[c.name for c in self.commands]}")
 
@@ -2012,7 +2026,10 @@ if __name__ == "__main__":
     parser.add_argument('--nvme', default=NVME_DEVICE, help='NVMe device')
     parser.add_argument('--namespace', type=int, default=NVME_NAMESPACE)
     parser.add_argument('--commands', nargs='+', default=[],
-                        help='Commands to use (e.g., Read Write GetFeatures)')
+                        help='Commands to use (e.g., Read Write GetFeatures FormatNVM)')
+    parser.add_argument('--all-commands', action='store_true', default=False,
+                        help='Enable ALL commands including destructive ones '
+                             '(FormatNVM, Sanitize, FWCommit, etc.)')
     parser.add_argument('--speed', type=int, default=JLINK_SPEED, help='JTAG speed (kHz)')
     parser.add_argument('--runtime', type=int, default=TOTAL_RUNTIME_SEC)
     parser.add_argument('--output', default=OUTPUT_DIR, help='Output dir')
@@ -2047,12 +2064,29 @@ if __name__ == "__main__":
                              f"Valid: {', '.join(nvme_timeouts.keys())}")
             nvme_timeouts[group] = int(ms)
 
-    print("Available commands:")
-    for cmd in NVME_COMMANDS:
+    # 활성화될 명령어 결정
+    if args.commands:
+        active_cmds = [c for c in NVME_COMMANDS if c.name in args.commands]
+    elif args.all_commands:
+        active_cmds = NVME_COMMANDS
+    else:
+        active_cmds = NVME_COMMANDS_DEFAULT
+
+    print("Default commands (safe):")
+    for cmd in NVME_COMMANDS_DEFAULT:
         tg = cmd.timeout_group
         tms = nvme_timeouts.get(tg, nvme_timeouts['command'])
+        marker = " *" if cmd in active_cmds else ""
         print(f"  {cmd.name}: opcode={hex(cmd.opcode)}, type={cmd.cmd_type.value}, "
-              f"timeout={tg}({tms}ms)")
+              f"timeout={tg}({tms}ms){marker}")
+    print("Extended commands (destructive, use --all-commands or --commands):")
+    for cmd in NVME_COMMANDS_EXTENDED:
+        tg = cmd.timeout_group
+        tms = nvme_timeouts.get(tg, nvme_timeouts['command'])
+        marker = " *" if cmd in active_cmds else ""
+        print(f"  {cmd.name}: opcode={hex(cmd.opcode)}, type={cmd.cmd_type.value}, "
+              f"timeout={tg}({tms}ms){marker}")
+    print(f"\nActive: {[c.name for c in active_cmds]}")
     print()
     print(f"v{FUZZER_VERSION} Features:")
     print("  - ioctl direct NVMe passthru (no subprocess fork)")
@@ -2069,6 +2103,7 @@ if __name__ == "__main__":
         nvme_namespace=args.namespace,
         nvme_timeouts=nvme_timeouts,
         enabled_commands=args.commands,
+        all_commands=args.all_commands,
         total_runtime_sec=args.runtime,
         output_dir=args.output,
         max_samples_per_run=args.samples,
