@@ -1185,10 +1185,20 @@ class NVMeFuzzer:
 
         return new_seed
 
+    # 반환값 상수: crash/timeout/포화 kill을 구분
+    RC_SATURATED = -1000   # 샘플링 포화로 프로세스 kill (정상)
+    RC_TIMEOUT   = -1001   # NVMe 타임아웃 (의미 있는 이벤트)
+    RC_ERROR     = -1002   # subprocess 에러 (내부 문제)
+
     def _send_nvme_command(self, data: bytes, seed: Seed) -> Optional[int]:
         """v4.2: subprocess(nvme-cli) 기반 NVMe passthru 명령 전송.
         샘플링 스레드가 idle/포화를 감지하면 프로세스를 kill하고 즉시 다음으로 넘어감.
-        성공 시 NVMe status code (int), 실패/타임아웃 시 None 반환."""
+        반환값:
+          >= 0: nvme-cli returncode (0=성공, 양수=NVMe 에러)
+          RC_SATURATED(-1000): 샘플링 포화로 kill (정상, crash 아님)
+          RC_TIMEOUT(-1001): NVMe 타임아웃
+          RC_ERROR(-1002): 내부 에러
+        """
         cmd = seed.cmd
         MAX_DATA_BUF = 2 * 1024 * 1024  # 2MB 상한
 
@@ -1319,25 +1329,21 @@ class NVMeFuzzer:
                     pass
 
                 # 샘플링 스레드가 idle/포화 감지로 자체 종료했는지 확인
+                # 샘플링 스레드가 idle/포화 감지로 자체 종료했는지 확인
                 if (self.sampler.sample_thread
                         and not self.sampler.sample_thread.is_alive()
                         and not self.sampler.stop_event.is_set()):
-                    log.info(f"[NVMe] Sampling saturated → killing {cmd.name} "
-                             f"({self.sampler._stopped_reason})")
+                    log.debug(f"[NVMe] Sampling saturated → killing {cmd.name} "
+                              f"({self.sampler._stopped_reason})")
                     process.kill()
                     process.wait(timeout=2)
-                    killed = True
-                    break
+                    return self.RC_SATURATED
 
                 if time.monotonic() >= deadline:
                     log.warning(f"[NVMe TIMEOUT] {cmd.name} — killing subprocess")
                     process.kill()
                     process.wait(timeout=2)
-                    killed = True
-                    break
-
-            if killed:
-                return None
+                    return self.RC_TIMEOUT
 
             rc = process.returncode
             log.info(f"[NVMe RET] rc={rc}")
@@ -1351,7 +1357,7 @@ class NVMeFuzzer:
                     process.wait(timeout=2)
                 except Exception:
                     pass
-            return None
+            return self.RC_ERROR
 
     def _seed_meta(self, seed: Seed) -> dict:
         """Seed의 전체 메타데이터를 dict로 반환 (재현용)"""
@@ -1375,7 +1381,7 @@ class NVMeFuzzer:
             meta["data_len_override"] = seed.data_len_override
         return meta
 
-    def _save_crash(self, data: bytes, seed: Seed):
+    def _save_crash(self, data: bytes, seed: Seed, reason: str = "timeout"):
         input_hash = hashlib.md5(data).hexdigest()[:12]
         filename = f"crash_{seed.cmd.name}_{hex(seed.cmd.opcode)}_{input_hash}"
         filepath = self.crashes_dir / filename
@@ -1383,8 +1389,11 @@ class NVMeFuzzer:
         with open(filepath, 'wb') as f:
             f.write(data)
 
+        meta = self._seed_meta(seed)
+        meta["crash_reason"] = reason
+        meta["timestamp"] = datetime.now().isoformat()
         with open(str(filepath) + '.json', 'w') as f:
-            json.dump(self._seed_meta(seed), f)
+            json.dump(meta, f, indent=2)
 
     def _save_per_command_data(self):
         """명령어별 edge/PC 데이터를 JSON 파일로 저장"""
@@ -1866,7 +1875,21 @@ class NVMeFuzzer:
                 self.executions += 1
                 self.cmd_stats[cmd.name]["exec"] += 1
 
-                if rc is not None:
+                # --- rc 분류 ---
+                # RC_SATURATED: 샘플링 포화로 kill (정상, crash 아님)
+                # RC_TIMEOUT: NVMe 타임아웃 (의미 있는 이벤트)
+                # RC_ERROR: 내부 에러
+                # >= 0: nvme-cli returncode (0=성공)
+
+                if rc == self.RC_SATURATED:
+                    # 샘플링 포화 → 정상적 조기 중단, crash 아님
+                    self.sampler.stop_sampling()
+                    self.rc_stats[cmd.name]["saturated_kill"] += 1
+                    log.debug(f"exec={self.executions} cmd={cmd.name} "
+                              f"rc=SATURATED (sampling idle/saturated, skipped)")
+                    continue
+
+                if rc not in (self.RC_TIMEOUT, self.RC_ERROR):
                     self.rc_stats[cmd.name][rc] += 1
 
                 # v4: Edge 기반 커버리지 평가
@@ -1905,14 +1928,20 @@ class NVMeFuzzer:
                     edges_str = [(hex(p), hex(c)) for p, c in sorted(self.sampler.current_edges)]
                     log.debug(f"  Edges: {edges_str[:20]}{'...' if len(edges_str) > 20 else ''}")
 
-                if rc is None:
+                # --- Timeout / Error 처리 ---
+                if rc == self.RC_TIMEOUT:
                     self.crash_inputs.append((fuzz_data, cmd))
                     self._save_crash(fuzz_data, mutated_seed)
-                    log.error(f"Crash/Timeout with {cmd.name}!")
+                    log.error(f"[TIMEOUT] {cmd.name} opcode=0x{mutated_seed.cmd.opcode:02x} "
+                              f"timeout_group={cmd.timeout_group} — saved to crashes/")
                     if not self.sampler.reconnect():
                         log.error("Cannot reconnect to J-Link, stopping")
                         break
                     time.sleep(1)
+                    continue
+
+                if rc == self.RC_ERROR:
+                    log.warning(f"[ERROR] {cmd.name} subprocess internal error — skipping")
                     continue
 
                 if is_interesting:
