@@ -659,12 +659,13 @@ class NVMeFuzzer:
                 dict(cdw10=0x03, description="NS Identification Descriptor list"),
             ],
             "GetLogPage": [
-                # CDW10[7:0]=LID, CDW10[27:16]=NUMDL (Number of Dwords Lower, 0-based)
-                dict(cdw10=(0xFF << 16) | 0x01, description="Error Information Log"),
-                dict(cdw10=(0x1FF << 16) | 0x02, description="SMART / Health Log"),
-                dict(cdw10=(0x1FF << 16) | 0x03, description="Firmware Slot Info Log"),
-                dict(cdw10=(0x7F << 16) | 0x05, description="Commands Supported and Effects Log"),
-                dict(cdw10=(0x1FF << 16) | 0x06, description="Device Self-test Log"),
+                # CDW10[7:0]=LID, CDW10[26:16]=NUMDL (Number of Dwords Lower, 0-based)
+                # NUMDL = (bytes / 4) - 1, data_len은 _send_nvme_command에서 NUMDL 기반으로 계산
+                dict(cdw10=(0x0F << 16) | 0x01, description="Error Information Log (64B)"),
+                dict(cdw10=(0x7F << 16) | 0x02, description="SMART / Health Log (512B)"),
+                dict(cdw10=(0x7F << 16) | 0x03, description="Firmware Slot Info Log (512B)"),
+                dict(cdw10=(0x1FF << 16) | 0x05, description="Commands Supported and Effects Log (2048B)"),
+                dict(cdw10=(0x8C << 16) | 0x06, description="Device Self-test Log (564B)"),
             ],
             "GetFeatures": [
                 # CDW10[7:0]=FID (Feature Identifier)
@@ -1135,9 +1136,9 @@ class NVMeFuzzer:
         #   Read(IO): NLB*512 응답, Write(IO): NLB*512 입력
         MAX_DATA_BUF = 2 * 1024 * 1024  # 2MB 상한 (mutation으로 인한 OOM 방지)
 
-        ADMIN_RESPONSE_SIZES = {
+        # Admin 명령어별 고정 응답 크기 (data_len과 무관하게 항상 이 크기의 버퍼 필요)
+        ADMIN_FIXED_RESPONSE = {
             "Identify": 4096,
-            "GetLogPage": 4096,
             "GetFeatures": 4096,
             "TelemetryHostInitiated": 4096,
         }
@@ -1147,16 +1148,25 @@ class NVMeFuzzer:
             data_buf = ctypes.create_string_buffer(data, len(data))
             data_addr = ctypes.addressof(data_buf)
             data_len = len(data)
-        elif cmd.cmd_type == NVMeCommandType.IO:
+        elif cmd.cmd_type == NVMeCommandType.IO and cmd.name != "Flush":
             # I/O Read: NLB 기반 버퍼 크기 계산 (상한 적용)
             nlb = seed.cdw12 & 0xFFFF  # NLB는 CDW12[15:0]만 유효
             read_len = min(max(512, (nlb + 1) * 512), MAX_DATA_BUF)
             data_buf = ctypes.create_string_buffer(read_len)
             data_addr = ctypes.addressof(data_buf)
             data_len = read_len
-        elif cmd.name in ADMIN_RESPONSE_SIZES:
-            # Admin 명령어: 응답 데이터를 받을 버퍼 (Identify=4KB 등)
-            resp_len = ADMIN_RESPONSE_SIZES[cmd.name]
+        elif cmd.name == "GetLogPage":
+            # GetLogPage: data_len은 CDW10의 NUMDL에서 계산해야 커널 검증 통과
+            # CDW10[26:16] = NUMDL (0-based, in dwords)
+            numdl = (seed.cdw10 >> 16) & 0x7FF  # 11 bits
+            log_bytes = (numdl + 1) * 4
+            log_bytes = min(max(4, log_bytes), MAX_DATA_BUF)
+            data_buf = ctypes.create_string_buffer(log_bytes)
+            data_addr = ctypes.addressof(data_buf)
+            data_len = log_bytes
+        elif cmd.name in ADMIN_FIXED_RESPONSE:
+            # Admin 명령어: 고정 크기 응답 버퍼
+            resp_len = ADMIN_FIXED_RESPONSE[cmd.name]
             data_buf = ctypes.create_string_buffer(resp_len)
             data_addr = ctypes.addressof(data_buf)
             data_len = resp_len
