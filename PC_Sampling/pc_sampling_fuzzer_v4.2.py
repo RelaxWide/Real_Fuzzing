@@ -183,6 +183,11 @@ class Seed:
     cdw13: int = 0
     cdw14: int = 0
     cdw15: int = 0
+    # 확장 mutation 필드 (None = 명령어 기본값 사용)
+    opcode_override: Optional[int] = None       # opcode mutation (vendor-specific 등)
+    nsid_override: Optional[int] = None         # namespace ID mutation
+    force_admin: Optional[bool] = None          # True=admin ioctl, False=IO ioctl, None=정상
+    data_len_override: Optional[int] = None     # data_len↔CDW 의도적 불일치
     exec_count: int = 0          # 이 시드가 선택된 횟수
     found_at: int = 0            # 발견된 시점 (execution number)
     new_edges: int = 0           # 발견한 새 edge 수
@@ -1084,7 +1089,7 @@ class NVMeFuzzer:
         )
 
     def _mutate(self, seed: Seed) -> Seed:
-        """AFL++ 스타일 Seed 전체 변형: havoc + splice + CDW 변형"""
+        """AFL++ 스타일 Seed 전체 변형: havoc + splice + CDW + 확장 mutation"""
         # 15% 확률로 splice 먼저 적용 (AFL++ splicing stage)
         if random.random() < 0.15:
             seed = self._splice(seed)
@@ -1098,11 +1103,14 @@ class NVMeFuzzer:
             cdw10=seed.cdw10, cdw11=seed.cdw11,
             cdw12=seed.cdw12, cdw13=seed.cdw13,
             cdw14=seed.cdw14, cdw15=seed.cdw15,
+            opcode_override=seed.opcode_override,
+            nsid_override=seed.nsid_override,
+            force_admin=seed.force_admin,
+            data_len_override=seed.data_len_override,
         )
 
-        # 30% 확률로 CDW 필드도 변형
+        # 30% 확률로 CDW 필드 변형
         if random.random() < 0.3:
-            # 1~3개 CDW 필드 동시 변형 (havoc 스타일)
             num_cdw_muts = random.randint(1, 3)
             cdw_fields = ['cdw2', 'cdw3', 'cdw10', 'cdw11',
                           'cdw12', 'cdw13', 'cdw14', 'cdw15']
@@ -1110,6 +1118,71 @@ class NVMeFuzzer:
                 field = random.choice(cdw_fields)
                 old_val = getattr(new_seed, field)
                 setattr(new_seed, field, self._mutate_cdw(old_val))
+
+        # --- 확장 mutation (각각 독립 확률) ---
+
+        # [1] opcode mutation (10%) — 미정의/vendor-specific opcode로 dispatch 테이블 탐색
+        if random.random() < 0.10:
+            mut_type = random.randint(0, 3)
+            if mut_type == 0:
+                # vendor-specific 범위 (0xC0~0xFF for admin, 0x80~0xFF for IO)
+                if seed.cmd.cmd_type == NVMeCommandType.ADMIN:
+                    new_seed.opcode_override = random.randint(0xC0, 0xFF)
+                else:
+                    new_seed.opcode_override = random.randint(0x80, 0xFF)
+            elif mut_type == 1:
+                # 완전 랜덤 opcode
+                new_seed.opcode_override = random.randint(0x00, 0xFF)
+            elif mut_type == 2:
+                # 원본 opcode의 bit flip
+                new_seed.opcode_override = seed.cmd.opcode ^ (1 << random.randint(0, 7))
+            else:
+                # 다른 알려진 명령어의 opcode 가져오기
+                other_cmd = random.choice(NVME_COMMANDS)
+                new_seed.opcode_override = other_cmd.opcode
+
+        # [2] nsid mutation (10%) — 잘못된 namespace로 에러 핸들링 코드 탐색
+        if random.random() < 0.10:
+            new_seed.nsid_override = random.choice([
+                0x00000000,       # nsid=0 (보통 "all namespaces" 또는 invalid)
+                0xFFFFFFFF,       # broadcast nsid
+                0x00000002,       # 존재하지 않을 가능성 높은 NS
+                0xFFFFFFFE,       # boundary
+                random.randint(2, 0xFFFF),  # 랜덤 존재하지 않는 NS
+                random.randint(0, 0xFFFFFFFF),  # 완전 랜덤
+            ])
+
+        # [3] Admin↔IO 교차 전송 (5%) — 잘못된 큐로 보내서 디스패치 혼란 유도
+        if random.random() < 0.05:
+            # 원래 admin이면 IO로, IO면 admin으로
+            new_seed.force_admin = (seed.cmd.cmd_type != NVMeCommandType.ADMIN)
+
+        # [4] data_len 의도적 불일치 (8%) — 커널은 통과, SSD DMA 엔진에 혼란
+        if random.random() < 0.08:
+            new_seed.data_len_override = random.choice([
+                0,                 # 빈 버퍼
+                4,                 # 극소
+                64,
+                512,
+                4096,
+                8192,
+                65536,             # 64KB
+                random.randint(1, 2 * 1024 * 1024),  # 랜덤 (max 2MB)
+            ])
+
+        # [5] GetLogPage NUMDL 과대 요청 (GetLogPage일 때 15%)
+        #     data_len을 NUMDL에 맞춰서 커널은 통과, SSD에 스펙 초과 크기 요청
+        if seed.cmd.name == "GetLogPage" and random.random() < 0.15:
+            lid = new_seed.cdw10 & 0xFF
+            # NUMDL을 스펙보다 크게 설정
+            oversized_numdl = random.choice([
+                0x7FF,              # 11-bit 최대 (8192 bytes)
+                0x3FF,              # 4096 bytes
+                random.randint(0x100, 0x7FF),
+            ])
+            new_seed.cdw10 = (new_seed.cdw10 & 0xF800FFFF) | (oversized_numdl << 16)
+            # data_len을 NUMDL에 맞춤 → 커널 통과 보장
+            new_seed.data_len_override = (oversized_numdl + 1) * 4
 
         return new_seed
 
@@ -1129,43 +1202,54 @@ class NVMeFuzzer:
         """v4.2: ioctl 직접 호출로 NVMe passthru 명령 전송.
         성공 시 NVMe status code (int), 실패/타임아웃 시 None 반환."""
         cmd = seed.cmd
+        MAX_DATA_BUF = 2 * 1024 * 1024  # 2MB 상한
 
-        # 데이터 버퍼 준비 (ctypes로 커널에 전달할 주소 확보)
-        # NVMe 명령별 응답/입력 데이터 크기:
-        #   Identify: 4096B 응답, GetLogPage: 가변 응답, GetFeatures: 응답 없거나 소량
-        #   Read(IO): NLB*512 응답, Write(IO): NLB*512 입력
-        MAX_DATA_BUF = 2 * 1024 * 1024  # 2MB 상한 (mutation으로 인한 OOM 방지)
+        # --- override 필드 적용 ---
+        actual_opcode = seed.opcode_override if seed.opcode_override is not None else cmd.opcode
+        actual_nsid = seed.nsid_override if seed.nsid_override is not None else (
+            self.config.nvme_namespace if cmd.needs_namespace else 0
+        )
 
-        # Admin 명령어별 고정 응답 크기 (data_len과 무관하게 항상 이 크기의 버퍼 필요)
+        # Admin 명령어별 고정 응답 크기
         ADMIN_FIXED_RESPONSE = {
             "Identify": 4096,
             "GetFeatures": 4096,
             "TelemetryHostInitiated": 4096,
         }
 
-        if cmd.needs_data and data:
-            # Write 등 입력 데이터가 있는 명령어
+        # --- 데이터 버퍼 준비 ---
+        if seed.data_len_override is not None:
+            # data_len 의도적 불일치 mutation: 커널은 이 크기로 DMA 버퍼 할당
+            override_len = min(max(0, seed.data_len_override), MAX_DATA_BUF)
+            if override_len > 0:
+                if cmd.needs_data and data:
+                    # 입력 데이터가 있으면 override 크기에 맞춰 패딩/트렁케이트
+                    padded = data[:override_len].ljust(override_len, b'\x00')
+                    data_buf = ctypes.create_string_buffer(padded, override_len)
+                else:
+                    data_buf = ctypes.create_string_buffer(override_len)
+                data_addr = ctypes.addressof(data_buf)
+                data_len = override_len
+            else:
+                data_addr = 0
+                data_len = 0
+        elif cmd.needs_data and data:
             data_buf = ctypes.create_string_buffer(data, len(data))
             data_addr = ctypes.addressof(data_buf)
             data_len = len(data)
-        elif cmd.cmd_type == NVMeCommandType.IO and cmd.name != "Flush":
-            # I/O Read: NLB 기반 버퍼 크기 계산 (상한 적용)
-            nlb = seed.cdw12 & 0xFFFF  # NLB는 CDW12[15:0]만 유효
+        elif cmd.cmd_type == NVMeCommandType.IO and cmd.name not in ("Flush", "DatasetManagement"):
+            nlb = seed.cdw12 & 0xFFFF
             read_len = min(max(512, (nlb + 1) * 512), MAX_DATA_BUF)
             data_buf = ctypes.create_string_buffer(read_len)
             data_addr = ctypes.addressof(data_buf)
             data_len = read_len
         elif cmd.name == "GetLogPage":
-            # GetLogPage: data_len은 CDW10의 NUMDL에서 계산해야 커널 검증 통과
-            # CDW10[26:16] = NUMDL (0-based, in dwords)
-            numdl = (seed.cdw10 >> 16) & 0x7FF  # 11 bits
-            log_bytes = (numdl + 1) * 4
-            log_bytes = min(max(4, log_bytes), MAX_DATA_BUF)
+            numdl = (seed.cdw10 >> 16) & 0x7FF
+            log_bytes = min(max(4, (numdl + 1) * 4), MAX_DATA_BUF)
             data_buf = ctypes.create_string_buffer(log_bytes)
             data_addr = ctypes.addressof(data_buf)
             data_len = log_bytes
         elif cmd.name in ADMIN_FIXED_RESPONSE:
-            # Admin 명령어: 고정 크기 응답 버퍼
             resp_len = ADMIN_FIXED_RESPONSE[cmd.name]
             data_buf = ctypes.create_string_buffer(resp_len)
             data_addr = ctypes.addressof(data_buf)
@@ -1174,8 +1258,6 @@ class NVMeFuzzer:
             data_addr = 0
             data_len = 0
 
-        nsid = self.config.nvme_namespace if cmd.needs_namespace else 0
-
         # 명령어 그룹별 타임아웃 조회
         timeout_ms = self.config.nvme_timeouts.get(
             cmd.timeout_group,
@@ -1183,17 +1265,16 @@ class NVMeFuzzer:
         )
 
         # struct nvme_passthru_cmd 패킹
-        # fmt: 'BBH I I I Q Q I I I I I I I I I I'
         passthru_cmd = struct.pack(
             NVME_PASSTHRU_CMD_FMT,
-            cmd.opcode,           # opcode  (u8)
-            0,                    # flags   (u8)
+            actual_opcode & 0xFF, # opcode  (u8) — override 적용
+            0,                    # flags   (u8) — 커널이 non-zero 거부
             0,                    # rsvd1   (u16)
-            nsid,                 # nsid    (u32)
+            actual_nsid,          # nsid    (u32) — override 적용
             seed.cdw2,            # cdw2    (u32)
             seed.cdw3,            # cdw3    (u32)
             0,                    # metadata (u64)
-            data_addr,            # addr    (u64) — 데이터 버퍼 주소
+            data_addr,            # addr    (u64)
             0,                    # metadata_len (u32)
             data_len,             # data_len (u32)
             seed.cdw10,           # cdw10   (u32)
@@ -1203,20 +1284,36 @@ class NVMeFuzzer:
             seed.cdw14,           # cdw14   (u32)
             seed.cdw15,           # cdw15   (u32)
             timeout_ms,           # timeout_ms (u32)
-            0,                    # result  (u32) — 커널이 채워줌
+            0,                    # result  (u32)
         )
 
-        # mutable buffer (ioctl이 result 필드를 업데이트)
         cmd_buf = bytearray(passthru_cmd)
 
-        log.info(f"[NVMe] ioctl {cmd.name} opcode=0x{cmd.opcode:02x} nsid={nsid} "
+        # 로그: mutation된 필드는 별도 표시
+        mut_flags = []
+        if seed.opcode_override is not None:
+            mut_flags.append(f"opcode=0x{actual_opcode:02x}(was 0x{cmd.opcode:02x})")
+        if seed.nsid_override is not None:
+            mut_flags.append(f"nsid=0x{actual_nsid:x}(mut)")
+        if seed.force_admin is not None:
+            mut_flags.append(f"force_{'admin' if seed.force_admin else 'io'}")
+        if seed.data_len_override is not None:
+            mut_flags.append(f"data_len={data_len}(override)")
+        mut_str = f" MUT[{','.join(mut_flags)}]" if mut_flags else ""
+
+        log.info(f"[NVMe] ioctl {cmd.name} opcode=0x{actual_opcode:02x} nsid={actual_nsid} "
                  f"timeout={timeout_ms}ms({cmd.timeout_group}) "
                  f"cdw10=0x{seed.cdw10:08x} cdw11=0x{seed.cdw11:08x} "
                  f"cdw12=0x{seed.cdw12:08x} data_len={data_len}"
                  f" data={data[:16].hex() if data else 'N/A'}"
-                 f"{'...' if data and len(data) > 16 else ''}")
+                 f"{'...' if data and len(data) > 16 else ''}"
+                 f"{mut_str}")
 
-        ioctl_nr = NVME_IOCTL_ADMIN_CMD if cmd.cmd_type == NVMeCommandType.ADMIN else NVME_IOCTL_IO_CMD
+        # ioctl 타입 결정: force_admin override 또는 정상 라우팅
+        if seed.force_admin is not None:
+            ioctl_nr = NVME_IOCTL_ADMIN_CMD if seed.force_admin else NVME_IOCTL_IO_CMD
+        else:
+            ioctl_nr = NVME_IOCTL_ADMIN_CMD if cmd.cmd_type == NVMeCommandType.ADMIN else NVME_IOCTL_IO_CMD
 
         # "덫 놓기" 전략: ioctl 전에 샘플링 시작
         # NOTE: stop_sampling()은 메인 루프(run)에서 호출 — 여기서는 하지 않음
@@ -1246,8 +1343,8 @@ class NVMeFuzzer:
             return None
 
     def _seed_meta(self, seed: Seed) -> dict:
-        """Seed의 CDW 메타데이터를 dict로 반환"""
-        return {
+        """Seed의 전체 메타데이터를 dict로 반환 (재현용)"""
+        meta = {
             "command": seed.cmd.name,
             "opcode": hex(seed.cmd.opcode),
             "type": seed.cmd.cmd_type.value,
@@ -1256,6 +1353,16 @@ class NVMeFuzzer:
             "cdw12": seed.cdw12, "cdw13": seed.cdw13,
             "cdw14": seed.cdw14, "cdw15": seed.cdw15,
         }
+        # 확장 mutation 필드 (None이 아닌 경우만 기록)
+        if seed.opcode_override is not None:
+            meta["opcode_override"] = hex(seed.opcode_override)
+        if seed.nsid_override is not None:
+            meta["nsid_override"] = hex(seed.nsid_override)
+        if seed.force_admin is not None:
+            meta["force_admin"] = seed.force_admin
+        if seed.data_len_override is not None:
+            meta["data_len_override"] = seed.data_len_override
+        return meta
 
     def _save_crash(self, data: bytes, seed: Seed):
         input_hash = hashlib.md5(data).hexdigest()[:12]
@@ -1803,7 +1910,7 @@ class NVMeFuzzer:
                     self.sampler.interesting_inputs += 1
                     self.cmd_stats[cmd.name]["interesting"] += 1
 
-                    # v4: 새 Seed 추가 (CDW 값 보존)
+                    # v4: 새 Seed 추가 (CDW + 확장 mutation 필드 보존)
                     new_seed = Seed(
                         data=fuzz_data,
                         cmd=cmd,
@@ -1811,6 +1918,10 @@ class NVMeFuzzer:
                         cdw10=mutated_seed.cdw10, cdw11=mutated_seed.cdw11,
                         cdw12=mutated_seed.cdw12, cdw13=mutated_seed.cdw13,
                         cdw14=mutated_seed.cdw14, cdw15=mutated_seed.cdw15,
+                        opcode_override=mutated_seed.opcode_override,
+                        nsid_override=mutated_seed.nsid_override,
+                        force_admin=mutated_seed.force_admin,
+                        data_len_override=mutated_seed.data_len_override,
                         found_at=self.executions,
                         new_edges=new_edges
                     )
