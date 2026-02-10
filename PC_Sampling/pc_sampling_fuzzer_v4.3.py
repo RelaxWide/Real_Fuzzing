@@ -2423,13 +2423,15 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # CLI에서 지정한 제외 opcode 파싱
-    excluded_opcodes = []
+    # CLI에서 지정한 제외 opcode 파싱 (상단 EXCLUDED_OPCODES 기본값 + CLI 추가분 병합)
+    excluded_opcodes = list(EXCLUDED_OPCODES)
     if args.exclude_opcodes.strip():
         for tok in args.exclude_opcodes.split(','):
             tok = tok.strip()
             if tok:
-                excluded_opcodes.append(int(tok, 16) if tok.startswith(('0x', '0X')) else int(tok, 16))
+                val = int(tok, 16) if tok.startswith(('0x', '0X')) else int(tok, 16)
+                if val not in excluded_opcodes:
+                    excluded_opcodes.append(val)
 
     # CLI에서 지정한 타임아웃으로 오버라이드
     nvme_timeouts = NVME_TIMEOUTS.copy()
