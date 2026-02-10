@@ -104,6 +104,8 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 | **interval 체크포인트 frozenset** | Perf | `sample_count in (10, 25, 50, 100, 200, 500)` 튜플 → 클래스 변수 `_INTERVAL_CHECKPOINTS = frozenset(...)` |
 | **랜덤 생성 비율 설정 분리** | Clarity | 하드코딩된 `0.8` (80% corpus, 20% random) → `random_gen_ratio` 설정값 + `--random-gen-ratio` CLI 옵션 |
 | **Mutation 통계 추적** | Feature | Summary에서 실제 전송된 opcode 분포, mutation 종류별 횟수/비율, passthru 타입(admin/io) 분포, 입력 소스(corpus vs random) 비율을 출력. 기존에는 원본 명령어 이름으로만 집계되어 mutation된 opcode/nsid/data_len 등이 보이지 않았음 |
+| **Timeout crash 불량 보존** | Feature | timeout 시 J-Link로 stuck PC를 20회 샘플링하여 crash 메타데이터에 기록. 빈도 분석으로 hang/loop/recovery 판별. CPU를 halt 상태로 유지하여 디버깅 가능. reconnect/continue 없이 퍼징 중단 |
+| **D state 블로킹 방지** | BugFix | subprocess kill 후 `communicate()`에 5초 타임아웃 추가. 커널 NVMe 에러 복구(command abort → controller reset → PCIe FLR) 중 nvme-cli가 D state에 빠져 무한 블로킹되는 문제 해결 |
 
 ---
 

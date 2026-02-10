@@ -15,6 +15,9 @@ v4.3 변경사항:
 - [Clarity] 20% 완전 랜덤 생성 비율을 설정값(random_gen_ratio)으로 분리
 - [Feature] Summary에 Mutation 통계 추가: opcode/nsid/admin↔io/data_len 변형 횟수,
   실제 전송된 opcode 분포, passthru 타입 비율, 입력 소스(corpus vs random) 비율
+- [Feature] Timeout crash 시 불량 현상 보존: J-Link로 stuck PC를 읽고 crash에 기록,
+  CPU를 halt 상태로 유지하여 디버깅 가능, reconnect/continue 없이 퍼징 중단
+- [BugFix] subprocess kill 후 D state 블로킹 방지: communicate()에 타임아웃 추가
 
 v4.2 변경사항:
 - subprocess + 샘플링 연동: idle/포화 감지 시 프로세스 kill → 즉시 다음 실행
@@ -425,6 +428,38 @@ class JLinkPCSampler:
                 self._go_func()
             except Exception:
                 pass
+
+    def read_stuck_pcs(self, count: int = 10) -> List[int]:
+        """v4.3: timeout/crash 후 SSD 펌웨어가 멈춘 PC를 읽는다.
+        halt→read→go를 반복하여 현재 펌웨어 위치를 여러 번 샘플링.
+        동일 PC가 반복되면 해당 주소에서 hang (무한루프/대기) 상태.
+        서로 다른 PC가 나오면 펌웨어가 에러 핸들링 루프 등을 돌고 있는 것."""
+        pcs = []
+        for _ in range(count):
+            try:
+                self._halt_func()
+                pc = self._read_reg_func(self._pc_reg_index)
+                pcs.append(pc)
+            except Exception:
+                pass
+            finally:
+                try:
+                    self._go_func()
+                except Exception:
+                    pass
+            time.sleep(0.05)
+        return pcs
+
+    def read_pc_and_halt(self) -> Optional[int]:
+        """v4.3: PC를 읽고 CPU를 halt 상태로 유지한다 (불량 현상 보존용).
+        이 함수 호출 후 SSD 컨트롤러는 멈춘 상태로 유지됨."""
+        try:
+            self._halt_func()
+            pc = self._read_reg_func(self._pc_reg_index)
+            # go()를 호출하지 않음 → CPU halt 상태 유지
+            return pc
+        except Exception:
+            return None
 
     def _in_range(self, pc: int) -> bool:
         """PC가 펌웨어 주소 범위 내인지 확인"""
@@ -1347,13 +1382,26 @@ class NVMeFuzzer:
                 stderr=subprocess.PIPE,
             )
 
-            # v4.1 방식: communicate()로 블로킹 대기 — 지연 없음
+            # subprocess 타임아웃 = NVMe 타임아웃 + 여유 2초
             timeout_sec = timeout_ms / 1000.0 + 2.0
             try:
                 stdout, stderr = process.communicate(timeout=timeout_sec)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.communicate()
+                # v4.3: kill 후 communicate()에도 타임아웃 설정
+                # nvme-cli가 커널 NVMe 에러 복구 중 D state (uninterruptible sleep)에
+                # 빠지면 SIGKILL이 전달되지 않아 수십~수백 초 블로킹될 수 있음.
+                # 원인: 커널 NVMe 드라이버가 command abort → controller reset →
+                # PCIe FLR 순서로 에러 복구를 시도하며, 각 단계에 30~60초 소요.
+                # 이 동안 ioctl() 시스템 콜이 반환되지 않아 프로세스가 D state에 머무름.
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    log.warning(
+                        f"[NVMe TIMEOUT] {cmd.name} — nvme-cli가 D state "
+                        f"(커널 NVMe 에러 복구 중). kill 후에도 프로세스 미종료. "
+                        f"커널이 controller reset/PCIe FLR을 완료할 때까지 "
+                        f"수십~수백 초 소요될 수 있음. 프로세스를 포기하고 진행합니다.")
                 log.warning(f"[NVMe TIMEOUT] {cmd.name} (>{timeout_sec:.0f}s)")
                 return self.RC_TIMEOUT
 
@@ -1409,7 +1457,8 @@ class NVMeFuzzer:
             meta["data_len_override"] = seed.data_len_override
         return meta
 
-    def _save_crash(self, data: bytes, seed: Seed, reason: str = "timeout"):
+    def _save_crash(self, data: bytes, seed: Seed, reason: str = "timeout",
+                    stuck_pcs: Optional[List[int]] = None):
         input_hash = hashlib.md5(data).hexdigest()[:12]
         filename = f"crash_{seed.cmd.name}_{hex(seed.cmd.opcode)}_{input_hash}"
         filepath = self.crashes_dir / filename
@@ -1420,6 +1469,21 @@ class NVMeFuzzer:
         meta = self._seed_meta(seed)
         meta["crash_reason"] = reason
         meta["timestamp"] = datetime.now().isoformat()
+
+        # v4.3: timeout 시 SSD 펌웨어가 멈춘 PC 주소 기록
+        if stuck_pcs:
+            meta["stuck_pcs"] = [hex(pc) for pc in stuck_pcs]
+            meta["stuck_pcs_unique"] = [hex(pc) for pc in sorted(set(stuck_pcs))]
+            meta["stuck_pcs_count"] = len(stuck_pcs)
+            # 가장 빈도 높은 PC = 가장 유력한 hang 지점
+            from collections import Counter
+            pc_counts = Counter(stuck_pcs)
+            most_common = pc_counts.most_common(5)
+            meta["stuck_pc_top5"] = [
+                {"pc": hex(pc), "count": cnt, "ratio": f"{cnt/len(stuck_pcs):.0%}"}
+                for pc, cnt in most_common
+            ]
+
         with open(str(filepath) + '.json', 'w') as f:
             json.dump(meta, f, indent=2)
 
@@ -1972,15 +2036,94 @@ class NVMeFuzzer:
 
                 # --- Timeout / Error 처리 ---
                 if rc == self.RC_TIMEOUT:
+                    # v4.3: timeout 시 SSD 불량 현상 유지 전략
+                    # J-Link reconnect 하지 않음 — 펌웨어 상태를 있는 그대로 보존
+
+                    # 1) J-Link로 SSD 펌웨어가 멈춘 PC를 읽기 (halt-read-go 반복)
+                    log.warning("[TIMEOUT] SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
+                    stuck_pcs = self.sampler.read_stuck_pcs(count=20)
+
+                    actual_opcode = mutated_seed.opcode_override \
+                        if mutated_seed.opcode_override is not None \
+                        else cmd.opcode
+
+                    if stuck_pcs:
+                        from collections import Counter
+                        pc_counts = Counter(stuck_pcs)
+                        most_common_pc, most_common_count = pc_counts.most_common(1)[0]
+                        unique_stuck = set(stuck_pcs)
+
+                        log.error(
+                            f"[TIMEOUT CRASH] {cmd.name} "
+                            f"actual_opcode=0x{actual_opcode:02x} "
+                            f"timeout_group={cmd.timeout_group}")
+                        log.error(
+                            f"  Stuck PCs ({len(stuck_pcs)} samples, "
+                            f"{len(unique_stuck)} unique):")
+                        for pc, cnt in pc_counts.most_common(5):
+                            in_range = " [IN RANGE]" if self.sampler._in_range(pc) else " [OUT]"
+                            log.error(
+                                f"    {hex(pc)}: {cnt}/{len(stuck_pcs)} "
+                                f"({100*cnt/len(stuck_pcs):.0f}%){in_range}")
+
+                        if len(unique_stuck) == 1:
+                            log.error(
+                                f"  → 펌웨어가 {hex(most_common_pc)}에서 "
+                                f"완전히 멈춤 (hang/deadlock)")
+                        elif len(unique_stuck) <= 3:
+                            log.error(
+                                f"  → 펌웨어가 {len(unique_stuck)}개 주소에서 "
+                                f"루프 중 (에러 핸들링 또는 busy-wait)")
+                        else:
+                            log.error(
+                                f"  → 펌웨어가 {len(unique_stuck)}개 주소를 "
+                                f"순회 중 (복구 루틴 진행 중일 수 있음)")
+                    else:
+                        log.error(
+                            f"[TIMEOUT CRASH] {cmd.name} "
+                            f"actual_opcode=0x{actual_opcode:02x} "
+                            f"— J-Link PC 읽기 실패 (JTAG 연결 확인 필요)")
+
+                    # 2) crash 저장 (stuck PC 포함)
                     self.crash_inputs.append((fuzz_data, cmd))
-                    self._save_crash(fuzz_data, mutated_seed)
-                    log.error(f"[TIMEOUT] {cmd.name} opcode=0x{mutated_seed.cmd.opcode:02x} "
-                              f"timeout_group={cmd.timeout_group} — saved to crashes/")
-                    if not self.sampler.reconnect():
-                        log.error("Cannot reconnect to J-Link, stopping")
-                        break
-                    time.sleep(1)
-                    continue
+                    self._save_crash(fuzz_data, mutated_seed,
+                                     reason="timeout", stuck_pcs=stuck_pcs)
+                    log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
+
+                    # 3) 마지막 PC를 읽고 halt 상태로 유지 (불량 현상 보존)
+                    final_pc = self.sampler.read_pc_and_halt()
+                    if final_pc is not None:
+                        log.error(
+                            f"  CPU를 halt 상태로 유지합니다. "
+                            f"최종 PC: {hex(final_pc)}")
+                        log.error(
+                            f"  이 상태에서 J-Link 디버거로 "
+                            f"레지스터/메모리 덤프가 가능합니다.")
+                    else:
+                        log.error("  CPU halt 실패 — J-Link 연결 확인 필요")
+
+                    # 4) NVMe 장치 상태 안내
+                    log.error("")
+                    log.error(
+                        "  [NVMe 장치 복구 안내] timeout 후 /dev/nvme* 가 "
+                        "사라질 수 있습니다.")
+                    log.error(
+                        "  원인: 커널 NVMe 드라이버가 controller reset 후 "
+                        "장치를 해제(unbind)함")
+                    log.error(
+                        "  확인: nvme list / ls /dev/nvme*")
+                    log.error(
+                        "  복구: echo 1 > /sys/bus/pci/devices/<BDF>/remove "
+                        "&& echo 1 > /sys/bus/pci/rescan")
+                    log.error(
+                        "        또는 modprobe -r nvme && modprobe nvme")
+                    log.error("")
+
+                    # 5) 퍼징 중단 — reconnect/continue 하지 않음
+                    log.error(
+                        "  퍼징을 중단합니다. SSD 상태를 유지하여 "
+                        "디버깅이 가능합니다.")
+                    break
 
                 if rc == self.RC_ERROR:
                     log.warning(f"[ERROR] {cmd.name} subprocess internal error — skipping")
