@@ -747,6 +747,27 @@ class NVMeFuzzer:
             return f"{cmd.name}_op0x{seed.opcode_override:02X}"
         return cmd.name
 
+    def _log_smart(self):
+        """v4.3: NVMe SMART / Health 로그를 읽어 INFO 레벨로 기록."""
+        try:
+            result = subprocess.run(
+                ['nvme', 'smart-log', self.config.nvme_device],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                log.info("[SMART] === NVMe SMART / Health Log ===")
+                for line in result.stdout.strip().splitlines():
+                    log.info(f"[SMART] {line}")
+            else:
+                log.warning(f"[SMART] smart-log 실패 (rc={result.returncode}): "
+                            f"{result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            log.warning("[SMART] smart-log 타임아웃 (10s)")
+        except FileNotFoundError:
+            log.warning("[SMART] nvme-cli가 설치되지 않았습니다")
+        except Exception as e:
+            log.warning(f"[SMART] smart-log 실행 오류: {e}")
+
     def _setup_directories(self):
         self.crashes_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2034,6 +2055,9 @@ class NVMeFuzzer:
         else:
             log.warning("Idle PC     : not detected (saturation = global edge only)")
 
+        # v4.3: 퍼징 시작 전 SMART baseline 기록
+        self._log_smart()
+
         self.start_time = datetime.now()
 
         try:
@@ -2265,6 +2289,10 @@ class NVMeFuzzer:
                         if isinstance(h, logging.FileHandler) and h.stream:
                             os.fsync(h.stream.fileno())
 
+                # v4.3: 10000회마다 SMART 로그 기록
+                if self.executions % 10000 == 0 and self.executions > 0:
+                    self._log_smart()
+
                 # v4.3: 1000회마다 corpus culling + J-Link heartbeat
                 if self.executions % 1000 == 0 and self.executions > 0:
                     self._cull_corpus()
@@ -2279,6 +2307,9 @@ class NVMeFuzzer:
             log.warning("Interrupted by user")
 
         finally:
+            # v4.3: 퍼징 종료 후 SMART 기록
+            self._log_smart()
+
             # 각 단계를 독립적으로 보호하여 하나가 실패해도 나머지 실행
             try:
                 stats = self._collect_stats()
