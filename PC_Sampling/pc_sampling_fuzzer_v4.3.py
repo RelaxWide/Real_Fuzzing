@@ -113,6 +113,12 @@ RANDOM_GEN_RATIO  = 0.2
 # v4.3: 제외할 opcode 목록 (e.g. [0xC1, 0xC0] — 디바이스 탈락 유발 opcode)
 EXCLUDED_OPCODES: List[int] = []
 
+# v4.3: 확장 mutation 확률 (0.0 = 비활성화)
+OPCODE_MUT_PROB   = 0.10   # opcode override 확률 (기본 10%)
+NSID_MUT_PROB     = 0.10   # namespace ID override 확률 (기본 10%)
+ADMIN_SWAP_PROB   = 0.05   # Admin↔IO 교차 전송 확률 (기본 5%)
+DATALEN_MUT_PROB  = 0.08   # data_len 불일치 확률 (기본 8%)
+
 # =============================================================================
 
 
@@ -250,6 +256,12 @@ class FuzzConfig:
 
     # v4.3: 제외할 opcode 목록
     excluded_opcodes: List[int] = field(default_factory=lambda: EXCLUDED_OPCODES.copy())
+
+    # v4.3: 확장 mutation 확률
+    opcode_mut_prob: float = OPCODE_MUT_PROB
+    nsid_mut_prob: float = NSID_MUT_PROB
+    admin_swap_prob: float = ADMIN_SWAP_PROB
+    datalen_mut_prob: float = DATALEN_MUT_PROB
 
 
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
@@ -1228,8 +1240,8 @@ class NVMeFuzzer:
 
         # --- 확장 mutation (각각 독립 확률) ---
 
-        # [1] opcode mutation (10%) — 미정의/vendor-specific opcode로 dispatch 테이블 탐색
-        if random.random() < 0.10:
+        # [1] opcode mutation — 미정의/vendor-specific opcode로 dispatch 테이블 탐색
+        if self.config.opcode_mut_prob > 0 and random.random() < self.config.opcode_mut_prob:
             excluded = set(self.config.excluded_opcodes)
             mut_type = random.randint(0, 3)
             if mut_type == 0:
@@ -1252,8 +1264,8 @@ class NVMeFuzzer:
             if new_seed.opcode_override is not None and new_seed.opcode_override in excluded:
                 new_seed.opcode_override = None
 
-        # [2] nsid mutation (10%) — 잘못된 namespace로 에러 핸들링 코드 탐색
-        if random.random() < 0.10:
+        # [2] nsid mutation — 잘못된 namespace로 에러 핸들링 코드 탐색
+        if self.config.nsid_mut_prob > 0 and random.random() < self.config.nsid_mut_prob:
             new_seed.nsid_override = random.choice([
                 0x00000000,       # nsid=0 (보통 "all namespaces" 또는 invalid)
                 0xFFFFFFFF,       # broadcast nsid
@@ -1263,13 +1275,13 @@ class NVMeFuzzer:
                 random.randint(0, 0xFFFFFFFF),  # 완전 랜덤
             ])
 
-        # [3] Admin↔IO 교차 전송 (5%) — 잘못된 큐로 보내서 디스패치 혼란 유도
-        if random.random() < 0.05:
+        # [3] Admin↔IO 교차 전송 — 잘못된 큐로 보내서 디스패치 혼란 유도
+        if self.config.admin_swap_prob > 0 and random.random() < self.config.admin_swap_prob:
             # 원래 admin이면 IO로, IO면 admin으로
             new_seed.force_admin = (seed.cmd.cmd_type != NVMeCommandType.ADMIN)
 
-        # [4] data_len 의도적 불일치 (8%) — 커널은 통과, SSD DMA 엔진에 혼란
-        if random.random() < 0.08:
+        # [4] data_len 의도적 불일치 — 커널은 통과, SSD DMA 엔진에 혼란
+        if self.config.datalen_mut_prob > 0 and random.random() < self.config.datalen_mut_prob:
             new_seed.data_len_override = random.choice([
                 0,                 # 빈 버퍼
                 4,                 # 극소
@@ -2396,6 +2408,14 @@ if __name__ == "__main__":
     parser.add_argument('--exclude-opcodes', type=str, default='',
                         help='Comma-separated hex opcodes to exclude from fuzzing, '
                              'e.g. "0xC1,0xC0" or "C1,C0"')
+    parser.add_argument('--opcode-mut-prob', type=float, default=OPCODE_MUT_PROB,
+                        help='Opcode mutation probability (0.0=disable, default 0.10)')
+    parser.add_argument('--nsid-mut-prob', type=float, default=NSID_MUT_PROB,
+                        help='NSID mutation probability (0.0=disable, default 0.10)')
+    parser.add_argument('--admin-swap-prob', type=float, default=ADMIN_SWAP_PROB,
+                        help='Admin/IO swap probability (0.0=disable, default 0.05)')
+    parser.add_argument('--datalen-mut-prob', type=float, default=DATALEN_MUT_PROB,
+                        help='Data length mismatch probability (0.0=disable, default 0.08)')
     parser.add_argument('--timeout', nargs=2, action='append', metavar=('GROUP', 'MS'),
                         help='Set timeout per group, e.g. --timeout command 8000 '
                              '--timeout format 600000. '
@@ -2477,6 +2497,10 @@ if __name__ == "__main__":
         max_energy=args.max_energy,
         random_gen_ratio=args.random_gen_ratio,
         excluded_opcodes=excluded_opcodes,
+        opcode_mut_prob=args.opcode_mut_prob,
+        nsid_mut_prob=args.nsid_mut_prob,
+        admin_swap_prob=args.admin_swap_prob,
+        datalen_mut_prob=args.datalen_mut_prob,
     )
 
     fuzzer = NVMeFuzzer(config)
