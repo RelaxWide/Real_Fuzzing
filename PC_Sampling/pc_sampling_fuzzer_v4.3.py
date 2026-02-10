@@ -201,6 +201,8 @@ class Seed:
     found_at: int = 0            # 발견된 시점 (execution number)
     new_edges: int = 0           # 발견한 새 edge 수
     energy: float = 1.0          # 계산된 에너지
+    covered_edges: Optional[set] = None  # v4.3: 이 시드 실행 시 발견된 edge set (culling용)
+    is_favored: bool = False     # v4.3: corpus culling에서 선정된 favored seed
 
 
 @dataclass
@@ -909,6 +911,41 @@ class NVMeFuzzer:
         # fallback
         self.corpus[-1].exec_count += 1
         return self.corpus[-1]
+
+    def _cull_corpus(self):
+        """v4.3: AFL++ 방식 corpus culling.
+        각 edge에 대해 가장 작은 seed를 favored로 마킹하고,
+        favored가 아닌 seed 중 기여도 없는 것을 제거한다."""
+        if len(self.corpus) <= 10:
+            return
+
+        # 1) edge → best seed 매핑 (가장 작은 data 우선)
+        edge_best: dict[tuple, Seed] = {}
+        for seed in self.corpus:
+            if not seed.covered_edges:
+                continue
+            for edge in seed.covered_edges:
+                current = edge_best.get(edge)
+                if current is None or len(seed.data) < len(current.data):
+                    edge_best[edge] = seed
+
+        # 2) favored 마킹
+        favored_seeds = set()
+        for seed in edge_best.values():
+            favored_seeds.add(id(seed))
+        for seed in self.corpus:
+            seed.is_favored = id(seed) in favored_seeds
+
+        # 3) 제거 대상: favored 아님 + exec_count >= 5 + 기본 시드 아님 (found_at > 0)
+        before = len(self.corpus)
+        self.corpus = [
+            s for s in self.corpus
+            if s.is_favored or s.exec_count < 5 or s.found_at == 0
+        ]
+        removed = before - len(self.corpus)
+        if removed > 0:
+            log.info(f"[Cull] corpus {before} → {len(self.corpus)} "
+                     f"(-{removed}, favored={sum(1 for s in self.corpus if s.is_favored)})")
 
     # =========================================================================
     # AFL++ Mutation Engine
@@ -1939,6 +1976,18 @@ class NVMeFuzzer:
 
         self._load_seeds()
 
+        # v4.3: NVMe 디바이스 사전 검증
+        nvme_dev = self.config.nvme_device
+        if not os.path.exists(nvme_dev):
+            log.error(f"[Pre-flight] NVMe 디바이스 {nvme_dev} 가 존재하지 않습니다.")
+            log.error("  nvme list / ls /dev/nvme* 로 확인하세요.")
+            return
+        if not os.access(nvme_dev, os.R_OK | os.W_OK):
+            log.error(f"[Pre-flight] NVMe 디바이스 {nvme_dev} 에 대한 읽기/쓰기 권한이 없습니다.")
+            log.error("  sudo로 실행하거나 권한을 확인하세요.")
+            return
+        log.info(f"[Pre-flight] NVMe 디바이스 확인: {nvme_dev} ✓")
+
         # 이전 커버리지 로드 (resume)
         if self.config.resume_coverage:
             self.sampler.load_coverage(self.config.resume_coverage)
@@ -2159,7 +2208,8 @@ class NVMeFuzzer:
                         force_admin=mutated_seed.force_admin,
                         data_len_override=mutated_seed.data_len_override,
                         found_at=self.executions,
-                        new_edges=new_edges
+                        new_edges=new_edges,
+                        covered_edges=set(self.sampler.current_edges),
                     )
                     self.corpus.append(new_seed)
 
@@ -2185,6 +2235,16 @@ class NVMeFuzzer:
                         h.flush()
                         if isinstance(h, logging.FileHandler) and h.stream:
                             os.fsync(h.stream.fileno())
+
+                # v4.3: 1000회마다 corpus culling + J-Link heartbeat
+                if self.executions % 1000 == 0 and self.executions > 0:
+                    self._cull_corpus()
+                    # J-Link 연결 상태 확인
+                    test_pc = self.sampler._read_pc()
+                    if test_pc is None:
+                        log.error("[J-Link] heartbeat 실패 — JTAG 연결이 끊어진 것 같습니다.")
+                        log.error("  USB 케이블/J-Link 상태를 확인하세요.")
+                        break
 
         except KeyboardInterrupt:
             log.warning("Interrupted by user")
