@@ -115,6 +115,8 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 | **실제 Opcode 기준 추적** | Feature | opcode_override 사용 시 `Identify_Controller_op0xD1`처럼 실제 전송 opcode로 분류. 히트맵/bar chart/per-command stats/rc_stats 모두 적용. 기존에는 base 명령어에 mutation된 opcode의 커버리지가 오염되어 누적됨 |
 | **SMART Health 로그** | Feature | `nvme smart-log` 결과를 INFO 레벨로 기록. 퍼징 시작 전(baseline) + 10,000회마다(모니터링) + 퍼징 종료 후(최종 상태) |
 | **Corpus/Graphs 초기화** | Feature | 매 실행 시작 시 이전 실행의 `corpus/`, `graphs/` 폴더를 삭제 후 재생성. 이전 데이터와 혼합 방지 |
+| **`--seed-dir` CLI 옵션 추가** | BugFix | 백엔드 로직(`_load_seeds()`)은 있었으나 CLI parser에 옵션이 없어 사용 불가였음. `--seed-dir` 옵션 추가로 이전 corpus를 시드로 재활용 가능 |
+| **Dead code 제거** | Cleanup | v4.3에서 timeout 시 복구하지 않는 정책으로 변경됨에 따라, 더 이상 호출되지 않는 `_resume()`, `reconnect()` 메서드 삭제 |
 
 ---
 
@@ -190,7 +192,7 @@ Main Thread                    Sampling Thread (daemon)
     │
 ```
 
-- **Thread Safety**: CPython GIL 하에서 `set.__contains__`, `set.add`는 원자적. 메인 스레드와 샘플링 스레드가 `global_edges`를 동시 접근하지만, 직렬화된 호출 순서(stop → evaluate → start)로 실제 동시성 문제 없음.
+- **Thread Safety**: 샘플링 스레드에서 `global_edges_ref = self.global_edges`로 참조를 캐싱하여 attribute lookup 제거. CPython GIL 하에서 `set.__contains__`는 원자적이므로 실질적 동시성 문제 없음. 다만, 메인 스레드가 `global_edges.update()`하는 시점과 샘플링 스레드가 읽는 시점이 겹칠 수 있어 이론적으로는 stale read 가능 (퍼징 결과에 영향 미미).
 
 ---
 
@@ -403,7 +405,7 @@ v4.3에서 모든 확률이 설정값으로 분리되어 CLI에서 개별 비활
 | nsid override | 10% | `--nsid-mut-prob` | nsid=0, 0xFFFFFFFF(broadcast), 존재하지 않는 NS |
 | Admin↔IO 교차 | 5% | `--admin-swap-prob` | 잘못된 큐로 전송하여 디스패치 혼란 유도 |
 | data_len 불일치 | 8% | `--datalen-mut-prob` | CDW와 data_len이 다른 값을 가지도록 하여 DMA 엔진 혼란 |
-| GetLogPage NUMDL 과대 | 15% | (고정) | 스펙 초과 크기의 로그 요청 |
+| GetLogPage NUMDL 과대 | 15% | (고정) | 스펙 초과 크기 로그 요청. GetLogPage 명령어에만 적용되므로 별도 설정 불필요 |
 
 **일반 명령어만으로 퍼징** (확장 mutation 전부 비활성화):
 ```bash
@@ -758,7 +760,7 @@ AFL++의 fork server는 `exec()`를 1회만 수행하고 이후 `fork()`만 반�
 
 ### 7.11 [Feature] AFL++ Corpus Culling
 
-**구현**: `_cull_corpus()` 메서드, 1000회마다 실행.
+**구현**: `_cull_corpus()` 메서드, 1000회마다 실행. corpus 10개 이하이면 skip.
 1. 각 edge에 대해 data가 가장 작은 seed를 `favored`로 마킹
 2. favored 아니고 + 5회 이상 실행되고 + 기본 시드가 아닌 seed 제거
 3. Seed에 `covered_edges` set 저장 (corpus 추가 시 `current_edges` 스냅샷)
@@ -865,6 +867,7 @@ sudo python3 pc_sampling_fuzzer_v4.3.py --all-commands
 | `--nsid-mut-prob` | 0.10 | NSID mutation 확률 (0=비활성화) |
 | `--admin-swap-prob` | 0.05 | Admin↔IO 교차 확률 (0=비활성화) |
 | `--datalen-mut-prob` | 0.08 | data_len 불일치 확률 (0=비활성화) |
+| `--seed-dir` | None | 시드 디렉토리 경로 (이전 corpus를 시드로 재활용) |
 | `--timeout GROUP MS` | (그룹별 기본값) | 타임아웃 그룹별 오버라이드 |
 
 ---

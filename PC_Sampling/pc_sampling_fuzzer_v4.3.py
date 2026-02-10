@@ -371,23 +371,6 @@ class JLinkPCSampler:
         log.warning("[J-Link] R15 인덱스를 찾지 못함, 기본값 15 사용")
         return 15
 
-    def _resume(self):
-        """halt 상태에서 실행을 재개한다 (CPU 리셋 없이)."""
-        try:
-            self._go_func()
-        except Exception:
-            self.jlink.restart()
-
-    def reconnect(self, max_retries: int = 5) -> bool:
-        for attempt in range(1, max_retries + 1):
-            delay = min(2 ** attempt, 30)
-            log.warning(f"[J-Link] Reconnect attempt {attempt}/{max_retries} (wait {delay}s)...")
-            time.sleep(delay)
-            if self.connect():
-                return True
-        log.error("[J-Link] All reconnection attempts failed")
-        return False
-
     def diagnose(self, count: int = 20) -> bool:
         """시작 전 PC 읽기 진단 — J-Link 동작 검증 + idle PC 감지 (v4.2)"""
         log.warning(f"[Diagnose] PC를 {count}회 읽어서 J-Link 상태를 확인합니다...")
@@ -2434,6 +2417,8 @@ if __name__ == "__main__":
     parser.add_argument('--speed', type=int, default=JLINK_SPEED, help='JTAG speed (kHz)')
     parser.add_argument('--runtime', type=int, default=TOTAL_RUNTIME_SEC)
     parser.add_argument('--output', default=OUTPUT_DIR, help='Output dir')
+    parser.add_argument('--seed-dir', default=SEED_DIR,
+                        help='Seed directory path (load previous corpus as seeds)')
     parser.add_argument('--samples', type=int, default=MAX_SAMPLES_PER_RUN)
     parser.add_argument('--interval', type=int, default=SAMPLE_INTERVAL_US,
                         help='Sample interval (us)')
@@ -2536,6 +2521,7 @@ if __name__ == "__main__":
         all_commands=args.all_commands,
         total_runtime_sec=args.runtime,
         output_dir=args.output,
+        seed_dir=args.seed_dir,
         max_samples_per_run=args.samples,
         sample_interval_us=args.interval,
         post_cmd_delay_ms=args.post_cmd_delay,
