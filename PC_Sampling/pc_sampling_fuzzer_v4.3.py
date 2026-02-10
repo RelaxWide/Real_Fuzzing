@@ -109,6 +109,9 @@ MAX_ENERGY        = 16.0      # 최대 에너지 값
 # v4.3: 완전 랜덤 생성 비율 (0.0~1.0, 기본 0.2 = 20%)
 RANDOM_GEN_RATIO  = 0.2
 
+# v4.3: 제외할 opcode 목록 (e.g. [0xC1, 0xC0] — 디바이스 탈락 유발 opcode)
+EXCLUDED_OPCODES: List[int] = []
+
 # =============================================================================
 
 
@@ -241,6 +244,9 @@ class FuzzConfig:
 
     # v4.3: 완전 랜덤 생성 비율
     random_gen_ratio: float = RANDOM_GEN_RATIO
+
+    # v4.3: 제외할 opcode 목록
+    excluded_opcodes: List[int] = field(default_factory=lambda: EXCLUDED_OPCODES.copy())
 
 
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
@@ -1186,6 +1192,7 @@ class NVMeFuzzer:
 
         # [1] opcode mutation (10%) — 미정의/vendor-specific opcode로 dispatch 테이블 탐색
         if random.random() < 0.10:
+            excluded = set(self.config.excluded_opcodes)
             mut_type = random.randint(0, 3)
             if mut_type == 0:
                 # vendor-specific 범위 (0xC0~0xFF for admin, 0x80~0xFF for IO)
@@ -1203,6 +1210,9 @@ class NVMeFuzzer:
                 # 다른 알려진 명령어의 opcode 가져오기
                 other_cmd = random.choice(NVME_COMMANDS)
                 new_seed.opcode_override = other_cmd.opcode
+            # v4.3: 제외 opcode 필터링 — 제외 대상이면 override 취소
+            if new_seed.opcode_override is not None and new_seed.opcode_override in excluded:
+                new_seed.opcode_override = None
 
         # [2] nsid mutation (10%) — 잘못된 namespace로 에러 핸들링 코드 탐색
         if random.random() < 0.10:
@@ -2314,12 +2324,23 @@ if __name__ == "__main__":
                         help='Max energy for power schedule')
     parser.add_argument('--random-gen-ratio', type=float, default=RANDOM_GEN_RATIO,
                         help='Ratio of fully random inputs (0.0~1.0, default 0.2)')
+    parser.add_argument('--exclude-opcodes', type=str, default='',
+                        help='Comma-separated hex opcodes to exclude from fuzzing, '
+                             'e.g. "0xC1,0xC0" or "C1,C0"')
     parser.add_argument('--timeout', nargs=2, action='append', metavar=('GROUP', 'MS'),
                         help='Set timeout per group, e.g. --timeout command 8000 '
                              '--timeout format 600000. '
                              f'Groups: {", ".join(NVME_TIMEOUTS.keys())}')
 
     args = parser.parse_args()
+
+    # CLI에서 지정한 제외 opcode 파싱
+    excluded_opcodes = []
+    if args.exclude_opcodes.strip():
+        for tok in args.exclude_opcodes.split(','):
+            tok = tok.strip()
+            if tok:
+                excluded_opcodes.append(int(tok, 16) if tok.startswith(('0x', '0X')) else int(tok, 16))
 
     # CLI에서 지정한 타임아웃으로 오버라이드
     nvme_timeouts = NVME_TIMEOUTS.copy()
@@ -2354,7 +2375,9 @@ if __name__ == "__main__":
               f"timeout={tg}({tms}ms){marker}")
     print(f"\nActive: {[c.name for c in active_cmds]}")
     print()
-    print(f"v{FUZZER_VERSION} Features:")
+    if excluded_opcodes:
+        print(f"Excluded opcodes: {[hex(o) for o in excluded_opcodes]}")
+    print(f"\nv{FUZZER_VERSION} Features:")
     print("  - subprocess (nvme-cli) NVMe passthru")
     print("  - Global edge saturation (configurable) + idle PC detection")
     print("  - Per-execution prev_pc reset (no cross-execution false edges)")
@@ -2384,6 +2407,7 @@ if __name__ == "__main__":
         global_saturation_limit=args.global_saturation_limit,
         max_energy=args.max_energy,
         random_gen_ratio=args.random_gen_ratio,
+        excluded_opcodes=excluded_opcodes,
     )
 
     fuzzer = NVMeFuzzer(config)
