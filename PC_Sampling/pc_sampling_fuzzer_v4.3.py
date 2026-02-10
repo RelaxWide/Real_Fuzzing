@@ -16,7 +16,8 @@ v4.3 변경사항:
 - [Feature] Summary에 Mutation 통계 추가: opcode/nsid/admin↔io/data_len 변형 횟수,
   실제 전송된 opcode 분포, passthru 타입 비율, 입력 소스(corpus vs random) 비율
 - [Feature] Timeout crash 시 불량 현상 보존: J-Link로 stuck PC를 읽고 crash에 기록,
-  CPU를 halt 상태로 유지하여 디버깅 가능, reconnect/continue 없이 퍼징 중단
+  SSD 펌웨어를 resume 상태로 유지 (halt하지 않음), J-Link 연결도 유지,
+  reconnect/continue/rescan 없이 퍼징 중단하여 불량 현상 그대로 보존
 - [BugFix] subprocess kill 후 D state 블로킹 방지: communicate()에 타임아웃 추가
 
 v4.2 변경사항:
@@ -450,17 +451,6 @@ class JLinkPCSampler:
             time.sleep(0.05)
         return pcs
 
-    def read_pc_and_halt(self) -> Optional[int]:
-        """v4.3: PC를 읽고 CPU를 halt 상태로 유지한다 (불량 현상 보존용).
-        이 함수 호출 후 SSD 컨트롤러는 멈춘 상태로 유지됨."""
-        try:
-            self._halt_func()
-            pc = self._read_reg_func(self._pc_reg_index)
-            # go()를 호출하지 않음 → CPU halt 상태 유지
-            return pc
-        except Exception:
-            return None
-
     def _in_range(self, pc: int) -> bool:
         """PC가 펌웨어 주소 범위 내인지 확인"""
         if self.config.addr_range_start is None or self.config.addr_range_end is None:
@@ -707,6 +697,9 @@ class NVMeFuzzer:
         self.actual_opcode_dist: dict[int, int] = defaultdict(int)
         # 실제 전송된 passthru 타입 분포
         self.passthru_stats = {"admin-passthru": 0, "io-passthru": 0}
+
+        # v4.3: timeout crash 발생 여부 — True면 finally에서 J-Link를 닫지 않음
+        self._timeout_crash = False
 
         # 명령어별 edge/PC 추적 (그래프 시각화용)
         self.cmd_edges: dict[str, Set[Tuple[int, int]]] = {c.name: set() for c in self.commands}
@@ -2090,22 +2083,20 @@ class NVMeFuzzer:
                                      reason="timeout", stuck_pcs=stuck_pcs)
                     log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
 
-                    # 3) 마지막 PC를 읽고 halt 상태로 유지 (불량 현상 보존)
-                    final_pc = self.sampler.read_pc_and_halt()
-                    if final_pc is not None:
-                        log.error(
-                            f"  CPU를 halt 상태로 유지합니다. "
-                            f"최종 PC: {hex(final_pc)}")
-                        log.error(
-                            f"  이 상태에서 J-Link 디버거로 "
-                            f"레지스터/메모리 덤프가 가능합니다.")
-                    else:
-                        log.error("  CPU halt 실패 — J-Link 연결 확인 필요")
+                    # 3) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
+                    # halt하면 불량 현상이 멈추므로, 펌웨어가 돌고 있는
+                    # 그대로 두어야 hang/loop 등의 현상을 외부에서 관찰 가능
+                    log.error(
+                        "  SSD 펌웨어를 resume 상태로 유지합니다. "
+                        "(halt하지 않음 — 불량 현상 보존)")
+                    log.error(
+                        "  J-Link 디버거로 연결하여 현재 상태를 "
+                        "관찰할 수 있습니다.")
 
-                    # 4) NVMe 장치 상태 안내
+                    # 4) NVMe 장치 상태 안내 (자동 복구 수행하지 않음)
                     log.error("")
                     log.error(
-                        "  [NVMe 장치 복구 안내] timeout 후 /dev/nvme* 가 "
+                        "  [NVMe 장치 안내] timeout 후 /dev/nvme* 가 "
                         "사라질 수 있습니다.")
                     log.error(
                         "  원인: 커널 NVMe 드라이버가 controller reset 후 "
@@ -2113,16 +2104,19 @@ class NVMeFuzzer:
                     log.error(
                         "  확인: nvme list / ls /dev/nvme*")
                     log.error(
-                        "  복구: echo 1 > /sys/bus/pci/devices/<BDF>/remove "
+                        "  디버깅 완료 후 수동 복구:")
+                    log.error(
+                        "    echo 1 > /sys/bus/pci/devices/<BDF>/remove "
                         "&& echo 1 > /sys/bus/pci/rescan")
                     log.error(
-                        "        또는 modprobe -r nvme && modprobe nvme")
+                        "    또는 modprobe -r nvme && modprobe nvme")
                     log.error("")
 
-                    # 5) 퍼징 중단 — reconnect/continue 하지 않음
+                    # 5) 퍼징 중단 — reconnect/continue/rescan 하지 않음
+                    self._timeout_crash = True
                     log.error(
-                        "  퍼징을 중단합니다. SSD 상태를 유지하여 "
-                        "디버깅이 가능합니다.")
+                        "  퍼징을 중단합니다. SSD와 NVMe 장치 상태를 "
+                        "그대로 유지합니다.")
                     break
 
                 if rc == self.RC_ERROR:
@@ -2273,10 +2267,17 @@ class NVMeFuzzer:
             except Exception:
                 pass
 
-            try:
-                self.sampler.close()
-            except Exception:
-                pass
+            # v4.3: timeout crash 시 J-Link를 닫지 않음
+            # SSD 펌웨어가 resume 상태로 계속 동작하도록 유지
+            if self._timeout_crash:
+                log.warning(
+                    "[J-Link] timeout crash 상태이므로 J-Link 연결을 "
+                    "유지합니다. SSD 펌웨어는 resume 상태로 동작 중입니다.")
+            else:
+                try:
+                    self.sampler.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
