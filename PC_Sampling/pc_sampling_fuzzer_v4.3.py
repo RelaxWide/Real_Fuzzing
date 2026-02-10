@@ -702,7 +702,9 @@ class NVMeFuzzer:
         self.executions = 0
         self.start_time: Optional[datetime] = None
 
-        self.cmd_stats = {c.name: {"exec": 0, "interesting": 0} for c in self.commands}
+        self.cmd_stats: dict[str, dict] = defaultdict(lambda: {"exec": 0, "interesting": 0})
+        for c in self.commands:
+            self.cmd_stats[c.name] = {"exec": 0, "interesting": 0}
         self.rc_stats: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
 
         # v4.3: 확장 mutation 통계 — 실제로 SSD에 전달된 내용을 추적
@@ -723,13 +725,27 @@ class NVMeFuzzer:
         self._timeout_crash = False
 
         # 명령어별 edge/PC 추적 (그래프 시각화용)
-        self.cmd_edges: dict[str, Set[Tuple[int, int]]] = {c.name: set() for c in self.commands}
-        self.cmd_pcs: dict[str, Set[int]] = {c.name: set() for c in self.commands}
+        # v4.3: defaultdict로 변경 — opcode_override 등 mutation별 키 자동 생성
+        self.cmd_edges: dict[str, Set[Tuple[int, int]]] = defaultdict(set)
+        self.cmd_pcs: dict[str, Set[int]] = defaultdict(set)
         # v4.3: deque로 교체 (pop(0) O(n) → popleft O(1))
-        self.cmd_traces: dict[str, deque] = {c.name: deque(maxlen=200) for c in self.commands}
+        self.cmd_traces: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
+        # 기본 명령어 키 초기화
+        for c in self.commands:
+            self.cmd_edges[c.name] = set()
+            self.cmd_pcs[c.name] = set()
+            self.cmd_traces[c.name] = deque(maxlen=200)
 
         # v4.2: subprocess 입력 파일 경로 (재사용)
         self._nvme_input_path: Optional[str] = None
+
+    @staticmethod
+    def _tracking_label(cmd: 'NVMeCommand', seed: 'Seed') -> str:
+        """v4.3: 실제 실행 내용 기준 추적 키 생성.
+        opcode_override가 있으면 원래 명령어와 분리하여 기록."""
+        if seed.opcode_override is not None:
+            return f"{cmd.name}_op0x{seed.opcode_override:02X}"
+        return cmd.name
 
     def _setup_directories(self):
         self.crashes_dir.mkdir(parents=True, exist_ok=True)
@@ -2064,7 +2080,8 @@ class NVMeFuzzer:
                 last_samples = self.sampler.stop_sampling()
 
                 self.executions += 1
-                self.cmd_stats[cmd.name]["exec"] += 1
+                track_key = self._tracking_label(cmd, mutated_seed)
+                self.cmd_stats[track_key]["exec"] += 1
 
                 # --- rc 분류 ---
                 # RC_TIMEOUT: NVMe 타임아웃 (의미 있는 이벤트)
@@ -2072,20 +2089,20 @@ class NVMeFuzzer:
                 # >= 0: nvme-cli returncode (0=성공)
 
                 if rc not in (self.RC_TIMEOUT, self.RC_ERROR):
-                    self.rc_stats[cmd.name][rc] += 1
+                    self.rc_stats[track_key][rc] += 1
 
                 # v4: Edge 기반 커버리지 평가
                 is_interesting, new_edges = self.sampler.evaluate_coverage()
 
-                # 명령어별 edge/PC/trace 기록 (시각화용)
-                self.cmd_edges[cmd.name].update(self.sampler.current_edges)
-                self.cmd_pcs[cmd.name].update(self.sampler.current_trace)
+                # v4.3: 실제 실행 opcode 기준으로 분류하여 기록
+                self.cmd_edges[track_key].update(self.sampler.current_edges)
+                self.cmd_pcs[track_key].update(self.sampler.current_trace)
                 # raw PC trace 저장 (deque maxlen=200 자동 관리)
                 if self.sampler._last_raw_pcs:
                     raw_in_range = [pc for pc in self.sampler._last_raw_pcs
                                     if self.sampler._in_range(pc)]
                     if raw_in_range:
-                        self.cmd_traces[cmd.name].append(raw_in_range)
+                        self.cmd_traces[track_key].append(raw_in_range)
 
                 # 로그
                 raw_count = len(self.sampler._last_raw_pcs)
@@ -2205,7 +2222,7 @@ class NVMeFuzzer:
 
                 if is_interesting:
                     self.sampler.interesting_inputs += 1
-                    self.cmd_stats[cmd.name]["interesting"] += 1
+                    self.cmd_stats[track_key]["interesting"] += 1
 
                     # v4: 새 Seed 추가 (CDW + 확장 mutation 필드 보존)
                     new_seed = Seed(
