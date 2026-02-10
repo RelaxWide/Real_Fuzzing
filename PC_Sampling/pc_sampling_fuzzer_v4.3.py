@@ -46,6 +46,7 @@ import time
 import threading
 import subprocess
 import os
+import shutil
 import json
 import hashlib
 import random
@@ -1927,6 +1928,14 @@ class NVMeFuzzer:
         log.warning(f"Timeouts    : {timeout_str}")
         log.warning(f"Output      : {self.config.output_dir}")
         log.warning("=" * 60)
+
+        # 이전 실행의 corpus/graphs 폴더 비우기
+        for subdir in ('corpus', 'graphs'):
+            target = self.output_dir / subdir
+            if target.exists():
+                shutil.rmtree(target)
+                log.info(f"[Cleanup] {target} 삭제 완료")
+            target.mkdir(parents=True, exist_ok=True)
 
         self._load_seeds()
 
