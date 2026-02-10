@@ -1,7 +1,7 @@
 # PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer — 기술 보고서
 
 **버전**: v4.3
-**최종 수정**: 2026-02-09
+**최종 수정**: 2026-02-10
 **파일**: `pc_sampling_fuzzer_v4.3.py`
 
 ---
@@ -92,7 +92,7 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 | **idle PC 감지** | `diagnose()` 단계에서 가장 빈도 높은 PC를 idle PC로 지정. 샘플링 중 연속 N회 idle PC에 머물면 조기 중단 |
 | **확장 mutation** | opcode mutation(10%), nsid mutation(10%), Admin↔IO 교차(5%), data_len 불일치(8%), GetLogPage NUMDL 과대 요청(15%) |
 
-### v4.3 — 버그 수정 + 설정 분리 + 성능 개선
+### v4.3 — 버그 수정 + 설정 분리 + 성능 개선 + 안정성 강화
 
 | 항목 | 분류 | 내용 |
 |---|---|---|
@@ -100,12 +100,21 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 | **글로벌 포화 임계값** | BugFix | 하드코딩된 `20`을 `global_saturation_limit` 설정값으로 분리. `--global-saturation-limit` CLI 옵션 추가 |
 | **prev_pc 캐리오버 제거** | BugFix | 이전 v4.2에서는 `self.prev_pc`를 실행 간 유지하여 서로 다른 NVMe 명령어 간의 가짜 edge가 생성될 수 있었음. v4.3에서 매 실행마다 sentinel(0xFFFFFFFF)으로 리셋 |
 | **post_cmd_delay_ms 구현** | BugFix | 설정에만 존재하고 실제로는 사용되지 않던 `post_cmd_delay_ms`를 `_send_nvme_command()` 내에서 명령 완료 후 sleep으로 구현 |
+| **EXCLUDED_OPCODES CLI 버그** | BugFix | CLI 파싱에서 `excluded_opcodes = []`로 초기화하여 스크립트 상단 `EXCLUDED_OPCODES` 상수가 무시되던 버그 수정. 이제 상수를 기본값으로 가져오고 CLI 추가분을 병합 |
 | **cmd_traces deque 교체** | Perf | `list.pop(0)` (O(n)) → `collections.deque(maxlen=200)` (O(1)) |
 | **interval 체크포인트 frozenset** | Perf | `sample_count in (10, 25, 50, 100, 200, 500)` 튜플 → 클래스 변수 `_INTERVAL_CHECKPOINTS = frozenset(...)` |
 | **랜덤 생성 비율 설정 분리** | Clarity | 하드코딩된 `0.8` (80% corpus, 20% random) → `random_gen_ratio` 설정값 + `--random-gen-ratio` CLI 옵션 |
-| **Mutation 통계 추적** | Feature | Summary에서 실제 전송된 opcode 분포, mutation 종류별 횟수/비율, passthru 타입(admin/io) 분포, 입력 소스(corpus vs random) 비율을 출력. 기존에는 원본 명령어 이름으로만 집계되어 mutation된 opcode/nsid/data_len 등이 보이지 않았음 |
-| **Timeout crash 불량 보존** | Feature | timeout 시 J-Link로 stuck PC를 20회 샘플링하여 crash 메타데이터에 기록. 빈도 분석으로 hang/loop/recovery 판별. CPU를 halt 상태로 유지하여 디버깅 가능. reconnect/continue 없이 퍼징 중단 |
+| **Mutation 통계 추적** | Feature | Summary에서 실제 전송된 opcode 분포, mutation 종류별 횟수/비율, passthru 타입(admin/io) 분포, 입력 소스(corpus vs random) 비율을 출력 |
+| **Timeout crash 불량 보존** | Feature | timeout 시 J-Link로 stuck PC를 20회 샘플링하여 crash 메타데이터에 기록. 빈도 분석으로 hang/loop/recovery 판별. **CPU를 resume 상태로 유지**하여 불량 현상 보존. reconnect/rescan/드라이버 재로드 없이 퍼징 중단 |
 | **D state 블로킹 방지** | BugFix | subprocess kill 후 `communicate()`에 5초 타임아웃 추가. 커널 NVMe 에러 복구(command abort → controller reset → PCIe FLR) 중 nvme-cli가 D state에 빠져 무한 블로킹되는 문제 해결 |
+| **제외 Opcode 설정** | Feature | `EXCLUDED_OPCODES` 상수 + `--exclude-opcodes "0xC1,0xC0"` CLI 옵션. 디바이스 탈락을 유발하는 opcode를 mutation 대상에서 제외 |
+| **확장 Mutation 확률 설정** | Feature | 하드코딩된 확장 mutation 확률을 설정값으로 분리. `--opcode-mut-prob 0`으로 opcode mutation 비활성화 가능 |
+| **AFL++ Corpus Culling** | Feature | 1000회마다 실행. 각 edge에 대해 data가 가장 작은 seed를 favored로 마킹하고, favored 아니면서 충분히 실행된(5회+) seed를 제거. Seed에 `covered_edges` set과 `is_favored` 플래그 추가 |
+| **NVMe 디바이스 사전 검증** | Feature | 퍼징 시작 전 `/dev/nvme0` 존재 여부 + 읽기/쓰기 권한 확인. 없으면 즉시 에러 출력 후 종료 (J-Link 연결 전에 실패) |
+| **J-Link Heartbeat** | Feature | 1000회마다 `_read_pc()` 시도. 실패 시 JTAG 연결 끊김으로 판단하고 퍼징 중단 |
+| **실제 Opcode 기준 추적** | Feature | opcode_override 사용 시 `Identify_Controller_op0xD1`처럼 실제 전송 opcode로 분류. 히트맵/bar chart/per-command stats/rc_stats 모두 적용. 기존에는 base 명령어에 mutation된 opcode의 커버리지가 오염되어 누적됨 |
+| **SMART Health 로그** | Feature | `nvme smart-log` 결과를 INFO 레벨로 기록. 퍼징 시작 전(baseline) + 10,000회마다(모니터링) + 퍼징 종료 후(최종 상태) |
+| **Corpus/Graphs 초기화** | Feature | 매 실행 시작 시 이전 실행의 `corpus/`, `graphs/` 폴더를 삭제 후 재생성. 이전 데이터와 혼합 방지 |
 
 ---
 
@@ -146,15 +155,19 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 ### 3.2 한 번의 실행(Execution) 상세
 
 ```
-1. _select_seed()       → 에너지 기반 가중치 랜덤으로 시드 선택
-2. _mutate()            → havoc + splice + CDW + 확장 mutation 적용
-3. start_sampling()     → J-Link 샘플링 스레드 시작 (백그라운드)
-4. subprocess.Popen()   → nvme-cli passthru 명령 전송
-5. communicate()        → 명령 완료 대기
-6. post_cmd_delay       → (v4.3) 추가 샘플링 대기
-7. stop_sampling()      → 샘플링 스레드 종료
-8. evaluate_coverage()  → current_edges와 global_edges 비교
-9. if interesting:      → corpus에 새 시드 추가
+ 1. _select_seed()       → 에너지 기반 가중치 랜덤으로 시드 선택
+ 2. _mutate()            → havoc + splice + CDW + 확장 mutation 적용
+ 3. start_sampling()     → J-Link 샘플링 스레드 시작 (백그라운드)
+ 4. subprocess.Popen()   → nvme-cli passthru 명령 전송
+ 5. communicate()        → 명령 완료 대기
+ 6. post_cmd_delay       → 추가 샘플링 대기
+ 7. stop_sampling()      → 샘플링 스레드 종료
+ 8. evaluate_coverage()  → current_edges와 global_edges 비교
+ 9. tracking_label()     → (v4.3) 실제 opcode 기준 추적 키 결정
+10. if interesting:      → corpus에 새 시드 추가 (covered_edges 포함)
+11. [매 100회]           → 상태 출력 + 로그 flush
+12. [매 1,000회]         → corpus culling + J-Link heartbeat
+13. [매 10,000회]        → SMART health 로그 기록
 ```
 
 ### 3.3 스레드 모델
@@ -296,6 +309,8 @@ class Seed:
     found_at: int            # 발견 시점
     new_edges: int           # 발견한 새 edge 수
     energy: float            # 계산된 에너지
+    covered_edges: set       # v4.3: 이 시드 실행 시 발견된 edge set (culling용)
+    is_favored: bool         # v4.3: corpus culling에서 선정된 favored seed
 ```
 
 #### 4.3.2 초기 시드 생성 (`_generate_default_seeds`)
@@ -380,13 +395,22 @@ NVMe 스펙에 따른 **정상 명령어 파라미터**를 초기 시드로 생�
 
 #### 4.4.4 확장 Mutation (NVMe 특화)
 
-| Mutation | 확률 | 목적 |
-|---|---|---|
-| opcode override | 10% | vendor-specific(0xC0~0xFF), 완전 랜덤, bitflip, 다른 명령어 opcode |
-| nsid override | 10% | nsid=0, 0xFFFFFFFF(broadcast), 존재하지 않는 NS |
-| Admin↔IO 교차 | 5% | 잘못된 큐로 전송하여 디스패치 혼란 유도 |
-| data_len 불일치 | 8% | CDW와 data_len이 다른 값을 가지도록 하여 DMA 엔진 혼란 |
-| GetLogPage NUMDL 과대 | 15% | 스펙 초과 크기의 로그 요청 |
+v4.3에서 모든 확률이 설정값으로 분리되어 CLI에서 개별 비활성화 가능 (`--opcode-mut-prob 0` 등).
+
+| Mutation | 기본 확률 | CLI 옵션 | 목적 |
+|---|---|---|---|
+| opcode override | 10% | `--opcode-mut-prob` | vendor-specific(0xC0~0xFF), 완전 랜덤, bitflip, 다른 명령어 opcode. `EXCLUDED_OPCODES`에 지정된 opcode는 자동 제외 |
+| nsid override | 10% | `--nsid-mut-prob` | nsid=0, 0xFFFFFFFF(broadcast), 존재하지 않는 NS |
+| Admin↔IO 교차 | 5% | `--admin-swap-prob` | 잘못된 큐로 전송하여 디스패치 혼란 유도 |
+| data_len 불일치 | 8% | `--datalen-mut-prob` | CDW와 data_len이 다른 값을 가지도록 하여 DMA 엔진 혼란 |
+| GetLogPage NUMDL 과대 | 15% | (고정) | 스펙 초과 크기의 로그 요청 |
+
+**일반 명령어만으로 퍼징** (확장 mutation 전부 비활성화):
+```bash
+python3 pc_sampling_fuzzer_v4.3.py \
+  --opcode-mut-prob 0 --nsid-mut-prob 0 \
+  --admin-swap-prob 0 --datalen-mut-prob 0
+```
 
 #### 4.4.5 Mutation 적용 순서
 
@@ -395,10 +419,10 @@ _mutate(seed):
     1. [15%] splice → 두 시드 합성
     2. _mutate_bytes() → havoc (2^1 ~ 2^7 스택)
     3. [30%] CDW mutation → 1~3개 CDW 필드 변형
-    4. [10%] opcode override
-    5. [10%] nsid override
-    6. [5%]  Admin↔IO 교차
-    7. [8%]  data_len 불일치
+    4. [configurable] opcode override (excluded 필터링 포함)
+    5. [configurable] nsid override
+    6. [configurable] Admin↔IO 교차
+    7. [configurable] data_len 불일치
     8. [15%] GetLogPage NUMDL 과대 (해당 명령어인 경우)
 ```
 
@@ -523,7 +547,7 @@ else:                      → 0
 | 값 | 의미 | 처리 |
 |---|---|---|
 | `>= 0` | nvme-cli returncode (0=성공) | 정상 처리, rc 통계 기록 |
-| `RC_TIMEOUT (-1001)` | NVMe 타임아웃 | crash로 저장, J-Link 재연결 |
+| `RC_TIMEOUT (-1001)` | NVMe 타임아웃 | stuck PC 20회 샘플링 → crash 저장 → 펌웨어 resume 유지 → 퍼징 중단 (복구 동작 없음) |
 | `RC_ERROR (-1002)` | subprocess 내부 에러 | 스킵 |
 
 ---
@@ -541,16 +565,26 @@ else:                      → 0
 
 - 펌웨어 주소 공간을 bin으로 나누어 각 bin의 PC 히트 수를 히트맵으로 표시
 - 전체(ALL) + 명령어별 행으로 구성
+- v4.3: opcode_override 사용 시 `Identify_Controller_op0xD1`처럼 실제 opcode별로 별도 행 생성
 
 #### 4.8.3 2D Edge Heatmap
 
 - prev_pc × cur_pc 인접 행렬을 2D 히트맵으로 표시
 - log 스케일, inferno 컬러맵
 - 대각선 참조선 (순차 실행 영역)
+- v4.3: 실제 opcode 기준으로 분류 (mutation된 opcode의 edge가 원래 명령어에 오염되지 않음)
 
 #### 4.8.4 명령어 비교 막대 차트
 
 - 명령어별 edge 수, PC 수, 실행 횟수를 가로 막대 차트로 비교
+- v4.3: 실제 opcode 기준 분류 반영 (e.g., `GetFeatures` vs `GetFeatures_op0xD1`)
+
+#### 4.8.5 SMART Health 로그 (v4.3 추가)
+
+- `nvme smart-log` 실행 결과를 INFO 레벨로 로그 기록
+- 기록 시점: 퍼징 시작 전(baseline) / 10,000회마다 / 퍼징 종료 후
+- SSD 온도, 가용 예비 공간, 미디어 에러 수 등 건강 상태 모니터링
+- 디바이스 탈락(timeout) 후에는 실패하고 warning만 출력
 
 ---
 
@@ -566,7 +600,7 @@ else:                      → 0
 | Arithmetic mutation | 구현 완료 | 8/16/32-bit, LE/BE, ARITH_MAX=35 |
 | Power Schedule (explore) | 부분 구현 | 에너지만 사용, perf_score 미포함 |
 | Edge coverage | 구현 완료 (변형) | 정확한 (prev,cur) 튜플 (bitmap 아님) |
-| Corpus management | 구현 완료 | interesting → corpus 추가 |
+| Corpus management | 구현 완료 | interesting → corpus 추가 + AFL++ 방식 culling (1000회마다) |
 | Crash detection | 구현 완료 | timeout → crash 저장 |
 | Resume (coverage reload) | 구현 완료 | coverage.txt + coverage_edges.txt 로드 |
 
@@ -583,18 +617,25 @@ else:                      → 0
 | **Dictionary** | 낮음 | NVMe 스펙 기반 시드가 사실상 dictionary 역할 |
 | **MOpt (mutator scheduling)** | 중간 | mutation 연산자별 효과를 추적하여 가중치 조정. 현재는 균등 확률 |
 
+> **v4.3에서 추가 구현된 AFL++ 기능**: corpus culling (favored seed 선정 + 비기여 seed 제거)
+
 ### 5.3 독자적 기능 (AFL++에 없는)
 
 | 기능 | 설명 |
 |---|---|
 | NVMe CDW mutation | 32-bit CDW 필드 전용 mutation (6종) |
-| opcode override | vendor-specific 범위 탐색, opcode bitflip |
+| opcode override | vendor-specific 범위 탐색, opcode bitflip. 제외 opcode 목록 지원 |
 | nsid override | 잘못된 namespace로 에러 핸들링 코드 탐색 |
 | Admin↔IO 교차 | 잘못된 큐로 전송하여 디스패치 혼란 유도 |
 | data_len 불일치 | CDW와 데이터 크기 불일치로 DMA 엔진 테스트 |
 | GetLogPage NUMDL 과대 | 스펙 초과 크기 로그 요청 |
 | idle PC 감지 | 의미 없는 idle loop 샘플링 자동 중단 |
 | 명령어별 CFG 시각화 | 각 NVMe 명령어가 실행하는 펌웨어 코드 경로 시각화 |
+| 실제 opcode 기준 추적 | opcode_override 사용 시 별도 키로 커버리지 분리 (오염 방지) |
+| SMART Health 모니터링 | 퍼징 전/중/후 SSD 건강 상태 기록 |
+| NVMe 디바이스 사전 검증 | 시작 전 장치 존재 + 권한 확인 |
+| J-Link Heartbeat | 1000회마다 JTAG 연결 상태 확인 |
+| Timeout 불량 보존 | timeout 시 복구 없이 펌웨어 resume 상태 유지 (디버깅용) |
 
 ---
 
@@ -693,6 +734,61 @@ AFL++의 fork server는 `exec()`를 1회만 수행하고 이후 `fork()`만 반�
 
 **수정**: `RANDOM_GEN_RATIO = 0.2` 상수 + `FuzzConfig.random_gen_ratio` 필드 + `--random-gen-ratio` CLI 옵션. 메인 루프에서 `random.random() >= self.config.random_gen_ratio` 조건으로 변경.
 
+### 7.8 [BugFix] EXCLUDED_OPCODES CLI 파싱 버그
+
+**문제**: CLI 파싱에서 `excluded_opcodes = []`로 초기화하여, 스크립트 상단에 `EXCLUDED_OPCODES = [0xC1, 0xC0]`을 설정해도 CLI 옵션을 안 넘기면 빈 리스트로 덮어씀.
+
+**수정**: `excluded_opcodes = list(EXCLUDED_OPCODES)`로 상수를 기본값으로 가져오고, CLI `--exclude-opcodes`로 추가 지정 시 병합.
+
+### 7.9 [Feature] 제외 Opcode 설정
+
+**배경**: opcode mutation으로 vendor-specific opcode(예: 0xC1, 0xC0)를 보내면 SSD가 응답 불능 상태에 빠져 커널이 controller reset → 장치 해제를 수행함.
+
+**구현**:
+- `EXCLUDED_OPCODES: List[int] = []` 스크립트 상단 상수
+- `FuzzConfig.excluded_opcodes` 필드
+- `--exclude-opcodes "0xC1,0xC0"` CLI 옵션
+- opcode mutation 발생 시 제외 대상이면 override 취소 (원래 opcode 사용)
+
+### 7.10 [Feature] 확장 Mutation 확률 설정
+
+**문제**: 확장 mutation 확률(10%, 10%, 5%, 8%)이 코드에 하드코딩되어, 특정 mutation만 끄려면 코드 수정이 필요했음.
+
+**수정**: `OPCODE_MUT_PROB`, `NSID_MUT_PROB`, `ADMIN_SWAP_PROB`, `DATALEN_MUT_PROB` 상수 + FuzzConfig 필드 + CLI 옵션 (`--opcode-mut-prob` 등). 0으로 설정하면 해당 mutation 비활성화.
+
+### 7.11 [Feature] AFL++ Corpus Culling
+
+**구현**: `_cull_corpus()` 메서드, 1000회마다 실행.
+1. 각 edge에 대해 data가 가장 작은 seed를 `favored`로 마킹
+2. favored 아니고 + 5회 이상 실행되고 + 기본 시드가 아닌 seed 제거
+3. Seed에 `covered_edges` set 저장 (corpus 추가 시 `current_edges` 스냅샷)
+
+### 7.12 [Feature] NVMe 디바이스 사전 검증
+
+**구현**: `run()` 시작 시 `/dev/nvme0` 존재 여부 + `os.access(R_OK | W_OK)` 확인. 실패 시 J-Link 연결 전에 즉시 종료.
+
+### 7.13 [Feature] J-Link Heartbeat
+
+**구현**: 1000회마다 `_read_pc()` 시도. None 반환 시 JTAG 연결 끊김으로 판단하고 퍼징 중단.
+
+### 7.14 [Feature] 실제 Opcode 기준 추적
+
+**문제**: opcode_override로 0xD1을 보내도 커버리지가 원래 명령어(e.g., `Identify_Controller`)에 누적됨. 히트맵/통계가 오염.
+
+**수정**: `_tracking_label(cmd, seed)` 메서드 도입. opcode_override 있으면 `Identify_Controller_op0xD1`처럼 별도 키 생성. `cmd_edges`, `cmd_pcs`, `cmd_traces`, `cmd_stats`, `rc_stats` 모두 실제 opcode 기준으로 분류. defaultdict 사용으로 새 키 자동 생성.
+
+### 7.15 [Feature] SMART Health 로그
+
+**구현**: `_log_smart()` 메서드. `nvme smart-log /dev/nvme0`을 subprocess로 실행하고 결과를 INFO 레벨로 기록.
+- 퍼징 시작 전: baseline 상태
+- 10,000회마다: 퍼징 중 SSD 상태 변화 모니터링
+- 퍼징 종료 후: 최종 상태
+- 디바이스 탈락 시 실패하고 warning만 출력
+
+### 7.16 [Feature] Corpus/Graphs 폴더 초기화
+
+**구현**: `run()` 시작 시 `shutil.rmtree()`로 `output/corpus/`, `output/graphs/` 삭제 후 재생성. 이전 실행 데이터와 혼합 방지.
+
 ---
 
 ## 8. 알려진 제한사항 및 향후 과제
@@ -764,6 +860,11 @@ sudo python3 pc_sampling_fuzzer_v4.3.py --all-commands
 | `--global-saturation-limit` | 20 | 글로벌 edge 포화 임계값 |
 | `--max-energy` | 16.0 | Power Schedule 최대 에너지 |
 | `--random-gen-ratio` | 0.2 | 완전 랜덤 입력 비율 |
+| `--exclude-opcodes` | (없음) | 제외할 opcode 목록 (e.g., `"0xC1,0xC0"`) |
+| `--opcode-mut-prob` | 0.10 | opcode mutation 확률 (0=비활성화) |
+| `--nsid-mut-prob` | 0.10 | NSID mutation 확률 (0=비활성화) |
+| `--admin-swap-prob` | 0.05 | Admin↔IO 교차 확률 (0=비활성화) |
+| `--datalen-mut-prob` | 0.08 | data_len 불일치 확률 (0=비활성화) |
 | `--timeout GROUP MS` | (그룹별 기본값) | 타임아웃 그룹별 오버라이드 |
 
 ---
