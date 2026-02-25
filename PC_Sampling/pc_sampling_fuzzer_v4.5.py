@@ -892,7 +892,9 @@ class NVMeFuzzer:
         actual_runs = 0
 
         for run_i in range(total_runs):
-            self.sampler.start_sampling()
+            # _send_nvme_command() 내부에서 start_sampling()을 호출하므로
+            # 여기서 별도로 start_sampling()을 호출하면 두 개의 sampling thread가
+            # 동시에 실행되어 current_edges가 오염되고 zombie thread가 누적된다.
             rc = self._send_nvme_command(seed.data, seed)
             self.sampler.stop_sampling()
             self.executions += 1
