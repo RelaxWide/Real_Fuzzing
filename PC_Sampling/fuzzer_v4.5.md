@@ -138,6 +138,8 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 |---|---|---|
 | **Hit count bucketing** | Feature | edge별 누적 실행 횟수를 AFL++ 스타일 로그 버킷(1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+)으로 변환. 버킷 변화 시 interesting으로 판단하여 루프 반복 횟수 변화를 감지 |
 | **Calibration** | Feature | 초기 시드를 N회(기본 3) 반복 실행하여 edge 안정성 측정. 모든 실행에서 등장한 edge만 `stable_edges`로 분류하고, 안정한 edge만 글로벌 커버리지에 반영. PC 샘플링의 비결정성 보정 |
+| **Calibration DLL stderr 억제** | BugFix | Calibration 구간의 tight halt/read/go 루프에서 J-Link DLL이 `"Cannot read register (R15) while CPU is running"` / `"CPU is not halted"` 경고를 stderr에 직접 출력하는 문제. `JLINKARM_Halt()`는 비동기(fire-and-forget)라 CPU 정지 확인 없이 바로 반환하며, 일반 퍼징에서는 NVMe 명령 처리 시간이 완충 역할을 하지만 calibration의 빡빡한 루프에서는 타이밍 위반이 빈번히 발생. Python `except Exception`으로는 DLL 수준의 stderr를 막을 수 없으므로, calibration 블록 전체를 `os.dup2(devnull, 2)` / `os.dup2(saved, 2)` 로 fd 수준에서 억제하고 `finally`에서 반드시 복원 |
+| **Calibration 결과 요약 테이블** | Feature | calibration 완료 후 시드별 Stability / StableEdges / AllEdges 를 표 형식으로 출력하고, 전체 Seeds 수 · Global stable edges · Avg stability 요약을 표시한 뒤 퍼징을 시작. 기존에는 각 시드가 log.info 한 줄씩 출력되어 전체 결과를 한눈에 파악하기 어려웠음 |
 | **Deterministic stage** | Feature | 새 시드의 CDW10~CDW15 필드에 대해 체계적 mutation(walking bitflip 32개, arithmetic ±1~10, interesting_32/8 대입) 수행. 제너레이터 기반 + deque로 havoc보다 우선 소비. 값이 0인 CDW 필드는 건너뜀 |
 | **MOpt mutation scheduling** | Feature | Pilot/Core 2단계 모드. Pilot(기본 5000회): 16개 mutation operator 균등 사용하며 성공률 측정. Core(기본 50000회): 성공률 기반 가중치로 효과적인 operator에 집중. 주기적으로 모드 전환 |
 | **Edge count 저장/로드** | Feature | `coverage_edge_counts.txt` 파일로 edge별 누적 hit count 저장/로드. resume 시 버킷 상태 완전 복원 |
@@ -981,6 +983,55 @@ def _capture_dmesg(self, lines: int = 80) -> str:
 4. **CLI**: `--calibration-runs 3` (기본), `--calibration-runs 0`으로 비활성화 가능
 
 **성능 영향**: 초기 시드 ~30개 × 3회 = ~90회 실행. 2~5 exec/s 기준 약 30초~1분 소요.
+
+#### 9.2.1 [BugFix] Calibration 중 DLL stderr 노이즈 억제
+
+**증상**: calibration 시작 직후 아래 메시지가 다량 출력된 뒤 정상 동작:
+```
+Cannot read register 9 (R15 (PC)) while CPU is running
+CPU is not halted
+```
+
+**원인**: `JLINKARM_Halt()`(raw DLL call)는 fire-and-forget — halt 요청을 보내고 CPU 정지를 확인하지 않고 즉시 반환한다. 바로 이어지는 `JLINKARM_ReadReg()`가 CPU가 아직 running 상태일 때 호출되면 DLL이 stderr에 직접 경고를 출력한다. Python의 `except Exception`은 DLL 수준 stderr 출력을 막지 못한다.
+
+일반 퍼징에서는 NVMe 명령 처리 시간(수 ms)이 자연적인 완충 역할을 하므로 문제가 드러나지 않는다. calibration은 `stop_sampling()` → `start_sampling()`을 딜레이 없이 반복하는 tight loop라 타이밍 위반이 빈번히 발생한다.
+
+**수정**: calibration 블록 전체를 fd 수준으로 stderr 억제. Python `sys.stderr`가 아닌 OS fd 2를 직접 교체해야 DLL 출력도 차단된다.
+
+```python
+devnull_fd = os.open(os.devnull, os.O_WRONLY)
+saved_stderr_fd = os.dup(2)
+os.dup2(devnull_fd, 2)   # fd 2 → /dev/null (DLL stdout도 차단)
+os.close(devnull_fd)
+try:
+    for seed in corpus:
+        seed = self._calibrate_seed(seed)
+        ...
+finally:
+    os.dup2(saved_stderr_fd, 2)   # 반드시 복원
+    os.close(saved_stderr_fd)
+```
+
+#### 9.2.2 [Feature] Calibration 결과 요약 테이블
+
+calibration 완료 후, 시드별 결과를 표 형식으로 정리하여 출력하고 퍼징을 시작한다:
+
+```
+[Calibration] Results:
+────────────────────────────────────────────────────────────────
+   # Command              Stability  StableEdges   AllEdges
+────────────────────────────────────────────────────────────────
+   1 Identify              100.0%          42          42
+   2 GetLogPage             83.3%          35          42
+   3 GetFeatures            91.7%          78          85
+  ...
+────────────────────────────────────────────────────────────────
+  Seeds: 26  |  Global stable edges: 847  |  Avg stability: 94.2%
+────────────────────────────────────────────────────────────────
+[Calibration] Complete. Starting fuzzing...
+```
+
+기존에는 각 시드가 `log.info` 한 줄씩 출력되어 전체 결과를 파악하기 어려웠다.
 
 ### 9.3 [Feature] Deterministic Stage (체계적 CDW 경계값 탐색)
 
