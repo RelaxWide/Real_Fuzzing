@@ -58,6 +58,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
+import contextlib
 
 # 버전
 FUZZER_VERSION = "4.5"
@@ -2412,21 +2413,57 @@ class NVMeFuzzer:
 
         # v4.5: 초기 시드 Calibration
         if self.config.calibration_runs > 0:
-            log.warning(f"[Calibration] {len(self.corpus)} seeds × "
-                        f"{self.config.calibration_runs} runs each")
+            total_seeds = len(self.corpus)
+            log.warning(f"[Calibration] {total_seeds} seeds × "
+                        f"{self.config.calibration_runs} runs each ...")
             calibrated_corpus = []
-            for i, seed in enumerate(self.corpus):
-                seed = self._calibrate_seed(seed)
-                calibrated_corpus.append(seed)
-                edge_count = len(seed.covered_edges) if seed.covered_edges else 0
-                log.info(f"  [{i+1}/{len(self.corpus)}] {seed.cmd.name} "
-                         f"stability={seed.stability:.2f} edges={edge_count}")
-                if self._timeout_crash:
-                    log.error("[Calibration] timeout during calibration — aborting")
-                    return
+            cal_results = []  # (index, cmd_name, stability, stable_edges, all_edges)
+
+            # J-Link DLL이 stderr로 직접 출력하는 "CPU is not halted" 등의
+            # 타이밍 경고를 calibration 구간에서만 fd 수준으로 억제한다.
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            saved_stderr_fd = os.dup(2)
+            os.dup2(devnull_fd, 2)
+            os.close(devnull_fd)
+            try:
+                for i, seed in enumerate(self.corpus):
+                    seed = self._calibrate_seed(seed)
+                    calibrated_corpus.append(seed)
+                    stable_cnt = len(seed.stable_edges) if seed.stable_edges else 0
+                    all_cnt    = len(seed.covered_edges) if seed.covered_edges else 0
+                    cal_results.append((i + 1, seed.cmd.name, seed.stability,
+                                        stable_cnt, all_cnt))
+                    if self._timeout_crash:
+                        os.dup2(saved_stderr_fd, 2)
+                        log.error("[Calibration] timeout during calibration — aborting")
+                        return
+            finally:
+                os.dup2(saved_stderr_fd, 2)
+                os.close(saved_stderr_fd)
+
             self.corpus = calibrated_corpus
-            log.warning(f"[Calibration] Done. Total edges after calibration: "
-                        f"{len(self.sampler.global_edges)}")
+
+            # ── Calibration 결과 요약 테이블 ──────────────────────────────
+            W_IDX, W_CMD, W_STA, W_STB, W_ALL = 4, 20, 11, 12, 10
+            sep = (f"{'─'*W_IDX}─{'─'*W_CMD}─{'─'*W_STA}─"
+                   f"{'─'*W_STB}─{'─'*W_ALL}")
+            hdr = (f"{'#':>{W_IDX}} {'Command':<{W_CMD}} {'Stability':>{W_STA}} "
+                   f"{'StableEdges':>{W_STB}} {'AllEdges':>{W_ALL}}")
+            log.warning("[Calibration] Results:")
+            log.warning(sep)
+            log.warning(hdr)
+            log.warning(sep)
+            for idx, cmd_name, stab, stable_cnt, all_cnt in cal_results:
+                stab_str = f"{stab*100:.1f}%"
+                log.warning(f"{idx:>{W_IDX}} {cmd_name:<{W_CMD}} "
+                            f"{stab_str:>{W_STA}} "
+                            f"{stable_cnt:>{W_STB}} {all_cnt:>{W_ALL}}")
+            log.warning(sep)
+            avg_stab = sum(r[2] for r in cal_results) / max(len(cal_results), 1)
+            log.warning(f"  Seeds: {total_seeds}  |  "
+                        f"Global stable edges: {len(self.sampler.global_edges)}  |  "
+                        f"Avg stability: {avg_stab*100:.1f}%")
+            log.warning(sep)
 
             # v4.5: Calibration 완료된 초기 시드에 대해 deterministic stage 등록
             if self.config.deterministic_enabled:
@@ -2435,6 +2472,8 @@ class NVMeFuzzer:
                         gen = self._deterministic_stage(seed)
                         self._det_queue.append((seed, gen))
                 log.warning(f"[Det] Queued {len(self._det_queue)} seeds for deterministic stage")
+
+            log.warning("[Calibration] Complete. Starting fuzzing...\n")
         else:
             log.info("[Calibration] Disabled (calibration_runs=0)")
 
