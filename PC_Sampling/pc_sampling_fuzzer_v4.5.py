@@ -908,8 +908,16 @@ class NVMeFuzzer:
                 break
 
         # 안정성 계산
+        # AFL++와 달리 PC Sampling은 확률적 샘플링이므로 실제로 실행된 코드도
+        # 매 run마다 캡처되지 않을 수 있다. 따라서:
+        #   - stable: 과반수(>50%) 이상 run에서 관측된 edge (seed 품질 메타데이터용)
+        #   - global_edges 반영: all_seen(합집합) — 관측된 모든 edge를 커버리지로 인정
+        # instrumentation 기반 AFL++처럼 cnt == actual_runs(100% 재현)를 쓰면
+        # 거의 모든 edge가 unstable 처리되어 initial global coverage가 극도로 희박해지고
+        # 퍼징 시작 후 대부분 입력이 "새 edge 발견"으로 오탐된다.
         all_seen = set(edge_appearances.keys())
-        stable = {e for e, cnt in edge_appearances.items() if cnt == actual_runs}
+        stable_threshold = actual_runs / 2.0  # 과반수 기준 (50% 초과)
+        stable = {e for e, cnt in edge_appearances.items() if cnt > stable_threshold}
         stability = len(stable) / max(len(all_seen), 1)
 
         seed.is_calibrated = True
@@ -917,10 +925,10 @@ class NVMeFuzzer:
         seed.stable_edges = stable
         seed.covered_edges = all_seen
 
-        # 안정한 edge만 global에 반영
-        self.sampler.global_edges.update(stable)
-        for edge in stable:
-            # hit count도 반영
+        # global_edges에 합집합(all_seen) 반영 — stable만 반영하면 initial coverage가
+        # 너무 희박해져 퍼징 효율이 크게 저하된다.
+        self.sampler.global_edges.update(all_seen)
+        for edge in all_seen:
             self.sampler.global_edge_counts[edge] = \
                 self.sampler.global_edge_counts.get(edge, 0) + edge_appearances[edge]
             self.sampler.global_edge_buckets[edge] = \
