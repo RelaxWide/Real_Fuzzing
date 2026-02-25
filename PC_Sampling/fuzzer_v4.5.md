@@ -140,6 +140,7 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 | **Calibration** | Feature | 초기 시드를 N회(기본 3) 반복 실행하여 edge 안정성 측정. 모든 실행에서 등장한 edge만 `stable_edges`로 분류하고, 안정한 edge만 글로벌 커버리지에 반영. PC 샘플링의 비결정성 보정 |
 | **Calibration DLL stderr 억제** | BugFix | Calibration 구간의 tight halt/read/go 루프에서 J-Link DLL이 `"Cannot read register (R15) while CPU is running"` / `"CPU is not halted"` 경고를 stderr에 직접 출력하는 문제. `JLINKARM_Halt()`는 비동기(fire-and-forget)라 CPU 정지 확인 없이 바로 반환하며, 일반 퍼징에서는 NVMe 명령 처리 시간이 완충 역할을 하지만 calibration의 빡빡한 루프에서는 타이밍 위반이 빈번히 발생. Python `except Exception`으로는 DLL 수준의 stderr를 막을 수 없으므로, calibration 블록 전체를 `os.dup2(devnull, 2)` / `os.dup2(saved, 2)` 로 fd 수준에서 억제하고 `finally`에서 반드시 복원 |
 | **Calibration 결과 요약 테이블** | Feature | calibration 완료 후 시드별 Stability / StableEdges / AllEdges 를 표 형식으로 출력하고, 전체 Seeds 수 · Global stable edges · Avg stability 요약을 표시한 뒤 퍼징을 시작. 기존에는 각 시드가 log.info 한 줄씩 출력되어 전체 결과를 한눈에 파악하기 어려웠음 |
+| **Calibration 이중 start_sampling 버그** | BugFix | `_calibrate_seed()`가 매 run마다 `start_sampling()`을 명시적으로 호출하지만, `_send_nvme_command()` 내부에서도 `start_sampling()`을 호출하여 run당 두 개의 sampling thread가 동시에 실행됨. Thread 2가 `current_edges = set()`으로 리셋하면 Thread 1은 구 set에 add하여 데이터 유실. 또한 `stop_sampling()`은 Thread 2만 join하고 Thread 1은 zombie로 남아 다음 run의 `current_edges`에 이전 run의 edge를 혼입시킴. 그 결과 매 run의 edge 집합이 비결정적으로 달라져 `stable = {}` → **StableEdges 전부 0**. 수정: `_calibrate_seed()` 내부의 명시적 `start_sampling()` 호출 제거 |
 | **Deterministic stage** | Feature | 새 시드의 CDW10~CDW15 필드에 대해 체계적 mutation(walking bitflip 32개, arithmetic ±1~10, interesting_32/8 대입) 수행. 제너레이터 기반 + deque로 havoc보다 우선 소비. 값이 0인 CDW 필드는 건너뜀 |
 | **MOpt mutation scheduling** | Feature | Pilot/Core 2단계 모드. Pilot(기본 5000회): 16개 mutation operator 균등 사용하며 성공률 측정. Core(기본 50000회): 성공률 기반 가중치로 효과적인 operator에 집중. 주기적으로 모드 전환 |
 | **Edge count 저장/로드** | Feature | `coverage_edge_counts.txt` 파일로 edge별 누적 hit count 저장/로드. resume 시 버킷 상태 완전 복원 |
@@ -1012,7 +1013,38 @@ finally:
     os.close(saved_stderr_fd)
 ```
 
-#### 9.2.2 [Feature] Calibration 결과 요약 테이블
+#### 9.2.2 [BugFix] Calibration 이중 start_sampling → StableEdges 전부 0
+
+**증상**: calibration 결과 테이블에서 모든 시드의 StableEdges 가 0으로 표시됨.
+
+**원인**: `_calibrate_seed()` 내부 루프가 매 run 시작 시 `start_sampling()`을 명시적으로 호출하지만, `_send_nvme_command()` 내부에서도 `start_sampling()`을 다시 호출하는 이중 호출 구조:
+
+```python
+# 버그가 있는 원래 코드
+for run_i in range(total_runs):
+    self.sampler.start_sampling()              # Thread A 시작
+    rc = self._send_nvme_command(seed.data, seed)
+    #   ↑ 내부에서 start_sampling() 재호출 → Thread B 시작, current_edges = set() 리셋
+    self.sampler.stop_sampling()               # Thread B만 join, Thread A는 zombie
+```
+
+문제 연쇄:
+1. Thread B가 `current_edges = set()`으로 리셋 → Thread A가 이전에 수집한 edge 유실
+2. `stop_sampling()`은 Thread B만 join. Thread A는 daemon thread로 살아남음
+3. 다음 run에서 `stop_event.clear()` 시 Thread A가 다시 활성화되어 다음 run의 `current_edges`에 이전 run의 edge를 혼입
+4. run이 쌓일수록 zombie thread가 누적 (run 1: zombie 1개, run 2: zombie 2개, run 3: zombie 3개)
+5. 매 run의 edge 집합이 비결정적으로 오염 → 3회 run 모두에서 동일한 edge가 없음 → `stable = {}` → **StableEdges = 0**
+
+**수정**: `_calibrate_seed()` 내부의 명시적 `start_sampling()` 제거. `_send_nvme_command()`가 이미 내부에서 `start_sampling()`을 호출하므로 외부에서 별도 호출 불필요. 메인 퍼징 루프와 동일한 패턴:
+
+```python
+# 수정된 코드
+for run_i in range(total_runs):
+    rc = self._send_nvme_command(seed.data, seed)  # 내부에서 start_sampling() 호출
+    self.sampler.stop_sampling()                   # 정확히 1:1 대응
+```
+
+#### 9.2.3 [Feature] Calibration 결과 요약 테이블
 
 calibration 완료 후, 시드별 결과를 표 형식으로 정리하여 출력하고 퍼징을 시작한다:
 
