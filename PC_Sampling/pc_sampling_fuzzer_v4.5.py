@@ -138,7 +138,7 @@ NVME_TIMEOUTS = {
 SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
 MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수 (상한)
 SATURATION_LIMIT      = 10    # idle PC 연속 N회 감지 시 샘플링 조기 종료
-GLOBAL_SATURATION_LIMIT = 20  # v4.3: 글로벌 edge 기준 연속 N회 새 edge 없으면 조기 종료
+GLOBAL_SATURATION_LIMIT = 20  # 연속 N회 새 global PC 없으면 조기 종료 (v4.5+: edge→PC 기준 전환)
 POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 
 # 퍼징 설정
@@ -424,8 +424,8 @@ class JLinkPCSampler:
         self.jlink: Optional[pylink.JLink] = None
         self._pc_reg_index: int = 9  # Cortex-R8: R15(PC)의 J-Link 레지스터 인덱스
 
-        # v4: Edge 기반 커버리지
-        self.global_edges: Set[Tuple[int, int]] = set()  # (prev_pc, cur_pc) 튜플
+        # 진단용 Edge 추적 (Diagnostic only — corpus 결정에 사용 안 함)
+        self.global_edges: Set[Tuple[int, int]] = set()  # confirmed (prev_pc, cur_pc) 튜플
         self.current_edges: Set[Tuple[int, int]] = set()
         # sentinel: 유효 주소 범위 밖의 값으로 초기화하여 가짜 edge 방지
         self.prev_pc: int = 0xFFFFFFFF
@@ -441,9 +441,9 @@ class JLinkPCSampler:
         # EDGE_CONFIRM_THRESHOLD 이상 관측 시 global_edges로 이동
         self.global_edge_pending: Dict[Tuple[int, int], int] = {}
 
-        # 기존 PC 기반 커버리지 (비교용으로 유지)
-        self.global_coverage: Set[int] = set()
-        self.current_trace: Set[int] = set()
+        # Primary coverage signal: unique PC 주소 (v4.5+)
+        self.global_coverage: Set[int] = set()   # 전체 세션에서 관측된 unique PC 주소
+        self.current_trace: Set[int] = set()     # 이번 실행에서 관측된 unique PC 주소
 
         self.stop_event = threading.Event()
         self.sample_thread: Optional[threading.Thread] = None
@@ -661,8 +661,8 @@ class JLinkPCSampler:
                 self.total_samples += 1
 
                 if sample_count in self._INTERVAL_CHECKPOINTS:
-                    cur_unique_edges = len(self.current_edges)
-                    self._unique_at_intervals[sample_count] = cur_unique_edges
+                    # v4.5+: PC 기준으로 변경 (기존 edge 기준에서 전환)
+                    self._unique_at_intervals[sample_count] = len(self.current_trace)
 
                 # 조기 종료 조건 (OR)
                 # 조건1: 연속 global_sat_limit회 이미 알려진 PC (새 코드 경로 없음)
@@ -2536,7 +2536,7 @@ class NVMeFuzzer:
         if self.sampler.idle_pc is not None:
             log.warning(f"Idle PC     : {hex(self.sampler.idle_pc)}")
         else:
-            log.warning("Idle PC     : not detected (saturation = global edge only)")
+            log.warning("Idle PC     : not detected (saturation = global PC only)")
 
         # v4.3: 퍼징 시작 전 SMART baseline 기록
         self._log_smart()
@@ -3079,7 +3079,7 @@ if __name__ == "__main__":
     parser.add_argument('--saturation-limit', type=int, default=SATURATION_LIMIT,
                         help='Stop sampling after N consecutive idle PCs (0=disable)')
     parser.add_argument('--global-saturation-limit', type=int, default=GLOBAL_SATURATION_LIMIT,
-                        help='Stop sampling after N consecutive non-new global edges (0=disable)')
+                        help='Stop sampling after N consecutive non-new global PCs (0=disable)')
     parser.add_argument('--max-energy', type=float, default=MAX_ENERGY,
                         help='Max energy for power schedule')
     parser.add_argument('--random-gen-ratio', type=float, default=RANDOM_GEN_RATIO,
@@ -3163,7 +3163,7 @@ if __name__ == "__main__":
         print(f"Excluded opcodes: {[hex(o) for o in excluded_opcodes]}")
     print(f"\nv{FUZZER_VERSION} Features:")
     print("  - subprocess (nvme-cli) NVMe passthru")
-    print("  - Global edge saturation (configurable) + idle PC detection")
+    print("  - Global PC saturation (configurable) + idle PC detection")
     print("  - Per-execution prev_pc reset (no cross-execution false edges)")
     print("  - Post-command delay sampling")
     print("  - AFL++ havoc/splice mutation engine")
