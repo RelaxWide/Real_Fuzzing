@@ -237,14 +237,14 @@ class Seed:
     data_len_override: Optional[int] = None     # data_len↔CDW 의도적 불일치
     exec_count: int = 0          # 이 시드가 선택된 횟수
     found_at: int = 0            # 발견된 시점 (execution number)
-    new_edges: int = 0           # 발견한 새 edge 수
+    new_pcs: int = 0             # 발견한 새 unique PC 수 (primary coverage signal)
     energy: float = 1.0          # 계산된 에너지
-    covered_edges: Optional[set] = None  # v4.3: 이 시드 실행 시 발견된 edge set (culling용)
+    covered_pcs: Optional[set] = None   # 이 시드 실행 시 방문된 PC 주소 집합 (culling용)
     is_favored: bool = False     # v4.3: corpus culling에서 선정된 favored seed
     # v4.5: Calibration
     is_calibrated: bool = False  # calibration 완료 여부
-    stability: float = 1.0      # 0.0~1.0, edge 안정성 비율
-    stable_edges: Optional[set] = None  # calibration에서 모든 실행에 등장한 edge
+    stability: float = 1.0      # 0.0~1.0, PC 안정성 비율
+    stable_pcs: Optional[set] = None    # calibration에서 과반수 실행에 등장한 PC 주소
     # v4.5: Deterministic stage
     det_done: bool = False       # deterministic stage 완료 여부
 
@@ -656,63 +656,55 @@ class JLinkPCSampler:
         return len(self.current_edges)
 
     def evaluate_coverage(self) -> Tuple[bool, int]:
-        """v4.5+: Edge Confirmation 기반 커버리지 평가.
+        """v4.5+: PC 주소 기반 커버리지 평가 (primary signal).
 
-        PC 샘플링 edge (prev_pc, cur_pc)는 타이밍 아티팩트를 포함한다.
-        동일 코드경로를 실행해도 샘플링 타이밍에 따라 다른 쌍이 생성되어
-        global_edges에 즉시 추가하면 corpus가 폭발적으로 증가한다.
+        PC 샘플링에서 (prev_pc, cur_pc) edge는 타이밍에 따라 달라지는
+        비결정적 쌍이므로 신뢰할 수 있는 coverage signal이 아니다.
 
-        이를 방지하기 위해 2단계 승격 방식을 사용한다:
-          1) 처음 관측 → global_edge_pending[edge] 증가
-          2) pending 횟수 >= edge_confirm_threshold → global_edges 승격 (confirmed)
+        대신 개별 PC 주소(unique visited addresses)를 primary signal로 사용한다:
+        - PC 주소는 결정론적: 코드가 실행되면 반드시 해당 주소가 생성됨
+        - corpus 크기가 펌웨어 실제 코드 크기에 자연스럽게 수렴
+        - confirmation 없이도 신뢰 가능
 
-        1회성 타이밍 노이즈는 pending에서 소멸하고 corpus 추가를 유발하지 않는다.
+        Edge 추적은 진단 목적으로 유지하되 corpus 추가 결정에는 사용하지 않는다.
         """
-        confirm_threshold = self.config.edge_confirm_threshold
-
-        # PC 커버리지(개별 주소)는 노이즈가 적으므로 그대로 합산
+        # ── Primary signal: unique PC addresses ──────────────────────────────
+        initial_pcs = len(self.global_coverage)
         self.global_coverage.update(self.current_trace)
+        new_pcs = len(self.global_coverage) - initial_pcs
 
-        new_confirmed = 0
+        # ── Diagnostic: edge confirmation (corpus 결정에 사용 안 함) ─────────
+        confirm_threshold = self.config.edge_confirm_threshold
         for edge in self.current_edges:
             if edge in self.global_edges:
-                continue  # 이미 확정된 edge — 건너뜀
+                continue
             cnt = self.global_edge_pending.get(edge, 0) + 1
             if cnt >= confirm_threshold:
-                # 임계값 도달 → global_edges로 승격
                 self.global_edges.add(edge)
                 self.global_edge_pending.pop(edge, None)
-                new_confirmed += 1
             else:
                 self.global_edge_pending[edge] = cnt
 
-        # v4.5: Hit count bucket 변화 감지
-        # v4.5+: 반드시 global_edges에 확정된 edge만 대상으로 한다.
-        # 미확정(pending) edge의 hit count 변화는 타이밍 샘플링 노이즈이므로
-        # corpus 추가 판단에 사용하면 is_interesting 오탐이 폭발적으로 증가한다.
+        # ── Diagnostic: hit count bucket (진단용) ─────────────────────────────
         bucket_changes = 0
         for edge, count in self.current_edge_counts.items():
             old_total = self.global_edge_counts.get(edge, 0)
             new_total = old_total + count
             self.global_edge_counts[edge] = new_total
-
-            # v4.5+: 확정된 edge만 bucket 변화 체크
             if edge not in self.global_edges:
                 continue
-
             old_bucket = self.global_edge_buckets.get(edge, 0)
             new_bucket = _count_to_bucket(new_total)
             if new_bucket != old_bucket:
                 self.global_edge_buckets[edge] = new_bucket
-                # 새 edge가 아닌데 bucket이 바뀐 경우만 별도 카운트
                 if old_total > 0:
                     bucket_changes += 1
 
-        self._last_bucket_changes = bucket_changes  # 로그용
+        self._last_bucket_changes = bucket_changes
 
-        # interesting = 새로 승격된 edge OR 확정된 edge의 bucket 변화
-        is_interesting = (new_confirmed > 0) or (bucket_changes > 0)
-        return is_interesting, new_confirmed + bucket_changes
+        # interesting = 새로운 PC 주소 발견 (primary signal)
+        is_interesting = new_pcs > 0
+        return is_interesting, new_pcs
 
     def load_coverage(self, filepath: str) -> int:
         """이전 세션의 커버리지 파일을 로드하여 global_coverage + global_edges에 합산"""
@@ -932,14 +924,19 @@ class NVMeFuzzer:
     # =========================================================================
 
     def _calibrate_seed(self, seed: Seed) -> Seed:
-        """시드를 N번 실행하여 edge 안정성 측정.
-        안정한 edge(모든 실행에서 관측)만 global에 반영."""
+        """시드를 N번 실행하여 PC 주소 안정성 측정 (v4.5+: PC 기반).
+
+        각 실행에서 방문된 PC 주소를 추적하고 과반수 실행에서 등장한 PC를
+        stable_pcs로 분류한다. global_coverage에는 관측된 전체 PC 합집합을 반영한다.
+        Edge 통계는 진단용으로 별도 추적한다.
+        """
         total_runs = self.config.calibration_runs
         if total_runs <= 0:
             seed.is_calibrated = True
             return seed
 
-        edge_appearances: Dict[Tuple[int, int], int] = {}
+        pc_appearances: Dict[int, int] = {}          # PC → 등장 횟수
+        edge_appearances: Dict[Tuple[int, int], int] = {}  # (진단용)
         actual_runs = 0
 
         for run_i in range(total_runs):
@@ -951,40 +948,37 @@ class NVMeFuzzer:
             self.executions += 1
             actual_runs += 1
 
-            for edge in self.sampler.current_edges:
+            for pc in self.sampler.current_trace:
+                pc_appearances[pc] = pc_appearances.get(pc, 0) + 1
+            for edge in self.sampler.current_edges:  # 진단용
                 edge_appearances[edge] = edge_appearances.get(edge, 0) + 1
 
             if rc in (self.RC_TIMEOUT, self.RC_ERROR):
                 log.warning(f"[Calibration] {seed.cmd.name} rc={rc} at run {run_i+1} — stopping early")
                 break
 
-        # 안정성 계산
-        # AFL++와 달리 PC Sampling은 확률적 샘플링이므로 실제로 실행된 코드도
-        # 매 run마다 캡처되지 않을 수 있다. 따라서:
-        #   - stable: 과반수(>50%) 이상 run에서 관측된 edge (seed 품질 메타데이터용)
-        #   - global_edges 반영: all_seen(합집합) — 관측된 모든 edge를 커버리지로 인정
-        # instrumentation 기반 AFL++처럼 cnt == actual_runs(100% 재현)를 쓰면
-        # 거의 모든 edge가 unstable 처리되어 initial global coverage가 극도로 희박해지고
-        # 퍼징 시작 후 대부분 입력이 "새 edge 발견"으로 오탐된다.
-        all_seen = set(edge_appearances.keys())
-        stable_threshold = actual_runs / 2.0  # 과반수 기준 (50% 초과)
-        stable = {e for e, cnt in edge_appearances.items() if cnt > stable_threshold}
-        stability = len(stable) / max(len(all_seen), 1)
+        # PC 안정성 계산 (과반수 기준)
+        all_seen_pcs = set(pc_appearances.keys())
+        stable_threshold = actual_runs / 2.0
+        stable_pcs = {pc for pc, cnt in pc_appearances.items() if cnt > stable_threshold}
+        stability = len(stable_pcs) / max(len(all_seen_pcs), 1)
 
         seed.is_calibrated = True
         seed.stability = stability
-        seed.stable_edges = stable
-        seed.covered_edges = all_seen
+        seed.stable_pcs = stable_pcs
+        seed.covered_pcs = all_seen_pcs
 
-        # global_edges에 합집합(all_seen) 반영 — stable만 반영하면 initial coverage가
-        # 너무 희박해져 퍼징 효율이 크게 저하된다.
-        self.sampler.global_edges.update(all_seen)
-        for edge in all_seen:
+        # global_coverage에 관측된 전체 PC 합집합을 반영
+        self.sampler.global_coverage.update(all_seen_pcs)
+
+        # 진단용: edge 통계 반영 (corpus 결정에는 사용 안 함)
+        all_seen_edges = set(edge_appearances.keys())
+        self.sampler.global_edges.update(all_seen_edges)
+        for edge in all_seen_edges:
             self.sampler.global_edge_counts[edge] = \
                 self.sampler.global_edge_counts.get(edge, 0) + edge_appearances[edge]
             self.sampler.global_edge_buckets[edge] = \
                 _count_to_bucket(self.sampler.global_edge_counts[edge])
-        self.sampler.global_coverage.update(self.sampler.current_trace)
 
         return seed
 
@@ -1322,25 +1316,25 @@ class NVMeFuzzer:
         return self.corpus[-1]
 
     def _cull_corpus(self):
-        """v4.3: AFL++ 방식 corpus culling.
-        각 edge에 대해 가장 작은 seed를 favored로 마킹하고,
+        """v4.3: AFL++ 방식 corpus culling (v4.5+: PC 주소 기반).
+        각 PC에 대해 가장 작은 seed를 favored로 마킹하고,
         favored가 아닌 seed 중 기여도 없는 것을 제거한다."""
         if len(self.corpus) <= 10:
             return
 
-        # 1) edge → best seed 매핑 (가장 작은 data 우선)
-        edge_best: dict[tuple, Seed] = {}
+        # 1) PC → best seed 매핑 (가장 작은 data 우선)
+        pc_best: dict[int, Seed] = {}
         for seed in self.corpus:
-            if not seed.covered_edges:
+            if not seed.covered_pcs:
                 continue
-            for edge in seed.covered_edges:
-                current = edge_best.get(edge)
+            for pc in seed.covered_pcs:
+                current = pc_best.get(pc)
                 if current is None or len(seed.data) < len(current.data):
-                    edge_best[edge] = seed
+                    pc_best[pc] = seed
 
         # 2) favored 마킹
         favored_seeds = set()
-        for seed in edge_best.values():
+        for seed in pc_best.values():
             favored_seeds.add(id(seed))
         for seed in self.corpus:
             seed.is_favored = id(seed) in favored_seeds
@@ -2390,9 +2384,9 @@ class NVMeFuzzer:
             'executions': self.executions,
             'corpus_size': len(self.corpus),
             'crashes': len(self.crash_inputs),
-            'coverage_unique_edges': len(self.sampler.global_edges),
-            'coverage_pending_edges': len(self.sampler.global_edge_pending),
             'coverage_unique_pcs': len(self.sampler.global_coverage),
+            'coverage_edges_diag': len(self.sampler.global_edges),
+            'coverage_pending_diag': len(self.sampler.global_edge_pending),
             'total_samples': self.sampler.total_samples,
             'interesting_inputs': self.sampler.interesting_inputs,
             'elapsed_seconds': elapsed,
@@ -2408,9 +2402,8 @@ class NVMeFuzzer:
         log.warning(f"[Stats] exec: {stats['executions']:,} | "
                  f"corpus: {stats['corpus_size']} | "
                  f"crashes: {stats['crashes']} | "
-                 f"edges: {stats['coverage_unique_edges']:,} "
-                 f"(pending: {stats['coverage_pending_edges']:,}) | "
                  f"pcs: {stats['coverage_unique_pcs']:,} | "
+                 f"edges(diag): {stats['coverage_edges_diag']:,} | "
                  f"samples: {stats['total_samples']:,} | "
                  f"last_run: {last_samples} | "
                  f"exec/s: {stats['exec_per_sec']:.1f}")
@@ -2496,7 +2489,7 @@ class NVMeFuzzer:
             log.warning(f"[Calibration] {total_seeds} seeds × "
                         f"{self.config.calibration_runs} runs each ...")
             calibrated_corpus = []
-            cal_results = []  # (index, cmd_name, stability, stable_edges, all_edges)
+            cal_results = []  # (index, cmd_name, stability, stable_pcs, all_pcs)
 
             # J-Link DLL이 stderr로 직접 출력하는 "CPU is not halted" 등의
             # 타이밍 경고를 calibration 구간에서만 fd 수준으로 억제한다.
@@ -2508,8 +2501,8 @@ class NVMeFuzzer:
                 for i, seed in enumerate(self.corpus):
                     seed = self._calibrate_seed(seed)
                     calibrated_corpus.append(seed)
-                    stable_cnt = len(seed.stable_edges) if seed.stable_edges else 0
-                    all_cnt    = len(seed.covered_edges) if seed.covered_edges else 0
+                    stable_cnt = len(seed.stable_pcs) if seed.stable_pcs else 0
+                    all_cnt    = len(seed.covered_pcs) if seed.covered_pcs else 0
                     cal_results.append((i + 1, seed.cmd.name, seed.stability,
                                         stable_cnt, all_cnt))
                     if self._timeout_crash:
@@ -2527,7 +2520,7 @@ class NVMeFuzzer:
             sep = (f"{'─'*W_IDX}─{'─'*W_CMD}─{'─'*W_STA}─"
                    f"{'─'*W_STB}─{'─'*W_ALL}")
             hdr = (f"{'#':>{W_IDX}} {'Command':<{W_CMD}} {'Stability':>{W_STA}} "
-                   f"{'StableEdges':>{W_STB}} {'AllEdges':>{W_ALL}}")
+                   f"{'StablePCs':>{W_STB}} {'AllPCs':>{W_ALL}}")
             log.warning("[Calibration] Results:")
             log.warning(sep)
             log.warning(hdr)
@@ -2540,7 +2533,7 @@ class NVMeFuzzer:
             log.warning(sep)
             avg_stab = sum(r[2] for r in cal_results) / max(len(cal_results), 1)
             log.warning(f"  Seeds: {total_seeds}  |  "
-                        f"Global stable edges: {len(self.sampler.global_edges)}  |  "
+                        f"Global PCs: {len(self.sampler.global_coverage)}  |  "
                         f"Avg stability: {avg_stab*100:.1f}%")
             log.warning(sep)
 
@@ -2633,8 +2626,8 @@ class NVMeFuzzer:
                 if rc not in (self.RC_TIMEOUT, self.RC_ERROR):
                     self.rc_stats[track_key][rc] += 1
 
-                # v4: Edge 기반 커버리지 평가
-                is_interesting, new_edges = self.sampler.evaluate_coverage()
+                # v4.5+: PC 기반 커버리지 평가 (primary signal)
+                is_interesting, new_pcs = self.sampler.evaluate_coverage()
 
                 # v4.3: 실제 실행 opcode 기준으로 분류하여 기록
                 self.cmd_edges[track_key].update(self.sampler.current_edges)
@@ -2654,10 +2647,11 @@ class NVMeFuzzer:
                 mopt_tag = f" mopt={self.mopt_mode}" if self.config.mopt_enabled else ""
                 log.info(f"exec={self.executions}{det_tag} cmd={cmd.name} "
                           f"raw_samples={raw_count} edges={len(self.sampler.current_edges)} "
-                          f"out_of_range={oor_count} new={new_edges} bucket_chg={bucket_chg} "
-                          f"global_edges={len(self.sampler.global_edges)} "
-                          f"pending_edges={len(self.sampler.global_edge_pending)} "
+                          f"out_of_range={oor_count} new_pcs={new_pcs} "
                           f"global_pcs={len(self.sampler.global_coverage)} "
+                          f"edges_diag={len(self.sampler.global_edges)} "
+                          f"pending_diag={len(self.sampler.global_edge_pending)} "
+                          f"bucket_chg_diag={bucket_chg} "
                           f"last_new_at={self.sampler._last_new_at}{mopt_tag} "
                           f"stop={self.sampler._stopped_reason}")
 
@@ -2798,11 +2792,10 @@ class NVMeFuzzer:
                         force_admin=mutated_seed.force_admin,
                         data_len_override=mutated_seed.data_len_override,
                         found_at=self.executions,
-                        new_edges=new_edges,
-                        # v4.5+: 확정된 edge만 저장 (global_edges와 교집합)
-                        # current_edges에는 미확정 noise edge도 포함되므로
-                        # 전체를 저장하면 corpus culling의 favored 판정이 오염된다.
-                        covered_edges=self.sampler.current_edges & self.sampler.global_edges,
+                        new_pcs=new_pcs,
+                        # 이 실행에서 방문한 PC 주소 집합 — culling의 favored 판정 기준
+                        # PC 주소는 결정론적이므로 별도 필터링 불필요
+                        covered_pcs=set(self.sampler.current_trace),
                     )
                     self.corpus.append(new_seed)
 
@@ -2817,9 +2810,8 @@ class NVMeFuzzer:
 
                     log.info(f"[+] New coverage! cmd={cmd.name} "
                              f"CDW10=0x{mutated_seed.cdw10:08x} "
-                             f"+{new_edges} edges (total: {len(self.sampler.global_edges)} edges, "
-                             f"{len(self.sampler.global_coverage)} pcs)"
-                             f" bucket_chg={getattr(self.sampler, '_last_bucket_changes', 0)}")
+                             f"+{new_pcs} PCs (total: {len(self.sampler.global_coverage)} pcs | "
+                             f"edges_diag={len(self.sampler.global_edges)})")
 
                     # v4.5: 새 seed에 대해 deterministic stage 등록
                     if self.config.deterministic_enabled and not new_seed.det_done:
@@ -2882,8 +2874,8 @@ class NVMeFuzzer:
                     f"Crashes          : {stats['crashes']}",
                     f"Total samples    : {stats['total_samples']:,}",
                     f"Interesting      : {stats['interesting_inputs']}",
-                    f"Coverage (edges) : {stats['coverage_unique_edges']:,}",
                     f"Coverage (PCs)   : {stats['coverage_unique_pcs']:,}",
+                    f"Coverage (edges, diag): {stats['coverage_edges_diag']:,}",
                     "Per-command stats:",
                 ]
                 for cmd_name, cmd_stat in stats['command_stats'].items():
