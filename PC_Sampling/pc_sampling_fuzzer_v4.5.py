@@ -138,6 +138,11 @@ MOPT_CORE_PERIOD  = 50000  # core 단계 실행 횟수
 # 타이밍 노이즈(1회성 edge)를 걸러 corpus 폭발을 방지한다.
 EDGE_CONFIRM_THRESHOLD = 2  # pending → global_edges 승격에 필요한 최소 관측 횟수
 
+# v4.5+: Corpus 하드 상한 (안전망)
+# 0 = 무제한. 양수로 설정하면 culling 후에도 상한을 초과할 경우
+# exec_count가 높은(많이 실행된) 비선호 seed부터 강제 제거한다.
+MAX_CORPUS_HARD_LIMIT = 0
+
 # =============================================================================
 
 
@@ -310,6 +315,9 @@ class FuzzConfig:
 
     # v4.5+: Edge Confirmation (타이밍 아티팩트 필터)
     edge_confirm_threshold: int = EDGE_CONFIRM_THRESHOLD
+
+    # v4.5+: Corpus 하드 상한 (0 = 무제한)
+    max_corpus_hard_limit: int = MAX_CORPUS_HARD_LIMIT
 
 
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
@@ -678,12 +686,19 @@ class JLinkPCSampler:
             else:
                 self.global_edge_pending[edge] = cnt
 
-        # v4.5: Hit count bucket 변화 감지 (already-confirmed edges에도 적용)
+        # v4.5: Hit count bucket 변화 감지
+        # v4.5+: 반드시 global_edges에 확정된 edge만 대상으로 한다.
+        # 미확정(pending) edge의 hit count 변화는 타이밍 샘플링 노이즈이므로
+        # corpus 추가 판단에 사용하면 is_interesting 오탐이 폭발적으로 증가한다.
         bucket_changes = 0
         for edge, count in self.current_edge_counts.items():
             old_total = self.global_edge_counts.get(edge, 0)
             new_total = old_total + count
             self.global_edge_counts[edge] = new_total
+
+            # v4.5+: 확정된 edge만 bucket 변화 체크
+            if edge not in self.global_edges:
+                continue
 
             old_bucket = self.global_edge_buckets.get(edge, 0)
             new_bucket = _count_to_bucket(new_total)
@@ -695,7 +710,7 @@ class JLinkPCSampler:
 
         self._last_bucket_changes = bucket_changes  # 로그용
 
-        # interesting = 새로 승격된 edge OR bucket 변화
+        # interesting = 새로 승격된 edge OR 확정된 edge의 bucket 변화
         is_interesting = (new_confirmed > 0) or (bucket_changes > 0)
         return is_interesting, new_confirmed + bucket_changes
 
@@ -1342,6 +1357,20 @@ class NVMeFuzzer:
         if removed > 0:
             log.info(f"[Cull] corpus {before} → {len(self.corpus)} "
                      f"(-{removed}, favored={sum(1 for s in self.corpus if s.is_favored)})")
+
+        # 4) 하드 상한: 상한 초과 시 exec_count가 높은 비선호 seed부터 강제 제거
+        hard_limit = self.config.max_corpus_hard_limit
+        if hard_limit > 0 and len(self.corpus) > hard_limit:
+            before_hard = len(self.corpus)
+            # 기본 시드(found_at==0)와 선호 시드는 보호, 나머지를 exec_count 내림차순 정렬 후 삭제
+            protected = [s for s in self.corpus if s.found_at == 0 or s.is_favored]
+            evictable = sorted(
+                [s for s in self.corpus if s.found_at > 0 and not s.is_favored],
+                key=lambda s: s.exec_count, reverse=True
+            )
+            keep = max(0, hard_limit - len(protected))
+            self.corpus = protected + evictable[:keep]
+            log.info(f"[Cull] Hard limit {hard_limit}: corpus {before_hard} → {len(self.corpus)}")
 
     # =========================================================================
     # AFL++ Mutation Engine
@@ -2770,7 +2799,10 @@ class NVMeFuzzer:
                         data_len_override=mutated_seed.data_len_override,
                         found_at=self.executions,
                         new_edges=new_edges,
-                        covered_edges=set(self.sampler.current_edges),
+                        # v4.5+: 확정된 edge만 저장 (global_edges와 교집합)
+                        # current_edges에는 미확정 noise edge도 포함되므로
+                        # 전체를 저장하면 corpus culling의 favored 판정이 오염된다.
+                        covered_edges=self.sampler.current_edges & self.sampler.global_edges,
                     )
                     self.corpus.append(new_seed)
 
