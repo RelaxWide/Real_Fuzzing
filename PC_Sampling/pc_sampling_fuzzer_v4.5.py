@@ -1,39 +1,75 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v4.3
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v4.5
 
 J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
+v4.5 이후 수정 사항:
+- [Redesign] Primary coverage signal: (prev_pc, cur_pc) edge → unique PC 주소
+    PC 샘플링 edge는 타이밍 아티팩트를 포함하여 결정론적이지 않다.
+    동일 코드경로를 실행해도 샘플링 타이밍에 따라 다른 (prev_pc, cur_pc) 쌍이
+    생성되어 corpus 추가 기준으로 사용하면 corpus가 폭발적으로 증가한다.
+    개별 PC 주소는 코드가 실행되면 항상 생성되므로 결정론적이다.
+    → is_interesting = 새 PC 주소 발견 여부 (new_pcs > 0)
+    → Seed 필드: new_edges→new_pcs, covered_edges→covered_pcs, stable_edges→stable_pcs
+    → corpus culling: edge→best_seed 매핑 → pc→best_seed 매핑
+    → Calibration: edge 안정성 측정 → PC 주소 안정성 측정
+    → Edge 추적(global_edges, pending, bucket_changes)은 진단용으로 유지
+- [BugFix] bucket_changes 오탐: 미확정(pending) edge의 hit count 변화가
+    is_interesting을 오탐시키던 문제 수정 (확정된 edge만 bucket 변화 체크)
+- [BugFix] covered_edges 노이즈: corpus 추가 시 noise edge를 포함하여 culling이
+    무력화되던 문제 수정 (covered_pcs = current_trace로 교체)
+- [Feature] Edge Confirmation (진단용): (prev_pc, cur_pc) edge는 EDGE_CONFIRM_THRESHOLD
+    (기본 2)회 이상 관측된 경우만 global_edges로 승격. corpus 판단에는 미사용.
+- [Feature] Corpus 하드 상한: max_corpus_hard_limit (기본 0=비활성). culling 후에도
+    초과 시 exec_count가 높은 비선호 seed부터 강제 제거하는 안전망.
+- [BugFix] Corpus culling exec_count 임계값 5→2: unfavored seed를 더 빠르게 제거.
+
+v4.5 변경사항:
+- [Feature] Hit Count Bucketing: edge별 누적 실행 횟수를 AFL++ 스타일 8단계
+    로그 버킷(1,2,3,4-7,8-15,16-31,32-127,128+)으로 관리
+- [Feature] Calibration: 초기 시드를 N회(기본 3) 반복 실행하여 PC 주소 안정성 측정,
+    global_coverage 초기화, 결과 요약 테이블(Stability / StablePCs / AllPCs) 출력
+- [BugFix] Calibration DLL stderr 억제: os.dup2(devnull, 2)로 J-Link DLL 타이밍 경고 억제
+- [BugFix] Calibration 이중 start_sampling 버그: _calibrate_seed() 내부의 명시적
+    start_sampling() 호출 제거 (StablePCs 전부 0이 되던 문제 해결)
+- [Feature] Deterministic stage: CDW10~CDW15 필드에 Walking bitflip / Arithmetic /
+    Interesting 값 체계적 적용, 제너레이터 기반 + deque로 havoc보다 우선 소비
+- [Feature] MOpt mutation scheduling: Pilot(5000회, 균등 사용 + 성공률 측정) /
+    Core(50000회, 성공률 기반 가중치) 2단계 교대
+- [Feature] Edge count 저장/로드: coverage_edge_counts.txt
+
+v4.4 변경사항:
+- [Feature] Tracking Label NVMe 스펙 매핑: _OPCODE_TO_NAME 역방향 테이블
+- [Feature] Heatmap 이미지 크기 제한: MAX_HEATMAP_CMDS=40, DPI 동적 조정
+- [Feature] Timeout dmesg 캡처: crash JSON + crash_*.dmesg.txt
+
 v4.3 변경사항:
 - [BugFix] 로그 메시지 불일치 수정: "ioctl direct" → "subprocess (nvme-cli)"
-- [BugFix] 글로벌 포화 임계값을 하드코딩(20) → 설정값(global_saturation_limit)으로 분리
-- [BugFix] 실행 간 prev_pc 캐리오버 제거: 매 실행마다 sentinel로 리셋하여 교차 edge 방지
+- [BugFix] 글로벌 포화 임계값 하드코딩 → global_saturation_limit 설정값 분리
+- [BugFix] 실행 간 prev_pc 캐리오버 제거: 매 실행마다 sentinel(0xFFFFFFFF)으로 리셋
 - [BugFix] post_cmd_delay_ms 미사용 수정: 명령 완료 후 추가 샘플링 대기 구현
 - [Perf] cmd_traces를 collections.deque로 교체 (pop(0) O(n) → popleft O(1))
 - [Perf] 샘플 간격 체크포인트를 frozenset으로 교체 (O(1) lookup 보장)
-- [Clarity] 20% 완전 랜덤 생성 비율을 설정값(random_gen_ratio)으로 분리
-- [Feature] Summary에 Mutation 통계 추가: opcode/nsid/admin↔io/data_len 변형 횟수,
-  실제 전송된 opcode 분포, passthru 타입 비율, 입력 소스(corpus vs random) 비율
-- [Feature] Timeout crash 시 불량 현상 보존: J-Link로 stuck PC를 읽고 crash에 기록,
-  SSD 펌웨어를 resume 상태로 유지 (halt하지 않음), J-Link 연결도 유지,
-  reconnect/continue/rescan 없이 퍼징 중단하여 불량 현상 그대로 보존
+- [Feature] Corpus culling (_cull_corpus), J-Link heartbeat, NVMe 디바이스 사전 검증
+- [Feature] Summary에 Mutation 통계 추가, 실제 opcode 기준 추적 (_tracking_label)
+- [Feature] Timeout crash 시 불량 현상 보존: resume 없이 퍼징 중단, stuck PC 기록
 - [BugFix] subprocess kill 후 D state 블로킹 방지: communicate()에 타임아웃 추가
 
 v4.2 변경사항:
 - subprocess + 샘플링 연동: idle/포화 감지 시 프로세스 kill → 즉시 다음 실행
 - 글로벌 기준 포화 판정 (global_edges 대비 새 edge 체크)
-- idle PC 감지: diagnose에서 가장 빈도 높은 PC를 idle로 설정,
-  연속 N회 idle PC일 때만 샘플링 조기 중단
+- idle PC 감지: diagnose에서 가장 빈도 높은 PC를 idle로 설정
 
 v4.1 변경사항:
 - Seed dataclass에 CDW2~CDW15 필드 추가
 - Opcode별 NVMe 스펙 기반 정상 명령어를 초기 시드로 자동 생성
 - AFL++ havoc/splice 기반 mutation 전략
-- 명령어별 edge/PC 추적 및 CFG 그래프 생성
 
 v4 변경사항:
-- Sampled Edge 커버리지: (prev_pc, cur_pc) 튜플 기반
+- Sampled Edge 커버리지: (prev_pc, cur_pc) 튜플 기반 (현재는 진단용으로만 유지)
+- Primary coverage signal은 unique PC 주소로 전환됨 (v4.5 이후)
 - Power Schedule: AFLfast explore 방식 에너지 기반 시드 선택
 - Seed dataclass 도입
 """

@@ -1,7 +1,7 @@
 # PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer — 기술 보고서
 
-**버전**: v4.5
-**최종 수정**: 2026-02-11
+**버전**: v4.5 (post-release fixes 포함)
+**최종 수정**: 2026-02-26
 **파일**: `pc_sampling_fuzzer_v4.5.py`
 
 ---
@@ -47,7 +47,8 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 | 커버리지 수집 | 컴파일 시 instrumentation | J-Link JTAG Halt-Sample-Resume |
 | 입력 전달 | stdin / 파일 / 공유 메모리 | NVMe passthru (nvme-cli subprocess) |
 | 타겟 환경 | 동일 호스트 프로세스 | 별도 하드웨어 (SSD 컨트롤러) |
-| Edge 정의 | `(prev_loc >> 1) XOR cur_loc` → bitmap | `(prev_pc, cur_pc)` 정확한 튜플 → set |
+| Primary signal | `(prev_loc >> 1) XOR cur_loc` → bitmap | Unique PC 주소 → set (결정론적) |
+| Edge 추적 | CFG branch (결정론적) | `(prev_pc, cur_pc)` 튜플 (진단용, 타이밍 의존) |
 
 ### 1.3 하드웨어 구성
 
@@ -136,16 +137,30 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 
 | 항목 | 분류 | 내용 |
 |---|---|---|
-| **Hit count bucketing** | Feature | edge별 누적 실행 횟수를 AFL++ 스타일 로그 버킷(1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+)으로 변환. 버킷 변화 시 interesting으로 판단하여 루프 반복 횟수 변화를 감지 |
-| **Calibration** | Feature | 초기 시드를 N회(기본 3) 반복 실행하여 edge 안정성 측정. 과반수(>50%) 이상 run에서 등장한 edge를 `stable_edges`(시드 품질 메타데이터)로 분류. **global_edges에는 합집합(all_seen) 반영** — PC Sampling의 확률론적 특성상 실제 실행된 코드도 매 run마다 캡처되지 않으므로 교집합/100% 재현 기준 대신 합집합 사용. `stability` 수치는 Power Schedule 등 시드 품질 지표로만 활용 |
-| **Calibration DLL stderr 억제** | BugFix | Calibration 구간의 tight halt/read/go 루프에서 J-Link DLL이 `"Cannot read register (R15) while CPU is running"` / `"CPU is not halted"` 경고를 stderr에 직접 출력하는 문제. `JLINKARM_Halt()`는 비동기(fire-and-forget)라 CPU 정지 확인 없이 바로 반환하며, 일반 퍼징에서는 NVMe 명령 처리 시간이 완충 역할을 하지만 calibration의 빡빡한 루프에서는 타이밍 위반이 빈번히 발생. Python `except Exception`으로는 DLL 수준의 stderr를 막을 수 없으므로, calibration 블록 전체를 `os.dup2(devnull, 2)` / `os.dup2(saved, 2)` 로 fd 수준에서 억제하고 `finally`에서 반드시 복원 |
-| **Calibration 결과 요약 테이블** | Feature | calibration 완료 후 시드별 Stability / StableEdges / AllEdges 를 표 형식으로 출력하고, 전체 Seeds 수 · Global stable edges · Avg stability 요약을 표시한 뒤 퍼징을 시작. 기존에는 각 시드가 log.info 한 줄씩 출력되어 전체 결과를 한눈에 파악하기 어려웠음 |
-| **Calibration 이중 start_sampling 버그** | BugFix | `_calibrate_seed()`가 매 run마다 `start_sampling()`을 명시적으로 호출하지만, `_send_nvme_command()` 내부에서도 `start_sampling()`을 호출하여 run당 두 개의 sampling thread가 동시에 실행됨. Thread 2가 `current_edges = set()`으로 리셋하면 Thread 1은 구 set에 add하여 데이터 유실. 또한 `stop_sampling()`은 Thread 2만 join하고 Thread 1은 zombie로 남아 다음 run의 `current_edges`에 이전 run의 edge를 혼입시킴. 그 결과 매 run의 edge 집합이 비결정적으로 달라져 `stable = {}` → **StableEdges 전부 0**. 수정: `_calibrate_seed()` 내부의 명시적 `start_sampling()` 호출 제거 |
-| **Deterministic stage** | Feature | 새 시드의 CDW10~CDW15 필드에 대해 체계적 mutation(walking bitflip 32개, arithmetic ±1~10, interesting_32/8 대입) 수행. 제너레이터 기반 + deque로 havoc보다 우선 소비. 값이 0인 CDW 필드는 건너뜀 |
-| **MOpt mutation scheduling** | Feature | Pilot/Core 2단계 모드. Pilot(기본 5000회): 16개 mutation operator 균등 사용하며 성공률 측정. Core(기본 50000회): 성공률 기반 가중치로 효과적인 operator에 집중. 주기적으로 모드 전환 |
-| **Edge count 저장/로드** | Feature | `coverage_edge_counts.txt` 파일로 edge별 누적 hit count 저장/로드. resume 시 버킷 상태 완전 복원 |
-| **Summary 통계 확장** | Feature | Summary에 hit count 추적 edge 수, MOpt 모드, operator별 finds/uses/성공률 출력 |
+| **Hit count bucketing** | Feature | edge별 누적 실행 횟수를 AFL++ 스타일 로그 버킷(1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+)으로 변환. 진단용으로 추적되며 corpus 판단에는 미사용 |
+| **Calibration** | Feature | 초기 시드를 N회(기본 3) 반복 실행하여 PC 주소 안정성 측정. 과반수(>50%) 이상 run에서 등장한 PC를 `stable_pcs`로 분류. global_coverage에 관측된 전체 PC 합집합 반영. edge 통계는 진단용으로 별도 추적 |
+| **Calibration DLL stderr 억제** | BugFix | calibration의 tight halt/read/go 루프에서 J-Link DLL이 `"Cannot read register (R15) while CPU is running"` 경고를 stderr에 직접 출력하는 문제. `os.dup2(devnull, 2)` / `os.dup2(saved, 2)` 로 fd 수준에서 억제, `finally`에서 반드시 복원 |
+| **Calibration 결과 요약 테이블** | Feature | calibration 완료 후 시드별 Stability / StablePCs / AllPCs를 표 형식으로 출력하고, Seeds 수 · Global PCs · Avg stability 요약 표시 |
+| **Calibration 이중 start_sampling 버그** | BugFix | `_calibrate_seed()`가 명시적 `start_sampling()`을 호출하지만 `_send_nvme_command()` 내부에서도 호출하여 run당 두 개의 sampling thread가 동시 실행되던 문제. 수정: `_calibrate_seed()` 내부의 명시적 `start_sampling()` 호출 제거 |
+| **Deterministic stage** | Feature | 새 시드의 CDW10~CDW15 필드에 대해 체계적 mutation(walking bitflip 32개, arithmetic ±1~10, interesting_32/8 대입) 수행. 제너레이터 기반 + deque로 havoc보다 우선 소비 |
+| **MOpt mutation scheduling** | Feature | Pilot/Core 2단계 모드. Pilot(기본 5000회): 16개 mutation operator 균등 사용하며 성공률 측정. Core(기본 50000회): 성공률 기반 가중치로 효과적인 operator에 집중 |
+| **Edge count 저장/로드** | Feature | `coverage_edge_counts.txt` 파일로 edge별 누적 hit count 저장/로드 |
+| **Summary 통계 확장** | Feature | MOpt 모드, operator별 finds/uses/성공률 출력 |
 | **CLI 옵션 추가** | Feature | `--calibration-runs`, `--no-deterministic`, `--det-arith-max`, `--no-mopt`, `--mopt-pilot-period`, `--mopt-core-period` |
+
+### v4.5 이후 수정 — PC 기반 coverage signal 전환 + 버그 수정
+
+| 항목 | 분류 | 내용 |
+|---|---|---|
+| **Primary signal 전환** | Redesign | `is_interesting` 기준을 `(prev_pc, cur_pc)` edge에서 **unique PC 주소**로 변경. edge는 타이밍에 따라 달라지는 비결정적 쌍이지만 PC 주소는 코드 실행 시 항상 생성되어 결정론적. corpus 크기가 펌웨어 코드 크기에 자연스럽게 수렴 |
+| **Seed 필드 변경** | Redesign | `new_edges→new_pcs`, `covered_edges→covered_pcs`, `stable_edges→stable_pcs` |
+| **corpus culling PC 기반 전환** | Redesign | `edge→best_seed` 매핑 → `pc→best_seed` 매핑. 각 PC 주소에 대해 data가 가장 작은 seed를 favored로 선정 |
+| **Calibration PC 기반 전환** | Redesign | edge 안정성 측정 → PC 주소 안정성 측정. `stable_pcs`, `covered_pcs` 저장, global_coverage에 합집합 반영 |
+| **Edge Confirmation** | Feature | 진단용 edge 추적에 confirmation 도입. `EDGE_CONFIRM_THRESHOLD`(기본 2)회 이상 관측된 edge만 `global_edges`로 승격. corpus 판단에는 미사용 |
+| **bucket_changes 오탐 수정** | BugFix | 미확정(pending) edge의 hit count 변화가 `is_interesting`을 오탐시키던 문제 수정. edge confirmation 도입으로 global_edges 성장이 느려지면서 pending pool에 쌓인 edge들이 bucket 경계를 반복 통과 → interesting rate 10% → 41%로 악화. 확정된 edge만 bucket 변화 체크 |
+| **covered_pcs 노이즈 수정** | BugFix | corpus 추가 시 `current_edges`(noise edge 포함)를 저장하여 culling의 favored 판정을 오염시키던 문제. `covered_pcs = current_trace`(결정론적 PC 집합)로 교체 |
+| **corpus culling exec_count 임계값** | BugFix | unfavored seed 제거 조건 `exec_count >= 5` → `exec_count >= 2`로 강화 |
+| **corpus 하드 상한** | Feature | `max_corpus_hard_limit` 설정값(기본 0=비활성). 양수로 설정 시 culling 후에도 초과하면 exec_count 높은 비선호 seed부터 강제 제거 |
 
 ---
 
@@ -193,9 +208,10 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
  5. communicate()        → 명령 완료 대기
  6. post_cmd_delay       → 추가 샘플링 대기
  7. stop_sampling()      → 샘플링 스레드 종료
- 8. evaluate_coverage()  → current_edges와 global_edges 비교
+ 8. evaluate_coverage()  → current_trace(PC 집합)와 global_coverage 비교 → new_pcs 계산
+                           (edge 추적은 진단용으로 별도 수행)
  9. tracking_label()     → (v4.3) 실제 opcode 기준 추적 키 결정
-10. if interesting:      → corpus에 새 시드 추가 (covered_edges 포함)
+10. if interesting:      → corpus에 새 시드 추가 (covered_pcs = current_trace)
 11. [매 100회]           → 상태 출력 + 로그 flush
 12. [매 1,000회]         → corpus culling + J-Link heartbeat
 13. [매 10,000회]        → SMART health 로그 기록
@@ -338,10 +354,13 @@ class Seed:
     data_len_override: int   # data_len 불일치
     exec_count: int          # 선택 횟수
     found_at: int            # 발견 시점
-    new_edges: int           # 발견한 새 edge 수
+    new_pcs: int             # 발견한 새 unique PC 주소 수 (primary coverage signal)
     energy: float            # 계산된 에너지
-    covered_edges: set       # v4.3: 이 시드 실행 시 발견된 edge set (culling용)
-    is_favored: bool         # v4.3: corpus culling에서 선정된 favored seed
+    covered_pcs: set         # 이 시드 실행 시 방문된 PC 주소 집합 (culling용)
+    is_favored: bool         # corpus culling에서 선정된 favored seed
+    is_calibrated: bool      # calibration 완료 여부
+    stability: float         # 0.0~1.0, PC 주소 안정성 비율
+    stable_pcs: set          # calibration에서 과반수 실행에 등장한 PC 주소
 ```
 
 #### 4.3.2 초기 시드 생성 (`_generate_default_seeds`)
@@ -502,45 +521,53 @@ _select_seed():
 
 ### 4.6 커버리지 피드백 메커니즘
 
-#### 4.6.1 Edge 정의
-
-```
-edge = (prev_pc, cur_pc)
-```
-
-- PC 샘플링에서 연속으로 읽힌 두 PC 값의 쌍
-- 정확한 주소 튜플이므로 해시 충돌 없음 (AFL++와 달리)
-
-#### 4.6.2 커버리지 저장소
-
-| 저장소 | 타입 | 용도 |
-|---|---|---|
-| `global_edges` | `Set[Tuple[int,int]]` | 전체 세션 누적 edge |
-| `current_edges` | `Set[Tuple[int,int]]` | 현재 실행의 edge |
-| `global_coverage` | `Set[int]` | 전체 세션 누적 PC (비교용) |
-| `current_trace` | `Set[int]` | 현재 실행의 PC |
-
-#### 4.6.3 "Interesting" 판정
+#### 4.6.1 Primary Signal: Unique PC 주소
 
 ```python
 evaluate_coverage():
-    new_edges = len(global_edges ∪ current_edges) - len(global_edges)
-    is_interesting = (new_edges > 0)
+    initial_pcs = len(global_coverage)
+    global_coverage.update(current_trace)
+    new_pcs = len(global_coverage) - initial_pcs
+    is_interesting = (new_pcs > 0)   # 새 PC 주소 발견 시만 interesting
 ```
 
-- **한 개라도 새로운 edge가 발견되면 interesting** → corpus에 추가
-- Hit count 변화는 고려하지 않음 (AFL++와의 주요 차이)
+PC 주소는 **결정론적**: 코드 경로 A가 실행되면 해당 주소들이 반드시 `current_trace`에 생성된다.
+corpus 크기가 펌웨어 실제 코드 크기에 수렴한다.
+
+#### 4.6.2 Edge 추적 (진단용)
+
+```
+edge = (prev_pc, cur_pc)  ← 연속으로 읽힌 두 PC 값의 쌍
+```
+
+`(prev_pc, cur_pc)` edge는 타이밍에 따라 달라지는 **비결정적** 쌍이다.
+동일 코드경로 A→B→C가 샘플링 시점에 따라 `(A,B)`, `(A,C)`, `(B,C)` 중 어느 것이든 생성될 수 있다.
+corpus 추가 기준으로는 부적합하므로 **진단 목적으로만 추적**한다.
+
+Edge Confirmation: `global_edge_pending`에서 `EDGE_CONFIRM_THRESHOLD`(기본 2)회 이상 관측된 edge만 `global_edges`로 승격. 로그에서 `edges_diag`로 표시된다.
+
+#### 4.6.3 커버리지 저장소
+
+| 저장소 | 타입 | 역할 |
+|---|---|---|
+| `global_coverage` | `Set[int]` | **Primary** — 전체 세션 누적 unique PC 주소 |
+| `current_trace` | `Set[int]` | **Primary** — 현재 실행의 PC 주소 |
+| `global_edges` | `Set[Tuple[int,int]]` | 진단용 — confirmed edge 집합 |
+| `global_edge_pending` | `Dict[Tuple,int]` | 진단용 — confirmation 미달 edge 풀 |
+| `current_edges` | `Set[Tuple[int,int]]` | 진단용 — 현재 실행의 edge |
+| `global_edge_counts` | `Dict[Tuple,int]` | 진단용 — edge 누적 hit count |
+| `global_edge_buckets` | `Dict[Tuple,int]` | 진단용 — edge 현재 bucket 값 |
 
 #### 4.6.4 AFL++와의 커버리지 모델 비교
 
 | 관점 | AFL++ | 본 퍼저 |
 |---|---|---|
-| Edge 표현 | `(prev_loc >> 1) ^ cur_loc` → bitmap index | `(prev_pc, cur_pc)` → set element |
-| 저장소 | 64KB bitmap (고정 크기) | Python set (가변 크기) |
-| 해시 충돌 | 있음 (bitmap 크기 제한) | 없음 (정확한 주소 쌍) |
-| Hit count | 8-bit counter → bucket (1,2,3,4-7,...) | 없음 (존재 여부만) |
-| "새로움" 기준 | 새 edge OR hit count bucket 변화 | 새 edge만 |
-| 메모리 사용 | 고정 64KB | edge 수에 비례 (수만~수십만 edge 시 수 MB) |
+| Primary signal | CFG edge bitmap (결정론적) | Unique PC 주소 set (결정론적) |
+| Edge 표현 | `(prev_loc >> 1) ^ cur_loc` → bitmap | `(prev_pc, cur_pc)` → 진단용 set |
+| "새로움" 기준 | 새 edge OR hit count bucket 변화 | 새 PC 주소 발견 |
+| corpus 상한 | 실제 CFG edge 수에 수렴 | 펌웨어 코드 내 unique PC 수에 수렴 |
+| Hit count | 루프 반복 횟수 변화 감지 (의미 있음) | 샘플링 빈도 변화 (의미 약함, 진단용만) |
+| 메모리 사용 | 고정 64KB bitmap | PC/edge set 크기에 비례 |
 
 ---
 
@@ -630,9 +657,10 @@ else:                      → 0
 | Interesting values | 구현 완료 | 8/16/32-bit, AFL++ 동일 상수 |
 | Arithmetic mutation | 구현 완료 | 8/16/32-bit, LE/BE, ARITH_MAX=35 |
 | Power Schedule (explore) | 부분 구현 | 에너지만 사용, perf_score 미포함 |
-| Edge coverage | 구현 완료 (변형) | 정확한 (prev,cur) 튜플 (bitmap 아님) |
-| **Hit count bucketing** | **v4.5 구현** | AFL++ 동일 8단계 로그 버킷. bucket 변화 시 interesting |
-| **Calibration** | **v4.5 구현** | 시드별 N회 반복 실행으로 edge 안정성 측정 |
+| Edge coverage | 진단용으로 유지 | `(prev_pc,cur_pc)` 튜플, corpus 판단 미사용 |
+| PC address coverage | 구현 완료 (독자적) | unique PC 주소 기반 primary signal |
+| **Hit count bucketing** | **진단용 구현** | 8단계 로그 버킷. corpus 판단 미사용 |
+| **Calibration** | **v4.5 구현** | 시드별 N회 반복 실행으로 PC 주소 안정성 측정 |
 | **Deterministic stage** | **v4.5 구현** | CDW 필드 대상 walking bitflip + arithmetic + interesting |
 | **MOpt** | **v4.5 구현** | Pilot/Core 2단계 mutation operator scheduling |
 | Corpus management | 구현 완료 | interesting → corpus 추가 + AFL++ 방식 culling (1000회마다) |
@@ -955,9 +983,10 @@ def _capture_dmesg(self, lines: int = 80) -> str:
 
 3. **`_sampling_worker()`**: edge 생성 시 `current_edge_counts[edge] += 1`로 카운팅
 
-4. **`evaluate_coverage()`**: 기존 새 edge 감지 + **bucket 변화 감지** 추가
-   - 이미 알려진 edge라도 누적 hit count의 bucket이 변하면 interesting
-   - 예: edge A가 총 3번 → 4번(bucket 4→8)이면 bucket_change 발생
+4. **`evaluate_coverage()`**: bucket 변화는 **진단 목적으로만** 계산
+   - PC 샘플링 hit count는 루프 반복 횟수가 아닌 샘플링 빈도를 반영하므로 AFL++의 bucket 변화와 의미가 다름
+   - `is_interesting` 판단에는 사용하지 않음 (primary signal은 new_pcs)
+   - confirmed edge(`global_edges` 내)만 bucket 변화 체크 (pending edge 제외)
 
 5. **저장/로드**: `coverage_edge_counts.txt` 파일로 edge별 누적 count 영속화
 
@@ -970,16 +999,17 @@ def _capture_dmesg(self, lines: int = 80) -> str:
 **구현**:
 
 1. **`_calibrate_seed(seed, N=3)`**: 동일 시드를 N번 mutation 없이 실행
-   - `edge_appearances[edge]` = 등장 횟수 추적
-   - `stable_edges` = 모든 N회에서 등장한 edge (100% 재현)
-   - `stability` = `|stable| / |all_seen|` (0.0~1.0)
+   - `pc_appearances[pc]` = PC 주소별 등장 횟수 추적
+   - `stable_pcs` = 과반수(>50%) 이상 run에서 등장한 PC 주소
+   - `stability` = `|stable_pcs| / |all_seen_pcs|` (0.0~1.0)
+   - edge 통계도 진단용으로 별도 추적 (`edge_appearances`)
 
 2. **글로벌 커버리지 반영**: 안정한 edge만 `global_edges`에 추가
    - 불안정한 edge는 글로벌 기준에 포함되지 않아 false interesting 방지
 
 3. **실행 시점**:
    - 퍼징 시작 전, 모든 초기 시드에 대해 calibration 실행
-   - Seed dataclass에 `is_calibrated`, `stability`, `stable_edges` 필드 추가
+   - Seed dataclass에 `is_calibrated`, `stability`, `stable_pcs`, `covered_pcs` 필드 추가
 
 4. **CLI**: `--calibration-runs 3` (기본), `--calibration-runs 0`으로 비활성화 가능
 
