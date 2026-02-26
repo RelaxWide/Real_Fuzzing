@@ -1851,8 +1851,17 @@ class NVMeFuzzer:
         )
 
         # --- nvme CLI 명령 구성 ---
+        # io-passthru를 char device(/dev/nvme0)에 보내면
+        # "using deprecated NVME_IOCTL_IO_CMD ioctl on the char device!" 경고 발생.
+        # IO 명령은 namespace block device(/dev/nvme0n1)를 사용해야 한다.
+        # Admin 명령은 char device 그대로 사용.
+        if passthru_type == "io-passthru":
+            target_device = f"{self.config.nvme_device}n{self.config.nvme_namespace}"
+        else:
+            target_device = self.config.nvme_device
+
         nvme_cmd = [
-            'nvme', passthru_type, self.config.nvme_device,
+            'nvme', passthru_type, target_device,
             f'--opcode={actual_opcode:#x}',
             f'--namespace-id={actual_nsid}',
             f'--cdw2={seed.cdw2:#x}',
