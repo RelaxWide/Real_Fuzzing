@@ -25,6 +25,13 @@ v4.5 이후 수정 사항:
 - [Feature] Corpus 하드 상한: max_corpus_hard_limit (기본 0=비활성). culling 후에도
     초과 시 exec_count가 높은 비선호 seed부터 강제 제거하는 안전망.
 - [BugFix] Corpus culling exec_count 임계값 5→2: unfavored seed를 더 빠르게 제거.
+- [BugFix] _sampling_worker 포화 체크 PC 기반 전환: global_edges_ref(edge) →
+    global_coverage_ref(PC 주소). calibration이 global_edges를 모든 초기 시드
+    edge로 채우므로 이후 실행에서 거의 모든 edge가 "이미 알려진 것"으로 판정,
+    ~20샘플 후 즉시 종료(last_run=2-3). PC 기반으로 전환하면 primary signal과 일치.
+- [BugFix] stop_sampling() 반환값: len(current_edges) → len(current_trace). primary
+    signal이 PC 주소로 전환된 이후에도 last_run이 edge 수를 표시하는 오해 해결.
+- [Feature] 로그 pcs_this_run 추가: per-exec 로그에 이번 실행 unique PC 수 추가.
 
 v4.5 변경사항:
 - [Feature] Hit Count Bucketing: edge별 누적 실행 횟수를 AFL++ 스타일 8단계
@@ -579,7 +586,14 @@ class JLinkPCSampler:
         return self.config.addr_range_start <= pc <= self.config.addr_range_end
 
     def _sampling_worker(self):
-        """v4.5: hit count tracking 추가 + 글로벌 포화 임계값 설정 분리 + prev_pc 실행 간 리셋"""
+        """v4.5+: PC 주소 기반 글로벌 포화 체크 + hit count tracking + prev_pc 실행 간 리셋
+
+        포화 판단 신호를 edge → PC 주소로 전환:
+        - 기존: global_edges_ref(calibration으로 채워짐) 기반 → 거의 모든 edge가
+          "이미 알려진 것"으로 판정 → ~20샘플 후 즉시 종료 → last_run=2-3
+        - 변경: global_coverage_ref(unique PC set) 기반 → 새 코드 경로를 실행해야만
+          새 PC가 나타나므로 올바른 포화 신호. primary coverage signal과 일치.
+        """
         self.current_edges = set()
         self.current_trace = set()
         self.current_edge_counts = {}   # v4.5: 이번 실행 hit count
@@ -590,18 +604,18 @@ class JLinkPCSampler:
         self._stopped_reason = ""
 
         sample_count = 0
-        since_last_global_new = 0   # v4.2: 글로벌 기준 카운터
+        since_last_global_new = 0   # 연속 "이미 알려진 PC" 카운터
         consecutive_idle = 0         # v4.2: 연속 idle PC 카운터
         interval = self.config.sample_interval_us / 1_000_000
         sat_limit = self.config.saturation_limit
         global_sat_limit = self.config.global_saturation_limit  # v4.3: 설정값 사용
         idle_pc = self.idle_pc       # v4.2: 로컬 캐싱
 
-        # v4.2: 글로벌 edge의 참조 캐싱 (thread safety)
-        # 메인 스레드가 evaluate_coverage()에서 update()하더라도
-        # CPython set.__contains__는 GIL 하에서 안전하지만,
-        # 명시적 참조 캐싱으로 attribute lookup도 제거
-        global_edges_ref = self.global_edges
+        # v4.5+: global_coverage(PC 주소 set) 참조 캐싱
+        # - global_edges_ref 대신 사용: calibration이 global_edges를 채워도
+        #   global_coverage는 실제 실행된 PC만 담으므로 포화 신호로 적합
+        # - CPython set.__contains__는 GIL 하에서 안전
+        global_coverage_ref = self.global_coverage
 
         # v4.3: 매 실행마다 prev_pc를 sentinel로 리셋
         # → 서로 다른 NVMe 명령어 간의 교차 edge 방지
@@ -618,19 +632,20 @@ class JLinkPCSampler:
                         prev_pc = pc
                         self.current_trace.add(pc)
                     else:
-                        # Edge 생성 (prev_pc, cur_pc)
+                        # Edge 생성 (prev_pc, cur_pc) — 진단용
                         edge = (prev_pc, pc)
                         self.current_edges.add(edge)
                         self.current_edge_counts[edge] = self.current_edge_counts.get(edge, 0) + 1  # v4.5
                         self.current_trace.add(pc)
                         prev_pc = pc
 
-                        # v4.2: 글로벌 기준으로 새로움 판단
-                        if edge not in global_edges_ref:
-                            self._last_new_at = sample_count
-                            since_last_global_new = 0
-                        else:
-                            since_last_global_new += 1
+                    # v4.5+: PC 기반 글로벌 포화 판단
+                    # 모든 in-range PC(첫 번째 포함)에 대해 체크
+                    if pc not in global_coverage_ref:
+                        self._last_new_at = sample_count
+                        since_last_global_new = 0
+                    else:
+                        since_last_global_new += 1
 
                     # v4.2: idle PC 연속 카운터
                     if idle_pc is not None and pc == idle_pc:
@@ -649,13 +664,13 @@ class JLinkPCSampler:
                     cur_unique_edges = len(self.current_edges)
                     self._unique_at_intervals[sample_count] = cur_unique_edges
 
-                # v4.3: 조기 종료 조건 (OR) — 글로벌 임계값 설정 분리
-                # 조건1: 연속 global_sat_limit회 글로벌 기준 새 edge 없음
+                # 조기 종료 조건 (OR)
+                # 조건1: 연속 global_sat_limit회 이미 알려진 PC (새 코드 경로 없음)
                 # 조건2: 연속 sat_limit회 idle PC에 머물러 있음
                 if sat_limit > 0:
                     if global_sat_limit > 0 and since_last_global_new >= global_sat_limit:
                         self._stopped_reason = (
-                            f"global_saturated (no global new edge for "
+                            f"global_saturated (no new PC for "
                             f"{since_last_global_new} consecutive samples, "
                             f"limit={global_sat_limit})"
                         )
@@ -686,10 +701,17 @@ class JLinkPCSampler:
         self.sample_thread.start()
 
     def stop_sampling(self) -> int:
+        """샘플링 종료 후 이번 실행에서 관측된 unique PC 수를 반환 (primary signal).
+
+        v4.5+: len(current_edges) → len(current_trace) 로 변경.
+        - current_edges: (prev_pc, cur_pc) 튜플 — 타이밍 아티팩트 포함, 진단용
+        - current_trace: unique PC 주소 set — 결정론적, primary coverage signal
+        last_run 로그값이 PC 수를 나타내므로 global_pcs와 직접 비교 가능.
+        """
         if self.sample_thread:
             self.stop_event.set()
             self.sample_thread.join(timeout=2.0)
-        return len(self.current_edges)
+        return len(self.current_trace)
 
     def evaluate_coverage(self) -> Tuple[bool, int]:
         """v4.5+: PC 주소 기반 커버리지 평가 (primary signal).
@@ -2682,10 +2704,10 @@ class NVMeFuzzer:
                 det_tag = " [Det]" if is_det_stage else ""
                 mopt_tag = f" mopt={self.mopt_mode}" if self.config.mopt_enabled else ""
                 log.info(f"exec={self.executions}{det_tag} cmd={cmd.name} "
-                          f"raw_samples={raw_count} edges={len(self.sampler.current_edges)} "
+                          f"raw_samples={raw_count} pcs_this_run={len(self.sampler.current_trace)} "
                           f"out_of_range={oor_count} new_pcs={new_pcs} "
                           f"global_pcs={len(self.sampler.global_coverage)} "
-                          f"edges_diag={len(self.sampler.global_edges)} "
+                          f"edges_diag={len(self.sampler.current_edges)}/{len(self.sampler.global_edges)} "
                           f"pending_diag={len(self.sampler.global_edge_pending)} "
                           f"bucket_chg_diag={bucket_chg} "
                           f"last_new_at={self.sampler._last_new_at}{mopt_tag} "

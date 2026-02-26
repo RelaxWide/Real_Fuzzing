@@ -161,6 +161,9 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 | **covered_pcs 노이즈 수정** | BugFix | corpus 추가 시 `current_edges`(noise edge 포함)를 저장하여 culling의 favored 판정을 오염시키던 문제. `covered_pcs = current_trace`(결정론적 PC 집합)로 교체 |
 | **corpus culling exec_count 임계값** | BugFix | unfavored seed 제거 조건 `exec_count >= 5` → `exec_count >= 2`로 강화 |
 | **corpus 하드 상한** | Feature | `max_corpus_hard_limit` 설정값(기본 0=비활성). 양수로 설정 시 culling 후에도 초과하면 exec_count 높은 비선호 seed부터 강제 제거 |
+| **포화 체크 PC 기반 전환** | BugFix | `_sampling_worker`의 글로벌 포화 판단 신호를 `global_edges_ref`(edge) → `global_coverage_ref`(PC 주소)로 변경. 기존 문제: calibration이 `global_edges`를 모든 초기 시드 edge로 채워두므로 이후 퍼징 실행에서 거의 모든 edge가 "이미 알려진 것"으로 판정 → 연속 20샘플 후 즉시 종료(`last_run=2-3`). PC 주소 기반으로 변경하면 새 코드 경로를 실행해야만 새 PC가 나타나므로 포화 신호가 primary coverage signal과 일치 |
+| **`stop_sampling()` 반환값 수정** | BugFix | `len(current_edges)` → `len(current_trace)` 반환. primary signal이 PC 주소로 전환된 이후에도 `last_run` 로그가 edge 수를 표시하여 오해를 유발. PC 수를 반환함으로써 `global_pcs`와 직접 비교 가능 |
+| **로그 `pcs_this_run` 추가** | Feature | per-exec 로그에 `pcs_this_run`(이번 실행 unique PC 수) 추가, `edges=`를 `edges_diag=current/global`로 변경하여 진단용임을 명시 |
 
 ---
 
