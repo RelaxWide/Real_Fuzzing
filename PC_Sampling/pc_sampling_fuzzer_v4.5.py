@@ -132,6 +132,12 @@ MOPT_ENABLED      = True
 MOPT_PILOT_PERIOD = 5000   # pilot 단계 실행 횟수
 MOPT_CORE_PERIOD  = 50000  # core 단계 실행 횟수
 
+# v4.5+: Edge Confirmation — PC 샘플링 타이밍 아티팩트 필터링
+# 처음 관측된 edge를 즉시 global_edges에 추가하지 않고 pending pool에서
+# EDGE_CONFIRM_THRESHOLD회 이상 관측된 경우에만 global_edges로 승격.
+# 타이밍 노이즈(1회성 edge)를 걸러 corpus 폭발을 방지한다.
+EDGE_CONFIRM_THRESHOLD = 2  # pending → global_edges 승격에 필요한 최소 관측 횟수
+
 # =============================================================================
 
 
@@ -302,6 +308,9 @@ class FuzzConfig:
     mopt_pilot_period: int = MOPT_PILOT_PERIOD
     mopt_core_period: int = MOPT_CORE_PERIOD
 
+    # v4.5+: Edge Confirmation (타이밍 아티팩트 필터)
+    edge_confirm_threshold: int = EDGE_CONFIRM_THRESHOLD
+
 
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     """파일 + 콘솔 동시 로깅 설정 (실행마다 날짜시간 로그 파일 생성)"""
@@ -375,6 +384,11 @@ class JLinkPCSampler:
         self.global_edge_buckets: Dict[Tuple[int, int], int] = {}  # edge → 현재 bucket 값
         self.current_edge_counts: Dict[Tuple[int, int], int] = {}  # 이번 실행의 edge hit count
         self._last_bucket_changes: int = 0                          # 마지막 evaluate에서의 bucket 변화 수
+
+        # v4.5+: Edge Confirmation — 타이밍 아티팩트 필터
+        # pending pool: edge → 관측 횟수 (아직 global_edges로 승격 안 됨)
+        # EDGE_CONFIRM_THRESHOLD 이상 관측 시 global_edges로 이동
+        self.global_edge_pending: Dict[Tuple[int, int], int] = {}
 
         # 기존 PC 기반 커버리지 (비교용으로 유지)
         self.global_coverage: Set[int] = set()
@@ -634,15 +648,37 @@ class JLinkPCSampler:
         return len(self.current_edges)
 
     def evaluate_coverage(self) -> Tuple[bool, int]:
-        """v4.5: Edge 기반 + hit count bucket 변화 기반 커버리지 평가"""
-        initial_edges = len(self.global_edges)
+        """v4.5+: Edge Confirmation 기반 커버리지 평가.
 
-        self.global_edges.update(self.current_edges)
+        PC 샘플링 edge (prev_pc, cur_pc)는 타이밍 아티팩트를 포함한다.
+        동일 코드경로를 실행해도 샘플링 타이밍에 따라 다른 쌍이 생성되어
+        global_edges에 즉시 추가하면 corpus가 폭발적으로 증가한다.
+
+        이를 방지하기 위해 2단계 승격 방식을 사용한다:
+          1) 처음 관측 → global_edge_pending[edge] 증가
+          2) pending 횟수 >= edge_confirm_threshold → global_edges 승격 (confirmed)
+
+        1회성 타이밍 노이즈는 pending에서 소멸하고 corpus 추가를 유발하지 않는다.
+        """
+        confirm_threshold = self.config.edge_confirm_threshold
+
+        # PC 커버리지(개별 주소)는 노이즈가 적으므로 그대로 합산
         self.global_coverage.update(self.current_trace)
 
-        new_edges = len(self.global_edges) - initial_edges
+        new_confirmed = 0
+        for edge in self.current_edges:
+            if edge in self.global_edges:
+                continue  # 이미 확정된 edge — 건너뜀
+            cnt = self.global_edge_pending.get(edge, 0) + 1
+            if cnt >= confirm_threshold:
+                # 임계값 도달 → global_edges로 승격
+                self.global_edges.add(edge)
+                self.global_edge_pending.pop(edge, None)
+                new_confirmed += 1
+            else:
+                self.global_edge_pending[edge] = cnt
 
-        # v4.5: Hit count bucket 변화 감지
+        # v4.5: Hit count bucket 변화 감지 (already-confirmed edges에도 적용)
         bucket_changes = 0
         for edge, count in self.current_edge_counts.items():
             old_total = self.global_edge_counts.get(edge, 0)
@@ -659,9 +695,9 @@ class JLinkPCSampler:
 
         self._last_bucket_changes = bucket_changes  # 로그용
 
-        # interesting = 새 edge OR bucket 변화
-        is_interesting = (new_edges > 0) or (bucket_changes > 0)
-        return is_interesting, new_edges + bucket_changes
+        # interesting = 새로 승격된 edge OR bucket 변화
+        is_interesting = (new_confirmed > 0) or (bucket_changes > 0)
+        return is_interesting, new_confirmed + bucket_changes
 
     def load_coverage(self, filepath: str) -> int:
         """이전 세션의 커버리지 파일을 로드하여 global_coverage + global_edges에 합산"""
@@ -1294,11 +1330,13 @@ class NVMeFuzzer:
         for seed in self.corpus:
             seed.is_favored = id(seed) in favored_seeds
 
-        # 3) 제거 대상: favored 아님 + exec_count >= 5 + 기본 시드 아님 (found_at > 0)
+        # 3) 제거 대상: favored 아님 + exec_count >= 2 + 기본 시드 아님 (found_at > 0)
+        # v4.5+: 임계값을 5→2로 낮춤. PC 샘플링 corpus는 false positive로 인해
+        # 매우 빠르게 팽창하므로 unfavored seed를 더 공격적으로 제거한다.
         before = len(self.corpus)
         self.corpus = [
             s for s in self.corpus
-            if s.is_favored or s.exec_count < 5 or s.found_at == 0
+            if s.is_favored or s.exec_count < 2 or s.found_at == 0
         ]
         removed = before - len(self.corpus)
         if removed > 0:
@@ -2324,6 +2362,7 @@ class NVMeFuzzer:
             'corpus_size': len(self.corpus),
             'crashes': len(self.crash_inputs),
             'coverage_unique_edges': len(self.sampler.global_edges),
+            'coverage_pending_edges': len(self.sampler.global_edge_pending),
             'coverage_unique_pcs': len(self.sampler.global_coverage),
             'total_samples': self.sampler.total_samples,
             'interesting_inputs': self.sampler.interesting_inputs,
@@ -2340,7 +2379,8 @@ class NVMeFuzzer:
         log.warning(f"[Stats] exec: {stats['executions']:,} | "
                  f"corpus: {stats['corpus_size']} | "
                  f"crashes: {stats['crashes']} | "
-                 f"edges: {stats['coverage_unique_edges']:,} | "
+                 f"edges: {stats['coverage_unique_edges']:,} "
+                 f"(pending: {stats['coverage_pending_edges']:,}) | "
                  f"pcs: {stats['coverage_unique_pcs']:,} | "
                  f"samples: {stats['total_samples']:,} | "
                  f"last_run: {last_samples} | "
@@ -2587,6 +2627,7 @@ class NVMeFuzzer:
                           f"raw_samples={raw_count} edges={len(self.sampler.current_edges)} "
                           f"out_of_range={oor_count} new={new_edges} bucket_chg={bucket_chg} "
                           f"global_edges={len(self.sampler.global_edges)} "
+                          f"pending_edges={len(self.sampler.global_edge_pending)} "
                           f"global_pcs={len(self.sampler.global_coverage)} "
                           f"last_new_at={self.sampler._last_new_at}{mopt_tag} "
                           f"stop={self.sampler._stopped_reason}")
