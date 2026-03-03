@@ -160,7 +160,7 @@ POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일 (커널 reset 방지, u32 max ~49.7일)
 
 # 퍼징 설정
-MAX_INPUT_LEN     = 4096      # 최대 입력 바이트
+MAX_INPUT_LEN     = 131072    # 최대 입력 바이트 (128KB = 256 blocks, Write 대용량 시드 지원)
 TOTAL_RUNTIME_SEC = 604_800   # 총 퍼징 시간 (초) — 1주일
 OUTPUT_DIR        = f'./output/pc_sampling_v{FUZZER_VERSION}/'
 SEED_DIR          = None      # 시드 폴더 경로 (없으면 None)
@@ -1075,33 +1075,53 @@ class NVMeFuzzer:
                 dict(cdw10=0x0B, description="Async Event Configuration"),
             ],
             "Read": [
-                # CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB (0-based)
-                dict(cdw10=0,      cdw11=0, cdw12=0,   description="Read LBA 0, 1 block"),
-                dict(cdw10=1,      cdw11=0, cdw12=0,   description="Read LBA 1, 1 block"),
-                dict(cdw10=0,      cdw11=0, cdw12=7,   description="Read LBA 0, 8 blocks"),
-                dict(cdw10=0,      cdw11=0, cdw12=31,  description="Read LBA 0, 32 blocks"),
-                dict(cdw10=0,      cdw11=0, cdw12=127, description="Read LBA 0, 128 blocks"),
-                dict(cdw10=500,    cdw11=0, cdw12=0,   description="Read LBA 500, 1 block"),
-                dict(cdw10=1000,   cdw11=0, cdw12=0,   description="Read LBA 1000, 1 block"),
-                dict(cdw10=5000,   cdw11=0, cdw12=0,   description="Read LBA 5000, 1 block"),
-                dict(cdw10=10000,  cdw11=0, cdw12=0,   description="Read LBA 10000, 1 block"),
-                dict(cdw10=0,      cdw11=0, cdw12=(1 << 14),
-                     description="Read LBA 0, FUA (Force Unit Access)"),
+                # CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB (0-based, 스펙 max=0xFFFF)
+                # ── 일반 LBA 범위 ──
+                dict(cdw10=0,      cdw11=0, cdw12=0,      description="Read LBA 0, 1 block"),
+                dict(cdw10=1,      cdw11=0, cdw12=0,      description="Read LBA 1, 1 block"),
+                dict(cdw10=0,      cdw11=0, cdw12=7,      description="Read LBA 0, 8 blocks"),
+                dict(cdw10=0,      cdw11=0, cdw12=31,     description="Read LBA 0, 32 blocks"),
+                dict(cdw10=0,      cdw11=0, cdw12=127,    description="Read LBA 0, 128 blocks"),
+                dict(cdw10=0,      cdw11=0, cdw12=255,    description="Read LBA 0, 256 blocks (128KB)"),
+                dict(cdw10=0,      cdw11=0, cdw12=0xFFFF, description="Read LBA 0, NLB max (65536 blocks, 32MB)"),
+                dict(cdw10=500,    cdw11=0, cdw12=0,      description="Read LBA 500, 1 block"),
+                dict(cdw10=1000,   cdw11=0, cdw12=0,      description="Read LBA 1000, 1 block"),
+                dict(cdw10=5000,   cdw11=0, cdw12=0,      description="Read LBA 5000, 1 block"),
+                dict(cdw10=10000,  cdw11=0, cdw12=0,      description="Read LBA 10000, 1 block"),
+                dict(cdw10=0,      cdw11=0, cdw12=(1 << 14), description="Read LBA 0, FUA (Force Unit Access)"),
+                # ── 64비트 LBA 경계 (CDW11=SLBA[63:32]) ──
+                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0,
+                     description="Read LBA 4G (SLBA=0x1_0000_0000), OOR 에러 경로"),
+                dict(cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0,
+                     description="Read SLBA near 64-bit max, OOR 에러 경로"),
             ],
             "Write": [
                 # CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB (0-based)
+                # data 크기 = (NLB+1) × 512B — 스펙상 NLB와 data 크기 일치 필수
+                # ── 1 block ──
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Write LBA 0, 1 block zeros"),
-                dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xAA' * 512,  description="Write LBA 0, 1 block pattern 0xAA"),
-                dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xFF' * 512,  description="Write LBA 0, 1 block all-ones"),
-                dict(cdw10=0,     cdw11=0, cdw12=7, data=b'\x00' * 4096, description="Write LBA 0, 8 blocks zeros"),
-                dict(cdw10=500,   cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Write LBA 500, 1 block"),
-                dict(cdw10=1000,  cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Write LBA 1000, 1 block"),
-                dict(cdw10=5000,  cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Write LBA 5000, 1 block"),
-                dict(cdw10=10000, cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Write LBA 10000, 1 block"),
-                dict(cdw10=0,     cdw11=0, cdw12=(1 << 14), data=b'\x00' * 512,
-                     description="Write LBA 0, FUA (Force Unit Access)"),
+                dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xAA' * 512,  description="Write LBA 0, 1 block 0xAA"),
+                dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xFF' * 512,  description="Write LBA 0, 1 block 0xFF"),
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=bytes(range(256)) * 2,
-                     description="Write LBA 0, sequential pattern 0x00-0xFF"),
+                     description="Write LBA 0, 1 block sequential 0x00-0xFF"),
+                # ── 다중 block (NLB와 data 일치) ──
+                dict(cdw10=0,     cdw11=0, cdw12=7,   data=b'\x00' * (8   * 512), description="Write LBA 0, 8 blocks (4KB)"),
+                dict(cdw10=0,     cdw11=0, cdw12=31,  data=b'\x00' * (32  * 512), description="Write LBA 0, 32 blocks (16KB)"),
+                dict(cdw10=0,     cdw11=0, cdw12=127, data=b'\x00' * (128 * 512), description="Write LBA 0, 128 blocks (64KB)"),
+                dict(cdw10=0,     cdw11=0, cdw12=255, data=b'\x00' * (256 * 512), description="Write LBA 0, 256 blocks (128KB)"),
+                # ── 다양한 SLBA ──
+                dict(cdw10=500,   cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 500, 1 block"),
+                dict(cdw10=1000,  cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 1000, 1 block"),
+                dict(cdw10=5000,  cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 5000, 1 block"),
+                dict(cdw10=10000, cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 10000, 1 block"),
+                # ── FUA ──
+                dict(cdw10=0, cdw11=0, cdw12=(1 << 14), data=b'\x00' * 512,
+                     description="Write LBA 0, FUA (Force Unit Access)"),
+                # ── 64비트 LBA 경계 (CDW11=SLBA[63:32]) ──
+                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0, data=b'\x00' * 512,
+                     description="Write LBA 4G (SLBA=0x1_0000_0000), OOR 에러 경로"),
+                dict(cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0, data=b'\x00' * 512,
+                     description="Write SLBA near 64-bit max, OOR 에러 경로"),
             ],
             "SetFeatures": [
                 # CDW10[7:0]=FID, CDW10[31]=SV(Save)
