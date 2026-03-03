@@ -166,14 +166,15 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 | **`stop_sampling()` 반환값 수정** | BugFix | `len(current_edges)` → `len(current_trace)` 반환. primary signal이 PC 주소로 전환된 이후에도 `last_run` 로그가 edge 수를 표시하여 오해를 유발 |
 | **로그 `pcs_this_run` 추가** | Feature | per-exec 로그에 `pcs_this_run`(이번 실행 unique PC 수) 추가, `edges=`를 `edges_diag=current/global`로 변경하여 진단용임을 명시 |
 
-### v4.6 — io-passthru 장치 수정 + Passthru Timeout 분리
+### v4.6 — io-passthru 장치 수정 + Passthru Timeout 분리 + Crash 시 SSD 상태 장기 보존
 
 | 항목 | 분류 | 내용 |
 |---|---|---|
 | **io-passthru → namespace block device** | BugFix | io-passthru 명령을 `/dev/nvme0`(char device) 대신 `/dev/nvme0n1`(namespace block device)로 전송. `/dev/nvme0`로 `io-passthru`를 전송하면 커널이 `NVME_IOCTL_IO_CMD` deprecated 경고를 dmesg에 출력. admin-passthru는 `/dev/nvme0` 유지 |
-| **Passthru timeout 분리** | Feature | 기존에는 subprocess 감지 timeout(nvme_timeouts)이 nvme-cli `--timeout` 인자로 그대로 전달되어, timeout 발생 시 커널이 NVMe 명령을 포기하고 controller reset → PCIe FLR을 수행. v4.6에서 두 timeout을 분리: (1) `nvme_timeouts` — subprocess `communicate(timeout=...)` 감지 창 (퍼저 crash 인식), (2) `NVME_PASSTHRU_TIMEOUT_MS=3_600_000`(1시간) — nvme-cli `--timeout` (커널 reset 방지). crash 발생 시 SSD 펌웨어 상태를 그대로 보존하여 JTAG 분석 가능 |
+| **Passthru timeout 분리** | Feature | 기존에는 subprocess 감지 timeout(nvme_timeouts)이 nvme-cli `--timeout` 인자로 그대로 전달되어, timeout 발생 시 커널이 NVMe 명령을 포기하고 controller reset → PCIe FLR을 수행. v4.6에서 두 timeout을 분리: (1) `nvme_timeouts` — subprocess `communicate(timeout=...)` 감지 창 (퍼저 crash 인식), (2) `NVME_PASSTHRU_TIMEOUT_MS=2_592_000_000`(30일) — nvme-cli `--timeout` (커널 reset 방지). crash 발생 시 SSD 펌웨어 상태를 그대로 보존하여 JTAG 분석 가능 |
+| **Crash 시 nvme-cli 프로세스 보존** | Feature | crash 감지 후 `process.kill()`을 호출하지 않음. nvme-cli fd가 열린 채로 유지되므로 커널이 NVMe 명령을 포기하지 않아 controller reset이 발생하지 않음. `start_new_session=True`(setsid)로 퍼저 종료 후에도 nvme-cli가 init에 입양되어 생존. crash nvme-cli PID를 로그 및 `crashes/crash_nvme_pid.txt`에 기록 |
 | **`nvme_passthru_timeout_ms` FuzzConfig 필드** | Feature | `FuzzConfig.nvme_passthru_timeout_ms` 필드 추가. CLI `--passthru-timeout`으로 오버라이드 가능 |
-| **시작 로그 업데이트** | Feature | 시작 시 두 timeout을 명확히 구분하여 출력: `"Timeouts    : subprocess=..."`, `"Passthru TO : ...ms (nvme-cli --timeout, 커널 reset 방지)"` |
+| **시작 로그 업데이트** | Feature | 시작 시 두 timeout을 명확히 구분하여 출력: `"Timeouts    : subprocess=..."`, `"Passthru TO : ...ms (...일, crash 시 SSD 상태 장기 보존)"` |
 
 ---
 
@@ -357,7 +358,7 @@ sanitize:   600,000ms
 **② nvme-cli passthru timeout (`NVME_PASSTHRU_TIMEOUT_MS`)** — 커널 reset 방지:
 
 ```
-기본값: 3,600,000ms (1시간)
+기본값: 2,592,000,000ms (30일, u32 최대 ~49.7일)
 ```
 
 nvme-cli `--timeout` 인자로 사용. 커널이 NVMe 명령을 포기하는 시점을 결정한다. 이 값을 충분히 크게 설정하면, 퍼저의 subprocess timeout이 먼저 발동하므로 커널이 controller reset → PCIe FLR을 수행하지 않아 SSD 펌웨어 상태가 보존된다.
@@ -365,11 +366,18 @@ nvme-cli `--timeout` 인자로 사용. 커널이 NVMe 명령을 포기하는 시
 **동작 흐름 (crash 시)**:
 
 ```
-t=0ms  : NVMe 명령 전송 (nvme-cli --timeout=3600000)
-t=8s   : subprocess communicate(timeout=8) 만료 → 퍼저가 crash 인식
-         J-Link로 stuck PC 20회 샘플링 → crash 저장 → 퍼징 중단
-         (nvme-cli 프로세스는 커널 명령을 1시간 타임아웃으로 보유 중)
-         → SSD 펌웨어 상태 보존 (커널 reset 없음)
+t=0ms   : NVMe 명령 전송 (nvme-cli PID=1234, --timeout=2592000000)
+          start_new_session=True → 새 세션(setsid), 부모 종료 후에도 생존
+t=8s    : subprocess communicate(timeout=8) 만료 → 퍼저가 crash 인식
+t=8s    : process.kill() 없음 → fd 유지
+          stdout/stderr 파이프 부모 쪽만 닫음
+          _crash_nvme_pid = 1234 저장
+t=8s~   : J-Link로 stuck PC 20회 샘플링 → crash 저장 → 퍼징 중단
+t=10s   : 퍼저(Python) 종료
+          → nvme-cli PID=1234는 init에 입양(orphan), D-state로 생존
+          → fd(/dev/nvme0n1) 유지 → 커널 reset 없음
+이후 30일: SSD 펌웨어 상태 그대로 보존
+분석 완료: kill 1234  (또는 cat crashes/crash_nvme_pid.txt | xargs kill)
 ```
 
 **동작 흐름 (정상 실행 시)**:
@@ -555,16 +563,23 @@ _send_nvme_command(data, seed):
     # subprocess 감지 timeout (퍼저 crash 인식 창)
     timeout_ms = config.nvme_timeouts.get(cmd.timeout_group, ...)
     # nvme-cli --timeout (커널 reset 방지용, v4.6: 분리)
-    passthru_timeout_ms = config.nvme_passthru_timeout_ms  # 기본 3,600,000ms
+    passthru_timeout_ms = config.nvme_passthru_timeout_ms  # 기본 2,592,000,000ms (30일)
 
     nvme_cmd = ['nvme', 'admin-passthru'|'io-passthru', target_device,
-                '--opcode=...', '--namespace-id=...', '--cdw2=...', ..., '--cdw15=...',
-                f'--timeout={passthru_timeout_ms}',  # 커널 포기 시점 (1시간)
+                '--opcode=...', ...,
+                f'--timeout={passthru_timeout_ms}',  # 커널 포기 시점 (30일)
                 '--data-len=...', '--input-file=...' | '-r']
 
     sampler.start_sampling()
-    process = Popen(nvme_cmd)
-    stdout, stderr = process.communicate(timeout=timeout_ms / 1000)  # 퍼저 감지 창
+    # v4.6: start_new_session=True — 부모 종료 후에도 생존 (setsid)
+    process = Popen(nvme_cmd, start_new_session=True, ...)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_ms / 1000)  # 8초
+    except subprocess.TimeoutExpired:
+        # v4.6: process.kill() 없음 — fd 유지 → 커널 reset 없음
+        process.stdout.close(); process.stderr.close()
+        self._crash_nvme_pid = process.pid  # crash 핸들러에서 로그/파일 저장
+        return RC_TIMEOUT
     if post_cmd_delay > 0:
         sleep(post_cmd_delay)
     return process.returncode
@@ -747,48 +762,72 @@ else:  # admin-passthru
 
 **영향**: dmesg 경고 제거, crash 분석 시 실제 에러 메시지 가독성 향상.
 
-### 10.2 [Feature] Passthru Timeout 분리 (커널 Reset 방지)
+### 10.2 [Feature] Passthru Timeout 분리 + Crash 시 nvme-cli 프로세스 보존
 
 **배경**: v4.5까지는 nvme-cli `--timeout` 인자에 퍼저의 subprocess 감지 timeout(예: 8000ms)을 그대로 사용했다. NVMe 명령이 timeout되면:
 
 ```
-t=8s : subprocess communicate() 만료 → nvme-cli SIGTERM/SIGKILL
-     → 커널: 미완료 NVMe 명령 abort 시도
-     → abort 실패 시: controller reset → PCIe FLR
-     → dmesg: "EAGAIN: Resource temporarily unavailable"
+t=8s : subprocess communicate() 만료 → process.kill() → nvme-cli 종료
+     → fd(/dev/nvme0) 닫힘
+     → 커널: orphaned in-flight 명령 정리 (abort → reset)
+     → dmesg: "nvme0: I/O 23 QID 0 timeout, reset controller"
      → SSD 펌웨어 상태 리셋 (crash 분석 불가)
 ```
 
-**v4.6 해결책**: 두 timeout을 독립적으로 설정한다.
+**근본 원인**: `process.kill()`로 fd가 닫히면 커널이 cleanup 경로로 진입한다. `--timeout` 값은 fd가 열려있는 동안의 능동적 타임아웃에만 적용되며, fd close 이벤트에는 무관하다.
+
+**v4.6 해결책**: 두 가지 변경을 조합한다.
 
 ```python
-# FuzzConfig 추가
-nvme_passthru_timeout_ms: int = NVME_PASSTHRU_TIMEOUT_MS  # 기본 3,600,000
+# 1. subprocess를 새 세션으로 분리 (부모 종료 후에도 생존)
+process = subprocess.Popen(
+    nvme_cmd,
+    start_new_session=True,   # setsid() — SIGHUP 차단
+    ...
+)
 
-# _send_nvme_command() 내:
-timeout_ms = self.config.nvme_timeouts.get(...)       # subprocess 감지 창
-passthru_timeout_ms = self.config.nvme_passthru_timeout_ms  # nvme-cli --timeout
+# 2. TimeoutExpired 시 process.kill() 제거
+except subprocess.TimeoutExpired:
+    # kill 없음 → fd 유지 → 커널 cleanup 경로 진입 안함
+    process.stdout.close()   # 파이프 부모 쪽만 닫음
+    process.stderr.close()
+    self._crash_nvme_pid = process.pid
+    return RC_TIMEOUT
 
-nvme_cmd = [..., f'--timeout={passthru_timeout_ms}', ...]  # 1시간
-process.communicate(timeout=timeout_ms / 1000)              # 8초
+# 3. passthru timeout은 30일 (u32 최대 ~49.7일 이내)
+NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일
 ```
 
 **동작 원리**:
-- 정상 실행: SSD가 수 ms 내 응답 → 두 timeout 모두 발동 안 함
-- Crash 발생: 8초 후 subprocess timeout 발동 → 퍼저가 crash 인식 → J-Link로 stuck PC 샘플링 → crash 저장 → 퍼징 중단. nvme-cli는 커널에 1시간 timeout을 제시했으므로 커널이 아직 명령을 포기하지 않음 → controller reset 없음 → SSD 펌웨어 상태 그대로 보존
+- **정상 실행**: SSD가 수 ms 내 응답 → `communicate()` 정상 리턴 → kill 없음. 성능 영향 없음.
+- **Crash 발생**: 8초 후 `communicate()` TimeoutExpired → kill 없이 파이프만 닫음 → nvme-cli 생존 (D-state) → fd 유지 → 커널 reset 없음 → SSD 상태 보존.
+- **퍼저 종료 후**: `start_new_session=True` 덕분에 SIGHUP 차단 → nvme-cli가 init에 입양 → D-state로 계속 생존.
+- **SSD 보존 기간**: nvme-cli `--timeout=30일` 만료 시까지 (또는 수동 kill 전까지).
+
+**출력 파일 추가**:
+- `crashes/crash_nvme_pid.txt`: 보존된 nvme-cli PID
 
 **새 CLI 옵션**:
 
 ```
---passthru-timeout MS   nvme-cli에 전달할 --timeout 값 (기본: 3600000ms = 1시간)
-                        커널이 NVMe 명령을 포기하는 시점을 늦춰 controller reset 방지
+--passthru-timeout MS   nvme-cli에 전달할 --timeout 값
+                        (기본: 2592000000ms = 30일)
 ```
 
 **시작 로그 (v4.6)**:
 
 ```
 [WARNING] Timeouts    : subprocess=command:8000,flush:30000,...
-[WARNING] Passthru TO : 3600000ms (nvme-cli --timeout, 커널 reset 방지)
+[WARNING] Passthru TO : 2592000000ms (30.0일, nvme-cli --timeout, crash 시 SSD 상태 장기 보존)
+```
+
+**crash 발생 시 로그**:
+
+```
+[ERROR]   [SSD 상태 보존] nvme-cli PID=1234 가 살아있습니다 (fd 유지 → 커널 reset 없음).
+[ERROR]   SSD 상태는 nvme-cli --timeout(30일) 만료까지 보존됩니다.
+[ERROR]   분석 완료 후 종료: kill 1234
+[ERROR]   PID 파일: .../crashes/crash_nvme_pid.txt
 ```
 
 ---
@@ -899,7 +938,7 @@ sudo python3 pc_sampling_fuzzer_v4.6.py --all-commands
 | `--datalen-mut-prob` | 0.08 | data_len 불일치 확률 (0=비활성화) |
 | `--seed-dir` | None | 시드 디렉토리 경로 (이전 corpus를 시드로 재활용) |
 | `--timeout GROUP MS` | (그룹별 기본값) | subprocess 감지 타임아웃 그룹별 오버라이드 |
-| **`--passthru-timeout`** | **3600000** | **nvme-cli --timeout 값 (ms). 커널 reset 방지용. v4.6 신규** |
+| **`--passthru-timeout`** | **2592000000** | **nvme-cli --timeout 값 (ms, 기본 30일). crash 시 nvme-cli 프로세스 보존 → SSD 상태 장기 유지. v4.6 신규** |
 | `--calibration-runs` | 3 | 초기 시드당 calibration 실행 횟수 (0=비활성화) |
 | `--no-deterministic` | False | Deterministic stage 비활성화 |
 | `--det-arith-max` | 10 | Deterministic arithmetic 최대 delta |
@@ -926,6 +965,7 @@ output/pc_sampling_v4.6/
 │   ├── crash_Identify_0x6_...
 │   ├── crash_Identify_0x6_....json       # crash 메타데이터 + 이유
 │   ├── crash_Identify_0x6_....dmesg.txt  # 커널 로그 스냅샷
+│   ├── crash_nvme_pid.txt                # v4.6: 보존된 nvme-cli PID (kill로 수동 종료)
 │   └── ...
 └── graphs/                        # 시각화 출력
     ├── summary.json               # 명령어별 edge/PC 수 요약
