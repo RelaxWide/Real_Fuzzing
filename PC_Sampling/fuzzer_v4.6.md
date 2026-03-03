@@ -837,7 +837,44 @@ NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일
 [ERROR]   PID 파일: .../crashes/crash_nvme_pid.txt
 ```
 
-### 10.3 [Refactor] 코드 정리 (v4.6 후속)
+### 10.3 [BugFix] Timeout Crash 후 커널 Controller Reset 차단
+
+**문제 현상**: timeout crash 감지 후 "퍼징을 중단합니다. SSD와 NVMe 장치 상태를 그대로 유지합니다." 로그 출력 후 약 1분 뒤 커널이 SSD를 reset하여 crash 상태가 소멸.
+
+**근본 원인**: `nvme-cli --timeout=2592000000`(30일)은 passthru 명령 자체의 per-command timeout만 설정한다. Linux 커널 NVMe 드라이버는 내부 admin 명령(Async Event Request, Keep-Alive 등)에 `ADMIN_TIMEOUT = 60초`를 독립적으로 사용한다. 펌웨어 크래시 시:
+
+```
+t=0s  : 펌웨어 크래시 (NVMe 완료 큐 응답 중단)
+t≈60s : 커널 NVMe 드라이버 내부 admin 명령 타임아웃 (ADMIN_TIMEOUT=60s)
+t≈60s : nvme_timeout() 발동 → nvme_reset_ctrl() 호출 → SSD 상태 소멸
+```
+
+passthru 명령에 30일 timeout을 설정해도 드라이버 내부 타이머(`ADMIN_TIMEOUT`)는 별개이므로 영향을 받지 않는다.
+
+**해결**: timeout 감지 직후 `/sys/bus/pci/drivers/nvme/unbind`로 NVMe PCIe 드라이버를 제거한다. 드라이버가 사라지면 `ADMIN_TIMEOUT` 타이머도 함께 사라져 controller reset이 발생하지 않는다.
+
+```
+t=0s  : 펌웨어 크래시
+t≈12s : 퍼저 subprocess timeout 감지
+t≈14s : stuck PC 읽기 완료 (J-Link, 20회 샘플)
+t≈14s : [신규] echo '<BDF>' > /sys/bus/pci/drivers/nvme/unbind
+       → 커널 NVMe 드라이버 제거 → ADMIN_TIMEOUT 타이머 소멸
+       → SSD 펌웨어 상태 무기한 보존
+```
+
+**사이드 이펙트**:
+- `/dev/nvme*` 장치 파일이 사라짐 (드라이버 없으므로 정상)
+- nvme-cli 프로세스가 D-state에서 깨어나 ENODEV로 종료됨 (정상)
+- SSD 펌웨어는 JTAG(J-Link)로 여전히 접근 가능
+- 분석 완료 후 rebind: `echo '<BDF>' > /sys/bus/pci/drivers/nvme/bind`
+
+**신규 메서드**:
+- `_get_nvme_pci_bdf()`: 시작 시 `/sys/class/nvme/<dev>`에서 PCI BDF 검색
+- `_unbind_nvme_driver()`: BDF를 `/sys/bus/pci/drivers/nvme/unbind`에 기록
+
+---
+
+### 10.4 [Refactor] 코드 정리 (v4.6 후속)
 
 hot-path 비활성화 코드 제거 및 코드 품질 개선.
 
@@ -883,6 +920,7 @@ hot-path 비활성화 코드 제거 및 코드 품질 개선.
 | ~~MOpt (mutator scheduling)~~ | ~~중간~~ | ~~mutation 연산자별 효과 추적 및 가중치 조정~~ | **v4.5 구현 완료** |
 | ~~io-passthru device 수정~~ | ~~낮음~~ | ~~deprecated NVME_IOCTL_IO_CMD 경고 제거~~ | **v4.6 구현 완료** |
 | ~~Passthru timeout 분리~~ | ~~중간~~ | ~~crash 시 SSD 상태 보존을 위한 timeout 구조 개선~~ | **v4.6 구현 완료** |
+| ~~커널 reset 차단 (unbind)~~ | ~~높음~~ | ~~timeout crash 후 ADMIN_TIMEOUT(60s)에 의한 커널 reset 차단 — PCIe NVMe 드라이버 즉시 unbind~~ | **v4.6 버그픽스 완료** |
 | ~~Edge 추적 코드 제거~~ | ~~높음~~ | ~~hot path에서 불필요한 edge 연산 제거 (183줄, 샘플당 set.add + dict 갱신)~~ | **v4.6 구현 완료** |
 | ~~코드 품질 정리~~ | ~~낮음~~ | ~~dead code, 중복 init, 로컬 import, stale 주석 제거~~ | **v4.6 구현 완료** |
 | Entropic scheduling | 중간 | 정보 이론 기반 시드 스케줄링 (corpus 성숙 후 AFLFast 대체) | 미구현 |

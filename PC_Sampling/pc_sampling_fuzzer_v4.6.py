@@ -18,14 +18,18 @@ v4.6 변경사항:
     - subprocess 감지 timeout: 퍼저가 "crash 발생"을 인식하는 창 (빠름, 그대로)
     - nvme-cli --timeout: 커널이 NVMe 명령을 포기하는 시점 (길게 → reset 방지)
     정상 실행에서는 SSD가 ms~초 단위로 응답하므로 성능에 전혀 영향 없음.
-- [Feature] Crash 시 nvme-cli 프로세스 보존 (SSD 상태 장기 유지):
-    기존에는 communicate() timeout 발생 시 process.kill()로 nvme-cli를 종료.
-    nvme-cli의 fd가 닫히면 커널이 in-flight NVMe 명령을 정리(abort → reset)하므로
-    SSD 펌웨어 상태가 리셋된다.
-    → process.kill() 제거, start_new_session=True로 부모 종료 후에도 생존.
-    → crash 발생 시 nvme-cli PID를 로그/파일로 기록.
-    → SSD 상태가 nvme-cli --timeout(30일) 만료까지 보존됨.
-    분석 완료 후: kill <PID> 또는 crashes/crash_nvme_pid.txt 참조.
+- [Feature] Crash 시 NVMe PCIe 드라이버 즉시 unbind (SSD 상태 보존):
+    문제: nvme-cli --timeout(30일)은 passthru 명령 자체에만 적용.
+    Linux NVMe 드라이버는 내부 admin 명령(AER, keep-alive 등)에 ADMIN_TIMEOUT(60s)을
+    사용하므로, 펌웨어 크래시 후 60초 뒤 nvme_reset_ctrl()이 발동하여 SSD 상태가
+    덮어써진다.
+    해결: timeout 감지 즉시 /sys/bus/pci/drivers/nvme/unbind로 드라이버 제거.
+    드라이버가 사라지면 60초 타이머도 제거 → SSD 펌웨어 상태 장기 보존.
+    /dev/nvme* 장치는 사라지지만 JTAG으로 펌웨어 접근 가능.
+    분석 완료 후: echo '<BDF>' > /sys/bus/pci/drivers/nvme/bind
+- [Feature] Crash 시 nvme-cli 프로세스 보존 (보조 수단):
+    process.kill() 제거, start_new_session=True로 부모 종료 후에도 생존.
+    unbind 후 nvme-cli는 ENODEV로 D-state에서 깨어나 자동 종료됨 (정상 동작).
 
 v4.5 변경사항 (v4.5 이후 수정 포함):
 - [Redesign] Primary coverage signal: (prev_pc, cur_pc) edge → unique PC 주소
@@ -94,6 +98,7 @@ v4 변경사항:
 from __future__ import annotations
 
 import pylink
+import re
 import struct
 import time
 import threading
@@ -795,6 +800,8 @@ class NVMeFuzzer:
         self._timeout_crash = False
         # v4.6: crash 시 보존된 nvme-cli PID (kill하지 않아 fd 유지 → SSD 상태 보존)
         self._crash_nvme_pid: Optional[int] = None
+        # v4.6: NVMe PCIe BDF (커널 드라이버 unbind로 admin-timeout reset 방지)
+        self._nvme_pci_bdf: Optional[str] = self._get_nvme_pci_bdf()
 
         # v4.5: MOpt (mutation operator scheduling) 상태
         self.NUM_MUTATION_OPS = 16
@@ -1886,6 +1893,63 @@ class NVMeFuzzer:
             meta["data_len_override"] = seed.data_len_override
         return meta
 
+    def _get_nvme_pci_bdf(self) -> Optional[str]:
+        """NVMe 컨트롤러의 PCI BDF(Bus:Device.Function)를 sysfs에서 검색한다.
+        예: '0000:03:00.0'
+        timeout crash 시 PCIe 드라이버 unbind에 사용."""
+        try:
+            dev_name = Path(self.config.nvme_device).name  # e.g., 'nvme0'
+            sysfs_path = Path(f'/sys/class/nvme/{dev_name}')
+            if not sysfs_path.exists():
+                log.warning(f"[BDF] {sysfs_path} 없음 — unbind 불가")
+                return None
+            real_path = sysfs_path.resolve()
+            # 경로 예: /sys/devices/pci0000:00/0000:00:1d.0/0000:03:00.0/nvme/nvme0
+            bdf_pattern = re.compile(r'^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$')
+            for parent in real_path.parents:
+                if bdf_pattern.match(parent.name):
+                    bdf = parent.name
+                    log.warning(f"[BDF] NVMe PCI BDF: {bdf}")
+                    return bdf
+        except Exception as e:
+            log.warning(f"[BDF] BDF 검색 실패: {e}")
+        log.warning("[BDF] BDF를 찾지 못함 — timeout crash 시 unbind 불가")
+        return None
+
+    def _unbind_nvme_driver(self) -> bool:
+        """PCIe NVMe 드라이버를 unbind하여 커널 controller reset을 차단한다.
+
+        Linux 커널 NVMe 드라이버는 내부 admin 명령(AER, keep-alive 등)에
+        ADMIN_TIMEOUT(60초)를 사용한다. 펌웨어 크래시 시 이 명령들이 응답을
+        받지 못하면 60초 후 nvme_reset_ctrl()이 발동하여 SSD 상태를 덮어쓴다.
+        드라이버를 unbind하면 타이머가 제거되어 크래시 상태가 장기간 보존된다.
+        """
+        if not self._nvme_pci_bdf:
+            log.error(
+                "[Unbind] PCI BDF를 알 수 없어 unbind 불가 "
+                "— 커널이 약 60초 후 controller reset을 시도합니다.")
+            return False
+        try:
+            unbind_path = Path('/sys/bus/pci/drivers/nvme/unbind')
+            unbind_path.write_text(self._nvme_pci_bdf)
+            log.error(
+                f"[Unbind] NVMe PCIe 드라이버 unbind 완료: {self._nvme_pci_bdf}")
+            log.error(
+                "  커널 controller reset이 차단됩니다.")
+            log.error(
+                "  /dev/nvme* 장치는 사라지지만 SSD 펌웨어 상태는 보존됩니다.")
+            log.error(
+                f"  분석 완료 후 rebind: "
+                f"echo '{self._nvme_pci_bdf}' > /sys/bus/pci/drivers/nvme/bind")
+            return True
+        except PermissionError:
+            log.error(
+                "[Unbind] 권한 없음 (PermissionError) — root로 실행 중인지 확인")
+            return False
+        except OSError as e:
+            log.error(f"[Unbind] 실패: {e}")
+            return False
+
     def _capture_dmesg(self, lines: int = 80) -> str:
         """v4.4: 커널 로그(dmesg) 마지막 N줄을 캡처한다.
         timeout 시 커널 NVMe 드라이버의 동작(abort, reset, FLR 등)을
@@ -2632,6 +2696,14 @@ class NVMeFuzzer:
                     log.warning("[TIMEOUT] SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
                     stuck_pcs = self.sampler.read_stuck_pcs(count=20)
 
+                    # 2) NVMe PCIe 드라이버 즉시 unbind — ADMIN_TIMEOUT(60s) reset 차단
+                    # Linux NVMe 드라이버는 내부 admin 명령(AER, keep-alive 등)에
+                    # ADMIN_TIMEOUT=60s를 사용. 펌웨어 크래시 시 이 타이머가 먼저 발동해
+                    # nvme_reset_ctrl()을 호출, SSD 상태를 덮어쓴다.
+                    # stuck PC 읽기 후 즉시 unbind하면 타이머가 제거된다.
+                    log.warning("[TIMEOUT] 커널 reset 차단을 위해 NVMe 드라이버를 unbind합니다...")
+                    self._unbind_nvme_driver()
+
                     actual_opcode = mutated_seed.opcode_override \
                         if mutated_seed.opcode_override is not None \
                         else cmd.opcode
@@ -2673,7 +2745,7 @@ class NVMeFuzzer:
                             f"actual_opcode=0x{actual_opcode:02x} "
                             f"— J-Link PC 읽기 실패 (JTAG 연결 확인 필요)")
 
-                    # 2) dmesg 캡처 (커널 NVMe 드라이버 동작 확인)
+                    # 3) dmesg 캡처 — unbind 직후라 reset 메시지 없는 게 정상
                     log.warning("[TIMEOUT] 커널 로그(dmesg)를 캡처합니다...")
                     dmesg_snapshot = self._capture_dmesg(lines=80)
                     # dmesg에서 NVMe 관련 라인만 요약 출력
@@ -2687,14 +2759,14 @@ class NVMeFuzzer:
                     else:
                         log.error("  dmesg에 NVMe 관련 메시지 없음")
 
-                    # 3) crash 저장 (stuck PC + dmesg 포함)
+                    # 4) crash 저장 (stuck PC + dmesg 포함)
                     self.crash_inputs.append((fuzz_data, cmd))
                     self._save_crash(fuzz_data, mutated_seed,
                                      reason="timeout", stuck_pcs=stuck_pcs,
                                      dmesg_snapshot=dmesg_snapshot)
                     log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
 
-                    # 4) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
+                    # 5) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
                     # halt하면 불량 현상이 멈추므로, 펌웨어가 돌고 있는
                     # 그대로 두어야 hang/loop 등의 현상을 외부에서 관찰 가능
                     log.error(
@@ -2704,10 +2776,9 @@ class NVMeFuzzer:
                         "  J-Link 디버거로 연결하여 현재 상태를 "
                         "관찰할 수 있습니다.")
 
-                    # 5) nvme-cli 프로세스 보존 (v4.6: SSD 상태 장기 유지)
-                    # process.kill()을 하지 않았으므로 nvme-cli가 살아있음.
-                    # fd가 열려있는 한 커널은 NVMe 명령을 포기하지 않음
-                    # → controller reset 없음 → SSD 상태 최대 30일 보존.
+                    # 6) nvme-cli 프로세스 정보 기록
+                    # unbind로 드라이버가 제거되면 nvme-cli(D-state)는 ENODEV로 깨어남.
+                    # 프로세스가 종료돼도 SSD 펌웨어 상태는 보존됨 (unbind가 보장).
                     log.error("")
                     if self._crash_nvme_pid is not None:
                         pid_file = self.crashes_dir / "crash_nvme_pid.txt"
@@ -2716,26 +2787,13 @@ class NVMeFuzzer:
                         except OSError:
                             pass
                         log.error(
-                            f"  [SSD 상태 보존] nvme-cli PID={self._crash_nvme_pid} "
-                            f"가 살아있습니다 (fd 유지 → 커널 reset 없음).")
+                            f"  [참고] nvme-cli PID={self._crash_nvme_pid} "
+                            f"(unbind 후 자동 종료될 수 있음 — 정상)")
                         log.error(
-                            f"  SSD 상태는 nvme-cli --timeout(30일) 만료까지 보존됩니다.")
-                        log.error(
-                            f"  분석 완료 후 종료: kill {self._crash_nvme_pid}")
-                        log.error(
-                            f"  PID 파일: {pid_file}")
-                    else:
-                        log.error(
-                            "  [NVMe 장치 안내] timeout 후 /dev/nvme* 가 "
-                            "사라질 수 있습니다.")
-                        log.error(
-                            "  디버깅 완료 후 수동 복구:")
-                        log.error(
-                            "    echo 1 > /sys/bus/pci/devices/<BDF>/remove "
-                            "&& echo 1 > /sys/bus/pci/rescan")
+                            f"  SSD 펌웨어 상태는 드라이버 unbind로 보존됩니다.")
                     log.error("")
 
-                    # 6) 퍼징 중단 — reconnect/continue/rescan 하지 않음
+                    # 7) 퍼징 중단 — reconnect/continue/rescan 하지 않음
                     self._timeout_crash = True
                     log.error(
                         "  퍼징을 중단합니다. SSD와 NVMe 장치 상태를 "
