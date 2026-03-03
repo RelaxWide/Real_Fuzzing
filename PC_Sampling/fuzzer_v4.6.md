@@ -839,38 +839,49 @@ NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일
 
 ### 10.3 [BugFix] Timeout Crash 후 커널 Controller Reset 차단
 
-**문제 현상**: timeout crash 감지 후 "퍼징을 중단합니다. SSD와 NVMe 장치 상태를 그대로 유지합니다." 로그 출력 후 약 1분 뒤 커널이 SSD를 reset하여 crash 상태가 소멸.
+**문제 현상**: timeout crash 감지 후 "퍼징을 중단합니다." 로그 출력 후 약 1분 뒤 커널이 SSD를 reset하여 crash 상태가 소멸.
 
-**근본 원인**: `nvme-cli --timeout=2592000000`(30일)은 passthru 명령 자체의 per-command timeout만 설정한다. Linux 커널 NVMe 드라이버는 내부 admin 명령(Async Event Request, Keep-Alive 등)에 `ADMIN_TIMEOUT = 60초`를 독립적으로 사용한다. 펌웨어 크래시 시:
+**근본 원인 분석**: dmesg 확인 결과 `nvme0: I/O X QID 0 timeout, reset controller` 메시지 발생. QID 0 = admin 큐. `nvme-cli --timeout=30일`은 passthru 명령 자체에만 적용되며, 커널 드라이버 내부 admin 명령(AER 등)은 `ADMIN_TIMEOUT=60초`를 독립적으로 사용한다.
 
 ```
 t=0s  : 펌웨어 크래시 (NVMe 완료 큐 응답 중단)
-t≈60s : 커널 NVMe 드라이버 내부 admin 명령 타임아웃 (ADMIN_TIMEOUT=60s)
-t≈60s : nvme_timeout() 발동 → nvme_reset_ctrl() 호출 → SSD 상태 소멸
+t≈60s : 드라이버 내부 admin 명령(AER) 타임아웃 (ADMIN_TIMEOUT=60s)
+t≈60s : nvme_timeout() → nvme_reset_ctrl() → SSD 상태 소멸
 ```
 
-passthru 명령에 30일 timeout을 설정해도 드라이버 내부 타이머(`ADMIN_TIMEOUT`)는 별개이므로 영향을 받지 않는다.
+**시도한 접근 (실패)**: crash 감지 후 `/sys/bus/pci/drivers/nvme/unbind`를 시도. 그러나 `nvme_remove()` → `nvme_shutdown_ctrl()` → `CC.EN=0` 후 `CSTS.RDY` 클리어 대기. **hang된 펌웨어는 하드웨어 응답이 없어 sysfs 쓰기가 무기한 블로킹됨.** timeout을 줘도 unbind 자체가 완료되지 않아 드라이버는 바인딩 상태 유지 → reset 그대로 발생. unbind는 정상 동작하는 컨트롤러를 위한 메커니즘이므로 hang된 펌웨어에는 적합하지 않다.
 
-**해결**: timeout 감지 직후 `/sys/bus/pci/drivers/nvme/unbind`로 NVMe PCIe 드라이버를 제거한다. 드라이버가 사라지면 `ADMIN_TIMEOUT` 타이머도 함께 사라져 controller reset이 발생하지 않는다.
+**실제 해결책**: 퍼저 **시작 시** `nvme_core` 모듈 파라미터를 사전에 늘린다. 이 값은 이후 드라이버가 새로 제출하는 모든 NVMe 명령의 timeout에 적용된다.
 
 ```
-t=0s  : 펌웨어 크래시
-t≈12s : 퍼저 subprocess timeout 감지
-t≈14s : stuck PC 읽기 완료 (J-Link, 20회 샘플)
-t≈14s : [신규] echo '<BDF>' > /sys/bus/pci/drivers/nvme/unbind
-       → 커널 NVMe 드라이버 제거 → ADMIN_TIMEOUT 타이머 소멸
-       → SSD 펌웨어 상태 무기한 보존
+퍼저 시작 시:
+  /sys/module/nvme_core/parameters/admin_timeout: 60s → 86400s (24시간)
+  /sys/module/nvme_core/parameters/io_timeout:    30s → 86400s (24시간)
+
+crash 발생 시:
+  t=0s  : 펌웨어 크래시
+  t≈12s : 퍼저 subprocess timeout 감지
+  t≈14s : stuck PC 읽기 / dmesg 캡처 / crash 저장 완료
+  t≈86400s : 커널 reset (24시간 후, 분석에 충분한 시간)
 ```
 
-**사이드 이펙트**:
-- `/dev/nvme*` 장치 파일이 사라짐 (드라이버 없으므로 정상)
-- nvme-cli 프로세스가 D-state에서 깨어나 ENODEV로 종료됨 (정상)
-- SSD 펌웨어는 JTAG(J-Link)로 여전히 접근 가능
-- 분석 완료 후 rebind: `echo '<BDF>' > /sys/bus/pci/drivers/nvme/bind`
+**제약**: 설정 시점 이후 새로 제출되는 명령에만 적용. 퍼저 시작 시 이미 in-flight인 AER의 deadline은 변경 불가. AER 이벤트가 발생해 재제출될 때부터 새 timeout이 적용된다 (SSD는 SMART 이벤트 등을 주기적으로 전송하므로 퍼징 중 자연스럽게 전환됨).
 
-**신규 메서드**:
-- `_get_nvme_pci_bdf()`: 시작 시 `/sys/class/nvme/<dev>`에서 PCI BDF 검색
-- `_unbind_nvme_driver()`: BDF를 `/sys/bus/pci/drivers/nvme/unbind`에 기록
+**정상 종료 시**: 원래 값(60s/30s)으로 자동 복원. crash 종료 시에는 복원하지 않음 (분석 중 reset 방지).
+
+**신규 메서드 / 설정**:
+- `_configure_nvme_timeouts()`: 퍼저 시작 시 호출, 파라미터 설정 및 원래 값 저장
+- `_restore_nvme_timeouts()`: 정상 종료 시 호출, 원래 값 복원
+- `FuzzConfig.nvme_kernel_timeout_sec` (기본 `86400`)
+- `--kernel-timeout` CLI 옵션 (초 단위)
+
+**시작 로그**:
+```
+[TimeoutCfg] /sys/module/nvme_core/parameters/admin_timeout: 60s → 86400s
+[TimeoutCfg] /sys/module/nvme_core/parameters/io_timeout:    30s → 86400s
+[TimeoutCfg] crash 발생 시 커널 reset까지 최대 86400초 유예
+             (단, 현재 in-flight AER는 기존 timeout 유지)
+```
 
 ---
 
