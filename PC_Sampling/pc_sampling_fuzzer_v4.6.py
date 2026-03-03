@@ -1916,22 +1916,52 @@ class NVMeFuzzer:
         log.warning("[BDF] BDF를 찾지 못함 — timeout crash 시 unbind 불가")
         return None
 
-    def _unbind_nvme_driver(self) -> bool:
+    def _unbind_nvme_driver(self, timeout_sec: float = 5.0) -> bool:
         """PCIe NVMe 드라이버를 unbind하여 커널 controller reset을 차단한다.
 
         Linux 커널 NVMe 드라이버는 내부 admin 명령(AER, keep-alive 등)에
         ADMIN_TIMEOUT(60초)를 사용한다. 펌웨어 크래시 시 이 명령들이 응답을
         받지 못하면 60초 후 nvme_reset_ctrl()이 발동하여 SSD 상태를 덮어쓴다.
         드라이버를 unbind하면 타이머가 제거되어 크래시 상태가 장기간 보존된다.
+
+        주의: nvme_remove() → nvme_shutdown_ctrl() → CC.EN=0 쓰고 CSTS.RDY 대기.
+        펌웨어가 완전히 죽어있으면 이 하드웨어 응답이 없어 sysfs 쓰기가 블로킹된다.
+        daemon thread + join(timeout)으로 최대 timeout_sec초만 기다리고 넘어간다.
+        스레드는 D-state로 남지만 프로세스 종료 시 자동 정리된다.
         """
         if not self._nvme_pci_bdf:
             log.error(
                 "[Unbind] PCI BDF를 알 수 없어 unbind 불가 "
                 "— 커널이 약 60초 후 controller reset을 시도합니다.")
             return False
-        try:
-            unbind_path = Path('/sys/bus/pci/drivers/nvme/unbind')
-            unbind_path.write_text(self._nvme_pci_bdf)
+
+        result_holder: list = []  # thread 결과 공유 (list는 가변, closure 캡처 가능)
+
+        def _do_unbind():
+            try:
+                Path('/sys/bus/pci/drivers/nvme/unbind').write_text(self._nvme_pci_bdf)
+                result_holder.append(True)
+            except PermissionError:
+                result_holder.append('permission')
+            except OSError as e:
+                result_holder.append(str(e))
+
+        t = threading.Thread(target=_do_unbind, daemon=True)
+        t.start()
+        t.join(timeout=timeout_sec)
+
+        if not result_holder:
+            # sysfs 쓰기가 블로킹 중 (nvme_shutdown_ctrl 하드웨어 응답 없음)
+            log.error(
+                f"[Unbind] {timeout_sec:.0f}초 내 완료되지 않음 "
+                f"(펌웨어 무응답 — CC.EN=0 후 CSTS.RDY 대기 중)")
+            log.error(
+                "  unbind 스레드는 백그라운드에서 계속 시도합니다.")
+            log.error(
+                "  커널 reset은 여전히 발생할 수 있습니다 (~60초 후).")
+            return False
+
+        if result_holder[0] is True:
             log.error(
                 f"[Unbind] NVMe PCIe 드라이버 unbind 완료: {self._nvme_pci_bdf}")
             log.error(
@@ -1942,12 +1972,11 @@ class NVMeFuzzer:
                 f"  분석 완료 후 rebind: "
                 f"echo '{self._nvme_pci_bdf}' > /sys/bus/pci/drivers/nvme/bind")
             return True
-        except PermissionError:
-            log.error(
-                "[Unbind] 권한 없음 (PermissionError) — root로 실행 중인지 확인")
+        elif result_holder[0] == 'permission':
+            log.error("[Unbind] 권한 없음 (PermissionError) — root로 실행 중인지 확인")
             return False
-        except OSError as e:
-            log.error(f"[Unbind] 실패: {e}")
+        else:
+            log.error(f"[Unbind] 실패: {result_holder[0]}")
             return False
 
     def _capture_dmesg(self, lines: int = 80) -> str:
