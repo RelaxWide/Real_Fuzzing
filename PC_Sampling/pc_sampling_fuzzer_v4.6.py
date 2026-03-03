@@ -98,7 +98,6 @@ v4 변경사항:
 from __future__ import annotations
 
 import pylink
-import re
 import struct
 import time
 import threading
@@ -163,6 +162,13 @@ POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 #           이 값이 길면 커널이 NVMe 명령을 포기하지 않아 controller reset을 하지 않음.
 #           → SSD 펌웨어 crash 상태 보존 (JTAG 분석 용이).
 NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일 (커널 reset 방지, u32 max ~49.7일)
+
+# 퍼저 시작 시 nvme_core 모듈 파라미터로 설정할 타임아웃 (초)
+# crash 발생 시 이 시간이 지나야 커널이 controller reset을 시작한다.
+# 기본값: admin_timeout=60s, io_timeout=30s → 펌웨어 crash 후 ~60초면 reset됨.
+# 이 값을 크게 설정하면 crash 상태가 장기간 보존되어 JTAG 분석 가능.
+# 적용 대상: 설정 이후 새로 제출되는 NVMe 명령 (기존 in-flight AER 제외)
+NVME_KERNEL_TIMEOUT_SEC = 86_400  # 24시간
 
 # 퍼징 설정
 MAX_INPUT_LEN     = 131072    # 최대 입력 바이트 (128KB = 256 blocks, Write 대용량 시드 지원)
@@ -335,6 +341,9 @@ class FuzzConfig:
 
     # v4.6: nvme-cli --timeout (커널 reset 방지용, subprocess 감지 timeout과 분리)
     nvme_passthru_timeout_ms: int = NVME_PASSTHRU_TIMEOUT_MS
+    # crash 상태 보존을 위한 nvme_core 모듈 타임아웃 (초)
+    # 퍼저 시작 시 /sys/module/nvme_core/parameters/{admin,io}_timeout 에 설정
+    nvme_kernel_timeout_sec: int = NVME_KERNEL_TIMEOUT_SEC
 
     # 퍼징 설정
     max_input_len: int = MAX_INPUT_LEN
@@ -800,8 +809,8 @@ class NVMeFuzzer:
         self._timeout_crash = False
         # v4.6: crash 시 보존된 nvme-cli PID (kill하지 않아 fd 유지 → SSD 상태 보존)
         self._crash_nvme_pid: Optional[int] = None
-        # v4.6: NVMe PCIe BDF (커널 드라이버 unbind로 admin-timeout reset 방지)
-        self._nvme_pci_bdf: Optional[str] = self._get_nvme_pci_bdf()
+        # nvme_core 모듈 파라미터 원래 값 (종료 시 복원용)
+        self._nvme_timeout_originals: dict = {}
 
         # v4.5: MOpt (mutation operator scheduling) 상태
         self.NUM_MUTATION_OPS = 16
@@ -1893,91 +1902,52 @@ class NVMeFuzzer:
             meta["data_len_override"] = seed.data_len_override
         return meta
 
-    def _get_nvme_pci_bdf(self) -> Optional[str]:
-        """NVMe 컨트롤러의 PCI BDF(Bus:Device.Function)를 sysfs에서 검색한다.
-        예: '0000:03:00.0'
-        timeout crash 시 PCIe 드라이버 unbind에 사용."""
-        try:
-            dev_name = Path(self.config.nvme_device).name  # e.g., 'nvme0'
-            sysfs_path = Path(f'/sys/class/nvme/{dev_name}')
-            if not sysfs_path.exists():
-                log.warning(f"[BDF] {sysfs_path} 없음 — unbind 불가")
-                return None
-            real_path = sysfs_path.resolve()
-            # 경로 예: /sys/devices/pci0000:00/0000:00:1d.0/0000:03:00.0/nvme/nvme0
-            bdf_pattern = re.compile(r'^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$')
-            for parent in real_path.parents:
-                if bdf_pattern.match(parent.name):
-                    bdf = parent.name
-                    log.warning(f"[BDF] NVMe PCI BDF: {bdf}")
-                    return bdf
-        except Exception as e:
-            log.warning(f"[BDF] BDF 검색 실패: {e}")
-        log.warning("[BDF] BDF를 찾지 못함 — timeout crash 시 unbind 불가")
-        return None
+    def _configure_nvme_timeouts(self) -> None:
+        """퍼저 시작 시 nvme_core 모듈 타임아웃 파라미터를 늘린다.
 
-    def _unbind_nvme_driver(self, timeout_sec: float = 5.0) -> bool:
-        """PCIe NVMe 드라이버를 unbind하여 커널 controller reset을 차단한다.
+        기본값: admin_timeout=60s, io_timeout=30s
+        → 펌웨어 crash 후 ~60초면 커널이 controller reset을 시작해 crash 상태 소멸.
 
-        Linux 커널 NVMe 드라이버는 내부 admin 명령(AER, keep-alive 등)에
-        ADMIN_TIMEOUT(60초)를 사용한다. 펌웨어 크래시 시 이 명령들이 응답을
-        받지 못하면 60초 후 nvme_reset_ctrl()이 발동하여 SSD 상태를 덮어쓴다.
-        드라이버를 unbind하면 타이머가 제거되어 크래시 상태가 장기간 보존된다.
+        이 값을 크게 설정하면 crash 발생 후에도 오랫동안 SSD 상태가 보존되어
+        JTAG 분석이 가능해진다.
 
-        주의: nvme_remove() → nvme_shutdown_ctrl() → CC.EN=0 쓰고 CSTS.RDY 대기.
-        펌웨어가 완전히 죽어있으면 이 하드웨어 응답이 없어 sysfs 쓰기가 블로킹된다.
-        daemon thread + join(timeout)으로 최대 timeout_sec초만 기다리고 넘어간다.
-        스레드는 D-state로 남지만 프로세스 종료 시 자동 정리된다.
+        제약: 설정 시점 이후 새로 제출되는 NVMe 명령에만 적용됨.
+        현재 in-flight AER 명령의 deadline은 변경 불가.
+        AER 이벤트가 발생해 재제출될 때부터 새 timeout이 적용된다.
         """
-        if not self._nvme_pci_bdf:
-            log.error(
-                "[Unbind] PCI BDF를 알 수 없어 unbind 불가 "
-                "— 커널이 약 60초 후 controller reset을 시도합니다.")
-            return False
-
-        result_holder: list = []  # thread 결과 공유 (list는 가변, closure 캡처 가능)
-
-        def _do_unbind():
+        params = [
+            '/sys/module/nvme_core/parameters/admin_timeout',
+            '/sys/module/nvme_core/parameters/io_timeout',
+        ]
+        value = self.config.nvme_kernel_timeout_sec
+        for path in params:
+            p = Path(path)
+            if not p.exists():
+                log.warning(f"[TimeoutCfg] {path} 없음 — 건너뜀")
+                continue
             try:
-                Path('/sys/bus/pci/drivers/nvme/unbind').write_text(self._nvme_pci_bdf)
-                result_holder.append(True)
+                original = p.read_text().strip()
+                p.write_text(str(value))
+                self._nvme_timeout_originals[path] = original
+                log.warning(f"[TimeoutCfg] {path}: {original}s → {value}s")
             except PermissionError:
-                result_holder.append('permission')
+                log.warning(f"[TimeoutCfg] {path} 쓰기 권한 없음 — root 필요")
             except OSError as e:
-                result_holder.append(str(e))
+                log.warning(f"[TimeoutCfg] {path} 설정 실패: {e}")
 
-        t = threading.Thread(target=_do_unbind, daemon=True)
-        t.start()
-        t.join(timeout=timeout_sec)
+        if self._nvme_timeout_originals:
+            log.warning(
+                f"[TimeoutCfg] crash 발생 시 커널 reset까지 최대 {value}초 유예 "
+                f"(단, 현재 in-flight AER는 기존 timeout 유지)")
 
-        if not result_holder:
-            # sysfs 쓰기가 블로킹 중 (nvme_shutdown_ctrl 하드웨어 응답 없음)
-            log.error(
-                f"[Unbind] {timeout_sec:.0f}초 내 완료되지 않음 "
-                f"(펌웨어 무응답 — CC.EN=0 후 CSTS.RDY 대기 중)")
-            log.error(
-                "  unbind 스레드는 백그라운드에서 계속 시도합니다.")
-            log.error(
-                "  커널 reset은 여전히 발생할 수 있습니다 (~60초 후).")
-            return False
-
-        if result_holder[0] is True:
-            log.error(
-                f"[Unbind] NVMe PCIe 드라이버 unbind 완료: {self._nvme_pci_bdf}")
-            log.error(
-                "  커널 controller reset이 차단됩니다.")
-            log.error(
-                "  /dev/nvme* 장치는 사라지지만 SSD 펌웨어 상태는 보존됩니다.")
-            log.error(
-                f"  분석 완료 후 rebind: "
-                f"echo '{self._nvme_pci_bdf}' > /sys/bus/pci/drivers/nvme/bind")
-            return True
-        elif result_holder[0] == 'permission':
-            log.error("[Unbind] 권한 없음 (PermissionError) — root로 실행 중인지 확인")
-            return False
-        else:
-            log.error(f"[Unbind] 실패: {result_holder[0]}")
-            return False
+    def _restore_nvme_timeouts(self) -> None:
+        """퍼저 종료 시 nvme_core 타임아웃 파라미터를 원래 값으로 복원한다."""
+        for path, original in self._nvme_timeout_originals.items():
+            try:
+                Path(path).write_text(original)
+                log.warning(f"[TimeoutCfg] {path} 복원: {original}s")
+            except OSError as e:
+                log.warning(f"[TimeoutCfg] {path} 복원 실패: {e}")
 
     def _capture_dmesg(self, lines: int = 80) -> str:
         """v4.4: 커널 로그(dmesg) 마지막 N줄을 캡처한다.
@@ -2496,7 +2466,9 @@ class NVMeFuzzer:
         log.warning(f"Timeouts    : subprocess={timeout_str}")
         passthru_days = self.config.nvme_passthru_timeout_ms / 86_400_000
         log.warning(f"Passthru TO : {self.config.nvme_passthru_timeout_ms}ms "
-                    f"({passthru_days:.1f}일, nvme-cli --timeout, crash 시 SSD 상태 장기 보존)")
+                    f"({passthru_days:.1f}일, nvme-cli --timeout)")
+        log.warning(f"Kernel TO   : {self.config.nvme_kernel_timeout_sec}s "
+                    f"(crash 후 커널 reset 유예, nvme_core admin/io_timeout)")
         log.warning(f"Output      : {self.config.output_dir}")
         log.warning("=" * 60)
 
@@ -2521,6 +2493,9 @@ class NVMeFuzzer:
             log.error("  sudo로 실행하거나 권한을 확인하세요.")
             return
         log.info(f"[Pre-flight] NVMe 디바이스 확인: {nvme_dev} ✓")
+
+        # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존)
+        self._configure_nvme_timeouts()
 
         # 이전 커버리지 로드 (resume)
         if self.config.resume_coverage:
@@ -2787,13 +2762,7 @@ class NVMeFuzzer:
                                      dmesg_snapshot=dmesg_snapshot)
                     log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
 
-                    # 5) NVMe PCIe 드라이버 unbind — ADMIN_TIMEOUT(60s) reset 차단
-                    # 모든 데이터 캡처 완료 후 시도. nvme_shutdown_ctrl()이 하드웨어
-                    # 응답을 기다리므로 블로킹될 수 있어 5초 timeout으로 비동기 처리.
-                    log.warning("[TIMEOUT] 커널 reset 차단을 위해 NVMe 드라이버를 unbind합니다...")
-                    self._unbind_nvme_driver()
-
-                    # 6) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
+                    # 5) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
                     # halt하면 불량 현상이 멈추므로, 펌웨어가 돌고 있는
                     # 그대로 두어야 hang/loop 등의 현상을 외부에서 관찰 가능
                     log.error(
@@ -2803,9 +2772,7 @@ class NVMeFuzzer:
                         "  J-Link 디버거로 연결하여 현재 상태를 "
                         "관찰할 수 있습니다.")
 
-                    # 7) nvme-cli 프로세스 정보 기록
-                    # unbind로 드라이버가 제거되면 nvme-cli(D-state)는 ENODEV로 깨어남.
-                    # 프로세스가 종료돼도 SSD 펌웨어 상태는 보존됨 (unbind가 보장).
+                    # 6) nvme-cli 프로세스 정보 기록
                     log.error("")
                     if self._crash_nvme_pid is not None:
                         pid_file = self.crashes_dir / "crash_nvme_pid.txt"
@@ -2815,12 +2782,14 @@ class NVMeFuzzer:
                             pass
                         log.error(
                             f"  [참고] nvme-cli PID={self._crash_nvme_pid} "
-                            f"(unbind 후 자동 종료될 수 있음 — 정상)")
-                        log.error(
-                            f"  SSD 펌웨어 상태는 드라이버 unbind로 보존됩니다.")
+                            f"(D-state 대기 중)")
+                    timeout_val = self.config.nvme_kernel_timeout_sec
+                    log.error(
+                        f"  커널 reset까지 최대 {timeout_val}초 유예 "
+                        f"(nvme_core admin/io_timeout 설정값)")
                     log.error("")
 
-                    # 8) 퍼징 중단 — reconnect/continue/rescan 하지 않음
+                    # 7) 퍼징 중단 — reconnect/continue/rescan 하지 않음
                     self._timeout_crash = True
                     log.error(
                         "  퍼징을 중단합니다. SSD와 NVMe 장치 상태를 "
@@ -3037,6 +3006,8 @@ class NVMeFuzzer:
                     self.sampler.close()
                 except Exception:
                     pass
+                # timeout crash가 아닌 정상 종료 시에만 타임아웃 복원
+                self._restore_nvme_timeouts()
 
 
 if __name__ == "__main__":
@@ -3062,8 +3033,11 @@ if __name__ == "__main__":
     parser.add_argument('--post-cmd-delay', type=int, default=POST_CMD_DELAY_MS,
                         help='Post-command sampling delay (ms)')
     parser.add_argument('--passthru-timeout', type=int, default=NVME_PASSTHRU_TIMEOUT_MS,
-                        help='nvme-cli --timeout (ms). 커널 reset 방지를 위해 길게 유지 '
-                             f'(default: {NVME_PASSTHRU_TIMEOUT_MS}ms = 1시간)')
+                        help='nvme-cli --timeout (ms). '
+                             f'(default: {NVME_PASSTHRU_TIMEOUT_MS}ms = 30일)')
+    parser.add_argument('--kernel-timeout', type=int, default=NVME_KERNEL_TIMEOUT_SEC,
+                        help='nvme_core admin/io_timeout (초). crash 후 커널 reset 유예 시간. '
+                             f'(default: {NVME_KERNEL_TIMEOUT_SEC}s = 24시간)')
     parser.add_argument('--addr-start', type=lambda x: int(x, 0), default=FW_ADDR_START,
                         help='Firmware .text start (hex)')
     parser.add_argument('--addr-end', type=lambda x: int(x, 0), default=FW_ADDR_END,
@@ -3191,6 +3165,7 @@ if __name__ == "__main__":
         sample_interval_us=args.interval,
         post_cmd_delay_ms=args.post_cmd_delay,
         nvme_passthru_timeout_ms=args.passthru_timeout,
+        nvme_kernel_timeout_sec=args.kernel_timeout,
         addr_range_start=args.addr_start,
         addr_range_end=args.addr_end,
         resume_coverage=args.resume_coverage,
