@@ -25,7 +25,7 @@
 7. [v4.3 버그 수정 및 개선사항](#7-v43-버그-수정-및-개선사항)
 8. [v4.4 개선사항](#8-v44-개선사항)
 9. [v4.5 개선사항](#9-v45-개선사항)
-10. [v4.6 개선사항](#10-v46-개선사항)
+10. [v4.6 개선사항 및 정리](#10-v46-개선사항)
 11. [알려진 제한사항 및 향후 과제](#11-알려진-제한사항-및-향후-과제)
 12. [관련 연구 및 도입 가능 기술](#12-관련-연구-및-도입-가능-기술)
 13. [실행 방법 및 CLI 옵션](#13-실행-방법-및-cli-옵션)
@@ -832,6 +832,25 @@ NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일
 [ERROR]   PID 파일: .../crashes/crash_nvme_pid.txt
 ```
 
+### 10.3 [Refactor] 코드 정리 (v4.6 후속)
+
+hot-path 비활성화 코드 제거 및 코드 품질 개선.
+
+**주요 변경 항목**:
+
+| 항목 | 내용 |
+|---|---|
+| `Counter` 모듈 레벨 import | 3개 로컬 import → 상단 1개로 통합 |
+| `self.prev_pc` 제거 | `JLinkPCSampler`의 dead field 제거 (로컬 `prev_pc` 변수는 유지) |
+| defaultdict 중복 init 제거 | `cmd_stats` / `cmd_pcs` / `cmd_traces` 초기 키 설정 루프 제거 |
+| `_compute_edges_from_traces()` 추출 | traces → edge 집합 변환 로직을 `@staticmethod`로 통합 (3개 호출 지점) |
+| CLI help 수정 | `--passthru-timeout` help 문자열 "1시간" → "30일" 수정 |
+| `cmd_traces` 저장 조건 단순화 | 이중 조건 → `raw_in_range` 단일 조건으로 단순화 |
+| 불필요한 changelog 제거 | 모듈 docstring에서 v4.1~v4.4 상세 항목 제거 (v4 기반 요약으로 대체) |
+| stale 주석 제거 | "이전 v4.2에서는..." 등 역사적 설명 주석 제거 |
+| heatmap 라벨 업데이트 | `prev_pc → cur_pc` → `src_pc → dst_pc` (primary signal 변경 반영) |
+| feature 출력 정리 | 기동 시 feature 목록에서 제거된 `prev_pc reset` 항목 삭제 |
+
 ---
 
 ## 11. 알려진 제한사항 및 향후 과제
@@ -857,6 +876,7 @@ NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일
 | ~~io-passthru device 수정~~ | ~~낮음~~ | ~~deprecated NVME_IOCTL_IO_CMD 경고 제거~~ | **v4.6 구현 완료** |
 | ~~Passthru timeout 분리~~ | ~~중간~~ | ~~crash 시 SSD 상태 보존을 위한 timeout 구조 개선~~ | **v4.6 구현 완료** |
 | ~~Edge 추적 코드 제거~~ | ~~높음~~ | ~~hot path에서 불필요한 edge 연산 제거 (183줄, 샘플당 set.add + dict 갱신)~~ | **v4.6 구현 완료** |
+| ~~코드 품질 정리~~ | ~~낮음~~ | ~~dead code, 중복 init, 로컬 import, stale 주석 제거~~ | **v4.6 구현 완료** |
 | Entropic scheduling | 중간 | 정보 이론 기반 시드 스케줄링 (corpus 성숙 후 AFLFast 대체) | 미구현 |
 | NVMe 구조 인식 mutation | 중간 | Peach Pit 방식 CDW 필드별 의미론적 mutation | 미구현 |
 | Directed fuzzing | 높음 | Ghidra CFG 기반 거리맵으로 특정 코드 영역 집중 탐색 | 미구현 |

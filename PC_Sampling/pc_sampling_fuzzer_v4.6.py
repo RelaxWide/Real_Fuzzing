@@ -57,38 +57,11 @@ v4.5 변경사항:
 - [Feature] MOpt mutation scheduling: Pilot(5000회, 균등 사용 + 성공률 측정) /
     Core(50000회, 성공률 기반 가중치) 2단계 교대
 
-v4.4 변경사항:
-- [Feature] Tracking Label NVMe 스펙 매핑: _OPCODE_TO_NAME 역방향 테이블
-- [Feature] Heatmap 이미지 크기 제한: MAX_HEATMAP_CMDS=40, DPI 동적 조정
-- [Feature] Timeout dmesg 캡처: crash JSON + crash_*.dmesg.txt
-
-v4.3 변경사항:
-- [BugFix] 로그 메시지 불일치 수정: "ioctl direct" → "subprocess (nvme-cli)"
-- [BugFix] 글로벌 포화 임계값 하드코딩 → global_saturation_limit 설정값 분리
-- [BugFix] 실행 간 prev_pc 캐리오버 제거: 매 실행마다 sentinel(0xFFFFFFFF)으로 리셋
-- [BugFix] post_cmd_delay_ms 미사용 수정: 명령 완료 후 추가 샘플링 대기 구현
-- [Perf] cmd_traces를 collections.deque로 교체 (pop(0) O(n) → popleft O(1))
-- [Perf] 샘플 간격 체크포인트를 frozenset으로 교체 (O(1) lookup 보장)
-- [Feature] Corpus culling (_cull_corpus), J-Link heartbeat, NVMe 디바이스 사전 검증
-- [Feature] Summary에 Mutation 통계 추가, 실제 opcode 기준 추적 (_tracking_label)
-- [Feature] Timeout crash 시 불량 현상 보존: resume 없이 퍼징 중단, stuck PC 기록
-- [BugFix] subprocess kill 후 D state 블로킹 방지: communicate()에 타임아웃 추가
-
-v4.2 변경사항:
-- subprocess + 샘플링 연동: idle/포화 감지 시 프로세스 kill → 즉시 다음 실행
-- 글로벌 기준 포화 판정 (global_coverage 대비 새 PC 체크)
-- idle PC 감지: diagnose에서 가장 빈도 높은 PC를 idle로 설정
-
-v4.1 변경사항:
-- Seed dataclass에 CDW2~CDW15 필드 추가
-- Opcode별 NVMe 스펙 기반 정상 명령어를 초기 시드로 자동 생성
-- AFL++ havoc/splice 기반 mutation 전략
-
-v4 변경사항:
+v4 기반:
 - Primary coverage signal: unique PC 주소 (global_coverage / current_trace)
 - CFG 그래프/히트맵의 edge는 cmd_traces (ordered PC sequences)에서 도출
 - Power Schedule: AFLfast explore 방식 에너지 기반 시드 선택
-- Seed dataclass 도입
+- Seed dataclass, Corpus culling, AFL++ havoc/splice mutation
 """
 
 from __future__ import annotations
@@ -105,7 +78,7 @@ import hashlib
 import random
 import logging
 import math
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from typing import Set, List, Optional, Tuple, Dict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -322,7 +295,7 @@ class FuzzConfig:
     max_samples_per_run: int = MAX_SAMPLES_PER_RUN
     saturation_limit: int = SATURATION_LIMIT
 
-    # v4.3: 글로벌 포화 임계값 (이전 v4.2에서는 하드코딩 20)
+    # 글로벌 포화 임계값 (연속 N회 새 global PC 없으면 조기 종료)
     global_saturation_limit: int = GLOBAL_SATURATION_LIMIT
 
     # NVMe 커맨드 완료 후 추가 샘플링 시간 (ms)
@@ -422,9 +395,6 @@ class JLinkPCSampler:
         self.jlink: Optional[pylink.JLink] = None
         self._pc_reg_index: int = 9  # Cortex-R8: R15(PC)의 J-Link 레지스터 인덱스
 
-        # sentinel: 유효 주소 범위 밖의 값으로 초기화하여 가짜 edge 방지
-        self.prev_pc: int = 0xFFFFFFFF
-
         # Primary coverage signal: unique PC 주소 (v4.5+)
         self.global_coverage: Set[int] = set()   # 전체 세션에서 관측된 unique PC 주소
         self.current_trace: Set[int] = set()     # 이번 실행에서 관측된 unique PC 주소
@@ -508,8 +478,7 @@ class JLinkPCSampler:
         log.warning(f"[Diagnose] 결과: {len(pcs)}/{count} 성공, "
                  f"failures={failures}, unique PCs={len(unique_pcs)}")
 
-        # v4.2: 가장 빈도 높은 PC를 idle PC로 설정
-        from collections import Counter
+        # 가장 빈도 높은 PC를 idle PC로 설정
         pc_counts = Counter(pcs)
         most_common_pc, most_common_count = pc_counts.most_common(1)[0]
         idle_ratio = most_common_count / len(pcs)
@@ -665,9 +634,6 @@ class JLinkPCSampler:
             else:
                 self._stopped_reason = f"max_samples ({self.config.max_samples_per_run})"
 
-        # v4.3: prev_pc를 인스턴스에 저장하지 않음 (매 실행 독립)
-        # 이전 v4.2에서는 self.prev_pc = prev_pc 로 캐리오버했으나,
-        # 서로 다른 명령어 간의 가짜 edge를 방지하기 위해 제거
 
     def start_sampling(self):
         self.stop_event.clear()
@@ -773,8 +739,6 @@ class NVMeFuzzer:
         self.start_time: Optional[datetime] = None
 
         self.cmd_stats: dict[str, dict] = defaultdict(lambda: {"exec": 0, "interesting": 0})
-        for c in self.commands:
-            self.cmd_stats[c.name] = {"exec": 0, "interesting": 0}
         self.rc_stats: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
 
         # v4.3: 확장 mutation 통계 — 실제로 SSD에 전달된 내용을 추적
@@ -809,14 +773,9 @@ class NVMeFuzzer:
         self._det_queue: deque = deque()  # (seed, generator) pairs
 
         # 명령어별 PC/trace 추적 (그래프 시각화용)
-        # v4.3: defaultdict로 변경 — opcode_override 등 mutation별 키 자동 생성
+        # opcode_override 등 mutation별 키도 defaultdict로 자동 생성
         self.cmd_pcs: dict[str, Set[int]] = defaultdict(set)
-        # v4.3: deque로 교체 (pop(0) O(n) → popleft O(1))
         self.cmd_traces: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
-        # 기본 명령어 키 초기화
-        for c in self.commands:
-            self.cmd_pcs[c.name] = set()
-            self.cmd_traces[c.name] = deque(maxlen=200)
 
         # v4.2: subprocess 입력 파일 경로 (재사용)
         self._nvme_input_path: Optional[str] = None
@@ -1903,7 +1862,6 @@ class NVMeFuzzer:
             meta["stuck_pcs_unique"] = [hex(pc) for pc in sorted(set(stuck_pcs))]
             meta["stuck_pcs_count"] = len(stuck_pcs)
             # 가장 빈도 높은 PC = 가장 유력한 hang 지점
-            from collections import Counter
             pc_counts = Counter(stuck_pcs)
             most_common = pc_counts.most_common(5)
             meta["stuck_pc_top5"] = [
@@ -1925,6 +1883,15 @@ class NVMeFuzzer:
         with open(str(filepath) + '.json', 'w') as f:
             json.dump(meta, f, indent=2)
 
+    @staticmethod
+    def _compute_edges_from_traces(traces) -> Set[Tuple[int, int]]:
+        """traces(deque of List[int])에서 (prev_pc, cur_pc) edge 집합을 도출한다."""
+        edges: Set[Tuple[int, int]] = set()
+        for trace in traces:
+            for i in range(len(trace) - 1):
+                edges.add((trace[i], trace[i + 1]))
+        return edges
+
     def _save_per_command_data(self):
         """명령어별 PC/trace 데이터를 JSON 파일로 저장"""
         graph_dir = self.output_dir / 'graphs'
@@ -1937,11 +1904,7 @@ class NVMeFuzzer:
             if not pcs:
                 continue
 
-            # edges를 traces에서 도출
-            edges: Set[Tuple[int, int]] = set()
-            for trace in traces:
-                for i in range(len(trace) - 1):
-                    edges.add((trace[i], trace[i + 1]))
+            edges = self._compute_edges_from_traces(traces)
 
             data = {
                 "command": cmd_name,
@@ -1963,13 +1926,9 @@ class NVMeFuzzer:
         all_data = {}
         for cmd_name in self.cmd_pcs:
             if self.cmd_pcs[cmd_name]:
-                edges_from_traces: Set[Tuple[int, int]] = set()
-                for trace in self.cmd_traces[cmd_name]:
-                    for i in range(len(trace) - 1):
-                        edges_from_traces.add((trace[i], trace[i + 1]))
                 all_data[cmd_name] = {
                     "pcs": len(self.cmd_pcs[cmd_name]),
-                    "edges": len(edges_from_traces),
+                    "edges": len(self._compute_edges_from_traces(self.cmd_traces[cmd_name])),
                 }
         with open(graph_dir / 'summary.json', 'w') as f:
             json.dump(all_data, f, indent=2)
@@ -2093,11 +2052,7 @@ class NVMeFuzzer:
             if self.cmd_pcs[cmd_name] or self.cmd_traces[cmd_name]:
                 cmd_names.append(cmd_name)
                 # edges derived from traces
-                derived_edges: Set[Tuple[int, int]] = set()
-                for trace in self.cmd_traces[cmd_name]:
-                    for i in range(len(trace) - 1):
-                        derived_edges.add((trace[i], trace[i + 1]))
-                edge_counts.append(len(derived_edges))
+                edge_counts.append(len(self._compute_edges_from_traces(self.cmd_traces[cmd_name])))
                 pc_counts.append(len(self.cmd_pcs[cmd_name]))
                 trace_counts.append(len(self.cmd_traces[cmd_name]))
 
@@ -2245,7 +2200,7 @@ class NVMeFuzzer:
         log.info(f"[Heatmap] 1D coverage heatmap → {heatmap_file} (dpi={dpi_1d})")
 
         # =================================================================
-        # 2D Edge Heatmap (prev_pc × cur_pc 인접 행렬)
+        # 2D Edge Heatmap (src_pc × dst_pc 인접 행렬)
         # =================================================================
         n_cols = min(3, len(active_cmds))
         n_rows_2d = (len(active_cmds) + n_cols - 1) // n_cols
@@ -2253,7 +2208,7 @@ class NVMeFuzzer:
         fig, axes_2d = plt.subplots(n_rows_2d, n_cols,
                                     figsize=(6.5 * n_cols, 5.5 * n_rows_2d),
                                     squeeze=False)
-        fig.suptitle(f'Edge Heatmap  prev_pc → cur_pc  (bin={bin_size_2d}B)',
+        fig.suptitle(f'Edge Heatmap  src_pc → dst_pc  (bin={bin_size_2d}B)',
                      fontsize=13, fontweight='bold')
 
         # 축 눈금 위치 (5개)
@@ -2292,8 +2247,8 @@ class NVMeFuzzer:
             ax.set_xticklabels(tick_labels, rotation=45, fontsize=6, ha='right')
             ax.set_yticks(tick_positions)
             ax.set_yticklabels(tick_labels, fontsize=6)
-            ax.set_xlabel('prev_pc (from)', fontsize=8)
-            ax.set_ylabel('cur_pc (to)', fontsize=8)
+            ax.set_xlabel('src_pc (from)', fontsize=8)
+            ax.set_ylabel('dst_pc (to)', fontsize=8)
 
             # 대각선 참조선 (순차 실행 영역)
             ax.plot([0, n_bins_2d - 1], [0, n_bins_2d - 1],
@@ -2576,11 +2531,10 @@ class NVMeFuzzer:
                 # v4.3: 실제 실행 opcode 기준으로 분류하여 기록
                 self.cmd_pcs[track_key].update(self.sampler.current_trace)
                 # raw PC trace 저장 (deque maxlen=200 자동 관리)
-                if self.sampler._last_raw_pcs:
-                    raw_in_range = [pc for pc in self.sampler._last_raw_pcs
-                                    if self.sampler._in_range(pc)]
-                    if raw_in_range:
-                        self.cmd_traces[track_key].append(raw_in_range)
+                raw_in_range = [pc for pc in self.sampler._last_raw_pcs
+                                if self.sampler._in_range(pc)]
+                if raw_in_range:
+                    self.cmd_traces[track_key].append(raw_in_range)
 
                 # 로그
                 raw_count = len(self.sampler._last_raw_pcs)
@@ -2614,7 +2568,6 @@ class NVMeFuzzer:
                         else cmd.opcode
 
                     if stuck_pcs:
-                        from collections import Counter
                         pc_counts = Counter(stuck_pcs)
                         most_common_pc, most_common_count = pc_counts.most_common(1)[0]
                         unique_stuck = set(stuck_pcs)
@@ -2955,7 +2908,7 @@ if __name__ == "__main__":
                         help='Post-command sampling delay (ms)')
     parser.add_argument('--passthru-timeout', type=int, default=NVME_PASSTHRU_TIMEOUT_MS,
                         help='nvme-cli --timeout (ms). 커널 reset 방지를 위해 길게 유지 '
-                             f'(default: {NVME_PASSTHRU_TIMEOUT_MS}ms = 1시간)')
+                             f'(default: {NVME_PASSTHRU_TIMEOUT_MS}ms = 30일)')
     parser.add_argument('--addr-start', type=lambda x: int(x, 0), default=FW_ADDR_START,
                         help='Firmware .text start (hex)')
     parser.add_argument('--addr-end', type=lambda x: int(x, 0), default=FW_ADDR_END,
@@ -3050,7 +3003,6 @@ if __name__ == "__main__":
     print(f"\nv{FUZZER_VERSION} Features:")
     print("  - subprocess (nvme-cli) NVMe passthru")
     print("  - Global PC saturation (configurable) + idle PC detection")
-    print("  - Per-execution prev_pc reset (no cross-execution false edges)")
     print("  - Post-command delay sampling")
     print("  - AFL++ havoc/splice mutation engine")
     print("  - Per-opcode NVMe spec seed templates")
