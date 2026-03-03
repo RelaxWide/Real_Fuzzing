@@ -36,28 +36,17 @@ v4.5 변경사항 (v4.5 이후 수정 포함):
     → is_interesting = 새 PC 주소 발견 여부 (new_pcs > 0)
     → Seed 필드: new_edges→new_pcs, covered_edges→covered_pcs, stable_edges→stable_pcs
     → corpus culling: edge→best_seed 매핑 → pc→best_seed 매핑
-    → Calibration: edge 안정성 측정 → PC 주소 안정성 측정
-    → Edge 추적(global_edges, pending, bucket_changes)은 진단용으로 유지
-- [BugFix] bucket_changes 오탐: 미확정(pending) edge의 hit count 변화가
-    is_interesting을 오탐시키던 문제 수정 (확정된 edge만 bucket 변화 체크)
+    → Calibration: PC 주소 안정성 측정
 - [BugFix] covered_edges 노이즈: corpus 추가 시 noise edge를 포함하여 culling이
     무력화되던 문제 수정 (covered_pcs = current_trace로 교체)
-- [Feature] Edge Confirmation (진단용): (prev_pc, cur_pc) edge는 EDGE_CONFIRM_THRESHOLD
-    (기본 2)회 이상 관측된 경우만 global_edges로 승격. corpus 판단에는 미사용.
 - [Feature] Corpus 하드 상한: max_corpus_hard_limit (기본 0=비활성). culling 후에도
     초과 시 exec_count가 높은 비선호 seed부터 강제 제거하는 안전망.
 - [BugFix] Corpus culling exec_count 임계값 5→2: unfavored seed를 더 빠르게 제거.
-- [BugFix] _sampling_worker 포화 체크 PC 기반 전환: global_edges_ref(edge) →
-    global_coverage_ref(PC 주소). calibration이 global_edges를 모든 초기 시드
-    edge로 채우므로 이후 실행에서 거의 모든 edge가 "이미 알려진 것"으로 판정,
-    ~20샘플 후 즉시 종료(last_run=2-3). PC 기반으로 전환하면 primary signal과 일치.
-- [BugFix] stop_sampling() 반환값: len(current_edges) → len(current_trace). primary
-    signal이 PC 주소로 전환된 이후에도 last_run이 edge 수를 표시하는 오해 해결.
+- [BugFix] _sampling_worker 포화 체크 PC 기반: global_coverage_ref(PC 주소) 기반.
+    primary signal과 일치.
 - [Feature] 로그 pcs_this_run 추가: per-exec 로그에 이번 실행 unique PC 수 추가.
 
 v4.5 변경사항:
-- [Feature] Hit Count Bucketing: edge별 누적 실행 횟수를 AFL++ 스타일 8단계
-    로그 버킷(1,2,3,4-7,8-15,16-31,32-127,128+)으로 관리
 - [Feature] Calibration: 초기 시드를 N회(기본 3) 반복 실행하여 PC 주소 안정성 측정,
     global_coverage 초기화, 결과 요약 테이블(Stability / StablePCs / AllPCs) 출력
 - [BugFix] Calibration DLL stderr 억제: os.dup2(devnull, 2)로 J-Link DLL 타이밍 경고 억제
@@ -67,7 +56,6 @@ v4.5 변경사항:
     Interesting 값 체계적 적용, 제너레이터 기반 + deque로 havoc보다 우선 소비
 - [Feature] MOpt mutation scheduling: Pilot(5000회, 균등 사용 + 성공률 측정) /
     Core(50000회, 성공률 기반 가중치) 2단계 교대
-- [Feature] Edge count 저장/로드: coverage_edge_counts.txt
 
 v4.4 변경사항:
 - [Feature] Tracking Label NVMe 스펙 매핑: _OPCODE_TO_NAME 역방향 테이블
@@ -88,7 +76,7 @@ v4.3 변경사항:
 
 v4.2 변경사항:
 - subprocess + 샘플링 연동: idle/포화 감지 시 프로세스 kill → 즉시 다음 실행
-- 글로벌 기준 포화 판정 (global_edges 대비 새 edge 체크)
+- 글로벌 기준 포화 판정 (global_coverage 대비 새 PC 체크)
 - idle PC 감지: diagnose에서 가장 빈도 높은 PC를 idle로 설정
 
 v4.1 변경사항:
@@ -97,8 +85,8 @@ v4.1 변경사항:
 - AFL++ havoc/splice 기반 mutation 전략
 
 v4 변경사항:
-- Sampled Edge 커버리지: (prev_pc, cur_pc) 튜플 기반 (현재는 진단용으로만 유지)
-- Primary coverage signal은 unique PC 주소로 전환됨 (v4.5 이후)
+- Primary coverage signal: unique PC 주소 (global_coverage / current_trace)
+- CFG 그래프/히트맵의 edge는 cmd_traces (ordered PC sequences)에서 도출
 - Power Schedule: AFLfast explore 방식 에너지 기반 시드 선택
 - Seed dataclass 도입
 """
@@ -204,12 +192,6 @@ DETERMINISTIC_ARITH_MAX = 10  # 결정론적 단계 arithmetic 최대 delta
 MOPT_ENABLED      = True
 MOPT_PILOT_PERIOD = 5000   # pilot 단계 실행 횟수
 MOPT_CORE_PERIOD  = 50000  # core 단계 실행 횟수
-
-# v4.5+: Edge Confirmation — PC 샘플링 타이밍 아티팩트 필터링
-# 처음 관측된 edge를 즉시 global_edges에 추가하지 않고 pending pool에서
-# EDGE_CONFIRM_THRESHOLD회 이상 관측된 경우에만 global_edges로 승격.
-# 타이밍 노이즈(1회성 edge)를 걸러 corpus 폭발을 방지한다.
-EDGE_CONFIRM_THRESHOLD = 2  # pending → global_edges 승격에 필요한 최소 관측 횟수
 
 # v4.5+: Corpus 하드 상한 (안전망)
 # 0 = 무제한. 양수로 설정하면 culling 후에도 상한을 초과할 경우
@@ -389,9 +371,6 @@ class FuzzConfig:
     mopt_pilot_period: int = MOPT_PILOT_PERIOD
     mopt_core_period: int = MOPT_CORE_PERIOD
 
-    # v4.5+: Edge Confirmation (타이밍 아티팩트 필터)
-    edge_confirm_threshold: int = EDGE_CONFIRM_THRESHOLD
-
     # v4.5+: Corpus 하드 상한 (0 = 무제한)
     max_corpus_hard_limit: int = MAX_CORPUS_HARD_LIMIT
 
@@ -432,22 +411,8 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
 log = logging.getLogger('pcfuzz')
 
 
-def _count_to_bucket(count: int) -> int:
-    """v4.5: AFL++ 스타일 로그 버켓팅 — hit count를 8단계 bucket으로 변환.
-    1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+"""
-    if count == 0:   return 0
-    if count == 1:   return 1
-    if count == 2:   return 2
-    if count == 3:   return 4
-    if count <= 7:   return 8
-    if count <= 15:  return 16
-    if count <= 31:  return 32
-    if count <= 127: return 64
-    return 128
-
-
 class JLinkPCSampler:
-    """J-Link Halt-Sample-Resume 기반 PC 수집기 (v4.5: hit count bucketing 추가)"""
+    """J-Link Halt-Sample-Resume 기반 PC 수집기"""
 
     # v4.3: 샘플 간격 체크포인트 (frozenset으로 O(1) lookup 보장)
     _INTERVAL_CHECKPOINTS = frozenset({10, 25, 50, 100, 200, 500})
@@ -457,22 +422,8 @@ class JLinkPCSampler:
         self.jlink: Optional[pylink.JLink] = None
         self._pc_reg_index: int = 9  # Cortex-R8: R15(PC)의 J-Link 레지스터 인덱스
 
-        # 진단용 Edge 추적 (Diagnostic only — corpus 결정에 사용 안 함)
-        self.global_edges: Set[Tuple[int, int]] = set()  # confirmed (prev_pc, cur_pc) 튜플
-        self.current_edges: Set[Tuple[int, int]] = set()
         # sentinel: 유효 주소 범위 밖의 값으로 초기화하여 가짜 edge 방지
         self.prev_pc: int = 0xFFFFFFFF
-
-        # v4.5: Hit count bucketing
-        self.global_edge_counts: Dict[Tuple[int, int], int] = {}   # edge → 누적 hit count
-        self.global_edge_buckets: Dict[Tuple[int, int], int] = {}  # edge → 현재 bucket 값
-        self.current_edge_counts: Dict[Tuple[int, int], int] = {}  # 이번 실행의 edge hit count
-        self._last_bucket_changes: int = 0                          # 마지막 evaluate에서의 bucket 변화 수
-
-        # v4.5+: Edge Confirmation — 타이밍 아티팩트 필터
-        # pending pool: edge → 관측 횟수 (아직 global_edges로 승격 안 됨)
-        # EDGE_CONFIRM_THRESHOLD 이상 관측 시 global_edges로 이동
-        self.global_edge_pending: Dict[Tuple[int, int], int] = {}
 
         # Primary coverage signal: unique PC 주소 (v4.5+)
         self.global_coverage: Set[int] = set()   # 전체 세션에서 관측된 unique PC 주소
@@ -619,17 +570,13 @@ class JLinkPCSampler:
         return self.config.addr_range_start <= pc <= self.config.addr_range_end
 
     def _sampling_worker(self):
-        """v4.5+: PC 주소 기반 글로벌 포화 체크 + hit count tracking + prev_pc 실행 간 리셋
+        """PC 주소 기반 글로벌 포화 체크 + prev_pc 실행 간 리셋.
 
-        포화 판단 신호를 edge → PC 주소로 전환:
-        - 기존: global_edges_ref(calibration으로 채워짐) 기반 → 거의 모든 edge가
-          "이미 알려진 것"으로 판정 → ~20샘플 후 즉시 종료 → last_run=2-3
-        - 변경: global_coverage_ref(unique PC set) 기반 → 새 코드 경로를 실행해야만
-          새 PC가 나타나므로 올바른 포화 신호. primary coverage signal과 일치.
+        global_coverage_ref(unique PC set) 기반 포화 판단:
+        새 코드 경로를 실행해야만 새 PC가 나타나므로 올바른 포화 신호.
+        primary coverage signal과 일치.
         """
-        self.current_edges = set()
         self.current_trace = set()
-        self.current_edge_counts = {}   # v4.5: 이번 실행 hit count
         self._last_raw_pcs = []
         self._out_of_range_count = 0
         self._last_new_at = 0
@@ -644,10 +591,8 @@ class JLinkPCSampler:
         global_sat_limit = self.config.global_saturation_limit  # v4.3: 설정값 사용
         idle_pc = self.idle_pc       # v4.2: 로컬 캐싱
 
-        # v4.5+: global_coverage(PC 주소 set) 참조 캐싱
-        # - global_edges_ref 대신 사용: calibration이 global_edges를 채워도
-        #   global_coverage는 실제 실행된 PC만 담으므로 포화 신호로 적합
-        # - CPython set.__contains__는 GIL 하에서 안전
+        # global_coverage(PC 주소 set) 참조 캐싱
+        # CPython set.__contains__는 GIL 하에서 안전
         global_coverage_ref = self.global_coverage
 
         # v4.3: 매 실행마다 prev_pc를 sentinel로 리셋
@@ -665,10 +610,6 @@ class JLinkPCSampler:
                         prev_pc = pc
                         self.current_trace.add(pc)
                     else:
-                        # Edge 생성 (prev_pc, cur_pc) — 진단용
-                        edge = (prev_pc, pc)
-                        self.current_edges.add(edge)
-                        self.current_edge_counts[edge] = self.current_edge_counts.get(edge, 0) + 1  # v4.5
                         self.current_trace.add(pc)
                         prev_pc = pc
 
@@ -736,9 +677,7 @@ class JLinkPCSampler:
     def stop_sampling(self) -> int:
         """샘플링 종료 후 이번 실행에서 관측된 unique PC 수를 반환 (primary signal).
 
-        v4.5+: len(current_edges) → len(current_trace) 로 변경.
-        - current_edges: (prev_pc, cur_pc) 튜플 — 타이밍 아티팩트 포함, 진단용
-        - current_trace: unique PC 주소 set — 결정론적, primary coverage signal
+        current_trace: unique PC 주소 set — 결정론적, primary coverage signal.
         last_run 로그값이 PC 수를 나타내므로 global_pcs와 직접 비교 가능.
         """
         if self.sample_thread:
@@ -747,60 +686,23 @@ class JLinkPCSampler:
         return len(self.current_trace)
 
     def evaluate_coverage(self) -> Tuple[bool, int]:
-        """v4.5+: PC 주소 기반 커버리지 평가 (primary signal).
+        """PC 주소 기반 커버리지 평가 (primary signal).
 
-        PC 샘플링에서 (prev_pc, cur_pc) edge는 타이밍에 따라 달라지는
-        비결정적 쌍이므로 신뢰할 수 있는 coverage signal이 아니다.
-
-        대신 개별 PC 주소(unique visited addresses)를 primary signal로 사용한다:
+        개별 PC 주소(unique visited addresses)를 primary signal로 사용한다:
         - PC 주소는 결정론적: 코드가 실행되면 반드시 해당 주소가 생성됨
         - corpus 크기가 펌웨어 실제 코드 크기에 자연스럽게 수렴
         - confirmation 없이도 신뢰 가능
-
-        Edge 추적은 진단 목적으로 유지하되 corpus 추가 결정에는 사용하지 않는다.
         """
-        # ── Primary signal: unique PC addresses ──────────────────────────────
         initial_pcs = len(self.global_coverage)
         self.global_coverage.update(self.current_trace)
         new_pcs = len(self.global_coverage) - initial_pcs
 
-        # ── Diagnostic: edge confirmation (corpus 결정에 사용 안 함) ─────────
-        confirm_threshold = self.config.edge_confirm_threshold
-        for edge in self.current_edges:
-            if edge in self.global_edges:
-                continue
-            cnt = self.global_edge_pending.get(edge, 0) + 1
-            if cnt >= confirm_threshold:
-                self.global_edges.add(edge)
-                self.global_edge_pending.pop(edge, None)
-            else:
-                self.global_edge_pending[edge] = cnt
-
-        # ── Diagnostic: hit count bucket (진단용) ─────────────────────────────
-        bucket_changes = 0
-        for edge, count in self.current_edge_counts.items():
-            old_total = self.global_edge_counts.get(edge, 0)
-            new_total = old_total + count
-            self.global_edge_counts[edge] = new_total
-            if edge not in self.global_edges:
-                continue
-            old_bucket = self.global_edge_buckets.get(edge, 0)
-            new_bucket = _count_to_bucket(new_total)
-            if new_bucket != old_bucket:
-                self.global_edge_buckets[edge] = new_bucket
-                if old_total > 0:
-                    bucket_changes += 1
-
-        self._last_bucket_changes = bucket_changes
-
-        # interesting = 새로운 PC 주소 발견 (primary signal)
         is_interesting = new_pcs > 0
         return is_interesting, new_pcs
 
     def load_coverage(self, filepath: str) -> int:
-        """이전 세션의 커버리지 파일을 로드하여 global_coverage + global_edges에 합산"""
+        """이전 세션의 커버리지 파일을 로드하여 global_coverage에 합산"""
         loaded_pcs = 0
-        loaded_edges = 0
         if not os.path.exists(filepath):
             log.warning(f"[Coverage] File not found: {filepath}")
             return 0
@@ -815,73 +717,18 @@ class JLinkPCSampler:
                 except ValueError:
                     pass
 
-        # edge 파일도 같이 로드 (coverage_edges.txt)
-        edges_path = filepath.replace('coverage.txt', 'coverage_edges.txt')
-        if os.path.exists(edges_path):
-            with open(edges_path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or ',' not in line:
-                        continue
-                    try:
-                        parts = line.split(',')
-                        prev_pc = int(parts[0], 16)
-                        cur_pc = int(parts[1], 16)
-                        self.global_edges.add((prev_pc, cur_pc))
-                        loaded_edges += 1
-                    except (ValueError, IndexError):
-                        pass
-            log.info(f"[Coverage] Loaded {loaded_edges} edges from {edges_path}")
-
-        # v4.5: edge count 파일 로드 (coverage_edge_counts.txt)
-        counts_path = filepath.replace('coverage.txt', 'coverage_edge_counts.txt')
-        if os.path.exists(counts_path):
-            loaded_counts = 0
-            with open(counts_path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or ',' not in line:
-                        continue
-                    try:
-                        parts = line.split(',')
-                        prev_pc = int(parts[0], 16)
-                        cur_pc = int(parts[1], 16)
-                        count = int(parts[2])
-                        edge = (prev_pc, cur_pc)
-                        self.global_edge_counts[edge] = count
-                        self.global_edge_buckets[edge] = _count_to_bucket(count)
-                        loaded_counts += 1
-                    except (ValueError, IndexError):
-                        pass
-            log.info(f"[Coverage] Loaded {loaded_counts} edge counts from {counts_path}")
-
         log.info(f"[Coverage] Loaded {loaded_pcs} PCs from {filepath} "
-                 f"(global: {len(self.global_coverage)} PCs, {len(self.global_edges)} edges)")
+                 f"(global: {len(self.global_coverage)} PCs)")
         return loaded_pcs
 
     def save_coverage(self, output_dir: str):
-        """현재 global_coverage와 global_edges를 파일로 저장"""
-        # PCs
+        """현재 global_coverage를 파일로 저장"""
         pc_path = os.path.join(output_dir, 'coverage.txt')
         with open(pc_path, 'w') as f:
             for pc in sorted(self.global_coverage):
                 f.write(f"{hex(pc)}\n")
 
-        # Edges
-        edges_path = os.path.join(output_dir, 'coverage_edges.txt')
-        with open(edges_path, 'w') as f:
-            for prev_pc, cur_pc in sorted(self.global_edges):
-                f.write(f"{hex(prev_pc)},{hex(cur_pc)}\n")
-
-        # v4.5: Edge counts
-        counts_path = os.path.join(output_dir, 'coverage_edge_counts.txt')
-        with open(counts_path, 'w') as f:
-            for (prev_pc, cur_pc), count in sorted(self.global_edge_counts.items()):
-                f.write(f"{hex(prev_pc)},{hex(cur_pc)},{count}\n")
-
         log.info(f"[Coverage] Saved {len(self.global_coverage)} PCs → {pc_path}")
-        log.info(f"[Coverage] Saved {len(self.global_edges)} edges → {edges_path}")
-        log.info(f"[Coverage] Saved {len(self.global_edge_counts)} edge counts → {counts_path}")
 
     def close(self):
         self.stop_event.set()
@@ -961,15 +808,13 @@ class NVMeFuzzer:
         # v4.5: Deterministic stage queue
         self._det_queue: deque = deque()  # (seed, generator) pairs
 
-        # 명령어별 edge/PC 추적 (그래프 시각화용)
+        # 명령어별 PC/trace 추적 (그래프 시각화용)
         # v4.3: defaultdict로 변경 — opcode_override 등 mutation별 키 자동 생성
-        self.cmd_edges: dict[str, Set[Tuple[int, int]]] = defaultdict(set)
         self.cmd_pcs: dict[str, Set[int]] = defaultdict(set)
         # v4.3: deque로 교체 (pop(0) O(n) → popleft O(1))
         self.cmd_traces: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
         # 기본 명령어 키 초기화
         for c in self.commands:
-            self.cmd_edges[c.name] = set()
             self.cmd_pcs[c.name] = set()
             self.cmd_traces[c.name] = deque(maxlen=200)
 
@@ -1017,11 +862,10 @@ class NVMeFuzzer:
     # =========================================================================
 
     def _calibrate_seed(self, seed: Seed) -> Seed:
-        """시드를 N번 실행하여 PC 주소 안정성 측정 (v4.5+: PC 기반).
+        """시드를 N번 실행하여 PC 주소 안정성 측정 (PC 기반).
 
         각 실행에서 방문된 PC 주소를 추적하고 과반수 실행에서 등장한 PC를
         stable_pcs로 분류한다. global_coverage에는 관측된 전체 PC 합집합을 반영한다.
-        Edge 통계는 진단용으로 별도 추적한다.
         """
         total_runs = self.config.calibration_runs
         if total_runs <= 0:
@@ -1029,13 +873,12 @@ class NVMeFuzzer:
             return seed
 
         pc_appearances: Dict[int, int] = {}          # PC → 등장 횟수
-        edge_appearances: Dict[Tuple[int, int], int] = {}  # (진단용)
         actual_runs = 0
 
         for run_i in range(total_runs):
             # _send_nvme_command() 내부에서 start_sampling()을 호출하므로
             # 여기서 별도로 start_sampling()을 호출하면 두 개의 sampling thread가
-            # 동시에 실행되어 current_edges가 오염되고 zombie thread가 누적된다.
+            # 동시에 실행되어 zombie thread가 누적된다.
             rc = self._send_nvme_command(seed.data, seed)
             self.sampler.stop_sampling()
             self.executions += 1
@@ -1043,8 +886,6 @@ class NVMeFuzzer:
 
             for pc in self.sampler.current_trace:
                 pc_appearances[pc] = pc_appearances.get(pc, 0) + 1
-            for edge in self.sampler.current_edges:  # 진단용
-                edge_appearances[edge] = edge_appearances.get(edge, 0) + 1
 
             if rc in (self.RC_TIMEOUT, self.RC_ERROR):
                 log.warning(f"[Calibration] {seed.cmd.name} rc={rc} at run {run_i+1} — stopping early")
@@ -1063,15 +904,6 @@ class NVMeFuzzer:
 
         # global_coverage에 관측된 전체 PC 합집합을 반영
         self.sampler.global_coverage.update(all_seen_pcs)
-
-        # 진단용: edge 통계 반영 (corpus 결정에는 사용 안 함)
-        all_seen_edges = set(edge_appearances.keys())
-        self.sampler.global_edges.update(all_seen_edges)
-        for edge in all_seen_edges:
-            self.sampler.global_edge_counts[edge] = \
-                self.sampler.global_edge_counts.get(edge, 0) + edge_appearances[edge]
-            self.sampler.global_edge_buckets[edge] = \
-                _count_to_bucket(self.sampler.global_edge_counts[edge])
 
         return seed
 
@@ -2094,17 +1926,22 @@ class NVMeFuzzer:
             json.dump(meta, f, indent=2)
 
     def _save_per_command_data(self):
-        """명령어별 edge/PC 데이터를 JSON 파일로 저장"""
+        """명령어별 PC/trace 데이터를 JSON 파일로 저장"""
         graph_dir = self.output_dir / 'graphs'
         graph_dir.mkdir(parents=True, exist_ok=True)
 
-        for cmd_name in self.cmd_edges:
-            edges = self.cmd_edges[cmd_name]
+        for cmd_name in self.cmd_pcs:
             pcs = self.cmd_pcs[cmd_name]
             traces = self.cmd_traces[cmd_name]
 
-            if not edges and not pcs:
+            if not pcs:
                 continue
+
+            # edges를 traces에서 도출
+            edges: Set[Tuple[int, int]] = set()
+            for trace in traces:
+                for i in range(len(trace) - 1):
+                    edges.add((trace[i], trace[i + 1]))
 
             data = {
                 "command": cmd_name,
@@ -2119,16 +1956,20 @@ class NVMeFuzzer:
             out_file = graph_dir / f"{cmd_name}_edges.json"
             with open(out_file, 'w') as f:
                 json.dump(data, f, indent=2)
-            log.info(f"[Graph] Saved {cmd_name}: {len(edges)} edges, "
+            log.info(f"[Graph] Saved {cmd_name}: {len(edges)} edges (from traces), "
                      f"{len(pcs)} PCs → {out_file}")
 
-        # 전체 통합 edge 데이터도 저장
+        # 전체 통합 데이터도 저장
         all_data = {}
-        for cmd_name in self.cmd_edges:
-            if self.cmd_edges[cmd_name]:
+        for cmd_name in self.cmd_pcs:
+            if self.cmd_pcs[cmd_name]:
+                edges_from_traces: Set[Tuple[int, int]] = set()
+                for trace in self.cmd_traces[cmd_name]:
+                    for i in range(len(trace) - 1):
+                        edges_from_traces.add((trace[i], trace[i + 1]))
                 all_data[cmd_name] = {
                     "pcs": len(self.cmd_pcs[cmd_name]),
-                    "edges": len(self.cmd_edges[cmd_name]),
+                    "edges": len(edges_from_traces),
                 }
         with open(graph_dir / 'summary.json', 'w') as f:
             json.dump(all_data, f, indent=2)
@@ -2146,26 +1987,25 @@ class NVMeFuzzer:
             log.warning("[Graph] graphviz 'dot' not found — DOT 파일만 생성합니다. "
                         "PNG 렌더링은 'sudo apt install graphviz' 후 가능")
 
-        for cmd_name, edges in self.cmd_edges.items():
-            if not edges:
+        for cmd_name in self.cmd_pcs:
+            pcs = self.cmd_pcs[cmd_name]
+            if not pcs:
                 continue
 
-            pcs = self.cmd_pcs[cmd_name]
-
-            # DOT 파일 생성
-            dot_file = graph_dir / f"{cmd_name}_cfg.dot"
-            png_file = graph_dir / f"{cmd_name}_cfg.png"
-
-            # Edge별 가중치(빈도) 계산
+            # Edge별 가중치(빈도) 계산 — traces에서 도출
             edge_counts: dict[Tuple[int, int], int] = defaultdict(int)
             for trace in self.cmd_traces[cmd_name]:
                 for i in range(len(trace) - 1):
                     edge_counts[(trace[i], trace[i + 1])] += 1
 
-            # 가중치 없는 edge는 1로 설정
-            for e in edges:
-                if e not in edge_counts:
-                    edge_counts[e] = 1
+            if not edge_counts:
+                continue
+
+            edges = set(edge_counts.keys())
+
+            # DOT 파일 생성
+            dot_file = graph_dir / f"{cmd_name}_cfg.dot"
+            png_file = graph_dir / f"{cmd_name}_cfg.png"
 
             # 노드별 in/out degree 계산
             in_degree: dict[int, int] = defaultdict(int)
@@ -2249,10 +2089,15 @@ class NVMeFuzzer:
         pc_counts = []
         trace_counts = []
 
-        for cmd_name in sorted(self.cmd_edges.keys()):
-            if self.cmd_edges[cmd_name] or self.cmd_pcs[cmd_name]:
+        for cmd_name in sorted(self.cmd_pcs.keys()):
+            if self.cmd_pcs[cmd_name] or self.cmd_traces[cmd_name]:
                 cmd_names.append(cmd_name)
-                edge_counts.append(len(self.cmd_edges[cmd_name]))
+                # edges derived from traces
+                derived_edges: Set[Tuple[int, int]] = set()
+                for trace in self.cmd_traces[cmd_name]:
+                    for i in range(len(trace) - 1):
+                        derived_edges.add((trace[i], trace[i + 1]))
+                edge_counts.append(len(derived_edges))
                 pc_counts.append(len(self.cmd_pcs[cmd_name]))
                 trace_counts.append(len(self.cmd_traces[cmd_name]))
 
@@ -2262,9 +2107,9 @@ class NVMeFuzzer:
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         fig.suptitle('Coverage per NVMe Command', fontsize=14, fontweight='bold')
 
-        # 1) Edge 수
+        # 1) Edge 수 (traces에서 도출)
         bars1 = axes[0].barh(cmd_names, edge_counts, color='steelblue')
-        axes[0].set_xlabel('Unique Edges')
+        axes[0].set_xlabel('Unique Edges (from traces)')
         axes[0].set_title('Edges per Command')
         for bar, val in zip(bars1, edge_counts):
             axes[0].text(bar.get_width() + 0.5, bar.get_y() + bar.get_height() / 2,
@@ -2313,17 +2158,17 @@ class NVMeFuzzer:
 
         # 데이터가 있는 명령어만 수집
         active_cmds = [name for name in sorted(self.cmd_pcs.keys())
-                       if self.cmd_pcs[name] or self.cmd_edges[name]]
+                       if self.cmd_pcs[name] or self.cmd_traces[name]]
         if not active_cmds:
             log.warning("[Heatmap] No coverage data to visualize")
             return
 
-        # v4.4: 명령어 수 제한 — 너무 많으면 edge 수 기준 상위 MAX개만 표시
+        # v4.4: 명령어 수 제한 — 너무 많으면 PC 수 기준 상위 MAX개만 표시
         MAX_HEATMAP_CMDS = 40
         if len(active_cmds) > MAX_HEATMAP_CMDS:
             log.info(f"[Heatmap] {len(active_cmds)} commands detected, "
-                     f"limiting to top {MAX_HEATMAP_CMDS} by edge count")
-            active_cmds.sort(key=lambda n: len(self.cmd_edges.get(n, set())),
+                     f"limiting to top {MAX_HEATMAP_CMDS} by PC count")
+            active_cmds.sort(key=lambda n: len(self.cmd_pcs.get(n, set())),
                              reverse=True)
             active_cmds = sorted(active_cmds[:MAX_HEATMAP_CMDS])
 
@@ -2385,7 +2230,6 @@ class NVMeFuzzer:
                       extent=[addr_start, addr_end, 0, 1], interpolation='nearest')
             ax.set_yticks([])
             ax.set_title(f'{cmd_name}  —  {len(self.cmd_pcs[cmd_name])} PCs, '
-                         f'{len(self.cmd_edges[cmd_name])} edges, '
                          f'{cmd_covered}/{n_bins_1d} bins ({100*cmd_covered/n_bins_1d:.1f}%)',
                          fontsize=9, loc='left')
             ax.xaxis.set_major_formatter(plt.FuncFormatter(_hex_formatter))
@@ -2420,32 +2264,23 @@ class NVMeFuzzer:
             row, col = divmod(idx, n_cols)
             ax = axes_2d[row][col]
 
-            edges = self.cmd_edges[cmd_name]
-            if not edges:
-                ax.set_visible(False)
-                continue
-
-            # Edge 빈도 행렬 구성
-            # unique edge = 1, trace에서 반복 출현 시 가산
+            # Edge 빈도 행렬 구성 — traces에서 도출
             edge_matrix = np.zeros((n_bins_2d, n_bins_2d))
+            unique_edges: Set[Tuple[int, int]] = set()
 
-            # 1) unique edge로 기본 구조
-            for prev_pc, cur_pc in edges:
-                if addr_start <= prev_pc <= addr_end and addr_start <= cur_pc <= addr_end:
-                    bx = (prev_pc - addr_start) // bin_size_2d
-                    by = (cur_pc - addr_start) // bin_size_2d
-                    if 0 <= bx < n_bins_2d and 0 <= by < n_bins_2d:
-                        edge_matrix[by][bx] += 1
-
-            # 2) trace에서 빈도 가산 (핫 edge 강조)
             for trace in self.cmd_traces[cmd_name]:
                 for ti in range(len(trace) - 1):
                     p, c = trace[ti], trace[ti + 1]
+                    unique_edges.add((p, c))
                     if addr_start <= p <= addr_end and addr_start <= c <= addr_end:
                         bx = (p - addr_start) // bin_size_2d
                         by = (c - addr_start) // bin_size_2d
                         if 0 <= bx < n_bins_2d and 0 <= by < n_bins_2d:
                             edge_matrix[by][bx] += 1
+
+            if not unique_edges:
+                ax.set_visible(False)
+                continue
 
             # log 스케일로 표시 (빈도 차이가 큼)
             edge_display = np.log1p(edge_matrix)
@@ -2465,7 +2300,7 @@ class NVMeFuzzer:
                     'w--', alpha=0.3, linewidth=0.5)
 
             active_bins = int(np.count_nonzero(edge_matrix))
-            ax.set_title(f'{cmd_name}  —  {len(edges)} edges, '
+            ax.set_title(f'{cmd_name}  —  {len(unique_edges)} edges, '
                          f'{active_bins} active bins',
                          fontsize=9)
             plt.colorbar(im, ax=ax, shrink=0.75, label='log(count+1)',
@@ -2494,8 +2329,6 @@ class NVMeFuzzer:
             'corpus_size': len(self.corpus),
             'crashes': len(self.crash_inputs),
             'coverage_unique_pcs': len(self.sampler.global_coverage),
-            'coverage_edges_diag': len(self.sampler.global_edges),
-            'coverage_pending_diag': len(self.sampler.global_edge_pending),
             'total_samples': self.sampler.total_samples,
             'interesting_inputs': self.sampler.interesting_inputs,
             'elapsed_seconds': elapsed,
@@ -2512,7 +2345,6 @@ class NVMeFuzzer:
                  f"corpus: {stats['corpus_size']} | "
                  f"crashes: {stats['crashes']} | "
                  f"pcs: {stats['coverage_unique_pcs']:,} | "
-                 f"edges(diag): {stats['coverage_edges_diag']:,} | "
                  f"samples: {stats['total_samples']:,} | "
                  f"last_run: {last_samples} | "
                  f"exec/s: {stats['exec_per_sec']:.1f}")
@@ -2742,7 +2574,6 @@ class NVMeFuzzer:
                 is_interesting, new_pcs = self.sampler.evaluate_coverage()
 
                 # v4.3: 실제 실행 opcode 기준으로 분류하여 기록
-                self.cmd_edges[track_key].update(self.sampler.current_edges)
                 self.cmd_pcs[track_key].update(self.sampler.current_trace)
                 # raw PC trace 저장 (deque maxlen=200 자동 관리)
                 if self.sampler._last_raw_pcs:
@@ -2754,16 +2585,12 @@ class NVMeFuzzer:
                 # 로그
                 raw_count = len(self.sampler._last_raw_pcs)
                 oor_count = self.sampler._out_of_range_count
-                bucket_chg = getattr(self.sampler, '_last_bucket_changes', 0)
                 det_tag = " [Det]" if is_det_stage else ""
                 mopt_tag = f" mopt={self.mopt_mode}" if self.config.mopt_enabled else ""
                 log.info(f"exec={self.executions}{det_tag} cmd={cmd.name} "
                           f"raw_samples={raw_count} pcs_this_run={len(self.sampler.current_trace)} "
                           f"out_of_range={oor_count} new_pcs={new_pcs} "
                           f"global_pcs={len(self.sampler.global_coverage)} "
-                          f"edges_diag={len(self.sampler.current_edges)}/{len(self.sampler.global_edges)} "
-                          f"pending_diag={len(self.sampler.global_edge_pending)} "
-                          f"bucket_chg_diag={bucket_chg} "
                           f"last_new_at={self.sampler._last_new_at}{mopt_tag} "
                           f"stop={self.sampler._stopped_reason}")
 
@@ -2772,9 +2599,6 @@ class NVMeFuzzer:
                 if self.sampler._last_raw_pcs:
                     all_pcs = [hex(pc) for pc in self.sampler._last_raw_pcs]
                     log.debug(f"  ALL raw PCs: {all_pcs}")
-                if self.sampler.current_edges:
-                    edges_str = [(hex(p), hex(c)) for p, c in sorted(self.sampler.current_edges)]
-                    log.debug(f"  Edges: {edges_str[:20]}{'...' if len(edges_str) > 20 else ''}")
 
                 # --- Timeout / Error 처리 ---
                 if rc == self.RC_TIMEOUT:
@@ -2934,8 +2758,7 @@ class NVMeFuzzer:
 
                     log.info(f"[+] New coverage! cmd={cmd.name} "
                              f"CDW10=0x{mutated_seed.cdw10:08x} "
-                             f"+{new_pcs} PCs (total: {len(self.sampler.global_coverage)} pcs | "
-                             f"edges_diag={len(self.sampler.global_edges)})")
+                             f"+{new_pcs} PCs (total: {len(self.sampler.global_coverage)} pcs)")
 
                     # v4.5: 새 seed에 대해 deterministic stage 등록
                     if self.config.deterministic_enabled and not new_seed.det_done:
@@ -2999,7 +2822,6 @@ class NVMeFuzzer:
                     f"Total samples    : {stats['total_samples']:,}",
                     f"Interesting      : {stats['interesting_inputs']}",
                     f"Coverage (PCs)   : {stats['coverage_unique_pcs']:,}",
-                    f"Coverage (edges, diag): {stats['coverage_edges_diag']:,}",
                     "Per-command stats:",
                 ]
                 for cmd_name, cmd_stat in stats['command_stats'].items():
@@ -3050,11 +2872,6 @@ class NVMeFuzzer:
                 summary_lines.append(
                     f"  Passthru type  : admin={pt.get('admin-passthru', 0)}, "
                     f"io={pt.get('io-passthru', 0)}")
-
-                # v4.5: Hit count bucketing 통계
-                total_edges_with_counts = len(self.sampler.global_edge_counts)
-                summary_lines.append(f"Hit count stats  : "
-                                     f"edges_tracked={total_edges_with_counts}")
 
                 # v4.5: MOpt 통계
                 if self.config.mopt_enabled:

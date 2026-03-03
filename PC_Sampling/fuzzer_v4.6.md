@@ -166,7 +166,7 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 | **`stop_sampling()` 반환값 수정** | BugFix | `len(current_edges)` → `len(current_trace)` 반환. primary signal이 PC 주소로 전환된 이후에도 `last_run` 로그가 edge 수를 표시하여 오해를 유발 |
 | **로그 `pcs_this_run` 추가** | Feature | per-exec 로그에 `pcs_this_run`(이번 실행 unique PC 수) 추가, `edges=`를 `edges_diag=current/global`로 변경하여 진단용임을 명시 |
 
-### v4.6 — io-passthru 장치 수정 + Passthru Timeout 분리 + Crash 시 SSD 상태 장기 보존
+### v4.6 — io-passthru 장치 수정 + Passthru Timeout 분리 + Crash 시 SSD 상태 장기 보존 + Edge 추적 코드 제거
 
 | 항목 | 분류 | 내용 |
 |---|---|---|
@@ -175,6 +175,7 @@ SSD 펌웨어의 NVMe 명령 처리 코드에 대해 **coverage-guided fuzzing**
 | **Crash 시 nvme-cli 프로세스 보존** | Feature | crash 감지 후 `process.kill()`을 호출하지 않음. nvme-cli fd가 열린 채로 유지되므로 커널이 NVMe 명령을 포기하지 않아 controller reset이 발생하지 않음. `start_new_session=True`(setsid)로 퍼저 종료 후에도 nvme-cli가 init에 입양되어 생존. crash nvme-cli PID를 로그 및 `crashes/crash_nvme_pid.txt`에 기록 |
 | **`nvme_passthru_timeout_ms` FuzzConfig 필드** | Feature | `FuzzConfig.nvme_passthru_timeout_ms` 필드 추가. CLI `--passthru-timeout`으로 오버라이드 가능 |
 | **시작 로그 업데이트** | Feature | 시작 시 두 timeout을 명확히 구분하여 출력: `"Timeouts    : subprocess=..."`, `"Passthru TO : ...ms (...일, crash 시 SSD 상태 장기 보존)"` |
+| **Edge 추적 코드 제거** | Perf | `current_edges`, `global_edges`, `global_edge_pending`, `global_edge_counts`, `global_edge_buckets`, `current_edge_counts`, `_last_bucket_changes`, `EDGE_CONFIRM_THRESHOLD`, `cmd_edges` 및 관련 루프 전부 제거. 샘플링 루프 내 hot path에서 매 샘플마다 실행되던 edge tuple 생성·set 추가·dict 갱신 연산 제거. `evaluate_coverage()`의 edge confirmation O(n) 루프 및 hit count bucketing O(m) 루프 제거. CFG 그래프 시각화는 `cmd_traces`(ordered PC sequence)에서 인접 쌍으로 edge를 직접 도출. 전체 183줄 감소(3291→3108) |
 
 ---
 
@@ -524,15 +525,17 @@ evaluate_coverage():
 
 PC 주소는 **결정론적**: 코드 경로 A가 실행되면 해당 주소들이 반드시 `current_trace`에 생성된다.
 
-#### 4.6.2 Edge 추적 (진단용)
+#### 4.6.2 Edge (CFG 시각화용)
 
+`(prev_pc, cur_pc)` edge는 타이밍에 따라 달라지는 **비결정적** 쌍이므로 corpus 추가 기준으로 사용하지 않는다. v4.6에서 edge 실시간 추적(hot path의 set.add + dict 갱신)을 제거했다.
+
+CFG 그래프 생성 시에만 `cmd_traces`에서 인접 PC 쌍으로 edge를 도출한다:
+
+```python
+for trace in cmd_traces[cmd_name]:
+    for i in range(len(trace) - 1):
+        edge_counts[(trace[i], trace[i+1])] += 1
 ```
-edge = (prev_pc, cur_pc)  ← 연속으로 읽힌 두 PC 값의 쌍
-```
-
-`(prev_pc, cur_pc)` edge는 타이밍에 따라 달라지는 **비결정적** 쌍이다. corpus 추가 기준으로는 부적합하므로 **진단 목적으로만 추적**한다.
-
-Edge Confirmation: `global_edge_pending`에서 `EDGE_CONFIRM_THRESHOLD`(기본 2)회 이상 관측된 edge만 `global_edges`로 승격. 로그에서 `edges_diag`로 표시된다.
 
 #### 4.6.3 커버리지 저장소
 
@@ -540,11 +543,10 @@ Edge Confirmation: `global_edge_pending`에서 `EDGE_CONFIRM_THRESHOLD`(기본 2
 |---|---|---|
 | `global_coverage` | `Set[int]` | **Primary** — 전체 세션 누적 unique PC 주소 |
 | `current_trace` | `Set[int]` | **Primary** — 현재 실행의 PC 주소 |
-| `global_edges` | `Set[Tuple[int,int]]` | 진단용 — confirmed edge 집합 |
-| `global_edge_pending` | `Dict[Tuple,int]` | 진단용 — confirmation 미달 edge 풀 |
-| `current_edges` | `Set[Tuple[int,int]]` | 진단용 — 현재 실행의 edge |
-| `global_edge_counts` | `Dict[Tuple,int]` | 진단용 — edge 누적 hit count |
-| `global_edge_buckets` | `Dict[Tuple,int]` | 진단용 — edge 현재 bucket 값 |
+| `cmd_pcs` | `Dict[str, Set[int]]` | 명령어별 누적 unique PC (시각화용) |
+| `cmd_traces` | `Dict[str, deque]` | 명령어별 최근 200개 ordered PC sequence (CFG 그래프용) |
+
+v4.6에서 `global_edges`, `current_edges`, `global_edge_pending`, `global_edge_counts`, `global_edge_buckets` 등 edge 추적 저장소를 모두 제거했다. CFG 그래프의 edge는 `cmd_traces`의 인접 PC 쌍 `(trace[i], trace[i+1])`에서 직접 도출한다.
 
 ---
 
@@ -642,9 +644,9 @@ nvme0: ioctl NVME_IOCTL_IO_CMD is deprecated and will be removed. Please update 
 | Interesting values | 구현 완료 | 8/16/32-bit, AFL++ 동일 상수 |
 | Arithmetic mutation | 구현 완료 | 8/16/32-bit, LE/BE, ARITH_MAX=35 |
 | Power Schedule (explore) | 부분 구현 | 에너지만 사용, perf_score 미포함 |
-| Edge coverage | 진단용으로 유지 | `(prev_pc,cur_pc)` 튜플, corpus 판단 미사용 |
+| Edge coverage | v4.6에서 실시간 추적 제거 | CFG 시각화 시 cmd_traces에서 on-demand 도출 |
 | PC address coverage | 구현 완료 (독자적) | unique PC 주소 기반 primary signal |
-| Hit count bucketing | 진단용 구현 | 8단계 로그 버킷. corpus 판단 미사용 |
+| Hit count bucketing | v4.6에서 제거 | PC 샘플링 hit count는 루프 횟수가 아닌 샘플링 빈도를 반영하여 의미 약함 |
 | Calibration | v4.5 구현 | 시드별 N회 반복 실행으로 PC 주소 안정성 측정 |
 | Deterministic stage | v4.5 구현 | CDW 필드 대상 walking bitflip + arithmetic + interesting |
 | MOpt | v4.5 구현 | Pilot/Core 2단계 mutation operator scheduling |
@@ -854,6 +856,7 @@ NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일
 | ~~MOpt (mutator scheduling)~~ | ~~중간~~ | ~~mutation 연산자별 효과 추적 및 가중치 조정~~ | **v4.5 구현 완료** |
 | ~~io-passthru device 수정~~ | ~~낮음~~ | ~~deprecated NVME_IOCTL_IO_CMD 경고 제거~~ | **v4.6 구현 완료** |
 | ~~Passthru timeout 분리~~ | ~~중간~~ | ~~crash 시 SSD 상태 보존을 위한 timeout 구조 개선~~ | **v4.6 구현 완료** |
+| ~~Edge 추적 코드 제거~~ | ~~높음~~ | ~~hot path에서 불필요한 edge 연산 제거 (183줄, 샘플당 set.add + dict 갱신)~~ | **v4.6 구현 완료** |
 | Entropic scheduling | 중간 | 정보 이론 기반 시드 스케줄링 (corpus 성숙 후 AFLFast 대체) | 미구현 |
 | NVMe 구조 인식 mutation | 중간 | Peach Pit 방식 CDW 필드별 의미론적 mutation | 미구현 |
 | Directed fuzzing | 높음 | Ghidra CFG 기반 거리맵으로 특정 코드 영역 집중 탐색 | 미구현 |
@@ -954,8 +957,6 @@ sudo python3 pc_sampling_fuzzer_v4.6.py --all-commands
 output/pc_sampling_v4.6/
 ├── fuzzer_YYYYMMDD_HHMMSS.log    # 실행 로그
 ├── coverage.txt                   # 글로벌 PC 커버리지 (hex, 줄당 1개)
-├── coverage_edges.txt             # 글로벌 edge 커버리지 (hex,hex 줄당 1개)
-├── coverage_edge_counts.txt       # edge별 누적 hit count (hex,hex,count)
 ├── .nvme_input.bin                # NVMe 입력 데이터 (재사용, 임시)
 ├── corpus/                        # interesting 입력 저장
 │   ├── input_Read_0x2_a1b2c3d4e5f6
