@@ -2725,14 +2725,6 @@ class NVMeFuzzer:
                     log.warning("[TIMEOUT] SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
                     stuck_pcs = self.sampler.read_stuck_pcs(count=20)
 
-                    # 2) NVMe PCIe 드라이버 즉시 unbind — ADMIN_TIMEOUT(60s) reset 차단
-                    # Linux NVMe 드라이버는 내부 admin 명령(AER, keep-alive 등)에
-                    # ADMIN_TIMEOUT=60s를 사용. 펌웨어 크래시 시 이 타이머가 먼저 발동해
-                    # nvme_reset_ctrl()을 호출, SSD 상태를 덮어쓴다.
-                    # stuck PC 읽기 후 즉시 unbind하면 타이머가 제거된다.
-                    log.warning("[TIMEOUT] 커널 reset 차단을 위해 NVMe 드라이버를 unbind합니다...")
-                    self._unbind_nvme_driver()
-
                     actual_opcode = mutated_seed.opcode_override \
                         if mutated_seed.opcode_override is not None \
                         else cmd.opcode
@@ -2795,7 +2787,13 @@ class NVMeFuzzer:
                                      dmesg_snapshot=dmesg_snapshot)
                     log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
 
-                    # 5) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
+                    # 5) NVMe PCIe 드라이버 unbind — ADMIN_TIMEOUT(60s) reset 차단
+                    # 모든 데이터 캡처 완료 후 시도. nvme_shutdown_ctrl()이 하드웨어
+                    # 응답을 기다리므로 블로킹될 수 있어 5초 timeout으로 비동기 처리.
+                    log.warning("[TIMEOUT] 커널 reset 차단을 위해 NVMe 드라이버를 unbind합니다...")
+                    self._unbind_nvme_driver()
+
+                    # 6) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
                     # halt하면 불량 현상이 멈추므로, 펌웨어가 돌고 있는
                     # 그대로 두어야 hang/loop 등의 현상을 외부에서 관찰 가능
                     log.error(
@@ -2805,7 +2803,7 @@ class NVMeFuzzer:
                         "  J-Link 디버거로 연결하여 현재 상태를 "
                         "관찰할 수 있습니다.")
 
-                    # 6) nvme-cli 프로세스 정보 기록
+                    # 7) nvme-cli 프로세스 정보 기록
                     # unbind로 드라이버가 제거되면 nvme-cli(D-state)는 ENODEV로 깨어남.
                     # 프로세스가 종료돼도 SSD 펌웨어 상태는 보존됨 (unbind가 보장).
                     log.error("")
@@ -2822,7 +2820,7 @@ class NVMeFuzzer:
                             f"  SSD 펌웨어 상태는 드라이버 unbind로 보존됩니다.")
                     log.error("")
 
-                    # 7) 퍼징 중단 — reconnect/continue/rescan 하지 않음
+                    # 8) 퍼징 중단 — reconnect/continue/rescan 하지 않음
                     self._timeout_crash = True
                     log.error(
                         "  퍼징을 중단합니다. SSD와 NVMe 장치 상태를 "
