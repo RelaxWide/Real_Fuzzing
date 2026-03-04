@@ -343,7 +343,7 @@ class FuzzConfig:
     nvme_timeouts: dict = field(default_factory=lambda: NVME_TIMEOUTS.copy())
 
     enabled_commands: List[str] = field(default_factory=list)
-    all_commands: bool = True    # True면 위험(파괴적) 명령어 포함 전체 활성화
+    all_commands: bool = False   # True면 위험(파괴적) 명령어 포함 전체 활성화
 
     # 샘플링 설정
     sample_interval_us: int = SAMPLE_INTERVAL_US
@@ -2721,10 +2721,16 @@ class NVMeFuzzer:
                     # v4.3: 완전 랜덤 비율을 설정값으로 분리
                     if self.corpus and random.random() >= self.config.random_gen_ratio:
                         base_seed = self._select_seed()
-                        mutated_seed = self._mutate(base_seed)
-                        fuzz_data = mutated_seed.data
-                        cmd = mutated_seed.cmd
-                        self.mutation_stats["corpus_mutated"] += 1
+                        if base_seed is None:
+                            cmd = random.choice(self.commands)
+                            fuzz_data = os.urandom(random.randint(64, 512))
+                            mutated_seed = Seed(data=fuzz_data, cmd=cmd)
+                            self.mutation_stats["random_gen"] += 1
+                        else:
+                            mutated_seed = self._mutate(base_seed)
+                            fuzz_data = mutated_seed.data
+                            cmd = mutated_seed.cmd
+                            self.mutation_stats["corpus_mutated"] += 1
                     else:
                         cmd = random.choice(self.commands)
                         fuzz_data = os.urandom(random.randint(64, 512))
@@ -3148,7 +3154,7 @@ if __name__ == "__main__":
     parser.add_argument('--namespace', type=int, default=NVME_NAMESPACE)
     parser.add_argument('--commands', nargs='+', default=[],
                         help='Commands to use (e.g., Read Write GetFeatures FormatNVM)')
-    parser.add_argument('--all-commands', action='store_true', default=True,
+    parser.add_argument('--all-commands', action='store_true', default=False,
                         help='Enable ALL commands including destructive ones '
                              '(FormatNVM, Sanitize, FWCommit, etc.)')
     parser.add_argument('--speed', type=int, default=JLINK_SPEED, help='JTAG speed (kHz)')
