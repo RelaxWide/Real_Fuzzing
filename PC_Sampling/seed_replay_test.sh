@@ -10,7 +10,7 @@
 #   -d DEVICE        NVMe 장치                (기본: /dev/nvme0)
 #   -n NAMESPACE     NVMe 네임스페이스 ID     (기본: 1)
 #   -t TIMEOUT       명령 타임아웃(초)        (기본: 10)
-#   -f FIRMWARE.BIN  FWDownload/FWCommit 테스트용 펌웨어 바이너리 (없으면 FW 테스트 스킵)
+#   -f FIRMWARE.BIN  FWDownload/FWCommit용 펌웨어 바이너리 (기본: ./FW.bin)
 #   -s FW_SLOT       FWCommit 슬롯 번호       (기본: 1)
 #   -v               상세 출력 (nvme 명령어 전체 표시)
 #   -h               도움말
@@ -26,7 +26,7 @@ set -uo pipefail
 DEVICE="/dev/nvme0"
 NAMESPACE=1
 TIMEOUT=10
-FW_BIN=""
+FW_BIN="FW.bin"
 FW_SLOT=1
 VERBOSE=0
 
@@ -54,8 +54,8 @@ fi
 for bin in nvme python3; do
     command -v "$bin" &>/dev/null || { echo -e "${RED}ERROR${NC}: $bin 가 없습니다"; exit 1; }
 done
-if [[ -n "$FW_BIN" && ! -f "$FW_BIN" ]]; then
-    echo -e "${RED}ERROR${NC}: 펌웨어 파일이 없습니다: $FW_BIN"; exit 1
+if [[ ! -f "$FW_BIN" ]]; then
+    echo -e "${RED}ERROR${NC}: 펌웨어 파일이 없습니다: $FW_BIN (FW.bin을 현재 디렉토리에 두거나 -f로 지정)"; exit 1
 fi
 
 TMPDIR_SEED=$(mktemp -d)
@@ -185,42 +185,33 @@ add("Write", 0x01, "io", True, True, cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0
 add("SetFeatures", 0x09, "admin", True, True, cdw10=0x07, cdw11=0x00010001, desc="Number of Queues", xfail=True)
 
 # ── FWDownload / FWCommit ─────────────────────────────────────────
-# -f 없으면 스킵. -f 있으면 전체 .bin을 4KB 청크로 분할 전송 후 FWCommit.
-if fw_bin:
-    CHUNK_SIZE = 4096  # 4KB per chunk (safe default; 실제는 FWUG 참조)
-    with open(fw_bin, "rb") as fh:
-        fw_data = fh.read()
-    fw_size = len(fw_data)
-    offset = 0
-    chunk_idx = 0
-    while offset < fw_size:
-        chunk = fw_data[offset:offset + CHUNK_SIZE]
-        chunk = chunk.ljust(CHUNK_SIZE, b'\x00')  # 마지막 청크 패딩
-        numd = (CHUNK_SIZE // 4) - 1              # CDW10: NUMD (0-based dwords)
-        ofst = offset // 4                         # CDW11: OFST (dword offset)
-        add("FWDownload", 0x11, "admin", True, True,
-            cdw10=numd, cdw11=ofst, data=chunk,
-            desc=f"FWDownload chunk {chunk_idx} offset={offset}")
-        offset += CHUNK_SIZE
-        chunk_idx += 1
-    # Commit Action 0b001 = download only, activate on next reset
-    # Firmware Slot = fw_slot (CDW10[5:3])
-    commit_action = 0x01  # CA=001: replace slot, no activation
-    cdw10_commit  = (fw_slot << 3) | commit_action
-    add("FWCommit", 0x10, "admin", True, False,
-        cdw10=cdw10_commit, desc=f"FWCommit slot={fw_slot} action=1 (activate on reset)")
-else:
-    add("FWDownload", 0x11, "admin", True, True,  desc="FWDownload (no -f provided)", skip=True)
-    add("FWCommit",   0x10, "admin", True, False, desc="FWCommit   (no -f provided)", skip=True)
-    add("FWCommit",   0x10, "admin", True, False, desc="FWCommit   (no -f provided)", skip=True)
+# 전체 .bin을 4KB 청크로 분할 전송 후 FWCommit.
+CHUNK_SIZE = 4096  # 4KB per chunk (safe default; 실제는 FWUG 참조)
+with open(fw_bin, "rb") as fh:
+    fw_data = fh.read()
+fw_size = len(fw_data)
+offset = 0
+chunk_idx = 0
+while offset < fw_size:
+    chunk = fw_data[offset:offset + CHUNK_SIZE]
+    chunk = chunk.ljust(CHUNK_SIZE, b'\x00')  # 마지막 청크 패딩
+    numd = (CHUNK_SIZE // 4) - 1              # CDW10: NUMD (0-based dwords)
+    ofst = offset // 4                         # CDW11: OFST (dword offset)
+    add("FWDownload", 0x11, "admin", True, True,
+        cdw10=numd, cdw11=ofst, data=chunk,
+        desc=f"FWDownload chunk {chunk_idx} offset={offset}")
+    offset += CHUNK_SIZE
+    chunk_idx += 1
+# Commit Action 0b001 = replace slot, activate on next reset
+# Firmware Slot = fw_slot (CDW10[5:3])
+commit_action = 0x01  # CA=001: replace slot, no activation
+cdw10_commit  = (fw_slot << 3) | commit_action
+add("FWCommit", 0x10, "admin", True, False,
+    cdw10=cdw10_commit, desc=f"FWCommit slot={fw_slot} action=1 (activate on reset)")
 
 # ── FormatNVM ─────────────────────────────────────────────────────
-# 실제 포맷 수행 — 기본 스킵 (퍼징 seed 검증에 불필요, 데이터 파괴 위험)
-add("FormatNVM", 0x80, "admin", False, False, cdw10=0x00, desc="Format LBAF 0 (SKIP: destructive)", skip=True)
-
-# ── Sanitize ──────────────────────────────────────────────────────
-# 경고: rc=0 이면 SSD가 실제로 Block Erase를 시작함! 기본 스킵.
-add("Sanitize", 0x84, "admin", False, False, cdw10=0x01, desc="Block Erase (SKIP: erases all data!)", skip=True)
+# SES=0 (No secure erase), LBAF=0. CDW10[11:9]=0, CDW10[3:0]=0 → 0x00
+add("FormatNVM", 0x80, "admin", True, False, cdw10=0x00, desc="Format LBAF 0 SES=0")
 
 # ── TelemetryHostInitiated ───────────────────────────────────────
 # NSID=0 으로 수정 (GetLogPage 컨트롤러 범위)
