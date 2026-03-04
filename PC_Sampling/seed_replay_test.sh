@@ -186,21 +186,23 @@ add("SetFeatures", 0x09, "admin", True, True, cdw10=0x07, cdw11=0x00010001, desc
 
 # ── FWDownload / FWCommit ─────────────────────────────────────────
 # 펌웨어 전체를 단일 FWDownload로 전송 (offset=0, numd=전체 크기)
-with open(fw_bin, "rb") as fh:
-    fw_data = fh.read()
-fw_size = len(fw_data)
+fw_size = os.path.getsize(fw_bin)
 fw_size_aligned = (fw_size + 3) & ~3  # CDW 단위(4바이트) 정렬
 if fw_size % 4 != 0:
-    fw_data = fw_data + b'\x00' * (fw_size_aligned - fw_size)
-fw_temp = os.path.join(tmpdir, "fw_full.bin")
-with open(fw_temp, "wb") as fh:
-    fh.write(fw_data)
+    # 패딩이 필요한 경우만 임시 파일 생성
+    with open(fw_bin, "rb") as fh:
+        fw_data = fh.read()
+    fw_file = os.path.join(tmpdir, "fw_padded.bin")
+    with open(fw_file, "wb") as fh:
+        fh.write(fw_data + b'\x00' * (fw_size_aligned - fw_size))
+else:
+    fw_file = fw_bin  # 원본 그대로 사용
 numd_total = (fw_size_aligned // 4) - 1  # CDW10: NUMD (0-based dword count)
 # add()의 MAX_DATA_BUF 캡을 우회해서 직접 추가
 seeds.append({"idx": idx, "cmd": "FWDownload", "opcode": 0x11, "type": "admin",
               "nsid": 0, "cdw10": numd_total, "cdw11": 0, "cdw12": 0,
               "cdw13": 0, "cdw14": 0, "cdw15": 0,
-              "data_len": fw_size_aligned, "write": True, "data_file": fw_temp,
+              "data_len": fw_size_aligned, "write": True, "data_file": fw_file,
               "desc": f"FWDownload full image {fw_size_aligned}B",
               "xfail": False, "skip": False})
 idx += 1
