@@ -475,6 +475,8 @@ class JLinkPCSampler:
 
         # v4.2: idle PC — diagnose()에서 가장 빈도 높은 PC로 설정
         self.idle_pc: Optional[int] = None
+        # v4.7: idle PC 집합 — SWD에서 WFI wake로 여러 주소가 관찰될 때 대응
+        self.idle_pcs: Set[int] = set()
 
     def connect(self) -> bool:
         try:
@@ -586,21 +588,30 @@ class JLinkPCSampler:
         log.warning(f"[Diagnose] 결과: {len(pcs)}/{count} 성공, "
                  f"failures={failures}, unique PCs={len(unique_pcs)}")
 
-        # v4.2: 가장 빈도 높은 PC를 idle PC로 설정
+        # v4.7: idle PC 집합 구성
+        # JTAG: WFI에서 항상 같은 주소 → 단일 PC가 높은 빈도로 등장
+        # SWD:  WFI wake로 idle loop 내 여러 주소 순환 → 개별 빈도는 낮지만 합산은 높음
+        # 전략: 전체 샘플의 5% 이상(최소 2회) 등장한 PC를 모두 idle_pcs에 포함
         from collections import Counter
         pc_counts = Counter(pcs)
         most_common_pc, most_common_count = pc_counts.most_common(1)[0]
         idle_ratio = most_common_count / len(pcs)
 
-        if idle_ratio >= 0.3:
-            # 30% 이상 동일 PC면 idle로 판정
-            self.idle_pc = most_common_pc
-            log.warning(f"[Diagnose] idle PC 감지: {hex(most_common_pc)} "
-                        f"(빈도: {most_common_count}/{len(pcs)} = {idle_ratio:.0%})")
+        freq_threshold = max(2, len(pcs) // 20)   # 5% 이상, 최소 2회
+        self.idle_pcs = {pc for pc, cnt in pc_counts.items() if cnt >= freq_threshold}
+        self.idle_pc = most_common_pc  # 대표값 (로그/호환성)
+
+        if self.idle_pcs:
+            coverage_ratio = sum(pc_counts[p] for p in self.idle_pcs) / len(pcs)
+            log.warning(
+                f"[Diagnose] idle PCs 감지: {len(self.idle_pcs)}개 "
+                f"({', '.join(hex(p) for p in sorted(self.idle_pcs))}) "
+                f"합산 빈도={coverage_ratio:.0%}, 임계값={freq_threshold}회"
+            )
         else:
-            self.idle_pc = None
+            self.idle_pcs = set()
             log.warning(f"[Diagnose] idle PC 없음 (최다 PC {hex(most_common_pc)}: "
-                        f"{idle_ratio:.0%} < 30% 임계값)")
+                        f"{idle_ratio:.0%}, 임계값 {freq_threshold}회 미달)")
 
         if len(unique_pcs) <= 1:
             log.warning(f"[Diagnose] PC가 항상 같은 값입니다 ({hex(pcs[0])}). "
@@ -667,7 +678,8 @@ class JLinkPCSampler:
         interval = self.config.sample_interval_us / 1_000_000
         sat_limit = self.config.saturation_limit
         global_sat_limit = self.config.global_saturation_limit  # v4.3: 설정값 사용
-        idle_pc = self.idle_pc       # v4.2: 로컬 캐싱
+        idle_pc = self.idle_pc       # v4.2: 로컬 캐싱 (대표값, 로그용)
+        idle_pcs = self.idle_pcs     # v4.7: idle PC 집합 (JTAG 단일 / SWD 복수 대응)
 
         # global_coverage(PC 주소 set) 참조 캐싱
         # CPython set.__contains__는 GIL 하에서 안전
@@ -699,8 +711,8 @@ class JLinkPCSampler:
                     else:
                         since_last_global_new += 1
 
-                    # v4.2: idle PC 연속 카운터
-                    if idle_pc is not None and pc == idle_pc:
+                    # v4.7: idle PC 집합 기반 연속 카운터 (JTAG 단일 / SWD 복수 모두 대응)
+                    if idle_pcs and pc in idle_pcs:
                         consecutive_idle += 1
                     else:
                         consecutive_idle = 0
@@ -727,9 +739,9 @@ class JLinkPCSampler:
                             f"limit={global_sat_limit})"
                         )
                         break
-                    if idle_pc is not None and consecutive_idle >= sat_limit:
+                    if idle_pcs and consecutive_idle >= sat_limit:
                         self._stopped_reason = (
-                            f"idle_saturated (idle PC {hex(idle_pc)} "
+                            f"idle_saturated ({len(idle_pcs)} idle PCs "
                             f"x{consecutive_idle} consecutive)"
                         )
                         break
@@ -2659,10 +2671,11 @@ class NVMeFuzzer:
             log.error("J-Link PC read diagnosis failed, aborting")
             return
 
-        if self.sampler.idle_pc is not None:
-            log.warning(f"Idle PC     : {hex(self.sampler.idle_pc)}")
+        if self.sampler.idle_pcs:
+            pcs_str = ', '.join(hex(p) for p in sorted(self.sampler.idle_pcs))
+            log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
         else:
-            log.warning("Idle PC     : not detected (saturation = global PC only)")
+            log.warning("Idle PCs    : not detected (saturation = global PC only)")
 
         # v4.3: 퍼징 시작 전 SMART baseline 기록
         self._log_smart()
