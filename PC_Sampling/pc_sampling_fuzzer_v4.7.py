@@ -168,13 +168,9 @@ NVME_TIMEOUTS = {
 # PC 샘플링 설정
 SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
 MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수 (상한)
-SATURATION_LIMIT      = 10    # per-run 수렴 감지: 이번 실행에서 이미 본 PC가 N회 연속이면 조기 종료
-                               # 주의: 처리 루프가 있는 펌웨어에서 오발동 가능.
-                               # JTAG: 단일 idle PC → 빠르게 감지, 이 값 그대로 사용.
-                               # SWD : 처리 루프 재방문과 idle 구별 불가 → 0으로 비활성화 권장.
-                               #        대신 GLOBAL_SATURATION_LIMIT + subprocess 완료 신호에 의존.
-GLOBAL_SATURATION_LIMIT = 20  # 연속 N회 새 global PC 없으면 조기 종료.
-                               # SWD에서 SATURATION_LIMIT=0 시 주요 종료 신호로 동작.
+SATURATION_LIMIT      = 10    # idle 유니버스 연속 카운터: idle_pcs 내 PC가 N회 연속이면 조기 종료.
+                               # diagnose()에서 수렴 수집한 idle 유니버스 기반 → JTAG/SWD 공통 동작.
+GLOBAL_SATURATION_LIMIT = 20  # 연속 N회 새 global PC 없으면 조기 종료 (global_coverage 기준).
 POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 
 # v4.6: NVMe passthru 명령 자체의 timeout (nvme-cli --timeout 인자)
@@ -213,6 +209,12 @@ OPCODE_MUT_PROB   = 0.10   # opcode override 확률 (기본 10%)
 NSID_MUT_PROB     = 0.10   # namespace ID override 확률 (기본 10%)
 ADMIN_SWAP_PROB   = 0.05   # Admin↔IO 교차 전송 확률 (기본 5%)
 DATALEN_MUT_PROB  = 0.08   # data_len 불일치 확률 (기본 8%)
+
+# v4.7: Idle 유니버스 수집 (diagnose 수렴 설정)
+# SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
+# 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
+DIAGNOSE_STABILITY = 50    # 새 idle PC 없이 연속 N회면 수렴으로 판정
+DIAGNOSE_MAX       = 1000  # 수렴 전 최대 샘플 수 (상한)
 
 # v4.5: Calibration 설정
 CALIBRATION_RUNS  = 3      # 초기 시드당 calibration 실행 횟수 (0 = 비활성화)
@@ -396,6 +398,10 @@ class FuzzConfig:
     admin_swap_prob: float = ADMIN_SWAP_PROB
     datalen_mut_prob: float = DATALEN_MUT_PROB
 
+    # v4.7: Idle 유니버스 수렴 설정
+    diagnose_stability: int = DIAGNOSE_STABILITY  # 새 idle PC 없이 연속 N회면 수렴
+    diagnose_max: int = DIAGNOSE_MAX              # 수렴 전 최대 샘플 수
+
     # v4.5: Calibration
     calibration_runs: int = CALIBRATION_RUNS
 
@@ -565,64 +571,87 @@ class JLinkPCSampler:
         return 15
 
     def diagnose(self, count: int = 20) -> bool:
-        """시작 전 PC 읽기 진단 — J-Link 동작 검증 + idle PC 감지 (v4.2)"""
-        log.warning(f"[Diagnose] PC를 {count}회 읽어서 J-Link 상태를 확인합니다...")
-        pcs = []
+        """시작 전 PC 읽기 진단 — J-Link 동작 검증 + idle 유니버스 수집 (v4.7)
+
+        idle_pcs 구성 전략 (JTAG/SWD 공통):
+          새 PC가 DIAGNOSE_STABILITY회 연속 나타나지 않을 때까지 샘플링 (최대 DIAGNOSE_MAX회).
+          JTAG: WFI 고정 → 수십 샘플에 수렴.
+          SWD:  WFI wake로 주기적 인터럽트 핸들러까지 포함 → 더 많은 샘플 필요.
+          수집된 idle_pcs = "idle 유니버스" — 퍼징 중 이 집합 밖 PC가 나오면 active 실행 중.
+        """
+        stability = self.config.diagnose_stability
+        max_samples = self.config.diagnose_max
+
+        log.warning(f"[Diagnose] idle 유니버스 수집 시작 "
+                    f"(수렴 조건: 새 PC 없이 {stability}회 연속, 최대 {max_samples}회)...")
+
+        # 1단계: 초기 20회 — 기본 동작 검증 및 로그 출력
+        initial = min(count, 20)
+        pcs_initial = []
         failures = 0
-        for i in range(count):
+        for i in range(initial):
             pc = self._read_pc()
             if pc is not None:
-                pcs.append(pc)
+                pcs_initial.append(pc)
                 in_range = ""
                 if self.config.addr_range_start is not None and self.config.addr_range_end is not None:
-                    if self.config.addr_range_start <= pc <= self.config.addr_range_end:
-                        in_range = " [IN RANGE]"
-                    else:
-                        in_range = " [OUT OF RANGE]"
+                    in_range = (" [IN RANGE]"
+                                if self.config.addr_range_start <= pc <= self.config.addr_range_end
+                                else " [OUT OF RANGE]")
                 log.warning(f"  [{i+1:2d}] PC = {hex(pc)}{in_range}")
             else:
                 failures += 1
                 log.warning(f"  [{i+1:2d}] PC read FAILED")
             time.sleep(0.05)
 
-        if not pcs:
+        if not pcs_initial:
             log.error("[Diagnose] PC를 한 번도 읽지 못했습니다. JTAG 연결을 확인하세요.")
             return False
 
-        unique_pcs = set(pcs)
-        log.warning(f"[Diagnose] 결과: {len(pcs)}/{count} 성공, "
-                 f"failures={failures}, unique PCs={len(unique_pcs)}")
+        # 2단계: 수렴 기반 adaptive 샘플링 — idle 유니버스 완성
+        idle_universe: Set[int] = set(pcs_initial)
+        consecutive_no_new = 0
+        total = len(pcs_initial)
 
-        # v4.7: idle PC 집합 구성 (정보 표시 / 디버그용, 샘플링 조기종료에는 미사용)
-        # 조기종료는 per-run 수렴 감지(_sampling_worker)가 담당하므로
-        # idle_pcs가 20개+여도 퍼저 동작에 영향 없음.
-        # JTAG: WFI에서 항상 같은 주소 → 단일 PC가 높은 빈도로 등장
-        # SWD:  WFI wake로 idle loop 내 여러 주소 순환 → 개별 빈도는 낮지만 합산은 높음
-        # 전략: 전체 샘플의 5% 이상(최소 2회) 등장한 PC를 모두 idle_pcs에 포함
-        from collections import Counter
-        pc_counts = Counter(pcs)
-        most_common_pc, most_common_count = pc_counts.most_common(1)[0]
-        idle_ratio = most_common_count / len(pcs)
+        log.warning(f"[Diagnose] 초기 {initial}회 완료, unique PCs={len(idle_universe)}. "
+                    f"idle 유니버스 수렴 샘플링 시작...")
 
-        freq_threshold = max(2, len(pcs) // 20)   # 5% 이상, 최소 2회
-        self.idle_pcs = {pc for pc, cnt in pc_counts.items() if cnt >= freq_threshold}
-        self.idle_pc = most_common_pc  # 대표값 (로그/호환성)
+        while consecutive_no_new < stability and total < max_samples:
+            pc = self._read_pc()
+            total += 1
+            if pc is not None:
+                if pc not in idle_universe:
+                    idle_universe.add(pc)
+                    consecutive_no_new = 0
+                    log.warning(f"  [+{total:4d}] 새 idle PC: {hex(pc)} "
+                                f"(누적 {len(idle_universe)}개)")
+                else:
+                    consecutive_no_new += 1
+            # 샘플 간격 없음 — 빠른 수렴 우선
 
-        if self.idle_pcs:
-            coverage_ratio = sum(pc_counts[p] for p in self.idle_pcs) / len(pcs)
-            log.warning(
-                f"[Diagnose] idle PCs 감지: {len(self.idle_pcs)}개 "
-                f"({', '.join(hex(p) for p in sorted(self.idle_pcs))}) "
-                f"합산 빈도={coverage_ratio:.0%}, 임계값={freq_threshold}회"
-            )
+        if consecutive_no_new >= stability:
+            log.warning(f"[Diagnose] idle 유니버스 수렴 완료: "
+                        f"{len(idle_universe)}개 PC, {total}회 샘플 "
+                        f"(새 PC 없이 {consecutive_no_new}회 연속)")
         else:
-            self.idle_pcs = set()
-            log.warning(f"[Diagnose] idle PC 없음 (최다 PC {hex(most_common_pc)}: "
-                        f"{idle_ratio:.0%}, 임계값 {freq_threshold}회 미달)")
+            log.warning(f"[Diagnose] 최대 샘플({max_samples}회) 도달. "
+                        f"idle 유니버스 {len(idle_universe)}개 (수렴 미완료, 이대로 사용)")
 
-        if len(unique_pcs) <= 1:
-            log.warning(f"[Diagnose] PC가 항상 같은 값입니다 ({hex(pcs[0])}). "
-                        f"CPU가 멈춰있거나 idle loop에 있을 수 있습니다.")
+        # idle_pcs = 수집된 전체 idle 유니버스 (범위 내 PC만)
+        if self.config.addr_range_start is not None and self.config.addr_range_end is not None:
+            self.idle_pcs = {
+                p for p in idle_universe
+                if self.config.addr_range_start <= p <= self.config.addr_range_end
+            }
+        else:
+            self.idle_pcs = set(idle_universe)
+
+        from collections import Counter
+        pc_counts = Counter(pcs_initial)
+        self.idle_pc = pc_counts.most_common(1)[0][0]  # 대표값 (로그/호환성)
+
+        log.warning(f"[Diagnose] idle_pcs = {len(self.idle_pcs)}개 "
+                    f"(범위 내), 대표 PC = {hex(self.idle_pc)}")
         return True
 
     def _read_pc(self) -> Optional[int]:
@@ -681,10 +710,11 @@ class JLinkPCSampler:
 
         sample_count = 0
         since_last_global_new = 0   # 연속 "이미 알려진 PC" 카운터 (global 기준)
-        no_new_local = 0             # v4.7: 연속 "이번 실행에서 이미 본 PC" 카운터
+        consecutive_idle = 0         # idle 유니버스 연속 카운터
         interval = self.config.sample_interval_us / 1_000_000
         sat_limit = self.config.saturation_limit
         global_sat_limit = self.config.global_saturation_limit  # v4.3: 설정값 사용
+        idle_pcs = self.idle_pcs     # idle 유니버스 (diagnose에서 수렴 수집)
 
         # global_coverage(PC 주소 set) 참조 캐싱
         # CPython set.__contains__는 GIL 하에서 안전
@@ -700,9 +730,6 @@ class JLinkPCSampler:
                 self._last_raw_pcs.append(pc)
 
                 if self._in_range(pc):
-                    # v4.7: current_trace 추가 전에 새 PC 여부 확인
-                    is_new_this_run = pc not in self.current_trace
-
                     if prev_pc == 0xFFFFFFFF:
                         # 첫 번째 in-range PC: sentinel이므로 edge 생성하지 않음
                         prev_pc = pc
@@ -712,24 +739,23 @@ class JLinkPCSampler:
                         prev_pc = pc
 
                     # v4.5+: PC 기반 글로벌 포화 판단
-                    # 모든 in-range PC(첫 번째 포함)에 대해 체크
                     if pc not in global_coverage_ref:
                         self._last_new_at = sample_count
                         since_last_global_new = 0
                     else:
                         since_last_global_new += 1
 
-                    # v4.7: per-run 수렴 감지
-                    # idle_pcs 사전 정의 없이 "이번 실행에서 이미 본 PC"로 수렴 판단.
-                    # JTAG(idle=1개)/SWD(idle=20개+) 모두 동작:
-                    # 처음 수십 샘플에 idle 주소 전부 수집 → 이후 no_new_local 상승 → 조기종료
-                    if is_new_this_run:
-                        no_new_local = 0
+                    # v4.7: idle 유니버스 기반 연속 카운터
+                    # diagnose()에서 수렴 수집한 idle_pcs = idle 상태에서 나올 수 있는 모든 PC.
+                    # NVMe 커맨드 처리 코드는 idle 유니버스 밖 → 처리 중엔 consecutive_idle 리셋.
+                    # idle 복귀 후 유니버스 내 PC만 연속 → sat_limit 도달 → 조기종료.
+                    if idle_pcs and pc in idle_pcs:
+                        consecutive_idle += 1
                     else:
-                        no_new_local += 1
+                        consecutive_idle = 0
                 else:
                     self._out_of_range_count += 1
-                    # out-of-range는 per-run 수렴 판단에서 제외 (카운터 변경 없음)
+                    consecutive_idle = 0  # out-of-range는 idle로 보지 않음
 
                 sample_count += 1
                 self.total_samples += 1
@@ -740,7 +766,7 @@ class JLinkPCSampler:
 
                 # 조기 종료 조건 (OR)
                 # 조건1: 연속 global_sat_limit회 이미 알려진 PC (새 코드 경로 없음, global 기준)
-                # 조건2: 연속 sat_limit회 이번 실행에서 이미 본 PC (per-run 수렴, JTAG/SWD 공통)
+                # 조건2: 연속 sat_limit회 idle 유니버스 내 PC (idle 복귀 감지)
                 if sat_limit > 0:
                     if global_sat_limit > 0 and since_last_global_new >= global_sat_limit:
                         self._stopped_reason = (
@@ -749,11 +775,11 @@ class JLinkPCSampler:
                             f"limit={global_sat_limit})"
                         )
                         break
-                    if no_new_local >= sat_limit:
+                    if idle_pcs and consecutive_idle >= sat_limit:
                         self._stopped_reason = (
-                            f"local_saturated (no new run-PC for "
-                            f"{no_new_local} consecutive samples, "
-                            f"run_unique={len(self.current_trace)})"
+                            f"idle_saturated (idle universe hit "
+                            f"{consecutive_idle} consecutive, "
+                            f"universe_size={len(idle_pcs)})"
                         )
                         break
 
@@ -3285,6 +3311,13 @@ if __name__ == "__main__":
                              '--timeout format 600000. '
                              f'Groups: {", ".join(NVME_TIMEOUTS.keys())}')
 
+    # v4.7: idle 유니버스 수렴 설정
+    parser.add_argument('--diagnose-stability', type=int, default=DIAGNOSE_STABILITY,
+                        help=f'idle 유니버스 수렴 조건: 새 PC 없이 연속 N회 (default: {DIAGNOSE_STABILITY}). '
+                             'SWD에서 주기적 인터럽트를 모두 포함하려면 크게 설정')
+    parser.add_argument('--diagnose-max', type=int, default=DIAGNOSE_MAX,
+                        help=f'idle 유니버스 수집 최대 샘플 수 (default: {DIAGNOSE_MAX})')
+
     # v4.5: 새 기능 CLI 옵션
     parser.add_argument('--calibration-runs', type=int, default=CALIBRATION_RUNS,
                         help='Calibration runs per initial seed (0=disable, default 3)')
@@ -3401,6 +3434,9 @@ if __name__ == "__main__":
         nsid_mut_prob=args.nsid_mut_prob,
         admin_swap_prob=args.admin_swap_prob,
         datalen_mut_prob=args.datalen_mut_prob,
+        # v4.7
+        diagnose_stability=args.diagnose_stability,
+        diagnose_max=args.diagnose_max,
         # v4.5
         calibration_runs=args.calibration_runs,
         deterministic_enabled=not args.no_deterministic,
