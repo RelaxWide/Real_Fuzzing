@@ -301,7 +301,7 @@ print('XFAIL=%d SKIP=%d' % (int(s['xfail']), int(s['skip'])))
     if [[ $DATA_LEN -gt 0 ]]; then
         nvme_cmd+=" --data-len=$DATA_LEN"
         if [[ $WRITE -eq 1 ]]; then
-            real_file=$(python3 -c "print($DATA_FILE)")
+            real_file="$DATA_FILE"
             nvme_cmd+=" --input-file=$real_file -w"
         else
             nvme_cmd+=" -r"
