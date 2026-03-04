@@ -53,9 +53,10 @@ else:  # auto
     try:
         jlink.set_tif(_JTAG)
         jlink.connect(DEVICE, speed=SPEED)
+        list(jlink.register_list())   # SWD 전용 타깃: connect()는 성공해도 register_list()에서 실패
         iface_str = "JTAG (auto)"
     except Exception as e:
-        print(f"[auto] JTAG 실패 ({e}), SWD로 재시도...")
+        print(f"[auto] JTAG 연결/검증 실패 ({e}), SWD로 재시도...")
         jlink.close()
         jlink = pylink.JLink()
         jlink.open()

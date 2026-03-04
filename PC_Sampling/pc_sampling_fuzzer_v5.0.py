@@ -530,13 +530,18 @@ class JLinkPCSampler:
                 self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
                 iface_name = "JTAG" if self.config.interface == _JTAG else "SWD"
             else:
-                # auto: JTAG 먼저 시도
+                # auto: JTAG 먼저 시도 + register_list()로 실제 CPU 응답 검증
+                # 주의: SWD 전용 타깃에서 connect()는 예외 없이 성공하지만
+                #       CPU가 JTAG에 응답하지 않아 register_list()에서 실패함.
+                #       connect() 성공만으로는 실제 연결을 보장할 수 없으므로
+                #       register_list()까지 확인해야 함.
                 try:
                     self.jlink.set_tif(_JTAG)
                     self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
+                    list(self.jlink.register_list())   # 실제 CPU 응답 검증
                     iface_name = "JTAG (auto)"
                 except Exception as jtag_err:
-                    log.warning(f"[J-Link] JTAG 연결 실패 ({jtag_err}), SWD로 재시도...")
+                    log.warning(f"[J-Link] JTAG 연결/검증 실패 ({jtag_err}), SWD로 재시도...")
                     self.jlink.close()
                     self.jlink = pylink.JLink()
                     self.jlink.open()
