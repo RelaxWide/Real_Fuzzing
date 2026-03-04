@@ -1043,25 +1043,52 @@ class NVMeFuzzer:
                 log.info("[MOpt] Core→Pilot (reset)")
 
     def _log_smart(self):
-        """v4.3: NVMe SMART / Health 로그를 읽어 INFO 레벨로 기록."""
+        """v4.3: NVMe SMART / Health 로그를 읽어 INFO 레벨로 기록.
+
+        subprocess.run(timeout=) 은 timeout 후 kill() 뒤에 communicate()를 한 번 더
+        호출하는데, NVMe 장치가 D-state인 경우 파이프가 절대 닫히지 않아 영구 블로킹된다.
+        Popen을 직접 써서 timeout 시 파이프만 닫고 대기 없이 반환한다.
+        """
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 ['nvme', 'smart-log', self.config.nvme_device],
-                capture_output=True, text=True, timeout=10
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                log.info("[SMART] === NVMe SMART / Health Log ===")
-                for line in result.stdout.strip().splitlines():
-                    log.info(f"[SMART] {line}")
-            else:
-                log.warning(f"[SMART] smart-log 실패 (rc={result.returncode}): "
-                            f"{result.stderr.strip()}")
-        except subprocess.TimeoutExpired:
-            log.warning("[SMART] smart-log 타임아웃 (10s)")
         except FileNotFoundError:
             log.warning("[SMART] nvme-cli가 설치되지 않았습니다")
+            return
         except Exception as e:
             log.warning(f"[SMART] smart-log 실행 오류: {e}")
+            return
+
+        try:
+            stdout_data, stderr_data = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            # D-state 프로세스는 SIGKILL도 무시 → communicate() 재호출 금지.
+            # 파이프를 닫고 non-blocking poll만 해서 계속 진행한다.
+            # (좀비 프로세스는 인터프리터 종료 시 OS가 정리)
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+            proc.poll()
+            log.warning("[SMART] smart-log 타임아웃 (10s) — NVMe 장치 응답 없음")
+            return
+
+        if proc.returncode == 0 and stdout_data.strip():
+            log.info("[SMART] === NVMe SMART / Health Log ===")
+            for line in stdout_data.decode(errors='replace').strip().splitlines():
+                log.info(f"[SMART] {line}")
+        else:
+            log.warning(f"[SMART] smart-log 실패 (rc={proc.returncode}): "
+                        f"{stderr_data.decode(errors='replace').strip()}")
 
     def _setup_directories(self):
         self.crashes_dir.mkdir(parents=True, exist_ok=True)
@@ -2891,11 +2918,13 @@ class NVMeFuzzer:
             except (OSError, ValueError):
                 pass  # 메인 스레드가 아닌 경우 무시
 
-            # v4.3: 퍼징 종료 후 SMART 기록 (timeout crash 시 nvme 응답 없을 수 있음)
-            try:
-                self._log_smart()
-            except Exception:
-                pass
+            # v4.3: 퍼징 종료 후 SMART 기록
+            # timeout crash 시 NVMe 장치가 D-state → nvme-cli가 영구 블로킹될 수 있으므로 스킵
+            if not self._timeout_crash:
+                try:
+                    self._log_smart()
+                except Exception:
+                    pass
 
             # 각 단계를 독립적으로 보호하여 하나가 실패해도 나머지 실행
             try:
