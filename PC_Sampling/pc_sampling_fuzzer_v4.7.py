@@ -588,7 +588,9 @@ class JLinkPCSampler:
         log.warning(f"[Diagnose] 결과: {len(pcs)}/{count} 성공, "
                  f"failures={failures}, unique PCs={len(unique_pcs)}")
 
-        # v4.7: idle PC 집합 구성
+        # v4.7: idle PC 집합 구성 (정보 표시 / 디버그용, 샘플링 조기종료에는 미사용)
+        # 조기종료는 per-run 수렴 감지(_sampling_worker)가 담당하므로
+        # idle_pcs가 20개+여도 퍼저 동작에 영향 없음.
         # JTAG: WFI에서 항상 같은 주소 → 단일 PC가 높은 빈도로 등장
         # SWD:  WFI wake로 idle loop 내 여러 주소 순환 → 개별 빈도는 낮지만 합산은 높음
         # 전략: 전체 샘플의 5% 이상(최소 2회) 등장한 PC를 모두 idle_pcs에 포함
@@ -673,13 +675,11 @@ class JLinkPCSampler:
         self._stopped_reason = ""
 
         sample_count = 0
-        since_last_global_new = 0   # 연속 "이미 알려진 PC" 카운터
-        consecutive_idle = 0         # v4.2: 연속 idle PC 카운터
+        since_last_global_new = 0   # 연속 "이미 알려진 PC" 카운터 (global 기준)
+        no_new_local = 0             # v4.7: 연속 "이번 실행에서 이미 본 PC" 카운터
         interval = self.config.sample_interval_us / 1_000_000
         sat_limit = self.config.saturation_limit
         global_sat_limit = self.config.global_saturation_limit  # v4.3: 설정값 사용
-        idle_pc = self.idle_pc       # v4.2: 로컬 캐싱 (대표값, 로그용)
-        idle_pcs = self.idle_pcs     # v4.7: idle PC 집합 (JTAG 단일 / SWD 복수 대응)
 
         # global_coverage(PC 주소 set) 참조 캐싱
         # CPython set.__contains__는 GIL 하에서 안전
@@ -695,6 +695,9 @@ class JLinkPCSampler:
                 self._last_raw_pcs.append(pc)
 
                 if self._in_range(pc):
+                    # v4.7: current_trace 추가 전에 새 PC 여부 확인
+                    is_new_this_run = pc not in self.current_trace
+
                     if prev_pc == 0xFFFFFFFF:
                         # 첫 번째 in-range PC: sentinel이므로 edge 생성하지 않음
                         prev_pc = pc
@@ -711,15 +714,17 @@ class JLinkPCSampler:
                     else:
                         since_last_global_new += 1
 
-                    # v4.7: idle PC 집합 기반 연속 카운터 (JTAG 단일 / SWD 복수 모두 대응)
-                    if idle_pcs and pc in idle_pcs:
-                        consecutive_idle += 1
+                    # v4.7: per-run 수렴 감지
+                    # idle_pcs 사전 정의 없이 "이번 실행에서 이미 본 PC"로 수렴 판단.
+                    # JTAG(idle=1개)/SWD(idle=20개+) 모두 동작:
+                    # 처음 수십 샘플에 idle 주소 전부 수집 → 이후 no_new_local 상승 → 조기종료
+                    if is_new_this_run:
+                        no_new_local = 0
                     else:
-                        consecutive_idle = 0
+                        no_new_local += 1
                 else:
                     self._out_of_range_count += 1
-                    # out-of-range도 idle 판정에 포함하지 않음
-                    consecutive_idle = 0
+                    # out-of-range는 per-run 수렴 판단에서 제외 (카운터 변경 없음)
 
                 sample_count += 1
                 self.total_samples += 1
@@ -729,8 +734,8 @@ class JLinkPCSampler:
                     self._unique_at_intervals[sample_count] = len(self.current_trace)
 
                 # 조기 종료 조건 (OR)
-                # 조건1: 연속 global_sat_limit회 이미 알려진 PC (새 코드 경로 없음)
-                # 조건2: 연속 sat_limit회 idle PC에 머물러 있음
+                # 조건1: 연속 global_sat_limit회 이미 알려진 PC (새 코드 경로 없음, global 기준)
+                # 조건2: 연속 sat_limit회 이번 실행에서 이미 본 PC (per-run 수렴, JTAG/SWD 공통)
                 if sat_limit > 0:
                     if global_sat_limit > 0 and since_last_global_new >= global_sat_limit:
                         self._stopped_reason = (
@@ -739,10 +744,11 @@ class JLinkPCSampler:
                             f"limit={global_sat_limit})"
                         )
                         break
-                    if idle_pcs and consecutive_idle >= sat_limit:
+                    if no_new_local >= sat_limit:
                         self._stopped_reason = (
-                            f"idle_saturated ({len(idle_pcs)} idle PCs "
-                            f"x{consecutive_idle} consecutive)"
+                            f"local_saturated (no new run-PC for "
+                            f"{no_new_local} consecutive samples, "
+                            f"run_unique={len(self.current_trace)})"
                         )
                         break
 
