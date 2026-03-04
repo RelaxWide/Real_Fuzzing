@@ -405,6 +405,11 @@ class FuzzConfig:
     # v4.5+: Corpus 하드 상한 (0 = 무제한)
     max_corpus_hard_limit: int = MAX_CORPUS_HARD_LIMIT
 
+    # v4.7: FWDownload 실제 펌웨어 시드 지원
+    fw_bin: Optional[str] = None        # 펌웨어 바이너리 경로 (없으면 더미 시드)
+    fw_xfer_size: int = 32768           # FWDownload 청크 크기(바이트), nvme fw-download -x 와 동일
+    fw_slot: int = 1                    # FWCommit 슬롯 번호
+
 
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     """파일 + 콘솔 동시 로깅 설정 (실행마다 날짜시간 로그 파일 생성)"""
@@ -1219,7 +1224,63 @@ class NVMeFuzzer:
             ],
         }
 
+        # v4.7: fw_bin이 제공된 경우 FWDownload/FWCommit 실제 시드 생성
+        fw_bin  = self.config.fw_bin
+        fw_xfer = self.config.fw_xfer_size
+        fw_slot = self.config.fw_slot
+        use_real_fw = bool(fw_bin and os.path.isfile(fw_bin))
+        if use_real_fw:
+            log.info(f"[Seed] fw_bin={fw_bin} (xfer={fw_xfer}B slot={fw_slot}) → 실제 FWDownload 시드 생성")
+        else:
+            log.info("[Seed] fw_bin 미지정 또는 파일 없음 → FWDownload 더미 시드 사용")
+
         for cmd in self.commands:
+            # ── FWDownload: fw_bin 있으면 실제 청크 시드, 없으면 더미 ──
+            if cmd.name == "FWDownload":
+                if use_real_fw:
+                    with open(fw_bin, "rb") as f:
+                        fw_data = f.read()
+                    offset = 0
+                    chunk_idx = 0
+                    while offset < len(fw_data):
+                        chunk = fw_data[offset:offset + fw_xfer]
+                        if len(chunk) % 4 != 0:
+                            chunk = chunk + b'\x00' * (4 - len(chunk) % 4)
+                        numd = (len(chunk) // 4) - 1  # CDW10: NUMD (0-based)
+                        ofst = offset // 4             # CDW11: OFST (dword offset)
+                        seed = Seed(data=chunk, cmd=cmd,
+                                    cdw10=numd, cdw11=ofst, found_at=0)
+                        seeds.append(seed)
+                        log.info(f"[Seed] FWDownload chunk {chunk_idx} "
+                                 f"offset={offset} ({len(chunk)}B) NUMD=0x{numd:x}")
+                        offset += fw_xfer
+                        chunk_idx += 1
+                else:
+                    # 더미: 1KB zeros (변이 시작점용)
+                    seed = Seed(data=b'\x00' * 1024, cmd=cmd,
+                                cdw10=0xFF, cdw11=0, found_at=0)
+                    seeds.append(seed)
+                    log.info("[Seed] FWDownload dummy 1KB (fw_bin 없음)")
+                continue
+
+            # ── FWCommit: fw_bin 있으면 올바른 슬롯으로, 없으면 기본 2개 ──
+            if cmd.name == "FWCommit":
+                if use_real_fw:
+                    cdw10_commit = (fw_slot << 3) | 0x01  # CA=1: replace, activate on reset
+                    seed = Seed(data=b'', cmd=cmd, cdw10=cdw10_commit, found_at=0)
+                    seeds.append(seed)
+                    log.info(f"[Seed] FWCommit slot={fw_slot} action=1 "
+                             f"CDW10=0x{cdw10_commit:08x}")
+                else:
+                    for tmpl in SEED_TEMPLATES["FWCommit"]:
+                        seed = Seed(data=b'', cmd=cmd,
+                                    cdw10=tmpl.get('cdw10', 0), found_at=0)
+                        seeds.append(seed)
+                        log.info(f"[Seed] FWCommit CDW10=0x{seed.cdw10:08x} "
+                                 f"({tmpl.get('description','')})")
+                continue
+
+            # ── 나머지 명령어: SEED_TEMPLATES 사용 ──
             templates = SEED_TEMPLATES.get(cmd.name, [])
             if templates:
                 for tmpl in templates:
@@ -3095,6 +3156,14 @@ if __name__ == "__main__":
     parser.add_argument('--output', default=OUTPUT_DIR, help='Output dir')
     parser.add_argument('--seed-dir', default=SEED_DIR,
                         help='Seed directory path (load previous corpus as seeds)')
+    parser.add_argument('--fw-bin', default=None,
+                        help='[v4.7] 펌웨어 바이너리 경로 (FWDownload 실제 시드 생성, '
+                             '없으면 더미 1KB 시드)')
+    parser.add_argument('--fw-xfer', type=int, default=32768,
+                        help='[v4.7] FWDownload 청크 크기(바이트), nvme fw-download -x 와 동일 '
+                             '(default: 32768)')
+    parser.add_argument('--fw-slot', type=int, default=1,
+                        help='[v4.7] FWCommit 슬롯 번호 (default: 1)')
     parser.add_argument('--samples', type=int, default=MAX_SAMPLES_PER_RUN)
     parser.add_argument('--interval', type=int, default=SAMPLE_INTERVAL_US,
                         help='Sample interval (us)')
@@ -3253,6 +3322,10 @@ if __name__ == "__main__":
         mopt_enabled=not args.no_mopt,
         mopt_pilot_period=args.mopt_pilot_period,
         mopt_core_period=args.mopt_core_period,
+        # v4.7
+        fw_bin=args.fw_bin,
+        fw_xfer_size=args.fw_xfer,
+        fw_slot=args.fw_slot,
     )
 
     fuzzer = NVMeFuzzer(config)
