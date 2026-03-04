@@ -5,8 +5,9 @@
 새 SSD 제품에서 PC 레지스터 인덱스를 확인할 때 사용합니다.
 
 사용법:
+  python3 jlink_reg_diag.py                              # auto (JTAG→SWD fallback)
   python3 jlink_reg_diag.py --device Cortex-M7 --speed 4000
-  python3 jlink_reg_diag.py --device RH850F1KM --speed 1000 --swd
+  python3 jlink_reg_diag.py --device Cortex-R8 --interface swd
   python3 jlink_reg_diag.py --pc-reg 15   # 특정 인덱스가 PC인지 확인
 """
 
@@ -17,13 +18,16 @@ import argparse
 parser = argparse.ArgumentParser(description='J-Link 레지스터 진단')
 parser.add_argument('--device', default='Cortex-R8', help='J-Link 타깃 디바이스명 (default: Cortex-R8)')
 parser.add_argument('--speed', type=int, default=12000, help='JTAG/SWD 속도 kHz (default: 12000)')
-parser.add_argument('--swd', action='store_true', help='SWD 인터페이스 사용 (기본: JTAG)')
+parser.add_argument('--interface', choices=['auto', 'jtag', 'swd'], default='auto',
+                    help='인터페이스 (default: auto). auto=JTAG 먼저 시도 후 실패 시 SWD 자동 전환')
 parser.add_argument('--pc-reg', type=int, default=None, help='PC 레지스터 인덱스 강제 지정 (auto-detect 건너뜀)')
 args = parser.parse_args()
 
 DEVICE = args.device
 SPEED  = args.speed
-INTERFACE = pylink.enums.JLinkInterfaces.SWD if args.swd else pylink.enums.JLinkInterfaces.JTAG
+
+_JTAG = pylink.enums.JLinkInterfaces.JTAG
+_SWD  = pylink.enums.JLinkInterfaces.SWD
 
 def resume(jl):
     """halt 후 실행 재개 (CPU 리셋 없이)"""
@@ -36,10 +40,29 @@ def resume(jl):
 
 jlink = pylink.JLink()
 jlink.open()
-jlink.set_tif(INTERFACE)
-jlink.connect(DEVICE, speed=SPEED)
 
-iface_str = "SWD" if args.swd else "JTAG"
+if args.interface == 'swd':
+    jlink.set_tif(_SWD)
+    jlink.connect(DEVICE, speed=SPEED)
+    iface_str = "SWD"
+elif args.interface == 'jtag':
+    jlink.set_tif(_JTAG)
+    jlink.connect(DEVICE, speed=SPEED)
+    iface_str = "JTAG"
+else:  # auto
+    try:
+        jlink.set_tif(_JTAG)
+        jlink.connect(DEVICE, speed=SPEED)
+        iface_str = "JTAG (auto)"
+    except Exception as e:
+        print(f"[auto] JTAG 실패 ({e}), SWD로 재시도...")
+        jlink.close()
+        jlink = pylink.JLink()
+        jlink.open()
+        jlink.set_tif(_SWD)
+        jlink.connect(DEVICE, speed=SPEED)
+        iface_str = "SWD (auto-fallback)"
+
 print(f"Connected: {DEVICE} @ {SPEED}kHz ({iface_str})")
 print(f"Core ID   : {hex(jlink.core_id())}")
 print(f"Device family: {jlink.device_family()}")

@@ -335,7 +335,7 @@ class Seed:
 @dataclass
 class FuzzConfig:
     device_name: str = JLINK_DEVICE
-    interface: int = pylink.enums.JLinkInterfaces.JTAG
+    interface: Optional[int] = None  # None=auto(JTAG→SWD), 또는 JLinkInterfaces.JTAG/SWD
     jtag_speed: int = JLINK_SPEED
     pc_reg_index: Optional[int] = None  # None = auto-detect, 정수 = 강제 지정
 
@@ -483,10 +483,31 @@ class JLinkPCSampler:
 
             self.jlink = pylink.JLink()
             self.jlink.open()
-            self.jlink.set_tif(self.config.interface)
-            self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
 
-            log.warning(f"[J-Link] Connected: {self.config.device_name} @ {self.config.jtag_speed}kHz")
+            # 인터페이스 결정: None=auto(JTAG 먼저 시도 → 실패 시 SWD fallback)
+            _JTAG = pylink.enums.JLinkInterfaces.JTAG
+            _SWD  = pylink.enums.JLinkInterfaces.SWD
+            if self.config.interface is not None:
+                # 명시적 지정: 그대로 사용
+                self.jlink.set_tif(self.config.interface)
+                self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
+                iface_name = "JTAG" if self.config.interface == _JTAG else "SWD"
+            else:
+                # auto: JTAG 먼저 시도
+                try:
+                    self.jlink.set_tif(_JTAG)
+                    self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
+                    iface_name = "JTAG (auto)"
+                except Exception as jtag_err:
+                    log.warning(f"[J-Link] JTAG 연결 실패 ({jtag_err}), SWD로 재시도...")
+                    self.jlink.close()
+                    self.jlink = pylink.JLink()
+                    self.jlink.open()
+                    self.jlink.set_tif(_SWD)
+                    self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
+                    iface_name = "SWD (auto-fallback)"
+
+            log.warning(f"[J-Link] Connected: {self.config.device_name} @ {self.config.jtag_speed}kHz [{iface_name}]")
 
             # R15(PC)의 실제 레지스터 인덱스: 강제 지정 우선, 없으면 자동 탐색
             if self.config.pc_reg_index is not None:
@@ -3179,8 +3200,10 @@ if __name__ == "__main__":
                         help='Enable ALL commands including destructive ones '
                              '(FormatNVM, Sanitize, FWCommit, etc.)')
     parser.add_argument('--speed', type=int, default=JLINK_SPEED, help='JTAG speed (kHz)')
-    parser.add_argument('--swd', action='store_true', default=False,
-                        help='SWD 인터페이스 사용 (기본: JTAG). Cortex-M 계열에서 필요할 수 있음')
+    parser.add_argument('--interface', choices=['auto', 'jtag', 'swd'], default='auto',
+                        help='J-Link 인터페이스 (default: auto). '
+                             'auto=JTAG 먼저 시도 후 실패 시 SWD로 자동 전환. '
+                             'jtag/swd=강제 지정')
     parser.add_argument('--pc-reg-index', type=int, default=None,
                         help='PC 레지스터 J-Link 인덱스 수동 지정. '
                              '자동 탐색 실패 시 jlink_reg_diag.py 로 확인 후 사용 '
@@ -3322,8 +3345,11 @@ if __name__ == "__main__":
 
     config = FuzzConfig(
         device_name=args.device,
-        interface=(pylink.enums.JLinkInterfaces.SWD if args.swd
-                   else pylink.enums.JLinkInterfaces.JTAG),
+        interface={
+            'auto': None,
+            'jtag': pylink.enums.JLinkInterfaces.JTAG,
+            'swd':  pylink.enums.JLinkInterfaces.SWD,
+        }[args.interface],
         jtag_speed=args.speed,
         pc_reg_index=args.pc_reg_index,
         nvme_device=args.nvme,
