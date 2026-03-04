@@ -685,14 +685,15 @@ class JLinkPCSampler:
         while consecutive_no_new < stability and total < max_samples:
             pc = self._read_pc()
             total += 1
-            if pc is not None:
-                if pc not in idle_universe:
-                    idle_universe.add(pc)
-                    consecutive_no_new = 0
-                    log.warning(f"  [+{total:4d}] 새 idle PC: {hex(pc)} "
-                                f"(누적 {len(idle_universe)}개)")
-                else:
-                    consecutive_no_new += 1
+            if pc is not None and pc not in idle_universe:
+                # 새 PC 발견 → 카운터 리셋
+                idle_universe.add(pc)
+                consecutive_no_new = 0
+                log.warning(f"  [+{total:4d}] 새 idle PC: {hex(pc)} "
+                            f"(누적 {len(idle_universe)}개)")
+            else:
+                # 기존 PC 재등장 또는 read 실패 → 수렴 카운터 증가
+                consecutive_no_new += 1
             # 샘플 간격 없음 — 빠른 수렴 우선
 
         if consecutive_no_new >= stability:
