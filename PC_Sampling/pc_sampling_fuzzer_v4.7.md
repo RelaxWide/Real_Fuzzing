@@ -53,6 +53,24 @@ sudo python3 pc_sampling_fuzzer_v4.7.py \
 
 ---
 
+### SWD 인터페이스 (idle 감지 비활성화 권장)
+
+```bash
+sudo python3 pc_sampling_fuzzer_v4.7.py \
+  --device Cortex-R8 \
+  --interface swd \
+  --nvme /dev/nvme0 \
+  --addr-start 0x00000000 \
+  --addr-end 0x00147FFF \
+  --saturation-limit 0 \          # SWD: per-run local saturation 비활성화
+  --global-saturation-limit 20 \  # global 기준 종료 신호로 대체
+  --output ./output/run_swd
+```
+
+> SWD에서 `--saturation-limit` 기본값(10)을 그대로 쓰면 명령 처리 루프에서 오발동할 수 있습니다.
+
+---
+
 ### 펌웨어 포함 전체 명령어 실행 (FWDownload/FWCommit 포함)
 
 ```bash
@@ -173,8 +191,8 @@ NVME_TIMEOUTS = {
 | `--samples N` | `500` | 명령어 1회당 최대 PC 샘플 수 |
 | `--interval US` | `0` | 샘플 간격 (마이크로초, 0 = halt 직후 즉시 재샘플) |
 | `--post-cmd-delay MS` | `0` | 명령 완료 후 추가 tail 샘플링 시간 (ms) |
-| `--saturation-limit N` | `10` | idle PC가 N회 연속 나오면 조기 종료 |
-| `--global-saturation-limit N` | `20` | global 커버리지 대비 새 PC 없이 N회 연속이면 조기 종료 |
+| `--saturation-limit N` | `10` | per-run 수렴 감지: 이번 실행에서 이미 본 PC가 N회 연속이면 조기 종료. **JTAG**: 단일 idle PC에서 빠르게 수렴, 그대로 사용. **SWD**: 처리 루프 재방문과 idle 구별 불가 → `0`으로 비활성화 권장 |
+| `--global-saturation-limit N` | `20` | global 커버리지 대비 새 PC 없이 N회 연속이면 조기 종료. SWD에서 `--saturation-limit 0` 설정 시 주요 종료 신호 |
 
 ### Mutation 옵션
 

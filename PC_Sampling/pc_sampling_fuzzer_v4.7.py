@@ -168,8 +168,13 @@ NVME_TIMEOUTS = {
 # PC 샘플링 설정
 SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
 MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수 (상한)
-SATURATION_LIMIT      = 10    # idle PC 연속 N회 감지 시 샘플링 조기 종료
-GLOBAL_SATURATION_LIMIT = 20  # 연속 N회 새 global PC 없으면 조기 종료 (v4.5+: edge→PC 기준 전환)
+SATURATION_LIMIT      = 10    # per-run 수렴 감지: 이번 실행에서 이미 본 PC가 N회 연속이면 조기 종료
+                               # 주의: 처리 루프가 있는 펌웨어에서 오발동 가능.
+                               # JTAG: 단일 idle PC → 빠르게 감지, 이 값 그대로 사용.
+                               # SWD : 처리 루프 재방문과 idle 구별 불가 → 0으로 비활성화 권장.
+                               #        대신 GLOBAL_SATURATION_LIMIT + subprocess 완료 신호에 의존.
+GLOBAL_SATURATION_LIMIT = 20  # 연속 N회 새 global PC 없으면 조기 종료.
+                               # SWD에서 SATURATION_LIMIT=0 시 주요 종료 신호로 동작.
 POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 
 # v4.6: NVMe passthru 명령 자체의 timeout (nvme-cli --timeout 인자)
