@@ -72,7 +72,7 @@ tmpdir, namespace, fw_bin, fw_slot, fw_xfer = sys.argv[1:]
 namespace = int(namespace)
 fw_slot   = int(fw_slot)
 fw_xfer   = int(fw_xfer)
-MAX_DATA_BUF = 65536
+MAX_DATA_BUF = 256 * 512  # 131072 — 가장 큰 시드(256블록 Read/Write) 수용
 
 # ── FUA 비트 위치 수정: CDW12[29] (NVMe spec) ──
 # 이전 코드는 (1<<14) 를 사용해 NLB=0x4000 이 되어 버퍼 불일치 → rc=2
@@ -153,7 +153,7 @@ add("Read", 0x02, "io", True, False, cdw10=0,     cdw11=0, cdw12=7,      desc="R
 add("Read", 0x02, "io", True, False, cdw10=0,     cdw11=0, cdw12=31,     desc="Read LBA 0, 32 blocks")
 add("Read", 0x02, "io", True, False, cdw10=0,     cdw11=0, cdw12=127,    desc="Read LBA 0, 128 blocks")
 add("Read", 0x02, "io", True, False, cdw10=0,     cdw11=0, cdw12=255,    desc="Read LBA 0, 256 blocks")
-# NLB max: data_len이 MAX_DATA_BUF에 cap → NLB 불일치 → 예상 실패
+# NLB=0xFFFF: 65535블록 × 512 = 32MB → MAX_DATA_BUF(131072)와 불일치 → 예상 실패
 add("Read", 0x02, "io", True, False, cdw10=0,     cdw11=0, cdw12=0xFFFF, desc="Read NLB max (OOR buffer mismatch)", xfail=True)
 add("Read", 0x02, "io", True, False, cdw10=500,   cdw11=0, cdw12=0,      desc="Read LBA 500")
 add("Read", 0x02, "io", True, False, cdw10=1000,  cdw11=0, cdw12=0,      desc="Read LBA 1000")
