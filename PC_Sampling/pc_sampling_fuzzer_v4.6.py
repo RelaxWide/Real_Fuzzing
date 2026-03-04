@@ -2878,11 +2878,24 @@ class NVMeFuzzer:
                         break
 
         except KeyboardInterrupt:
-            log.warning("Interrupted by user")
+            log.warning("Interrupted by user — 정리 작업 완료 후 종료합니다 (잠시 대기)...")
 
         finally:
-            # v4.3: 퍼징 종료 후 SMART 기록
-            self._log_smart()
+            # Ctrl+C가 정리 작업을 중단하지 않도록 SIGINT 임시 무시.
+            # finally 블록이 KeyboardInterrupt로 중단되면 그래프/통계 저장이
+            # 스킵되므로, 정리가 끝날 때까지 추가 시그널을 억제한다.
+            import signal as _signal
+            _old_sigint = None
+            try:
+                _old_sigint = _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+            except (OSError, ValueError):
+                pass  # 메인 스레드가 아닌 경우 무시
+
+            # v4.3: 퍼징 종료 후 SMART 기록 (timeout crash 시 nvme 응답 없을 수 있음)
+            try:
+                self._log_smart()
+            except Exception:
+                pass
 
             # 각 단계를 독립적으로 보호하여 하나가 실패해도 나머지 실행
             try:
@@ -3008,6 +3021,13 @@ class NVMeFuzzer:
                     pass
                 # timeout crash가 아닌 정상 종료 시에만 타임아웃 복원
                 self._restore_nvme_timeouts()
+
+            # 정리 완료 — SIGINT 핸들러 복원
+            if _old_sigint is not None:
+                try:
+                    _signal.signal(_signal.SIGINT, _old_sigint)
+                except (OSError, ValueError):
+                    pass
 
 
 if __name__ == "__main__":
