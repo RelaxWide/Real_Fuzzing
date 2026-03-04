@@ -531,15 +531,23 @@ class JLinkPCSampler:
                 self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
                 iface_name = "JTAG" if self.config.interface == _JTAG else "SWD"
             else:
-                # auto: JTAG 먼저 시도 + register_list()/register_name() 모두 검증
-                # 주의: SWD 전용 타깃에서 connect()는 예외 없이 성공하지만
-                #       CPU가 JTAG에 응답하지 않아 register_name() 등에서 실패함.
-                #       register_list() 성공만으로는 부족하므로 register_name()까지
-                #       검증하는 _probe_pc_register_index()를 try 블록 안에서 호출.
+                # auto: JTAG 먼저 시도 + 실제 CPU 응답 검증 후 SWD fallback
+                # register_list()/register_name()은 J-Link 내부 DB를 읽으므로
+                # CPU 비응답 상태에서도 성공한다. 따라서 halt() 후 halted() 상태로
+                # 실제 CPU 통신 여부를 판별한다.
                 try:
                     self.jlink.set_tif(_JTAG)
                     self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
-                    # register_list() + register_name() 모두 검증 — 어느 쪽 실패해도 SWD fallback
+                    # 실제 CPU halt 응답으로 JTAG 연결 검증
+                    self.jlink.halt()
+                    _jtag_halted = False
+                    for _ in range(20):
+                        if self.jlink.halted():
+                            _jtag_halted = True
+                            break
+                        time.sleep(0.005)
+                    if not _jtag_halted:
+                        raise Exception("JTAG halt 미응답 (100ms 초과) — SWD 전용 타깃으로 판단")
                     _jtag_pc_idx = self._probe_pc_register_index()
                     iface_name = "JTAG (auto)"
                 except Exception as jtag_err:
