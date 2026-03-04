@@ -12,6 +12,7 @@
 #   -t TIMEOUT       명령 타임아웃(초)        (기본: 10)
 #   -f FIRMWARE.BIN  FWDownload/FWCommit용 펌웨어 바이너리 (기본: ./FW.bin)
 #   -s FW_SLOT       FWCommit 슬롯 번호       (기본: 1)
+#   -x XFER_SIZE     FWDownload 청크 크기(바이트, 기본: 32768 = nvme fw-download -x 32768)
 #   -v               상세 출력 (nvme 명령어 전체 표시)
 #   -h               도움말
 #
@@ -28,6 +29,7 @@ NAMESPACE=1
 TIMEOUT=10
 FW_BIN="FW.bin"
 FW_SLOT=1
+FW_XFER=32768
 VERBOSE=0
 
 RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[1;33m'; CYN='\033[0;36m'; DIM='\033[2m'; NC='\033[0m'
@@ -41,6 +43,7 @@ while getopts "d:n:t:f:s:vh" opt; do
         t) TIMEOUT="$OPTARG"   ;;
         f) FW_BIN="$OPTARG"    ;;
         s) FW_SLOT="$OPTARG"   ;;
+        x) FW_XFER="$OPTARG"   ;;
         v) VERBOSE=1           ;;
         h) usage               ;;
         *) echo "알 수 없는 옵션: -$OPTARG" >&2; exit 1 ;;
@@ -62,12 +65,13 @@ TMPDIR_SEED=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_SEED"' EXIT
 
 # ── Python: 초기 시드 목록 → JSON Lines ────────────────────────────
-SEED_JSON=$(python3 - "$TMPDIR_SEED" "$NAMESPACE" "$FW_BIN" "$FW_SLOT" <<'PYEOF'
+SEED_JSON=$(python3 - "$TMPDIR_SEED" "$NAMESPACE" "$FW_BIN" "$FW_SLOT" "$FW_XFER" <<'PYEOF'
 import sys, json, struct, os
 
-tmpdir, namespace, fw_bin, fw_slot = sys.argv[1:]
+tmpdir, namespace, fw_bin, fw_slot, fw_xfer = sys.argv[1:]
 namespace = int(namespace)
 fw_slot   = int(fw_slot)
+fw_xfer   = int(fw_xfer)
 MAX_DATA_BUF = 65536
 
 # ── FUA 비트 위치 수정: CDW12[29] (NVMe spec) ──
@@ -185,27 +189,34 @@ add("Write", 0x01, "io", True, True, cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0
 add("SetFeatures", 0x09, "admin", True, True, cdw10=0x07, cdw11=0x00010001, desc="Number of Queues", xfail=True)
 
 # ── FWDownload / FWCommit ─────────────────────────────────────────
-# 펌웨어 전체를 단일 FWDownload로 전송 (offset=0, numd=전체 크기)
-fw_size = os.path.getsize(fw_bin)
-fw_size_aligned = (fw_size + 3) & ~3  # CDW 단위(4바이트) 정렬
-if fw_size % 4 != 0:
-    # 패딩이 필요한 경우만 임시 파일 생성
-    with open(fw_bin, "rb") as fh:
-        fw_data = fh.read()
-    fw_file = os.path.join(tmpdir, "fw_padded.bin")
-    with open(fw_file, "wb") as fh:
-        fh.write(fw_data + b'\x00' * (fw_size_aligned - fw_size))
-else:
-    fw_file = fw_bin  # 원본 그대로 사용
-numd_total = (fw_size_aligned // 4) - 1  # CDW10: NUMD (0-based dword count)
-# add()의 MAX_DATA_BUF 캡을 우회해서 직접 추가
-seeds.append({"idx": idx, "cmd": "FWDownload", "opcode": 0x11, "type": "admin",
-              "nsid": 0, "cdw10": numd_total, "cdw11": 0, "cdw12": 0,
-              "cdw13": 0, "cdw14": 0, "cdw15": 0,
-              "data_len": fw_size_aligned, "write": True, "data_file": fw_file,
-              "desc": f"FWDownload full image {fw_size_aligned}B",
-              "xfail": False, "skip": False})
-idx += 1
+# nvme fw-download -x fw_xfer 과 동일하게 fw_xfer 바이트 청크로 분할 전송
+with open(fw_bin, "rb") as fh:
+    fw_data = fh.read()
+fw_size = len(fw_data)
+chunk_size = fw_xfer  # e.g. 32768 (컨트롤러 FWUG에 맞춰야 함)
+offset = 0
+chunk_idx = 0
+while offset < fw_size:
+    chunk = fw_data[offset:offset + chunk_size]
+    # 마지막 청크: 4바이트 정렬
+    if len(chunk) % 4 != 0:
+        chunk = chunk + b'\x00' * (4 - len(chunk) % 4)
+    chunk_len = len(chunk)
+    numd = (chunk_len // 4) - 1   # CDW10: NUMD (0-based)
+    ofst = offset // 4             # CDW11: OFST (dword offset)
+    fw_chunk_file = os.path.join(tmpdir, f"fw_chunk_{chunk_idx}.bin")
+    with open(fw_chunk_file, "wb") as fh:
+        fh.write(chunk)
+    # add()의 MAX_DATA_BUF 캡을 우회해서 직접 추가
+    seeds.append({"idx": idx, "cmd": "FWDownload", "opcode": 0x11, "type": "admin",
+                  "nsid": 0, "cdw10": numd, "cdw11": ofst, "cdw12": 0,
+                  "cdw13": 0, "cdw14": 0, "cdw15": 0,
+                  "data_len": chunk_len, "write": True, "data_file": fw_chunk_file,
+                  "desc": f"FWDownload chunk {chunk_idx} offset={offset} ({chunk_len}B)",
+                  "xfail": False, "skip": False})
+    idx += 1
+    offset += chunk_size
+    chunk_idx += 1
 # Commit Action 0b001 = replace slot, activate on next reset
 commit_action = 0x01  # CA=001: replace slot, no activation
 cdw10_commit  = (fw_slot << 3) | commit_action
@@ -238,8 +249,7 @@ if [[ -z "$SEED_JSON" ]]; then
 fi
 
 TOTAL=$(echo "$SEED_JSON" | wc -l)
-FW_INFO=""
-[[ -n "$FW_BIN" ]] && FW_INFO=" | FW: $(basename "$FW_BIN") slot=$FW_SLOT"
+FW_INFO=" | FW: $(basename "$FW_BIN") slot=$FW_SLOT xfer=${FW_XFER}B"
 
 echo "════════════════════════════════════════════════════════"
 echo "  Initial Seed Replay Test"
