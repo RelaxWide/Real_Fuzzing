@@ -189,39 +189,18 @@ add("Write", 0x01, "io", True, True, cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0
 add("SetFeatures", 0x09, "admin", True, True, cdw10=0x07, cdw11=0x00010001, desc="Number of Queues", xfail=True)
 
 # ── FWDownload / FWCommit ─────────────────────────────────────────
-# nvme fw-download -x fw_xfer 과 동일하게 fw_xfer 바이트 청크로 분할 전송
-with open(fw_bin, "rb") as fh:
-    fw_data = fh.read()
-fw_size = len(fw_data)
-chunk_size = fw_xfer  # e.g. 32768 (컨트롤러 FWUG에 맞춰야 함)
-offset = 0
-chunk_idx = 0
-while offset < fw_size:
-    chunk = fw_data[offset:offset + chunk_size]
-    # 마지막 청크: 4바이트 정렬
-    if len(chunk) % 4 != 0:
-        chunk = chunk + b'\x00' * (4 - len(chunk) % 4)
-    chunk_len = len(chunk)
-    numd = (chunk_len // 4) - 1   # CDW10: NUMD (0-based)
-    ofst = offset // 4             # CDW11: OFST (dword offset)
-    fw_chunk_file = os.path.join(tmpdir, f"fw_chunk_{chunk_idx}.bin")
-    with open(fw_chunk_file, "wb") as fh:
-        fh.write(chunk)
-    # add()의 MAX_DATA_BUF 캡을 우회해서 직접 추가
-    seeds.append({"idx": idx, "cmd": "FWDownload", "opcode": 0x11, "type": "admin",
-                  "nsid": 0, "cdw10": numd, "cdw11": ofst, "cdw12": 0,
-                  "cdw13": 0, "cdw14": 0, "cdw15": 0,
-                  "data_len": chunk_len, "write": True, "data_file": fw_chunk_file,
-                  "desc": f"FWDownload chunk {chunk_idx} offset={offset} ({chunk_len}B)",
-                  "xfail": False, "skip": False})
-    idx += 1
-    offset += chunk_size
-    chunk_idx += 1
-# Commit Action 0b001 = replace slot, activate on next reset
-commit_action = 0x01  # CA=001: replace slot, no activation
-cdw10_commit  = (fw_slot << 3) | commit_action
-add("FWCommit", 0x10, "admin", True, False,
-    cdw10=cdw10_commit, desc=f"FWCommit slot={fw_slot} action=1 (activate on reset)")
+# bash에서 'nvme fw-download -x fw_xfer' / 'nvme fw-commit' 로 실행
+# (단일 CLI 명령 = 단일 시드)
+fw_size = os.path.getsize(fw_bin)
+seeds.append({"idx": idx, "cmd": "FWDownload", "opcode": 0x11, "type": "fw",
+              "nsid": 0, "cdw10": 0, "cdw11": 0, "cdw12": 0,
+              "cdw13": 0, "cdw14": 0, "cdw15": 0,
+              "data_len": 0, "write": False, "data_file": "",
+              "desc": f"fw-download -f {os.path.basename(fw_bin)} -x {fw_xfer} ({fw_size}B)",
+              "xfail": False, "skip": False})
+idx += 1
+add("FWCommit", 0x10, "admin", True, False, cdw10=(fw_slot << 3) | 0x01,
+    desc=f"fw-commit slot={fw_slot} action=1 (activate on reset)")
 
 # ── FormatNVM ─────────────────────────────────────────────────────
 # SES=0 (No secure erase), LBAF=0. CDW10[11:9]=0, CDW10[3:0]=0 → 0x00
@@ -283,32 +262,37 @@ print('XFAIL=%d SKIP=%d' % (int(s['xfail']), int(s['skip'])))
         continue
     fi
 
-    # passthru 타입 / 타겟 장치
-    if [[ "$CTYPE" == "admin" ]]; then
-        PASSTHRU="admin-passthru"; TARGET="$DEVICE"
-    else
-        PASSTHRU="io-passthru";    TARGET="${DEVICE}n${NAMESPACE}"
-    fi
-
     # nvme 명령 구성
-    nvme_cmd="nvme $PASSTHRU $TARGET"
-    nvme_cmd+=" --opcode=$(python3 -c "print(hex($OPCODE))")"
-    nvme_cmd+=" --namespace-id=$NSID"
-    nvme_cmd+=" --cdw10=$(python3 -c "print(hex($CDW10))")"
-    nvme_cmd+=" --cdw11=$(python3 -c "print(hex($CDW11))")"
-    nvme_cmd+=" --cdw12=$(python3 -c "print(hex($CDW12))")"
-    nvme_cmd+=" --cdw13=$(python3 -c "print(hex($CDW13))")"
-    nvme_cmd+=" --cdw14=$(python3 -c "print(hex($CDW14))")"
-    nvme_cmd+=" --cdw15=$(python3 -c "print(hex($CDW15))")"
-    nvme_cmd+=" --timeout=$(( TIMEOUT * 1000 ))"
-
-    if [[ $DATA_LEN -gt 0 ]]; then
-        nvme_cmd+=" --data-len=$DATA_LEN"
-        if [[ $WRITE -eq 1 ]]; then
-            real_file="$DATA_FILE"
-            nvme_cmd+=" --input-file=$real_file -w"
+    if [[ "$CMD" == "FWDownload" ]]; then
+        # high-level 명령어 (단일 시드 = 단일 CLI)
+        nvme_cmd="nvme fw-download $DEVICE -f $FW_BIN -x $FW_XFER"
+    elif [[ "$CMD" == "FWCommit" ]]; then
+        nvme_cmd="nvme fw-commit $DEVICE -s $FW_SLOT -a 1"
+    else
+        # passthru 타입 / 타겟 장치
+        if [[ "$CTYPE" == "admin" ]]; then
+            PASSTHRU="admin-passthru"; TARGET="$DEVICE"
         else
-            nvme_cmd+=" -r"
+            PASSTHRU="io-passthru";    TARGET="${DEVICE}n${NAMESPACE}"
+        fi
+        nvme_cmd="nvme $PASSTHRU $TARGET"
+        nvme_cmd+=" --opcode=$(python3 -c "print(hex($OPCODE))")"
+        nvme_cmd+=" --namespace-id=$NSID"
+        nvme_cmd+=" --cdw10=$(python3 -c "print(hex($CDW10))")"
+        nvme_cmd+=" --cdw11=$(python3 -c "print(hex($CDW11))")"
+        nvme_cmd+=" --cdw12=$(python3 -c "print(hex($CDW12))")"
+        nvme_cmd+=" --cdw13=$(python3 -c "print(hex($CDW13))")"
+        nvme_cmd+=" --cdw14=$(python3 -c "print(hex($CDW14))")"
+        nvme_cmd+=" --cdw15=$(python3 -c "print(hex($CDW15))")"
+        nvme_cmd+=" --timeout=$(( TIMEOUT * 1000 ))"
+        if [[ $DATA_LEN -gt 0 ]]; then
+            nvme_cmd+=" --data-len=$DATA_LEN"
+            if [[ $WRITE -eq 1 ]]; then
+                real_file="$DATA_FILE"
+                nvme_cmd+=" --input-file=$real_file -w"
+            else
+                nvme_cmd+=" -r"
+            fi
         fi
     fi
 
