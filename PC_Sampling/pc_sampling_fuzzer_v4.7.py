@@ -156,7 +156,7 @@ NVME_NAMESPACE = 1
 # NVMe 명령어 그룹별 타임아웃 (ms)
 # 그룹에 속하지 않는 명령어는 모두 'command'에 해당
 NVME_TIMEOUTS = {
-    'command':      8_000,     # 일반 명령어 (Identify, GetLogPage, GetFeatures, Read, Write 등)
+    'command':      18_000,    # 일반 명령어 (Identify, GetLogPage, GetFeatures, Read, Write 등)
     'format':       600_000,   # Format NVM — 전체 미디어 포맷, 수 분 소요 가능
     'sanitize':     600_000,   # Sanitize — 보안 삭제, 수 분~수십 분 소요
     'fw_commit':    120_000,   # Firmware Commit — 펌웨어 슬롯 활성화, 리셋 포함 가능
