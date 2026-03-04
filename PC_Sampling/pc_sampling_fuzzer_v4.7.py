@@ -337,6 +337,7 @@ class FuzzConfig:
     device_name: str = JLINK_DEVICE
     interface: int = pylink.enums.JLinkInterfaces.JTAG
     jtag_speed: int = JLINK_SPEED
+    pc_reg_index: Optional[int] = None  # None = auto-detect, 정수 = 강제 지정
 
     nvme_device: str = NVME_DEVICE
     nvme_namespace: int = NVME_NAMESPACE
@@ -487,10 +488,14 @@ class JLinkPCSampler:
 
             log.warning(f"[J-Link] Connected: {self.config.device_name} @ {self.config.jtag_speed}kHz")
 
-            # R15(PC)의 실제 레지스터 인덱스를 동적으로 탐색
-            self._pc_reg_index = self._find_pc_register_index()
-            log.warning(f"[J-Link] PC register index: {self._pc_reg_index} "
-                     f"(name: {self.jlink.register_name(self._pc_reg_index)})")
+            # R15(PC)의 실제 레지스터 인덱스: 강제 지정 우선, 없으면 자동 탐색
+            if self.config.pc_reg_index is not None:
+                self._pc_reg_index = self.config.pc_reg_index
+                log.warning(f"[J-Link] PC register index: {self._pc_reg_index} (--pc-reg-index 강제 지정)")
+            else:
+                self._pc_reg_index = self._find_pc_register_index()
+                log.warning(f"[J-Link] PC register index: {self._pc_reg_index} "
+                         f"(name: {self.jlink.register_name(self._pc_reg_index)})")
 
             # DLL 함수 참조 캐싱 (pylink wrapper 우회, 매 호출 attribute lookup 제거)
             self._halt_func = self.jlink._dll.JLINKARM_Halt
@@ -503,16 +508,32 @@ class JLinkPCSampler:
             return False
 
     def _find_pc_register_index(self) -> int:
-        """register_list()에서 R15(PC)의 실제 인덱스를 찾는다.
-        Cortex-R8 등에서는 레지스터 인덱스가 0-15 순서가 아닐 수 있음."""
+        """register_list()에서 PC 레지스터의 실제 인덱스를 찾는다.
+
+        아키텍처별 PC 레지스터 이름:
+          ARM Cortex-R/A : R15, r15
+          ARM Cortex-M   : PC, R15
+          RISC-V         : PC, mepc, pc
+          MIPS           : PC, EPC
+        자동 탐색 실패 시 --pc-reg-index N 으로 수동 지정 가능.
+        """
+        _PC_NAMES = {'R15', 'PC', 'EPC', 'MEPC', 'SEPC'}
         try:
-            for idx in self.jlink.register_list():
-                name = self.jlink.register_name(idx)
-                if 'R15' in name or name.upper() == 'PC':
+            all_regs = list(self.jlink.register_list())
+            # 1단계: 이름이 정확히 PC 계열인 것
+            for idx in all_regs:
+                name = self.jlink.register_name(idx).upper().strip()
+                if name in _PC_NAMES:
+                    return idx
+            # 2단계: 이름에 R15 포함 (e.g. "R15_USR", "ARM_R15")
+            for idx in all_regs:
+                name = self.jlink.register_name(idx).upper().strip()
+                if 'R15' in name:
                     return idx
         except Exception as e:
             log.warning(f"[J-Link] register_list() 탐색 실패: {e}")
-        log.warning("[J-Link] R15 인덱스를 찾지 못함, 기본값 15 사용")
+        log.warning("[J-Link] PC 레지스터를 자동으로 찾지 못했습니다. fallback=15 사용.")
+        log.warning("[J-Link] 올바른 인덱스를 jlink_reg_diag.py 로 확인 후 --pc-reg-index N 으로 지정하세요.")
         return 15
 
     def diagnose(self, count: int = 20) -> bool:
@@ -3158,6 +3179,12 @@ if __name__ == "__main__":
                         help='Enable ALL commands including destructive ones '
                              '(FormatNVM, Sanitize, FWCommit, etc.)')
     parser.add_argument('--speed', type=int, default=JLINK_SPEED, help='JTAG speed (kHz)')
+    parser.add_argument('--swd', action='store_true', default=False,
+                        help='SWD 인터페이스 사용 (기본: JTAG). Cortex-M 계열에서 필요할 수 있음')
+    parser.add_argument('--pc-reg-index', type=int, default=None,
+                        help='PC 레지스터 J-Link 인덱스 수동 지정. '
+                             '자동 탐색 실패 시 jlink_reg_diag.py 로 확인 후 사용 '
+                             '(Cortex-R8=9, Cortex-M=15, 아키텍처마다 다름)')
     parser.add_argument('--runtime', type=int, default=TOTAL_RUNTIME_SEC)
     parser.add_argument('--output', default=OUTPUT_DIR, help='Output dir')
     parser.add_argument('--seed-dir', default=SEED_DIR,
@@ -3295,7 +3322,10 @@ if __name__ == "__main__":
 
     config = FuzzConfig(
         device_name=args.device,
+        interface=(pylink.enums.JLinkInterfaces.SWD if args.swd
+                   else pylink.enums.JLinkInterfaces.JTAG),
         jtag_speed=args.speed,
+        pc_reg_index=args.pc_reg_index,
         nvme_device=args.nvme,
         nvme_namespace=args.namespace,
         nvme_timeouts=nvme_timeouts,

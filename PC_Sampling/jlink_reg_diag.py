@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
 """J-Link 레지스터 읽기 진단 스크립트
-Cortex-R8에서 R15(PC) = index 9 확인 및 resume 동작 검증
+
+레지스터 인덱스 매핑, halt/resume 동작, PC 샘플링 동작을 검증합니다.
+새 SSD 제품에서 PC 레지스터 인덱스를 확인할 때 사용합니다.
+
+사용법:
+  python3 jlink_reg_diag.py --device Cortex-M7 --speed 4000
+  python3 jlink_reg_diag.py --device RH850F1KM --speed 1000 --swd
+  python3 jlink_reg_diag.py --pc-reg 15   # 특정 인덱스가 PC인지 확인
 """
 
 import pylink
 import time
+import argparse
 
-DEVICE = 'Cortex-R8'
-SPEED  = 12000
-PC_REG_INDEX = 9  # Cortex-R8: R15(PC)의 실제 J-Link 레지스터 인덱스
+parser = argparse.ArgumentParser(description='J-Link 레지스터 진단')
+parser.add_argument('--device', default='Cortex-R8', help='J-Link 타깃 디바이스명 (default: Cortex-R8)')
+parser.add_argument('--speed', type=int, default=12000, help='JTAG/SWD 속도 kHz (default: 12000)')
+parser.add_argument('--swd', action='store_true', help='SWD 인터페이스 사용 (기본: JTAG)')
+parser.add_argument('--pc-reg', type=int, default=None, help='PC 레지스터 인덱스 강제 지정 (auto-detect 건너뜀)')
+args = parser.parse_args()
+
+DEVICE = args.device
+SPEED  = args.speed
+INTERFACE = pylink.enums.JLinkInterfaces.SWD if args.swd else pylink.enums.JLinkInterfaces.JTAG
 
 def resume(jl):
     """halt 후 실행 재개 (CPU 리셋 없이)"""
@@ -21,10 +36,11 @@ def resume(jl):
 
 jlink = pylink.JLink()
 jlink.open()
-jlink.set_tif(pylink.enums.JLinkInterfaces.JTAG)
+jlink.set_tif(INTERFACE)
 jlink.connect(DEVICE, speed=SPEED)
 
-print(f"Connected: {DEVICE} @ {SPEED}kHz")
+iface_str = "SWD" if args.swd else "JTAG"
+print(f"Connected: {DEVICE} @ {SPEED}kHz ({iface_str})")
 print(f"Core ID   : {hex(jlink.core_id())}")
 print(f"Device family: {jlink.device_family()}")
 print()
@@ -34,14 +50,32 @@ print()
 # =============================================================
 print("=== TEST 1: Register index mapping ===")
 reg_indices = jlink.register_list()
+auto_pc_index = None
 for idx in reg_indices:
     name = jlink.register_name(idx)
     tag = ""
-    if "R15" in name or "PC" in name.upper():
-        tag = "  <-- PC"
-    elif "CPSR" in name.upper():
-        tag = "  <-- CPSR"
+    name_up = name.upper()
+    if "R15" in name_up or name_up in ("PC", "EPC", "MEPC", "SEPC"):
+        tag = "  <-- PC (auto-detect)"
+        if auto_pc_index is None:
+            auto_pc_index = idx
+    elif "CPSR" in name_up or "PSR" in name_up:
+        tag = "  <-- status register"
     print(f"  index {idx:3d} -> {name}{tag}")
+print()
+
+# 사용할 PC 인덱스 결정
+if args.pc_reg is not None:
+    PC_REG_INDEX = args.pc_reg
+    print(f"  => PC 인덱스: {PC_REG_INDEX} (--pc-reg 강제 지정)")
+elif auto_pc_index is not None:
+    PC_REG_INDEX = auto_pc_index
+    print(f"  => PC 인덱스: {PC_REG_INDEX} (자동 탐지)")
+else:
+    PC_REG_INDEX = 15
+    print(f"  => PC 인덱스: {PC_REG_INDEX} (탐지 실패, fallback 15)")
+    print("  !! 위 레지스터 목록에서 PC에 해당하는 index를 확인 후")
+    print("  !! --pc-reg N 으로 직접 지정하거나 퍼저에 --pc-reg-index N 을 쓰세요.")
 print()
 
 # =============================================================
@@ -67,11 +101,13 @@ print()
 # =============================================================
 # TEST 3: index 9 (R15) vs index 15 비교
 # =============================================================
-print("=== TEST 3: register_read(9) vs register_read(15) ===")
-val_idx9 = jlink.register_read(PC_REG_INDEX)
+print(f"=== TEST 3: register_read({PC_REG_INDEX}) vs register_read(15) ===")
+val_pc  = jlink.register_read(PC_REG_INDEX)
 val_idx15 = jlink.register_read(15)
-print(f"  register_read({PC_REG_INDEX})  [R15/PC] = 0x{val_idx9:08X}")
-print(f"  register_read(15) [wrong]  = 0x{val_idx15:08X}")
+print(f"  register_read({PC_REG_INDEX})  [PC 후보] = 0x{val_pc:08X}")
+print(f"  register_read(15)          = 0x{val_idx15:08X}")
+if PC_REG_INDEX != 15:
+    print(f"  => 두 값이 다르면 index {PC_REG_INDEX}이 올바른 PC 인덱스입니다.")
 print()
 
 # =============================================================
