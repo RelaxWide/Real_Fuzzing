@@ -1,34 +1,46 @@
 #!/usr/bin/env bash
 # seed_replay_test.sh
 # 퍼저의 _generate_default_seeds() 초기 시드를 NVMe passthru로 직접 실행하여
-# 모두 정상 응답(rc=0)을 반환하는지 확인한다.
+# 정상 응답(rc=0)을 반환하는지 확인한다.
 #
 # 사용법:
 #   sudo ./seed_replay_test.sh [옵션]
 #
 # 옵션:
-#   -d DEVICE    NVMe 장치          (기본: /dev/nvme0)
-#   -n NAMESPACE NVMe 네임스페이스  (기본: 1)
-#   -t TIMEOUT   명령 타임아웃(초)  (기본: 10)
-#   -v           상세 출력 (nvme 명령어 전체 표시)
-#   -h           도움말
+#   -d DEVICE        NVMe 장치                (기본: /dev/nvme0)
+#   -n NAMESPACE     NVMe 네임스페이스 ID     (기본: 1)
+#   -t TIMEOUT       명령 타임아웃(초)        (기본: 10)
+#   -f FIRMWARE.BIN  FWDownload/FWCommit 테스트용 펌웨어 바이너리 (없으면 FW 테스트 스킵)
+#   -s FW_SLOT       FWCommit 슬롯 번호       (기본: 1)
+#   -v               상세 출력 (nvme 명령어 전체 표시)
+#   -h               도움말
+#
+# 결과 분류:
+#   [PASS]  rc=0, 정상
+#   [FAIL]  rc≠0, 예상치 못한 실패
+#   [XFAIL] rc≠0, 예상된 실패 (OOR, 사전조건 없음 등) — FAIL 카운트에 미포함
+#   [SKIP]  실행 안 함 (FW 없이 FW 관련 커맨드, 위험 동작 등)
 
 set -uo pipefail
 
 DEVICE="/dev/nvme0"
 NAMESPACE=1
 TIMEOUT=10
+FW_BIN=""
+FW_SLOT=1
 VERBOSE=0
 
-RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[1;33m'; CYN='\033[0;36m'; NC='\033[0m'
+RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[1;33m'; CYN='\033[0;36m'; DIM='\033[2m'; NC='\033[0m'
 
-usage() { sed -n 's/^# \?//p' "$0" | head -16; exit 0; }
+usage() { sed -n 's/^# \?//p' "$0" | head -22; exit 0; }
 
-while getopts "d:n:t:vh" opt; do
+while getopts "d:n:t:f:s:vh" opt; do
     case $opt in
         d) DEVICE="$OPTARG"    ;;
         n) NAMESPACE="$OPTARG" ;;
         t) TIMEOUT="$OPTARG"   ;;
+        f) FW_BIN="$OPTARG"    ;;
+        s) FW_SLOT="$OPTARG"   ;;
         v) VERBOSE=1           ;;
         h) usage               ;;
         *) echo "알 수 없는 옵션: -$OPTARG" >&2; exit 1 ;;
@@ -39,188 +51,188 @@ if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}ERROR${NC}: NVMe passthru는 root 권한이 필요합니다 (sudo 사용)"
     exit 1
 fi
-if ! command -v nvme &>/dev/null; then
-    echo -e "${RED}ERROR${NC}: nvme-cli가 설치되지 않았습니다"; exit 1
-fi
-if ! command -v python3 &>/dev/null; then
-    echo -e "${RED}ERROR${NC}: python3가 필요합니다"; exit 1
+for bin in nvme python3; do
+    command -v "$bin" &>/dev/null || { echo -e "${RED}ERROR${NC}: $bin 가 없습니다"; exit 1; }
+done
+if [[ -n "$FW_BIN" && ! -f "$FW_BIN" ]]; then
+    echo -e "${RED}ERROR${NC}: 펌웨어 파일이 없습니다: $FW_BIN"; exit 1
 fi
 
-# ── 임시 디렉토리 (write 시드용 데이터 파일) ────────────────────────
 TMPDIR_SEED=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_SEED"' EXIT
 
-# ── Python: 초기 시드 목록 생성 후 JSON Lines로 출력 ────────────────
-#
-# 퍼저의 NVME_COMMANDS + _generate_default_seeds() 를 그대로 재현.
-# 각 시드를 JSON 한 줄로 출력 → bash가 읽어서 nvme 명령 실행.
-#
-SEED_JSON=$(python3 - "$TMPDIR_SEED" <<'PYEOF'
-import sys, json, struct, os, tempfile
+# ── Python: 초기 시드 목록 → JSON Lines ────────────────────────────
+SEED_JSON=$(python3 - "$TMPDIR_SEED" "$NAMESPACE" "$FW_BIN" "$FW_SLOT" <<'PYEOF'
+import sys, json, struct, os
 
-tmpdir = sys.argv[1]
-
-# ── 커맨드 정의 (fuzzer NVME_COMMANDS와 동일) ─────────────────────
-#   (name, opcode, type, needs_namespace, needs_data)
-COMMANDS = [
-    # DEFAULT
-    ("Identify",               0x06, "admin", True,  False),
-    ("GetLogPage",             0x02, "admin", True,  False),
-    ("GetFeatures",            0x0A, "admin", True,  False),
-    ("Read",                   0x02, "io",    True,  False),
-    ("Write",                  0x01, "io",    True,  True ),
-    # EXTENDED
-    ("SetFeatures",            0x09, "admin", True,  True ),
-    ("FWDownload",             0x11, "admin", True,  True ),
-    ("FWCommit",               0x10, "admin", True,  False),
-    ("FormatNVM",              0x80, "admin", False, False),
-    ("Sanitize",               0x84, "admin", False, False),
-    ("TelemetryHostInitiated", 0x02, "admin", True,  False),
-    ("Flush",                  0x00, "io",    True,  False),
-    ("DatasetManagement",      0x09, "io",    True,  True ),
-]
-CMD_MAP = {name: (opcode, ctype, needs_ns, needs_data)
-           for name, opcode, ctype, needs_ns, needs_data in COMMANDS}
-
-# ── 시드 템플릿 (fuzzer _generate_default_seeds() 와 동일) ──────────
-SEED_TEMPLATES = {
-    "Identify": [
-        dict(cdw10=0x01, desc="Identify Controller"),
-        dict(cdw10=0x00, desc="Identify Namespace"),
-        dict(cdw10=0x02, desc="Active NS ID list"),
-        dict(cdw10=0x03, desc="NS Identification Descriptor list"),
-    ],
-    "GetLogPage": [
-        dict(cdw10=(0x0F << 16) | 0x01, desc="Error Information Log (64B)"),
-        dict(cdw10=(0x7F << 16) | 0x02, desc="SMART / Health Log (512B)"),
-    ],
-    "GetFeatures": [
-        dict(cdw10=0x06, desc="Volatile Write Cache"),
-        dict(cdw10=0x07, desc="Number of Queues"),
-        dict(cdw10=0x0B, desc="Async Event Configuration"),
-    ],
-    "Read": [
-        dict(cdw10=0,          cdw11=0, cdw12=0,      desc="Read LBA 0, 1 block"),
-        dict(cdw10=1,          cdw11=0, cdw12=0,      desc="Read LBA 1, 1 block"),
-        dict(cdw10=0,          cdw11=0, cdw12=7,      desc="Read LBA 0, 8 blocks"),
-        dict(cdw10=0,          cdw11=0, cdw12=31,     desc="Read LBA 0, 32 blocks"),
-        dict(cdw10=0,          cdw11=0, cdw12=127,    desc="Read LBA 0, 128 blocks"),
-        dict(cdw10=0,          cdw11=0, cdw12=255,    desc="Read LBA 0, 256 blocks (128KB)"),
-        dict(cdw10=0,          cdw11=0, cdw12=0xFFFF, desc="Read LBA 0, NLB max (32MB)"),
-        dict(cdw10=500,        cdw11=0, cdw12=0,      desc="Read LBA 500"),
-        dict(cdw10=1000,       cdw11=0, cdw12=0,      desc="Read LBA 1000"),
-        dict(cdw10=5000,       cdw11=0, cdw12=0,      desc="Read LBA 5000"),
-        dict(cdw10=10000,      cdw11=0, cdw12=0,      desc="Read LBA 10000"),
-        dict(cdw10=0,          cdw11=0, cdw12=(1<<14), desc="Read LBA 0, FUA"),
-        dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0, desc="Read LBA 4G (OOR)"),
-        dict(cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0, desc="Read SLBA 64-bit max (OOR)"),
-    ],
-    "Write": [
-        dict(cdw10=0,     cdw11=0, cdw12=0,       data=b'\x00'*512,       desc="Write LBA 0, zeros"),
-        dict(cdw10=0,     cdw11=0, cdw12=0,       data=b'\xAA'*512,       desc="Write LBA 0, 0xAA"),
-        dict(cdw10=0,     cdw11=0, cdw12=0,       data=b'\xFF'*512,       desc="Write LBA 0, 0xFF"),
-        dict(cdw10=0,     cdw11=0, cdw12=0,       data=bytes(range(256))*2, desc="Write LBA 0, 0x00-0xFF"),
-        dict(cdw10=0,     cdw11=0, cdw12=7,       data=b'\x00'*(8*512),   desc="Write LBA 0, 8 blocks"),
-        dict(cdw10=0,     cdw11=0, cdw12=31,      data=b'\x00'*(32*512),  desc="Write LBA 0, 32 blocks"),
-        dict(cdw10=0,     cdw11=0, cdw12=127,     data=b'\x00'*(128*512), desc="Write LBA 0, 128 blocks"),
-        dict(cdw10=0,     cdw11=0, cdw12=255,     data=b'\x00'*(256*512), desc="Write LBA 0, 256 blocks"),
-        dict(cdw10=500,   cdw11=0, cdw12=0,       data=b'\x00'*512,       desc="Write LBA 500"),
-        dict(cdw10=1000,  cdw11=0, cdw12=0,       data=b'\x00'*512,       desc="Write LBA 1000"),
-        dict(cdw10=5000,  cdw11=0, cdw12=0,       data=b'\x00'*512,       desc="Write LBA 5000"),
-        dict(cdw10=10000, cdw11=0, cdw12=0,       data=b'\x00'*512,       desc="Write LBA 10000"),
-        dict(cdw10=0,     cdw11=0, cdw12=(1<<14), data=b'\x00'*512,       desc="Write LBA 0, FUA"),
-        dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0, data=b'\x00'*512, desc="Write LBA 4G (OOR)"),
-        dict(cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0, data=b'\x00'*512, desc="Write SLBA 64-bit max (OOR)"),
-    ],
-    "SetFeatures": [
-        dict(cdw10=0x07, cdw11=0x00010001, desc="Number of Queues (1 SQ + 1 CQ)"),
-    ],
-    "FWDownload": [
-        dict(cdw10=0xFF, cdw11=0, data=b'\x00'*1024, desc="FW Download offset=0, 1KB"),
-    ],
-    "FWCommit": [
-        dict(cdw10=0x01, desc="Commit Action 1, Slot 0"),
-        dict(cdw10=0x09, desc="Commit Action 1, Slot 1"),
-    ],
-    "FormatNVM": [
-        dict(cdw10=0x00, desc="Format LBAF 0, no secure erase"),
-    ],
-    "Sanitize": [
-        dict(cdw10=0x01, desc="Block Erase"),
-    ],
-    "TelemetryHostInitiated": [
-        dict(cdw10=(0x1FF << 16) | 0x07, desc="Telemetry Host-Initiated Log"),
-    ],
-    "Flush": [
-        dict(desc="Flush (no parameters)"),
-    ],
-    "DatasetManagement": [
-        dict(cdw10=0, cdw11=0x04,
-             data=struct.pack('<IIIII', 0, 0, 0, 0, 8),
-             desc="TRIM LBA 0, 8 blocks"),
-    ],
-}
-
+tmpdir, namespace, fw_bin, fw_slot = sys.argv[1:]
+namespace = int(namespace)
+fw_slot   = int(fw_slot)
 MAX_DATA_BUF = 65536
+
+# ── FUA 비트 위치 수정: CDW12[29] (NVMe spec) ──
+# 이전 코드는 (1<<14) 를 사용해 NLB=0x4000 이 되어 버퍼 불일치 → rc=2
+FUA_BIT = (1 << 29)  # CDW12[29] = Force Unit Access
+
 ADMIN_FIXED_RESPONSE = {"Identify": 4096, "GetFeatures": 4096, "TelemetryHostInitiated": 4096}
 WRITE_CMDS = {"Write", "FWDownload", "DatasetManagement"}
 
+# xfail: 예상된 실패 (OOR, 사전조건 없음 등)
+# skip:  실행 자체를 건너뜀
+
 seeds = []
-seed_idx = 0
+idx = 0
 
-for cmd_name, templates in SEED_TEMPLATES.items():
-    if cmd_name not in CMD_MAP:
-        continue
-    opcode, ctype, needs_ns, needs_data = CMD_MAP[cmd_name]
+def add(cmd, opcode, ctype, needs_ns, needs_data, cdw10=0, cdw11=0, cdw12=0,
+        cdw13=0, cdw14=0, cdw15=0, data=b"", desc="", xfail=False,
+        skip=False, nsid_override=None):
+    global idx
 
-    for tmpl in templates:
-        cdw10 = tmpl.get("cdw10", 0)
-        cdw11 = tmpl.get("cdw11", 0)
-        cdw12 = tmpl.get("cdw12", 0)
-        cdw13 = tmpl.get("cdw13", 0)
-        cdw14 = tmpl.get("cdw14", 0)
-        cdw15 = tmpl.get("cdw15", 0)
-        data  = tmpl.get("data",  b"")
-        desc  = tmpl.get("desc",  cmd_name)
+    is_write = cmd in WRITE_CMDS
+    write_dir = False
+    data_len  = 0
 
-        # data_len + write_direction (fuzzer _send_nvme_command 동일 로직)
-        is_write = cmd_name in WRITE_CMDS
-        write_direction = False
-        data_len = 0
+    if is_write and len(data) > 0:
+        data_len  = min(len(data), MAX_DATA_BUF)
+        write_dir = True
+    elif ctype == "io" and cmd not in ("Flush", "DatasetManagement"):
+        nlb      = cdw12 & 0xFFFF
+        data_len = min(max(512, (nlb + 1) * 512), MAX_DATA_BUF)
+    elif cmd == "GetLogPage":
+        numdl    = (cdw10 >> 16) & 0x7FF
+        data_len = min(max(4, (numdl + 1) * 4), MAX_DATA_BUF)
+    elif cmd in ADMIN_FIXED_RESPONSE:
+        data_len = ADMIN_FIXED_RESPONSE[cmd]
 
-        if is_write and len(data) > 0:
-            data_len = min(len(data), MAX_DATA_BUF)
-            write_direction = True
-        elif ctype == "io" and cmd_name not in ("Flush", "DatasetManagement"):
-            nlb = cdw12 & 0xFFFF
-            data_len = min(max(512, (nlb + 1) * 512), MAX_DATA_BUF)
-        elif cmd_name == "GetLogPage":
-            numdl = (cdw10 >> 16) & 0x7FF
-            data_len = min(max(4, (numdl + 1) * 4), MAX_DATA_BUF)
-        elif cmd_name in ADMIN_FIXED_RESPONSE:
-            data_len = ADMIN_FIXED_RESPONSE[cmd_name]
+    data_file = ""
+    if write_dir and data_len > 0:
+        data_file = os.path.join(tmpdir, f"seed_{idx}.bin")
+        with open(data_file, "wb") as f:
+            f.write(data[:data_len])
 
-        # write 데이터 파일 준비
-        data_file = ""
-        if write_direction and data_len > 0:
-            data_file = os.path.join(tmpdir, f"seed_{seed_idx}.bin")
-            with open(data_file, "wb") as f:
-                f.write(data[:data_len])
+    # nsid 결정
+    if nsid_override is not None:
+        nsid = nsid_override
+    elif needs_ns:
+        nsid = namespace
+    else:
+        nsid = 0
 
-        seeds.append({
-            "idx":       seed_idx,
-            "cmd":       cmd_name,
-            "opcode":    opcode,
-            "type":      ctype,
-            "needs_ns":  needs_ns,
-            "cdw10": cdw10, "cdw11": cdw11, "cdw12": cdw12,
-            "cdw13": cdw13, "cdw14": cdw14, "cdw15": cdw15,
-            "data_len":  data_len,
-            "write":     write_direction,
-            "data_file": data_file,
-            "desc":      desc,
-        })
-        seed_idx += 1
+    seeds.append({"idx": idx, "cmd": cmd, "opcode": opcode, "type": ctype,
+                  "nsid": nsid, "cdw10": cdw10, "cdw11": cdw11, "cdw12": cdw12,
+                  "cdw13": cdw13, "cdw14": cdw14, "cdw15": cdw15,
+                  "data_len": data_len, "write": write_dir, "data_file": data_file,
+                  "desc": desc, "xfail": xfail, "skip": skip})
+    idx += 1
+
+# ── Identify ──────────────────────────────────────────────────────
+# CNS=0x01(Identify Controller): NSID는 Reserved → nsid_override=0
+add("Identify", 0x06, "admin", True,  False, cdw10=0x01, desc="Identify Controller",                nsid_override=0)
+add("Identify", 0x06, "admin", True,  False, cdw10=0x00, desc="Identify Namespace")
+add("Identify", 0x06, "admin", True,  False, cdw10=0x02, desc="Active NS ID list")
+add("Identify", 0x06, "admin", True,  False, cdw10=0x03, desc="NS Identification Descriptor")
+
+# ── GetLogPage ────────────────────────────────────────────────────
+# Error Info(0x01), SMART(0x02): 컨트롤러 범위 → NSID=0
+add("GetLogPage", 0x02, "admin", True, False, cdw10=(0x0F << 16)|0x01, desc="Error Info Log",       nsid_override=0)
+add("GetLogPage", 0x02, "admin", True, False, cdw10=(0x7F << 16)|0x02, desc="SMART/Health Log",     nsid_override=0)
+
+# ── GetFeatures ───────────────────────────────────────────────────
+add("GetFeatures", 0x0A, "admin", True, False, cdw10=0x06, desc="Volatile Write Cache")
+add("GetFeatures", 0x0A, "admin", True, False, cdw10=0x07, desc="Number of Queues")
+add("GetFeatures", 0x0A, "admin", True, False, cdw10=0x0B, desc="Async Event Config")
+
+# ── Read ──────────────────────────────────────────────────────────
+add("Read", 0x02, "io", True, False, cdw10=0,     cdw11=0, cdw12=0,      desc="Read LBA 0, 1 block")
+add("Read", 0x02, "io", True, False, cdw10=1,     cdw11=0, cdw12=0,      desc="Read LBA 1")
+add("Read", 0x02, "io", True, False, cdw10=0,     cdw11=0, cdw12=7,      desc="Read LBA 0, 8 blocks")
+add("Read", 0x02, "io", True, False, cdw10=0,     cdw11=0, cdw12=31,     desc="Read LBA 0, 32 blocks")
+add("Read", 0x02, "io", True, False, cdw10=0,     cdw11=0, cdw12=127,    desc="Read LBA 0, 128 blocks")
+add("Read", 0x02, "io", True, False, cdw10=0,     cdw11=0, cdw12=255,    desc="Read LBA 0, 256 blocks")
+# NLB max: data_len이 MAX_DATA_BUF에 cap → NLB 불일치 → 예상 실패
+add("Read", 0x02, "io", True, False, cdw10=0,     cdw11=0, cdw12=0xFFFF, desc="Read NLB max (OOR buffer mismatch)", xfail=True)
+add("Read", 0x02, "io", True, False, cdw10=500,   cdw11=0, cdw12=0,      desc="Read LBA 500")
+add("Read", 0x02, "io", True, False, cdw10=1000,  cdw11=0, cdw12=0,      desc="Read LBA 1000")
+add("Read", 0x02, "io", True, False, cdw10=5000,  cdw11=0, cdw12=0,      desc="Read LBA 5000")
+add("Read", 0x02, "io", True, False, cdw10=10000, cdw11=0, cdw12=0,      desc="Read LBA 10000")
+# FUA: CDW12[29]=1, NLB=0 (1 block)
+add("Read", 0x02, "io", True, False, cdw10=0, cdw11=0, cdw12=FUA_BIT,    desc="Read LBA 0, FUA")
+# OOR LBA → 예상 실패
+add("Read", 0x02, "io", True, False, cdw10=0x00000000, cdw11=0x00000001, cdw12=0, desc="Read LBA 4G (OOR)", xfail=True)
+add("Read", 0x02, "io", True, False, cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0, desc="Read SLBA 64bit max (OOR)", xfail=True)
+
+# ── Write ─────────────────────────────────────────────────────────
+add("Write", 0x01, "io", True, True, cdw10=0,     cdw11=0, cdw12=0,      data=b'\x00'*512,       desc="Write LBA 0, zeros")
+add("Write", 0x01, "io", True, True, cdw10=0,     cdw11=0, cdw12=0,      data=b'\xAA'*512,       desc="Write LBA 0, 0xAA")
+add("Write", 0x01, "io", True, True, cdw10=0,     cdw11=0, cdw12=0,      data=b'\xFF'*512,       desc="Write LBA 0, 0xFF")
+add("Write", 0x01, "io", True, True, cdw10=0,     cdw11=0, cdw12=0,      data=bytes(range(256))*2, desc="Write LBA 0, sequential")
+add("Write", 0x01, "io", True, True, cdw10=0,     cdw11=0, cdw12=7,      data=b'\x00'*(8*512),   desc="Write LBA 0, 8 blocks")
+add("Write", 0x01, "io", True, True, cdw10=0,     cdw11=0, cdw12=31,     data=b'\x00'*(32*512),  desc="Write LBA 0, 32 blocks")
+add("Write", 0x01, "io", True, True, cdw10=0,     cdw11=0, cdw12=127,    data=b'\x00'*(128*512), desc="Write LBA 0, 128 blocks")
+add("Write", 0x01, "io", True, True, cdw10=0,     cdw11=0, cdw12=255,    data=b'\x00'*(256*512), desc="Write LBA 0, 256 blocks")
+add("Write", 0x01, "io", True, True, cdw10=500,   cdw11=0, cdw12=0,      data=b'\x00'*512,       desc="Write LBA 500")
+add("Write", 0x01, "io", True, True, cdw10=1000,  cdw11=0, cdw12=0,      data=b'\x00'*512,       desc="Write LBA 1000")
+add("Write", 0x01, "io", True, True, cdw10=5000,  cdw11=0, cdw12=0,      data=b'\x00'*512,       desc="Write LBA 5000")
+add("Write", 0x01, "io", True, True, cdw10=10000, cdw11=0, cdw12=0,      data=b'\x00'*512,       desc="Write LBA 10000")
+# FUA: CDW12[29]=1, NLB=0
+add("Write", 0x01, "io", True, True, cdw10=0, cdw11=0, cdw12=FUA_BIT,   data=b'\x00'*512,        desc="Write LBA 0, FUA")
+# OOR → 예상 실패
+add("Write", 0x01, "io", True, True, cdw10=0x00000000, cdw11=0x00000001, cdw12=0, data=b'\x00'*512, desc="Write LBA 4G (OOR)", xfail=True)
+add("Write", 0x01, "io", True, True, cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0, data=b'\x00'*512, desc="Write SLBA 64bit max (OOR)", xfail=True)
+
+# ── SetFeatures ───────────────────────────────────────────────────
+# 큐 설정은 초기화 이후 변경 불가 → 예상 실패 (0x0C Command Sequence Error)
+add("SetFeatures", 0x09, "admin", True, True, cdw10=0x07, cdw11=0x00010001, desc="Number of Queues", xfail=True)
+
+# ── FWDownload / FWCommit ─────────────────────────────────────────
+# -f 없으면 스킵. -f 있으면 전체 .bin을 4KB 청크로 분할 전송 후 FWCommit.
+if fw_bin:
+    CHUNK_SIZE = 4096  # 4KB per chunk (safe default; 실제는 FWUG 참조)
+    with open(fw_bin, "rb") as fh:
+        fw_data = fh.read()
+    fw_size = len(fw_data)
+    offset = 0
+    chunk_idx = 0
+    while offset < fw_size:
+        chunk = fw_data[offset:offset + CHUNK_SIZE]
+        chunk = chunk.ljust(CHUNK_SIZE, b'\x00')  # 마지막 청크 패딩
+        numd = (CHUNK_SIZE // 4) - 1              # CDW10: NUMD (0-based dwords)
+        ofst = offset // 4                         # CDW11: OFST (dword offset)
+        add("FWDownload", 0x11, "admin", True, True,
+            cdw10=numd, cdw11=ofst, data=chunk,
+            desc=f"FWDownload chunk {chunk_idx} offset={offset}")
+        offset += CHUNK_SIZE
+        chunk_idx += 1
+    # Commit Action 0b001 = download only, activate on next reset
+    # Firmware Slot = fw_slot (CDW10[5:3])
+    commit_action = 0x01  # CA=001: replace slot, no activation
+    cdw10_commit  = (fw_slot << 3) | commit_action
+    add("FWCommit", 0x10, "admin", True, False,
+        cdw10=cdw10_commit, desc=f"FWCommit slot={fw_slot} action=1 (activate on reset)")
+else:
+    add("FWDownload", 0x11, "admin", True, True,  desc="FWDownload (no -f provided)", skip=True)
+    add("FWCommit",   0x10, "admin", True, False, desc="FWCommit   (no -f provided)", skip=True)
+    add("FWCommit",   0x10, "admin", True, False, desc="FWCommit   (no -f provided)", skip=True)
+
+# ── FormatNVM ─────────────────────────────────────────────────────
+# 실제 포맷 수행 — 기본 스킵 (퍼징 seed 검증에 불필요, 데이터 파괴 위험)
+add("FormatNVM", 0x80, "admin", False, False, cdw10=0x00, desc="Format LBAF 0 (SKIP: destructive)", skip=True)
+
+# ── Sanitize ──────────────────────────────────────────────────────
+# 경고: rc=0 이면 SSD가 실제로 Block Erase를 시작함! 기본 스킵.
+add("Sanitize", 0x84, "admin", False, False, cdw10=0x01, desc="Block Erase (SKIP: erases all data!)", skip=True)
+
+# ── TelemetryHostInitiated ───────────────────────────────────────
+# NSID=0 으로 수정 (GetLogPage 컨트롤러 범위)
+add("TelemetryHostInitiated", 0x02, "admin", True, False,
+    cdw10=(0x1FF << 16)|0x07, desc="Telemetry Host-Initiated", nsid_override=0)
+
+# ── Flush ─────────────────────────────────────────────────────────
+add("Flush", 0x00, "io", True, False, desc="Flush")
+
+# ── DatasetManagement ─────────────────────────────────────────────
+add("DatasetManagement", 0x09, "io", True, True,
+    cdw10=0, cdw11=0x04, data=struct.pack('<IIIII', 0, 0, 0, 0, 8), desc="TRIM LBA 0, 8 blocks")
 
 for s in seeds:
     print(json.dumps(s))
@@ -228,91 +240,92 @@ PYEOF
 )
 
 if [[ -z "$SEED_JSON" ]]; then
-    echo -e "${RED}ERROR${NC}: 시드 생성 실패"
-    exit 1
+    echo -e "${RED}ERROR${NC}: 시드 생성 실패"; exit 1
 fi
 
 TOTAL=$(echo "$SEED_JSON" | wc -l)
+FW_INFO=""
+[[ -n "$FW_BIN" ]] && FW_INFO=" | FW: $(basename "$FW_BIN") slot=$FW_SLOT"
 
-echo "════════════════════════════════════════════════"
-echo "  Initial Seed Replay Test (default seeds)"
-echo "════════════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════"
+echo "  Initial Seed Replay Test"
+echo "════════════════════════════════════════════════════════"
 printf "  Device    : %s\n"  "$DEVICE"
 printf "  Namespace : %s\n"  "$NAMESPACE"
-printf "  Timeout   : %ss\n" "$TIMEOUT"
+printf "  Timeout   : %ss%s\n" "$TIMEOUT" "$FW_INFO"
 printf "  시드 수   : %d개\n" "$TOTAL"
-echo "════════════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════"
 echo ""
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; XFAIL=0; SKIP=0
 
 while IFS= read -r line; do
-    # JSON 파싱
-    read -r idx cmd opcode ctype needs_ns cdw10 cdw11 cdw12 cdw13 cdw14 cdw15 \
-             data_len write data_file desc <<< "$(python3 -c "
+    eval "$(python3 -c "
 import json, sys
-s = json.loads(sys.stdin.read())
-print(s['idx'], s['cmd'], s['opcode'], s['type'], int(s['needs_ns']),
-      s['cdw10'], s['cdw11'], s['cdw12'], s['cdw13'], s['cdw14'], s['cdw15'],
-      s['data_len'], int(s['write']), repr(s['data_file']), repr(s['desc']))
-" <<< "$line")"
+s = json.loads('''$line'''.replace(\"'''\", '\"\"\"'))
+print('IDX=%d CMD=%s OPCODE=%d CTYPE=%s NSID=%d' % (s['idx'],s['cmd'],s['opcode'],s['type'],s['nsid']))
+print('CDW10=%d CDW11=%d CDW12=%d CDW13=%d CDW14=%d CDW15=%d' % (s['cdw10'],s['cdw11'],s['cdw12'],s['cdw13'],s['cdw14'],s['cdw15']))
+print('DATA_LEN=%d WRITE=%d' % (s['data_len'], int(s['write'])))
+print('DATA_FILE=%s' % repr(s['data_file']))
+print('DESC=%s' % repr(s['desc']))
+print('XFAIL=%d SKIP=%d' % (int(s['xfail']), int(s['skip'])))
+")"
 
-    # passthru 타입 / 타겟 장치
-    if [[ "$ctype" == "admin" ]]; then
-        passthru="admin-passthru"
-        target="$DEVICE"
-    else
-        passthru="io-passthru"
-        target="${DEVICE}n${NAMESPACE}"
+    label=$(printf "[%3d] %-22s %s" "$IDX" "$CMD" "$DESC")
+
+    if [[ $SKIP -eq 1 ]]; then
+        printf "${DIM}[SKIP]${NC} %s\n" "$label"
+        ((SKIP++)) || true
+        continue
     fi
 
-    # nsid
-    if [[ "$needs_ns" == "1" ]]; then
-        nsid="$NAMESPACE"
+    # passthru 타입 / 타겟 장치
+    if [[ "$CTYPE" == "admin" ]]; then
+        PASSTHRU="admin-passthru"; TARGET="$DEVICE"
     else
-        nsid="0"
+        PASSTHRU="io-passthru";    TARGET="${DEVICE}n${NAMESPACE}"
     fi
 
     # nvme 명령 구성
-    nvme_cmd="nvme $passthru $target"
-    nvme_cmd+=" --opcode=$(python3 -c "print(hex($opcode))")"
-    nvme_cmd+=" --namespace-id=$nsid"
-    nvme_cmd+=" --cdw10=$(python3 -c "print(hex($cdw10))")"
-    nvme_cmd+=" --cdw11=$(python3 -c "print(hex($cdw11))")"
-    nvme_cmd+=" --cdw12=$(python3 -c "print(hex($cdw12))")"
-    nvme_cmd+=" --cdw13=$(python3 -c "print(hex($cdw13))")"
-    nvme_cmd+=" --cdw14=$(python3 -c "print(hex($cdw14))")"
-    nvme_cmd+=" --cdw15=$(python3 -c "print(hex($cdw15))")"
+    nvme_cmd="nvme $PASSTHRU $TARGET"
+    nvme_cmd+=" --opcode=$(python3 -c "print(hex($OPCODE))")"
+    nvme_cmd+=" --namespace-id=$NSID"
+    nvme_cmd+=" --cdw10=$(python3 -c "print(hex($CDW10))")"
+    nvme_cmd+=" --cdw11=$(python3 -c "print(hex($CDW11))")"
+    nvme_cmd+=" --cdw12=$(python3 -c "print(hex($CDW12))")"
+    nvme_cmd+=" --cdw13=$(python3 -c "print(hex($CDW13))")"
+    nvme_cmd+=" --cdw14=$(python3 -c "print(hex($CDW14))")"
+    nvme_cmd+=" --cdw15=$(python3 -c "print(hex($CDW15))")"
     nvme_cmd+=" --timeout=$(( TIMEOUT * 1000 ))"
 
-    if [[ "$data_len" -gt 0 ]]; then
-        nvme_cmd+=" --data-len=$data_len"
-        if [[ "$write" == "1" ]]; then
-            # data_file 은 repr() 로 감싸져 있으므로 strip
-            real_file=$(python3 -c "print($data_file)")
+    if [[ $DATA_LEN -gt 0 ]]; then
+        nvme_cmd+=" --data-len=$DATA_LEN"
+        if [[ $WRITE -eq 1 ]]; then
+            real_file=$(python3 -c "print($DATA_FILE)")
             nvme_cmd+=" --input-file=$real_file -w"
         else
             nvme_cmd+=" -r"
         fi
     fi
 
-    label=$(printf "[%3d] %-24s %s" "$idx" "$cmd" "$(python3 -c "print($desc)")")
-
     [[ $VERBOSE -eq 1 ]] && printf "${CYN}[CMD]${NC} %s\n" "$nvme_cmd"
 
     out=$(timeout "${TIMEOUT}s" bash -c "$nvme_cmd" 2>&1) && rc=0 || rc=$?
 
     if [[ $rc -eq 0 ]]; then
-        printf "${GRN}[PASS]${NC} %s\n" "$label"
+        printf "${GRN}[PASS]${NC}  %s\n" "$label"
         ((PASS++)) || true
+    elif [[ $XFAIL -eq 1 ]]; then
+        printf "${DIM}[XFAIL]${NC} %s  rc=%d (예상된 실패)\n" "$label" "$rc"
+        ((XFAIL++)) || true
     elif [[ $rc -eq 124 ]]; then
-        printf "${YEL}[TOUT]${NC} %s  — timeout\n" "$label"
-        [[ $VERBOSE -eq 1 ]] && printf "       CMD: %s\n" "$nvme_cmd"
+        printf "${YEL}[TOUT]${NC}  %s  timeout\n" "$label"
+        [[ $VERBOSE -eq 1 ]] && printf "        CMD: %s\n" "$nvme_cmd"
         ((FAIL++)) || true
     else
         status=$(printf '%s' "$out" | grep -oP 'NVMe status:.*' | head -1 || true)
-        printf "${RED}[FAIL]${NC} %s  rc=%d  %s\n" "$label" "$rc" "$status"
-        [[ $VERBOSE -eq 1 ]] && printf "       CMD: %s\n       OUT: %s\n" \
+        printf "${RED}[FAIL]${NC}  %s  rc=%d  %s\n" "$label" "$rc" "$status"
+        [[ $VERBOSE -eq 1 ]] && printf "        CMD: %s\n        OUT: %s\n" \
             "$nvme_cmd" "$(printf '%s' "$out" | head -2 | tr '\n' '|')"
         ((FAIL++)) || true
     fi
@@ -320,18 +333,20 @@ print(s['idx'], s['cmd'], s['opcode'], s['type'], int(s['needs_ns']),
 done <<< "$SEED_JSON"
 
 echo ""
-echo "════════════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════"
 echo "  결과 요약"
-echo "════════════════════════════════════════════════"
-printf "  전체  : %d\n"        "$TOTAL"
-printf "  ${GRN}PASS${NC}  : %d\n"  "$PASS"
-printf "  ${RED}FAIL${NC}  : %d\n"  "$FAIL"
-echo "════════════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════"
+printf "  전체   : %d\n"                 "$TOTAL"
+printf "  ${GRN}PASS${NC}   : %d\n"     "$PASS"
+printf "  ${RED}FAIL${NC}   : %d\n"     "$FAIL"
+printf "  ${DIM}XFAIL${NC}  : %d (예상된 실패, 퍼징용 경계값)\n" "$XFAIL"
+printf "  ${DIM}SKIP${NC}   : %d\n"     "$SKIP"
+echo "════════════════════════════════════════════════════════"
 
 if [[ $FAIL -gt 0 ]]; then
-    echo -e "\n  ${RED}실패한 시드가 있습니다. -v 옵션으로 상세 확인하세요.${NC}"
+    echo -e "\n  ${RED}예상치 못한 실패가 있습니다. -v 옵션으로 상세 확인하세요.${NC}"
     exit 1
 else
-    echo -e "\n  ${GRN}모든 초기 시드가 PASS를 반환했습니다.${NC}"
+    echo -e "\n  ${GRN}모든 시드가 정상 범위 내에서 실행됐습니다.${NC}"
     exit 0
 fi
