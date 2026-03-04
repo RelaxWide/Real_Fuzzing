@@ -524,21 +524,23 @@ class JLinkPCSampler:
             # 인터페이스 결정: None=auto(JTAG 먼저 시도 → 실패 시 SWD fallback)
             _JTAG = pylink.enums.JLinkInterfaces.JTAG
             _SWD  = pylink.enums.JLinkInterfaces.SWD
+            _jtag_pc_idx: Optional[int] = None  # auto JTAG 검증 중 탐지된 PC 인덱스 캐시
             if self.config.interface is not None:
                 # 명시적 지정: 그대로 사용
                 self.jlink.set_tif(self.config.interface)
                 self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
                 iface_name = "JTAG" if self.config.interface == _JTAG else "SWD"
             else:
-                # auto: JTAG 먼저 시도 + register_list()로 실제 CPU 응답 검증
+                # auto: JTAG 먼저 시도 + register_list()/register_name() 모두 검증
                 # 주의: SWD 전용 타깃에서 connect()는 예외 없이 성공하지만
-                #       CPU가 JTAG에 응답하지 않아 register_list()에서 실패함.
-                #       connect() 성공만으로는 실제 연결을 보장할 수 없으므로
-                #       register_list()까지 확인해야 함.
+                #       CPU가 JTAG에 응답하지 않아 register_name() 등에서 실패함.
+                #       register_list() 성공만으로는 부족하므로 register_name()까지
+                #       검증하는 _probe_pc_register_index()를 try 블록 안에서 호출.
                 try:
                     self.jlink.set_tif(_JTAG)
                     self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
-                    list(self.jlink.register_list())   # 실제 CPU 응답 검증
+                    # register_list() + register_name() 모두 검증 — 어느 쪽 실패해도 SWD fallback
+                    _jtag_pc_idx = self._probe_pc_register_index()
                     iface_name = "JTAG (auto)"
                 except Exception as jtag_err:
                     log.warning(f"[J-Link] JTAG 연결/검증 실패 ({jtag_err}), SWD로 재시도...")
@@ -551,11 +553,18 @@ class JLinkPCSampler:
 
             log.warning(f"[J-Link] Connected: {self.config.device_name} @ {self.config.jtag_speed}kHz [{iface_name}]")
 
-            # R15(PC)의 실제 레지스터 인덱스: 강제 지정 우선, 없으면 자동 탐색
+            # R15(PC)의 실제 레지스터 인덱스 결정
             if self.config.pc_reg_index is not None:
+                # 사용자가 --pc-reg-index로 강제 지정
                 self._pc_reg_index = self.config.pc_reg_index
                 log.warning(f"[J-Link] PC register index: {self._pc_reg_index} (--pc-reg-index 강제 지정)")
+            elif _jtag_pc_idx is not None:
+                # auto JTAG 검증 중 이미 탐지됨 → 재호출 불필요
+                self._pc_reg_index = _jtag_pc_idx
+                log.warning(f"[J-Link] PC register index: {self._pc_reg_index} "
+                         f"(name: {self.jlink.register_name(self._pc_reg_index)}, JTAG auto)")
             else:
+                # SWD fallback 또는 explicit interface 경로 → 여기서 탐색
                 self._pc_reg_index = self._find_pc_register_index()
                 log.warning(f"[J-Link] PC register index: {self._pc_reg_index} "
                          f"(name: {self.jlink.register_name(self._pc_reg_index)})")
@@ -569,6 +578,26 @@ class JLinkPCSampler:
         except Exception as e:
             log.error(f"[J-Link Error] {e}")
             return False
+
+    def _probe_pc_register_index(self) -> int:
+        """JTAG 연결 검증 겸 PC 레지스터 인덱스 탐색 (예외를 그대로 raise).
+
+        _find_pc_register_index()와 동일한 로직이지만 예외를 삼키지 않는다.
+        auto-detect 시 JTAG try 블록 안에서 호출해 register_name() 실패까지
+        SWD fallback 트리거로 사용한다.
+        연결 유효하지만 PC 이름을 못 찾으면 15를 반환 (예외 없음).
+        """
+        _PC_NAMES = {'R15', 'PC', 'EPC', 'MEPC', 'SEPC'}
+        all_regs = list(self.jlink.register_list())   # 실패 시 그대로 raise
+        for idx in all_regs:
+            name = self.jlink.register_name(idx).upper().strip()  # 실패 시 그대로 raise
+            if name in _PC_NAMES:
+                return idx
+        for idx in all_regs:
+            name = self.jlink.register_name(idx).upper().strip()
+            if 'R15' in name:
+                return idx
+        return 15  # 연결은 유효하나 이름 매칭 실패 → fallback
 
     def _find_pc_register_index(self) -> int:
         """register_list()에서 PC 레지스터의 실제 인덱스를 찾는다.
