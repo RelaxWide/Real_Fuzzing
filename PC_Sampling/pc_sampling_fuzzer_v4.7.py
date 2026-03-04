@@ -185,7 +185,7 @@ NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일 (커널 reset 방지, u32 max 
 # 기본값: admin_timeout=60s, io_timeout=30s → 펌웨어 crash 후 ~60초면 reset됨.
 # 이 값을 크게 설정하면 crash 상태가 장기간 보존되어 JTAG 분석 가능.
 # 적용 대상: 설정 이후 새로 제출되는 NVMe 명령 (기존 in-flight AER 제외)
-NVME_KERNEL_TIMEOUT_SEC = 86_400  # 24시간
+NVME_KERNEL_TIMEOUT_SEC = 2_592_000  # 30일 (30 * 24 * 3600)
 
 # 퍼징 설정
 MAX_INPUT_LEN     = 131072    # 최대 입력 바이트 (128KB = 256 blocks, Write 대용량 시드 지원)
