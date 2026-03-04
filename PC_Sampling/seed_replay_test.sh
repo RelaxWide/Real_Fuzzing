@@ -185,25 +185,26 @@ add("Write", 0x01, "io", True, True, cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0
 add("SetFeatures", 0x09, "admin", True, True, cdw10=0x07, cdw11=0x00010001, desc="Number of Queues", xfail=True)
 
 # ── FWDownload / FWCommit ─────────────────────────────────────────
-# 전체 .bin을 4KB 청크로 분할 전송 후 FWCommit.
-CHUNK_SIZE = 4096  # 4KB per chunk (safe default; 실제는 FWUG 참조)
+# 펌웨어 전체를 단일 FWDownload로 전송 (offset=0, numd=전체 크기)
 with open(fw_bin, "rb") as fh:
     fw_data = fh.read()
 fw_size = len(fw_data)
-offset = 0
-chunk_idx = 0
-while offset < fw_size:
-    chunk = fw_data[offset:offset + CHUNK_SIZE]
-    chunk = chunk.ljust(CHUNK_SIZE, b'\x00')  # 마지막 청크 패딩
-    numd = (CHUNK_SIZE // 4) - 1              # CDW10: NUMD (0-based dwords)
-    ofst = offset // 4                         # CDW11: OFST (dword offset)
-    add("FWDownload", 0x11, "admin", True, True,
-        cdw10=numd, cdw11=ofst, data=chunk,
-        desc=f"FWDownload chunk {chunk_idx} offset={offset}")
-    offset += CHUNK_SIZE
-    chunk_idx += 1
+fw_size_aligned = (fw_size + 3) & ~3  # CDW 단위(4바이트) 정렬
+if fw_size % 4 != 0:
+    fw_data = fw_data + b'\x00' * (fw_size_aligned - fw_size)
+fw_temp = os.path.join(tmpdir, "fw_full.bin")
+with open(fw_temp, "wb") as fh:
+    fh.write(fw_data)
+numd_total = (fw_size_aligned // 4) - 1  # CDW10: NUMD (0-based dword count)
+# add()의 MAX_DATA_BUF 캡을 우회해서 직접 추가
+seeds.append({"idx": idx, "cmd": "FWDownload", "opcode": 0x11, "type": "admin",
+              "nsid": 0, "cdw10": numd_total, "cdw11": 0, "cdw12": 0,
+              "cdw13": 0, "cdw14": 0, "cdw15": 0,
+              "data_len": fw_size_aligned, "write": True, "data_file": fw_temp,
+              "desc": f"FWDownload full image {fw_size_aligned}B",
+              "xfail": False, "skip": False})
+idx += 1
 # Commit Action 0b001 = replace slot, activate on next reset
-# Firmware Slot = fw_slot (CDW10[5:3])
 commit_action = 0x01  # CA=001: replace slot, no activation
 cdw10_commit  = (fw_slot << 3) | commit_action
 add("FWCommit", 0x10, "admin", True, False,
