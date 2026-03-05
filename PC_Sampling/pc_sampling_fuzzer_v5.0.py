@@ -726,7 +726,35 @@ class JLinkPCSampler:
 
         log.warning(f"[Diagnose] idle_pcs = {len(self.idle_pcs)}개 "
                     f"(범위 내), 대표 PC = {hex(self.idle_pc)}")
+
+        # ★ 샘플링 루프 후 CPU 상태 명시 확인 + resume 보장
+        # 마지막 _read_pc()의 JLINKARM_Go()가 race condition 등으로
+        # 효력이 없을 경우 CPU가 halt 상태인 채 반환될 수 있음.
+        self.ensure_running(caller="diagnose")
         return True
+
+    def ensure_running(self, settle_ms: int = 100, caller: str = "") -> None:
+        """CPU halt 상태 확인 후 JLINKARM_Go()로 resume, settle_ms 대기.
+
+        NVMe 명령 전 또는 샘플링 루프 종료 후에 호출하여
+        SSD 펌웨어가 NVMe 명령을 받을 수 있는 상태인지 보장한다.
+        """
+        tag = f"[{caller}] " if caller else ""
+        try:
+            if self.jlink.halted():
+                log.warning(f"[J-Link] {tag}CPU halt 상태 감지 → JLINKARM_Go() resume 시도")
+                self.jlink._dll.JLINKARM_Go()
+                time.sleep(settle_ms / 1000)
+                # resume 성공 여부 재확인
+                if self.jlink.halted():
+                    log.error(f"[J-Link] {tag}JLINKARM_Go() 후에도 CPU 여전히 halted!"
+                              " NVMe 명령이 타임아웃될 수 있습니다.")
+                else:
+                    log.warning(f"[J-Link] {tag}CPU resumed OK.")
+            else:
+                log.warning(f"[J-Link] {tag}CPU running 확인 (halt 없음).")
+        except Exception as e:
+            log.warning(f"[J-Link] {tag}ensure_running 실패: {e}")
 
     def _read_pc(self) -> Optional[int]:
         try:
@@ -2895,6 +2923,8 @@ class NVMeFuzzer:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
 
         # v4.3: 퍼징 시작 전 SMART baseline 기록
+        # NVMe 명령 전 CPU running 상태 명시 보장
+        self.sampler.ensure_running(caller="pre-SMART")
         self._log_smart()
 
         # v4.5: 초기 시드 Calibration
