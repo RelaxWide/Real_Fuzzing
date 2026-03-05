@@ -747,38 +747,24 @@ class JLinkPCSampler:
         log.warning(f"[Diagnose] idle_pcs = {len(self.idle_pcs)}개 "
                     f"(범위 내), 대표 PC = {hex(self.idle_pc)}")
 
-        # ★ 샘플링 루프 후 CPU 상태 명시 확인 + resume 보장
-        # 마지막 _read_pc()의 JLINKARM_Go()가 race condition 등으로
-        # 효력이 없을 경우 CPU가 halt 상태인 채 반환될 수 있음.
-        self.ensure_running(caller="diagnose")
+        # 샘플링 루프 종료 후 CPU가 running 상태임을 보장한다.
+        self._ensure_running()
         return True
 
-    def ensure_running(self, settle_ms: int = 100, caller: str = "") -> None:
-        """CPU halt 상태 확인 후 JLINKARM_Go()로 resume, settle_ms 대기.
+    def _ensure_running(self, settle_ms: int = 100) -> None:
+        """샘플링 루프 후 CPU가 running 상태임을 보장한다.
 
-        NVMe 명령 전 또는 샘플링 루프 종료 후에 호출하여
-        SSD 펌웨어가 NVMe 명령을 받을 수 있는 상태인지 보장한다.
+        JLINKARM_GoEx는 이미 running CPU에 호출해도 무해하다.
+        halted() 대신 GoEx를 무조건 호출하는 이유: DLL 내부 캐시가 실제 CPU 상태와
+        달리 False를 반환하는 경우가 있어 GoEx ret 값이 더 신뢰성 있다.
         """
-        tag = f"[{caller}] " if caller else ""
         try:
-            # halted()는 DLL 내부 캐시를 보므로 GoEx 실패 후 False를 잘못 반환할 수 있다.
-            # → 조건 없이 GoEx를 호출하고 return value를 직접 확인한다.
-            # (이미 running CPU에 GoEx를 보내면 ret=-1이지만 CPU 상태에는 무해하다.)
-            halted_before = bool(self.jlink._dll.JLINKARM_IsHalted())
             ret = self.jlink._dll.JLINKARM_GoEx(0, 0)
             time.sleep(settle_ms / 1000)
-            halted_after = bool(self.jlink._dll.JLINKARM_IsHalted())
-            log.warning(
-                f"[J-Link] {tag}ensure_running: "
-                f"halted_before={halted_before}, GoEx ret={ret}, halted_after={halted_after}"
-            )
-            if halted_after:
-                log.error(
-                    f"[J-Link] {tag}JLINKARM_GoEx(0,0) 후에도 CPU 여전히 halted! "
-                    "NVMe 명령이 타임아웃될 수 있습니다."
-                )
+            if ret != 0 and bool(self.jlink._dll.JLINKARM_IsHalted()):
+                log.warning("[J-Link] GoEx 후에도 CPU halted 상태 — NVMe 명령이 지연될 수 있음")
         except Exception as e:
-            log.warning(f"[J-Link] {tag}ensure_running 실패: {e}")
+            log.warning(f"[J-Link] _ensure_running 실패: {e}")
 
     def _read_pc(self) -> Optional[int]:
         try:
@@ -1284,57 +1270,6 @@ class NVMeFuzzer:
                 self.mopt_mode = 'pilot'
                 self.mopt_pilot_rounds = 0
                 log.info("[MOpt] Core→Pilot (reset)")
-
-    def _wait_nvme_live(self, timeout_sec: float = 30.0) -> bool:
-        """NVMe 장치가 실제로 명령에 응답할 때까지 대기.
-
-        J-Link connect()가 타겟 CPU를 리셋하거나 PCIe 링크를 교란하는 경우,
-        nvme 드라이버가 재초기화를 마칠 때까지 smart-log 등이 블로킹된다.
-        state 파일(커널 버전 의존)이 없어도 동작하도록 nvme id-ctrl로 직접 확인.
-        """
-        # subprocess.run(timeout=)은 D-state nvme 프로세스에서 영구 hang 발생:
-        #   TimeoutExpired → proc.kill() → communicate() 재호출 → D-state 파이프 EOF 없음 → hang
-        # Popen + proc.wait(timeout=) 로 D-state를 안전하게 처리한다.
-        # D-state 프로세스: SIGKILL 무시 → wait() 재호출 없이 poll()만 하고 다음 시도로 이동.
-        deadline = time.time() + timeout_sec
-        attempt = 0
-        while time.time() < deadline:
-            attempt += 1
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            probe_timeout = min(3.0, remaining)
-            try:
-                proc = subprocess.Popen(
-                    ['nvme', 'id-ctrl', self.config.nvme_device],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            except Exception as e:
-                log.warning(f"[NVMe] id-ctrl 실행 실패 (attempt {attempt}): {e}")
-                time.sleep(1.0)
-                continue
-
-            try:
-                proc.wait(timeout=probe_timeout)
-                if proc.returncode == 0:
-                    if attempt > 1:
-                        log.warning(f"[NVMe] device ready (attempt {attempt})")
-                    return True
-                log.warning(f"[NVMe] id-ctrl rc={proc.returncode} (attempt {attempt}) — 재시도...")
-            except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                # D-state: SIGKILL 무시 → communicate()/wait() 재호출 금지, poll()만
-                proc.poll()
-                log.warning(f"[NVMe] id-ctrl D-state timeout (attempt {attempt}) — 재시도...")
-            time.sleep(0.5)
-
-        log.error(f"[NVMe] {timeout_sec}s 내 device 응답 없음 ({attempt}회 시도)"
-                  " — smart-log가 타임아웃될 수 있음")
-        return False
 
     def _log_smart(self):
         """v4.3: NVMe SMART / Health 로그를 읽어 INFO 레벨로 기록.
@@ -2979,25 +2914,9 @@ class NVMeFuzzer:
         if self.config.resume_coverage:
             self.sampler.load_coverage(self.config.resume_coverage)
 
-        # ── 진단: connect() 이전 baseline ─────────────────────────────────
-        # J-Link connect() 자체가 NVMe 응답에 영향을 주는지 확인.
-        # 여기서 성공하면 NVMe는 정상, 이후 실패는 J-Link connect()가 원인.
-        log.warning("[SMART-DIAG] ★ connect() 이전 baseline smart-log 시도...")
-        self._log_smart()
-        log.warning("[SMART-DIAG] ── 위가 J-Link 없는 상태의 결과 ──────────")
-        # ──────────────────────────────────────────────────────────────────
-
         if not self.sampler.connect():
             log.error("J-Link connection failed, aborting")
             return
-
-        # ── 진단: connect() 이후, diagnose() 이전 ─────────────────────────
-        log.warning("[SMART-DIAG] connect() 후 / diagnose() 전 smart-log 시도...")
-        self.sampler.ensure_running(caller="pre-SMART-1")
-        self._wait_nvme_live(timeout_sec=30)   # nvme id-ctrl 실제 응답 대기
-        self._log_smart()
-        log.warning("[SMART-DIAG] ── 위가 connect()만 한 상태의 결과 ──────────")
-        # ──────────────────────────────────────────────────────────────────
 
         # J-Link PC 읽기 진단 + idle PC 감지
         if not self.sampler.diagnose():
@@ -3009,18 +2928,6 @@ class NVMeFuzzer:
             log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
         else:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
-
-        # ── 진단: diagnose() 이후 ──────────────────────────────────────────
-        log.warning("[SMART-DIAG] diagnose() 후 smart-log 시도...")
-        self.sampler.ensure_running(caller="post-diagnose")
-        # diagnose() halt 사이클이 NVMe 컨트롤러를 교란할 수 있음 → 최대 60초 대기
-        nvme_ok = self._wait_nvme_live(timeout_sec=60)
-        if nvme_ok:
-            self._log_smart()
-        else:
-            log.error("[SMART-DIAG] NVMe 응답 없음 — diagnose() 후 smart-log 건너뜀")
-        log.warning("[SMART-DIAG] ── 위가 diagnose() 후 상태의 결과 ──────────")
-        # ──────────────────────────────────────────────────────────────────
 
         # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
         # _log_smart() 이후에 설정: 이전에 실행하면 admin_timeout=30일 상태에서
