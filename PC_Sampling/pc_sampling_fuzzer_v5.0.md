@@ -394,16 +394,31 @@ NVME_TIMEOUTS = {
 
 ### 확장 명령어 (`--all-commands` 또는 `--commands`로 활성화)
 
-| 이름 | Opcode | 타입 | 주의 |
-|------|--------|------|------|
-| `SetFeatures` | `0x09` | Admin | |
-| `FWDownload` | `0x11` | Admin | `FW_BIN_FILENAME` 설정 권장 (없으면 더미 시드) |
-| `FWCommit` | `0x10` | Admin | 펌웨어 재부팅 유발 가능 |
-| `FormatNVM` | `0x80` | Admin | ⚠️ 미디어 초기화 |
-| `Sanitize` | `0x84` | Admin | ⚠️ 전체 데이터 소거 |
-| `TelemetryHostInitiated` | `0x02` | Admin | |
-| `Flush` | `0x00` | IO | |
-| `DatasetManagement` | `0x09` | IO | TRIM/Deallocate |
+#### Admin
+
+| 이름 | Opcode | 주의 |
+|------|--------|------|
+| `SetFeatures` | `0x09` | FID 16종 시드 |
+| `FWDownload` | `0x11` | `FW_BIN_FILENAME` 설정 권장 |
+| `FWCommit` | `0x10` | CA 7종 시드, 재부팅 유발 가능 |
+| `FormatNVM` | `0x80` | ⚠️ 미디어 초기화, SES 3종 시드 |
+| `Sanitize` | `0x84` | ⚠️ 전체 데이터 소거 |
+| `TelemetryHostInitiated` | `0x02` | Create=0/1 시드 |
+| `DeviceSelfTest` | `0x14` | STC 6종 시드, 즉시 반환 |
+| `SecuritySend` | `0x81` | TCG/OPAL/IEEE1667, SECP 7종 시드 |
+| `SecurityReceive` | `0x82` | TCG/OPAL/IEEE1667, SECP 7종 시드 |
+| `GetLBAStatus` | `0x86` | ATYPE 3종 시드 |
+
+#### IO
+
+| 이름 | Opcode | 주의 |
+|------|--------|------|
+| `Flush` | `0x00` | |
+| `DatasetManagement` | `0x09` | TRIM/Deallocate, 7종 시드 |
+| `WriteZeroes` | `0x08` | DMA 없음, DEAC/FUA 시드 포함 |
+| `Compare` | `0x05` | 비교 불일치 시 에러 반환 |
+| `WriteUncorrectable` | `0x04` | 에러 주입 (LBA uncorrectable 마킹) |
+| `Verify` | `0x0C` | CRC/PI 검증, PRINFO 시드 포함 |
 
 ---
 
@@ -532,7 +547,7 @@ sudo ./seed_replay_test.sh /dev/nvme0 FW.bin 32768 1
 
 | 버전 | 주요 변경 |
 |------|-----------|
-| **v5.0** | `--interface auto/jtag/swd` (JTAG→SWD 자동 전환), `--pc-reg-index`, `diagnose()` 수렴 기반 idle 유니버스 수집, idle 유니버스 기반 `_sampling_worker()`; `FW_BIN_FILENAME` user setting (`.py` 위치 기준 펌웨어 파일명 자동 경로 조합) <br>**BugFix**: JTAG auto halt 후 CPU resume 누락 → `jlink.go()` 추가; `_go_func` raw DLL → `jlink.go()`; `diagnose()` None 샘플 수렴 미반영; calibration RC_TIMEOUT crash 처리 없음 |
+| **v5.0** | `--interface auto/jtag/swd` (JTAG→SWD 자동 전환), `--pc-reg-index`, `diagnose()` 수렴 기반 idle 유니버스 수집, idle 유니버스 기반 `_sampling_worker()`; `FW_BIN_FILENAME` user setting; NVMe 2.0 전체 명령어 확장 (WriteZeroes/Compare/WriteUncorrectable/Verify/DeviceSelfTest/SecuritySend/SecurityReceive/GetLBAStatus 추가); Identify CNS·GetLogPage LID·GetFeatures FID·SetFeatures·FWCommit CA·FormatNVM SES 시드 전면 확장; CDW12 PRINFO/LR/FUA·CDW13 DSPEC·CDW14 ILBRT·CDW15 LBAT/LBATM E2E 보호 시드 추가 <br>**BugFix**: JTAG auto halt 후 CPU resume 누락 → `jlink.go()` 추가; `_go_func` raw DLL → `jlink.go()`; `diagnose()` None 샘플 수렴 미반영; calibration RC_TIMEOUT crash 처리 없음 |
 | **v4.7** | FUA 비트 수정 (CDW12[14]→[29]), 컨트롤러 범위 NSID=0, Sanitize 제거, `--fw-bin/--fw-xfer/--fw-slot`, critical 버그 2건 수정 |
 | **v4.6** | io-passthru → namespace device, passthru timeout 분리, 크래시 시 nvme 드라이버 unbind |
 | **v4.5** | Calibration, Deterministic stage, MOpt mutation scheduling |
