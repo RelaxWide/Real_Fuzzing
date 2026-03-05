@@ -552,10 +552,16 @@ class JLinkPCSampler:
                     # ★ JTAG 검증 완료 후 즉시 resume.
                     # halt() 상태로 반환하면 connect() 이후 _log_smart() 등 NVMe
                     # 명령이 펌웨어를 못 받아 10초 타임아웃이 바로 발생한다.
-                    # JLINKARM_Go()는 Cortex-R8 등에서 -1 오류로 실패.
-                    # pylink 내부 go()와 동일한 GoEx(0,0) 사용.
-                    self.jlink._dll.JLINKARM_GoEx(0, 0)
-                    log.warning("[J-Link] JTAG 검증용 halt 해제 — CPU resumed.")
+                    # JLINKARM_GoEx는 ctypes DLL 호출이므로 실패해도 Python 예외를
+                    # 던지지 않고 int(ret)를 반환할 뿐이다.
+                    # ret != 0 이면 raise해서 SWD fallback을 트리거한다.
+                    _go_ret = self.jlink._dll.JLINKARM_GoEx(0, 0)
+                    if _go_ret != 0:
+                        raise Exception(
+                            f"JLINKARM_GoEx(0,0) 실패 (ret={_go_ret}) — "
+                            "JTAG CPU resume 불가, SWD fallback 시도"
+                        )
+                    log.warning("[J-Link] JTAG 검증용 halt 해제 — CPU resumed (GoEx OK).")
                     iface_name = "JTAG (auto)"
                 except Exception as jtag_err:
                     log.warning(f"[J-Link] JTAG 연결/검증 실패 ({jtag_err}), SWD로 재시도...")
@@ -752,18 +758,22 @@ class JLinkPCSampler:
         """
         tag = f"[{caller}] " if caller else ""
         try:
-            if self.jlink.halted():
-                log.warning(f"[J-Link] {tag}CPU halt 상태 감지 → JLINKARM_GoEx(0,0) resume 시도")
-                self.jlink._dll.JLINKARM_GoEx(0, 0)
-                time.sleep(settle_ms / 1000)
-                # resume 성공 여부 재확인
-                if self.jlink.halted():
-                    log.error(f"[J-Link] {tag}JLINKARM_GoEx(0,0) 후에도 CPU 여전히 halted!"
-                              " NVMe 명령이 타임아웃될 수 있습니다.")
-                else:
-                    log.warning(f"[J-Link] {tag}CPU resumed OK.")
-            else:
-                log.warning(f"[J-Link] {tag}CPU running 확인 (halt 없음).")
+            # halted()는 DLL 내부 캐시를 보므로 GoEx 실패 후 False를 잘못 반환할 수 있다.
+            # → 조건 없이 GoEx를 호출하고 return value를 직접 확인한다.
+            # (이미 running CPU에 GoEx를 보내면 ret=-1이지만 CPU 상태에는 무해하다.)
+            halted_before = bool(self.jlink._dll.JLINKARM_IsHalted())
+            ret = self.jlink._dll.JLINKARM_GoEx(0, 0)
+            time.sleep(settle_ms / 1000)
+            halted_after = bool(self.jlink._dll.JLINKARM_IsHalted())
+            log.warning(
+                f"[J-Link] {tag}ensure_running: "
+                f"halted_before={halted_before}, GoEx ret={ret}, halted_after={halted_after}"
+            )
+            if halted_after:
+                log.error(
+                    f"[J-Link] {tag}JLINKARM_GoEx(0,0) 후에도 CPU 여전히 halted! "
+                    "NVMe 명령이 타임아웃될 수 있습니다."
+                )
         except Exception as e:
             log.warning(f"[J-Link] {tag}ensure_running 실패: {e}")
 
@@ -2953,6 +2963,7 @@ class NVMeFuzzer:
 
         # ── 진단: connect() 이후, diagnose() 이전 ─────────────────────────
         log.warning("[SMART-DIAG] connect() 후 / diagnose() 전 smart-log 시도...")
+        self.sampler.ensure_running(caller="pre-SMART-1")
         self._wait_nvme_live(timeout_sec=10)
         self._log_smart()
         log.warning("[SMART-DIAG] ── 위가 connect()만 한 상태의 결과 ──────────")
