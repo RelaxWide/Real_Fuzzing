@@ -1314,7 +1314,7 @@ class NVMeFuzzer:
             return
 
         try:
-            stdout_data, stderr_data = proc.communicate(timeout=10)
+            stdout_data, stderr_data = proc.communicate(timeout=60)
         except subprocess.TimeoutExpired:
             # D-state 프로세스는 SIGKILL도 무시 → communicate() 재호출 금지.
             # 파이프를 닫고 non-blocking poll만 해서 계속 진행한다.
@@ -1330,7 +1330,7 @@ class NVMeFuzzer:
                     except Exception:
                         pass
             proc.poll()
-            log.warning("[SMART] smart-log 타임아웃 (10s) — NVMe 장치 응답 없음")
+            log.warning("[SMART] smart-log 타임아웃 (60s) — NVMe 장치 무응답")
             return
 
         if proc.returncode == 0 and stdout_data.strip():
@@ -2951,17 +2951,17 @@ class NVMeFuzzer:
         else:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
 
-        # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
-        # _log_smart() 이전에 실행하면 admin_timeout=30일 상태에서 첫 ioctl이
-        # 제출되어 커널이 포기하지 않고 기다리다가 Python 10초 timeout이 먼저 터진다.
-        # 따라서 _log_smart() 이후에 설정한다.
-        self._configure_nvme_timeouts()
-
         # v4.3: 퍼징 시작 전 SMART baseline 기록
-        # NVMe 명령 전 CPU running 상태 + NVMe 디바이스 state 명시 보장
+        # NVMe 명령 전 CPU running 상태 보장
         self.sampler.ensure_running(caller="pre-SMART")
         self._wait_nvme_live(timeout_sec=30)
         self._log_smart()
+
+        # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
+        # _log_smart() 이후에 설정: 이전에 실행하면 admin_timeout=30일 상태에서
+        # smart-log ioctl이 제출되어, SSD 응답이 조금 느릴 때 커널이 계속 기다리고
+        # Python 10초 timeout이 먼저 터지는 문제 방지.
+        self._configure_nvme_timeouts()
 
         # v4.5: 초기 시드 Calibration
         if self.config.calibration_runs > 0:
