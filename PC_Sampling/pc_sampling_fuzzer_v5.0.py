@@ -1261,6 +1261,38 @@ class NVMeFuzzer:
                 self.mopt_pilot_rounds = 0
                 log.info("[MOpt] Core→Pilot (reset)")
 
+    def _wait_nvme_live(self, timeout_sec: float = 30.0) -> bool:
+        """NVMe 디바이스 state가 'live'가 될 때까지 대기.
+
+        connect() / diagnose() 이후 커널 AER timeout → controller reset이
+        진행 중인 경우 state='resetting'. 이 상태에서 smart-log/passthru를
+        보내면 10초 이상 블로킹된다.
+        state 파일이 없는 커널 버전에서는 즉시 True 반환.
+        """
+        dev_name = Path(self.config.nvme_device).name.split('n')[0]  # nvme0n1 → nvme0
+        state_path = Path(f'/sys/class/nvme/{dev_name}/state')
+        if not state_path.exists():
+            log.warning(f"[NVMe] {state_path} 없음 — state 확인 건너뜀")
+            return True
+
+        deadline = time.time() + timeout_sec
+        last_state = None
+        while time.time() < deadline:
+            try:
+                state = state_path.read_text().strip()
+            except OSError:
+                state = 'unknown'
+            if state != last_state:
+                log.warning(f"[NVMe] device state: {state}")
+                last_state = state
+            if state == 'live':
+                return True
+            time.sleep(0.5)
+
+        log.error(f"[NVMe] {timeout_sec}s 내 state=live 미도달 (마지막: {last_state})"
+                  " — NVMe 명령이 타임아웃될 수 있음")
+        return False
+
     def _log_smart(self):
         """v4.3: NVMe SMART / Health 로그를 읽어 INFO 레벨로 기록.
 
@@ -2923,8 +2955,9 @@ class NVMeFuzzer:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
 
         # v4.3: 퍼징 시작 전 SMART baseline 기록
-        # NVMe 명령 전 CPU running 상태 명시 보장
+        # NVMe 명령 전 CPU running 상태 + NVMe 디바이스 state 명시 보장
         self.sampler.ensure_running(caller="pre-SMART")
+        self._wait_nvme_live(timeout_sec=30)
         self._log_smart()
 
         # v4.5: 초기 시드 Calibration
