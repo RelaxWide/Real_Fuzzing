@@ -717,8 +717,11 @@ class JLinkPCSampler:
                                     f"— 연결 불안정 또는 CPU halt 방치 가능성")
                 else:
                     consecutive_failures = 0
-            # USB 과부하 방지: 무sleep 고속 사이클은 J-Link 연결을 불안정하게 만들 수 있음
-            time.sleep(0.005)
+            # NVMe 보호: 5ms(이전)는 너무 짧아 펌웨어가 NVMe 큐 처리를 완료하기 전에
+            # 다시 halt되어 컨트롤러가 불안정해진다.
+            # 50ms: 펌웨어가 pending 인터럽트·AER·완료큐 처리 후 WFI로 돌아갈 시간 확보.
+            # diagnose 총 시간: ~200샘플 × 50ms ≈ 10초 (허용 범위)
+            time.sleep(0.05)
 
         if consecutive_no_new >= stability:
             log.warning(f"[Diagnose] idle 유니버스 수렴 완료: "
@@ -1289,27 +1292,45 @@ class NVMeFuzzer:
         nvme 드라이버가 재초기화를 마칠 때까지 smart-log 등이 블로킹된다.
         state 파일(커널 버전 의존)이 없어도 동작하도록 nvme id-ctrl로 직접 확인.
         """
+        # subprocess.run(timeout=)은 D-state nvme 프로세스에서 영구 hang 발생:
+        #   TimeoutExpired → proc.kill() → communicate() 재호출 → D-state 파이프 EOF 없음 → hang
+        # Popen + proc.wait(timeout=) 로 D-state를 안전하게 처리한다.
+        # D-state 프로세스: SIGKILL 무시 → wait() 재호출 없이 poll()만 하고 다음 시도로 이동.
         deadline = time.time() + timeout_sec
         attempt = 0
         while time.time() < deadline:
             attempt += 1
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            probe_timeout = min(3.0, remaining)
             try:
-                result = subprocess.run(
+                proc = subprocess.Popen(
                     ['nvme', 'id-ctrl', self.config.nvme_device],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=3.0,
                     start_new_session=True,
                 )
-                if result.returncode == 0:
+            except Exception as e:
+                log.warning(f"[NVMe] id-ctrl 실행 실패 (attempt {attempt}): {e}")
+                time.sleep(1.0)
+                continue
+
+            try:
+                proc.wait(timeout=probe_timeout)
+                if proc.returncode == 0:
                     if attempt > 1:
                         log.warning(f"[NVMe] device ready (attempt {attempt})")
                     return True
-                log.warning(f"[NVMe] id-ctrl rc={result.returncode} (attempt {attempt}) — 재시도...")
+                log.warning(f"[NVMe] id-ctrl rc={proc.returncode} (attempt {attempt}) — 재시도...")
             except subprocess.TimeoutExpired:
-                log.warning(f"[NVMe] id-ctrl timeout (attempt {attempt}) — 재시도...")
-            except Exception as e:
-                log.warning(f"[NVMe] id-ctrl 오류 (attempt {attempt}): {e}")
-            time.sleep(1.0)
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                # D-state: SIGKILL 무시 → communicate()/wait() 재호출 금지, poll()만
+                proc.poll()
+                log.warning(f"[NVMe] id-ctrl D-state timeout (attempt {attempt}) — 재시도...")
+            time.sleep(0.5)
 
         log.error(f"[NVMe] {timeout_sec}s 내 device 응답 없음 ({attempt}회 시도)"
                   " — smart-log가 타임아웃될 수 있음")
@@ -2992,8 +3013,12 @@ class NVMeFuzzer:
         # ── 진단: diagnose() 이후 ──────────────────────────────────────────
         log.warning("[SMART-DIAG] diagnose() 후 smart-log 시도...")
         self.sampler.ensure_running(caller="post-diagnose")
-        self._wait_nvme_live(timeout_sec=15)   # diagnose 후 NVMe 회복 대기
-        self._log_smart()
+        # diagnose() halt 사이클이 NVMe 컨트롤러를 교란할 수 있음 → 최대 60초 대기
+        nvme_ok = self._wait_nvme_live(timeout_sec=60)
+        if nvme_ok:
+            self._log_smart()
+        else:
+            log.error("[SMART-DIAG] NVMe 응답 없음 — diagnose() 후 smart-log 건너뜀")
         log.warning("[SMART-DIAG] ── 위가 diagnose() 후 상태의 결과 ──────────")
         # ──────────────────────────────────────────────────────────────────
 
