@@ -2940,6 +2940,13 @@ class NVMeFuzzer:
             log.error("J-Link connection failed, aborting")
             return
 
+        # ── 진단: connect() 이후, diagnose() 이전 ─────────────────────────
+        log.warning("[SMART-DIAG] connect() 후 / diagnose() 전 smart-log 시도...")
+        self._wait_nvme_live(timeout_sec=10)
+        self._log_smart()
+        log.warning("[SMART-DIAG] ── 위가 connect()만 한 상태의 결과 ──────────")
+        # ──────────────────────────────────────────────────────────────────
+
         # J-Link PC 읽기 진단 + idle PC 감지
         if not self.sampler.diagnose():
             log.error("J-Link PC read diagnosis failed, aborting")
@@ -2951,11 +2958,12 @@ class NVMeFuzzer:
         else:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
 
-        # v4.3: 퍼징 시작 전 SMART baseline 기록
-        # NVMe 명령 전 CPU running 상태 보장
-        self.sampler.ensure_running(caller="pre-SMART")
-        self._wait_nvme_live(timeout_sec=30)
+        # ── 진단: diagnose() 이후 ──────────────────────────────────────────
+        log.warning("[SMART-DIAG] diagnose() 후 smart-log 시도...")
+        self.sampler.ensure_running(caller="post-diagnose")
         self._log_smart()
+        log.warning("[SMART-DIAG] ── 위가 diagnose() 후 상태의 결과 ──────────")
+        # ──────────────────────────────────────────────────────────────────
 
         # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
         # _log_smart() 이후에 설정: 이전에 실행하면 admin_timeout=30일 상태에서
