@@ -2932,9 +2932,6 @@ class NVMeFuzzer:
             return
         log.info(f"[Pre-flight] NVMe 디바이스 확인: {nvme_dev} ✓")
 
-        # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존)
-        self._configure_nvme_timeouts()
-
         # 이전 커버리지 로드 (resume)
         if self.config.resume_coverage:
             self.sampler.load_coverage(self.config.resume_coverage)
@@ -2953,6 +2950,12 @@ class NVMeFuzzer:
             log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
         else:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
+
+        # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
+        # _log_smart() 이전에 실행하면 admin_timeout=30일 상태에서 첫 ioctl이
+        # 제출되어 커널이 포기하지 않고 기다리다가 Python 10초 timeout이 먼저 터진다.
+        # 따라서 _log_smart() 이후에 설정한다.
+        self._configure_nvme_timeouts()
 
         # v4.3: 퍼징 시작 전 SMART baseline 기록
         # NVMe 명령 전 CPU running 상태 + NVMe 디바이스 state 명시 보장
