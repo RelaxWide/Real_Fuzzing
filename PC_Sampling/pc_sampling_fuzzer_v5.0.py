@@ -219,6 +219,16 @@ OUTPUT_DIR        = f'./output/pc_sampling_v{FUZZER_VERSION}/'
 SEED_DIR          = None      # 시드 폴더 경로 (없으면 None)
 RESUME_COVERAGE   = None      # 이전 coverage.txt 경로 (없으면 None)
 
+# v5.0: 펌웨어 바이너리 파일명 (FWDownload 시드 생성용)
+# .py 파일과 같은 디렉토리에 있는 파일명만 입력하세요.
+# 예: FW_BIN_FILENAME = 'FW.bin'
+# None 또는 파일이 없으면 더미 1KB zeros 시드로 대체됩니다.
+FW_BIN_FILENAME   = None
+_FW_BIN_PATH = (
+    str(Path(__file__).parent / FW_BIN_FILENAME)
+    if FW_BIN_FILENAME else None
+)
+
 # Power Schedule 설정 (v4 추가)
 MAX_ENERGY        = 16.0      # 최대 에너지 값
 
@@ -3380,9 +3390,9 @@ if __name__ == "__main__":
     parser.add_argument('--output', default=OUTPUT_DIR, help='Output dir')
     parser.add_argument('--seed-dir', default=SEED_DIR,
                         help='Seed directory path (load previous corpus as seeds)')
-    parser.add_argument('--fw-bin', default=None,
+    parser.add_argument('--fw-bin', default=_FW_BIN_PATH,
                         help='[v4.7] 펌웨어 바이너리 경로 (FWDownload 실제 시드 생성, '
-                             '없으면 더미 1KB 시드)')
+                             '없으면 더미 1KB 시드). 기본값: FW_BIN_FILENAME 설정')
     parser.add_argument('--fw-xfer', type=int, default=32768,
                         help='[v4.7] FWDownload 청크 크기(바이트), nvme fw-download -x 와 동일 '
                              '(default: 32768)')
