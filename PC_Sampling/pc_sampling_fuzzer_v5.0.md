@@ -235,6 +235,13 @@ sudo python3 pc_sampling_fuzzer_v5.0.py \
 
 ### 펌웨어 포함 전체 명령어
 
+코드 상단 user setting에서 파일명을 지정합니다:
+
+```python
+# pc_sampling_fuzzer_v5.0.py 상단
+FW_BIN_FILENAME = 'FW.bin'   # .py와 같은 디렉터리에 위치
+```
+
 ```bash
 sudo python3 pc_sampling_fuzzer_v5.0.py \
   --device Cortex-R8 \
@@ -242,7 +249,6 @@ sudo python3 pc_sampling_fuzzer_v5.0.py \
   --addr-start 0x00000000 \
   --addr-end 0x00147FFF \
   --all-commands \
-  --fw-bin ./FW.bin \
   --fw-xfer 32768 \
   --fw-slot 1 \
   --output ./output/run_fw
@@ -271,6 +277,7 @@ sudo python3 pc_sampling_fuzzer_v5.0.py \
 | `JLINK_SPEED`   | `12000` | JTAG/SWD 속도 (kHz) |
 | `NVME_DEVICE`   | `'/dev/nvme0'` | NVMe 캐릭터 디바이스 경로 |
 | `NVME_NAMESPACE`| `1` | NVMe 네임스페이스 번호 |
+| `FW_BIN_FILENAME`   | `None` | FWDownload 시드용 펌웨어 파일명 (`.py`와 같은 디렉터리). `None`이면 더미 1KB 시드 |
 | `DIAGNOSE_STABILITY` | `50` | idle 유니버스 수렴 조건: 새 PC 없이 연속 N회 |
 | `DIAGNOSE_MAX`  | `1000` | idle 유니버스 수집 최대 샘플 수 |
 | `SATURATION_LIMIT` | `10` | idle 유니버스 내 PC 연속 N회 → 조기종료 |
@@ -318,7 +325,7 @@ NVME_TIMEOUTS = {
 | *(없음)* | — | 기본 안전 명령어: `Identify`, `GetLogPage`, `GetFeatures`, `Read`, `Write` |
 | `--commands A B` | — | 명령어 명시 선택 |
 | `--all-commands` | — | 파괴적 명령어 포함 전체 활성화 |
-| `--fw-bin PATH` | `None` | 펌웨어 바이너리 (FWDownload 실제 시드) |
+| `--fw-bin PATH` | `FW_BIN_FILENAME` 기반 자동 | 펌웨어 바이너리 경로. 기본값은 코드 상단 `FW_BIN_FILENAME`에서 결정 |
 | `--fw-xfer BYTES` | `32768` | FWDownload 청크 크기 |
 | `--fw-slot N` | `1` | FWCommit 슬롯 번호 |
 
@@ -390,7 +397,7 @@ NVME_TIMEOUTS = {
 | 이름 | Opcode | 타입 | 주의 |
 |------|--------|------|------|
 | `SetFeatures` | `0x09` | Admin | |
-| `FWDownload` | `0x11` | Admin | `--fw-bin` 권장 |
+| `FWDownload` | `0x11` | Admin | `FW_BIN_FILENAME` 설정 권장 (없으면 더미 시드) |
 | `FWCommit` | `0x10` | Admin | 펌웨어 재부팅 유발 가능 |
 | `FormatNVM` | `0x80` | Admin | ⚠️ 미디어 초기화 |
 | `Sanitize` | `0x84` | Admin | ⚠️ 전체 데이터 소거 |
@@ -525,7 +532,7 @@ sudo ./seed_replay_test.sh /dev/nvme0 FW.bin 32768 1
 
 | 버전 | 주요 변경 |
 |------|-----------|
-| **v5.0** | `--interface auto/jtag/swd` (JTAG→SWD 자동 전환), `--pc-reg-index`, `diagnose()` 수렴 기반 idle 유니버스 수집, idle 유니버스 기반 `_sampling_worker()` <br>**BugFix**: JTAG auto halt 후 CPU resume 누락 → `jlink.go()` 추가; `_go_func` raw DLL → `jlink.go()`; `diagnose()` None 샘플 수렴 미반영; calibration RC_TIMEOUT crash 처리 없음 |
+| **v5.0** | `--interface auto/jtag/swd` (JTAG→SWD 자동 전환), `--pc-reg-index`, `diagnose()` 수렴 기반 idle 유니버스 수집, idle 유니버스 기반 `_sampling_worker()`; `FW_BIN_FILENAME` user setting (`.py` 위치 기준 펌웨어 파일명 자동 경로 조합) <br>**BugFix**: JTAG auto halt 후 CPU resume 누락 → `jlink.go()` 추가; `_go_func` raw DLL → `jlink.go()`; `diagnose()` None 샘플 수렴 미반영; calibration RC_TIMEOUT crash 처리 없음 |
 | **v4.7** | FUA 비트 수정 (CDW12[14]→[29]), 컨트롤러 범위 NSID=0, Sanitize 제거, `--fw-bin/--fw-xfer/--fw-slot`, critical 버그 2건 수정 |
 | **v4.6** | io-passthru → namespace device, passthru timeout 분리, 크래시 시 nvme 드라이버 unbind |
 | **v4.5** | Calibration, Deterministic stage, MOpt mutation scheduling |
