@@ -1283,35 +1283,36 @@ class NVMeFuzzer:
                 log.info("[MOpt] Core→Pilot (reset)")
 
     def _wait_nvme_live(self, timeout_sec: float = 30.0) -> bool:
-        """NVMe 디바이스 state가 'live'가 될 때까지 대기.
+        """NVMe 장치가 실제로 명령에 응답할 때까지 대기.
 
-        connect() / diagnose() 이후 커널 AER timeout → controller reset이
-        진행 중인 경우 state='resetting'. 이 상태에서 smart-log/passthru를
-        보내면 10초 이상 블로킹된다.
-        state 파일이 없는 커널 버전에서는 즉시 True 반환.
+        J-Link connect()가 타겟 CPU를 리셋하거나 PCIe 링크를 교란하는 경우,
+        nvme 드라이버가 재초기화를 마칠 때까지 smart-log 등이 블로킹된다.
+        state 파일(커널 버전 의존)이 없어도 동작하도록 nvme id-ctrl로 직접 확인.
         """
-        dev_name = Path(self.config.nvme_device).name.split('n')[0]  # nvme0n1 → nvme0
-        state_path = Path(f'/sys/class/nvme/{dev_name}/state')
-        if not state_path.exists():
-            log.warning(f"[NVMe] {state_path} 없음 — state 확인 건너뜀")
-            return True
-
         deadline = time.time() + timeout_sec
-        last_state = None
+        attempt = 0
         while time.time() < deadline:
+            attempt += 1
             try:
-                state = state_path.read_text().strip()
-            except OSError:
-                state = 'unknown'
-            if state != last_state:
-                log.warning(f"[NVMe] device state: {state}")
-                last_state = state
-            if state == 'live':
-                return True
-            time.sleep(0.5)
+                result = subprocess.run(
+                    ['nvme', 'id-ctrl', self.config.nvme_device],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=3.0,
+                    start_new_session=True,
+                )
+                if result.returncode == 0:
+                    if attempt > 1:
+                        log.warning(f"[NVMe] device ready (attempt {attempt})")
+                    return True
+                log.warning(f"[NVMe] id-ctrl rc={result.returncode} (attempt {attempt}) — 재시도...")
+            except subprocess.TimeoutExpired:
+                log.warning(f"[NVMe] id-ctrl timeout (attempt {attempt}) — 재시도...")
+            except Exception as e:
+                log.warning(f"[NVMe] id-ctrl 오류 (attempt {attempt}): {e}")
+            time.sleep(1.0)
 
-        log.error(f"[NVMe] {timeout_sec}s 내 state=live 미도달 (마지막: {last_state})"
-                  " — NVMe 명령이 타임아웃될 수 있음")
+        log.error(f"[NVMe] {timeout_sec}s 내 device 응답 없음 ({attempt}회 시도)"
+                  " — smart-log가 타임아웃될 수 있음")
         return False
 
     def _log_smart(self):
@@ -2957,6 +2958,14 @@ class NVMeFuzzer:
         if self.config.resume_coverage:
             self.sampler.load_coverage(self.config.resume_coverage)
 
+        # ── 진단: connect() 이전 baseline ─────────────────────────────────
+        # J-Link connect() 자체가 NVMe 응답에 영향을 주는지 확인.
+        # 여기서 성공하면 NVMe는 정상, 이후 실패는 J-Link connect()가 원인.
+        log.warning("[SMART-DIAG] ★ connect() 이전 baseline smart-log 시도...")
+        self._log_smart()
+        log.warning("[SMART-DIAG] ── 위가 J-Link 없는 상태의 결과 ──────────")
+        # ──────────────────────────────────────────────────────────────────
+
         if not self.sampler.connect():
             log.error("J-Link connection failed, aborting")
             return
@@ -2964,7 +2973,7 @@ class NVMeFuzzer:
         # ── 진단: connect() 이후, diagnose() 이전 ─────────────────────────
         log.warning("[SMART-DIAG] connect() 후 / diagnose() 전 smart-log 시도...")
         self.sampler.ensure_running(caller="pre-SMART-1")
-        self._wait_nvme_live(timeout_sec=10)
+        self._wait_nvme_live(timeout_sec=30)   # nvme id-ctrl 실제 응답 대기
         self._log_smart()
         log.warning("[SMART-DIAG] ── 위가 connect()만 한 상태의 결과 ──────────")
         # ──────────────────────────────────────────────────────────────────
@@ -2983,6 +2992,7 @@ class NVMeFuzzer:
         # ── 진단: diagnose() 이후 ──────────────────────────────────────────
         log.warning("[SMART-DIAG] diagnose() 후 smart-log 시도...")
         self.sampler.ensure_running(caller="post-diagnose")
+        self._wait_nvme_live(timeout_sec=15)   # diagnose 후 NVMe 회복 대기
         self._log_smart()
         log.warning("[SMART-DIAG] ── 위가 diagnose() 후 상태의 결과 ──────────")
         # ──────────────────────────────────────────────────────────────────
