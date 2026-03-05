@@ -552,8 +552,9 @@ class JLinkPCSampler:
                     # ★ JTAG 검증 완료 후 즉시 resume.
                     # halt() 상태로 반환하면 connect() 이후 _log_smart() 등 NVMe
                     # 명령이 펌웨어를 못 받아 10초 타임아웃이 바로 발생한다.
-                    # jlink.go()는 pylink 버전에 따라 없을 수 있으므로 raw DLL 사용.
-                    self.jlink._dll.JLINKARM_Go()
+                    # JLINKARM_Go()는 Cortex-R8 등에서 -1 오류로 실패.
+                    # pylink 내부 go()와 동일한 GoEx(0,0) 사용.
+                    self.jlink._dll.JLINKARM_GoEx(0, 0)
                     log.warning("[J-Link] JTAG 검증용 halt 해제 — CPU resumed.")
                     iface_name = "JTAG (auto)"
                 except Exception as jtag_err:
@@ -587,7 +588,7 @@ class JLinkPCSampler:
             # DLL 함수 참조 캐싱 (pylink wrapper 우회, 매 호출 attribute lookup 제거)
             self._halt_func = self.jlink._dll.JLINKARM_Halt
             self._read_reg_func = self.jlink._dll.JLINKARM_ReadReg
-            self._go_func = self.jlink._dll.JLINKARM_Go
+            self._go_func = lambda: self.jlink._dll.JLINKARM_GoEx(0, 0)
 
             return True
         except Exception as e:
@@ -752,12 +753,12 @@ class JLinkPCSampler:
         tag = f"[{caller}] " if caller else ""
         try:
             if self.jlink.halted():
-                log.warning(f"[J-Link] {tag}CPU halt 상태 감지 → JLINKARM_Go() resume 시도")
-                self.jlink._dll.JLINKARM_Go()
+                log.warning(f"[J-Link] {tag}CPU halt 상태 감지 → JLINKARM_GoEx(0,0) resume 시도")
+                self.jlink._dll.JLINKARM_GoEx(0, 0)
                 time.sleep(settle_ms / 1000)
                 # resume 성공 여부 재확인
                 if self.jlink.halted():
-                    log.error(f"[J-Link] {tag}JLINKARM_Go() 후에도 CPU 여전히 halted!"
+                    log.error(f"[J-Link] {tag}JLINKARM_GoEx(0,0) 후에도 CPU 여전히 halted!"
                               " NVMe 명령이 타임아웃될 수 있습니다.")
                 else:
                     log.warning(f"[J-Link] {tag}CPU resumed OK.")
