@@ -1083,7 +1083,11 @@ class NVMeFuzzer:
             for pc in self.sampler.current_trace:
                 pc_appearances[pc] = pc_appearances.get(pc, 0) + 1
 
-            if rc in (self.RC_TIMEOUT, self.RC_ERROR):
+            if rc == self.RC_TIMEOUT:
+                log.error(f"[Calibration] {seed.cmd.name} timeout at run {run_i+1} — treating as crash")
+                self._handle_timeout_crash(seed, seed.data)
+                break
+            elif rc == self.RC_ERROR:
                 log.warning(f"[Calibration] {seed.cmd.name} rc={rc} at run {run_i+1} — stopping early")
                 break
 
@@ -2276,6 +2280,108 @@ class NVMeFuzzer:
         with open(str(filepath) + '.json', 'w') as f:
             json.dump(meta, f, indent=2)
 
+    def _handle_timeout_crash(self, seed: Seed, fuzz_data: bytes) -> None:
+        """RC_TIMEOUT 발생 시 공통 처리 (Calibration/Main loop 공용).
+
+        stuck PC 분석 → dmesg 캡처 → crash 저장 → _timeout_crash 플래그 설정.
+        호출 후 caller는 break로 현재 루프를 탈출해야 한다.
+        """
+        from collections import Counter
+
+        cmd = seed.cmd
+        actual_opcode = (seed.opcode_override if seed.opcode_override is not None
+                         else cmd.opcode)
+
+        # 1) stuck PC 읽기
+        log.warning("[TIMEOUT] SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
+        stuck_pcs = self.sampler.read_stuck_pcs(count=20)
+
+        if stuck_pcs:
+            pc_counts = Counter(stuck_pcs)
+            most_common_pc, _ = pc_counts.most_common(1)[0]
+            unique_stuck = set(stuck_pcs)
+
+            log.error(
+                f"[TIMEOUT CRASH] {cmd.name} "
+                f"actual_opcode=0x{actual_opcode:02x} "
+                f"timeout_group={cmd.timeout_group}")
+            log.error(
+                f"  Stuck PCs ({len(stuck_pcs)} samples, "
+                f"{len(unique_stuck)} unique):")
+            for pc, cnt in pc_counts.most_common(5):
+                in_range = " [IN RANGE]" if self.sampler._in_range(pc) else " [OUT]"
+                log.error(
+                    f"    {hex(pc)}: {cnt}/{len(stuck_pcs)} "
+                    f"({100*cnt/len(stuck_pcs):.0f}%){in_range}")
+
+            if len(unique_stuck) == 1:
+                log.error(
+                    f"  → 펌웨어가 {hex(most_common_pc)}에서 "
+                    f"완전히 멈춤 (hang/deadlock)")
+            elif len(unique_stuck) <= 3:
+                log.error(
+                    f"  → 펌웨어가 {len(unique_stuck)}개 주소에서 "
+                    f"루프 중 (에러 핸들링 또는 busy-wait)")
+            else:
+                log.error(
+                    f"  → 펌웨어가 {len(unique_stuck)}개 주소를 "
+                    f"순회 중 (복구 루틴 진행 중일 수 있음)")
+        else:
+            log.error(
+                f"[TIMEOUT CRASH] {cmd.name} "
+                f"actual_opcode=0x{actual_opcode:02x} "
+                f"— J-Link PC 읽기 실패 (JTAG 연결 확인 필요)")
+
+        # 2) dmesg 캡처
+        log.warning("[TIMEOUT] 커널 로그(dmesg)를 캡처합니다...")
+        dmesg_snapshot = self._capture_dmesg(lines=80)
+        nvme_lines = [l for l in dmesg_snapshot.splitlines()
+                      if 'nvme' in l.lower() or 'blk_update' in l.lower()
+                      or 'reset' in l.lower() or 'timeout' in l.lower()]
+        if nvme_lines:
+            log.error(f"  dmesg NVMe 관련 ({len(nvme_lines)}줄):")
+            for line in nvme_lines[-10:]:
+                log.error(f"    {line}")
+        else:
+            log.error("  dmesg에 NVMe 관련 메시지 없음")
+
+        # 3) crash 저장
+        self.crash_inputs.append((fuzz_data, cmd))
+        self._save_crash(fuzz_data, seed, reason="timeout",
+                         stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot)
+        log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
+
+        # 4) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
+        log.error(
+            "  SSD 펌웨어를 resume 상태로 유지합니다. "
+            "(halt하지 않음 — 불량 현상 보존)")
+        log.error(
+            "  J-Link 디버거로 연결하여 현재 상태를 "
+            "관찰할 수 있습니다.")
+
+        # 5) nvme-cli PID 기록
+        log.error("")
+        if self._crash_nvme_pid is not None:
+            pid_file = self.crashes_dir / "crash_nvme_pid.txt"
+            try:
+                pid_file.write_text(f"{self._crash_nvme_pid}\n")
+            except OSError:
+                pass
+            log.error(
+                f"  [참고] nvme-cli PID={self._crash_nvme_pid} "
+                f"(D-state 대기 중)")
+        timeout_val = self.config.nvme_kernel_timeout_sec
+        log.error(
+            f"  커널 reset까지 최대 {timeout_val}초 유예 "
+            f"(nvme_core admin/io_timeout 설정값)")
+        log.error("")
+
+        # 6) 플래그 설정 — caller가 break로 루프 탈출
+        self._timeout_crash = True
+        log.error(
+            "  퍼징을 중단합니다. SSD와 NVMe 장치 상태를 "
+            "그대로 유지합니다.")
+
     def _save_per_command_data(self):
         """명령어별 PC/trace 데이터를 JSON 파일로 저장"""
         graph_dir = self.output_dir / 'graphs'
@@ -2965,107 +3071,7 @@ class NVMeFuzzer:
 
                 # --- Timeout / Error 처리 ---
                 if rc == self.RC_TIMEOUT:
-                    # v4.3: timeout 시 SSD 불량 현상 유지 전략
-                    # J-Link reconnect 하지 않음 — 펌웨어 상태를 있는 그대로 보존
-
-                    # 1) J-Link로 SSD 펌웨어가 멈춘 PC를 읽기 (halt-read-go 반복)
-                    log.warning("[TIMEOUT] SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
-                    stuck_pcs = self.sampler.read_stuck_pcs(count=20)
-
-                    actual_opcode = mutated_seed.opcode_override \
-                        if mutated_seed.opcode_override is not None \
-                        else cmd.opcode
-
-                    if stuck_pcs:
-                        from collections import Counter
-                        pc_counts = Counter(stuck_pcs)
-                        most_common_pc, most_common_count = pc_counts.most_common(1)[0]
-                        unique_stuck = set(stuck_pcs)
-
-                        log.error(
-                            f"[TIMEOUT CRASH] {cmd.name} "
-                            f"actual_opcode=0x{actual_opcode:02x} "
-                            f"timeout_group={cmd.timeout_group}")
-                        log.error(
-                            f"  Stuck PCs ({len(stuck_pcs)} samples, "
-                            f"{len(unique_stuck)} unique):")
-                        for pc, cnt in pc_counts.most_common(5):
-                            in_range = " [IN RANGE]" if self.sampler._in_range(pc) else " [OUT]"
-                            log.error(
-                                f"    {hex(pc)}: {cnt}/{len(stuck_pcs)} "
-                                f"({100*cnt/len(stuck_pcs):.0f}%){in_range}")
-
-                        if len(unique_stuck) == 1:
-                            log.error(
-                                f"  → 펌웨어가 {hex(most_common_pc)}에서 "
-                                f"완전히 멈춤 (hang/deadlock)")
-                        elif len(unique_stuck) <= 3:
-                            log.error(
-                                f"  → 펌웨어가 {len(unique_stuck)}개 주소에서 "
-                                f"루프 중 (에러 핸들링 또는 busy-wait)")
-                        else:
-                            log.error(
-                                f"  → 펌웨어가 {len(unique_stuck)}개 주소를 "
-                                f"순회 중 (복구 루틴 진행 중일 수 있음)")
-                    else:
-                        log.error(
-                            f"[TIMEOUT CRASH] {cmd.name} "
-                            f"actual_opcode=0x{actual_opcode:02x} "
-                            f"— J-Link PC 읽기 실패 (JTAG 연결 확인 필요)")
-
-                    # 3) dmesg 캡처 — unbind 직후라 reset 메시지 없는 게 정상
-                    log.warning("[TIMEOUT] 커널 로그(dmesg)를 캡처합니다...")
-                    dmesg_snapshot = self._capture_dmesg(lines=80)
-                    # dmesg에서 NVMe 관련 라인만 요약 출력
-                    nvme_lines = [l for l in dmesg_snapshot.splitlines()
-                                  if 'nvme' in l.lower() or 'blk_update' in l.lower()
-                                  or 'reset' in l.lower() or 'timeout' in l.lower()]
-                    if nvme_lines:
-                        log.error(f"  dmesg NVMe 관련 ({len(nvme_lines)}줄):")
-                        for line in nvme_lines[-10:]:
-                            log.error(f"    {line}")
-                    else:
-                        log.error("  dmesg에 NVMe 관련 메시지 없음")
-
-                    # 4) crash 저장 (stuck PC + dmesg 포함)
-                    self.crash_inputs.append((fuzz_data, cmd))
-                    self._save_crash(fuzz_data, mutated_seed,
-                                     reason="timeout", stuck_pcs=stuck_pcs,
-                                     dmesg_snapshot=dmesg_snapshot)
-                    log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
-
-                    # 5) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
-                    # halt하면 불량 현상이 멈추므로, 펌웨어가 돌고 있는
-                    # 그대로 두어야 hang/loop 등의 현상을 외부에서 관찰 가능
-                    log.error(
-                        "  SSD 펌웨어를 resume 상태로 유지합니다. "
-                        "(halt하지 않음 — 불량 현상 보존)")
-                    log.error(
-                        "  J-Link 디버거로 연결하여 현재 상태를 "
-                        "관찰할 수 있습니다.")
-
-                    # 6) nvme-cli 프로세스 정보 기록
-                    log.error("")
-                    if self._crash_nvme_pid is not None:
-                        pid_file = self.crashes_dir / "crash_nvme_pid.txt"
-                        try:
-                            pid_file.write_text(f"{self._crash_nvme_pid}\n")
-                        except OSError:
-                            pass
-                        log.error(
-                            f"  [참고] nvme-cli PID={self._crash_nvme_pid} "
-                            f"(D-state 대기 중)")
-                    timeout_val = self.config.nvme_kernel_timeout_sec
-                    log.error(
-                        f"  커널 reset까지 최대 {timeout_val}초 유예 "
-                        f"(nvme_core admin/io_timeout 설정값)")
-                    log.error("")
-
-                    # 7) 퍼징 중단 — reconnect/continue/rescan 하지 않음
-                    self._timeout_crash = True
-                    log.error(
-                        "  퍼징을 중단합니다. SSD와 NVMe 장치 상태를 "
-                        "그대로 유지합니다.")
+                    self._handle_timeout_crash(mutated_seed, fuzz_data)
                     break
 
                 if rc == self.RC_ERROR:
