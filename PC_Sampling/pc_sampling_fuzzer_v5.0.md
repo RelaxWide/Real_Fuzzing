@@ -114,64 +114,72 @@ SWD에서: 20+개 PC가 고르게 등장 → 어느 PC도 30% 미달 → idle_pc
 
 ---
 
-### [BugFix] JTAG auto-detect — `halt()` 응답으로 실제 CPU 통신 검증
+### [BugFix] `connect()` JTAG auto — halt 후 CPU resume 누락
 
-**문제**: `register_list()` / `register_name()`은 J-Link 내부 디바이스 DB를 읽으므로,
-SWD 전용 타깃에서 JTAG `connect()` 후 두 API가 모두 예외 없이 성공했다.
-결과적으로 auto-detect가 JTAG을 유효한 연결로 오판하고 SWD fallback이 발동하지 않았다.
+**증상**: JTAG auto-detect 경로에서 퍼저 시작 직후 `_log_smart()` 10초 타임아웃.
+nvme-cli를 수동으로 실행하면 정상 동작하는데 퍼저에서만 발생.
 
-**수정**: JTAG 검증 단계에서 `halt()` 후 `halted()` 폴링(최대 100ms)으로 실제 CPU 응답을 확인.
-- 100ms 내 halted=True → JTAG 정상 → `JTAG (auto)` 확정
-- 응답 없거나 예외 → SWD fallback 트리거
-
+**원인**:
 ```
-Before: connect(JTAG) → register_list() 성공 여부로만 판단 (CPU 비응답도 통과)
-After : connect(JTAG) → halt() → halted() 폴링 → CPU 실제 응답 확인
+connect() JTAG auto 경로:
+  jlink.halt()          ← JTAG 연결 검증을 위해 CPU halt
+  halted() polling 확인 ← halt 상태 확정
+  _probe_pc_register_index()
+  return True           ← ★ CPU가 여전히 halt 상태로 반환!
+↓
+_log_smart() 호출 시 SSD 펌웨어가 멈춰있어 NVMe 명령을 처리 못함 → 10초 타임아웃
 ```
+
+**수정**: JTAG 검증 완료 후 즉시 `jlink.go()` 호출하여 CPU resume.
 
 ---
 
-### [BugFix] `diagnose()` — `None` 읽기도 수렴 카운터에 포함
+### [BugFix] `_go_func` — raw `JLINKARM_Go` → `jlink.go()`
 
-**문제**: `_read_pc()`가 `None`을 반환할 때 `consecutive_no_new` 카운터가 증가하지 않아
-수렴 조건에 도달하지 못하고 항상 `DIAGNOSE_MAX`(1000회)까지 실행됐다.
+**원인**: `_go_func = jlink._dll.JLINKARM_Go` (raw ctypes DLL 호출).
+ctypes 기본 설정(인자 타입 미지정)으로 호출 시 silently fail 가능.
+`jlink.go()` (pylink 고수준 래퍼)는 내부적으로 `JLINKARM_GoEx(0, 0)` 사용.
 
-**수정**: 새 PC가 아닌 모든 경우(기존 PC 재등장, 읽기 실패)를 동일하게
-`consecutive_no_new += 1` 처리. 새 PC 누적이 없으면 `DIAGNOSE_STABILITY`(기본 50)회 후 조기 종료.
+**수정**: `self._go_func = self.jlink.go`
+`_read_pc()`, `read_stuck_pcs()` 양쪽 모두 `_go_func()` 무인자 호출이므로 호환.
+
+---
+
+### [BugFix] `diagnose()` — `None` 샘플이 수렴 카운터 미반영
+
+**증상**: idle 유니버스 수집이 항상 DIAGNOSE_MAX(1000)회까지 실행됨.
+
+**원인**: `_read_pc()` 실패 시 반환되는 `None`이 수렴 카운터(`consecutive_no_new`)를
+증가시키지 않아 수렴 조건에 영향을 미치지 못함.
+
+**수정**: `None` 또는 기존 PC 재등장 모두 수렴 카운터 증가.
 
 ```python
-# Before
+# 수정 전 (버그)
 if pc is not None:
     if pc not in idle_universe:
-        consecutive_no_new = 0   # 새 PC
+        consecutive_no_new = 0
     else:
-        consecutive_no_new += 1  # 기존 PC
-# None이면 카운터 변화 없음 → 수렴 불가
+        consecutive_no_new += 1
+# None이면 카운터 변동 없음 → 수렴 불가
 
-# After
+# 수정 후
 if pc is not None and pc not in idle_universe:
-    consecutive_no_new = 0       # 새 PC
+    idle_universe.add(pc)
+    consecutive_no_new = 0
 else:
-    consecutive_no_new += 1      # 기존 PC 또는 None → 수렴 카운터 증가
+    consecutive_no_new += 1  # None + 기존 PC 재등장 모두 카운터 증가
 ```
 
 ---
 
-### [BugFix] Calibration timeout — main loop와 동일하게 즉시 중단
+### [BugFix] `_calibrate_seed()` RC_TIMEOUT — crash 처리 없이 루프 탈출
 
-**문제**: Calibration 중 RC_TIMEOUT 발생 시 해당 시드의 run만 `break`하고 다음 시드 calibration을 계속했다.
-`_timeout_crash` 플래그가 calibration 단계에서 절대 설정되지 않아 `if self._timeout_crash` 체크가 dead code였다.
-결과적으로 hung 상태의 SSD에 계속 커맨드를 전송하는 문제가 발생했다.
+**증상**: Calibration 중 timeout이 발생해도 `_timeout_crash` 플래그가 세워지지 않아
+메인 루프 직전의 `if self._timeout_crash: return` 체크가 dead code로 동작.
 
-**수정**: `_handle_timeout_crash(seed, fuzz_data)` 공통 메서드 추가.
-- stuck PC 분석 → dmesg 캡처 → crash 저장 → `_timeout_crash = True` 순서로 처리
-- Calibration RC_TIMEOUT: `_handle_timeout_crash()` 호출 → `_timeout_crash = True` → 외부 루프가 감지 → calibration 즉시 abort
-- Main loop RC_TIMEOUT: 기존 50줄의 인라인 코드를 `_handle_timeout_crash()` 호출 2줄로 교체 (동작 동일)
-
-```
-Before: Calibration timeout → 해당 시드 run만 break → 다음 시드 계속 (hung SSD에 커맨드 전송)
-After : Calibration timeout → _handle_timeout_crash() → crash 저장 → abort (main loop와 동일)
-```
+**수정**: `_handle_timeout_crash()` 메서드 추출 (main loop와 공용).
+RC_TIMEOUT 시 calibration에서도 stuck PC 분석 → dmesg 캡처 → crash 저장 → 플래그 설정 → `break`.
 
 ---
 
@@ -517,8 +525,7 @@ sudo ./seed_replay_test.sh /dev/nvme0 FW.bin 32768 1
 
 | 버전 | 주요 변경 |
 |------|-----------|
-| **v5.0** | `--interface auto/jtag/swd` (JTAG→SWD 자동 전환), `--pc-reg-index`, `diagnose()` 수렴 기반 idle 유니버스 수집, idle 유니버스 기반 `_sampling_worker()` |
-| *(v5.0 패치)* | JTAG auto-detect `halt()` 응답 검증, `diagnose()` None 읽기 수렴 카운터 포함, calibration timeout crash 처리 공통화 (`_handle_timeout_crash`) |
+| **v5.0** | `--interface auto/jtag/swd` (JTAG→SWD 자동 전환), `--pc-reg-index`, `diagnose()` 수렴 기반 idle 유니버스 수집, idle 유니버스 기반 `_sampling_worker()` <br>**BugFix**: JTAG auto halt 후 CPU resume 누락 → `jlink.go()` 추가; `_go_func` raw DLL → `jlink.go()`; `diagnose()` None 샘플 수렴 미반영; calibration RC_TIMEOUT crash 처리 없음 |
 | **v4.7** | FUA 비트 수정 (CDW12[14]→[29]), 컨트롤러 범위 NSID=0, Sanitize 제거, `--fw-bin/--fw-xfer/--fw-slot`, critical 버그 2건 수정 |
 | **v4.6** | io-passthru → namespace device, passthru timeout 분리, 크래시 시 nvme 드라이버 unbind |
 | **v4.5** | Calibration, Deterministic stage, MOpt mutation scheduling |
