@@ -689,6 +689,7 @@ class JLinkPCSampler:
         log.warning(f"[Diagnose] 초기 {initial}회 완료, unique PCs={len(idle_universe)}. "
                     f"idle 유니버스 수렴 샘플링 시작...")
 
+        consecutive_failures = 0
         while consecutive_no_new < stability and total < max_samples:
             pc = self._read_pc()
             total += 1
@@ -696,12 +697,21 @@ class JLinkPCSampler:
                 # 새 PC 발견 → 카운터 리셋
                 idle_universe.add(pc)
                 consecutive_no_new = 0
+                consecutive_failures = 0
                 log.warning(f"  [+{total:4d}] 새 idle PC: {hex(pc)} "
                             f"(누적 {len(idle_universe)}개)")
             else:
                 # 기존 PC 재등장 또는 read 실패 → 수렴 카운터 증가
                 consecutive_no_new += 1
-            # 샘플 간격 없음 — 빠른 수렴 우선
+                if pc is None:
+                    consecutive_failures += 1
+                    if consecutive_failures % 10 == 0:
+                        log.warning(f"[Diagnose] J-Link read 연속 실패 {consecutive_failures}회 "
+                                    f"— 연결 불안정 또는 CPU halt 방치 가능성")
+                else:
+                    consecutive_failures = 0
+            # USB 과부하 방지: 무sleep 고속 사이클은 J-Link 연결을 불안정하게 만들 수 있음
+            time.sleep(0.005)
 
         if consecutive_no_new >= stability:
             log.warning(f"[Diagnose] idle 유니버스 수렴 완료: "
