@@ -192,7 +192,11 @@ NVME_TIMEOUTS = {
 }
 
 # PC 샘플링 설정
-SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
+SAMPLE_INTERVAL_US    = 20_000  # 샘플 간격 (us). 0은 halt-as-fast-as-USB 모드로
+                               # NVMe 펌웨어가 커맨드를 처리할 CPU 시간을 뺏어 타임아웃 유발.
+                               # diagnose() 경험: 5ms 미만 → 컨트롤러 불안정, 50ms → 안정.
+                               # 20ms = 합리적인 중간값. 여전히 타임아웃 발생 시 50_000으로 올리세요.
+                               # 최대 밀도 원할 경우: --interval 0 (NVMe 불안정 위험 있음)
 MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수 (상한)
 SATURATION_LIMIT      = 10    # idle 유니버스 연속 카운터: idle_pcs 내 PC가 N회 연속이면 조기 종료.
                                # diagnose()에서 수렴 수집한 idle 유니버스 기반 → JTAG/SWD 공통 동작.
@@ -784,13 +788,30 @@ class JLinkPCSampler:
 
     def _ensure_running(self, settle_ms: int = 100) -> None:
         """샘플링 루프 후 CPU가 running 상태임을 보장한다."""
-        try:
-            self.jlink._dll.JLINKARM_Go()
-            time.sleep(settle_ms / 1000)
-            if bool(self.jlink._dll.JLINKARM_IsHalted()):
-                log.warning("[J-Link] Go() 후에도 CPU halted 상태 — NVMe 명령이 지연될 수 있음")
-        except Exception as e:
-            log.warning(f"[J-Link] _ensure_running 실패: {e}")
+        ok = self._go_with_retry()
+        if not ok:
+            log.warning("[J-Link] _ensure_running: Go() 재시도 후에도 CPU halted 상태")
+
+    def _go_with_retry(self, max_attempts: int = 5, retry_delay_s: float = 0.05) -> bool:
+        """JLINKARM_Go() 재시도 래퍼.
+
+        JLINKARM_Go()는 실패해도 Python exception을 발생시키지 않고 음수를 반환한다.
+        "Could not start CPU core. (ErrorCode: -1)" 메시지는 J-Link DLL이 stderr에 직접
+        출력하며, Python 레이어에서는 반환값을 확인해야만 감지 가능하다.
+
+        NVMe DMA 처리 중 CPU 클럭 게이팅 등으로 Go()가 일시적으로 실패할 수 있으므로
+        짧은 대기 후 재시도하여 CPU를 running 상태로 복구한다.
+        """
+        for attempt in range(max_attempts):
+            ret = self._go_func()   # 0 = 성공, 음수 = 실패 (exception 없음)
+            time.sleep(retry_delay_s)
+            if ret == 0 and not bool(self.jlink._dll.JLINKARM_IsHalted()):
+                return True         # CPU 실제로 running 확인
+            if attempt < max_attempts - 1:
+                log.debug(f"[J-Link] Go() 재시도 {attempt + 1}/{max_attempts} "
+                          f"(ret={ret}, halted={bool(self.jlink._dll.JLINKARM_IsHalted())})")
+        log.warning(f"[J-Link] Go() {max_attempts}회 재시도 후에도 CPU halt 상태")
+        return False
 
     def _read_pc(self) -> Optional[int]:
         try:
@@ -800,10 +821,7 @@ class JLinkPCSampler:
         except Exception:
             return None
         finally:
-            try:
-                self._go_func()
-            except Exception:
-                pass
+            self._go_with_retry()
 
     def read_stuck_pcs(self, count: int = 10) -> List[int]:
         """v4.3: timeout/crash 후 SSD 펌웨어가 멈춘 PC를 읽는다.

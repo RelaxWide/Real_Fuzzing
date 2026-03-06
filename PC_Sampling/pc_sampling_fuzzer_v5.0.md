@@ -344,7 +344,7 @@ NVME_TIMEOUTS = {
 | `--samples N` | `500` | 명령어 1회당 최대 PC 샘플 수 |
 | `--saturation-limit N` | `10` | idle 유니버스 내 PC 연속 N회 → 조기종료 (0=비활성화) |
 | `--global-saturation-limit N` | `20` | 새 global PC 없이 N회 연속 → 조기종료 |
-| `--interval US` | `0` | 샘플 간격 (0=즉시) |
+| `--interval US` | `20000` | 샘플 간격 (µs). 0은 NVMe 타임아웃 유발 (CPU 실행 시간 부족). 5ms 미만 → 컨트롤러 불안정. 여전히 타임아웃 시 50000으로 올리세요. |
 | `--post-cmd-delay MS` | `0` | 명령 완료 후 tail 샘플링 시간 |
 
 ### Mutation / Power Schedule 옵션
@@ -547,7 +547,8 @@ sudo ./seed_replay_test.sh /dev/nvme0 FW.bin 32768 1
 
 | 버전 | 주요 변경 |
 |------|-----------|
-| **v5.0** | `--interface auto/jtag/swd` (JTAG→SWD 자동 전환), `--pc-reg-index`, `diagnose()` 수렴 기반 idle 유니버스 수집, idle 유니버스 기반 `_sampling_worker()`; `FW_BIN_FILENAME` user setting; NVMe 2.0 전체 명령어 확장 (WriteZeroes/Compare/WriteUncorrectable/Verify/DeviceSelfTest/SecuritySend/SecurityReceive/GetLBAStatus 추가); Identify CNS·GetLogPage LID·GetFeatures FID·SetFeatures·FWCommit CA·FormatNVM SES 시드 전면 확장; CDW12 PRINFO/LR/FUA·CDW13 DSPEC·CDW14 ILBRT·CDW15 LBAT/LBATM E2E 보호 시드 추가 <br>**BugFix**: JTAG auto halt 후 CPU resume 누락 → `jlink.go()` 추가; `_go_func` raw DLL → `jlink.go()`; `diagnose()` None 샘플 수렴 미반영; calibration RC_TIMEOUT crash 처리 없음 |
+| **v5.0 (latest)** | `_go_with_retry()`: `JLINKARM_Go()` 반환값 체크 + 재시도 (SWD NVMe DMA 중 클럭 게이팅으로 인한 Go() 실패 복구) — `_read_pc()` / `_ensure_running()` 모두 적용 |
+| **v5.0** | `--interface auto/jtag/swd` (JTAG→SWD 자동 전환), `--pc-reg-index`, `diagnose()` 수렴 기반 idle 유니버스 수집, idle 유니버스 기반 `_sampling_worker()`; `FW_BIN_FILENAME` user setting; NVMe 2.0 전체 명령어 확장 (WriteZeroes/Compare/WriteUncorrectable/Verify/DeviceSelfTest/SecuritySend/SecurityReceive/GetLBAStatus 추가); Identify CNS·GetLogPage LID·GetFeatures FID·SetFeatures·FWCommit CA·FormatNVM SES 시드 전면 확장; CDW12 PRINFO/LR/FUA·CDW13 DSPEC·CDW14 ILBRT·CDW15 LBAT/LBATM E2E 보호 시드 추가; **`SAMPLE_INTERVAL_US` 기본값 0→20000µs** (0 사용 시 NVMe 커맨드 타임아웃 발생 확인) <br>**BugFix**: JTAG auto halt 후 CPU resume 누락 → `jlink.go()` 추가; `_go_func` raw DLL → `jlink.go()`; `diagnose()` None 샘플 수렴 미반영; calibration RC_TIMEOUT crash 처리 없음; resume DLL `JLINKARM_GoEx(0,0)` → `JLINKARM_Go()` (GoEx에서 퍼저 오동작 확인) |
 | **v4.7** | FUA 비트 수정 (CDW12[14]→[29]), 컨트롤러 범위 NSID=0, Sanitize 제거, `--fw-bin/--fw-xfer/--fw-slot`, critical 버그 2건 수정 |
 | **v4.6** | io-passthru → namespace device, passthru timeout 분리, 크래시 시 nvme 드라이버 unbind |
 | **v4.5** | Calibration, Deterministic stage, MOpt mutation scheduling |
