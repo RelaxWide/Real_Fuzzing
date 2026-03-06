@@ -1017,6 +1017,13 @@ class JLinkPCSampler:
         if self.sample_thread:
             self.sample_thread.join(timeout=1.0)
         if self.jlink:
+            # 종료 전 CPU resume 보장 — halt 상태로 J-Link를 닫으면
+            # SSD 펌웨어가 영구 정지 상태로 남는다.
+            if self._go_func is not None:
+                try:
+                    self._go_with_retry(max_attempts=3, retry_delay_s=0.05)
+                except Exception:
+                    pass
             try:
                 self.jlink.close()
             except Exception:
