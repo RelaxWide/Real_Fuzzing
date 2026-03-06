@@ -800,16 +800,15 @@ class JLinkPCSampler:
         출력하며, Python 레이어에서는 반환값을 확인해야만 감지 가능하다.
 
         NVMe DMA 처리 중 CPU 클럭 게이팅 등으로 Go()가 일시적으로 실패할 수 있으므로
-        짧은 대기 후 재시도하여 CPU를 running 상태로 복구한다.
+        실패 시에만 짧은 대기 후 재시도한다. 성공 시 즉시 반환하여 오버헤드 최소화.
         """
         for attempt in range(max_attempts):
             ret = self._go_func()   # 0 = 성공, 음수 = 실패 (exception 없음)
+            if ret == 0:
+                return True         # 성공 시 즉시 반환 — sleep 없음
+            # 실패 시에만 대기 후 재시도
+            log.debug(f"[J-Link] Go() 재시도 {attempt + 1}/{max_attempts} (ret={ret})")
             time.sleep(retry_delay_s)
-            if ret == 0 and not bool(self.jlink._dll.JLINKARM_IsHalted()):
-                return True         # CPU 실제로 running 확인
-            if attempt < max_attempts - 1:
-                log.debug(f"[J-Link] Go() 재시도 {attempt + 1}/{max_attempts} "
-                          f"(ret={ret}, halted={bool(self.jlink._dll.JLINKARM_IsHalted())})")
         log.warning(f"[J-Link] Go() {max_attempts}회 재시도 후에도 CPU halt 상태")
         return False
 
