@@ -584,16 +584,15 @@ class JLinkPCSampler:
                     # ★ JTAG 검증 완료 후 즉시 resume.
                     # halt() 상태로 반환하면 connect() 이후 _log_smart() 등 NVMe
                     # 명령이 펌웨어를 못 받아 10초 타임아웃이 바로 발생한다.
-                    # JLINKARM_GoEx는 ctypes DLL 호출이므로 실패해도 Python 예외를
-                    # 던지지 않고 int(ret)를 반환할 뿐이다.
-                    # ret != 0 이면 raise해서 SWD fallback을 트리거한다.
-                    _go_ret = self.jlink._dll.JLINKARM_GoEx(0, 0)
-                    if _go_ret != 0:
+                    # JLINKARM_Go() — jlink_reg_diag.py에서 실증된 resume 방식.
+                    # ctypes 호출이므로 Python 예외 없음, 실패 시 JLINKARM_IsHalted로 확인.
+                    self.jlink._dll.JLINKARM_Go()
+                    if bool(self.jlink._dll.JLINKARM_IsHalted()):
                         raise Exception(
-                            f"JLINKARM_GoEx(0,0) 실패 (ret={_go_ret}) — "
+                            "JLINKARM_Go() 호출 후 CPU 여전히 halt — "
                             "JTAG CPU resume 불가, SWD fallback 시도"
                         )
-                    log.warning("[J-Link] JTAG 검증용 halt 해제 — CPU resumed (GoEx OK).")
+                    log.warning("[J-Link] JTAG 검증용 halt 해제 — CPU resumed (Go OK).")
                     iface_name = "JTAG (auto)"
                 except Exception as jtag_err:
                     log.warning(f"[J-Link] JTAG 연결/검증 실패 ({jtag_err}), SWD로 재시도...")
@@ -626,7 +625,7 @@ class JLinkPCSampler:
             # DLL 함수 참조 캐싱 (pylink wrapper 우회, 매 호출 attribute lookup 제거)
             self._halt_func = self.jlink._dll.JLINKARM_Halt
             self._read_reg_func = self.jlink._dll.JLINKARM_ReadReg
-            self._go_func = lambda: self.jlink._dll.JLINKARM_GoEx(0, 0)
+            self._go_func = self.jlink._dll.JLINKARM_Go
 
             return True
         except Exception as e:
@@ -784,17 +783,12 @@ class JLinkPCSampler:
         return True
 
     def _ensure_running(self, settle_ms: int = 100) -> None:
-        """샘플링 루프 후 CPU가 running 상태임을 보장한다.
-
-        JLINKARM_GoEx는 이미 running CPU에 호출해도 무해하다.
-        halted() 대신 GoEx를 무조건 호출하는 이유: DLL 내부 캐시가 실제 CPU 상태와
-        달리 False를 반환하는 경우가 있어 GoEx ret 값이 더 신뢰성 있다.
-        """
+        """샘플링 루프 후 CPU가 running 상태임을 보장한다."""
         try:
-            ret = self.jlink._dll.JLINKARM_GoEx(0, 0)
+            self.jlink._dll.JLINKARM_Go()
             time.sleep(settle_ms / 1000)
-            if ret != 0 and bool(self.jlink._dll.JLINKARM_IsHalted()):
-                log.warning("[J-Link] GoEx 후에도 CPU halted 상태 — NVMe 명령이 지연될 수 있음")
+            if bool(self.jlink._dll.JLINKARM_IsHalted()):
+                log.warning("[J-Link] Go() 후에도 CPU halted 상태 — NVMe 명령이 지연될 수 있음")
         except Exception as e:
             log.warning(f"[J-Link] _ensure_running 실패: {e}")
 
