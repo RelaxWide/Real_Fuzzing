@@ -192,11 +192,18 @@ NVME_TIMEOUTS = {
 }
 
 # PC 샘플링 설정
-SAMPLE_INTERVAL_US    = 20_000  # 샘플 간격 (us). 0은 halt-as-fast-as-USB 모드로
-                               # NVMe 펌웨어가 커맨드를 처리할 CPU 시간을 뺏어 타임아웃 유발.
-                               # diagnose() 경험: 5ms 미만 → 컨트롤러 불안정, 50ms → 안정.
-                               # 20ms = 합리적인 중간값. 여전히 타임아웃 발생 시 50_000으로 올리세요.
-                               # 최대 밀도 원할 경우: --interval 0 (NVMe 불안정 위험 있음)
+SAMPLE_INTERVAL_US    = 0      # 샘플 간격 (us). 0 = halt-as-fast-as-possible (최대 밀도).
+                               # 다른 제품(JTAG/정상 SWD)은 0으로도 안정적으로 동작한다.
+                               # NVMe 안정성이 필요한 경우 아래 GO_SETTLE_MS 를 사용할 것.
+
+# Go() 후 CPU 최소 실행 보장 시간 (ms)
+# SAMPLE_INTERVAL_US 와 독립적인 하드웨어 안정성 파라미터.
+# 기본값 0 = 비활성화 (JTAG / 정상 SWD 환경 — 하위 호환성 유지).
+# SWD + 1.8V 레벨시프터 환경: NVMe DMA/클럭 게이팅으로 Go() 직후
+#   halt 시 CPU 실행 시간이 너무 짧아 NVMe 커맨드 타임아웃 발생.
+#   diagnose() 경험: 5ms 미만 → 불안정, 50ms → 안정.
+#   이 값을 50 으로 설정하면 Go() 후 CPU에 최소 50ms 실행 시간 보장.
+GO_SETTLE_MS          = 50     # ms. 0 = 비활성화, >0 = Go() 후 최소 CPU 실행 보장 (SWD 전용)
 MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수 (상한)
 SATURATION_LIMIT      = 10    # idle 유니버스 연속 카운터: idle_pcs 내 PC가 N회 연속이면 조기 종료.
                                # diagnose()에서 수렴 수집한 idle 유니버스 기반 → JTAG/SWD 공통 동작.
@@ -415,6 +422,7 @@ class FuzzConfig:
 
     # 샘플링 설정
     sample_interval_us: int = SAMPLE_INTERVAL_US
+    go_settle_ms: int = GO_SETTLE_MS  # Go() 후 CPU 최소 실행 보장 (ms). 0 = 비활성화
     max_samples_per_run: int = MAX_SAMPLES_PER_RUN
     saturation_limit: int = SATURATION_LIMIT
 
@@ -867,6 +875,10 @@ class JLinkPCSampler:
         since_last_global_new = 0   # 연속 "이미 알려진 PC" 카운터 (global 기준)
         consecutive_idle = 0         # idle 유니버스 연속 카운터
         interval = self.config.sample_interval_us / 1_000_000
+        # GO_SETTLE_MS: Go() 후 CPU에 최소 실행 시간 보장 (SWD+레벨시프터 NVMe 안정성).
+        # SAMPLE_INTERVAL_US(샘플 밀도 제어)와 독립적. 둘 중 큰 값이 실제 sleep.
+        settle_s  = self.config.go_settle_ms / 1_000.0
+        effective_interval = max(interval, settle_s)
         sat_limit = self.config.saturation_limit
         global_sat_limit = self.config.global_saturation_limit  # v4.3: 설정값 사용
         idle_pcs = self.idle_pcs     # idle 유니버스 (diagnose에서 수렴 수집)
@@ -938,8 +950,8 @@ class JLinkPCSampler:
                         )
                         break
 
-            if interval > 0:
-                time.sleep(interval)
+            if effective_interval > 0:
+                time.sleep(effective_interval)
 
         if not self._stopped_reason:
             if self.stop_event.is_set():
@@ -3356,6 +3368,7 @@ class NVMeFuzzer:
         else:
             log.warning("Addr filter : NONE (all PCs collected - noisy!)")
         log.warning(f"Sampling    : interval={self.config.sample_interval_us}us, "
+                 f"go_settle={self.config.go_settle_ms}ms, "
                  f"max={self.config.max_samples_per_run}/run, "
                  f"idle_sat={self.config.saturation_limit}, "
                  f"global_sat={self.config.global_saturation_limit}, "
@@ -3876,7 +3889,11 @@ if __name__ == "__main__":
                         help='[v4.7] FWCommit 슬롯 번호 (default: 1)')
     parser.add_argument('--samples', type=int, default=MAX_SAMPLES_PER_RUN)
     parser.add_argument('--interval', type=int, default=SAMPLE_INTERVAL_US,
-                        help='Sample interval (us)')
+                        help='Sample interval (us). 0 = max density (기본값)')
+    parser.add_argument('--go-settle', type=int, default=GO_SETTLE_MS,
+                        help='Go() 후 CPU 최소 실행 보장 시간 (ms). '
+                             '0=비활성화(JTAG/정상SWD). SWD+레벨시프터=50 권장. '
+                             f'(default: {GO_SETTLE_MS})')
     parser.add_argument('--post-cmd-delay', type=int, default=POST_CMD_DELAY_MS,
                         help='Post-command sampling delay (ms)')
     parser.add_argument('--passthru-timeout', type=int, default=NVME_PASSTHRU_TIMEOUT_MS,
@@ -4023,6 +4040,7 @@ if __name__ == "__main__":
         seed_dir=args.seed_dir,
         max_samples_per_run=args.samples,
         sample_interval_us=args.interval,
+        go_settle_ms=args.go_settle,
         post_cmd_delay_ms=args.post_cmd_delay,
         nvme_passthru_timeout_ms=args.passthru_timeout,
         nvme_kernel_timeout_sec=args.kernel_timeout,
