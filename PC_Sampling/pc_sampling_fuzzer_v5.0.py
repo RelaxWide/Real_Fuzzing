@@ -203,7 +203,9 @@ SAMPLE_INTERVAL_US    = 0      # 샘플 간격 (us). 0 = halt-as-fast-as-possibl
 #   halt 시 CPU 실행 시간이 너무 짧아 NVMe 커맨드 타임아웃 발생.
 #   diagnose() 경험: 5ms 미만 → 불안정, 50ms → 안정.
 #   이 값을 50 으로 설정하면 Go() 후 CPU에 최소 50ms 실행 시간 보장.
-GO_SETTLE_MS          = 50     # ms. 0 = 비활성화, >0 = Go() 후 최소 CPU 실행 보장 (SWD 전용)
+GO_SETTLE_MS          = 0      # ms. 0 = 비활성화 (기본값, JTAG/정상 SWD 환경).
+                               # SWD + 1.8V 레벨시프터 등 불안정 환경에서 NVMe 타임아웃 발생 시
+                               # --go-settle 50 등으로 올려서 시도.
 MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수 (상한)
 SATURATION_LIMIT      = 10    # idle 유니버스 연속 카운터: idle_pcs 내 PC가 N회 연속이면 조기 종료.
                                # diagnose()에서 수렴 수집한 idle 유니버스 기반 → JTAG/SWD 공통 동작.

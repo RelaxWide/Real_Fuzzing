@@ -274,7 +274,7 @@ sudo python3 pc_sampling_fuzzer_v5.0.py \
 | `FW_ADDR_START` | `0x00000000` | 펌웨어 .text 시작 주소 |
 | `FW_ADDR_END`   | `0x00147FFF` | 펌웨어 .text 끝 주소 |
 | `JLINK_DEVICE`  | `'Cortex-R8'` | J-Link 타깃 디바이스명 |
-| `JLINK_SPEED`   | `12000` | JTAG/SWD 속도 (kHz) |
+| `JLINK_SPEED`   | `4000` | JTAG/SWD 속도 (kHz) |
 | `NVME_DEVICE`   | `'/dev/nvme0'` | NVMe 캐릭터 디바이스 경로 |
 | `NVME_NAMESPACE`| `1` | NVMe 네임스페이스 번호 |
 | `FW_BIN_FILENAME`   | `None` | FWDownload 시드용 펌웨어 파일명 (`.py`와 같은 디렉터리). `None`이면 더미 1KB 시드 |
@@ -306,7 +306,7 @@ NVME_TIMEOUTS = {
 |------|--------|------|
 | `--device NAME` | `Cortex-R8` | J-Link 타깃 디바이스명 |
 | `--interface [auto\|jtag\|swd]` | `auto` | **[v5.0]** 인터페이스 선택. auto=JTAG 시도 후 실패 시 SWD 자동 전환 |
-| `--speed KHZ` | `12000` | JTAG/SWD 속도 |
+| `--speed KHZ` | `4000` | JTAG/SWD 속도 |
 | `--pc-reg-index N` | `None` | **[v5.0]** PC 레지스터 인덱스 강제 지정 (자동 탐지 실패 시) |
 
 ### idle 유니버스 옵션 (v5.0 신규)
@@ -344,7 +344,8 @@ NVME_TIMEOUTS = {
 | `--samples N` | `500` | 명령어 1회당 최대 PC 샘플 수 |
 | `--saturation-limit N` | `10` | idle 유니버스 내 PC 연속 N회 → 조기종료 (0=비활성화) |
 | `--global-saturation-limit N` | `20` | 새 global PC 없이 N회 연속 → 조기종료 |
-| `--interval US` | `20000` | 샘플 간격 (µs). 0은 NVMe 타임아웃 유발 (CPU 실행 시간 부족). 5ms 미만 → 컨트롤러 불안정. 여전히 타임아웃 시 50000으로 올리세요. |
+| `--interval US` | `0` | 샘플 간격 (µs). 0 = 최대 밀도. NVMe 안정성이 필요하면 `--go-settle` 사용 권장 |
+| `--go-settle MS` | `0` | Go() 후 CPU 최소 실행 보장 시간 (ms). 0 = 비활성화 (기본값). SWD + 레벨시프터 환경에서 NVMe 타임아웃 발생 시 `50` 권장. `--interval`과 독립적이며 둘 중 큰 값이 적용됨 |
 | `--post-cmd-delay MS` | `0` | 명령 완료 후 tail 샘플링 시간 |
 
 ### Mutation / Power Schedule 옵션
@@ -547,7 +548,8 @@ sudo ./seed_replay_test.sh /dev/nvme0 FW.bin 32768 1
 
 | 버전 | 주요 변경 |
 |------|-----------|
-| **v5.0 (latest)** | `_go_with_retry()`: `JLINKARM_Go()` 반환값 체크 + 재시도 (SWD NVMe DMA 중 클럭 게이팅으로 인한 Go() 실패 복구) — `_read_pc()` / `_ensure_running()` 모두 적용 |
+| **v5.0 (latest)** | `GO_SETTLE_MS` 기본값 50→0 (하위 호환 기본값. SWD+레벨시프터 불안정 환경은 `--go-settle 50`으로 수동 지정); `JLINK_SPEED` 기본값 12000→4000kHz; `SAMPLE_INTERVAL_US` 0 복원 (`--go-settle`로 분리) |
+| **v5.0** | `_go_with_retry()`: `JLINKARM_Go()` 반환값 체크 + 재시도 (SWD NVMe DMA 중 클럭 게이팅으로 인한 Go() 실패 복구) — `_read_pc()` / `_ensure_running()` 모두 적용; `--go-settle MS` 신규 옵션 (Go() 후 CPU 최소 실행 보장, `--interval`과 독립) |
 | **v5.0** | `--interface auto/jtag/swd` (JTAG→SWD 자동 전환), `--pc-reg-index`, `diagnose()` 수렴 기반 idle 유니버스 수집, idle 유니버스 기반 `_sampling_worker()`; `FW_BIN_FILENAME` user setting; NVMe 2.0 전체 명령어 확장 (WriteZeroes/Compare/WriteUncorrectable/Verify/DeviceSelfTest/SecuritySend/SecurityReceive/GetLBAStatus 추가); Identify CNS·GetLogPage LID·GetFeatures FID·SetFeatures·FWCommit CA·FormatNVM SES 시드 전면 확장; CDW12 PRINFO/LR/FUA·CDW13 DSPEC·CDW14 ILBRT·CDW15 LBAT/LBATM E2E 보호 시드 추가; **`SAMPLE_INTERVAL_US` 기본값 0→20000µs** (0 사용 시 NVMe 커맨드 타임아웃 발생 확인) <br>**BugFix**: JTAG auto halt 후 CPU resume 누락 → `jlink.go()` 추가; `_go_func` raw DLL → `jlink.go()`; `diagnose()` None 샘플 수렴 미반영; calibration RC_TIMEOUT crash 처리 없음; resume DLL `JLINKARM_GoEx(0,0)` → `JLINKARM_Go()` (GoEx에서 퍼저 오동작 확인) |
 | **v4.7** | FUA 비트 수정 (CDW12[14]→[29]), 컨트롤러 범위 NSID=0, Sanitize 제거, `--fw-bin/--fw-xfer/--fw-slot`, critical 버그 2건 수정 |
 | **v4.6** | io-passthru → namespace device, passthru timeout 분리, 크래시 시 nvme 드라이버 unbind |
