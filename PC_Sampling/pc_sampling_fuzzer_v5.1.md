@@ -3,7 +3,7 @@
 J-Link Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 `nvme-cli` subprocess를 통해 NVMe 명령어를 SSD에 전달하는 Coverage-Guided Fuzzer.
 
-v5.1에서는 **PM(Power Management) 주입** 기능이 추가되어, 확률적으로 SSD를 저전력 상태(PS1~PS4)에 진입시킨 상태에서 NVMe 명령을 전달함으로써 PM 관련 펌웨어 경로를 탐색합니다.
+v5.1에서는 **PM(Power Management) 주입**, **crash 재현 TC 자동 생성**, **UFAS 펌웨어 덤프** 등 crash 분석 지원 기능이 추가되었습니다.
 
 ---
 
@@ -40,7 +40,7 @@ sudo python3 pc_sampling_fuzzer_v5.1.py [옵션]
 
 ## 빠른 시작
 
-### 기본 실행 (PM injection 15% 확률, 기본값)
+### 기본 실행 (PM injection 비활성화)
 
 ```bash
 sudo python3 pc_sampling_fuzzer_v5.1.py \
@@ -48,45 +48,26 @@ sudo python3 pc_sampling_fuzzer_v5.1.py \
   --nvme /dev/nvme0 \
   --addr-start 0x00000000 \
   --addr-end 0x00147FFF \
+  --output ./output/run_base
+```
+
+### PM injection 활성화 (기본 확률 15%)
+
+```bash
+sudo python3 pc_sampling_fuzzer_v5.1.py \
+  --device Cortex-R8 \
+  --nvme /dev/nvme0 \
+  --addr-start 0x00000000 \
+  --addr-end 0x00147FFF \
+  --pm \
   --output ./output/run_pm
 ```
 
-기본 활성 명령어: `Identify`, `GetLogPage`, `GetFeatures`, `Read`, `Write`
-기본 PM injection 확률: 15% (매 iteration마다 독립 시행)
+`PM_INJECT_PROB = 0.15` 상수로 확률 조정 (코드 상단 USER CONFIGURATION 섹션).
 
 ---
 
-### PM injection 비활성화
-
-```bash
-sudo python3 pc_sampling_fuzzer_v5.1.py \
-  --device Cortex-R8 \
-  --nvme /dev/nvme0 \
-  --addr-start 0x00000000 \
-  --addr-end 0x00147FFF \
-  --pm-inject-prob 0.0 \
-  --output ./output/run_no_pm
-```
-
----
-
-### PM injection 100% (검증/디버깅용)
-
-```bash
-sudo python3 pc_sampling_fuzzer_v5.1.py \
-  --device Cortex-R8 \
-  --nvme /dev/nvme0 \
-  --addr-start 0x00000000 \
-  --addr-end 0x00147FFF \
-  --pm-inject-prob 1.0 \
-  --output ./output/run_pm_always
-```
-
-모든 iteration에서 `[PM] SetFeatures cdw11=0x...` 로그가 출력됩니다.
-
----
-
-### SWD 인터페이스 (idle 감지 비활성화 권장)
+### SWD 인터페이스
 
 ```bash
 sudo python3 pc_sampling_fuzzer_v5.1.py \
@@ -98,23 +79,6 @@ sudo python3 pc_sampling_fuzzer_v5.1.py \
   --saturation-limit 0 \
   --global-saturation-limit 20 \
   --output ./output/run_swd
-```
-
----
-
-### 펌웨어 포함 전체 명령어 실행
-
-```bash
-sudo python3 pc_sampling_fuzzer_v5.1.py \
-  --device Cortex-R8 \
-  --nvme /dev/nvme0 \
-  --addr-start 0x00000000 \
-  --addr-end 0x00147FFF \
-  --all-commands \
-  --fw-bin ./FW.bin \
-  --fw-xfer 32768 \
-  --fw-slot 1 \
-  --output ./output/run_fw
 ```
 
 ---
@@ -133,17 +97,20 @@ sudo python3 pc_sampling_fuzzer_v5.1.py \
 ## PM injection 동작 원리
 
 ```
-[일반 iteration]            [PM-wrapped iteration (확률: pm_inject_prob)]
-  NVMe command 전송            _pm_set_state(random 1~4)   ← PS 진입 (silent)
-  J-Link 샘플링                NVMe command 전송 + J-Link 샘플링
-                               stop_sampling()
-                               _pm_set_state(0)            ← PS0 복귀 (silent)
+[일반 iteration]        [PM injection iteration (확률: PM_INJECT_PROB)]
+  NVMe command 전송        J-Link 샘플링 시작
+  J-Link 샘플링            SetFeatures(CDW11=PS1~4)   ← PS 진입 (샘플링 중)
+  stop_sampling()          SetFeatures(CDW11=0x00)    ← PS0 복귀 (샘플링 중)
+                           NVMe command 전송           (샘플링 중, 이미 시작됨)
+                           stop_sampling()
 ```
 
 - PM enter/exit는 `SetFeatures(FID=0x02, CDW11=ps)` Admin 명령으로 전송
-- J-Link 샘플링은 **메인 NVMe 명령** 구간에만 적용 (PM enter/exit는 샘플링 없음)
-- PM 전송 실패 시 로그만 출력하고 퍼징 흐름에는 영향 없음
-- `pm_inject_count` 통계가 세션 종료 시 출력됨
+- **J-Link 샘플링은 PM 전환 구간부터 NVMe 명령 완료까지 연속으로 진행**
+  - PM wake-up → PS0 복귀 → 명령 처리 전체 경로를 한 번에 관측
+- PS1~PS4 모두 사용 가능 — PS3/PS4(Non-operational)도 **PS0 복귀 후** 명령 전송이므로 안전
+- PM 전송 실패 시 로그에 `→ FAIL(rc=N)` 출력, 퍼징 흐름에 영향 없음
+- 세션 종료 시 PS별 시도/OK/FAIL 통계 출력
 
 ---
 
@@ -162,6 +129,7 @@ sudo python3 pc_sampling_fuzzer_v5.1.py \
 | `MAX_SAMPLES_PER_RUN` | `500` | 명령어 1회당 최대 PC 샘플 수 |
 | `TOTAL_RUNTIME_SEC`   | `604800` | 총 퍼징 시간 (초, 기본 1주일) |
 | `OUTPUT_DIR`    | `'./output/pc_sampling_v5.1/'` | 결과 저장 경로 |
+| `PM_INJECT_PROB` | `0.15` | PM injection 확률 (`--pm` 플래그 활성화 시 사용) |
 
 타임아웃은 코드 내 `NVME_TIMEOUTS` 딕셔너리에서 설정:
 
@@ -203,9 +171,9 @@ NVME_TIMEOUTS = {
 
 ### v5.1 PM Injection 옵션
 
-| 옵션 | 기본값 | 설명 |
-|------|--------|------|
-| `--pm-inject-prob P` | `0.15` | PM 상태 주입 확률 (0.0=비활성화, 1.0=항상). iteration마다 독립 시행. |
+| 옵션 | 설명 |
+|------|------|
+| `--pm` | PM injection 활성화 (확률은 코드 상단 `PM_INJECT_PROB` 상수로 설정, 기본 15%) |
 
 ### 펌웨어 다운로드 옵션 (v4.7)
 
@@ -303,9 +271,13 @@ output/pc_sampling_v5.1/
 │   ├── seed_0000.bin
 │   └── ...
 ├── crashes/
-│   ├── crash_<md5>.json
-│   ├── crash_<md5>.bin
-│   └── crash_<md5>.dmesg.txt
+│   ├── crash_<cmd>_<opcode>_<md5>          # crash 입력 바이너리
+│   ├── crash_<cmd>_<opcode>_<md5>.json     # 메타데이터 (stuck PC, dmesg 등)
+│   ├── crash_<cmd>_<opcode>_<md5>.dmesg.txt
+│   ├── replay_<tag>.sh                     # 재현 TC 스크립트 (직접 실행 가능)
+│   └── replay_data_<tag>/
+│       ├── data_023.bin                    # write 명령의 실제 페이로드
+│       └── ...
 ├── cfg/
 │   └── cfg_Read.dot
 └── heatmap_<timestamp>.png
@@ -315,16 +287,64 @@ output/pc_sampling_v5.1/
 
 ## 크래시 발생 후 처리
 
-퍼저는 크래시(timeout) 감지 즉시 NVMe 드라이버를 unbind해 SSD 상태를 보존합니다.
+timeout crash 감지 시 다음 순서로 자동 처리됩니다:
 
-### 1. 크래시 확인
-
-```bash
-ls ./output/pc_sampling_v5.1/crashes/
-cat ./output/pc_sampling_v5.1/crashes/crash_<md5>.json
+```
+1. stuck PC 읽기 (J-Link)
+2. dmesg 캡처
+3. FAIL CMD 상세 출력         ← 실패 명령 전체 파라미터 로그 출력
+4. crash 파일 저장
+5. replay .sh 생성            ← 이전 100개 명령 재현 스크립트 자동 생성
+6. UFAS 펌웨어 덤프           ← ./ufas 실행 파일이 있을 때만
+7. SSD 상태 보존 (resume 유지)
 ```
 
-### 2. JTAG으로 펌웨어 상태 분석
+### FAIL CMD 출력 예시
+
+```
+================================================================
+  !! FAIL CMD !!
+  cmd       : Write (IO)
+  opcode    : 0x01
+  device    : /dev/nvme0n1
+  nsid      : 1 (default)
+  cdw2      : 0x00000000
+  cdw3      : 0x00000000
+  cdw10     : 0x00000000
+  cdw11     : 0x00000000
+  cdw12     : 0x0000001f
+  cdw13     : 0x00000000
+  cdw14     : 0x00000000
+  cdw15     : 0x00000000
+  data_len  : 16384 bytes
+  data(hex) : deadbeef01020304...
+================================================================
+```
+
+### replay .sh 생성
+
+crash 발생 시 `crashes/replay_<tag>.sh`가 자동으로 생성됩니다.
+최근 100개 명령어(NVMe + PM 전환 포함)를 순서대로 재현합니다.
+마지막 항목(crash를 유발한 명령)은 `← CRASH CMD` 주석으로 표기됩니다.
+
+```bash
+# 재현 실행
+sudo bash ./output/pc_sampling_v5.1/crashes/replay_<tag>.sh
+```
+
+write 명령의 실제 페이로드는 `replay_data_<tag>/data_NNN.bin`으로 함께 저장됩니다.
+
+### UFAS 펌웨어 덤프
+
+fuzzer와 같은 디렉터리에 `ufas` 실행 파일을 두면 crash 시 자동으로 덤프를 실행합니다.
+
+```
+sudo ./ufas <PCIe_bus> 1 <YYYYMMDD>_UFAS_Dump.bin --ini=./SnapShot/A815.ini
+```
+
+PCIe bus 번호는 `/sys/class/nvme/<ctrl>/address` sysfs에서 자동 탐지하며, 실패 시 `lspci` fallback을 사용합니다.
+
+### JTAG으로 펌웨어 상태 분석
 
 ```bash
 (gdb) monitor halt
@@ -332,17 +352,11 @@ cat ./output/pc_sampling_v5.1/crashes/crash_<md5>.json
 (gdb) backtrace
 ```
 
-### 3. 분석 완료 후 드라이버 재바인드
+### 분석 완료 후 드라이버 재바인드
 
 ```bash
 lspci | grep -i nvme
 echo '0000:02:00.0' | sudo tee /sys/bus/pci/drivers/nvme/bind
-```
-
-### 4. SSD가 정상 복귀하지 않는 경우
-
-```gdb
-monitor reset run
 ```
 
 ---
@@ -361,7 +375,7 @@ sudo ./seed_replay_test.sh /dev/nvme0 [FW.bin] [fw_xfer_size] [fw_slot]
 
 | 버전 | 주요 변경 |
 |------|-----------|
-| **v5.1** | PM injection 추가: `--pm-inject-prob`로 SetFeatures(FID=0x02) silent 전송, 확률적 PS1~PS4 진입 후 메인 명령 실행, `pm_inject_count` 통계 |
+| **v5.1** | PM injection(`--pm`), FAIL CMD 상세 출력, replay .sh 자동 생성, UFAS 덤프, idle_pcs addr_range 필터 제거, DIAGNOSE_STABILITY/MAX 확장 |
 | **v5.0** | `diagnose()` halt 빈도 감소, `_wait_nvme_live()` 실제 응답 확인, `GoEx(0,0)` 전면 교체, SMART-DIAG 코드 정리 |
 | **v4.7** | FUA 비트 수정 (CDW12[14]→[29]), 컨트롤러 범위 명령 NSID=0, `--fw-bin/--fw-xfer/--fw-slot` 추가 |
 | **v4.6** | io-passthru → namespace device, passthru timeout 분리, 크래시 시 nvme 드라이버 unbind |

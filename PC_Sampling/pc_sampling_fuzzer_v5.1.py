@@ -7,15 +7,33 @@ subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
 v5.1 변경사항:
 - [Feature] PM injection: --pm 플래그로 NVMe 명령 전송 전
-    SetFeatures(PS1~PS2 진입) → SetFeatures(PS0 복귀) → NVMe 명령 + 샘플링 순서로 실행.
+    SetFeatures(PS1~PS4 진입) → SetFeatures(PS0 복귀) → NVMe 명령 + 샘플링 순서로 실행.
     펌웨어의 PM wake-up 경로를 거친 후 명령을 처리하도록 유도.
     PS1~PS4 모두 사용 — PS0 복귀 후 명령 실행이므로 Non-operational(PS3/PS4)도 허용.
-    PM 전송 실패 시 로그만 출력, 퍼징 흐름에 영향 없음.
-    pm_inject_count 통계 추가, 시작 로그에 prob 출력.
+    PM 전환 구간도 J-Link 샘플링 병행 (start_sampling 중복 방지: is_alive() 가드).
+    _pm_set_state() → bool: rc를 로그에 표기 (→ OK / → FAIL(rc=N)).
+    pm_inject_ok/fail dict(PS별) 통계 추가, 종료 시 summary 출력.
+    PM_INJECT_PROB 상수로 확률 설정, --pm 플래그로 활성화.
 - [Tune] DIAGNOSE_STABILITY: 50 → 100, DIAGNOSE_MAX: 1000 → 5000
     idle PC 100개+ 환경(복잡한 RTOS, 주기 인터럽트)에서 최대 샘플 도달로
     idle 유니버스 수렴 미완료 발생 → 상한 확장으로 완전 수렴 보장.
     최대 소요 시간: 5000 × 50ms ≈ 4분 (퍼저 시작 시 1회).
+- [BugFix] idle_pcs addr_range 필터 제거:
+    RTOS/IRQ 핸들러(0x10000000+) 등 범위 밖 PC가 idle_pcs에서 빠지면
+    consecutive_idle 카운터가 리셋되어 idle saturation이 동작하지 않는 문제 수정.
+    idle_pcs는 전체 idle 유니버스를 포함, addr_range 필터는 coverage 추적에만 적용.
+- [Feature] Crash 시 FAIL CMD 상세 출력:
+    timeout crash 발생 시 dmesg 캡처 직후, 실패한 NVMe 명령의
+    cmd/opcode/device/nsid/cdw2~15/data_len/data hex/mutations 전체를
+    "!! FAIL CMD !!" 블록으로 강조 출력.
+- [Feature] Crash 시 UFAS 펌웨어 덤프 자동 실행:
+    fuzzer 동일 디렉토리의 ./ufas 파일이 있으면 crash 저장 직후 자동 실행.
+    PCIe bus 번호는 /sys/class/nvme/<ctrl>/address sysfs 우선 탐지,
+    실패 시 lspci fallback. 덤프 파일명: <YYYYMMDD>_UFAS_Dump.bin.
+- [Feature] Crash 재현 TC replay .sh 자동 생성:
+    _cmd_history(deque maxlen=100)에 NVMe 명령 + PM 동작을 순서대로 기록.
+    crash 발생 시 crashes/replay_<tag>.sh 생성 — sudo bash replay_<tag>.sh 로 바로 실행.
+    마지막 항목(CRASH CMD) 주석 표기, write 데이터는 replay_data_<tag>/data_NNN.bin 저장.
 
 v5.0 변경사항:
 - [Feature] --interface auto/jtag/swd: J-Link 인터페이스 자동 탐지
