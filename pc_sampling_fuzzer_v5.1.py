@@ -262,8 +262,8 @@ DATALEN_MUT_PROB  = 0.08   # data_len 불일치 확률 (기본 8%)
 # v4.7: Idle 유니버스 수집 (diagnose 수렴 설정)
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
 # 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
-DIAGNOSE_STABILITY = 50    # 새 idle PC 없이 연속 N회면 수렴으로 판정
-DIAGNOSE_MAX       = 1000  # 수렴 전 최대 샘플 수 (상한)
+DIAGNOSE_STABILITY = 100   # 새 idle PC 없이 연속 N회면 수렴으로 판정
+DIAGNOSE_MAX       = 5000  # 수렴 전 최대 샘플 수 (상한)
 
 # v4.5: Calibration 설정
 CALIBRATION_RUNS  = 3      # 초기 시드당 calibration 실행 횟수 (0 = 비활성화)
