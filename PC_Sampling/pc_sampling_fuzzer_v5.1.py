@@ -981,6 +981,9 @@ class JLinkPCSampler:
         # 서로 다른 명령어 간의 가짜 edge를 방지하기 위해 제거
 
     def start_sampling(self):
+        # 이미 샘플링 중이면 스킵 (PM 구간에서 먼저 시작한 경우 중복 방지)
+        if self.sample_thread and self.sample_thread.is_alive():
+            return
         self.stop_event.clear()
         self.sample_thread = threading.Thread(target=self._sampling_worker, daemon=True)
         self.sample_thread.start()
@@ -3611,15 +3614,16 @@ class NVMeFuzzer:
                     pt = "admin-passthru" if cmd.cmd_type == NVMeCommandType.ADMIN else "io-passthru"
                 self.passthru_stats[pt] += 1
 
-                # v5.1: PM injection — PS 진입 후 PS0 복귀, 그 다음 NVMe 명령 실행
-                # 목적: 펌웨어의 PM wake-up 경로를 거친 후 명령을 처리하도록 유도
+                # v5.1: PM injection — PS 진입/복귀 구간도 샘플링에 포함
+                # 목적: PM 전환 펌웨어 경로(진입/wake-up 코드) + 이후 명령 처리까지 전체 커버
                 if self.config.pm_inject_prob > 0 and random.random() < self.config.pm_inject_prob:
                     _pm_target_ps = random.choice([1, 2, 3, 4])  # PS0 복귀 후 명령 실행이므로 PS3/PS4도 허용
-                    self._pm_set_state(_pm_target_ps)       # PS 진입
-                    self._pm_set_state(0)                   # PS0 복귀
+                    self.sampler.start_sampling()            # PM 진입 전부터 샘플링 시작
+                    self._pm_set_state(_pm_target_ps)       # PS 진입 (샘플링 중)
+                    self._pm_set_state(0)                   # PS0 복귀 (샘플링 중)
                     self.pm_inject_count += 1
 
-                # NVMe 커맨드 전송 (PS0 복귀 후 실행)
+                # NVMe 커맨드 전송 — 이미 샘플링 중이면 _send_nvme_command 내부 start_sampling 스킵
                 rc = self._send_nvme_command(fuzz_data, mutated_seed)
                 last_samples = self.sampler.stop_sampling()
 
