@@ -2814,6 +2814,79 @@ class NVMeFuzzer:
             except OSError as e:
                 log.warning(f"[TimeoutCfg] {path} 복원 실패: {e}")
 
+    def _get_nvme_pcie_bus(self) -> Optional[str]:
+        """NVMe 장치의 PCIe bus 번호를 자동 탐지한다.
+
+        1차: /sys/class/nvme/<ctrl>/address → "0000:01:00.0" → "01"
+        2차 fallback: lspci | grep nvme
+        반환값 예: "01" (hex 문자열), 탐지 실패 시 None.
+        """
+        import re as _re
+        dev_name = os.path.basename(self.config.nvme_device)  # e.g. "nvme0" or "nvme0n1"
+        m = _re.match(r'(nvme\d+)', dev_name)
+        if m:
+            ctrl = m.group(1)  # "nvme0"
+            addr_file = f'/sys/class/nvme/{ctrl}/address'
+            try:
+                addr = Path(addr_file).read_text().strip()  # e.g. "0000:01:00.0"
+                parts = addr.split(':')
+                if len(parts) >= 3:
+                    bus = parts[-2]  # "01"
+                    log.debug(f"[UFAS] NVMe PCIe address: {addr} → bus={bus}")
+                    return bus
+            except Exception as e:
+                log.debug(f"[UFAS] sysfs read failed: {e}")
+
+        # fallback: lspci
+        try:
+            result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
+            for line in result.stdout.splitlines():
+                if 'nvme' in line.lower() or 'non-volatile' in line.lower():
+                    # "01:00.0 Non-Volatile memory controller: ..."
+                    bus = line.split(':')[0]
+                    log.debug(f"[UFAS] lspci → bus={bus} ({line.strip()})")
+                    return bus
+        except Exception as e:
+            log.debug(f"[UFAS] lspci fallback failed: {e}")
+
+        log.warning("[UFAS] PCIe bus 번호 자동 탐지 실패 — UFAS 덤프 건너뜀")
+        return None
+
+    def _run_ufas_dump(self) -> None:
+        """crash 발생 시 UFAS 펌웨어 덤프를 실행한다.
+
+        실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./ufas
+        명령: sudo ./ufas <pcie_bus> 1 <YYYYMMDD>_UFAS_Dump.bin --ini=./SnapShot/A815.ini
+        PCIe bus 번호는 _get_nvme_pcie_bus()로 자동 탐지.
+        """
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        ufas_path = os.path.join(script_dir, 'ufas')
+
+        if not os.path.isfile(ufas_path):
+            log.warning(f"[UFAS] 실행 파일 없음: {ufas_path} — 덤프 건너뜀")
+            return
+
+        pcie_bus = self._get_nvme_pcie_bus()
+        if pcie_bus is None:
+            return
+
+        date_str = datetime.now().strftime('%Y%m%d')
+        dump_filename = f"{date_str}_UFAS_Dump.bin"
+        dump_path = os.path.join(script_dir, dump_filename)
+
+        cmd = ['sudo', ufas_path, pcie_bus, '1', dump_path, '--ini=./SnapShot/A815.ini']
+        log.warning(f"[UFAS] 덤프 실행: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, timeout=120, cwd=script_dir)
+            if result.returncode == 0:
+                log.warning(f"[UFAS] 덤프 완료 → {dump_path}")
+            else:
+                log.warning(f"[UFAS] 덤프 실패 (rc={result.returncode})")
+        except subprocess.TimeoutExpired:
+            log.warning("[UFAS] 덤프 timeout (120초 초과)")
+        except Exception as e:
+            log.warning(f"[UFAS] 덤프 실행 오류: {e}")
+
     def _capture_dmesg(self, lines: int = 80) -> str:
         """v4.4: 커널 로그(dmesg) 마지막 N줄을 캡처한다.
         timeout 시 커널 NVMe 드라이버의 동작(abort, reset, FLR 등)을
@@ -2946,6 +3019,10 @@ class NVMeFuzzer:
         self._save_crash(fuzz_data, seed, reason="timeout",
                          stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot)
         log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
+
+        # 3.5) UFAS 펌웨어 덤프
+        log.warning("[TIMEOUT] UFAS 펌웨어 덤프를 실행합니다...")
+        self._run_ufas_dump()
 
         # 4) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
         log.error(
