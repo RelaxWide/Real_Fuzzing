@@ -290,8 +290,10 @@ NSID_MUT_PROB     = 0.10   # namespace ID override 확률 (기본 10%)
 ADMIN_SWAP_PROB   = 0.05   # Admin↔IO 교차 전송 확률 (기본 5%)
 DATALEN_MUT_PROB  = 0.08   # data_len 불일치 확률 (기본 8%)
 
-# v5.1: PM injection 확률 (--pm 플래그로 활성화 시 적용)
-PM_INJECT_PROB    = 0.15   # 0.0~1.0 (예: 0.15 = 15%)
+# v5.1: PM 로테이션 설정 (--pm 플래그로 활성화)
+PM_ROTATE_INTERVAL = 100   # 이 횟수마다 PS 상태 전환 (PS0→PS1→PS2→PS3→PS4→PS0...)
+# PS별 subprocess 감지 timeout 배수 (PS1/PS2는 응답 지연 허용)
+PS_TIMEOUT_MULT    = {0: 1, 1: 16, 2: 32, 3: 1, 4: 1}
 
 # v4.7: Idle 유니버스 수집 (diagnose 수렴 설정)
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
@@ -526,7 +528,7 @@ class FuzzConfig:
     fw_xfer_size: int = 32768           # FWDownload 청크 크기(바이트), nvme fw-download -x 와 동일
     fw_slot: int = 1                    # FWCommit 슬롯 번호
 
-    # v5.1: PM 주입 확률 (0.0=비활성화, --pm 플래그로 PM_INJECT_PROB 값 사용)
+    # v5.1: PM 로테이션 활성화 플래그 (0.0=비활성화, 1.0=활성화 — --pm 플래그로 설정)
     pm_inject_prob: float = 0.0
 
 
@@ -1111,9 +1113,11 @@ class NVMeFuzzer:
 
         self.executions = 0
         self.start_time: Optional[datetime] = None
-        self.pm_inject_count = 0              # v5.1: PM 주입 총 횟수
-        self.pm_inject_ok: dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0}   # PS별 성공 횟수
-        self.pm_inject_fail: dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0} # PS별 실패 횟수
+        # v5.1: PM 로테이션 상태
+        self._current_ps: int = 0                              # 현재 PS 상태
+        self._ps_cmd_counter: int = 0                          # 현재 PS 상태에서 실행한 명령 수
+        self._ps_idx: int = 0                                  # PS_SEQUENCE 인덱스
+        self.ps_exec_counts: dict[int, int] = {i: 0 for i in range(5)}  # PS별 실행 횟수
 
         self.cmd_stats: dict[str, dict] = defaultdict(lambda: {"exec": 0, "interesting": 0})
         for c in self.commands:
@@ -2576,7 +2580,7 @@ class NVMeFuzzer:
             log.warning(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label}) → FAIL(exception: {e})")
             return False
 
-    def _send_nvme_command(self, data: bytes, seed: Seed) -> int:
+    def _send_nvme_command(self, data: bytes, seed: Seed, timeout_mult: int = 1) -> int:
         """subprocess(nvme-cli) 기반 NVMe passthru 명령 전송.
         반환값:
           >= 0: nvme-cli returncode (0=성공, 양수=NVMe 에러)
@@ -2656,6 +2660,8 @@ class NVMeFuzzer:
             cmd.timeout_group,
             self.config.nvme_timeouts.get('command', 8000)
         )
+        if timeout_mult > 1:
+            timeout_ms = int(timeout_ms * timeout_mult)
         # nvme-cli --timeout: 커널이 NVMe 명령을 포기하는 시점 (v4.6: 분리)
         # 이 값을 길게 유지하면 crash 시 커널이 controller reset을 하지 않아
         # SSD 펌웨어 상태를 그대로 보존할 수 있다 (JTAG 분석 용이).
@@ -3723,7 +3729,10 @@ class NVMeFuzzer:
         log.warning(f"Power Sched : max_energy={self.config.max_energy}")
         # v4.3: 로그 메시지 수정 — 실제 구현은 subprocess(nvme-cli) 방식
         log.warning(f"NVMe I/O    : subprocess (nvme-cli passthru)")
-        log.warning(f"PM Inject   : prob={self.config.pm_inject_prob:.0%}")
+        if self.config.pm_inject_prob > 0:
+            log.warning(f"PM Rotate   : interval={PM_ROTATE_INTERVAL}cmds, "
+                        f"seq=PS0→PS1→PS2→PS3→PS4→PS0, "
+                        f"timeout_mult=PS1×{PS_TIMEOUT_MULT[1]} PS2×{PS_TIMEOUT_MULT[2]}")
         log.warning(f"Random gen  : {self.config.random_gen_ratio:.0%}")
         timeout_str = ", ".join(f"{k}={v}ms" for k, v in self.config.nvme_timeouts.items())
         log.warning(f"Timeouts    : subprocess={timeout_str}")
@@ -3915,21 +3924,44 @@ class NVMeFuzzer:
                     pt = "admin-passthru" if cmd.cmd_type == NVMeCommandType.ADMIN else "io-passthru"
                 self.passthru_stats[pt] += 1
 
-                # v5.1: PM injection — PS 진입/복귀 구간도 샘플링에 포함
-                # 목적: PM 전환 펌웨어 경로(진입/wake-up 코드) + 이후 명령 처리까지 전체 커버
-                if self.config.pm_inject_prob > 0 and random.random() < self.config.pm_inject_prob:
-                    _pm_target_ps = random.choice([1, 2, 3, 4])  # PS0 복귀 후 명령 실행이므로 PS3/PS4도 허용
-                    self.sampler.start_sampling()                  # PM 진입 전부터 샘플링 시작
-                    ok_enter = self._pm_set_state(_pm_target_ps)  # PS 진입 (샘플링 중)
-                    self._pm_set_state(0)                          # PS0 복귀 (샘플링 중)
-                    self.pm_inject_count += 1
-                    if ok_enter:
-                        self.pm_inject_ok[_pm_target_ps] += 1
-                    else:
-                        self.pm_inject_fail[_pm_target_ps] += 1
+                # v5.1: PM 로테이션 — PM_ROTATE_INTERVAL 명령마다 PS 상태 전환
+                # PS0→PS1→PS2→PS3→PS4→PS0 순환. 전환 시 _pm_set_state() 호출.
+                # PS3/PS4: IO 명령은 위에서 이미 Admin으로 대체됨.
+                # PS1: timeout ×16, PS2: timeout ×32 적용.
+                if self.config.pm_inject_prob > 0:
+                    self._ps_cmd_counter += 1
+                    if self._ps_cmd_counter >= PM_ROTATE_INTERVAL:
+                        self._ps_cmd_counter = 0
+                        self._ps_idx = (self._ps_idx + 1) % 5   # PS0~PS4 순환
+                        next_ps = self._ps_idx
+                        if next_ps != self._current_ps:
+                            log.warning(
+                                f"[PM] PS 상태 전환: PS{self._current_ps} → PS{next_ps}"
+                                + (f" (timeout ×{PS_TIMEOUT_MULT[next_ps]})"
+                                   if PS_TIMEOUT_MULT[next_ps] > 1 else "")
+                                + (" [Admin only]" if next_ps in (3, 4) else "")
+                            )
+                            self._pm_set_state(next_ps)
+                            self._current_ps = next_ps
+                    self.ps_exec_counts[self._current_ps] += 1
 
-                # NVMe 커맨드 전송 — 이미 샘플링 중이면 _send_nvme_command 내부 start_sampling 스킵
-                rc = self._send_nvme_command(fuzz_data, mutated_seed)
+                # PS3/PS4: IO 명령 → Admin 명령으로 대체
+                if self.config.pm_inject_prob > 0 and self._current_ps in (3, 4):
+                    if cmd.cmd_type == NVMeCommandType.IO:
+                        admin_cmds = [c for c in self.commands
+                                      if c.cmd_type == NVMeCommandType.ADMIN]
+                        if admin_cmds:
+                            fallback_cmd = random.choice(admin_cmds)
+                            fuzz_data = os.urandom(random.randint(64, 512))
+                            mutated_seed = Seed(data=fuzz_data, cmd=fallback_cmd)
+                            cmd = fallback_cmd
+                            log.debug(f"[PM] PS{self._current_ps} IO→Admin 대체: {cmd.name}")
+
+                # NVMe 커맨드 전송
+                _timeout_mult = PS_TIMEOUT_MULT.get(self._current_ps, 1) \
+                    if self.config.pm_inject_prob > 0 else 1
+                rc = self._send_nvme_command(fuzz_data, mutated_seed,
+                                             timeout_mult=_timeout_mult)
                 last_samples = self.sampler.stop_sampling()
 
                 self.executions += 1
@@ -4148,18 +4180,16 @@ class NVMeFuzzer:
                     f"  Passthru type  : admin={pt.get('admin-passthru', 0)}, "
                     f"io={pt.get('io-passthru', 0)}")
                 if self.config.pm_inject_prob > 0:
-                    summary_lines.append(
-                        f"PM inject total  : {self.pm_inject_count} "
-                        f"({100*self.pm_inject_count/total:.1f}%)")
-                    for ps in [1, 2, 3, 4]:
-                        ok   = self.pm_inject_ok.get(ps, 0)
-                        fail = self.pm_inject_fail.get(ps, 0)
-                        attempted = ok + fail
-                        if attempted > 0:
+                    summary_lines.append(f"PM Rotate interval: {PM_ROTATE_INTERVAL}cmds/state")
+                    for ps in range(5):
+                        cnt = self.ps_exec_counts.get(ps, 0)
+                        if cnt > 0:
+                            pct = 100 * cnt / total
+                            mult = PS_TIMEOUT_MULT.get(ps, 1)
+                            note = f" [TO×{mult}]" if mult > 1 else \
+                                   (" [Admin only]" if ps in (3, 4) else "")
                             summary_lines.append(
-                                f"  PS{ps}: {attempted}회 시도 / "
-                                f"OK={ok} FAIL={fail} "
-                                f"(성공률 {100*ok/attempted:.1f}%)")
+                                f"  PS{ps}: {cnt}회 ({pct:.1f}%){note}")
 
                 # v4.5: MOpt 통계
                 if self.config.mopt_enabled:
@@ -4329,7 +4359,9 @@ if __name__ == "__main__":
 
     # v5.1: PM injection
     parser.add_argument('--pm', action='store_true', default=False,
-                        help='PM injection 활성화 (확률은 .py 파일 상단 PM_INJECT_PROB 참조)')
+                        help=f'PM 로테이션 활성화: {PM_ROTATE_INTERVAL}명령마다 PS0→PS1→PS2→PS3→PS4 순환. '
+                             f'PS1 timeout×{PS_TIMEOUT_MULT[1]}, PS2 timeout×{PS_TIMEOUT_MULT[2]}, '
+                             f'PS3/PS4 Admin 명령만 허용')
 
     args = parser.parse_args()
 
@@ -4449,7 +4481,7 @@ if __name__ == "__main__":
         fw_xfer_size=args.fw_xfer,
         fw_slot=args.fw_slot,
         # v5.1
-        pm_inject_prob=PM_INJECT_PROB if args.pm else 0.0,
+        pm_inject_prob=1.0 if args.pm else 0.0,
     )
 
     fuzzer = NVMeFuzzer(config)
