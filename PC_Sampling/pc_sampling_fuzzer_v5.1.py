@@ -9,7 +9,7 @@ v5.1 변경사항:
 - [Feature] PM injection: --pm 플래그로 NVMe 명령 전송 전
     SetFeatures(PS1~PS2 진입) → SetFeatures(PS0 복귀) → NVMe 명령 + 샘플링 순서로 실행.
     펌웨어의 PM wake-up 경로를 거친 후 명령을 처리하도록 유도.
-    PS1/PS2(Operational)만 사용 — PS3/PS4는 Non-operational로 제외.
+    PS1~PS4 모두 사용 — PS0 복귀 후 명령 실행이므로 Non-operational(PS3/PS4)도 허용.
     PM 전송 실패 시 로그만 출력, 퍼징 흐름에 영향 없음.
     pm_inject_count 통계 추가, 시작 로그에 prob 출력.
 - [Tune] DIAGNOSE_STABILITY: 50 → 100, DIAGNOSE_MAX: 1000 → 5000
@@ -3614,7 +3614,7 @@ class NVMeFuzzer:
                 # v5.1: PM injection — PS 진입 후 PS0 복귀, 그 다음 NVMe 명령 실행
                 # 목적: 펌웨어의 PM wake-up 경로를 거친 후 명령을 처리하도록 유도
                 if self.config.pm_inject_prob > 0 and random.random() < self.config.pm_inject_prob:
-                    _pm_target_ps = random.choice([1, 2])  # PS1/PS2(Operational). PS3/PS4는 Non-operational → 제외
+                    _pm_target_ps = random.choice([1, 2, 3, 4])  # PS0 복귀 후 명령 실행이므로 PS3/PS4도 허용
                     self._pm_set_state(_pm_target_ps)       # PS 진입
                     self._pm_set_state(0)                   # PS0 복귀
                     self.pm_inject_count += 1
