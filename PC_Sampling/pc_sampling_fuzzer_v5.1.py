@@ -2920,17 +2920,21 @@ class NVMeFuzzer:
 
         실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./ufas
         명령: sudo ./ufas <pcie_bus> 1 <YYYYMMDD>_UFAS_Dump.bin --ini=./SnapShot/A815.ini
-        PCIe bus 번호는 _get_nvme_pcie_bus()로 자동 탐지.
-        stdout/stderr 캡처하여 로그 출력.
+        Popen으로 PID 추적, timeout 후 D-state 대비 포기 처리.
         """
+        TIMEOUT = 120
+
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         ufas_path = os.path.join(script_dir, 'ufas')
 
         log.warning(f"[UFAS] 실행 파일 경로: {ufas_path}")
         if not os.path.isfile(ufas_path):
-            log.warning(f"[UFAS] 실행 파일 없음 — 덤프 건너뜀")
+            log.warning("[UFAS] 실행 파일 없음 — 덤프 건너뜀")
             return
-        log.warning(f"[UFAS] 실행 파일 확인 OK")
+        if not os.access(ufas_path, os.X_OK):
+            log.warning("[UFAS] 실행 권한 없음 (chmod +x 필요) — 덤프 건너뜀")
+            return
+        log.warning("[UFAS] 실행 파일 확인 OK")
 
         pcie_bus = self._get_nvme_pcie_bus()
         if pcie_bus is None:
@@ -2944,24 +2948,46 @@ class NVMeFuzzer:
         log.warning(f"[UFAS] 실행 명령: {' '.join(cmd)}")
         log.warning(f"[UFAS] 작업 디렉토리: {script_dir}")
         log.warning(f"[UFAS] 덤프 출력 파일: {dump_path}")
-        log.warning("[UFAS] 실행 중... (최대 120초 대기)")
+
         try:
-            result = subprocess.run(
-                cmd, timeout=120, cwd=script_dir,
-                capture_output=True, text=True,
+            proc = subprocess.Popen(
+                cmd, cwd=script_dir,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
-            if result.stdout.strip():
-                log.warning(f"[UFAS] stdout:\n{result.stdout.strip()}")
-            if result.stderr.strip():
-                log.warning(f"[UFAS] stderr:\n{result.stderr.strip()}")
-            if result.returncode == 0:
+        except Exception as e:
+            log.warning(f"[UFAS] Popen 실패: {e}")
+            return
+
+        log.warning(f"[UFAS] 프로세스 시작 PID={proc.pid} — 최대 {TIMEOUT}초 대기")
+        try:
+            stdout, stderr = proc.communicate(timeout=TIMEOUT)
+            rc = proc.returncode
+            out = stdout.decode(errors='replace').strip()
+            err = stderr.decode(errors='replace').strip()
+            if out:
+                log.warning(f"[UFAS] stdout:\n{out}")
+            if err:
+                log.warning(f"[UFAS] stderr:\n{err}")
+            if rc == 0:
                 log.warning(f"[UFAS] 덤프 완료 (rc=0) → {dump_path}")
             else:
-                log.warning(f"[UFAS] 덤프 실패 (rc={result.returncode})")
+                log.warning(f"[UFAS] 덤프 실패 (rc={rc})")
         except subprocess.TimeoutExpired:
-            log.warning("[UFAS] 덤프 timeout (120초 초과) — ufas 프로세스가 응답하지 않음")
+            log.warning(f"[UFAS] {TIMEOUT}초 timeout — SIGKILL 전송 (PID={proc.pid})")
+            try:
+                proc.kill()
+            except Exception as e:
+                log.warning(f"[UFAS] kill 실패: {e}")
+            # D-state 프로세스는 kill 후에도 종료 안 될 수 있음 — 3초만 추가 대기
+            try:
+                proc.communicate(timeout=3)
+                log.warning("[UFAS] kill 후 프로세스 종료 확인")
+            except subprocess.TimeoutExpired:
+                log.warning("[UFAS] kill 후에도 프로세스 미종료 — D-state 의심, 포기")
+            except Exception as e:
+                log.warning(f"[UFAS] kill 후 communicate 오류: {e}")
         except Exception as e:
-            log.warning(f"[UFAS] 덤프 실행 오류: {e}")
+            log.warning(f"[UFAS] communicate 오류: {e}")
 
     def _generate_replay_sh(self, crash_dir: Path, tag: str) -> None:
         """crash 발생 직전 최대 100개 명령어(PM 포함)를 재현 가능한 .sh 파일로 저장.
@@ -3208,7 +3234,11 @@ class NVMeFuzzer:
 
         # 3.6) UFAS 펌웨어 덤프
         log.warning("[TIMEOUT] UFAS 펌웨어 덤프를 실행합니다...")
-        self._run_ufas_dump()
+        try:
+            self._run_ufas_dump()
+        except Exception as _ufas_exc:
+            log.warning(f"[UFAS] _run_ufas_dump 예기치 않은 예외: {_ufas_exc}")
+        log.warning("[UFAS] _run_ufas_dump 반환")
 
         # 4) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
         log.error(
