@@ -794,14 +794,11 @@ class JLinkPCSampler:
             log.warning(f"[Diagnose] 최대 샘플({max_samples}회) 도달. "
                         f"idle 유니버스 {len(idle_universe)}개 (수렴 미완료, 이대로 사용)")
 
-        # idle_pcs = 수집된 전체 idle 유니버스 (범위 내 PC만)
-        if self.config.addr_range_start is not None and self.config.addr_range_end is not None:
-            self.idle_pcs = {
-                p for p in idle_universe
-                if self.config.addr_range_start <= p <= self.config.addr_range_end
-            }
-        else:
-            self.idle_pcs = set(idle_universe)
+        # idle_pcs = 수집된 전체 idle 유니버스 (범위 필터 없음)
+        # addr_range 필터는 커버리지 추적(global_coverage, current_trace)에만 적용.
+        # idle 감지용 idle_pcs는 out-of-range PC(RTOS 스케줄러, 인터럽트 핸들러 등)도
+        # 포함해야 consecutive_idle 카운터가 리셋되지 않고 정상 동작함.
+        self.idle_pcs = set(idle_universe)
 
         from collections import Counter
         pc_counts = Counter(pcs_initial)
