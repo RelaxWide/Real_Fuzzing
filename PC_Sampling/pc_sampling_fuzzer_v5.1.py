@@ -1115,8 +1115,8 @@ class NVMeFuzzer:
         self.start_time: Optional[datetime] = None
         # v5.1: PM 로테이션 상태
         self._current_ps: int = 0                              # 현재 PS 상태
-        self._ps_cmd_counter: int = 0                          # 현재 PS 상태에서 실행한 명령 수
-        self._ps_idx: int = 0                                  # PS_SEQUENCE 인덱스
+        # _ps_cmd_counter 제거 — PM 전환을 executions % 100 경계에서 처리
+        # _ps_idx 제거 — 랜덤 전환으로 변경
         self.ps_exec_counts: dict[int, int] = {i: 0 for i in range(5)}  # PS별 실행 횟수
 
         self.cmd_stats: dict[str, dict] = defaultdict(lambda: {"exec": 0, "interesting": 0})
@@ -2569,15 +2569,18 @@ class NVMeFuzzer:
             'cdw12': 0, 'cdw13': 0, 'cdw14': 0, 'cdw15': 0,
             'data': None, 'data_len': 0, 'is_write': False,
         })
+        _pm_t0 = time.monotonic()
         try:
             result = subprocess.run(nvme_cmd, timeout=5.0,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             ok = (result.returncode == 0)
             status = "OK" if ok else f"FAIL(rc={result.returncode})"
-            log.info(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label}) → {status}")
+            _pm_elapsed = time.monotonic() - _pm_t0
+            log.warning(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label}) → {status} ({_pm_elapsed:.3f}s)")
             return ok
         except Exception as e:
-            log.warning(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label}) → FAIL(exception: {e})")
+            _pm_elapsed = time.monotonic() - _pm_t0
+            log.warning(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label}) → FAIL(exception: {e}) ({_pm_elapsed:.3f}s)")
             return False
 
     def _send_nvme_command(self, data: bytes, seed: Seed, timeout_mult: int = 1) -> int:
@@ -3933,25 +3936,8 @@ class NVMeFuzzer:
                     pt = "admin-passthru" if cmd.cmd_type == NVMeCommandType.ADMIN else "io-passthru"
                 self.passthru_stats[pt] += 1
 
-                # v5.1: PM 로테이션 — PM_ROTATE_INTERVAL 명령마다 PS 상태 전환
-                # PS0→PS1→PS2→PS3→PS4→PS0 순환. 전환 시 _pm_set_state() 호출.
-                # PS3/PS4: IO 명령은 위에서 이미 Admin으로 대체됨.
-                # PS1: timeout ×16, PS2: timeout ×32 적용.
+                # v5.1: 현재 PS 상태별 실행 카운트
                 if self.config.pm_inject_prob > 0:
-                    self._ps_cmd_counter += 1
-                    if self._ps_cmd_counter >= PM_ROTATE_INTERVAL:
-                        self._ps_cmd_counter = 0
-                        self._ps_idx = (self._ps_idx + 1) % 5   # PS0~PS4 순환
-                        next_ps = self._ps_idx
-                        if next_ps != self._current_ps:
-                            log.warning(
-                                f"[PM] PS 상태 전환: PS{self._current_ps} → PS{next_ps}"
-                                + (f" (timeout ×{PS_TIMEOUT_MULT[next_ps]})"
-                                   if PS_TIMEOUT_MULT[next_ps] > 1 else "")
-                                + (" [Admin only]" if next_ps in (3, 4) else "")
-                            )
-                            self._pm_set_state(next_ps)
-                            self._current_ps = next_ps
                     self.ps_exec_counts[self._current_ps] += 1
 
                 # PS3/PS4: IO 명령 → Admin 명령으로 대체
@@ -4077,6 +4063,18 @@ class NVMeFuzzer:
                         self.mopt_uses[op] += 1
 
                 if self.executions % 100 == 0:
+                    # v5.1: PM 로테이션 — Stats 출력과 동일 지점에서 PS 전환
+                    if self.config.pm_inject_prob > 0:
+                        next_ps = random.randint(0, 4)
+                        log.warning(
+                            f"[PM] PS 상태 전환: PS{self._current_ps} → PS{next_ps}"
+                            + (f" (timeout ×{PS_TIMEOUT_MULT[next_ps]})"
+                               if PS_TIMEOUT_MULT[next_ps] > 1 else "")
+                            + (" [Admin only]" if next_ps in (3, 4) else "")
+                        )
+                        self._pm_set_state(next_ps)
+                        self._current_ps = next_ps
+
                     stats = self._collect_stats()
                     # 구간별 exec/s 계산 (마지막 100개 기준)
                     _now = datetime.now()
