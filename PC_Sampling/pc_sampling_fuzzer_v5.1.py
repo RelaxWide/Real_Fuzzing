@@ -3693,14 +3693,21 @@ class NVMeFuzzer:
             'passthru_stats': dict(self.passthru_stats),
         }
 
-    def _print_status(self, stats: dict, last_samples: int = 0):
+    def _print_status(self, stats: dict, last_samples: int = 0,
+                      window_eps: float = 0.0):
+        ps_tag = (f" | PS{self._current_ps}"
+                  f"(×{PS_TIMEOUT_MULT.get(self._current_ps, 1)}TO"
+                  f"{',Admin' if self._current_ps in (3, 4) else ''})"
+                  if self.config.pm_inject_prob > 0 else "")
         log.warning(f"[Stats] exec: {stats['executions']:,} | "
                  f"corpus: {stats['corpus_size']} | "
                  f"crashes: {stats['crashes']} | "
                  f"pcs: {stats['coverage_unique_pcs']:,} | "
                  f"samples: {stats['total_samples']:,} | "
                  f"last_run: {last_samples} | "
-                 f"exec/s: {stats['exec_per_sec']:.1f}")
+                 f"exec/s(avg): {stats['exec_per_sec']:.1f} | "
+                 f"exec/s(win): {window_eps:.1f}"
+                 f"{ps_tag}")
 
     def run(self):
         global log
@@ -3858,6 +3865,8 @@ class NVMeFuzzer:
             log.info("[Calibration] Disabled (calibration_runs=0)")
 
         self.start_time = datetime.now()
+        self._window_t0 = self.start_time          # 구간별 exec/s 계산용
+        self._window_exec0: int = 0
 
         try:
             while True:
@@ -4069,7 +4078,15 @@ class NVMeFuzzer:
 
                 if self.executions % 100 == 0:
                     stats = self._collect_stats()
-                    self._print_status(stats, last_samples)
+                    # 구간별 exec/s 계산 (마지막 100개 기준)
+                    _now = datetime.now()
+                    _wdt = (_now - self._window_t0).total_seconds()
+                    _wexec = self.executions - self._window_exec0
+                    _window_eps = _wexec / _wdt if _wdt > 0 else 0
+                    self._window_t0 = _now
+                    self._window_exec0 = self.executions
+                    self._print_status(stats, last_samples,
+                                       window_eps=_window_eps)
                     # OS 버퍼까지 강제 flush (파일 핸들러만)
                     for h in log.handlers:
                         h.flush()
