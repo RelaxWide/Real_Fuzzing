@@ -3014,6 +3014,41 @@ class NVMeFuzzer:
         else:
             log.error("  dmesg에 NVMe 관련 메시지 없음")
 
+        # 2.5) FAIL CMD — 실패한 명령어 및 파라미터 전체 출력
+        _nsid_str = (f"0x{seed.nsid_override:x} (override)"
+                     if seed.nsid_override is not None else "1 (default)")
+        _mut_parts = []
+        if seed.opcode_override is not None:
+            _mut_parts.append(f"opcode_override=0x{seed.opcode_override:02x}")
+        if seed.nsid_override is not None:
+            _mut_parts.append(f"nsid_override=0x{seed.nsid_override:x}")
+        if seed.force_admin is not None:
+            _mut_parts.append(f"force_admin={seed.force_admin}")
+        if seed.data_len_override is not None:
+            _mut_parts.append(f"data_len_override={seed.data_len_override}")
+        _data_hex = fuzz_data[:64].hex() if fuzz_data else "N/A"
+        _data_suffix = "..." if fuzz_data and len(fuzz_data) > 64 else ""
+        _sep = "=" * 64
+        log.error(_sep)
+        log.error("  !! FAIL CMD !!")
+        log.error(f"  cmd       : {cmd.name} ({cmd.cmd_type.name})")
+        log.error(f"  opcode    : 0x{actual_opcode:02x}")
+        log.error(f"  device    : {self.config.nvme_device}")
+        log.error(f"  nsid      : {_nsid_str}")
+        log.error(f"  cdw2      : 0x{seed.cdw2:08x}")
+        log.error(f"  cdw3      : 0x{seed.cdw3:08x}")
+        log.error(f"  cdw10     : 0x{seed.cdw10:08x}")
+        log.error(f"  cdw11     : 0x{seed.cdw11:08x}")
+        log.error(f"  cdw12     : 0x{seed.cdw12:08x}")
+        log.error(f"  cdw13     : 0x{seed.cdw13:08x}")
+        log.error(f"  cdw14     : 0x{seed.cdw14:08x}")
+        log.error(f"  cdw15     : 0x{seed.cdw15:08x}")
+        log.error(f"  data_len  : {len(fuzz_data) if fuzz_data else 0} bytes")
+        log.error(f"  data(hex) : {_data_hex}{_data_suffix}")
+        if _mut_parts:
+            log.error(f"  mutations : {', '.join(_mut_parts)}")
+        log.error(_sep)
+
         # 3) crash 저장
         self.crash_inputs.append((fuzz_data, cmd))
         self._save_crash(fuzz_data, seed, reason="timeout",
