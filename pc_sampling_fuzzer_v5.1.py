@@ -2524,12 +2524,12 @@ class NVMeFuzzer:
             '--timeout=3000',
         ]
         label = f"PS{ps}" if ps > 0 else "PS0(복귀)"
-        log.debug(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label})")
+        log.info(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label})")
         try:
             subprocess.run(nvme_cmd, timeout=5.0,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
-            log.debug(f"[PM] _pm_set_state PS{ps} 실패: {e}")
+            log.warning(f"[PM] _pm_set_state PS{ps} 실패: {e}")
 
     def _send_nvme_command(self, data: bytes, seed: Seed) -> int:
         """subprocess(nvme-cli) 기반 NVMe passthru 명령 전송.
@@ -3843,6 +3843,10 @@ class NVMeFuzzer:
                 summary_lines.append(
                     f"  Passthru type  : admin={pt.get('admin-passthru', 0)}, "
                     f"io={pt.get('io-passthru', 0)}")
+                if self.config.pm_inject_prob > 0:
+                    summary_lines.append(
+                        f"PM inject count  : {self.pm_inject_count} "
+                        f"({100*self.pm_inject_count/total:.1f}%)")
 
                 # v4.5: MOpt 통계
                 if self.config.mopt_enabled:
