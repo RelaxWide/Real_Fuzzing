@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v5.0
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v5.1
 
 J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
+
+v5.1 변경사항:
+- [Feature] PM injection: --pm-inject-prob(기본 0.15)로 NVMe 명령 전송 전
+    SetFeatures(FID=0x02, CDW11=PS1~PS4)를 silent 전송하여 저전력 상태에서
+    펌웨어 코드 경로 탐색. J-Link 샘플링은 메인 명령 구간에만 적용.
+    명령 완료 후 SetFeatures(CDW11=0x00)으로 PS0 복귀.
+    PM 전송 실패 시 로그만 출력, 퍼징 흐름에 영향 없음.
+    pm_inject_count 통계 추가, 시작 로그에 prob 출력.
+- [Tune] DIAGNOSE_STABILITY: 50 → 100, DIAGNOSE_MAX: 1000 → 5000
+    idle PC 100개+ 환경(복잡한 RTOS, 주기 인터럽트)에서 최대 샘플 도달로
+    idle 유니버스 수렴 미완료 발생 → 상한 확장으로 완전 수렴 보장.
+    최대 소요 시간: 5000 × 50ms ≈ 4분 (퍼저 시작 시 1회).
 
 v5.0 변경사항:
 - [Feature] --interface auto/jtag/swd: J-Link 인터페이스 자동 탐지
