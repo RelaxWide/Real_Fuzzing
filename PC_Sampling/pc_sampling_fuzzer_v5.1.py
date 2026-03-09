@@ -6,9 +6,11 @@ J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
 v5.1 변경사항:
-- [Feature] PM injection: --pm-inject-prob(기본 0.15)로 NVMe 명령 전송 전
-    SetFeatures(FID=0x02, CDW11=PS1~PS4)를 silent 전송하여 저전력 상태에서
-    펌웨어 코드 경로 탐색. J-Link 샘플링은 메인 명령 구간에만 적용.
+- [Feature] PM injection: --pm 플래그로 NVMe 명령 전송 전
+    SetFeatures(FID=0x02, CDW11=PS1~PS2)를 silent 전송하여 저전력 상태에서
+    펌웨어 코드 경로 탐색. PS1/PS2(Operational)만 사용 — PS3/PS4는
+    Non-operational이라 명령 처리 불가 → timeout 유발로 제외.
+    J-Link 샘플링은 메인 명령 구간에만 적용.
     명령 완료 후 SetFeatures(CDW11=0x00)으로 PS0 복귀.
     PM 전송 실패 시 로그만 출력, 퍼징 흐름에 영향 없음.
     pm_inject_count 통계 추가, 시작 로그에 prob 출력.
@@ -3615,7 +3617,7 @@ class NVMeFuzzer:
                 _pm_entered = False
                 _pm_target_ps = 0
                 if self.config.pm_inject_prob > 0 and random.random() < self.config.pm_inject_prob:
-                    _pm_target_ps = random.choice([1, 2, 3, 4])
+                    _pm_target_ps = random.choice([1, 2])  # PS1/PS2만 (Operational). PS3/PS4는 Non-operational → timeout 유발
                     self._pm_set_state(_pm_target_ps)
                     _pm_entered = True
                     self.pm_inject_count += 1
