@@ -1147,6 +1147,9 @@ class NVMeFuzzer:
         # v4.2: subprocess 입력 파일 경로 (재사용)
         self._nvme_input_path: Optional[str] = None
 
+        # v5.1: 재현 TC용 명령 히스토리 (최근 100개, PM 포함)
+        self._cmd_history: deque = deque(maxlen=100)
+
     @staticmethod
     def _tracking_label(cmd: 'NVMeCommand', seed: 'Seed') -> str:
         """v4.4: 실제 실행 내용 기준 추적 키 생성.
@@ -2530,6 +2533,19 @@ class NVMeFuzzer:
             '--timeout=3000',
         ]
         label = f"PS{ps}" if ps > 0 else "PS0(복귀)"
+        # 재현 TC 히스토리 기록 (PM 진입/복귀도 포함)
+        self._cmd_history.append({
+            'kind': 'pm',
+            'label': f'PM {label}',
+            'passthru_type': 'admin-passthru',
+            'device': self.config.nvme_device,
+            'opcode': sf.opcode,
+            'nsid': 0,
+            'cdw2': 0, 'cdw3': 0,
+            'cdw10': 0x02, 'cdw11': ps,
+            'cdw12': 0, 'cdw13': 0, 'cdw14': 0, 'cdw15': 0,
+            'data': None, 'data_len': 0, 'is_write': False,
+        })
         try:
             result = subprocess.run(nvme_cmd, timeout=5.0,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2657,6 +2673,23 @@ class NVMeFuzzer:
                 nvme_cmd.extend([f'--input-file={input_file}', '-w'])
             else:
                 nvme_cmd.append('-r')
+
+        # 재현 TC 히스토리 기록 (crash 시 replay .sh 생성에 사용)
+        self._cmd_history.append({
+            'kind': 'nvme',
+            'label': cmd.name,
+            'passthru_type': passthru_type,
+            'device': target_device,
+            'opcode': actual_opcode,
+            'nsid': actual_nsid,
+            'cdw2': seed.cdw2, 'cdw3': seed.cdw3,
+            'cdw10': seed.cdw10, 'cdw11': seed.cdw11,
+            'cdw12': seed.cdw12, 'cdw13': seed.cdw13,
+            'cdw14': seed.cdw14, 'cdw15': seed.cdw15,
+            'data': bytes(data[:data_len]) if (write_data and data_len > 0 and data) else None,
+            'data_len': data_len,
+            'is_write': bool(write_data and data_len > 0),
+        })
 
         # 로그: mutation된 필드는 별도 표시
         mut_flags = []
@@ -2887,6 +2920,76 @@ class NVMeFuzzer:
         except Exception as e:
             log.warning(f"[UFAS] 덤프 실행 오류: {e}")
 
+    def _generate_replay_sh(self, crash_dir: Path, tag: str) -> None:
+        """crash 발생 직전 최대 100개 명령어(PM 포함)를 재현 가능한 .sh 파일로 저장.
+
+        쓰기 데이터가 있는 명령은 replay_data_<tag>/ 하위에 바이너리 파일로 함께 저장.
+        생성된 .sh는 chmod +x 로 바로 실행 가능.
+        """
+        history = list(self._cmd_history)
+        if not history:
+            log.warning("[REPLAY] 히스토리 없음 — replay .sh 생성 건너뜀")
+            return
+
+        sh_path = crash_dir / f"replay_{tag}.sh"
+        data_dir = crash_dir / f"replay_data_{tag}"
+        data_dir.mkdir(exist_ok=True)
+
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        lines = [
+            "#!/bin/bash",
+            f"# Auto-generated replay script — {len(history)} commands before crash",
+            f"# Generated : {now_str}",
+            f"# Device    : {self.config.nvme_device}",
+            f"# Tag       : {tag}",
+            "#",
+            "# 실행 방법:",
+            f"#   sudo bash {sh_path.name}",
+            "#",
+            "set -e",
+            "",
+        ]
+
+        for i, entry in enumerate(history, 1):
+            label = entry['label']
+            is_last = (i == len(history))
+            marker = "  ← CRASH CMD" if is_last else ""
+            lines.append(f"# [{i:03d}/{len(history)}] {label}{marker}")
+
+            cmd_parts = [
+                "nvme", entry['passthru_type'], entry['device'],
+                f"--opcode={entry['opcode']:#x}",
+                f"--namespace-id={entry['nsid']}",
+                f"--cdw2={entry['cdw2']:#x}",
+                f"--cdw3={entry['cdw3']:#x}",
+                f"--cdw10={entry['cdw10']:#x}",
+                f"--cdw11={entry['cdw11']:#x}",
+                f"--cdw12={entry['cdw12']:#x}",
+                f"--cdw13={entry['cdw13']:#x}",
+                f"--cdw14={entry['cdw14']:#x}",
+                f"--cdw15={entry['cdw15']:#x}",
+                "--timeout=30000",
+            ]
+
+            if entry['is_write'] and entry['data']:
+                data_file = data_dir / f"data_{i:03d}.bin"
+                data_file.write_bytes(entry['data'])
+                cmd_parts += [f"--data-len={entry['data_len']}",
+                               f"--input-file={data_file}", "-w"]
+            elif entry['data_len'] > 0:
+                cmd_parts += [f"--data-len={entry['data_len']}", "-r"]
+
+            lines.append("sudo " + " \\\n  ".join(cmd_parts))
+            lines.append("sleep 0.1")
+            lines.append("")
+
+        lines.append('echo "Replay complete."')
+
+        sh_path.write_text("\n".join(lines) + "\n")
+        sh_path.chmod(0o755)
+        log.warning(f"[REPLAY] 재현 스크립트 → {sh_path}  ({len(history)}개 명령)")
+        log.warning(f"[REPLAY] 실행: sudo bash {sh_path}")
+
     def _capture_dmesg(self, lines: int = 80) -> str:
         """v4.4: 커널 로그(dmesg) 마지막 N줄을 캡처한다.
         timeout 시 커널 NVMe 드라이버의 동작(abort, reset, FLR 등)을
@@ -3055,7 +3158,12 @@ class NVMeFuzzer:
                          stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot)
         log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
 
-        # 3.5) UFAS 펌웨어 덤프
+        # 3.5) 재현 TC replay 스크립트 생성
+        _replay_tag = hashlib.md5(fuzz_data).hexdigest()[:8]
+        log.warning("[TIMEOUT] 재현 TC 스크립트를 생성합니다...")
+        self._generate_replay_sh(self.crashes_dir, _replay_tag)
+
+        # 3.6) UFAS 펌웨어 덤프
         log.warning("[TIMEOUT] UFAS 펌웨어 덤프를 실행합니다...")
         self._run_ufas_dump()
 
