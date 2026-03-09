@@ -6,14 +6,14 @@ J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
 v5.1 변경사항:
-- [Feature] PM injection: --pm 플래그로 NVMe 명령 전송 전
-    SetFeatures(PS1~PS4 진입) → SetFeatures(PS0 복귀) → NVMe 명령 + 샘플링 순서로 실행.
-    펌웨어의 PM wake-up 경로를 거친 후 명령을 처리하도록 유도.
-    PS1~PS4 모두 사용 — PS0 복귀 후 명령 실행이므로 Non-operational(PS3/PS4)도 허용.
-    PM 전환 구간도 J-Link 샘플링 병행 (start_sampling 중복 방지: is_alive() 가드).
-    _pm_set_state() → bool: rc를 로그에 표기 (→ OK / → FAIL(rc=N)).
-    pm_inject_ok/fail dict(PS별) 통계 추가, 종료 시 summary 출력.
-    PM_INJECT_PROB 상수로 확률 설정, --pm 플래그로 활성화.
+- [Feature] PM Rotation: --pm 플래그로 매 100회 명령마다 Power State를 랜덤 전환.
+    PS0~PS4 중 random.randint(0,4) 선택 — 같은 PS 재진입 허용.
+    전환 시점: executions % 100 == 0 경계 ([Stats] 출력 직전).
+    PS3/PS4 상태: IO 명령을 Admin 명령으로 자동 대체 (non-operational 대응).
+    PS1: subprocess 감지 timeout ×16, PS2: ×32 적용.
+    _pm_set_state() 호출 시 소요 시간 로그 출력 (성능 진단용).
+    ps_enter_counts(PS별 진입 횟수) + ps_exec_counts(PS별 실행 횟수) 통계 추가.
+    종료 summary에 "실행 N회 (X%), 진입 N회" 형식으로 출력.
 - [Tune] DIAGNOSE_STABILITY: 50 → 100, DIAGNOSE_MAX: 1000 → 5000
     idle PC 100개+ 환경(복잡한 RTOS, 주기 인터럽트)에서 최대 샘플 도달로
     idle 유니버스 수렴 미완료 발생 → 상한 확장으로 완전 수렴 보장.
