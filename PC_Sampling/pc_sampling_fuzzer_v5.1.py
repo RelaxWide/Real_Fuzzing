@@ -1118,6 +1118,7 @@ class NVMeFuzzer:
         # _ps_cmd_counter 제거 — PM 전환을 executions % 100 경계에서 처리
         # _ps_idx 제거 — 랜덤 전환으로 변경
         self.ps_exec_counts: dict[int, int] = {i: 0 for i in range(5)}  # PS별 실행 횟수
+        self.ps_enter_counts: dict[int, int] = {i: 0 for i in range(5)} # PS별 진입 횟수
 
         self.cmd_stats: dict[str, dict] = defaultdict(lambda: {"exec": 0, "interesting": 0})
         for c in self.commands:
@@ -3741,7 +3742,7 @@ class NVMeFuzzer:
         log.warning(f"NVMe I/O    : subprocess (nvme-cli passthru)")
         if self.config.pm_inject_prob > 0:
             log.warning(f"PM Rotate   : interval={PM_ROTATE_INTERVAL}cmds, "
-                        f"seq=PS0→PS1→PS2→PS3→PS4→PS0, "
+                        f"mode=random(PS0~PS4), "
                         f"timeout_mult=PS1×{PS_TIMEOUT_MULT[1]} PS2×{PS_TIMEOUT_MULT[2]}")
         log.warning(f"Random gen  : {self.config.random_gen_ratio:.0%}")
         timeout_str = ", ".join(f"{k}={v}ms" for k, v in self.config.nvme_timeouts.items())
@@ -4074,6 +4075,7 @@ class NVMeFuzzer:
                         )
                         self._pm_set_state(next_ps)
                         self._current_ps = next_ps
+                        self.ps_enter_counts[next_ps] += 1
 
                     stats = self._collect_stats()
                     # 구간별 exec/s 계산 (마지막 100개 기준)
@@ -4195,16 +4197,17 @@ class NVMeFuzzer:
                     f"  Passthru type  : admin={pt.get('admin-passthru', 0)}, "
                     f"io={pt.get('io-passthru', 0)}")
                 if self.config.pm_inject_prob > 0:
-                    summary_lines.append(f"PM Rotate interval: {PM_ROTATE_INTERVAL}cmds/state")
+                    summary_lines.append(f"PM Rotate interval: {PM_ROTATE_INTERVAL}cmds (random PS0~PS4)")
                     for ps in range(5):
                         cnt = self.ps_exec_counts.get(ps, 0)
-                        if cnt > 0:
+                        enters = self.ps_enter_counts.get(ps, 0)
+                        if cnt > 0 or enters > 0:
                             pct = 100 * cnt / total
                             mult = PS_TIMEOUT_MULT.get(ps, 1)
                             note = f" [TO×{mult}]" if mult > 1 else \
                                    (" [Admin only]" if ps in (3, 4) else "")
                             summary_lines.append(
-                                f"  PS{ps}: {cnt}회 ({pct:.1f}%){note}")
+                                f"  PS{ps}: 실행 {cnt}회 ({pct:.1f}%), 진입 {enters}회{note}")
 
                 # v4.5: MOpt 통계
                 if self.config.mopt_enabled:
