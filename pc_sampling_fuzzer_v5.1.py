@@ -271,6 +271,9 @@ NSID_MUT_PROB     = 0.10   # namespace ID override 확률 (기본 10%)
 ADMIN_SWAP_PROB   = 0.05   # Admin↔IO 교차 전송 확률 (기본 5%)
 DATALEN_MUT_PROB  = 0.08   # data_len 불일치 확률 (기본 8%)
 
+# v5.1: PM injection 확률 (--pm 플래그로 활성화 시 적용)
+PM_INJECT_PROB    = 0.15   # 0.0~1.0 (예: 0.15 = 15%)
+
 # v4.7: Idle 유니버스 수집 (diagnose 수렴 설정)
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
 # 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
@@ -504,8 +507,8 @@ class FuzzConfig:
     fw_xfer_size: int = 32768           # FWDownload 청크 크기(바이트), nvme fw-download -x 와 동일
     fw_slot: int = 1                    # FWCommit 슬롯 번호
 
-    # v5.1: PM 주입 확률 (0.0=비활성화)
-    pm_inject_prob: float = 0.15
+    # v5.1: PM 주입 확률 (0.0=비활성화, --pm 플래그로 PM_INJECT_PROB 값 사용)
+    pm_inject_prob: float = 0.0
 
 
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
@@ -4011,8 +4014,8 @@ if __name__ == "__main__":
                         help='MOpt core phase length in executions (default 50000)')
 
     # v5.1: PM injection
-    parser.add_argument('--pm-inject-prob', type=float, default=0.15,
-                        help='PM state injection probability per iteration (0.0=disable, default=0.15)')
+    parser.add_argument('--pm', action='store_true', default=False,
+                        help='PM injection 활성화 (확률은 .py 파일 상단 PM_INJECT_PROB 참조)')
 
     args = parser.parse_args()
 
@@ -4132,7 +4135,7 @@ if __name__ == "__main__":
         fw_xfer_size=args.fw_xfer,
         fw_slot=args.fw_slot,
         # v5.1
-        pm_inject_prob=args.pm_inject_prob,
+        pm_inject_prob=PM_INJECT_PROB if args.pm else 0.0,
     )
 
     fuzzer = NVMeFuzzer(config)
