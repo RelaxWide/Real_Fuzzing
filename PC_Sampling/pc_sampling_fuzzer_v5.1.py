@@ -2874,31 +2874,43 @@ class NVMeFuzzer:
         """
         import re as _re
         dev_name = os.path.basename(self.config.nvme_device)  # e.g. "nvme0" or "nvme0n1"
+        log.warning(f"[UFAS] PCIe bus 탐지 시작: nvme_device={self.config.nvme_device}")
         m = _re.match(r'(nvme\d+)', dev_name)
         if m:
             ctrl = m.group(1)  # "nvme0"
             addr_file = f'/sys/class/nvme/{ctrl}/address'
+            log.warning(f"[UFAS] sysfs 경로 시도: {addr_file}")
             try:
                 addr = Path(addr_file).read_text().strip()  # e.g. "0000:01:00.0"
                 parts = addr.split(':')
                 if len(parts) >= 3:
                     bus = parts[-2]  # "01"
-                    log.debug(f"[UFAS] NVMe PCIe address: {addr} → bus={bus}")
+                    log.warning(f"[UFAS] sysfs 탐지 성공: {addr} → bus={bus}")
                     return bus
+                else:
+                    log.warning(f"[UFAS] sysfs 주소 형식 이상: '{addr}' — lspci fallback")
             except Exception as e:
-                log.debug(f"[UFAS] sysfs read failed: {e}")
+                log.warning(f"[UFAS] sysfs read 실패: {e} — lspci fallback")
+        else:
+            log.warning(f"[UFAS] 디바이스명에서 nvme 컨트롤러 파싱 실패: '{dev_name}' — lspci fallback")
 
         # fallback: lspci
+        log.warning("[UFAS] lspci로 NVMe 장치 탐색 중...")
         try:
             result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
-            for line in result.stdout.splitlines():
-                if 'nvme' in line.lower() or 'non-volatile' in line.lower():
-                    # "01:00.0 Non-Volatile memory controller: ..."
-                    bus = line.split(':')[0]
-                    log.debug(f"[UFAS] lspci → bus={bus} ({line.strip()})")
-                    return bus
+            nvme_lines = [l for l in result.stdout.splitlines()
+                          if 'nvme' in l.lower() or 'non-volatile' in l.lower()]
+            if nvme_lines:
+                log.warning(f"[UFAS] lspci NVMe 장치 목록:")
+                for line in nvme_lines:
+                    log.warning(f"  {line.strip()}")
+                bus = nvme_lines[0].split(':')[0]
+                log.warning(f"[UFAS] lspci 탐지 성공: bus={bus}")
+                return bus
+            else:
+                log.warning("[UFAS] lspci에서 NVMe 장치를 찾지 못함")
         except Exception as e:
-            log.debug(f"[UFAS] lspci fallback failed: {e}")
+            log.warning(f"[UFAS] lspci 실행 실패: {e}")
 
         log.warning("[UFAS] PCIe bus 번호 자동 탐지 실패 — UFAS 덤프 건너뜀")
         return None
@@ -2909,13 +2921,16 @@ class NVMeFuzzer:
         실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./ufas
         명령: sudo ./ufas <pcie_bus> 1 <YYYYMMDD>_UFAS_Dump.bin --ini=./SnapShot/A815.ini
         PCIe bus 번호는 _get_nvme_pcie_bus()로 자동 탐지.
+        stdout/stderr 캡처하여 로그 출력.
         """
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         ufas_path = os.path.join(script_dir, 'ufas')
 
+        log.warning(f"[UFAS] 실행 파일 경로: {ufas_path}")
         if not os.path.isfile(ufas_path):
-            log.warning(f"[UFAS] 실행 파일 없음: {ufas_path} — 덤프 건너뜀")
+            log.warning(f"[UFAS] 실행 파일 없음 — 덤프 건너뜀")
             return
+        log.warning(f"[UFAS] 실행 파일 확인 OK")
 
         pcie_bus = self._get_nvme_pcie_bus()
         if pcie_bus is None:
@@ -2926,15 +2941,25 @@ class NVMeFuzzer:
         dump_path = os.path.join(script_dir, dump_filename)
 
         cmd = ['sudo', ufas_path, pcie_bus, '1', dump_path, '--ini=./SnapShot/A815.ini']
-        log.warning(f"[UFAS] 덤프 실행: {' '.join(cmd)}")
+        log.warning(f"[UFAS] 실행 명령: {' '.join(cmd)}")
+        log.warning(f"[UFAS] 작업 디렉토리: {script_dir}")
+        log.warning(f"[UFAS] 덤프 출력 파일: {dump_path}")
+        log.warning("[UFAS] 실행 중... (최대 120초 대기)")
         try:
-            result = subprocess.run(cmd, timeout=120, cwd=script_dir)
+            result = subprocess.run(
+                cmd, timeout=120, cwd=script_dir,
+                capture_output=True, text=True,
+            )
+            if result.stdout.strip():
+                log.warning(f"[UFAS] stdout:\n{result.stdout.strip()}")
+            if result.stderr.strip():
+                log.warning(f"[UFAS] stderr:\n{result.stderr.strip()}")
             if result.returncode == 0:
-                log.warning(f"[UFAS] 덤프 완료 → {dump_path}")
+                log.warning(f"[UFAS] 덤프 완료 (rc=0) → {dump_path}")
             else:
                 log.warning(f"[UFAS] 덤프 실패 (rc={result.returncode})")
         except subprocess.TimeoutExpired:
-            log.warning("[UFAS] 덤프 timeout (120초 초과)")
+            log.warning("[UFAS] 덤프 timeout (120초 초과) — ufas 프로세스가 응답하지 않음")
         except Exception as e:
             log.warning(f"[UFAS] 덤프 실행 오류: {e}")
 
