@@ -7,11 +7,9 @@ subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
 v5.1 변경사항:
 - [Feature] PM injection: --pm 플래그로 NVMe 명령 전송 전
-    SetFeatures(FID=0x02, CDW11=PS1~PS2)를 silent 전송하여 저전력 상태에서
-    펌웨어 코드 경로 탐색. PS1/PS2(Operational)만 사용 — PS3/PS4는
-    Non-operational이라 명령 처리 불가 → timeout 유발로 제외.
-    J-Link 샘플링은 메인 명령 구간에만 적용.
-    명령 완료 후 SetFeatures(CDW11=0x00)으로 PS0 복귀.
+    SetFeatures(PS1~PS2 진입) → SetFeatures(PS0 복귀) → NVMe 명령 + 샘플링 순서로 실행.
+    펌웨어의 PM wake-up 경로를 거친 후 명령을 처리하도록 유도.
+    PS1/PS2(Operational)만 사용 — PS3/PS4는 Non-operational로 제외.
     PM 전송 실패 시 로그만 출력, 퍼징 흐름에 영향 없음.
     pm_inject_count 통계 추가, 시작 로그에 prob 출력.
 - [Tune] DIAGNOSE_STABILITY: 50 → 100, DIAGNOSE_MAX: 1000 → 5000
@@ -3613,22 +3611,17 @@ class NVMeFuzzer:
                     pt = "admin-passthru" if cmd.cmd_type == NVMeCommandType.ADMIN else "io-passthru"
                 self.passthru_stats[pt] += 1
 
-                # v5.1: PM injection — 확률적으로 저전력 상태 진입
-                _pm_entered = False
-                _pm_target_ps = 0
+                # v5.1: PM injection — PS 진입 후 PS0 복귀, 그 다음 NVMe 명령 실행
+                # 목적: 펌웨어의 PM wake-up 경로를 거친 후 명령을 처리하도록 유도
                 if self.config.pm_inject_prob > 0 and random.random() < self.config.pm_inject_prob:
-                    _pm_target_ps = random.choice([1, 2])  # PS1/PS2만 (Operational). PS3/PS4는 Non-operational → timeout 유발
-                    self._pm_set_state(_pm_target_ps)
-                    _pm_entered = True
+                    _pm_target_ps = random.choice([1, 2])  # PS1/PS2(Operational). PS3/PS4는 Non-operational → 제외
+                    self._pm_set_state(_pm_target_ps)       # PS 진입
+                    self._pm_set_state(0)                   # PS0 복귀
                     self.pm_inject_count += 1
 
-                # NVMe 커맨드 전송
+                # NVMe 커맨드 전송 (PS0 복귀 후 실행)
                 rc = self._send_nvme_command(fuzz_data, mutated_seed)
                 last_samples = self.sampler.stop_sampling()
-
-                # v5.1: PM 복귀
-                if _pm_entered:
-                    self._pm_set_state(0)
 
                 self.executions += 1
                 track_key = self._tracking_label(cmd, mutated_seed)
