@@ -1092,7 +1092,9 @@ class NVMeFuzzer:
 
         self.executions = 0
         self.start_time: Optional[datetime] = None
-        self.pm_inject_count = 0  # v5.1: PM 주입 횟수
+        self.pm_inject_count = 0              # v5.1: PM 주입 총 횟수
+        self.pm_inject_ok: dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0}   # PS별 성공 횟수
+        self.pm_inject_fail: dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0} # PS별 실패 횟수
 
         self.cmd_stats: dict[str, dict] = defaultdict(lambda: {"exec": 0, "interesting": 0})
         for c in self.commands:
@@ -2509,13 +2511,14 @@ class NVMeFuzzer:
     RC_TIMEOUT   = -1001   # NVMe 타임아웃 (의미 있는 이벤트)
     RC_ERROR     = -1002   # subprocess 에러 (내부 문제)
 
-    def _pm_set_state(self, ps: int) -> None:
-        """SetFeatures(FID=0x02) silent 전송 — PM 상태 진입/복귀용.
-        J-Link 샘플링 없음. 실패해도 fuzzing 흐름에 영향 없음.
+    def _pm_set_state(self, ps: int) -> bool:
+        """SetFeatures(FID=0x02) 전송 — PM 상태 진입/복귀용.
+        반환값: True=성공(rc==0), False=실패(rc!=0 또는 예외).
+        실패해도 fuzzing 흐름에 영향 없음.
         """
         sf = next((c for c in NVME_COMMANDS if c.name == "SetFeatures"), None)
         if sf is None:
-            return
+            return False
         nvme_cmd = [
             'nvme', 'admin-passthru', self.config.nvme_device,
             f'--opcode={sf.opcode:#x}',
@@ -2527,12 +2530,16 @@ class NVMeFuzzer:
             '--timeout=3000',
         ]
         label = f"PS{ps}" if ps > 0 else "PS0(복귀)"
-        log.info(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label})")
         try:
-            subprocess.run(nvme_cmd, timeout=5.0,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            result = subprocess.run(nvme_cmd, timeout=5.0,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ok = (result.returncode == 0)
+            status = "OK" if ok else f"FAIL(rc={result.returncode})"
+            log.info(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label}) → {status}")
+            return ok
         except Exception as e:
-            log.warning(f"[PM] _pm_set_state PS{ps} 실패: {e}")
+            log.warning(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label}) → FAIL(exception: {e})")
+            return False
 
     def _send_nvme_command(self, data: bytes, seed: Seed) -> int:
         """subprocess(nvme-cli) 기반 NVMe passthru 명령 전송.
@@ -3618,10 +3625,14 @@ class NVMeFuzzer:
                 # 목적: PM 전환 펌웨어 경로(진입/wake-up 코드) + 이후 명령 처리까지 전체 커버
                 if self.config.pm_inject_prob > 0 and random.random() < self.config.pm_inject_prob:
                     _pm_target_ps = random.choice([1, 2, 3, 4])  # PS0 복귀 후 명령 실행이므로 PS3/PS4도 허용
-                    self.sampler.start_sampling()            # PM 진입 전부터 샘플링 시작
-                    self._pm_set_state(_pm_target_ps)       # PS 진입 (샘플링 중)
-                    self._pm_set_state(0)                   # PS0 복귀 (샘플링 중)
+                    self.sampler.start_sampling()                  # PM 진입 전부터 샘플링 시작
+                    ok_enter = self._pm_set_state(_pm_target_ps)  # PS 진입 (샘플링 중)
+                    self._pm_set_state(0)                          # PS0 복귀 (샘플링 중)
                     self.pm_inject_count += 1
+                    if ok_enter:
+                        self.pm_inject_ok[_pm_target_ps] += 1
+                    else:
+                        self.pm_inject_fail[_pm_target_ps] += 1
 
                 # NVMe 커맨드 전송 — 이미 샘플링 중이면 _send_nvme_command 내부 start_sampling 스킵
                 rc = self._send_nvme_command(fuzz_data, mutated_seed)
@@ -3844,8 +3855,17 @@ class NVMeFuzzer:
                     f"io={pt.get('io-passthru', 0)}")
                 if self.config.pm_inject_prob > 0:
                     summary_lines.append(
-                        f"PM inject count  : {self.pm_inject_count} "
+                        f"PM inject total  : {self.pm_inject_count} "
                         f"({100*self.pm_inject_count/total:.1f}%)")
+                    for ps in [1, 2, 3, 4]:
+                        ok   = self.pm_inject_ok.get(ps, 0)
+                        fail = self.pm_inject_fail.get(ps, 0)
+                        attempted = ok + fail
+                        if attempted > 0:
+                            summary_lines.append(
+                                f"  PS{ps}: {attempted}회 시도 / "
+                                f"OK={ok} FAIL={fail} "
+                                f"(성공률 {100*ok/attempted:.1f}%)")
 
                 # v4.5: MOpt 통계
                 if self.config.mopt_enabled:
