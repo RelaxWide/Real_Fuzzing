@@ -2951,7 +2951,7 @@ class NVMeFuzzer:
         dump_filename = f"{date_str}_UFAS_Dump.bin"
         dump_path = os.path.join(script_dir, dump_filename)
 
-        cmd = ['sudo', ufas_path, pcie_bus, '1', dump_path, '--ini=./SnapShot/A815.ini']
+        cmd = ['sudo', ufas_path, pcie_bus, '1', dump_path, '--ini=A815.ini']
         log.warning(f"[UFAS] 실행 명령: {' '.join(cmd)}")
         log.warning(f"[UFAS] 작업 디렉토리: {script_dir}")
         log.warning(f"[UFAS] 덤프 출력 파일: {dump_path}")
