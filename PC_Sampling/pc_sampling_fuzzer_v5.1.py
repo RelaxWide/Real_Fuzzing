@@ -1133,6 +1133,8 @@ class NVMeFuzzer:
         self._sa_total_funcs: int = 0
         self._sa_covered_addrs: int = 0       # 커버된 알려진 명령어 주소 수
         self._sa_entered_funcs: set = set()   # 진입한 함수 entry point 집합
+        # 성장 곡선 이력: [(executions, elapsed_s, code_pct, funcs_pct), ...]
+        self._sa_cov_history: list = []
         self._load_static_analysis()
 
         self.cmd_stats: dict[str, dict] = defaultdict(lambda: {"exec": 0, "interesting": 0})
@@ -3590,6 +3592,187 @@ class NVMeFuzzer:
         plt.close()
         log.info(f"[Graph] 명령어 비교 차트 → {chart_file}")
 
+    def _generate_static_coverage_graphs(self):
+        """정적 분석 커버리지 시각화 3종 생성 (파일 미로드 시 조용히 스킵).
+
+        1. coverage_growth.png  — 성장 곡선 (code_cov% / funcs_cov% vs executions)
+        2. firmware_map.png     — 펌웨어 주소 공간 커버리지 맵
+        3. uncovered_funcs.png  — 미커버 함수 Top-30 (크기 순)
+        """
+        if not self._sa_loaded:
+            return
+
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
+        except ImportError:
+            log.warning("[StatGraph] matplotlib 미설치 — 정적 분석 그래프 생략")
+            return
+
+        graph_dir = self.output_dir / 'graphs'
+        graph_dir.mkdir(parents=True, exist_ok=True)
+
+        # ------------------------------------------------------------------ #
+        # 1. Coverage growth curve
+        # ------------------------------------------------------------------ #
+        if len(self._sa_cov_history) >= 2:
+            execs  = [h[0] for h in self._sa_cov_history]
+            c_pcts = [h[2] for h in self._sa_cov_history]
+            f_pcts = [h[3] for h in self._sa_cov_history]
+
+            fig, ax = plt.subplots(figsize=(10, 5))
+            if self._sa_total_code > 0:
+                ax.plot(execs, c_pcts, color='steelblue', linewidth=1.5,
+                        label=f'Code ({self._sa_total_code:,} instrs)')
+            if self._sa_total_funcs > 0:
+                ax.plot(execs, f_pcts, color='coral', linewidth=1.5,
+                        label=f'Functions ({self._sa_total_funcs:,})')
+
+            ax.set_xlabel('Executions')
+            ax.set_ylabel('Coverage (%)')
+            ax.set_title('Coverage Growth — PC Sampling Fuzzer')
+            ax.legend(loc='lower right')
+            ax.set_ylim(0, max(max(c_pcts, default=0), max(f_pcts, default=0)) * 1.15 + 1)
+            ax.grid(True, alpha=0.3)
+
+            # 최종 값 annotation
+            if c_pcts:
+                ax.annotate(f'{c_pcts[-1]:.1f}%',
+                            xy=(execs[-1], c_pcts[-1]),
+                            xytext=(8, 4), textcoords='offset points',
+                            color='steelblue', fontsize=9)
+            if f_pcts:
+                ax.annotate(f'{f_pcts[-1]:.1f}%',
+                            xy=(execs[-1], f_pcts[-1]),
+                            xytext=(8, -12), textcoords='offset points',
+                            color='coral', fontsize=9)
+
+            plt.tight_layout()
+            growth_file = graph_dir / 'coverage_growth.png'
+            plt.savefig(growth_file, dpi=150, bbox_inches='tight')
+            plt.close()
+            log.info(f"[StatGraph] 성장 곡선 → {growth_file}")
+
+        # ------------------------------------------------------------------ #
+        # 2. Firmware address-space map
+        # ------------------------------------------------------------------ #
+        if self._sa_func_entries and self._sa_total_funcs > 0:
+            entries = self._sa_func_entries
+            ends    = self._sa_func_ends
+            entered = self._sa_entered_funcs
+
+            # 함수를 entry 순으로 정렬 (이미 정렬됨)
+            # 최대 400개까지만 표시 (너무 많으면 가독성 저하)
+            MAX_FUNCS = 400
+            step = max(1, len(entries) // MAX_FUNCS)
+            sampled_idx = list(range(0, len(entries), step))
+
+            n_show = len(sampled_idx)
+            # 행 수: 20개씩 1행
+            cols = 20
+            rows = (n_show + cols - 1) // cols
+
+            fig, ax = plt.subplots(figsize=(min(cols * 0.6, 14), max(rows * 0.4, 3)))
+            ax.set_xlim(0, cols)
+            ax.set_ylim(0, rows)
+            ax.set_aspect('equal')
+            ax.axis('off')
+
+            fig.patch.set_facecolor('#1a1a2e')
+            ax.set_facecolor('#1a1a2e')
+
+            COLOR_COV   = '#00c875'   # 커버됨 (초록)
+            COLOR_UNCOV = '#444466'   # 미커버 (어두운 보라)
+
+            for plot_i, func_i in enumerate(sampled_idx):
+                row = plot_i // cols
+                col = plot_i % cols
+                y   = rows - 1 - row  # 위에서 아래로
+
+                # 크기에 비례한 너비 (시각적 강조)
+                func_size = ends[func_i] - entries[func_i]
+                w = 0.85
+                h = min(0.85, 0.4 + func_size / 8000.0)
+                h = min(h, 0.85)
+
+                color = COLOR_COV if entries[func_i] in entered else COLOR_UNCOV
+                rect = mpatches.FancyBboxPatch(
+                    (col + 0.075, y + (0.85 - h) / 2), w, h,
+                    boxstyle="round,pad=0.02",
+                    facecolor=color, edgecolor='none', alpha=0.9)
+                ax.add_patch(rect)
+
+            n_cov   = len(entered)
+            n_uncov = self._sa_total_funcs - n_cov
+            cov_pct = 100.0 * n_cov / self._sa_total_funcs
+
+            legend_patches = [
+                mpatches.Patch(color=COLOR_COV,   label=f'Covered ({n_cov})'),
+                mpatches.Patch(color=COLOR_UNCOV, label=f'Not covered ({n_uncov})'),
+            ]
+            ax.legend(handles=legend_patches, loc='upper right',
+                      facecolor='#2a2a3e', edgecolor='gray',
+                      labelcolor='white', fontsize=9)
+
+            note = f'  (showing {n_show}/{self._sa_total_funcs} funcs)' \
+                   if n_show < self._sa_total_funcs else ''
+            ax.set_title(
+                f'Firmware Function Map — {cov_pct:.1f}% covered{note}',
+                color='white', fontsize=11, pad=8)
+
+            map_file = graph_dir / 'firmware_map.png'
+            plt.savefig(map_file, dpi=150, bbox_inches='tight',
+                        facecolor=fig.get_facecolor())
+            plt.close()
+            log.info(f"[StatGraph] 펌웨어 맵 → {map_file}")
+
+        # ------------------------------------------------------------------ #
+        # 3. Top uncovered functions (by size)
+        # ------------------------------------------------------------------ #
+        if self._sa_func_entries and self._sa_total_funcs > 0:
+            entered = self._sa_entered_funcs
+            uncov = [
+                (self._sa_func_names[i],
+                 self._sa_func_ends[i] - self._sa_func_entries[i],
+                 self._sa_func_entries[i])
+                for i in range(len(self._sa_func_entries))
+                if self._sa_func_entries[i] not in entered
+            ]
+            # 크기(bytes) 내림차순
+            uncov.sort(key=lambda x: x[1], reverse=True)
+            top = uncov[:30]
+
+            if top:
+                names_top  = [f"{n}  (0x{addr:08x})" for n, _, addr in top]
+                sizes_top  = [sz for _, sz, _ in top]
+
+                fig, ax = plt.subplots(figsize=(10, max(4, len(top) * 0.35)))
+                bars = ax.barh(range(len(top)), sizes_top,
+                               color='#e05a5a', edgecolor='none', height=0.7)
+                ax.set_yticks(range(len(top)))
+                ax.set_yticklabels(names_top, fontsize=8)
+                ax.invert_yaxis()
+                ax.set_xlabel('Function size (bytes)')
+                ax.set_title(
+                    f'Top {len(top)} Uncovered Functions (by size)\n'
+                    f'Total uncovered: {len(uncov):,} / {self._sa_total_funcs:,}',
+                    fontsize=11)
+                ax.grid(True, axis='x', alpha=0.3)
+
+                # 막대 끝에 크기 숫자
+                for bar, sz in zip(bars, sizes_top):
+                    ax.text(bar.get_width() + max(sizes_top) * 0.01,
+                            bar.get_y() + bar.get_height() / 2,
+                            str(sz), va='center', fontsize=7, color='#555')
+
+                plt.tight_layout()
+                uncov_file = graph_dir / 'uncovered_funcs.png'
+                plt.savefig(uncov_file, dpi=150, bbox_inches='tight')
+                plt.close()
+                log.info(f"[StatGraph] 미커버 함수 Top-{len(top)} → {uncov_file}")
+
     def _generate_heatmaps(self):
         """1D 주소 커버리지 히트맵 + 2D edge 히트맵 생성"""
         try:
@@ -4198,6 +4381,17 @@ class NVMeFuzzer:
                         self._current_ps = next_ps
                         self.ps_enter_counts[next_ps] += 1
 
+                    # v5.1: 정적 분석 성장 곡선 스냅샷
+                    if self._sa_loaded:
+                        _elapsed_snap = (datetime.now() - self.start_time).total_seconds() \
+                                        if self.start_time else 0
+                        _cpct = (100.0 * self._sa_covered_addrs / self._sa_total_code
+                                 if self._sa_total_code > 0 else 0.0)
+                        _fpct = (100.0 * len(self._sa_entered_funcs) / self._sa_total_funcs
+                                 if self._sa_total_funcs > 0 else 0.0)
+                        self._sa_cov_history.append(
+                            (self.executions, _elapsed_snap, _cpct, _fpct))
+
                     stats = self._collect_stats()
                     # 구간별 exec/s 계산 (마지막 100개 기준)
                     _now = datetime.now()
@@ -4380,6 +4574,11 @@ class NVMeFuzzer:
                 self._generate_heatmaps()
             except Exception as e:
                 log.error(f"Graph/heatmap generation failed: {e}")
+
+            try:
+                self._generate_static_coverage_graphs()
+            except Exception as e:
+                log.error(f"Static coverage graph generation failed: {e}")
 
             try:
                 for h in log.handlers:
