@@ -3126,17 +3126,17 @@ class NVMeFuzzer:
             "# 실행 방법:",
             f"#   sudo bash {sh_path.name}",
             "#",
-            "set -e",
+            # set -e 대신 set +e — rc를 직접 캡처하기 위해 오류 즉시 종료 비활성화
+            "set +e",
             "",
         ]
 
         for i, entry in enumerate(history, 1):
             label = entry['label']
             is_last = (i == len(history))
-            marker = "  ← CRASH CMD" if is_last else ""
+            marker = "  <- CRASH CMD" if is_last else ""
             step_str = f"[{i:03d}/{len(history)}] {label}{marker}"
             lines.append(f"# {step_str}")
-            lines.append(f'echo ">>> {step_str}"')
 
             cmd_parts = [
                 "nvme", entry['passthru_type'], entry['device'],
@@ -3162,7 +3162,13 @@ class NVMeFuzzer:
             elif entry['data_len'] > 0:
                 cmd_parts += [f"--data-len={entry['data_len']}", "-r"]
 
-            lines.append("sudo " + " \\\n  ".join(cmd_parts))
+            # CLI 한 줄로 echo (인수를 공백으로 이어서 출력)
+            cmd_oneline = "sudo " + " ".join(cmd_parts)
+            lines.append(f'echo ">>> {step_str}"')
+            lines.append(f'echo "    {cmd_oneline}"')
+            # stdout(response buffer)은 /dev/null 억제, stderr(에러 메시지)만 출력
+            lines.append("sudo " + " \\\n  ".join(cmd_parts) + " > /dev/null")
+            lines.append('echo "    rc=$?"')
             lines.append("sleep 0.1")
             lines.append("")
 
