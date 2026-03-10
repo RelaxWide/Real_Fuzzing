@@ -1127,6 +1127,7 @@ class NVMeFuzzer:
         self.start_time: Optional[datetime] = None
         # v5.1: PM 로테이션 상태
         self._current_ps: int = 0                              # 현재 PS 상태
+        self._prev_op_ps: int = 0                             # 마지막 operational PS (0~2) — PS3/4 timeout 기준
         # _ps_cmd_counter 제거 — PM 전환을 executions % 100 경계에서 처리
         # _ps_idx 제거 — 랜덤 전환으로 변경
         self.ps_exec_counts: dict[int, int] = {i: 0 for i in range(5)}  # PS별 실행 횟수
@@ -4101,10 +4102,13 @@ class NVMeFuzzer:
 
     def _print_status(self, stats: dict, last_samples: int = 0,
                       window_eps: float = 0.0):
-        ps_tag = (f" | PS{self._current_ps}"
-                  f"(×{PS_TIMEOUT_MULT.get(self._current_ps, 1)}TO"
-                  f"{',Admin' if self._current_ps in (3, 4) else ''})"
-                  if self.config.pm_inject_prob > 0 else "")
+        if self.config.pm_inject_prob > 0:
+            _ps_to = (self._prev_op_ps if self._current_ps in (3, 4) else self._current_ps)
+            _mult  = PS_TIMEOUT_MULT.get(_ps_to, 1)
+            _prev  = f",prev=PS{self._prev_op_ps}" if self._current_ps in (3, 4) else ""
+            ps_tag = f" | PS{self._current_ps}(×{_mult}TO{_prev})"
+        else:
+            ps_tag = ""
         log.warning(f"[Stats] exec: {stats['executions']:,} | "
                  f"corpus: {stats['corpus_size']} | "
                  f"crashes: {stats['crashes']} | "
@@ -4157,7 +4161,8 @@ class NVMeFuzzer:
         if self.config.pm_inject_prob > 0:
             log.warning(f"PM Rotate   : interval={PM_ROTATE_INTERVAL}cmds, "
                         f"mode=random(PS0~PS4), "
-                        f"timeout_mult=PS1×{PS_TIMEOUT_MULT[1]} PS2×{PS_TIMEOUT_MULT[2]}")
+                        f"timeout_mult=PS1×{PS_TIMEOUT_MULT[1]} PS2×{PS_TIMEOUT_MULT[2]} "
+                        f"PS3/PS4=prev_op_PS 기준, IO 필터 없음")
         if self._sa_loaded:
             sa_info = []
             if self._sa_total_code > 0:
@@ -4364,20 +4369,15 @@ class NVMeFuzzer:
                 if self.config.pm_inject_prob > 0:
                     self.ps_exec_counts[self._current_ps] += 1
 
-                # PS3/PS4: IO 명령 → Admin 명령으로 대체
-                if self.config.pm_inject_prob > 0 and self._current_ps in (3, 4):
-                    if cmd.cmd_type == NVMeCommandType.IO:
-                        admin_cmds = [c for c in self.commands
-                                      if c.cmd_type == NVMeCommandType.ADMIN]
-                        if admin_cmds:
-                            fallback_cmd = random.choice(admin_cmds)
-                            fuzz_data = os.urandom(random.randint(64, 512))
-                            mutated_seed = Seed(data=fuzz_data, cmd=fallback_cmd)
-                            cmd = fallback_cmd
-                            log.debug(f"[PM] PS{self._current_ps} IO→Admin 대체: {cmd.name}")
+                # PS3/PS4에서도 IO 명령 포함 모든 타입 허용 — 필터링 없음
 
                 # NVMe 커맨드 전송
-                _timeout_mult = PS_TIMEOUT_MULT.get(self._current_ps, 1) \
+                # PS3/PS4: 디바이스가 복귀할 operational PS 기준으로 timeout 결정
+                _ps_for_timeout = (self._prev_op_ps
+                                   if self.config.pm_inject_prob > 0
+                                      and self._current_ps in (3, 4)
+                                   else self._current_ps)
+                _timeout_mult = PS_TIMEOUT_MULT.get(_ps_for_timeout, 1) \
                     if self.config.pm_inject_prob > 0 else 1
                 rc = self._send_nvme_command(fuzz_data, mutated_seed,
                                              timeout_mult=_timeout_mult)
@@ -4502,11 +4502,16 @@ class NVMeFuzzer:
                     # v5.1: PM 로테이션 — exec/s 계산 후 PS 전환
                     if self.config.pm_inject_prob > 0:
                         next_ps = random.randint(0, 4)
+                        # PS3/PS4 timeout은 진입 전 operational PS(0~2) 기준
+                        if next_ps not in (3, 4):
+                            self._prev_op_ps = next_ps
+                        _eff_mult = PS_TIMEOUT_MULT.get(
+                            next_ps if next_ps not in (3, 4) else self._prev_op_ps, 1)
                         log.warning(
                             f"[PM] PS 상태 전환: PS{self._current_ps} → PS{next_ps}"
-                            + (f" (timeout ×{PS_TIMEOUT_MULT[next_ps]})"
-                               if PS_TIMEOUT_MULT[next_ps] > 1 else "")
-                            + (" [Admin only]" if next_ps in (3, 4) else "")
+                            + (f" (timeout ×{_eff_mult}, prev_op=PS{self._prev_op_ps})"
+                               if next_ps in (3, 4) else
+                               (f" (timeout ×{_eff_mult})" if _eff_mult > 1 else ""))
                         )
                         self._pm_set_state(next_ps)
                         self._current_ps = next_ps
@@ -4647,8 +4652,8 @@ class NVMeFuzzer:
                         if cnt > 0 or enters > 0:
                             pct = 100 * cnt / total
                             mult = PS_TIMEOUT_MULT.get(ps, 1)
-                            note = f" [TO×{mult}]" if mult > 1 else \
-                                   (" [Admin only]" if ps in (3, 4) else "")
+                            note = (f" [TO×{mult}]" if mult > 1 else "") + \
+                                   (" [TO=prev_op_PS]" if ps in (3, 4) else "")
                             summary_lines.append(
                                 f"  PS{ps}: 실행 {cnt}회 ({pct:.1f}%), 진입 {enters}회{note}")
 
