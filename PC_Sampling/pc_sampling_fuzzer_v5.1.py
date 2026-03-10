@@ -6,14 +6,14 @@ J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
 v5.1 변경사항:
-- [Feature] PM Rotation: --pm 플래그로 매 100회 명령마다 Power State를 랜덤 전환.
-    PS0~PS4 중 random.randint(0,4) 선택 — 같은 PS 재진입 허용.
-    전환 시점: executions % 100 == 0 경계 ([Stats] 출력 직전).
-    PS3/PS4 상태: IO 명령을 Admin 명령으로 자동 대체 (non-operational 대응).
-    PS1: subprocess 감지 timeout ×16, PS2: ×32 적용.
-    _pm_set_state() 호출 시 소요 시간 로그 출력 (성능 진단용).
-    ps_enter_counts(PS별 진입 횟수) + ps_exec_counts(PS별 실행 횟수) 통계 추가.
-    종료 summary에 "실행 N회 (X%), 진입 N회" 형식으로 출력.
+- [Feature] PM injection: --pm 플래그로 NVMe 명령 전송 전
+    SetFeatures(PS1~PS4 진입) → SetFeatures(PS0 복귀) → NVMe 명령 + 샘플링 순서로 실행.
+    펌웨어의 PM wake-up 경로를 거친 후 명령을 처리하도록 유도.
+    PS1~PS4 모두 사용 — PS0 복귀 후 명령 실행이므로 Non-operational(PS3/PS4)도 허용.
+    PM 전환 구간도 J-Link 샘플링 병행 (start_sampling 중복 방지: is_alive() 가드).
+    _pm_set_state() → bool: rc를 로그에 표기 (→ OK / → FAIL(rc=N)).
+    pm_inject_ok/fail dict(PS별) 통계 추가, 종료 시 summary 출력.
+    PM_INJECT_PROB 상수로 확률 설정, --pm 플래그로 활성화.
 - [Tune] DIAGNOSE_STABILITY: 50 → 100, DIAGNOSE_MAX: 1000 → 5000
     idle PC 100개+ 환경(복잡한 RTOS, 주기 인터럽트)에서 최대 샘플 도달로
     idle 유니버스 수렴 미완료 발생 → 상한 확장으로 완전 수렴 보장.
@@ -188,6 +188,7 @@ from datetime import datetime
 from pathlib import Path
 from enum import Enum
 import contextlib
+import bisect
 
 # 버전
 FUZZER_VERSION = "5.1"
@@ -592,6 +593,7 @@ class JLinkPCSampler:
         self.interesting_inputs = 0
         self._last_raw_pcs: List[int] = []
         self._out_of_range_count = 0
+        self._last_new_pcs: set = set()   # evaluate_coverage()에서 노출 — 정적 분석 연동용
 
         # v4.2: idle PC — diagnose()에서 가장 빈도 높은 PC로 설정
         self.idle_pc: Optional[int] = None
@@ -1028,9 +1030,10 @@ class JLinkPCSampler:
         - corpus 크기가 펌웨어 실제 코드 크기에 자연스럽게 수렴
         - confirmation 없이도 신뢰 가능
         """
-        initial_pcs = len(self.global_coverage)
+        new_pc_set = self.current_trace - self.global_coverage
+        self._last_new_pcs = new_pc_set
         self.global_coverage.update(self.current_trace)
-        new_pcs = len(self.global_coverage) - initial_pcs
+        new_pcs = len(new_pc_set)
 
         is_interesting = new_pcs > 0
         return is_interesting, new_pcs
@@ -1119,6 +1122,18 @@ class NVMeFuzzer:
         # _ps_idx 제거 — 랜덤 전환으로 변경
         self.ps_exec_counts: dict[int, int] = {i: 0 for i in range(5)}  # PS별 실행 횟수
         self.ps_enter_counts: dict[int, int] = {i: 0 for i in range(5)} # PS별 진입 횟수
+
+        # v5.1: 정적 분석 연동 (Ghidra export — code_addrs.txt / functions.txt)
+        self._sa_loaded: bool = False
+        self._sa_code_addrs: Optional[frozenset] = None
+        self._sa_total_code: int = 0
+        self._sa_func_entries: Optional[list] = None  # sorted by entry, bisect용
+        self._sa_func_ends: Optional[list] = None
+        self._sa_func_names: Optional[list] = None
+        self._sa_total_funcs: int = 0
+        self._sa_covered_addrs: int = 0       # 커버된 알려진 명령어 주소 수
+        self._sa_entered_funcs: set = set()   # 진입한 함수 entry point 집합
+        self._load_static_analysis()
 
         self.cmd_stats: dict[str, dict] = defaultdict(lambda: {"exec": 0, "interesting": 0})
         for c in self.commands:
@@ -2538,6 +2553,87 @@ class NVMeFuzzer:
     RC_TIMEOUT   = -1001   # NVMe 타임아웃 (의미 있는 이벤트)
     RC_ERROR     = -1002   # subprocess 에러 (내부 문제)
 
+    def _load_static_analysis(self) -> None:
+        """같은 디렉토리의 code_addrs.txt / functions.txt 자동 탐지 후 로드.
+
+        파일이 없으면 아무것도 하지 않음 (기존 동작 유지).
+        Ghidra의 ghidra_export.py 스크립트로 생성한 파일을 기대함.
+        """
+        script_dir = Path(__file__).parent.resolve()
+        code_file = script_dir / 'code_addrs.txt'
+        func_file  = script_dir / 'functions.txt'
+
+        if not code_file.exists() and not func_file.exists():
+            return  # 파일 없음 — 로그 없이 조용히 넘어감
+
+        # --- code_addrs.txt ---
+        if code_file.exists():
+            addrs: set = set()
+            with open(code_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            addrs.add(int(line, 16))
+                        except ValueError:
+                            pass
+            self._sa_code_addrs = frozenset(addrs)
+            self._sa_total_code = len(self._sa_code_addrs)
+            # log은 run() 이후에야 설정되므로 print 사용
+            print(f"[StaticAnalysis] code_addrs.txt: {self._sa_total_code:,}개 명령어 주소")
+
+        # --- functions.txt ---
+        if func_file.exists():
+            entries: list = []
+            ends: list = []
+            names: list = []
+            with open(func_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split(None, 2)
+                    if len(parts) >= 2:
+                        try:
+                            entry = int(parts[0], 16)
+                            size  = int(parts[1])
+                            name  = parts[2].strip() if len(parts) > 2 else f"FUN_{entry:08x}"
+                            entries.append(entry)
+                            ends.append(entry + size)
+                            names.append(name)
+                        except ValueError:
+                            pass
+            sorted_tuples = sorted(zip(entries, ends, names))
+            if sorted_tuples:
+                self._sa_func_entries = [t[0] for t in sorted_tuples]
+                self._sa_func_ends    = [t[1] for t in sorted_tuples]
+                self._sa_func_names   = [t[2] for t in sorted_tuples]
+                self._sa_total_funcs  = len(self._sa_func_entries)
+                print(f"[StaticAnalysis] functions.txt: {self._sa_total_funcs:,}개 함수")
+
+        self._sa_loaded = self._sa_total_code > 0 or self._sa_total_funcs > 0
+
+    def _update_static_coverage(self, new_pcs: set) -> None:
+        """새로 발견된 PC 집합으로 정적 분석 커버리지를 증분 업데이트.
+
+        O(new_pcs × log(funcs)) — Stats 출력마다 재계산하지 않음.
+        """
+        if not new_pcs:
+            return
+
+        # 코드 주소 커버리지
+        if self._sa_code_addrs is not None:
+            for pc in new_pcs:
+                if pc in self._sa_code_addrs:
+                    self._sa_covered_addrs += 1
+
+        # 함수 커버리지 — bisect로 O(log N) 함수 탐색
+        if self._sa_func_entries is not None:
+            for pc in new_pcs:
+                idx = bisect.bisect_right(self._sa_func_entries, pc) - 1
+                if idx >= 0 and pc < self._sa_func_ends[idx]:
+                    self._sa_entered_funcs.add(self._sa_func_entries[idx])
+
     def _pm_set_state(self, ps: int) -> bool:
         """SetFeatures(FID=0x02) 전송 — PM 상태 진입/복귀용.
         반환값: True=성공(rc==0), False=실패(rc!=0 또는 예외).
@@ -3712,6 +3808,18 @@ class NVMeFuzzer:
                  f"exec/s(avg): {stats['exec_per_sec']:.1f} | "
                  f"exec/s(win): {window_eps:.1f}"
                  f"{ps_tag}")
+        if self._sa_loaded:
+            sa_parts = []
+            if self._sa_total_code > 0:
+                pct = 100.0 * self._sa_covered_addrs / self._sa_total_code
+                sa_parts.append(
+                    f"code: {pct:.1f}% ({self._sa_covered_addrs:,}/{self._sa_total_code:,})")
+            if self._sa_total_funcs > 0:
+                n_f = len(self._sa_entered_funcs)
+                fpct = 100.0 * n_f / self._sa_total_funcs
+                sa_parts.append(f"funcs: {n_f}/{self._sa_total_funcs} ({fpct:.1f}%)")
+            if sa_parts:
+                log.warning(f"[StatCov] {' | '.join(sa_parts)}")
 
     def run(self):
         global log
@@ -3744,6 +3852,15 @@ class NVMeFuzzer:
             log.warning(f"PM Rotate   : interval={PM_ROTATE_INTERVAL}cmds, "
                         f"mode=random(PS0~PS4), "
                         f"timeout_mult=PS1×{PS_TIMEOUT_MULT[1]} PS2×{PS_TIMEOUT_MULT[2]}")
+        if self._sa_loaded:
+            sa_info = []
+            if self._sa_total_code > 0:
+                sa_info.append(f"code_addrs={self._sa_total_code:,}")
+            if self._sa_total_funcs > 0:
+                sa_info.append(f"funcs={self._sa_total_funcs:,}")
+            log.warning(f"StaticAnalysis: {', '.join(sa_info)}")
+        else:
+            log.warning("StaticAnalysis: not loaded (code_addrs.txt / functions.txt 없음)")
         log.warning(f"Random gen  : {self.config.random_gen_ratio:.0%}")
         timeout_str = ", ".join(f"{k}={v}ms" for k, v in self.config.nvme_timeouts.items())
         log.warning(f"Timeouts    : subprocess={timeout_str}")
@@ -3974,6 +4091,10 @@ class NVMeFuzzer:
 
                 # v4.5+: PC 기반 커버리지 평가 (primary signal)
                 is_interesting, new_pcs = self.sampler.evaluate_coverage()
+
+                # v5.1: 정적 분석 커버리지 증분 업데이트
+                if self._sa_loaded and self.sampler._last_new_pcs:
+                    self._update_static_coverage(self.sampler._last_new_pcs)
 
                 # v4.3: 실제 실행 opcode 기준으로 분류하여 기록
                 self.cmd_pcs[track_key].update(self.sampler.current_trace)
@@ -4208,6 +4329,20 @@ class NVMeFuzzer:
                                    (" [Admin only]" if ps in (3, 4) else "")
                             summary_lines.append(
                                 f"  PS{ps}: 실행 {cnt}회 ({pct:.1f}%), 진입 {enters}회{note}")
+
+                # v5.1: 정적 분석 커버리지 요약
+                if self._sa_loaded:
+                    if self._sa_total_code > 0:
+                        pct = 100.0 * self._sa_covered_addrs / self._sa_total_code
+                        summary_lines.append(
+                            f"Code Coverage    : {pct:.2f}%"
+                            f" ({self._sa_covered_addrs:,} / {self._sa_total_code:,} instrs)")
+                    if self._sa_total_funcs > 0:
+                        n_f = len(self._sa_entered_funcs)
+                        fpct = 100.0 * n_f / self._sa_total_funcs
+                        summary_lines.append(
+                            f"Func Coverage    : {fpct:.2f}%"
+                            f" ({n_f} / {self._sa_total_funcs} functions)")
 
                 # v4.5: MOpt 통계
                 if self.config.mopt_enabled:
