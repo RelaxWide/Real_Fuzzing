@@ -3262,7 +3262,7 @@ class NVMeFuzzer:
                 f"--cdw13={entry['cdw13']:#x}",
                 f"--cdw14={entry['cdw14']:#x}",
                 f"--cdw15={entry['cdw15']:#x}",
-                "--timeout=30000",
+                "--timeout=3600000",  # 1시간: crash 시 blocking 유지 (커널 abort 방지), 분석 후 Ctrl+C
             ]
 
             if entry['is_write'] and entry['data']:
