@@ -6,14 +6,21 @@ J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
 v5.1 변경사항:
-- [Feature] PM injection: --pm 플래그로 NVMe 명령 전송 전
-    SetFeatures(PS1~PS4 진입) → SetFeatures(PS0 복귀) → NVMe 명령 + 샘플링 순서로 실행.
-    펌웨어의 PM wake-up 경로를 거친 후 명령을 처리하도록 유도.
-    PS1~PS4 모두 사용 — PS0 복귀 후 명령 실행이므로 Non-operational(PS3/PS4)도 허용.
-    PM 전환 구간도 J-Link 샘플링 병행 (start_sampling 중복 방지: is_alive() 가드).
-    _pm_set_state() → bool: rc를 로그에 표기 (→ OK / → FAIL(rc=N)).
-    pm_inject_ok/fail dict(PS별) 통계 추가, 종료 시 summary 출력.
-    PM_INJECT_PROB 상수로 확률 설정, --pm 플래그로 활성화.
+- [Feature] PM Rotation: --pm 플래그로 매 PM_ROTATE_INTERVAL(기본 100)회 명령마다
+    random.randint(0,4)로 PS0~PS4 중 랜덤 전환 (같은 PS 재진입 허용).
+    _pm_set_state() → bool: SetFeatures(FID=0x02, CDW11=ps) 전송, rc·소요시간 로그 출력.
+    [Stats] 출력과 동일 경계(executions % 100)에서 PS 전환.
+    PS별 실행 횟수 / 진입 횟수 통계 — 종료 summary에 출력.
+- [Feature] 정적 분석 커버리지 연동:
+    퍼저 동일 디렉토리에 code_addrs.txt / functions.txt(Ghidra ghidra_export.py 생성) 두면
+    자동 탐지 · 로드 (CLI 인자 불필요). 파일 없으면 기존 동작 유지.
+    evaluate_coverage() 호출 후 신규 PC만 증분 처리 (bisect O(log N), 성능 영향 최소).
+    [Stats] 출력 시 [StatCov] code: X.X% | funcs: N/M (Y.Y%) 행 추가.
+    종료 summary에 Code Coverage / Func Coverage 섹션 추가.
+- [Feature] 정적 분석 시각화 그래프 3종 (graphs/ 에 자동 생성):
+    coverage_growth.png  : code_cov% / funcs_cov% 성장 곡선 (100회마다 스냅샷)
+    firmware_map.png     : 펌웨어 함수 공간 전체 맵 (커버=초록 / 미커버=회색)
+    uncovered_funcs.png  : 미커버 함수 Top-30 크기 내림차순 막대 차트
 - [Tune] DIAGNOSE_STABILITY: 50 → 100, DIAGNOSE_MAX: 1000 → 5000
     idle PC 100개+ 환경(복잡한 RTOS, 주기 인터럽트)에서 최대 샘플 도달로
     idle 유니버스 수렴 미완료 발생 → 상한 확장으로 완전 수렴 보장.
@@ -34,6 +41,8 @@ v5.1 변경사항:
     _cmd_history(deque maxlen=100)에 NVMe 명령 + PM 동작을 순서대로 기록.
     crash 발생 시 crashes/replay_<tag>.sh 생성 — sudo bash replay_<tag>.sh 로 바로 실행.
     마지막 항목(CRASH CMD) 주석 표기, write 데이터는 replay_data_<tag>/data_NNN.bin 저장.
+    --input-file 절대경로 저장 (실행 위치 무관), stdout > /dev/null 으로 response buffer 억제,
+    명령어 CLI 전체 + rc=$? echo 출력, set +e 로 중간 실패 시에도 전체 시퀀스 실행.
 
 v5.0 변경사항:
 - [Feature] --interface auto/jtag/swd: J-Link 인터페이스 자동 탐지

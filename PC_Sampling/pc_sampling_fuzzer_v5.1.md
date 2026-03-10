@@ -3,7 +3,7 @@
 J-Link Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 `nvme-cli` subprocess를 통해 NVMe 명령어를 SSD에 전달하는 Coverage-Guided Fuzzer.
 
-v5.1에서는 **PM Rotation(`--pm`)**, **crash 재현 TC 자동 생성**, **UFAS 펌웨어 덤프** 등 crash 분석 지원 기능이 추가되었습니다.
+v5.1에서는 **PM Rotation(`--pm`)**, **정적 분석 커버리지 연동(Ghidra)**, **시각화 그래프 3종**, **crash 재현 TC 자동 생성**, **UFAS 펌웨어 덤프** 등이 추가되었습니다.
 
 ---
 
@@ -16,8 +16,9 @@ v5.1에서는 **PM Rotation(`--pm`)**, **crash 재현 TC 자동 생성**, **UFAS
 5. [명령어 목록](#명령어-목록)
 6. [출력 디렉터리 구조](#출력-디렉터리-구조)
 7. [크래시 발생 후 처리](#크래시-발생-후-처리)
-8. [seed_replay_test.sh](#seed_replay_testsh)
-9. [버전 이력 요약](#버전-이력-요약)
+8. [정적 분석 커버리지 연동](#정적-분석-커버리지-연동)
+9. [seed_replay_test.sh](#seed_replay_testsh)
+10. [버전 이력 요약](#버전-이력-요약)
 
 ---
 
@@ -293,9 +294,15 @@ output/pc_sampling_v5.1/
 │   └── replay_data_<tag>/
 │       ├── data_023.bin                    # write 명령의 실제 페이로드
 │       └── ...
-├── cfg/
-│   └── cfg_Read.dot
-└── heatmap_<timestamp>.png
+└── graphs/
+    ├── command_comparison.png              # 명령어별 PCs / Edges / Executions 비교
+    ├── <cmd>_cfg.dot / .png               # 명령어별 PC flow CFG
+    ├── edge_heatmap_2d.png                # 2D edge 히트맵
+    ├── coverage_growth.png                # code_cov% / funcs_cov% 성장 곡선 *
+    ├── firmware_map.png                   # 펌웨어 함수 공간 커버리지 맵 *
+    └── uncovered_funcs.png                # 미커버 함수 Top-30 막대 차트 *
+
+* code_addrs.txt / functions.txt 로드 시에만 생성
 ```
 
 ---
@@ -340,14 +347,28 @@ timeout crash 감지 시 다음 순서로 자동 처리됩니다:
 
 crash 발생 시 `crashes/replay_<tag>.sh`가 자동으로 생성됩니다.
 최근 100개 명령어(NVMe + PM 전환 포함)를 순서대로 재현합니다.
-마지막 항목(crash를 유발한 명령)은 `← CRASH CMD` 주석으로 표기됩니다.
+마지막 항목(crash를 유발한 명령)은 `<- CRASH CMD` 주석으로 표기됩니다.
 
 ```bash
-# 재현 실행
+# 재현 실행 (어느 디렉토리에서 실행해도 동작)
 sudo bash ./output/pc_sampling_v5.1/crashes/replay_<tag>.sh
 ```
 
-write 명령의 실제 페이로드는 `replay_data_<tag>/data_NNN.bin`으로 함께 저장됩니다.
+실행 시 각 명령어마다 다음 형식으로 출력됩니다:
+
+```
+>>> [005/47] Write
+    sudo nvme io-passthru /dev/nvme0n1 --opcode=0x1 --namespace-id=1 ... -w
+    rc=0
+>>> [006/47] SetFeatures  <- CRASH CMD
+    sudo nvme admin-passthru /dev/nvme0 --opcode=0x9 ...
+    rc=1
+Replay complete.
+```
+
+- response buffer(hex dump)는 `/dev/null`로 억제 — 터미널 출력 최소화
+- `set +e` 사용 — 중간에 rc≠0인 명령이 있어도 전체 시퀀스 끝까지 실행
+- write 명령의 실제 페이로드는 `replay_data_<tag>/data_NNN.bin`으로 함께 저장 (절대경로)
 
 ### UFAS 펌웨어 덤프
 
@@ -376,6 +397,65 @@ echo '0000:02:00.0' | sudo tee /sys/bus/pci/drivers/nvme/bind
 
 ---
 
+## 정적 분석 커버리지 연동
+
+Ghidra로 펌웨어 바이너리를 분석한 결과를 퍼저에 연동하면 **전체 코드 대비 커버리지 비율**과 **미탐색 함수 목록**을 실시간으로 확인할 수 있습니다.
+
+### 1단계: Ghidra 분석 파일 추출
+
+Ghidra에서 펌웨어 바이너리 Analyze 완료 후:
+
+```
+Ghidra → Window → Script Manager → ghidra_export.py → Run
+```
+
+`/tmp/ghidra_export/` 에 두 파일이 생성됩니다:
+
+| 파일 | 내용 |
+|------|------|
+| `code_addrs.txt` | 모든 명령어 주소 (`0xXXXXXXXX` 형식, 1줄 1주소) |
+| `functions.txt` | 함수 목록 (`entry size name` 형식) |
+
+### 2단계: 퍼저 디렉토리에 복사
+
+```bash
+cp /tmp/ghidra_export/code_addrs.txt /path/to/pc_sampling_fuzzer_v5.1.py의_디렉토리/
+cp /tmp/ghidra_export/functions.txt  /path/to/pc_sampling_fuzzer_v5.1.py의_디렉토리/
+```
+
+퍼저 실행 시 자동으로 탐지 · 로드됩니다. CLI 인자 불필요.
+
+### 3단계: 실행 시 출력 변화
+
+**시작 시**:
+```
+StaticAnalysis: code_addrs=220,000, funcs=1,521
+```
+
+**[Stats] 출력마다**:
+```
+[Stats] exec: 1,000 | pcs: 8,432 | ...
+[StatCov] code: 3.8% (8,432/220,000) | funcs: 187/1,521 (12.3%)
+```
+
+**종료 Summary**:
+```
+Code Coverage    : 3.84% (8,432 / 220,000 instrs)
+Func Coverage    : 12.29% (187 / 1,521 functions)
+```
+
+**종료 시 그래프 3종 자동 생성** (`graphs/`):
+
+| 파일 | 내용 |
+|------|------|
+| `coverage_growth.png` | 실행 횟수 대비 code_cov% / funcs_cov% 성장 곡선 |
+| `firmware_map.png` | 펌웨어 전체 함수 격자 맵 (초록=커버, 회색=미커버) |
+| `uncovered_funcs.png` | 미커버 함수 Top-30 크기 내림차순 막대 차트 |
+
+파일이 없으면 모든 정적 분석 기능이 비활성화되고 기존 동작만 수행합니다.
+
+---
+
 ## seed_replay_test.sh
 
 퍼저 초기 시드를 실제 NVMe 명령어로 실행해 동작을 검증하는 스크립트입니다.
@@ -390,7 +470,7 @@ sudo ./seed_replay_test.sh /dev/nvme0 [FW.bin] [fw_xfer_size] [fw_slot]
 
 | 버전 | 주요 변경 |
 |------|-----------|
-| **v5.1** | PM Rotation(`--pm`, 랜덤 PS0~4 전환, 매 100회), FAIL CMD 상세 출력, replay .sh 자동 생성, UFAS 덤프, idle_pcs addr_range 필터 제거, DIAGNOSE_STABILITY/MAX 확장 |
+| **v5.1** | PM Rotation(`--pm`, 랜덤 PS0~4 전환, 매 100회), 정적 분석 커버리지 연동(Ghidra), 시각화 그래프 3종(성장곡선·펌웨어맵·미커버함수), FAIL CMD 상세 출력, replay .sh 자동 생성(절대경로·echo·rc·set+e), UFAS 덤프, idle_pcs addr_range 필터 제거 |
 | **v5.0** | `diagnose()` halt 빈도 감소, `_wait_nvme_live()` 실제 응답 확인, `GoEx(0,0)` 전면 교체, SMART-DIAG 코드 정리 |
 | **v4.7** | FUA 비트 수정 (CDW12[14]→[29]), 컨트롤러 범위 명령 NSID=0, `--fw-bin/--fw-xfer/--fw-slot` 추가 |
 | **v4.6** | io-passthru → namespace device, passthru timeout 분리, 크래시 시 nvme 드라이버 unbind |
