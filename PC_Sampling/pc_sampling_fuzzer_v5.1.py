@@ -11,14 +11,18 @@ v5.1 변경사항:
     _pm_set_state() → bool: SetFeatures(FID=0x02, CDW11=ps) 전송, rc·소요시간 로그 출력.
     [Stats] 출력과 동일 경계(executions % 100)에서 PS 전환.
     PS별 실행 횟수 / 진입 횟수 통계 — 종료 summary에 출력.
-- [Feature] 정적 분석 커버리지 연동:
+    PS3/PS4: 명령 타입 필터 없음(IO 포함 모든 명령 허용).
+             timeout_mult는 진입 전 마지막 operational PS(0~2)인 _prev_op_ps 기준.
+- [Feature] 정적 분석 커버리지 연동 (Basic Block 기준):
     퍼저 동일 디렉토리에 basic_blocks.txt / functions.txt(Ghidra ghidra_export.py 생성) 두면
     자동 탐지 · 로드 (CLI 인자 불필요). 파일 없으면 기존 동작 유지.
-    BB 커버리지: bisect O(log N)으로 PC → BB 매핑, instruction 단위보다 정확한 실행 여부 판단.
-    [Stats] 출력 시 [StatCov] code: X.X% | funcs: N/M (Y.Y%) 행 추가.
-    종료 summary에 Code Coverage / Func Coverage 섹션 추가.
+    BB 커버리지: bisect O(log N)으로 샘플된 PC → BB(start/end) 탐색.
+    BB 내 어느 instruction이든 1회 샘플 = 해당 BB 전체 실행으로 판단
+    (instruction 단위 집계보다 샘플링 노이즈에 강인).
+    [Stats] 출력 시 [StatCov] BB: X.X% | funcs: N/M (Y.Y%) 행 추가.
+    종료 summary에 BB Coverage / Func Coverage 섹션 추가.
 - [Feature] 정적 분석 시각화 그래프 3종 (graphs/ 에 자동 생성):
-    coverage_growth.png  : code_cov% / funcs_cov% 성장 곡선 (100회마다 스냅샷)
+    coverage_growth.png  : BB_cov% / funcs_cov% 성장 곡선 (100회마다 스냅샷)
     firmware_map.png     : 펌웨어 함수 공간 전체 맵 (커버=초록 / 미커버=회색)
     uncovered_funcs.png  : 미커버 함수 Top-30 크기 내림차순 막대 차트
 - [Tune] DIAGNOSE_STABILITY: 50 → 100, DIAGNOSE_MAX: 1000 → 5000
@@ -43,6 +47,8 @@ v5.1 변경사항:
     마지막 항목(CRASH CMD) 주석 표기, write 데이터는 replay_data_<tag>/data_NNN.bin 저장.
     --input-file 절대경로 저장 (실행 위치 무관), stdout > /dev/null 으로 response buffer 억제,
     명령어 CLI 전체 + rc=$? echo 출력, set +e 로 중간 실패 시에도 전체 시퀀스 실행.
+    nvme-cli --timeout=3600000(1시간): crash 발생 명령에서 blocking 유지 → crash state 보존.
+    스크립트 헤더에서 nvme_core.admin_timeout/io_timeout을 30일로 설정 → 커널 abort/reset 방지.
 
 v5.0 변경사항:
 - [Feature] --interface auto/jtag/swd: J-Link 인터페이스 자동 탐지
