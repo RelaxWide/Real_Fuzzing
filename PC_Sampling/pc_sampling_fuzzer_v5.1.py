@@ -1142,6 +1142,8 @@ class NVMeFuzzer:
         self._sa_total_funcs: int = 0
         self._sa_covered_addrs: int = 0       # 커버된 알려진 명령어 주소 수
         self._sa_entered_funcs: set = set()   # 진입한 함수 entry point 집합
+        self._sa_thumb_mask: bool = False     # True면 PC & ~1 로 비교 (Thumb bit 자동 보정)
+        self._sa_diag_done: bool = False      # 첫 update 진단 출력 완료 여부
         # 성장 곡선 이력: [(executions, elapsed_s, code_pct, funcs_pct), ...]
         self._sa_cov_history: list = []
         self._load_static_analysis()
@@ -2624,6 +2626,17 @@ class NVMeFuzzer:
 
         self._sa_loaded = self._sa_total_code > 0 or self._sa_total_funcs > 0
 
+        # 로드된 주소 범위 출력 — J-Link 샘플 범위와 비교용
+        if self._sa_code_addrs:
+            _mn = min(self._sa_code_addrs)
+            _mx = max(self._sa_code_addrs)
+            print(f"[StaticAnalysis] code 주소 범위: 0x{_mn:08x} ~ 0x{_mx:08x}")
+        if self._sa_func_entries:
+            print(f"[StaticAnalysis] 함수 주소 범위: "
+                  f"0x{self._sa_func_entries[0]:08x} ~ 0x{self._sa_func_entries[-1]:08x}")
+
+        self._sa_diag_done = False   # 첫 update 시 1회만 진단 로그 출력
+
     def _update_static_coverage(self, new_pcs: set) -> None:
         """새로 발견된 PC 집합으로 정적 분석 커버리지를 증분 업데이트.
 
@@ -2632,17 +2645,49 @@ class NVMeFuzzer:
         if not new_pcs:
             return
 
+        # 첫 호출 시 1회 진단: 실제 PC 샘플과 static 주소의 매칭 여부 확인
+        if not self._sa_diag_done:
+            self._sa_diag_done = True
+            sample = sorted(new_pcs)[:10]
+            if self._sa_code_addrs:
+                matched = [pc for pc in sample if pc in self._sa_code_addrs]
+                # Thumb bit(bit0) 마스킹 시 매칭 여부도 확인
+                matched_thumb = [pc for pc in sample if (pc & ~1) in self._sa_code_addrs]
+                log.warning(
+                    f"[StatDiag] 첫 new_pcs 샘플(최대10개): "
+                    f"{[hex(p) for p in sample]}")
+                log.warning(
+                    f"[StatDiag] code_addrs 직접 매칭: {len(matched)}/{len(sample)}개  "
+                    f"| Thumb bit(bit0) 마스킹 후 매칭: {len(matched_thumb)}/{len(sample)}개")
+                if len(matched) == 0 and len(matched_thumb) > 0:
+                    log.warning(
+                        "[StatDiag] *** Thumb bit 불일치 감지! "
+                        "J-Link PC의 bit0이 set된 것으로 보임 → 자동 마스킹 적용 ***")
+                    self._sa_thumb_mask = True
+                elif len(matched) == 0 and len(matched_thumb) == 0:
+                    if self._sa_code_addrs:
+                        _sa_min = min(self._sa_code_addrs)
+                        _sa_max = max(self._sa_code_addrs)
+                        _pc_min = min(new_pcs)
+                        _pc_max = max(new_pcs)
+                        log.warning(
+                            f"[StatDiag] *** 주소 범위 불일치! "
+                            f"PC 범위: 0x{_pc_min:08x}~0x{_pc_max:08x}  "
+                            f"code_addrs 범위: 0x{_sa_min:08x}~0x{_sa_max:08x} ***")
+
         # 코드 주소 커버리지
         if self._sa_code_addrs is not None:
             for pc in new_pcs:
-                if pc in self._sa_code_addrs:
+                pc_key = (pc & ~1) if getattr(self, '_sa_thumb_mask', False) else pc
+                if pc_key in self._sa_code_addrs:
                     self._sa_covered_addrs += 1
 
         # 함수 커버리지 — bisect로 O(log N) 함수 탐색
         if self._sa_func_entries is not None:
             for pc in new_pcs:
-                idx = bisect.bisect_right(self._sa_func_entries, pc) - 1
-                if idx >= 0 and pc < self._sa_func_ends[idx]:
+                pc_key = (pc & ~1) if getattr(self, '_sa_thumb_mask', False) else pc
+                idx = bisect.bisect_right(self._sa_func_entries, pc_key) - 1
+                if idx >= 0 and pc_key < self._sa_func_ends[idx]:
                     self._sa_entered_funcs.add(self._sa_func_entries[idx])
 
     def _pm_set_state(self, ps: int) -> bool:
