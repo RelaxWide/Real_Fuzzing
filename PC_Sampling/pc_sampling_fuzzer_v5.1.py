@@ -3109,9 +3109,11 @@ class NVMeFuzzer:
             log.warning("[REPLAY] 히스토리 없음 — replay .sh 생성 건너뜀")
             return
 
-        sh_path = crash_dir / f"replay_{tag}.sh"
+        sh_path  = crash_dir / f"replay_{tag}.sh"
         data_dir = crash_dir / f"replay_data_{tag}"
         data_dir.mkdir(exist_ok=True)
+        # 절대경로로 변환 — 스크립트를 어느 디렉토리에서 실행해도 경로가 깨지지 않음
+        data_dir_abs = data_dir.resolve()
 
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         lines = [
@@ -3132,7 +3134,9 @@ class NVMeFuzzer:
             label = entry['label']
             is_last = (i == len(history))
             marker = "  ← CRASH CMD" if is_last else ""
-            lines.append(f"# [{i:03d}/{len(history)}] {label}{marker}")
+            step_str = f"[{i:03d}/{len(history)}] {label}{marker}"
+            lines.append(f"# {step_str}")
+            lines.append(f'echo ">>> {step_str}"')
 
             cmd_parts = [
                 "nvme", entry['passthru_type'], entry['device'],
@@ -3150,10 +3154,11 @@ class NVMeFuzzer:
             ]
 
             if entry['is_write'] and entry['data']:
-                data_file = data_dir / f"data_{i:03d}.bin"
-                data_file.write_bytes(entry['data'])
+                # 절대경로로 data bin 파일 저장 — 스크립트 실행 위치 무관
+                data_file_abs = data_dir_abs / f"data_{i:03d}.bin"
+                data_file_abs.write_bytes(entry['data'])
                 cmd_parts += [f"--data-len={entry['data_len']}",
-                               f"--input-file={data_file}", "-w"]
+                               f"--input-file={data_file_abs}", "-w"]
             elif entry['data_len'] > 0:
                 cmd_parts += [f"--data-len={entry['data_len']}", "-r"]
 
