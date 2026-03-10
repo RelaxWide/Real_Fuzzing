@@ -12,9 +12,9 @@ v5.1 변경사항:
     [Stats] 출력과 동일 경계(executions % 100)에서 PS 전환.
     PS별 실행 횟수 / 진입 횟수 통계 — 종료 summary에 출력.
 - [Feature] 정적 분석 커버리지 연동:
-    퍼저 동일 디렉토리에 code_addrs.txt / functions.txt(Ghidra ghidra_export.py 생성) 두면
+    퍼저 동일 디렉토리에 basic_blocks.txt / functions.txt(Ghidra ghidra_export.py 생성) 두면
     자동 탐지 · 로드 (CLI 인자 불필요). 파일 없으면 기존 동작 유지.
-    evaluate_coverage() 호출 후 신규 PC만 증분 처리 (bisect O(log N), 성능 영향 최소).
+    BB 커버리지: bisect O(log N)으로 PC → BB 매핑, instruction 단위보다 정확한 실행 여부 판단.
     [Stats] 출력 시 [StatCov] code: X.X% | funcs: N/M (Y.Y%) 행 추가.
     종료 summary에 Code Coverage / Func Coverage 섹션 추가.
 - [Feature] 정적 분석 시각화 그래프 3종 (graphs/ 에 자동 생성):
@@ -1133,19 +1133,20 @@ class NVMeFuzzer:
         self.ps_exec_counts: dict[int, int] = {i: 0 for i in range(5)}  # PS별 실행 횟수
         self.ps_enter_counts: dict[int, int] = {i: 0 for i in range(5)} # PS별 진입 횟수
 
-        # v5.1: 정적 분석 연동 (Ghidra export — code_addrs.txt / functions.txt)
+        # v5.1: 정적 분석 연동 (Ghidra export — basic_blocks.txt / functions.txt)
         self._sa_loaded: bool = False
-        self._sa_code_addrs: Optional[frozenset] = None
-        self._sa_total_code: int = 0
+        self._sa_bb_starts: Optional[list] = None  # sorted BB start addrs (bisect용)
+        self._sa_bb_ends: Optional[list] = None    # parallel BB end addrs (exclusive)
+        self._sa_total_bbs: int = 0
+        self._sa_covered_bbs: set = set()          # 커버된 BB start addr 집합
         self._sa_func_entries: Optional[list] = None  # sorted by entry, bisect용
         self._sa_func_ends: Optional[list] = None
         self._sa_func_names: Optional[list] = None
         self._sa_total_funcs: int = 0
-        self._sa_covered_addrs: int = 0       # 커버된 알려진 명령어 주소 수
         self._sa_entered_funcs: set = set()   # 진입한 함수 entry point 집합
         self._sa_thumb_mask: bool = False     # True면 PC & ~1 로 비교 (Thumb bit 자동 보정)
         self._sa_diag_done: bool = False      # 첫 update 진단 출력 완료 여부
-        # 성장 곡선 이력: [(executions, elapsed_s, code_pct, funcs_pct), ...]
+        # 성장 곡선 이력: [(executions, elapsed_s, bb_pct, funcs_pct), ...]
         self._sa_cov_history: list = []
         self._load_static_analysis()
 
@@ -2568,33 +2569,42 @@ class NVMeFuzzer:
     RC_ERROR     = -1002   # subprocess 에러 (내부 문제)
 
     def _load_static_analysis(self) -> None:
-        """같은 디렉토리의 code_addrs.txt / functions.txt 자동 탐지 후 로드.
+        """같은 디렉토리의 basic_blocks.txt / functions.txt 자동 탐지 후 로드.
 
         파일이 없으면 아무것도 하지 않음 (기존 동작 유지).
         Ghidra의 ghidra_export.py 스크립트로 생성한 파일을 기대함.
         """
         script_dir = Path(__file__).parent.resolve()
-        code_file = script_dir / 'code_addrs.txt'
-        func_file  = script_dir / 'functions.txt'
+        bb_file   = script_dir / 'basic_blocks.txt'
+        func_file = script_dir / 'functions.txt'
 
-        if not code_file.exists() and not func_file.exists():
+        if not bb_file.exists() and not func_file.exists():
             return  # 파일 없음 — 로그 없이 조용히 넘어감
 
-        # --- code_addrs.txt ---
-        if code_file.exists():
-            addrs: set = set()
-            with open(code_file, 'r') as f:
+        # --- basic_blocks.txt ---
+        # format: 0xSTART 0xEND  (END is exclusive)
+        if bb_file.exists():
+            starts: list = []
+            ends_bb: list = []
+            with open(bb_file, 'r') as f:
                 for line in f:
                     line = line.strip()
-                    if line:
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 2:
                         try:
-                            addrs.add(int(line, 16))
+                            starts.append(int(parts[0], 16))
+                            ends_bb.append(int(parts[1], 16))
                         except ValueError:
                             pass
-            self._sa_code_addrs = frozenset(addrs)
-            self._sa_total_code = len(self._sa_code_addrs)
-            # log은 run() 이후에야 설정되므로 print 사용
-            print(f"[StaticAnalysis] code_addrs.txt: {self._sa_total_code:,}개 명령어 주소")
+            sorted_pairs = sorted(zip(starts, ends_bb))
+            if sorted_pairs:
+                self._sa_bb_starts = [p[0] for p in sorted_pairs]
+                self._sa_bb_ends   = [p[1] for p in sorted_pairs]
+                self._sa_total_bbs = len(self._sa_bb_starts)
+                print(f"[StaticAnalysis] basic_blocks.txt: {self._sa_total_bbs:,}개 BB "
+                      f"(0x{self._sa_bb_starts[0]:08x} ~ 0x{self._sa_bb_ends[-1]:08x})")
 
         # --- functions.txt ---
         if func_file.exists():
@@ -2625,13 +2635,8 @@ class NVMeFuzzer:
                 self._sa_total_funcs  = len(self._sa_func_entries)
                 print(f"[StaticAnalysis] functions.txt: {self._sa_total_funcs:,}개 함수")
 
-        self._sa_loaded = self._sa_total_code > 0 or self._sa_total_funcs > 0
+        self._sa_loaded = self._sa_total_bbs > 0 or self._sa_total_funcs > 0
 
-        # 로드된 주소 범위 출력 — J-Link 샘플 범위와 비교용
-        if self._sa_code_addrs:
-            _mn = min(self._sa_code_addrs)
-            _mx = max(self._sa_code_addrs)
-            print(f"[StaticAnalysis] code 주소 범위: 0x{_mn:08x} ~ 0x{_mx:08x}")
         if self._sa_func_entries:
             print(f"[StaticAnalysis] 함수 주소 범위: "
                   f"0x{self._sa_func_entries[0]:08x} ~ 0x{self._sa_func_entries[-1]:08x}")
@@ -2641,24 +2646,28 @@ class NVMeFuzzer:
     def _update_static_coverage(self, new_pcs: set) -> None:
         """새로 발견된 PC 집합으로 정적 분석 커버리지를 증분 업데이트.
 
-        O(new_pcs × log(funcs)) — Stats 출력마다 재계산하지 않음.
+        BB 커버리지: bisect로 PC가 속한 BB를 O(log N)에 탐색.
+        함수 커버리지: bisect로 O(log N) 함수 탐색.
         """
         if not new_pcs:
             return
 
-        # 첫 호출 시 1회 진단: 실제 PC 샘플과 static 주소의 매칭 여부 확인
+        # 첫 호출 시 1회 진단: PC 샘플과 BB 범위의 매칭 여부 + Thumb bit 자동 감지
         if not self._sa_diag_done:
             self._sa_diag_done = True
             sample = sorted(new_pcs)[:10]
-            if self._sa_code_addrs:
-                matched = [pc for pc in sample if pc in self._sa_code_addrs]
-                # Thumb bit(bit0) 마스킹 시 매칭 여부도 확인
-                matched_thumb = [pc for pc in sample if (pc & ~1) in self._sa_code_addrs]
+            if self._sa_bb_starts:
+                def _pc_in_bb(pc):
+                    idx = bisect.bisect_right(self._sa_bb_starts, pc) - 1
+                    return idx >= 0 and pc < self._sa_bb_ends[idx]
+
+                matched       = [pc for pc in sample if _pc_in_bb(pc)]
+                matched_thumb = [pc for pc in sample if _pc_in_bb(pc & ~1)]
                 log.warning(
                     f"[StatDiag] 첫 new_pcs 샘플(최대10개): "
                     f"{[hex(p) for p in sample]}")
                 log.warning(
-                    f"[StatDiag] code_addrs 직접 매칭: {len(matched)}/{len(sample)}개  "
+                    f"[StatDiag] BB 직접 매칭: {len(matched)}/{len(sample)}개  "
                     f"| Thumb bit(bit0) 마스킹 후 매칭: {len(matched_thumb)}/{len(sample)}개")
                 if len(matched) == 0 and len(matched_thumb) > 0:
                     log.warning(
@@ -2666,27 +2675,27 @@ class NVMeFuzzer:
                         "J-Link PC의 bit0이 set된 것으로 보임 → 자동 마스킹 적용 ***")
                     self._sa_thumb_mask = True
                 elif len(matched) == 0 and len(matched_thumb) == 0:
-                    if self._sa_code_addrs:
-                        _sa_min = min(self._sa_code_addrs)
-                        _sa_max = max(self._sa_code_addrs)
-                        _pc_min = min(new_pcs)
-                        _pc_max = max(new_pcs)
-                        log.warning(
-                            f"[StatDiag] *** 주소 범위 불일치! "
-                            f"PC 범위: 0x{_pc_min:08x}~0x{_pc_max:08x}  "
-                            f"code_addrs 범위: 0x{_sa_min:08x}~0x{_sa_max:08x} ***")
+                    _pc_min = min(new_pcs)
+                    _pc_max = max(new_pcs)
+                    log.warning(
+                        f"[StatDiag] *** 주소 범위 불일치! "
+                        f"PC 범위: 0x{_pc_min:08x}~0x{_pc_max:08x}  "
+                        f"BB 범위: 0x{self._sa_bb_starts[0]:08x}~0x{self._sa_bb_ends[-1]:08x} ***")
 
-        # 코드 주소 커버리지
-        if self._sa_code_addrs is not None:
+        mask = self._sa_thumb_mask
+
+        # BB 커버리지 — bisect로 PC가 속한 BB 탐색
+        if self._sa_bb_starts is not None:
             for pc in new_pcs:
-                pc_key = (pc & ~1) if getattr(self, '_sa_thumb_mask', False) else pc
-                if pc_key in self._sa_code_addrs:
-                    self._sa_covered_addrs += 1
+                pc_key = (pc & ~1) if mask else pc
+                idx = bisect.bisect_right(self._sa_bb_starts, pc_key) - 1
+                if idx >= 0 and pc_key < self._sa_bb_ends[idx]:
+                    self._sa_covered_bbs.add(self._sa_bb_starts[idx])
 
         # 함수 커버리지 — bisect로 O(log N) 함수 탐색
         if self._sa_func_entries is not None:
             for pc in new_pcs:
-                pc_key = (pc & ~1) if getattr(self, '_sa_thumb_mask', False) else pc
+                pc_key = (pc & ~1) if mask else pc
                 idx = bisect.bisect_right(self._sa_func_entries, pc_key) - 1
                 if idx >= 0 and pc_key < self._sa_func_ends[idx]:
                     self._sa_entered_funcs.add(self._sa_func_entries[idx])
@@ -3747,9 +3756,9 @@ class NVMeFuzzer:
             f_pcts = [h[3] for h in self._sa_cov_history]
 
             fig, ax = plt.subplots(figsize=(10, 5))
-            if self._sa_total_code > 0:
+            if self._sa_total_bbs > 0:
                 ax.plot(execs, c_pcts, color='steelblue', linewidth=1.5,
-                        label=f'Code ({self._sa_total_code:,} instrs)')
+                        label=f'Basic Blocks ({self._sa_total_bbs:,})')
             if self._sa_total_funcs > 0:
                 ax.plot(execs, f_pcts, color='coral', linewidth=1.5,
                         label=f'Functions ({self._sa_total_funcs:,})')
@@ -4120,12 +4129,12 @@ class NVMeFuzzer:
                  f"{ps_tag}")
         if self._sa_loaded:
             sa_parts = []
-            if self._sa_total_code > 0:
-                pct = 100.0 * self._sa_covered_addrs / self._sa_total_code
-                sa_parts.append(
-                    f"code: {pct:.1f}% ({self._sa_covered_addrs:,}/{self._sa_total_code:,})")
+            if self._sa_total_bbs > 0:
+                n_bb = len(self._sa_covered_bbs)
+                pct  = 100.0 * n_bb / self._sa_total_bbs
+                sa_parts.append(f"BB: {pct:.1f}% ({n_bb:,}/{self._sa_total_bbs:,})")
             if self._sa_total_funcs > 0:
-                n_f = len(self._sa_entered_funcs)
+                n_f  = len(self._sa_entered_funcs)
                 fpct = 100.0 * n_f / self._sa_total_funcs
                 sa_parts.append(f"funcs: {n_f}/{self._sa_total_funcs} ({fpct:.1f}%)")
             if sa_parts:
@@ -4165,13 +4174,13 @@ class NVMeFuzzer:
                         f"PS3/PS4=prev_op_PS 기준, IO 필터 없음")
         if self._sa_loaded:
             sa_info = []
-            if self._sa_total_code > 0:
-                sa_info.append(f"code_addrs={self._sa_total_code:,}")
+            if self._sa_total_bbs > 0:
+                sa_info.append(f"basic_blocks={self._sa_total_bbs:,}")
             if self._sa_total_funcs > 0:
                 sa_info.append(f"funcs={self._sa_total_funcs:,}")
             log.warning(f"StaticAnalysis: {', '.join(sa_info)}")
         else:
-            log.warning("StaticAnalysis: not loaded (code_addrs.txt / functions.txt 없음)")
+            log.warning("StaticAnalysis: not loaded (basic_blocks.txt / functions.txt 없음)")
         log.warning(f"Random gen  : {self.config.random_gen_ratio:.0%}")
         timeout_str = ", ".join(f"{k}={v}ms" for k, v in self.config.nvme_timeouts.items())
         log.warning(f"Timeouts    : subprocess={timeout_str}")
@@ -4525,12 +4534,12 @@ class NVMeFuzzer:
                     if self._sa_loaded:
                         _elapsed_snap = (datetime.now() - self.start_time).total_seconds() \
                                         if self.start_time else 0
-                        _cpct = (100.0 * self._sa_covered_addrs / self._sa_total_code
-                                 if self._sa_total_code > 0 else 0.0)
-                        _fpct = (100.0 * len(self._sa_entered_funcs) / self._sa_total_funcs
-                                 if self._sa_total_funcs > 0 else 0.0)
+                        _bbpct = (100.0 * len(self._sa_covered_bbs) / self._sa_total_bbs
+                                  if self._sa_total_bbs > 0 else 0.0)
+                        _fpct  = (100.0 * len(self._sa_entered_funcs) / self._sa_total_funcs
+                                  if self._sa_total_funcs > 0 else 0.0)
                         self._sa_cov_history.append(
-                            (self.executions, _elapsed_snap, _cpct, _fpct))
+                            (self.executions, _elapsed_snap, _bbpct, _fpct))
 
                     stats = self._collect_stats()
                     self._print_status(stats, last_samples,
@@ -4659,13 +4668,14 @@ class NVMeFuzzer:
 
                 # v5.1: 정적 분석 커버리지 요약
                 if self._sa_loaded:
-                    if self._sa_total_code > 0:
-                        pct = 100.0 * self._sa_covered_addrs / self._sa_total_code
+                    if self._sa_total_bbs > 0:
+                        n_bb = len(self._sa_covered_bbs)
+                        pct  = 100.0 * n_bb / self._sa_total_bbs
                         summary_lines.append(
-                            f"Code Coverage    : {pct:.2f}%"
-                            f" ({self._sa_covered_addrs:,} / {self._sa_total_code:,} instrs)")
+                            f"BB Coverage      : {pct:.2f}%"
+                            f" ({n_bb:,} / {self._sa_total_bbs:,} basic blocks)")
                     if self._sa_total_funcs > 0:
-                        n_f = len(self._sa_entered_funcs)
+                        n_f  = len(self._sa_entered_funcs)
                         fpct = 100.0 * n_f / self._sa_total_funcs
                         summary_lines.append(
                             f"Func Coverage    : {fpct:.2f}%"
