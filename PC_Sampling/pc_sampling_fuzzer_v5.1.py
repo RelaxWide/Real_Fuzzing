@@ -3206,6 +3206,8 @@ class NVMeFuzzer:
         data_dir_abs = data_dir.resolve()
 
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # nvme_core 모듈 타임아웃 — 퍼저와 동일한 값
+        _kt_sec = self.config.nvme_kernel_timeout_sec
         lines = [
             "#!/bin/bash",
             f"# Auto-generated replay script — {len(history)} commands before crash",
@@ -3218,6 +3220,26 @@ class NVMeFuzzer:
             "#",
             # set -e 대신 set +e — rc를 직접 캡처하기 위해 오류 즉시 종료 비활성화
             "set +e",
+            "",
+            "# ── nvme_core 커널 timeout 설정 ─────────────────────────────────────",
+            "# crash 발생 후 커널이 abort/reset_controller 를 수행하지 않도록",
+            "# admin_timeout / io_timeout 을 큰 값으로 설정한다.",
+            "# (기본값: admin=60s / io=30s → crash 후 60초면 커널이 상태 소멸)",
+            f"_NVME_KT={_kt_sec}",
+            "_set_kernel_timeout() {",
+            "    for _p in /sys/module/nvme_core/parameters/admin_timeout \\",
+            "               /sys/module/nvme_core/parameters/io_timeout; do",
+            "        [ -f \"$_p\" ] || continue",
+            "        _old=$(cat \"$_p\" 2>/dev/null)",
+            "        echo \"$1\" > \"$_p\" 2>/dev/null \\",
+            "            && echo \"  [TimeoutCfg] $_p : ${_old}s -> $1 s\" \\",
+            "            || echo \"  [TimeoutCfg] $_p 설정 실패 (root 필요)\"",
+            "    done",
+            "}",
+            "echo '>>> [SETUP] nvme_core kernel timeout 설정 (crash 상태 보존)'",
+            "_set_kernel_timeout ${_NVME_KT}",
+            "",
+            "# ────────────────────────────────────────────────────────────────────",
             "",
         ]
 
@@ -3240,7 +3262,9 @@ class NVMeFuzzer:
                 f"--cdw13={entry['cdw13']:#x}",
                 f"--cdw14={entry['cdw14']:#x}",
                 f"--cdw15={entry['cdw15']:#x}",
-                "--timeout=30000",
+                # nvme-cli passthru timeout: 퍼저와 동일한 30일(ms) 설정
+                # → nvme-cli 레벨 timeout이 먼저 터져 커널 복구 전에 명령이 끝나는 것을 방지
+                f"--timeout={NVME_PASSTHRU_TIMEOUT_MS}",
             ]
 
             if entry['is_write'] and entry['data']:
