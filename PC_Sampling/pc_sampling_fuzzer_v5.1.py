@@ -4433,7 +4433,15 @@ class NVMeFuzzer:
                         self.mopt_uses[op] += 1
 
                 if self.executions % 100 == 0:
-                    # v5.1: PM 로테이션 — Stats 출력과 동일 지점에서 PS 전환
+                    # exec/s(win) 계산을 PM 전환 전에 먼저 수행:
+                    # PM 전환 시간(wake-up latency 등)이 직전 100개 명령의 속도를
+                    # 왜곡하지 않도록, 명령 실행이 끝난 시점 기준으로 계산.
+                    _now = datetime.now()
+                    _wdt = (_now - self._window_t0).total_seconds()
+                    _wexec = self.executions - self._window_exec0
+                    _window_eps = _wexec / _wdt if _wdt > 0 else 0
+
+                    # v5.1: PM 로테이션 — exec/s 계산 후 PS 전환
                     if self.config.pm_inject_prob > 0:
                         next_ps = random.randint(0, 4)
                         log.warning(
@@ -4445,6 +4453,10 @@ class NVMeFuzzer:
                         self._pm_set_state(next_ps)
                         self._current_ps = next_ps
                         self.ps_enter_counts[next_ps] += 1
+
+                    # 윈도우 리셋은 PM 전환 완료 후 — 전환 시간이 다음 윈도우에도 포함되지 않음
+                    self._window_t0 = datetime.now()
+                    self._window_exec0 = self.executions
 
                     # v5.1: 정적 분석 성장 곡선 스냅샷
                     if self._sa_loaded:
@@ -4458,13 +4470,6 @@ class NVMeFuzzer:
                             (self.executions, _elapsed_snap, _cpct, _fpct))
 
                     stats = self._collect_stats()
-                    # 구간별 exec/s 계산 (마지막 100개 기준)
-                    _now = datetime.now()
-                    _wdt = (_now - self._window_t0).total_seconds()
-                    _wexec = self.executions - self._window_exec0
-                    _window_eps = _wexec / _wdt if _wdt > 0 else 0
-                    self._window_t0 = _now
-                    self._window_exec0 = self.executions
                     self._print_status(stats, last_samples,
                                        window_eps=_window_eps)
                     # OS 버퍼까지 강제 flush (파일 핸들러만)
