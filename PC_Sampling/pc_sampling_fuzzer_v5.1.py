@@ -3262,9 +3262,7 @@ class NVMeFuzzer:
                 f"--cdw13={entry['cdw13']:#x}",
                 f"--cdw14={entry['cdw14']:#x}",
                 f"--cdw15={entry['cdw15']:#x}",
-                # nvme-cli passthru timeout: 퍼저와 동일한 30일(ms) 설정
-                # → nvme-cli 레벨 timeout이 먼저 터져 커널 복구 전에 명령이 끝나는 것을 방지
-                f"--timeout={NVME_PASSTHRU_TIMEOUT_MS}",
+                "--timeout=30000",
             ]
 
             if entry['is_write'] and entry['data']:
