@@ -3085,7 +3085,7 @@ class NVMeFuzzer:
         명령: sudo ./ufas <pcie_bus> 1 <YYYYMMDD>_UFAS_Dump.bin --ini=./SnapShot/A815.ini
         Popen으로 PID 추적, timeout 후 D-state 대비 포기 처리.
         """
-        TIMEOUT = 120
+        TIMEOUT = 600   # 10분 — 펌웨어 덤프는 수 분 소요됨
 
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         ufas_path = os.path.join(script_dir, 'ufas')
@@ -3116,41 +3116,77 @@ class NVMeFuzzer:
             proc = subprocess.Popen(
                 cmd, cwd=script_dir,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,  # sudo 패스워드 프롬프트 방지
             )
         except Exception as e:
             log.warning(f"[UFAS] Popen 실패: {e}")
             return
 
         log.warning(f"[UFAS] 프로세스 시작 PID={proc.pid} — 최대 {TIMEOUT}초 대기")
-        try:
-            stdout, stderr = proc.communicate(timeout=TIMEOUT)
-            rc = proc.returncode
-            out = stdout.decode(errors='replace').strip()
-            err = stderr.decode(errors='replace').strip()
-            if out:
-                log.warning(f"[UFAS] stdout:\n{out}")
-            if err:
-                log.warning(f"[UFAS] stderr:\n{err}")
-            if rc == 0:
-                log.warning(f"[UFAS] 덤프 완료 (rc=0) → {dump_path}")
+
+        # communicate()는 블로킹이라 진행 상황을 알 수 없으므로
+        # 30초마다 파일 크기를 확인해 진행 중임을 표시
+        import threading
+
+        _result: dict = {}
+
+        def _communicate():
+            try:
+                out, err = proc.communicate()
+                _result['stdout'] = out
+                _result['stderr'] = err
+                _result['rc'] = proc.returncode
+            except Exception as ex:
+                _result['error'] = ex
+
+        t = threading.Thread(target=_communicate, daemon=True)
+        t.start()
+
+        POLL_INTERVAL = 30
+        waited = 0
+        while waited < TIMEOUT:
+            t.join(timeout=POLL_INTERVAL)
+            if not t.is_alive():
+                break
+            waited += POLL_INTERVAL
+            # 덤프 파일이 생성 중이면 크기 확인
+            if os.path.exists(dump_path):
+                fsize = os.path.getsize(dump_path)
+                log.warning(f"[UFAS] 진행 중... {waited}s 경과, "
+                             f"덤프 파일 크기: {fsize:,} bytes")
             else:
-                log.warning(f"[UFAS] 덤프 실패 (rc={rc})")
-        except subprocess.TimeoutExpired:
+                log.warning(f"[UFAS] 진행 중... {waited}s 경과 (덤프 파일 미생성)")
+
+        if t.is_alive():
+            # timeout 초과
             log.warning(f"[UFAS] {TIMEOUT}초 timeout — SIGKILL 전송 (PID={proc.pid})")
             try:
                 proc.kill()
             except Exception as e:
                 log.warning(f"[UFAS] kill 실패: {e}")
-            # D-state 프로세스는 kill 후에도 종료 안 될 수 있음 — 3초만 추가 대기
-            try:
-                proc.communicate(timeout=3)
-                log.warning("[UFAS] kill 후 프로세스 종료 확인")
-            except subprocess.TimeoutExpired:
+            t.join(timeout=5)
+            if t.is_alive():
                 log.warning("[UFAS] kill 후에도 프로세스 미종료 — D-state 의심, 포기")
-            except Exception as e:
-                log.warning(f"[UFAS] kill 후 communicate 오류: {e}")
-        except Exception as e:
-            log.warning(f"[UFAS] communicate 오류: {e}")
+            else:
+                log.warning("[UFAS] kill 후 프로세스 종료 확인")
+            return
+
+        # 정상 완료
+        if 'error' in _result:
+            log.warning(f"[UFAS] communicate 오류: {_result['error']}")
+            return
+
+        rc = _result.get('rc', -1)
+        out = _result.get('stdout', b'').decode(errors='replace').strip()
+        err = _result.get('stderr', b'').decode(errors='replace').strip()
+        if out:
+            log.warning(f"[UFAS] stdout:\n{out}")
+        if err:
+            log.warning(f"[UFAS] stderr:\n{err}")
+        if rc == 0:
+            log.warning(f"[UFAS] 덤프 완료 (rc=0) → {dump_path}")
+        else:
+            log.warning(f"[UFAS] 덤프 실패 (rc={rc})")
 
     def _generate_replay_sh(self, crash_dir: Path, tag: str) -> None:
         """crash 발생 직전 최대 100개 명령어(PM 포함)를 재현 가능한 .sh 파일로 저장.
