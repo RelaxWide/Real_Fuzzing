@@ -3253,6 +3253,71 @@ class NVMeFuzzer:
         ok &= self._pm_set_state(0)
         return ok
 
+    def _pm_verify_combo(self, combo: PowerCombo) -> dict:
+        """현재 PM 상태를 다중 방법으로 검증하여 dict로 반환.
+
+        검증 항목:
+          pmu       : python3 pmu4_1.py 3 (getcurrent) 원시 출력값
+          d_state   : setpci PMCSR bits[1:0] 실제값 vs 기대값
+          l_state   : setpci LNKCTL bits[1:0] ASPM 실제값 vs 기대값
+          l1ss      : setpci L1SSCTL1 bits[3:0] 실제값 (L1SS cap 있을 때)
+          sysfs_d   : /sys/bus/pci/devices/<BDF>/power_state 커널 뷰
+        """
+        res = {}
+
+        # 1. PMU getcurrent
+        try:
+            r = subprocess.run(
+                ['python3', 'pmu4_1.py', '3'],
+                capture_output=True, text=True, timeout=3)
+            raw = r.stdout.strip()
+            res['pmu'] = raw if r.returncode == 0 else f"FAIL(rc={r.returncode}) {r.stderr.strip()}"
+        except Exception as e:
+            res['pmu'] = f"ERR({e})"
+
+        # 2. PMCSR readback — D-state bits[1:0]
+        if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
+            v = self._setpci_read(self._pcie_bdf, self._pcie_pm_cap_offset + 0x04, 'w')
+            if v is not None:
+                dval  = v & 0x3
+                dname = {0: 'D0', 1: 'D1', 2: 'D2', 3: 'D3hot'}.get(dval, 'D?')
+                exp   = 3 if combo.pcie_d == PCIeDState.D3 else 0
+                chk   = 'OK' if dval == exp else f'MISMATCH(exp={exp})'
+                res['d_state'] = f"{dname}(raw={dval:#04x}) {chk}"
+            else:
+                res['d_state'] = 'read_fail'
+
+        # 3. LNKCTL readback — ASPM bits[1:0]
+        if self._pcie_bdf and self._pcie_cap_offset is not None:
+            v = self._setpci_read(self._pcie_bdf, self._pcie_cap_offset + 0x10, 'w')
+            if v is not None:
+                aspm  = v & 0x3
+                aname = {0: 'L0/disabled', 1: 'L0s', 2: 'L1', 3: 'L0s+L1'}.get(aspm, '?')
+                exp   = 0 if combo.pcie_l == PCIeLState.L0 else 2
+                chk   = 'OK' if aspm == exp else f'MISMATCH(exp={exp})'
+                res['l_state'] = f"ASPM={aname}(raw={aspm:#04x}) {chk}"
+            else:
+                res['l_state'] = 'read_fail'
+
+        # 4. L1SSCTL1 readback — enable bits[3:0] (cap 있을 때만)
+        if self._pcie_bdf and self._pcie_l1ss_offset is not None:
+            v = self._setpci_read(self._pcie_bdf, self._pcie_l1ss_offset + 0x08, 'l')
+            if v is not None:
+                l1ss_en = v & 0xF
+                exp_en  = 0xF if combo.pcie_l == PCIeLState.L1_2 else 0x0
+                chk     = 'OK' if l1ss_en == exp_en else f'MISMATCH(exp={exp_en:#03x})'
+                res['l1ss'] = f"L1SS_EN={l1ss_en:#03x} {chk}"
+
+        # 5. sysfs power_state (커널 D-state 뷰)
+        if self._pcie_bdf:
+            try:
+                ps_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/power_state"
+                res['sysfs_d'] = Path(ps_path).read_text().strip()
+            except Exception:
+                res['sysfs_d'] = 'N/A'
+
+        return res
+
     def _pm_preflight_check(self) -> bool:
         """퍼징 시작 전 전체 PowerCombo(30개) 사전 동작 검증.
         idle 유니버스 수집(diagnose) 직전에 호출됨.
@@ -3306,7 +3371,24 @@ class NVMeFuzzer:
                 settle += D3_EXTRA
             time.sleep(settle)
 
-            # 3. PS0+L0+D0 복귀
+            # 3. PM 상태 다중 검증 (진입 직후, 복귀 전)
+            #    - PMU getcurrent (pmu4_1.py 3)
+            #    - setpci PMCSR / LNKCTL / L1SSCTL1 readback
+            #    - sysfs power_state
+            verify = {}
+            if ok_set:
+                verify = self._pm_verify_combo(combo)
+                log.warning(f"    [verify] PMU      : {verify.get('pmu', 'N/A')}")
+                if 'd_state' in verify:
+                    log.warning(f"    [verify] D-state  : {verify['d_state']}")
+                if 'l_state' in verify:
+                    log.warning(f"    [verify] L-state  : {verify['l_state']}")
+                if 'l1ss' in verify:
+                    log.warning(f"    [verify] L1SS     : {verify['l1ss']}")
+                if 'sysfs_d' in verify:
+                    log.warning(f"    [verify] sysfs    : {verify['sysfs_d']}")
+
+            # 4. PS0+L0+D0 복귀
             #    D3 포함 combo: D0 먼저(setpci) → Trst → L0 → PS0 순서 필수.
             #    D3hot 상태에서 NVMe 커맨드를 먼저 보내면 hang 발생.
             ok_restore = True
@@ -3320,7 +3402,7 @@ class NVMeFuzzer:
                 log.warning(f"    → baseline 복귀 예외: {e}")
                 ok_restore = False
 
-            # 4. NVMe 생존 확인 — 복귀 완료 후 probe (D3 중에는 응답 불가)
+            # 5. NVMe 생존 확인 — 복귀 완료 후 probe (D3 중에는 응답 불가)
             ok_nvme = False
             try:
                 r = subprocess.run(
