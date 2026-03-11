@@ -1202,6 +1202,7 @@ class NVMeFuzzer:
         self._pcie_root_cap_offset: Optional[int]  = None  # 루트 포트 PCIe Express cap
         self._pcie_root_l1ss_offset: Optional[int] = None  # 루트 포트 L1SS cap
         self._orig_aspm_policy: str                = 'default'  # 원본 ASPM 정책 복원용
+        self._orig_apst_cdw11: Optional[int]       = None       # 원본 APST CDW11 (복원용)
 
         # v5.2: 현재 / 이전 operational PowerCombo
         self._current_combo: PowerCombo  = POWER_COMBOS[0]   # PS0+L0+D0
@@ -3271,6 +3272,61 @@ class NVMeFuzzer:
                 'pcie_root_l1ss_offset': self._pcie_root_l1ss_offset,
             })
 
+    def _apst_disable(self) -> None:
+        """NVMe APST(Autonomous Power State Transition) 비활성화.
+
+        APST 활성화 상태에서는 NVMe 컨트롤러가 자율적으로 PS 전환을 하면서
+        PCIe 트래픽을 발생시켜 L1/L1.2 idle window를 깨뜨림.
+        퍼징 시작 전 비활성화하여 PM 상태가 fuzzer 제어 하에만 전환되도록 함.
+        """
+        dev = self.config.nvme_device
+        # 현재 APST CDW11 값 저장
+        try:
+            r = subprocess.run(
+                ['nvme', 'get-feature', dev, '-f', '0x0C'],
+                capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if 'value:' in line.lower() or 'Current value' in line:
+                    import re as _re
+                    m = _re.search(r'0x([0-9a-fA-F]+)', line)
+                    if m:
+                        self._orig_apst_cdw11 = int(m.group(1), 16)
+                        break
+        except Exception as e:
+            log.warning(f"[APST] get-feature 실패: {e}")
+
+        # APST 비활성화 (APSTE=0)
+        if self._orig_apst_cdw11 == 0:
+            log.warning("[APST] 이미 비활성화 상태 — skip")
+            return
+        try:
+            r = subprocess.run(
+                ['nvme', 'set-feature', dev, '-f', '0x0C', '-v', '0'],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                log.warning(f"[APST] 비활성화 완료 (원본 CDW11={self._orig_apst_cdw11:#010x})")
+            else:
+                log.warning(f"[APST] 비활성화 실패 (rc={r.returncode}): {r.stderr.strip()}")
+        except Exception as e:
+            log.warning(f"[APST] set-feature 실패: {e}")
+
+    def _apst_restore(self) -> None:
+        """퍼징 종료 시 원본 APST 상태 복원."""
+        if self._orig_apst_cdw11 is None or self._orig_apst_cdw11 == 0:
+            return  # 원래 비활성화 상태였으면 복원 불필요
+        dev = self.config.nvme_device
+        try:
+            r = subprocess.run(
+                ['nvme', 'set-feature', dev, '-f', '0x0C',
+                 '-v', str(self._orig_apst_cdw11)],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                log.warning(f"[APST] 복원 완료 (CDW11={self._orig_apst_cdw11:#010x})")
+            else:
+                log.warning(f"[APST] 복원 실패 (rc={r.returncode}): {r.stderr.strip()}")
+        except Exception as e:
+            log.warning(f"[APST] 복원 실패: {e}")
+
     def _pm_d3_safe_restore(self) -> bool:
         """D3hot / L1.2+D3 상태에서 안전하게 PS0+L0+D0 으로 복귀.
 
@@ -5204,6 +5260,11 @@ class NVMeFuzzer:
             log.error("J-Link connection failed, aborting")
             return
 
+        # APST 비활성화 — APST 활성화 시 NVMe 컨트롤러 자율 PS 전환으로
+        # PCIe 트래픽 발생 → L1/L1.2 idle window 방해. PM 퍼징 여부와 무관하게
+        # 항상 비활성화하여 PM 상태가 fuzzer 제어 하에만 전환되도록 함.
+        self._apst_disable()
+
         # PM preflight: idle 유니버스 수집 전에 전체 PowerCombo 검증.
         # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
         self._pm_preflight_check()
@@ -5745,7 +5806,8 @@ class NVMeFuzzer:
                     self.sampler.close()
                 except Exception:
                     pass
-                # timeout crash가 아닌 정상 종료 시에만 타임아웃 복원
+                # timeout crash가 아닌 정상 종료 시에만 타임아웃/APST 복원
+                self._apst_restore()
                 self._restore_nvme_timeouts()
 
             # 정리 완료 — SIGINT 핸들러 복원
