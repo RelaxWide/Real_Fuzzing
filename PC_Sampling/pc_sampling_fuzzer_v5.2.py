@@ -2973,11 +2973,30 @@ class NVMeFuzzer:
         except Exception:
             self._orig_aspm_policy = 'default'
 
+        # ── 루트 포트 LNKCAP ASPMS 읽기 ─────────────────────────────
+        rp_lnkcap = None
+        if self._pcie_root_bdf and self._pcie_root_cap_offset is not None:
+            rp_lnkcap = self._setpci_read(
+                self._pcie_root_bdf, self._pcie_root_cap_offset + 0x0C)
+
+        # ── 커널 ASPM 활성화 여부 확인 ───────────────────────────────
+        aspm_disabled = False
+        try:
+            cmdline = Path('/proc/cmdline').read_text()
+            if 'pcie_aspm=off' in cmdline or 'pcie_aspm=force_disable' in cmdline:
+                aspm_disabled = True
+                log.warning("[PCIe] !!! 커널 cmdline에 pcie_aspm=off 감지 — "
+                            "LNKCTL 쓰기가 커널에 의해 override될 수 있음 !!!")
+        except Exception:
+            pass
+
         # ── 로그 ────────────────────────────────────────────────────
-        aspms = None if self._pcie_lnkcap is None else (self._pcie_lnkcap >> 10) & 0x3
-        cpm   = None if self._pcie_lnkcap is None else (self._pcie_lnkcap >> 18) & 0x1
+        aspms    = None if self._pcie_lnkcap is None else (self._pcie_lnkcap >> 10) & 0x3
+        cpm      = None if self._pcie_lnkcap is None else (self._pcie_lnkcap >> 18) & 0x1
+        rp_aspms = None if rp_lnkcap is None else (rp_lnkcap >> 10) & 0x3
         l1ss_cap_str = (f'{self._pcie_l1ss_cap:#010x}'
                         if self._pcie_l1ss_cap is not None else 'None')
+
         log.warning(
             f"[PCIe] EP={self._pcie_bdf}  "
             f"EXP={self._pcie_cap_offset!r}  PM={self._pcie_pm_cap_offset!r}  "
@@ -2987,7 +3006,21 @@ class NVMeFuzzer:
             f"[PCIe] RP={self._pcie_root_bdf}  "
             f"RP_EXP={self._pcie_root_cap_offset!r}  "
             f"RP_L1SS={self._pcie_root_l1ss_offset!r}  "
-            f"ASPM_policy_orig={self._orig_aspm_policy!r}")
+            f"RP_ASPMS={rp_aspms!r}  "
+            f"ASPM_policy_orig={self._orig_aspm_policy!r}  "
+            f"aspm_disabled={aspm_disabled}")
+
+        # ── ASPM 진입 가능 여부 최종 판단 ────────────────────────────
+        if self._pcie_root_bdf is None:
+            log.warning("[PCIe] !!! RP BDF 미탐지 — L1/L1.2 진입 불가 (EP만 ASPMC 세팅됨) !!!")
+        elif self._pcie_root_cap_offset is None:
+            log.warning("[PCIe] !!! RP PCIe cap offset 없음 — RP LNKCTL 세팅 불가 !!!")
+        elif aspms is not None and not (aspms & 0x2):
+            log.warning(f"[PCIe] !!! EP LNKCAP ASPMS={aspms:#04x} — L1 미지원 !!!")
+        elif rp_aspms is not None and not (rp_aspms & 0x2):
+            log.warning(f"[PCIe] !!! RP LNKCAP ASPMS={rp_aspms:#04x} — RP L1 미지원 !!!")
+        else:
+            log.warning("[PCIe] L1 진입 조건 충족 (EP/RP 양측 L1 지원 확인)")
 
     # ── L-state (ASPM) ───────────────────────────────────────────────
 
