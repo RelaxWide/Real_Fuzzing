@@ -3257,7 +3257,7 @@ class NVMeFuzzer:
         """현재 PM 상태를 다중 방법으로 검증하여 dict로 반환.
 
         검증 항목:
-          pmu       : python3 pmu4_1.py 3 (getcurrent) 원시 출력값
+          pmu       : python3 pmu4_1.py 3 1 (getcurrent) 원시 출력값
           d_state   : setpci PMCSR bits[1:0] 실제값 vs 기대값
           l_state   : setpci LNKCTL bits[1:0] ASPM 실제값 vs 기대값
           l1ss      : setpci L1SSCTL1 bits[3:0] 실제값 (L1SS cap 있을 때)
@@ -3268,7 +3268,7 @@ class NVMeFuzzer:
         # 1. PMU getcurrent
         try:
             r = subprocess.run(
-                ['python3', 'pmu4_1.py', '3'],
+                ['python3', 'pmu4_1.py', '3', '1'],
                 capture_output=True, text=True, timeout=3)
             raw = r.stdout.strip()
             res['pmu'] = raw if r.returncode == 0 else f"FAIL(rc={r.returncode}) {r.stderr.strip()}"
@@ -3372,7 +3372,7 @@ class NVMeFuzzer:
             time.sleep(settle)
 
             # 3. PM 상태 다중 검증 (진입 직후, 복귀 전)
-            #    - PMU getcurrent (pmu4_1.py 3)
+            #    - PMU getcurrent (pmu4_1.py 3 1)
             #    - setpci PMCSR / LNKCTL / L1SSCTL1 readback
             #    - sysfs power_state
             verify = {}
