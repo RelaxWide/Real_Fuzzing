@@ -3230,14 +3230,40 @@ class NVMeFuzzer:
                 'pcie_root_l1ss_offset': self._pcie_root_l1ss_offset,
             })
 
+    def _pm_d3_safe_restore(self) -> bool:
+        """D3hot 상태에서 안전하게 PS0+L0+D0 으로 복귀.
+
+        D3hot 에서는 NVMe 컨트롤러 코어가 꺼져 있어 NVMe 커맨드(SetFeatures)를
+        먼저 보내면 hang 발생. 복귀 순서:
+          1. setpci PMCSR=D0  (config space는 D3hot에서도 접근 가능)
+          2. 10ms Trst 대기   (PCI spec §5.3.1.4 최소 대기)
+          3. setpci LNKCTL=L0 (PCIe L-state 해제)
+          4. NVMe SetFeatures PS0  (D0 복귀 후 NVMe 커맨드 가능)
+        """
+        ok = True
+        # Step 1: D3 → D0 (setpci, config space 접근)
+        if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
+            ok &= self._set_pcie_d_state(PCIeDState.D0)
+        # Step 2: Trst
+        time.sleep(0.01)
+        # Step 3: L-state → L0
+        if self._pcie_bdf and self._pcie_cap_offset is not None:
+            self._set_pcie_l_state(PCIeLState.L0)
+        # Step 4: NVMe PS0
+        ok &= self._pm_set_state(0)
+        return ok
+
     def _pm_preflight_check(self) -> bool:
         """퍼징 시작 전 전체 PowerCombo(30개) 사전 동작 검증.
+        idle 유니버스 수집(diagnose) 직전에 호출됨.
 
         각 조합에 대해:
           1. _set_power_combo() 로 상태 진입
           2. 정착 대기 (L1.2/D3는 추가 대기)
-          3. nvme id-ctrl 로 NVMe 생존 확인
-          4. PS0+L0+D0 (baseline) 으로 복귀
+          3. PS0+L0+D0 (baseline) 으로 복귀
+             - D3 포함 combo: _pm_d3_safe_restore() 사용 (D0 먼저, NVMe 나중)
+             - D0 combo    : _set_power_combo(baseline) 사용
+          4. 복귀 후 nvme id-ctrl 로 NVMe 생존 확인
         결과 요약 테이블 출력.
         실패 조합이 있어도 fuzzing 계속 (경고만 출력).
         """
@@ -3256,7 +3282,7 @@ class NVMeFuzzer:
                     f"({len(POWER_COMBOS)}개 조합)")
         log.warning("=" * 60)
 
-        # (combo, ok_set, ok_nvme, ok_restore, elapsed)
+        # (combo, ok_set, ok_restore, ok_nvme, elapsed)
         results: list = []
         failed_labels: list = []
 
@@ -3280,7 +3306,21 @@ class NVMeFuzzer:
                 settle += D3_EXTRA
             time.sleep(settle)
 
-            # 3. NVMe 생존 확인 (nvme id-ctrl)
+            # 3. PS0+L0+D0 복귀
+            #    D3 포함 combo: D0 먼저(setpci) → Trst → L0 → PS0 순서 필수.
+            #    D3hot 상태에서 NVMe 커맨드를 먼저 보내면 hang 발생.
+            ok_restore = True
+            try:
+                if combo.pcie_d == PCIeDState.D3:
+                    ok_restore = self._pm_d3_safe_restore()
+                else:
+                    self._set_power_combo(baseline)
+                time.sleep(BASE_SETTLE)
+            except Exception as e:
+                log.warning(f"    → baseline 복귀 예외: {e}")
+                ok_restore = False
+
+            # 4. NVMe 생존 확인 — 복귀 완료 후 probe (D3 중에는 응답 불가)
             ok_nvme = False
             try:
                 r = subprocess.run(
@@ -3291,30 +3331,21 @@ class NVMeFuzzer:
             except Exception as e:
                 log.warning(f"    → nvme id-ctrl 예외: {e}")
 
-            # 4. PS0+L0+D0 복귀
-            ok_restore = True
-            try:
-                self._set_power_combo(baseline)
-                time.sleep(BASE_SETTLE)
-            except Exception as e:
-                log.warning(f"    → baseline 복귀 예외: {e}")
-                ok_restore = False
-
             elapsed = time.monotonic() - t0
-            results.append((combo, ok_set, ok_nvme, ok_restore, elapsed))
+            results.append((combo, ok_set, ok_restore, ok_nvme, elapsed))
 
-            ok_all = ok_set and ok_nvme and ok_restore
+            ok_all = ok_set and ok_restore and ok_nvme
             mark   = "OK  " if ok_all else "FAIL"
             log.warning(f"    → SET={'OK' if ok_set else 'FAIL'} "
-                        f"NVMe={'OK' if ok_nvme else 'FAIL'} "
                         f"RESTORE={'OK' if ok_restore else 'FAIL'} "
+                        f"NVMe={'OK' if ok_nvme else 'FAIL'} "
                         f"[{mark}]  ({elapsed:.2f}s)")
             if not ok_all:
                 failed_labels.append(combo.label)
 
         # 최종 baseline 복귀 보장
         try:
-            self._set_power_combo(baseline)
+            self._pm_d3_safe_restore()
             time.sleep(BASE_SETTLE)
         except Exception:
             pass
@@ -3322,15 +3353,15 @@ class NVMeFuzzer:
         # ── 요약 테이블 ──
         log.warning("=" * 60)
         log.warning("[PM-Preflight] 결과 요약")
-        log.warning(f"  {'Combo':<20} {'SET':>5} {'NVMe':>6} {'RESTORE':>8} {'Time':>7}  ")
+        log.warning(f"  {'Combo':<20} {'SET':>5} {'RESTORE':>8} {'NVMe':>6} {'Time':>7}  ")
         log.warning("  " + "-" * 50)
-        for combo, ok_set, ok_nvme, ok_restore, elapsed in results:
-            mark = "✓" if (ok_set and ok_nvme and ok_restore) else "✗"
+        for combo, ok_set, ok_restore, ok_nvme, elapsed in results:
+            mark = "✓" if (ok_set and ok_restore and ok_nvme) else "✗"
             log.warning(
                 f"  {combo.label:<20} "
                 f"{'OK' if ok_set else 'FAIL':>5} "
-                f"{'OK' if ok_nvme else 'FAIL':>6} "
                 f"{'OK' if ok_restore else 'FAIL':>8} "
+                f"{'OK' if ok_nvme else 'FAIL':>6} "
                 f"{elapsed:>6.2f}s  {mark}")
         log.warning("  " + "-" * 50)
         passed = len(results) - len(failed_labels)
@@ -4961,6 +4992,10 @@ class NVMeFuzzer:
             log.error("J-Link connection failed, aborting")
             return
 
+        # PM preflight: idle 유니버스 수집 전에 전체 PowerCombo 검증.
+        # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
+        self._pm_preflight_check()
+
         # J-Link PC 읽기 진단 + idle PC 감지
         if not self.sampler.diagnose():
             log.error("J-Link PC read diagnosis failed, aborting")
@@ -4971,10 +5006,6 @@ class NVMeFuzzer:
             log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
         else:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
-
-        # PM preflight: idle 유니버스 수집 직후, Calibration 직전에 전체 PowerCombo 검증.
-        # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
-        self._pm_preflight_check()
 
         # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
         # _log_smart() 이후에 설정: 이전에 실행하면 admin_timeout=30일 상태에서
