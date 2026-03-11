@@ -3021,7 +3021,7 @@ class NVMeFuzzer:
             # [PMU] CLKREQ# Assert — 클록 복원 먼저, 링크 L0 재진입 후 레지스터 해제
             #   L1.2 상태에서는 클록이 없으므로 setpci(config space write) 전에 반드시 수행.
             #   클록 안정화(T_COMMON_MODE) 대기 후 레지스터 조작.
-            subprocess.run(['python3', 'pmu4_1.py', '16', '1', '3300'],
+            subprocess.run(['python3', 'pmu_4_1.py', '16', '1', '3300'],
                            timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.001)
 
@@ -3177,7 +3177,7 @@ class NVMeFuzzer:
 
             # [PMU] CLKREQ# Deassert — 레지스터 설정·검증 완료 후 마지막 수행
             #   루트 포트가 CLKREQ# 비활성 감지 → 레퍼런스 클록 제거 → 실제 L1.2 진입.
-            subprocess.run(['python3', 'pmu4_1.py', '15', '1', '3300'],
+            subprocess.run(['python3', 'pmu_4_1.py', '15', '1', '3300'],
                            timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             return ok
@@ -3257,7 +3257,7 @@ class NVMeFuzzer:
         """현재 PM 상태를 다중 방법으로 검증하여 dict로 반환.
 
         검증 항목:
-          pmu       : python3 pmu4_1.py 3 1 (getcurrent) 원시 출력값
+          pmu       : python3 pmu_4_1.py 3 1 (getcurrent) 원시 출력값
           d_state   : setpci PMCSR bits[1:0] 실제값 vs 기대값
           l_state   : setpci LNKCTL bits[1:0] ASPM 실제값 vs 기대값
           l1ss      : setpci L1SSCTL1 bits[3:0] 실제값 (L1SS cap 있을 때)
@@ -3268,7 +3268,7 @@ class NVMeFuzzer:
         # 1. PMU getcurrent
         try:
             r = subprocess.run(
-                ['python3', 'pmu4_1.py', '3', '1'],
+                ['python3', 'pmu_4_1.py', '3', '1'],
                 capture_output=True, text=True, timeout=3)
             raw = r.stdout.strip()
             res['pmu'] = raw if r.returncode == 0 else f"FAIL(rc={r.returncode}) {r.stderr.strip()}"
@@ -3372,7 +3372,7 @@ class NVMeFuzzer:
             time.sleep(settle)
 
             # 3. PM 상태 다중 검증 (진입 직후, 복귀 전)
-            #    - PMU getcurrent (pmu4_1.py 3 1)
+            #    - PMU getcurrent (pmu_4_1.py 3 1)
             #    - setpci PMCSR / LNKCTL / L1SSCTL1 readback
             #    - sysfs power_state
             verify = {}
