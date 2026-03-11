@@ -359,8 +359,8 @@ D3_TIMEOUT_MULT = 4   # D3hot wake-up 추가 timeout 배수
 
 # PCIe L1 진입 settle 시간
 # LNKCTL 쓴 뒤 link idle → L1 idle timer 만료 → PM_Request_Ack DLLP 핸드셰이크 완료까지
-L1_SETTLE     = 20.0  # L1: idle timer + handshake 대기 (초) — 진입 확인용 확장
-L1_2_SETTLE   = 5.0   # L1.2 추가 대기: CLKREQ# 제거 + clock off (초, L1_SETTLE 이후 추가)
+L1_SETTLE     = 5.0   # L1: idle timer + handshake 대기 (초)
+L1_2_SETTLE   = 2.0   # L1.2 추가 대기: CLKREQ# 제거 + clock off (초, L1_SETTLE 이후 추가)
 
 # PMU 스크립트 절대경로 — subprocess CWD와 무관하게 항상 올바른 파일 사용
 _PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.py')
@@ -1203,6 +1203,7 @@ class NVMeFuzzer:
         self._pcie_root_l1ss_offset: Optional[int] = None  # 루트 포트 L1SS cap
         self._orig_aspm_policy: str                = 'default'  # 원본 ASPM 정책 복원용
         self._orig_apst_cdw11: Optional[int]       = None       # 원본 APST CDW11 (복원용)
+        self._orig_keepalive_val: int              = 0          # 원본 Keep-Alive Timer (복원용)
 
         # v5.2: 현재 / 이전 operational PowerCombo
         self._current_combo: PowerCombo  = POWER_COMBOS[0]   # PS0+L0+D0
@@ -3327,6 +3328,64 @@ class NVMeFuzzer:
         except Exception as e:
             log.warning(f"[APST] 복원 실패: {e}")
 
+    def _keepalive_disable(self) -> None:
+        """NVMe Keep-Alive Timer 비활성화.
+
+        Keep-Alive 활성화 시 드라이버가 주기적으로 NVMe admin command를 전송,
+        PS3/PS4 deep sleep에서 컨트롤러를 wake-up시켜 PCIe 트래픽 발생.
+        L1/L1.2 idle window를 깨뜨리므로 퍼징 전 비활성화.
+        """
+        dev = self.config.nvme_device
+        # 현재 Keep-Alive 값 저장
+        try:
+            r = subprocess.run(
+                ['nvme', 'get-feature', dev, '-f', '0x0F'],
+                capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if 'value:' in line.lower() or 'Current value' in line:
+                    import re as _re
+                    m = _re.search(r'0x([0-9a-fA-F]+)', line)
+                    if m:
+                        self._orig_keepalive_val = int(m.group(1), 16)
+                        break
+        except Exception as e:
+            log.warning(f"[KeepAlive] get-feature 실패: {e}")
+
+        if self._orig_keepalive_val == 0:
+            log.warning("[KeepAlive] 이미 비활성화 상태 — skip")
+            return
+        try:
+            r = subprocess.run(
+                ['nvme', 'set-feature', dev, '-f', '0x0F', '-v', '0'],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                log.warning(f"[KeepAlive] 비활성화 완료 "
+                            f"(원본={self._orig_keepalive_val:#010x})")
+            else:
+                log.warning(f"[KeepAlive] 비활성화 실패 (rc={r.returncode}): "
+                            f"{r.stderr.strip()}")
+        except Exception as e:
+            log.warning(f"[KeepAlive] set-feature 실패: {e}")
+
+    def _keepalive_restore(self) -> None:
+        """퍼징 종료 시 원본 Keep-Alive 상태 복원."""
+        if self._orig_keepalive_val == 0:
+            return
+        dev = self.config.nvme_device
+        try:
+            r = subprocess.run(
+                ['nvme', 'set-feature', dev, '-f', '0x0F',
+                 '-v', str(self._orig_keepalive_val)],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                log.warning(f"[KeepAlive] 복원 완료 "
+                            f"(val={self._orig_keepalive_val:#010x})")
+            else:
+                log.warning(f"[KeepAlive] 복원 실패 (rc={r.returncode}): "
+                            f"{r.stderr.strip()}")
+        except Exception as e:
+            log.warning(f"[KeepAlive] 복원 실패: {e}")
+
     def _pm_d3_safe_restore(self) -> bool:
         """D3hot / L1.2+D3 상태에서 안전하게 PS0+L0+D0 으로 복귀.
 
@@ -5260,10 +5319,11 @@ class NVMeFuzzer:
             log.error("J-Link connection failed, aborting")
             return
 
-        # APST 비활성화 — APST 활성화 시 NVMe 컨트롤러 자율 PS 전환으로
-        # PCIe 트래픽 발생 → L1/L1.2 idle window 방해. PM 퍼징 여부와 무관하게
-        # 항상 비활성화하여 PM 상태가 fuzzer 제어 하에만 전환되도록 함.
+        # APST / Keep-Alive 비활성화 — NVMe 컨트롤러 자율 트래픽 제거
+        # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
+        # Keep-Alive: 주기적 admin cmd → PS3/PS4 wake-up → L1 진입 불가
         self._apst_disable()
+        self._keepalive_disable()
 
         # PM preflight: idle 유니버스 수집 전에 전체 PowerCombo 검증.
         # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
@@ -5808,6 +5868,7 @@ class NVMeFuzzer:
                     pass
                 # timeout crash가 아닌 정상 종료 시에만 타임아웃/APST 복원
                 self._apst_restore()
+                self._keepalive_restore()
                 self._restore_nvme_timeouts()
 
             # 정리 완료 — SIGINT 핸들러 복원
