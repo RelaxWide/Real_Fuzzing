@@ -3272,24 +3272,24 @@ class NVMeFuzzer:
             })
 
     def _pm_d3_safe_restore(self) -> bool:
-        """D3hot 상태에서 안전하게 PS0+L0+D0 으로 복귀.
+        """D3hot / L1.2+D3 상태에서 안전하게 PS0+L0+D0 으로 복귀.
 
-        D3hot 에서는 NVMe 컨트롤러 코어가 꺼져 있어 NVMe 커맨드(SetFeatures)를
-        먼저 보내면 hang 발생. 복귀 순서:
-          1. setpci PMCSR=D0  (config space는 D3hot에서도 접근 가능)
-          2. 10ms Trst 대기   (PCI spec §5.3.1.4 최소 대기)
-          3. setpci LNKCTL=L0 (PCIe L-state 해제)
-          4. NVMe SetFeatures PS0  (D0 복귀 후 NVMe 커맨드 가능)
+        복귀 순서:
+          1. _set_pcie_l_state(L0) — L1.2 시 CLKREQ# assert로 clock 복원 먼저.
+                                     clock 없는 상태(L1.2)에서 config write하면 hang.
+          2. setpci PMCSR=D0       — clock 복원 후 config space 접근 가능
+          3. 10ms Trst 대기        — PCI spec §5.3.1.4
+          4. NVMe SetFeatures PS0  — D0 복귀 후 NVMe 커맨드 가능
         """
         ok = True
-        # Step 1: D3 → D0 (setpci, config space 접근)
-        if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
-            ok &= self._set_pcie_d_state(PCIeDState.D0)
-        # Step 2: Trst
-        time.sleep(0.01)
-        # Step 3: L-state → L0
+        # Step 1: L0 먼저 — L1.2이면 CLKREQ# assert로 clock 복원 (TLP 전 필수)
         if self._pcie_bdf and self._pcie_cap_offset is not None:
             self._set_pcie_l_state(PCIeLState.L0)
+        # Step 2: D3 → D0 (clock 복원 후 config space 접근)
+        if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
+            ok &= self._set_pcie_d_state(PCIeDState.D0)
+        # Step 3: Trst
+        time.sleep(0.01)
         # Step 4: NVMe PS0
         ok &= self._pm_set_state(0)
         return ok
@@ -3314,7 +3314,8 @@ class NVMeFuzzer:
         """D3hot / L1.2 상태에서 NVMe 커맨드 가능 상태로 복귀.
 
         복귀 순서:
-          D3hot 포함: setpci D0 → Trst 10ms → setpci L0 → SetFeatures PS0
+          D3hot 포함: L0(CLKREQ# assert) → setpci D0 → Trst 10ms → SetFeatures PS0
+                      L1.2+D3 시 clock 없는 상태에서 config write 금지
           L1.2 (D0) : PMU CLKREQ# assert 포함 _set_pcie_l_state(L0)
 
         반환값: 복귀 후 실제 상태를 나타내는 PowerCombo
