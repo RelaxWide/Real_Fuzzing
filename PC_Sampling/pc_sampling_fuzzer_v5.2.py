@@ -3021,8 +3021,9 @@ class NVMeFuzzer:
             # [PMU] CLKREQ# Assert — 클록 복원 먼저, 링크 L0 재진입 후 레지스터 해제
             #   L1.2 상태에서는 클록이 없으므로 setpci(config space write) 전에 반드시 수행.
             #   클록 안정화(T_COMMON_MODE) 대기 후 레지스터 조작.
-            # >>> your_pmu_api.clkreq_assert()
-            # >>> time.sleep(0.001)
+            subprocess.run(['python3', 'pmu4_1.py', '16', '1', '3300'],
+                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.001)
 
             # 1. LNKCTL ASPMC = 0b00 (spec: ASPM disable 먼저)
             ok = self._setpci_write(ep, ec + 0x10, 0x0000, 0x0003, 'w')
@@ -3176,7 +3177,8 @@ class NVMeFuzzer:
 
             # [PMU] CLKREQ# Deassert — 레지스터 설정·검증 완료 후 마지막 수행
             #   루트 포트가 CLKREQ# 비활성 감지 → 레퍼런스 클록 제거 → 실제 L1.2 진입.
-            # >>> your_pmu_api.clkreq_deassert()
+            subprocess.run(['python3', 'pmu4_1.py', '15', '1', '3300'],
+                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             return ok
 
