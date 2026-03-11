@@ -1183,11 +1183,17 @@ class NVMeFuzzer:
         self.ps_exec_counts: dict[int, int] = {i: 0 for i in range(5)}  # PS별 실행 횟수
         self.ps_enter_counts: dict[int, int] = {i: 0 for i in range(5)} # PS별 진입 횟수
 
-        # v5.2: PCIe BDF + capability offsets
-        self._pcie_bdf: Optional[str]           = None
-        self._pcie_cap_offset: Optional[int]    = None   # PCIe Express cap (LNKCTL용)
-        self._pcie_pm_cap_offset: Optional[int] = None   # PCI PM cap (PMCSR용)
-        self._pcie_l1ss_offset: Optional[int]   = None   # L1 Sub-States cap (L1.2용)
+        # v5.2: PCIe BDF + capability offsets + register cache
+        self._pcie_bdf: Optional[str]              = None
+        self._pcie_cap_offset: Optional[int]       = None  # PCIe Express cap (LNKCTL, DEVCTL2)
+        self._pcie_pm_cap_offset: Optional[int]    = None  # PCI PM cap (PMCSR)
+        self._pcie_l1ss_offset: Optional[int]      = None  # L1 Sub-States cap (L1.2)
+        self._pcie_lnkcap: Optional[int]           = None  # LNKCAP 캐시 (ASPMS bit[11:10], CPM bit18)
+        self._pcie_l1ss_cap: Optional[int]         = None  # L1SSCAP 캐시 (지원 substate 비트)
+        self._pcie_root_bdf: Optional[str]         = None  # 루트 포트 BDF
+        self._pcie_root_cap_offset: Optional[int]  = None  # 루트 포트 PCIe Express cap
+        self._pcie_root_l1ss_offset: Optional[int] = None  # 루트 포트 L1SS cap
+        self._orig_aspm_policy: str                = 'default'  # 원본 ASPM 정책 복원용
 
         # v5.2: 현재 / 이전 operational PowerCombo
         self._current_combo: PowerCombo  = POWER_COMBOS[0]   # PS0+L0+D0
@@ -2809,19 +2815,63 @@ class NVMeFuzzer:
             return False
 
     # ------------------------------------------------------------------
-    # v5.2: PCIe L/D-state 제어
+    # v5.2: PCIe L/D-state 제어  (PCIe spec r5.0 §5.5.4 기준)
     # ------------------------------------------------------------------
 
-    def _detect_pcie_info(self) -> None:
-        """NVMe 디바이스의 PCIe BDF + capability offsets 탐지.
+    # ── setpci 헬퍼 ──────────────────────────────────────────────────
 
-        self._pcie_bdf          : "0000:02:00.0"
-        self._pcie_cap_offset   : PCIe Express cap offset (LNKCTL용)
-        self._pcie_pm_cap_offset: PCI PM cap offset (PMCSR용)
-        self._pcie_l1ss_offset  : L1 Sub-States cap offset (L1.2용, 없을 수 있음)
-        실패해도 _pcie_bdf=None 유지 → L/D-state 제어 비활성화.
+    def _setpci_read(self, bdf: str, offset: int, width: str = 'l') -> Optional[int]:
+        """setpci로 PCI config 레지스터 읽기. 실패 시 None 반환.
+        width: 'b'=1B 'w'=2B 'l'=4B
+        """
+        try:
+            r = subprocess.run(
+                ['setpci', '-s', bdf, f'{offset:#x}.{width}'],
+                capture_output=True, text=True, timeout=3)
+            if r.returncode == 0 and r.stdout.strip():
+                return int(r.stdout.strip(), 16)
+        except Exception:
+            pass
+        return None
+
+    def _setpci_write(self, bdf: str, offset: int, value: int, mask: int,
+                      width: str = 'l') -> bool:
+        """setpci write-with-mask. mask=1인 비트만 수정, 나머지 보존.
+        width: 'b'=1B 'w'=2B 'l'=4B
+        반환: setpci returncode == 0 여부.
+        """
+        nchars = {'b': 2, 'w': 4, 'l': 8}[width]
+        spec = (f'{offset:#x}.{width}='
+                f'{value & mask:0{nchars}x}:{mask:0{nchars}x}')
+        try:
+            r = subprocess.run(
+                ['setpci', '-s', bdf, spec],
+                timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    # ── 탐지 ─────────────────────────────────────────────────────────
+
+    def _detect_pcie_info(self) -> None:
+        """NVMe 디바이스의 PCIe BDF + capability offsets + 루트 포트 탐지.
+
+        저장 변수:
+          _pcie_bdf              : "0000:02:00.0"   (endpoint)
+          _pcie_cap_offset       : PCIe Express cap (LNKCTL, DEVCTL2)
+          _pcie_pm_cap_offset    : PCI PM cap (PMCSR)
+          _pcie_l1ss_offset      : L1 Sub-States cap (없을 수 있음)
+          _pcie_lnkcap           : LNKCAP 레지스터 (ASPMS bit[11:10], CPM bit18)
+          _pcie_l1ss_cap         : L1SSCAP 레지스터 (지원 substate 비트[3:0])
+          _pcie_root_bdf         : 루트 포트 BDF
+          _pcie_root_cap_offset  : 루트 포트 PCIe Express cap
+          _pcie_root_l1ss_offset : 루트 포트 L1SS cap
+          _orig_aspm_policy      : 원본 ASPM policy (복원용)
+        실패해도 _pcie_bdf=None → L/D-state 제어 비활성화.
         """
         import re as _re
+
+        # ── 1. endpoint BDF 탐지 ────────────────────────────────────
         dev = os.path.basename(self.config.nvme_device)
         m = _re.match(r'(nvme\d+)', dev)
         if m:
@@ -2836,7 +2886,6 @@ class NVMeFuzzer:
                 for line in r.stdout.splitlines():
                     if 'nvme' in line.lower() or 'non-volatile' in line.lower():
                         bdf = line.split()[0]
-                        # "02:00.0" → "0000:02:00.0"
                         if bdf.count(':') == 1:
                             bdf = '0000:' + bdf
                         self._pcie_bdf = bdf
@@ -2848,85 +2897,306 @@ class NVMeFuzzer:
             log.warning("[PCIe] BDF 탐지 실패 — L/D-state 제어 비활성화")
             return
 
-        # lspci -v 로 capability offsets 파싱
-        try:
-            r = subprocess.run(['lspci', '-v', '-s', self._pcie_bdf],
-                               capture_output=True, text=True, timeout=5)
-            for line in r.stdout.splitlines():
-                mm = _re.search(r'Capabilities: \[([0-9a-fA-F]+)\]\s+(.*)', line)
-                if not mm:
-                    continue
-                offset = int(mm.group(1), 16)
-                desc   = mm.group(2)
-                if 'Express' in desc and self._pcie_cap_offset is None:
-                    self._pcie_cap_offset = offset
-                elif 'Power Management' in desc and self._pcie_pm_cap_offset is None:
-                    self._pcie_pm_cap_offset = offset
-                elif ('L1 PM' in desc or 'Substates' in desc) and self._pcie_l1ss_offset is None:
-                    self._pcie_l1ss_offset = offset
-        except Exception as e:
-            log.warning(f"[PCIe] lspci cap 파싱 실패: {e}")
+        # ── 2. lspci -v capability offsets 파싱 (공통 헬퍼) ─────────
+        def _parse_caps(bdf_str: str) -> dict:
+            caps: dict = {}
+            try:
+                r = subprocess.run(['lspci', '-v', '-s', bdf_str],
+                                   capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    mm = _re.search(r'Capabilities: \[([0-9a-fA-F]+)\]\s+(.*)', line)
+                    if not mm:
+                        continue
+                    off  = int(mm.group(1), 16)
+                    desc = mm.group(2)
+                    if 'Express' in desc and 'exp' not in caps:
+                        caps['exp'] = off
+                    elif 'Power Management' in desc and 'pm' not in caps:
+                        caps['pm'] = off
+                    elif ('L1 PM' in desc or 'Substates' in desc) and 'l1ss' not in caps:
+                        caps['l1ss'] = off
+            except Exception as e:
+                log.warning(f"[PCIe] lspci cap 파싱 실패({bdf_str}): {e}")
+            return caps
 
+        ep_caps = _parse_caps(self._pcie_bdf)
+        self._pcie_cap_offset    = ep_caps.get('exp')
+        self._pcie_pm_cap_offset = ep_caps.get('pm')
+        self._pcie_l1ss_offset   = ep_caps.get('l1ss')
+
+        # ── 3. LNKCAP / L1SSCAP 레지스터 읽기 ──────────────────────
+        #   LNKCAP: PCIe Express cap + 0x0C  (PCI_EXP_LNKCAP)
+        #   L1SSCAP: L1SS cap + 0x04         (PCI_L1SS_CAP)
+        if self._pcie_cap_offset is not None:
+            self._pcie_lnkcap = self._setpci_read(
+                self._pcie_bdf, self._pcie_cap_offset + 0x0C)
+        if self._pcie_l1ss_offset is not None:
+            self._pcie_l1ss_cap = self._setpci_read(
+                self._pcie_bdf, self._pcie_l1ss_offset + 0x04)
+
+        # ── 4. 루트 포트 BDF 탐지 (sysfs 심볼릭 링크 역추적) ───────
+        #   /sys/bus/pci/devices/<EP_BDF> → realpath → 부모 디렉터리명 = RP BDF
+        try:
+            ep_real = os.path.realpath(f'/sys/bus/pci/devices/{self._pcie_bdf}')
+            parent_bdf = os.path.basename(os.path.dirname(ep_real))
+            if _re.match(r'^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$',
+                         parent_bdf):
+                self._pcie_root_bdf = parent_bdf
+        except Exception as e:
+            log.debug(f"[PCIe] 루트 포트 BDF 탐지 실패: {e}")
+
+        # ── 5. 루트 포트 capability offsets ──────────────────────────
+        if self._pcie_root_bdf:
+            rp_caps = _parse_caps(self._pcie_root_bdf)
+            self._pcie_root_cap_offset  = rp_caps.get('exp')
+            self._pcie_root_l1ss_offset = rp_caps.get('l1ss')
+
+        # ── 6. 원본 ASPM 정책 저장 ──────────────────────────────────
+        #   /sys/module/pcie_aspm/parameters/policy 형식 예:
+        #   "default [powersave] performance" → 현재 선택은 [괄호] 안
+        try:
+            raw = Path('/sys/module/pcie_aspm/parameters/policy').read_text().strip()
+            for tok in raw.split():
+                if tok.startswith('[') and tok.endswith(']'):
+                    self._orig_aspm_policy = tok[1:-1]
+                    break
+            else:
+                self._orig_aspm_policy = raw  # 단일 값이면 그대로
+        except Exception:
+            self._orig_aspm_policy = 'default'
+
+        # ── 로그 ────────────────────────────────────────────────────
+        aspms = None if self._pcie_lnkcap is None else (self._pcie_lnkcap >> 10) & 0x3
+        cpm   = None if self._pcie_lnkcap is None else (self._pcie_lnkcap >> 18) & 0x1
+        l1ss_cap_str = (f'{self._pcie_l1ss_cap:#010x}'
+                        if self._pcie_l1ss_cap is not None else 'None')
         log.warning(
-            f"[PCIe] BDF={self._pcie_bdf}  "
-            f"EXP_CAP={self._pcie_cap_offset!r}  "
-            f"PM_CAP={self._pcie_pm_cap_offset!r}  "
-            f"L1SS={self._pcie_l1ss_offset!r}")
+            f"[PCIe] EP={self._pcie_bdf}  "
+            f"EXP={self._pcie_cap_offset!r}  PM={self._pcie_pm_cap_offset!r}  "
+            f"L1SS={self._pcie_l1ss_offset!r}  "
+            f"ASPMS={aspms!r}  CPM={cpm!r}  L1SSCAP={l1ss_cap_str}")
+        log.warning(
+            f"[PCIe] RP={self._pcie_root_bdf}  "
+            f"RP_EXP={self._pcie_root_cap_offset!r}  "
+            f"RP_L1SS={self._pcie_root_l1ss_offset!r}  "
+            f"ASPM_policy_orig={self._orig_aspm_policy!r}")
+
+    # ── L-state (ASPM) ───────────────────────────────────────────────
 
     def _set_pcie_l_state(self, state: PCIeLState) -> bool:
-        """setpci로 LNKCTL bits[1:0] 설정 + L1.2 시 L1SS cap 설정.
+        """PCIe L-state 설정 (PCIe spec r5.0 §5.5.4.1 절차 준수).
 
-        L0  : LNKCTL bits[1:0] = 00 (ASPM disabled)
-        L1  : LNKCTL bits[1:0] = 10 (L1 enabled)
-        L1.2: LNKCTL bits[1:0] = 10 + L1SS Control1 bit2 set
+        L0  : ASPM 전체 비활성화
+              → LNKCTL ASPMC=00, L1SSCTL1 enable bits=0, DEVCTL2 LTRE=0, ECPM=0
+        L1  : ASPM L1 활성화 (LNKCAP.ASPMS 확인, 루트 포트→endpoint 순서)
+              → policy=powersave, LNKCTL ASPMC=ASPMS&0x2, ECPM if CPM
+        L1.2: L1 + L1 PM Substates L1.2 활성화 (spec §5.5.4.1 6단계)
+              Step1: L1SS enable bits 비활성화 (양측)
+              Step2: DEVCTL2 LTRE 활성화 (양측)
+              Step3: L1SSCTL1 LTR threshold 설정 (양측)
+                     LL1_2TV=0xa at bits[25:16], LL1_2TS=2 at bits[31:29]
+                     → threshold = 10 × 1024ns = 10.24µs
+              Step4: L1SSCTL1 enable bits 활성화 — upstream(RP) 먼저
+              Step5: LNKCTL ASPMC 활성화 (양측)
+              Step6: ECPM if CPM
         BDF 미탐지 시 False 반환 (퍼징 흐름 영향 없음).
         """
         if not self._pcie_bdf or self._pcie_cap_offset is None:
             return False
-        lnkctl_reg = f"{self._pcie_cap_offset + 0x10:#x}"
-        aspm_val   = 0 if state == PCIeLState.L0 else 2   # L1/L1.2 모두 bit1=1
-        try:
-            subprocess.run(
-                ['setpci', '-s', self._pcie_bdf,
-                 f'{lnkctl_reg}.w={aspm_val:#06x}:0x0003'],
-                timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            log.debug(f"[PCIe] LNKCTL setpci 실패: {e}")
-            return False
 
-        # L1.2: L1SS Control1 reg (cap+0x8) bit2 = ASPM L1.2 Enable
-        if self._pcie_l1ss_offset is not None:
-            l1ss_ctrl1 = f"{self._pcie_l1ss_offset + 0x8:#x}"
-            bit_val = '00000004' if state == PCIeLState.L1_2 else '00000000'
+        ep = self._pcie_bdf
+        rp = self._pcie_root_bdf            # None이면 루트 포트 skip
+        ec = self._pcie_cap_offset
+        rc = self._pcie_root_cap_offset     # None이면 skip
+        el = self._pcie_l1ss_offset
+        rl = self._pcie_root_l1ss_offset
+
+        # LNKCAP에서 ASPMS(bits[11:10]), CPM(bit18) 파싱
+        # LNKCAP 읽기 실패 시 L1 지원(0x2)·CPM 미지원(0) 으로 가정
+        aspms = ((self._pcie_lnkcap >> 10) & 0x3) if self._pcie_lnkcap is not None else 0x2
+        cpm   = ((self._pcie_lnkcap >> 18) & 0x1) if self._pcie_lnkcap is not None else 0
+
+        # ── L0: ASPM 전체 비활성화 ──────────────────────────────────
+        if state == PCIeLState.L0:
+            # [PMU] CLKREQ# Assert — 클록 복원 먼저, 링크 L0 재진입 후 레지스터 해제
+            #   L1.2 상태에서는 클록이 없으므로 setpci(config space write) 전에 반드시 수행.
+            #   클록 안정화(T_COMMON_MODE) 대기 후 레지스터 조작.
+            # >>> your_pmu_api.clkreq_assert()
+            # >>> time.sleep(0.001)
+
+            # 1. LNKCTL ASPMC = 0b00 (spec: ASPM disable 먼저)
+            ok = self._setpci_write(ep, ec + 0x10, 0x0000, 0x0003, 'w')
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x10, 0x0000, 0x0003, 'w')
+            # 2. L1SS enable bits clear (양측)
+            if el:
+                self._setpci_write(ep, el + 0x08, 0x00000000, 0x0000000F)
+            if rp and rl:
+                self._setpci_write(rp, rl + 0x08, 0x00000000, 0x0000000F)
+            # 3. DEVCTL2 LTRE clear (bit10) — LTR 비활성화
+            self._setpci_write(ep, ec + 0x28, 0x0000, 0x0400, 'w')
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x28, 0x0000, 0x0400, 'w')
+            # 4. LNKCTL ECPM clear (bit8)
+            self._setpci_write(ep, ec + 0x10, 0x0000, 0x0100, 'w')
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x10, 0x0000, 0x0100, 'w')
+            # 5. ASPM 정책 복원
             try:
-                subprocess.run(
-                    ['setpci', '-s', self._pcie_bdf,
-                     f'{l1ss_ctrl1}.l={bit_val}:00000004'],
-                    timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception as e:
-                log.debug(f"[PCIe] L1SS setpci 실패: {e}")
-        return True
+                Path('/sys/module/pcie_aspm/parameters/policy').write_text(
+                    self._orig_aspm_policy)
+            except Exception:
+                pass
+            # 6. 검증: endpoint LNKCTL ASPMC == 0
+            rb = self._setpci_read(ep, ec + 0x10, 'w')
+            if rb is not None and (rb & 0x0003) != 0:
+                log.debug(f"[PCIe] L0 verify: LNKCTL ASPMC={rb & 0x3:#04x} (expected 0x00)")
+            return ok
+
+        # ── L1: ASPM L1 활성화 ──────────────────────────────────────
+        elif state == PCIeLState.L1:
+            if not (aspms & 0x2):
+                log.warning(f"[PCIe] L1 미지원 (LNKCAP.ASPMS={aspms:#04x})")
+                return False
+            # 1. 기존 L1SS enable bits 비활성화 (L1.2 잔류 방지)
+            if el:
+                self._setpci_write(ep, el + 0x08, 0x00000000, 0x0000000F)
+            if rp and rl:
+                self._setpci_write(rp, rl + 0x08, 0x00000000, 0x0000000F)
+            # 2. 전역 ASPM 정책 → powersave (커널 override 방지)
+            try:
+                Path('/sys/module/pcie_aspm/parameters/policy').write_text('powersave')
+            except Exception:
+                pass
+            # 3. LNKCTL ASPMC = ASPMS & 0b10 — upstream(RP) 먼저, endpoint 이후
+            aspm_val = aspms & 0x2
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x10, aspm_val, 0x0003, 'w')
+            ok = self._setpci_write(ep, ec + 0x10, aspm_val, 0x0003, 'w')
+            # 4. Clock PM (LNKCTL ECPM bit8) — CPM 지원 시만
+            if cpm:
+                if rp and rc:
+                    self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
+                self._setpci_write(ep, ec + 0x10, 0x0100, 0x0100, 'w')
+            # 5. 검증: endpoint LNKCTL ASPMC
+            rb = self._setpci_read(ep, ec + 0x10, 'w')
+            if rb is not None and (rb & 0x0003) != aspm_val:
+                log.debug(
+                    f"[PCIe] L1 verify: LNKCTL ASPMC={rb & 0x3:#04x} (expected {aspm_val:#04x})")
+                ok = False
+            return ok
+
+        # ── L1.2: ASPM L1 + L1 PM Substates L1.2 활성화 ────────────
+        else:  # PCIeLState.L1_2
+            # 전제 조건 확인
+            if not (aspms & 0x2):
+                log.warning(f"[PCIe] L1.2: L1 미지원 (LNKCAP.ASPMS={aspms:#04x})")
+                return False
+            if self._pcie_l1ss_cap is None:
+                log.warning("[PCIe] L1.2: L1SS cap 없음 — L1.2 불가")
+                return False
+            if not (self._pcie_l1ss_cap & 0x4):  # ASPM L1.2 Support (bit2)
+                log.warning(
+                    f"[PCIe] L1.2: ASPM L1.2 미지원 (L1SSCAP={self._pcie_l1ss_cap:#010x})")
+                return False
+
+            # LTR threshold 상수
+            #   LL1_2TV = 0xa (value) at bits[25:16]  → Linux: PCI_L1SS_CTL1_LTR_L12_TH_VALUE
+            #   LL1_2TS = 2   (scale) at bits[31:29]  → Linux: PCI_L1SS_CTL1_LTR_L12_TH_SCALE
+            #   scale=2 → 1024ns 단위, threshold = 10 × 1024ns = 10.24µs
+            LTR_VAL  = (0xa << 16) | (2 << 29)   # 0x400A_0000
+            LTR_MASK = 0xE3FF_0000                # bits[31:29] | bits[25:16]
+
+            # Step 1: L1SS enable bits 비활성화 (양측) — spec §5.5.4.1 step 2
+            if el:
+                self._setpci_write(ep, el + 0x08, 0x00000000, 0x0000000F)
+            if rp and rl:
+                self._setpci_write(rp, rl + 0x08, 0x00000000, 0x0000000F)
+
+            # Step 2: 전역 ASPM 정책
+            try:
+                Path('/sys/module/pcie_aspm/parameters/policy').write_text('powersave')
+            except Exception:
+                pass
+
+            # Step 3: DEVCTL2 LTRE (bit10) 활성화 — LTR 메커니즘 필수 (양측)
+            #   PCI_EXP_DEVCTL2 = PCIe cap + 0x28
+            self._setpci_write(ep, ec + 0x28, 0x0400, 0x0400, 'w')
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x28, 0x0400, 0x0400, 'w')
+
+            # Step 4: L1SSCTL1 LTR threshold 설정 (enable bits 제외) — spec step 4
+            if el:
+                self._setpci_write(ep, el + 0x08, LTR_VAL, LTR_MASK)
+            if rp and rl:
+                self._setpci_write(rp, rl + 0x08, LTR_VAL, LTR_MASK)
+
+            # Step 5: L1SSCTL1 enable bits — L1SSCAP 지원 비트만 활성화
+            #   bit0: PCI-PM L1.2, bit1: PCI-PM L1.1, bit2: ASPM L1.2, bit3: ASPM L1.1
+            #   upstream(RP) 먼저 enable — spec §5.5.4.1 step 5
+            l1ss_en = self._pcie_l1ss_cap & 0xF
+            if rp and rl:
+                self._setpci_write(rp, rl + 0x08, l1ss_en, 0x0000000F)
+            ok = True
+            if el:
+                ok = self._setpci_write(ep, el + 0x08, l1ss_en, 0x0000000F)
+
+            # Step 6: LNKCTL ASPMC — upstream(RP) 먼저, endpoint 이후 — spec step 6
+            aspm_val = aspms & 0x2
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x10, aspm_val, 0x0003, 'w')
+            ok &= self._setpci_write(ep, ec + 0x10, aspm_val, 0x0003, 'w')
+
+            # Step 7: ECPM (Clock PM)
+            if cpm:
+                if rp and rc:
+                    self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
+                self._setpci_write(ep, ec + 0x10, 0x0100, 0x0100, 'w')
+
+            # Step 8: 검증 (endpoint LNKCTL + L1SSCTL1) — CLKREQ# deassert 이전 필수
+            #   deassert 후에는 클록이 없어 config space read 불가.
+            rb_lnk = self._setpci_read(ep, ec + 0x10, 'w')
+            if rb_lnk is not None and (rb_lnk & 0x0003) != aspm_val:
+                log.debug(
+                    f"[PCIe] L1.2 verify LNKCTL ASPMC={rb_lnk & 0x3:#04x} "
+                    f"(expected {aspm_val:#04x})")
+                ok = False
+            if el:
+                rb_l1ss = self._setpci_read(ep, el + 0x08)
+                if rb_l1ss is not None:
+                    if (rb_l1ss & 0xF) != l1ss_en:
+                        log.debug(
+                            f"[PCIe] L1.2 verify L1SSCTL1 enable="
+                            f"{rb_l1ss & 0xF:#04x} (expected {l1ss_en:#04x})")
+                    if (rb_l1ss & LTR_MASK) != (LTR_VAL & LTR_MASK):
+                        log.debug(
+                            f"[PCIe] L1.2 verify LTR threshold="
+                            f"{rb_l1ss & LTR_MASK:#010x} "
+                            f"(expected {LTR_VAL & LTR_MASK:#010x})")
+
+            # [PMU] CLKREQ# Deassert — 레지스터 설정·검증 완료 후 마지막 수행
+            #   루트 포트가 CLKREQ# 비활성 감지 → 레퍼런스 클록 제거 → 실제 L1.2 진입.
+            # >>> your_pmu_api.clkreq_deassert()
+
+            return ok
+
+    # ── D-state (PCI PM) ─────────────────────────────────────────────
 
     def _set_pcie_d_state(self, state: PCIeDState) -> bool:
-        """setpci로 PMCSR bits[1:0] 설정.
-
-        D0    : PMCSR bits[1:0] = 00
-        D3hot : PMCSR bits[1:0] = 11
-        BDF 미탐지 시 False 반환 (퍼징 흐름 영향 없음).
+        """setpci로 PMCSR bits[1:0] 설정 (D0=0x00, D3hot=0x03).
+        PCI PM cap + 0x04 = PMCSR 레지스터.
+        BDF 미탐지 시 False 반환.
         """
         if not self._pcie_bdf or self._pcie_pm_cap_offset is None:
             return False
-        pmcsr_reg = f"{self._pcie_pm_cap_offset + 0x4:#x}"
         val = 3 if state == PCIeDState.D3 else 0
-        try:
-            subprocess.run(
-                ['setpci', '-s', self._pcie_bdf,
-                 f'{pmcsr_reg}.w={val:#06x}:0x0003'],
-                timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return True
-        except Exception as e:
-            log.debug(f"[PCIe] PMCSR setpci 실패: {e}")
-            return False
+        ok  = self._setpci_write(
+            self._pcie_bdf, self._pcie_pm_cap_offset + 0x04, val, 0x0003, 'w')
+        if not ok:
+            log.debug("[PCIe] PMCSR setpci 실패")
+        return ok
+
+    # ── 통합 setter ──────────────────────────────────────────────────
 
     def _set_power_combo(self, combo: PowerCombo) -> None:
         """NVMe PS + PCIe L/D-state 동시 설정 + cmd_history 기록."""
@@ -2943,14 +3213,19 @@ class NVMeFuzzer:
         # PCIe 상태 변화를 별도 항목으로 기록 → replay .sh에서 setpci 재현
         if self._pcie_bdf:
             self._cmd_history.append({
-                'kind': 'pcie_state',
-                'label': f'PCIe {combo.label}',
-                'pcie_l': int(combo.pcie_l),
-                'pcie_d': int(combo.pcie_d),
-                'pcie_bdf': self._pcie_bdf,
-                'pcie_cap_offset':    self._pcie_cap_offset,
-                'pcie_pm_cap_offset': self._pcie_pm_cap_offset,
-                'pcie_l1ss_offset':   self._pcie_l1ss_offset,
+                'kind':                  'pcie_state',
+                'label':                 f'PCIe {combo.label}',
+                'pcie_l':                int(combo.pcie_l),
+                'pcie_d':                int(combo.pcie_d),
+                'pcie_bdf':              self._pcie_bdf,
+                'pcie_cap_offset':       self._pcie_cap_offset,
+                'pcie_pm_cap_offset':    self._pcie_pm_cap_offset,
+                'pcie_l1ss_offset':      self._pcie_l1ss_offset,
+                'pcie_lnkcap':           self._pcie_lnkcap,
+                'pcie_l1ss_cap':         self._pcie_l1ss_cap,
+                'pcie_root_bdf':         self._pcie_root_bdf,
+                'pcie_root_cap_offset':  self._pcie_root_cap_offset,
+                'pcie_root_l1ss_offset': self._pcie_root_l1ss_offset,
             })
 
     def _send_nvme_command(self, data: bytes, seed: Seed, timeout_mult: int = 1) -> int:
@@ -3467,7 +3742,7 @@ class NVMeFuzzer:
             step_str = f"[{i:03d}/{len(history)}] {label}{marker}"
             lines.append(f"# {step_str}")
 
-            # v5.2: pcie_state 항목 → setpci 커맨드
+            # v5.2: pcie_state 항목 → PCIe spec 준수 setpci 시퀀스
             if entry.get('kind') == 'pcie_state':
                 bdf      = entry.get('pcie_bdf', '')
                 pcie_l   = PCIeLState(entry.get('pcie_l', 0))
@@ -3475,27 +3750,131 @@ class NVMeFuzzer:
                 cap_off  = entry.get('pcie_cap_offset')
                 pm_off   = entry.get('pcie_pm_cap_offset')
                 l1ss_off = entry.get('pcie_l1ss_offset')
+                lnkcap   = entry.get('pcie_lnkcap')
+                l1ss_cap = entry.get('pcie_l1ss_cap')
+                r_bdf    = entry.get('pcie_root_bdf', '')
+                r_cap    = entry.get('pcie_root_cap_offset')
+                r_l1ss   = entry.get('pcie_root_l1ss_offset')
+
+                aspms    = ((lnkcap >> 10) & 0x3) if lnkcap else 0x2
+                cpm      = ((lnkcap >> 18) & 0x1) if lnkcap else 0
+                aspm_val = aspms & 0x2
+                LTR_VAL  = f'{(0xa << 16) | (2 << 29):08x}'   # 400a0000
+                LTR_MASK = 'e3ff0000'
+
                 lines.append(f'echo ">>> {step_str}"')
+                pcmds: list = []  # 이 항목의 setpci 커맨드 목록
+
                 if bdf and cap_off is not None:
-                    aspm_val = 0 if pcie_l == PCIeLState.L0 else 2
-                    lnkctl   = f"{cap_off + 0x10:#x}"
-                    cmd = f"sudo setpci -s {bdf} {lnkctl}.w={aspm_val:#06x}:0x0003"
-                    lines.append(f'echo "    {cmd}  # LNKCTL ASPM"')
-                    lines.append(cmd)
-                    lines.append('echo "    rc=$?"')
-                    if l1ss_off is not None:
-                        bit_val = '00000004' if pcie_l == PCIeLState.L1_2 else '00000000'
-                        l1ss_c1 = f"{l1ss_off + 0x8:#x}"
-                        cmd2 = f"sudo setpci -s {bdf} {l1ss_c1}.l={bit_val}:00000004"
-                        lines.append(f'echo "    {cmd2}  # L1SS L1.2"')
-                        lines.append(cmd2)
-                        lines.append('echo "    rc=$?"')
+                    if pcie_l == PCIeLState.L0:
+                        pcmds += [
+                            f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w=0000:0003"
+                            f"  # EP LNKCTL ASPMC=00 (L0)",
+                            f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w=0000:0100"
+                            f"  # EP LNKCTL ECPM=0",
+                        ]
+                        if l1ss_off:
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {l1ss_off+0x8:#x}.l=00000000:0000000f"
+                                f"  # EP L1SSCTL1 enable bits=0")
+                        pcmds.append(
+                            f"sudo setpci -s {bdf} {cap_off+0x28:#x}.w=0000:0400"
+                            f"  # EP DEVCTL2 LTRE=0")
+                        if r_bdf and r_cap:
+                            pcmds += [
+                                f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w=0000:0003"
+                                f"  # RP LNKCTL ASPMC=00",
+                                f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w=0000:0100"
+                                f"  # RP LNKCTL ECPM=0",
+                            ]
+                            if r_l1ss:
+                                pcmds.append(
+                                    f"sudo setpci -s {r_bdf} {r_l1ss+0x8:#x}.l=00000000:0000000f"
+                                    f"  # RP L1SSCTL1 enable bits=0")
+
+                    elif pcie_l == PCIeLState.L1:
+                        pcmds.append("# echo powersave > /sys/module/pcie_aspm/parameters/policy")
+                        if r_bdf and r_cap:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w={aspm_val:04x}:0003"
+                                f"  # RP LNKCTL ASPMC=L1")
+                        pcmds.append(
+                            f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w={aspm_val:04x}:0003"
+                            f"  # EP LNKCTL ASPMC=L1")
+                        if cpm:
+                            if r_bdf and r_cap:
+                                pcmds.append(
+                                    f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w=0100:0100"
+                                    f"  # RP LNKCTL ECPM=1")
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w=0100:0100"
+                                f"  # EP LNKCTL ECPM=1")
+
+                    else:  # L1.2 — spec §5.5.4.1 6단계
+                        l1ss_en = (l1ss_cap & 0xF) if l1ss_cap else 0x5
+                        pcmds.append("# echo powersave > /sys/module/pcie_aspm/parameters/policy")
+                        # Step1: L1SS disable
+                        if l1ss_off:
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {l1ss_off+0x8:#x}.l=00000000:0000000f"
+                                f"  # Step1 EP L1SSCTL1 enable bits=0")
+                        if r_bdf and r_l1ss:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_l1ss+0x8:#x}.l=00000000:0000000f"
+                                f"  # Step1 RP L1SSCTL1 enable bits=0")
+                        # Step3: DEVCTL2 LTRE
+                        pcmds.append(
+                            f"sudo setpci -s {bdf} {cap_off+0x28:#x}.w=0400:0400"
+                            f"  # Step3 EP DEVCTL2 LTRE=1")
+                        if r_bdf and r_cap:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_cap+0x28:#x}.w=0400:0400"
+                                f"  # Step3 RP DEVCTL2 LTRE=1")
+                        # Step4: LTR threshold (LL1_2TV=0xa bits[25:16], LL1_2TS=2 bits[31:29])
+                        if l1ss_off:
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {l1ss_off+0x8:#x}.l={LTR_VAL}:{LTR_MASK}"
+                                f"  # Step4 EP LTR threshold=10.24µs")
+                        if r_bdf and r_l1ss:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_l1ss+0x8:#x}.l={LTR_VAL}:{LTR_MASK}"
+                                f"  # Step4 RP LTR threshold=10.24µs")
+                        # Step5: L1SS enable (upstream=RP 먼저)
+                        if r_bdf and r_l1ss:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_l1ss+0x8:#x}.l={l1ss_en:08x}:0000000f"
+                                f"  # Step5 RP L1SSCTL1 enable={l1ss_en:#04x}")
+                        if l1ss_off:
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {l1ss_off+0x8:#x}.l={l1ss_en:08x}:0000000f"
+                                f"  # Step5 EP L1SSCTL1 enable={l1ss_en:#04x}")
+                        # Step6: LNKCTL ASPMC (RP 먼저)
+                        if r_bdf and r_cap:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w={aspm_val:04x}:0003"
+                                f"  # Step6 RP LNKCTL ASPMC=L1")
+                        pcmds.append(
+                            f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w={aspm_val:04x}:0003"
+                            f"  # Step6 EP LNKCTL ASPMC=L1")
+                        if cpm:
+                            if r_bdf and r_cap:
+                                pcmds.append(
+                                    f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w=0100:0100"
+                                    f"  # RP LNKCTL ECPM=1")
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w=0100:0100"
+                                f"  # EP LNKCTL ECPM=1")
+
+                # D-state
                 if bdf and pm_off is not None:
-                    dval    = 3 if pcie_d == PCIeDState.D3 else 0
-                    pmcsr   = f"{pm_off + 0x4:#x}"
-                    cmd3 = f"sudo setpci -s {bdf} {pmcsr}.w={dval:#06x}:0x0003"
-                    lines.append(f'echo "    {cmd3}  # PMCSR D-state"')
-                    lines.append(cmd3)
+                    dval = 3 if pcie_d == PCIeDState.D3 else 0
+                    pcmds.append(
+                        f"sudo setpci -s {bdf} {pm_off+0x4:#x}.w={dval:04x}:0003"
+                        f"  # PMCSR D-state={'D3hot' if dval else 'D0'}")
+
+                for pcmd in pcmds:
+                    lines.append(f'echo "    {pcmd}"')
+                    lines.append(pcmd)
                     lines.append('echo "    rc=$?"')
                 lines.append("sleep 0.1")
                 lines.append("")
