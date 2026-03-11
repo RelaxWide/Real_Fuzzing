@@ -362,6 +362,12 @@ D3_TIMEOUT_MULT = 4   # D3hot wake-up 추가 timeout 배수
 L1_SETTLE     = 5.0   # L1: idle timer + handshake 대기 (초)
 L1_2_SETTLE   = 2.0   # L1.2 추가 대기: CLKREQ# 제거 + clock off (초, L1_SETTLE 이후 추가)
 
+# v5.2: PM-Preflight 전용 PS별 settle 배수 (BASE_SETTLE=0.5s 기준)
+# PS3/PS4는 진입 시 NAND 캐시 플러시가 발생하여 ENLAT(2~3ms)과 무관하게
+# 전력 안정화까지 수백ms~수초 소요됨. EXLAT ≠ 진입 정착 시간.
+# PS4(EXLAT=46ms): NAND retention mode, cache flush 시간이 길어 10배 적용.
+PS_PREFLIGHT_SETTLE = {0: 1, 1: 1, 2: 1, 3: 4, 4: 10}  # × BASE_SETTLE(0.5s)
+
 # PMU 스크립트 절대경로 — subprocess CWD와 무관하게 항상 올바른 파일 사용
 _PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.py')
 
@@ -3460,6 +3466,33 @@ class NVMeFuzzer:
         """
         res = {}
 
+        # 0. nvme get-feature FID=0x02 — 컨트롤러가 실제 보고하는 현재 PS 확인
+        #    PS4 진입 후 컨트롤러가 아직 전환 중이면 PS0을 보고할 수 있음
+        try:
+            r = subprocess.run(
+                ['nvme', 'get-feature', self.config.nvme_device, '-f', '0x02'],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                # "get-feature:0x2 (Power Management), Current value:0x00000004" 형태 파싱
+                raw_gf = (r.stdout + r.stderr).strip()
+                cur_ps = None
+                for tok in raw_gf.replace(',', ' ').split():
+                    if tok.startswith('0x') or tok.startswith('0X'):
+                        try:
+                            cur_ps = int(tok, 16)
+                        except ValueError:
+                            pass
+                if cur_ps is not None:
+                    exp_ps = combo.nvme_ps
+                    chk    = 'OK' if cur_ps == exp_ps else f'MISMATCH(exp=PS{exp_ps})'
+                    res['nvme_ps'] = f"PS{cur_ps} {chk}"
+                else:
+                    res['nvme_ps'] = f"parse_fail: {raw_gf[:80]}"
+            else:
+                res['nvme_ps'] = f"FAIL(rc={r.returncode}) {r.stderr.strip()[:60]}"
+        except Exception as e:
+            res['nvme_ps'] = f"ERR({e})"
+
         # 1. PMU getcurrent
         try:
             r = subprocess.run(
@@ -3594,7 +3627,9 @@ class NVMeFuzzer:
 
             # 2. 정착 대기
             #    L1/L1.2 settle은 _set_pcie_l_state() 내부에서 이미 처리됨
-            settle = BASE_SETTLE
+            #    PS3/PS4는 NAND 캐시 플러시 완료까지 수초 소요되므로 PS_PREFLIGHT_SETTLE 배수 적용
+            ps_mult = PS_PREFLIGHT_SETTLE.get(combo.nvme_ps, 1)
+            settle  = BASE_SETTLE * ps_mult
             if combo.pcie_d == PCIeDState.D3:
                 settle += D3_EXTRA
             time.sleep(settle)
@@ -3606,6 +3641,8 @@ class NVMeFuzzer:
             verify = {}
             if ok_set:
                 verify = self._pm_verify_combo(combo)
+                if 'nvme_ps' in verify:
+                    log.warning(f"    [verify] NVMe PS    : {verify['nvme_ps']}")
                 log.warning(f"    [verify] PMU        : {verify.get('pmu', 'N/A')}")
                 if 'd_state' in verify:
                     log.warning(f"    [verify] D-state    : {verify['d_state']}")
