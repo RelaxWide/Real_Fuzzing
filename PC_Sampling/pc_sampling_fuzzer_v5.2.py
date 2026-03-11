@@ -359,8 +359,8 @@ D3_TIMEOUT_MULT = 4   # D3hot wake-up 추가 timeout 배수
 
 # PCIe L1 진입 settle 시간
 # LNKCTL 쓴 뒤 link idle → L1 idle timer 만료 → PM_Request_Ack DLLP 핸드셰이크 완료까지
-L1_SETTLE     = 1.0   # L1: idle timer + handshake 대기 (초)
-L1_2_SETTLE   = 0.5   # L1.2 추가 대기: CLKREQ# 제거 + clock off (초, L1_SETTLE 이후 추가)
+L1_SETTLE     = 20.0  # L1: idle timer + handshake 대기 (초) — 진입 확인용 확장
+L1_2_SETTLE   = 5.0   # L1.2 추가 대기: CLKREQ# 제거 + clock off (초, L1_SETTLE 이후 추가)
 
 # PMU 스크립트 절대경로 — subprocess CWD와 무관하게 항상 올바른 파일 사용
 _PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.py')
