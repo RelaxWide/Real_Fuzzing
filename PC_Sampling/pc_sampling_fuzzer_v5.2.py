@@ -3498,8 +3498,7 @@ class NVMeFuzzer:
                 log.warning(f"    → nvme id-ctrl 예외: {e}")
 
             elapsed  = time.monotonic() - t0
-            pmu_raw  = verify.get('pmu', '')
-            pmu_val  = pmu_raw.split()[0] if pmu_raw and not pmu_raw.startswith(('FAIL', 'ERR', 'N/A')) else pmu_raw or 'N/A'
+            pmu_val  = verify.get('pmu', 'N/A')
             results.append((combo, ok_set, ok_restore, ok_nvme, elapsed, pmu_val))
 
             ok_all = ok_set and ok_restore and ok_nvme
