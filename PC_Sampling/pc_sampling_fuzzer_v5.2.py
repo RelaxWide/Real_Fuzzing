@@ -3497,8 +3497,10 @@ class NVMeFuzzer:
             except Exception as e:
                 log.warning(f"    → nvme id-ctrl 예외: {e}")
 
-            elapsed = time.monotonic() - t0
-            results.append((combo, ok_set, ok_restore, ok_nvme, elapsed))
+            elapsed  = time.monotonic() - t0
+            pmu_raw  = verify.get('pmu', '')
+            pmu_val  = pmu_raw.split()[0] if pmu_raw and not pmu_raw.startswith(('FAIL', 'ERR', 'N/A')) else pmu_raw or 'N/A'
+            results.append((combo, ok_set, ok_restore, ok_nvme, elapsed, pmu_val))
 
             ok_all = ok_set and ok_restore and ok_nvme
             mark   = "OK  " if ok_all else "FAIL"
@@ -3519,17 +3521,18 @@ class NVMeFuzzer:
         # ── 요약 테이블 ──
         log.warning("=" * 60)
         log.warning("[PM-Preflight] 결과 요약")
-        log.warning(f"  {'Combo':<20} {'SET':>5} {'RESTORE':>8} {'NVMe':>6} {'Time':>7}  ")
-        log.warning("  " + "-" * 50)
-        for combo, ok_set, ok_restore, ok_nvme, elapsed in results:
+        log.warning(f"  {'Combo':<20} {'PMU(mA)':>9} {'SET':>5} {'RESTORE':>8} {'NVMe':>6} {'Time':>7}  ")
+        log.warning("  " + "-" * 60)
+        for combo, ok_set, ok_restore, ok_nvme, elapsed, pmu_val in results:
             mark = "✓" if (ok_set and ok_restore and ok_nvme) else "✗"
             log.warning(
                 f"  {combo.label:<20} "
+                f"{pmu_val:>9} "
                 f"{'OK' if ok_set else 'FAIL':>5} "
                 f"{'OK' if ok_restore else 'FAIL':>8} "
                 f"{'OK' if ok_nvme else 'FAIL':>6} "
                 f"{elapsed:>6.2f}s  {mark}")
-        log.warning("  " + "-" * 50)
+        log.warning("  " + "-" * 60)
         passed = len(results) - len(failed_labels)
         log.warning(f"[PM-Preflight] 통과: {passed}/{len(POWER_COMBOS)}")
         if failed_labels:
