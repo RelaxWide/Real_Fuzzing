@@ -357,6 +357,11 @@ POWER_COMBOS: list = [
 
 D3_TIMEOUT_MULT = 4   # D3hot wake-up 추가 timeout 배수
 
+# PCIe L1 진입 settle 시간
+# LNKCTL 쓴 뒤 link idle → L1 idle timer 만료 → PM_Request_Ack DLLP 핸드셰이크 완료까지
+L1_SETTLE     = 1.0   # L1: idle timer + handshake 대기 (초)
+L1_2_SETTLE   = 0.5   # L1.2 추가 대기: CLKREQ# 제거 + clock off (초, L1_SETTLE 이후 추가)
+
 # PMU 스크립트 절대경로 — subprocess CWD와 무관하게 항상 올바른 파일 사용
 _PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.py')
 
@@ -3083,8 +3088,9 @@ class NVMeFuzzer:
                 self._setpci_write(ep, ec + 0x10, 0x0100, 0x0100, 'w')
                 if rp and rc:
                     self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
-            # 5. 검증 readback 제거 — PCIe TLP 발생으로 idle window 깨짐
-            #    실제 검증은 _pm_verify_combo()에서 settle sleep 후 수행
+            # 5. idle window — LNKCTL 쓴 뒤 PCIe 트래픽 없는 구간 확보
+            #    HW가 L1 idle timer 만료 + PM_Request_Ack DLLP 핸드셰이크 처리
+            time.sleep(L1_SETTLE)
             return ok
 
         # ── L1.2: ASPM L1 + L1 PM Substates L1.2 활성화 ────────────
@@ -3180,6 +3186,8 @@ class NVMeFuzzer:
             subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
                            timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+            # idle window — L1 idle timer + L1.2 clock off 완료 대기
+            time.sleep(L1_SETTLE + L1_2_SETTLE)
             return ok
 
     # ── D-state (PCI PM) ─────────────────────────────────────────────
@@ -3408,9 +3416,7 @@ class NVMeFuzzer:
         if self.config.pm_inject_prob <= 0:
             return True
 
-        BASE_SETTLE   = 0.5   # 기본 정착 대기 (초)
-        L1_EXTRA      = 0.5   # L1 idle timer 만료 + PM_Request_Ack 대기
-        L1_2_EXTRA    = 0.5   # L1.2 추가 대기 (L1_EXTRA 포함)
+        BASE_SETTLE   = 0.5   # 기본 정착 대기 (초) — L1/L1.2 settle은 _set_pcie_l_state() 내부
         D3_EXTRA      = 1.0   # D3 wake-up 추가 대기
         PROBE_TIMEOUT = 5.0   # nvme id-ctrl 타임아웃
 
@@ -3438,13 +3444,8 @@ class NVMeFuzzer:
                 ok_set = False
 
             # 2. 정착 대기
-            #    L1: idle timer 만료 + PM_Request_Ack DLLP 핸드셰이크 대기
-            #    L1.2: 클럭 제거까지 추가 대기 (L1_EXTRA 포함)
+            #    L1/L1.2 settle은 _set_pcie_l_state() 내부에서 이미 처리됨
             settle = BASE_SETTLE
-            if combo.pcie_l == PCIeLState.L1:
-                settle += L1_EXTRA
-            elif combo.pcie_l == PCIeLState.L1_2:
-                settle += L1_EXTRA + L1_2_EXTRA
             if combo.pcie_d == PCIeDState.D3:
                 settle += D3_EXTRA
             time.sleep(settle)
