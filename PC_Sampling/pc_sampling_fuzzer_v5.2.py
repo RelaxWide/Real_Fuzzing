@@ -3328,7 +3328,7 @@ class NVMeFuzzer:
             else:
                 res['d_state'] = 'read_fail'
 
-        # 3. LNKCTL readback — ASPM bits[1:0]
+        # 3. LNKCTL readback — EP ASPM bits[1:0]
         if self._pcie_bdf and self._pcie_cap_offset is not None:
             v = self._setpci_read(self._pcie_bdf, self._pcie_cap_offset + 0x10, 'w')
             if v is not None:
@@ -3336,9 +3336,44 @@ class NVMeFuzzer:
                 aname = {0: 'L0/disabled', 1: 'L0s', 2: 'L1', 3: 'L0s+L1'}.get(aspm, '?')
                 exp   = 0 if combo.pcie_l == PCIeLState.L0 else 2
                 chk   = 'OK' if aspm == exp else f'MISMATCH(exp={exp})'
-                res['l_state'] = f"ASPM={aname}(raw={aspm:#04x}) {chk}"
+                res['l_state_ep'] = f"EP ASPM={aname}(raw={aspm:#04x}) {chk}"
             else:
-                res['l_state'] = 'read_fail'
+                res['l_state_ep'] = 'read_fail'
+
+        # 3b. RP LNKCTL readback — L1은 EP+RP 양측 모두 설정되어야 진입 가능
+        if self._pcie_root_bdf and self._pcie_root_cap_offset is not None:
+            v = self._setpci_read(self._pcie_root_bdf,
+                                  self._pcie_root_cap_offset + 0x10, 'w')
+            if v is not None:
+                aspm  = v & 0x3
+                aname = {0: 'L0/disabled', 1: 'L0s', 2: 'L1', 3: 'L0s+L1'}.get(aspm, '?')
+                exp   = 0 if combo.pcie_l == PCIeLState.L0 else 2
+                chk   = 'OK' if aspm == exp else f'MISMATCH(exp={exp})'
+                res['l_state_rp'] = f"RP ASPM={aname}(raw={aspm:#04x}) {chk}"
+            else:
+                res['l_state_rp'] = 'read_fail'
+        else:
+            res['l_state_rp'] = f"RP not detected (bdf={self._pcie_root_bdf!r} cap={self._pcie_root_cap_offset!r})"
+
+        # 3c. ASPM 정책 실제값 확인 (커널 override 감지)
+        try:
+            raw = Path('/sys/module/pcie_aspm/parameters/policy').read_text().strip()
+            res['aspm_policy'] = raw
+        except Exception:
+            res['aspm_policy'] = 'N/A'
+
+        # 3d. lspci -vv 로 실제 링크 ASPM 상태 확인 (LnkCtl: ASPM ... line)
+        if self._pcie_bdf:
+            try:
+                r = subprocess.run(
+                    ['lspci', '-vv', '-s', self._pcie_bdf],
+                    capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    if 'LnkCtl' in line and 'ASPM' in line:
+                        res['lspci_lnkctl'] = line.strip()
+                        break
+            except Exception:
+                pass
 
         # 4. L1SSCTL1 readback — enable bits[3:0] (cap 있을 때만)
         if self._pcie_bdf and self._pcie_l1ss_offset is not None:
@@ -3419,15 +3454,21 @@ class NVMeFuzzer:
             verify = {}
             if ok_set:
                 verify = self._pm_verify_combo(combo)
-                log.warning(f"    [verify] PMU      : {verify.get('pmu', 'N/A')}")
+                log.warning(f"    [verify] PMU        : {verify.get('pmu', 'N/A')}")
                 if 'd_state' in verify:
-                    log.warning(f"    [verify] D-state  : {verify['d_state']}")
-                if 'l_state' in verify:
-                    log.warning(f"    [verify] L-state  : {verify['l_state']}")
+                    log.warning(f"    [verify] D-state    : {verify['d_state']}")
+                if 'l_state_ep' in verify:
+                    log.warning(f"    [verify] L-state EP : {verify['l_state_ep']}")
+                if 'l_state_rp' in verify:
+                    log.warning(f"    [verify] L-state RP : {verify['l_state_rp']}")
+                if 'aspm_policy' in verify:
+                    log.warning(f"    [verify] ASPM policy: {verify['aspm_policy']}")
+                if 'lspci_lnkctl' in verify:
+                    log.warning(f"    [verify] lspci      : {verify['lspci_lnkctl']}")
                 if 'l1ss' in verify:
-                    log.warning(f"    [verify] L1SS     : {verify['l1ss']}")
+                    log.warning(f"    [verify] L1SS       : {verify['l1ss']}")
                 if 'sysfs_d' in verify:
-                    log.warning(f"    [verify] sysfs    : {verify['sysfs_d']}")
+                    log.warning(f"    [verify] sysfs      : {verify['sysfs_d']}")
 
             # 4. PS0+L0+D0 복귀
             #    D3 포함 combo: D0 먼저(setpci) → Trst → L0 → PS0 순서 필수.
