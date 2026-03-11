@@ -3245,8 +3245,8 @@ class NVMeFuzzer:
         """NVMe PS + PCIe L/D-state 동시 설정 + cmd_history 기록."""
         t0    = time.monotonic()
         ok_ps = self._pm_set_state(combo.nvme_ps)
-        ok_l  = self._set_pcie_l_state(combo.pcie_l)
         ok_d  = self._set_pcie_d_state(combo.pcie_d)
+        ok_l  = self._set_pcie_l_state(combo.pcie_l)  # 마지막 — sleep 후 TLP 없음
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
