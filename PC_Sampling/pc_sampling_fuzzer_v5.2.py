@@ -5315,15 +5315,13 @@ class NVMeFuzzer:
         if self.config.resume_coverage:
             self.sampler.load_coverage(self.config.resume_coverage)
 
+        # APST / Keep-Alive 비활성화 — NVMe 작업, J-Link 불필요
+        self._apst_disable()
+        self._keepalive_disable()
+
         if not self.sampler.connect():
             log.error("J-Link connection failed, aborting")
             return
-
-        # APST / Keep-Alive 비활성화 — NVMe 컨트롤러 자율 트래픽 제거
-        # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
-        # Keep-Alive: 주기적 admin cmd → PS3/PS4 wake-up → L1 진입 불가
-        self._apst_disable()
-        self._keepalive_disable()
 
         # PM preflight: idle 유니버스 수집 전에 전체 PowerCombo 검증.
         # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
