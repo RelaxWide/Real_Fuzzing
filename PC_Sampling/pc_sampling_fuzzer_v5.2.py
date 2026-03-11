@@ -3498,7 +3498,16 @@ class NVMeFuzzer:
                 log.warning(f"    → nvme id-ctrl 예외: {e}")
 
             elapsed  = time.monotonic() - t0
-            pmu_val  = verify.get('pmu', 'N/A')
+            # pmu 출력은 멀티라인 (CLI 경로 echo 포함) — 숫자만 있는 줄을 추출
+            _pmu_raw = verify.get('pmu', 'N/A')
+            pmu_val  = 'N/A'
+            for _line in _pmu_raw.splitlines():
+                _tok = _line.strip()
+                if _tok and _tok.lstrip('-').replace('.', '', 1).isdigit():
+                    pmu_val = _tok
+                    break
+            if pmu_val == 'N/A' and _pmu_raw not in ('N/A', ''):
+                pmu_val = _pmu_raw.strip().splitlines()[-1].strip() or 'N/A'
             results.append((combo, ok_set, ok_restore, ok_nvme, elapsed, pmu_val))
 
             ok_all = ok_set and ok_restore and ok_nvme
