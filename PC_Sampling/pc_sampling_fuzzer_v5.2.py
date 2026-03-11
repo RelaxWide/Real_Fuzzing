@@ -3072,22 +3072,19 @@ class NVMeFuzzer:
                 Path('/sys/module/pcie_aspm/parameters/policy').write_text('powersave')
             except Exception:
                 pass
-            # 3. LNKCTL ASPMC = ASPMS & 0b10 — upstream(RP) 먼저, endpoint 이후
+            # 3. LNKCTL ASPMC = ASPMS & 0b10 — EP(downstream) 먼저, RP(upstream) 이후
+            #    Linux kernel pci-aspm.c 순서: enable 시 EP 먼저, disable 시 RP 먼저
             aspm_val = aspms & 0x2
+            ok = self._setpci_write(ep, ec + 0x10, aspm_val, 0x0003, 'w')   # EP 먼저
             if rp and rc:
-                self._setpci_write(rp, rc + 0x10, aspm_val, 0x0003, 'w')
-            ok = self._setpci_write(ep, ec + 0x10, aspm_val, 0x0003, 'w')
+                self._setpci_write(rp, rc + 0x10, aspm_val, 0x0003, 'w')   # RP 나중
             # 4. Clock PM (LNKCTL ECPM bit8) — CPM 지원 시만
             if cpm:
+                self._setpci_write(ep, ec + 0x10, 0x0100, 0x0100, 'w')
                 if rp and rc:
                     self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
-                self._setpci_write(ep, ec + 0x10, 0x0100, 0x0100, 'w')
-            # 5. 검증: endpoint LNKCTL ASPMC
-            rb = self._setpci_read(ep, ec + 0x10, 'w')
-            if rb is not None and (rb & 0x0003) != aspm_val:
-                log.debug(
-                    f"[PCIe] L1 verify: LNKCTL ASPMC={rb & 0x3:#04x} (expected {aspm_val:#04x})")
-                ok = False
+            # 5. 검증 readback 제거 — PCIe TLP 발생으로 idle window 깨짐
+            #    실제 검증은 _pm_verify_combo()에서 settle sleep 후 수행
             return ok
 
         # ── L1.2: ASPM L1 + L1 PM Substates L1.2 활성화 ────────────
@@ -3412,7 +3409,8 @@ class NVMeFuzzer:
             return True
 
         BASE_SETTLE   = 0.5   # 기본 정착 대기 (초)
-        L1_2_EXTRA    = 0.5   # L1.2 추가 대기
+        L1_EXTRA      = 0.5   # L1 idle timer 만료 + PM_Request_Ack 대기
+        L1_2_EXTRA    = 0.5   # L1.2 추가 대기 (L1_EXTRA 포함)
         D3_EXTRA      = 1.0   # D3 wake-up 추가 대기
         PROBE_TIMEOUT = 5.0   # nvme id-ctrl 타임아웃
 
@@ -3440,9 +3438,13 @@ class NVMeFuzzer:
                 ok_set = False
 
             # 2. 정착 대기
+            #    L1: idle timer 만료 + PM_Request_Ack DLLP 핸드셰이크 대기
+            #    L1.2: 클럭 제거까지 추가 대기 (L1_EXTRA 포함)
             settle = BASE_SETTLE
-            if combo.pcie_l == PCIeLState.L1_2:
-                settle += L1_2_EXTRA
+            if combo.pcie_l == PCIeLState.L1:
+                settle += L1_EXTRA
+            elif combo.pcie_l == PCIeLState.L1_2:
+                settle += L1_EXTRA + L1_2_EXTRA
             if combo.pcie_d == PCIeDState.D3:
                 settle += D3_EXTRA
             time.sleep(settle)
