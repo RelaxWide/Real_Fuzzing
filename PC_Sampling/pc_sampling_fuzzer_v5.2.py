@@ -357,6 +357,9 @@ POWER_COMBOS: list = [
 
 D3_TIMEOUT_MULT = 4   # D3hot wake-up 추가 timeout 배수
 
+# PMU 스크립트 절대경로 — subprocess CWD와 무관하게 항상 올바른 파일 사용
+_PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.py')
+
 # v4.7: Idle 유니버스 수집 (diagnose 수렴 설정)
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
 # 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
@@ -3021,7 +3024,7 @@ class NVMeFuzzer:
             # [PMU] CLKREQ# Assert — 클록 복원 먼저, 링크 L0 재진입 후 레지스터 해제
             #   L1.2 상태에서는 클록이 없으므로 setpci(config space write) 전에 반드시 수행.
             #   클록 안정화(T_COMMON_MODE) 대기 후 레지스터 조작.
-            subprocess.run(['python3', 'pmu_4_1.py', '16', '1', '3300'],
+            subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
                            timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.001)
 
@@ -3177,7 +3180,7 @@ class NVMeFuzzer:
 
             # [PMU] CLKREQ# Deassert — 레지스터 설정·검증 완료 후 마지막 수행
             #   루트 포트가 CLKREQ# 비활성 감지 → 레퍼런스 클록 제거 → 실제 L1.2 진입.
-            subprocess.run(['python3', 'pmu_4_1.py', '15', '1', '3300'],
+            subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
                            timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             return ok
@@ -3268,7 +3271,7 @@ class NVMeFuzzer:
         # 1. PMU getcurrent
         try:
             r = subprocess.run(
-                ['python3', 'pmu_4_1.py', '3', '1'],
+                ['python3', _PMU_SCRIPT, '3', '1'],
                 capture_output=True, text=True, timeout=3)
             raw = r.stdout.strip()
             res['pmu'] = raw if r.returncode == 0 else f"FAIL(rc={r.returncode}) {r.stderr.strip()}"
