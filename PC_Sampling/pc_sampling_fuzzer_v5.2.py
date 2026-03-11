@@ -3256,6 +3256,60 @@ class NVMeFuzzer:
         ok &= self._pm_set_state(0)
         return ok
 
+    @staticmethod
+    def _is_nonop_combo(combo: PowerCombo) -> bool:
+        """NVMe 커맨드 전송 전 반드시 복귀가 필요한 Non-Operational 상태 판정.
+
+        Non-Operational 기준:
+          D3hot   : PCIe 컨트롤러 core 전원 차단 → NVMe 커맨드 hang
+          L1.2    : PMU CLKREQ# deasserted → 레퍼런스 클록 없음 → TLP 실패
+          PS3/PS4 : NVMe Non-Operational Power State (spec상 I/O 금지)
+
+        Operational (복귀 불필요):
+          L1      : HW가 TLP 수신 시 자동 wake (클록 유지)
+          PS1/PS2 : Operational lower-power, 커맨드 가능
+        """
+        return (combo.pcie_d  == PCIeDState.D3
+                or combo.pcie_l == PCIeLState.L1_2
+                or combo.nvme_ps in (3, 4))
+
+    def _nonop_restore(self, combo: PowerCombo) -> PowerCombo:
+        """Non-Operational PM 상태에서 NVMe 커맨드 가능 상태로 복귀.
+
+        복귀 순서 (우선순위):
+          1. D3hot 포함: D0 먼저(setpci) → Trst 10ms → L0 → PS0
+             (D3hot에서 NVMe 커맨드 먼저 보내면 hang — _pm_d3_safe_restore 사용)
+          2. L1.2 (D0): PMU CLKREQ# assert 포함 L0 복귀 → PS3/4면 PS0도 복귀
+          3. PS3/PS4 (D0, L0/L1): SetFeatures PS0
+
+        반환값: 복귀 후 실제 상태를 나타내는 PowerCombo
+        """
+        if combo.pcie_d == PCIeDState.D3:
+            # D3hot: config space만 가능, NVMe 불가 → D0 먼저
+            log.warning(f"[PM] NonOp restore: {combo.label} → D0+L0+PS0 "
+                        f"(D3hot: setpci D0 → Trst → L0 → SetFeatures PS0)")
+            self._pm_d3_safe_restore()
+            return POWER_COMBOS[0]  # PS0+L0+D0
+
+        if combo.pcie_l == PCIeLState.L1_2:
+            # L1.2: PMU CLKREQ# deasserted → assert 포함한 L0 복귀 필수
+            log.warning(f"[PM] NonOp restore: {combo.label} → L0 "
+                        f"(L1.2: PMU CLKREQ# assert + setpci L0)")
+            self._set_pcie_l_state(PCIeLState.L0)
+            if combo.nvme_ps in (3, 4):
+                self._pm_set_state(0)
+                return PowerCombo(0, PCIeLState.L0, PCIeDState.D0)
+            return PowerCombo(combo.nvme_ps, PCIeLState.L0, PCIeDState.D0)
+
+        if combo.nvme_ps in (3, 4):
+            # PS3/PS4 NOPS (D0, L0/L1): SetFeatures PS0
+            log.warning(f"[PM] NonOp restore: {combo.label} → PS0 "
+                        f"(NOPS: SetFeatures PS0)")
+            self._pm_set_state(0)
+            return PowerCombo(0, combo.pcie_l, PCIeDState.D0)
+
+        return combo  # operational, 복귀 불필요
+
     def _pm_verify_combo(self, combo: PowerCombo) -> dict:
         """현재 PM 상태를 다중 방법으로 검증하여 dict로 반환.
 
@@ -5238,11 +5292,18 @@ class NVMeFuzzer:
                     self.ps_exec_counts[self._current_ps] += 1
                     self.combo_exec_counts[self._current_combo] += 1
 
-                # PS3/PS4에서도 IO 명령 포함 모든 타입 허용 — 필터링 없음
+                # Non-Operational PM 상태 복귀 — NVMe 커맨드 전 mandatory
+                # D3hot / L1.2(CLKREQ# deasserted) / PS3/PS4(NOPS) 진입 후
+                # 트랜지션 자체를 퍼징하고, 커맨드는 복귀 후 전송하여 테스트 지속.
+                if (self.config.pm_inject_prob > 0
+                        and self._is_nonop_combo(self._current_combo)):
+                    restored = self._nonop_restore(self._current_combo)
+                    self._current_combo = restored
+                    self._current_ps    = restored.nvme_ps
 
                 # NVMe 커맨드 전송
-                # PS3/PS4: 복귀할 operational PS 기준으로 timeout 결정
-                # D3: wake-up 지연을 위해 D3_TIMEOUT_MULT 추가 적용
+                # PS3/PS4 복귀 후라면 _current_ps=0 이므로 timeout_mult=1
+                # L1/L0+PS1/2: operational이므로 PS_TIMEOUT_MULT 그대로 사용
                 _ps_for_timeout = (self._prev_op_ps
                                    if self.config.pm_inject_prob > 0
                                       and self._current_ps in (3, 4)
