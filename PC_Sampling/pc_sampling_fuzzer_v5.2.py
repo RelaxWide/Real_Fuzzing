@@ -3116,11 +3116,11 @@ class NVMeFuzzer:
             ok = self._setpci_write(ep, ec + 0x10, aspm_val, 0x0003, 'w')   # EP 먼저
             if rp and rc:
                 self._setpci_write(rp, rc + 0x10, aspm_val, 0x0003, 'w')   # RP 나중
-            # 4. Clock PM (LNKCTL ECPM bit8) — CPM 지원 시만
-            if cpm:
-                self._setpci_write(ep, ec + 0x10, 0x0100, 0x0100, 'w')
-                if rp and rc:
-                    self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
+            # 4. Clock PM (LNKCTL ECPM bit8) — CPM 미선언 시도 강제 활성화
+            #    LNKCAP CPM=0은 BIOS가 막은 경우가 많으므로 unconditional write
+            self._setpci_write(ep, ec + 0x10, 0x0100, 0x0100, 'w')
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
             # 5. idle window — LNKCTL 쓴 뒤 PCIe 트래픽 없는 구간 확보
             #    HW가 L1 idle timer 만료 + PM_Request_Ack DLLP 핸드셰이크 처리
             time.sleep(L1_SETTLE)
