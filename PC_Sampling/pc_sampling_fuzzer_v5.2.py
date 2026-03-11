@@ -3230,6 +3230,121 @@ class NVMeFuzzer:
                 'pcie_root_l1ss_offset': self._pcie_root_l1ss_offset,
             })
 
+    def _pm_preflight_check(self) -> bool:
+        """퍼징 시작 전 전체 PowerCombo(30개) 사전 동작 검증.
+
+        각 조합에 대해:
+          1. _set_power_combo() 로 상태 진입
+          2. 정착 대기 (L1.2/D3는 추가 대기)
+          3. nvme id-ctrl 로 NVMe 생존 확인
+          4. PS0+L0+D0 (baseline) 으로 복귀
+        결과 요약 테이블 출력.
+        실패 조합이 있어도 fuzzing 계속 (경고만 출력).
+        """
+        if self.config.pm_inject_prob <= 0:
+            return True
+
+        BASE_SETTLE   = 0.5   # 기본 정착 대기 (초)
+        L1_2_EXTRA    = 0.5   # L1.2 추가 대기
+        D3_EXTRA      = 1.0   # D3 wake-up 추가 대기
+        PROBE_TIMEOUT = 5.0   # nvme id-ctrl 타임아웃
+
+        baseline = POWER_COMBOS[0]  # PS0+L0+D0
+
+        log.warning("=" * 60)
+        log.warning(f"[PM-Preflight] 전체 PowerCombo 사전 검증 시작 "
+                    f"({len(POWER_COMBOS)}개 조합)")
+        log.warning("=" * 60)
+
+        # (combo, ok_set, ok_nvme, ok_restore, elapsed)
+        results: list = []
+        failed_labels: list = []
+
+        for i, combo in enumerate(POWER_COMBOS):
+            log.warning(f"  [{i+1:2d}/{len(POWER_COMBOS)}] {combo.label} 진입 중...")
+            t0 = time.monotonic()
+
+            # 1. 상태 진입
+            ok_set = True
+            try:
+                self._set_power_combo(combo)
+            except Exception as e:
+                log.warning(f"    → _set_power_combo 예외: {e}")
+                ok_set = False
+
+            # 2. 정착 대기
+            settle = BASE_SETTLE
+            if combo.pcie_l == PCIeLState.L1_2:
+                settle += L1_2_EXTRA
+            if combo.pcie_d == PCIeDState.D3:
+                settle += D3_EXTRA
+            time.sleep(settle)
+
+            # 3. NVMe 생존 확인 (nvme id-ctrl)
+            ok_nvme = False
+            try:
+                r = subprocess.run(
+                    ['nvme', 'id-ctrl', self.config.nvme_device],
+                    timeout=PROBE_TIMEOUT,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                ok_nvme = (r.returncode == 0)
+            except Exception as e:
+                log.warning(f"    → nvme id-ctrl 예외: {e}")
+
+            # 4. PS0+L0+D0 복귀
+            ok_restore = True
+            try:
+                self._set_power_combo(baseline)
+                time.sleep(BASE_SETTLE)
+            except Exception as e:
+                log.warning(f"    → baseline 복귀 예외: {e}")
+                ok_restore = False
+
+            elapsed = time.monotonic() - t0
+            results.append((combo, ok_set, ok_nvme, ok_restore, elapsed))
+
+            ok_all = ok_set and ok_nvme and ok_restore
+            mark   = "OK  " if ok_all else "FAIL"
+            log.warning(f"    → SET={'OK' if ok_set else 'FAIL'} "
+                        f"NVMe={'OK' if ok_nvme else 'FAIL'} "
+                        f"RESTORE={'OK' if ok_restore else 'FAIL'} "
+                        f"[{mark}]  ({elapsed:.2f}s)")
+            if not ok_all:
+                failed_labels.append(combo.label)
+
+        # 최종 baseline 복귀 보장
+        try:
+            self._set_power_combo(baseline)
+            time.sleep(BASE_SETTLE)
+        except Exception:
+            pass
+
+        # ── 요약 테이블 ──
+        log.warning("=" * 60)
+        log.warning("[PM-Preflight] 결과 요약")
+        log.warning(f"  {'Combo':<20} {'SET':>5} {'NVMe':>6} {'RESTORE':>8} {'Time':>7}  ")
+        log.warning("  " + "-" * 50)
+        for combo, ok_set, ok_nvme, ok_restore, elapsed in results:
+            mark = "✓" if (ok_set and ok_nvme and ok_restore) else "✗"
+            log.warning(
+                f"  {combo.label:<20} "
+                f"{'OK' if ok_set else 'FAIL':>5} "
+                f"{'OK' if ok_nvme else 'FAIL':>6} "
+                f"{'OK' if ok_restore else 'FAIL':>8} "
+                f"{elapsed:>6.2f}s  {mark}")
+        log.warning("  " + "-" * 50)
+        passed = len(results) - len(failed_labels)
+        log.warning(f"[PM-Preflight] 통과: {passed}/{len(POWER_COMBOS)}")
+        if failed_labels:
+            log.warning(f"[PM-Preflight] 실패 조합: {', '.join(failed_labels)}")
+            log.warning("[PM-Preflight] 실패 조합은 퍼징 중 예상치 못한 동작 유발 가능 — 확인 권장")
+        else:
+            log.warning("[PM-Preflight] 모든 조합 정상 — PM 퍼징 준비 완료")
+        log.warning("=" * 60)
+
+        # 실패 조합이 있어도 fuzzing 계속 (abort하지 않음)
+        return True
+
     def _send_nvme_command(self, data: bytes, seed: Seed, timeout_mult: int = 1) -> int:
         """subprocess(nvme-cli) 기반 NVMe passthru 명령 전송.
         반환값:
@@ -4856,6 +4971,10 @@ class NVMeFuzzer:
             log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
         else:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
+
+        # PM preflight: idle 유니버스 수집 직후, Calibration 직전에 전체 PowerCombo 검증.
+        # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
+        self._pm_preflight_check()
 
         # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
         # _log_smart() 이후에 설정: 이전에 실행하면 admin_timeout=30일 상태에서
