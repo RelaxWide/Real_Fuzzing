@@ -3268,11 +3268,18 @@ class NVMeFuzzer:
     # ── 통합 setter ──────────────────────────────────────────────────
 
     def _set_power_combo(self, combo: PowerCombo) -> None:
-        """NVMe PS + PCIe L/D-state 동시 설정 + cmd_history 기록."""
+        """NVMe PS + PCIe L/D-state 동시 설정 + cmd_history 기록.
+
+        순서: NVMe PS → L-state → D-state
+          L-state를 D3보다 먼저 설정해야 L1/L1.2 ASPM 핸드셰이크가 정상 동작.
+          D3hot 진입 후에는 endpoint가 LTR·CLKREQ# 협상에 참여하지 못해
+          L1.2가 실제로 진입되지 않음.
+          D3hot은 L-state settle(L1_SETTLE) 완료 후 마지막에 적용.
+        """
         t0    = time.monotonic()
         ok_ps = self._pm_set_state(combo.nvme_ps)
-        ok_d  = self._set_pcie_d_state(combo.pcie_d)
-        ok_l  = self._set_pcie_l_state(combo.pcie_l)  # 마지막 — sleep 후 TLP 없음
+        ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — settle sleep 포함
+        ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 마지막 — L-state 안정 후 적용
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
@@ -3639,9 +3646,11 @@ class NVMeFuzzer:
         """nvme id-ctrl 텍스트 출력에서 PS별 enlat/exlat(μs) 파싱 → preflight settle 계산.
 
         formula: settle = (enlat_us + exlat_us) / 1_000_000 * 2 + 0.05
+                 NOPS(nops=1) 최소값: 0.5s (NAND 캐시 플러시 + retention 진입 대기)
         파싱 실패 시 _PS_SETTLE_FALLBACK 유지.
         """
         import re as _re
+        NOPS_MIN_SETTLE = 0.5   # PS3/PS4: NAND retention 진입까지 최소 대기
         parsed: dict[int, float] = {}
         try:
             r = subprocess.run(
@@ -3654,6 +3663,10 @@ class NVMeFuzzer:
                     enlat = int(m.group(2))
                     exlat = int(m.group(3))
                     settle = (enlat + exlat) / 1_000_000 * 2 + 0.05
+                    # NOPS 여부: 같은 줄에 'non-operational' 포함 여부로 판단
+                    is_nops = 'non-operational' in line.lower()
+                    if is_nops:
+                        settle = max(settle, NOPS_MIN_SETTLE)
                     parsed[ps] = max(settle, 0.05)
         except Exception as e:
             log.warning(f"[PS-Settle] id-ctrl 파싱 예외: {e} → fallback 유지")
