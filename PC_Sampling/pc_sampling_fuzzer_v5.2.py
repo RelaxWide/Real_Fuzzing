@@ -365,7 +365,7 @@ L1_2_SETTLE   = 2.0   # L1.2 추가 대기: CLKREQ# 제거 + clock off (초, L1_
 # v5.2+: PS별 preflight settle 시간은 런타임에 nvme id-ctrl로 동적 계산 (_init_ps_settle).
 # formula: (enlat_us + exlat_us) × 2 / 1e6 + 0.05s
 # 파싱 실패 시 아래 fallback 값(초) 사용.
-_PS_SETTLE_FALLBACK: dict[int, float] = {0: 0.05, 1: 0.05, 2: 0.05, 3: 0.1, 4: 0.2}
+_PS_SETTLE_FALLBACK: dict[int, float] = {0: 0.05, 1: 0.05, 2: 0.05, 3: 0.5, 4: 2.0}
 
 # PMU 스크립트 절대경로 — subprocess CWD와 무관하게 항상 올바른 파일 사용
 _PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.py')
@@ -3266,28 +3266,15 @@ class NVMeFuzzer:
     def _set_power_combo(self, combo: PowerCombo) -> None:
         """NVMe PS + PCIe L/D-state 동시 설정 + cmd_history 기록.
 
-        순서: NVMe PS → L-state → D3 → (L1.2 재진입)
-          1. L-state 먼저: ASPM 핸드셰이크·CLKREQ# deassertion을 D3 전에 완료.
-          2. D3 write: setpci(config TLP)가 링크를 L0으로 순간 깨움 → L1.2 리셋.
-          3. L1.2+D3 조합: D3 write 후 CLKREQ# 재 deassertion으로 L1.2 재진입.
-             D3hot에서도 링크 idle 시 L1.2 진입 가능 (spec §5.5.3.3).
+        순서: NVMe PS → D3 → L-state
+          D3 먼저 설정 후 L-state 진입: _set_pcie_l_state() 마지막에 실행되는
+          CLKREQ# deassertion(L1.2)이 D3 직후 타이밍 윈도우에서 동작.
+          device가 D3hot CLKREQ# assert를 시작하기 전에 deassert가 먹히는 구조.
         """
         t0    = time.monotonic()
         ok_ps = self._pm_set_state(combo.nvme_ps)
-        ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — settle sleep 포함
-        ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 write — 링크 순간 깨움
-
-        # D3+L1/L1.2: D3 setpci write(config TLP)가 링크를 L0으로 순간 깨움
-        #   → L1/L1.2 idle 타이머 리셋되므로 재진입 대기 필요
-        if combo.pcie_d == PCIeDState.D3:
-            if combo.pcie_l == PCIeLState.L1_2:
-                # L1.2: CLKREQ# 재 deassertion + clock off 대기
-                subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
-                               timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                time.sleep(L1_SETTLE + L1_2_SETTLE)
-            elif combo.pcie_l == PCIeLState.L1:
-                # L1: idle timer 만료 + PM_Request_Ack DLLP 재대기
-                time.sleep(L1_SETTLE)
+        ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 먼저
+        ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 마지막 — CLKREQ# deassert 포함
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
@@ -3649,11 +3636,13 @@ class NVMeFuzzer:
         """nvme id-ctrl 텍스트 출력에서 PS별 enlat/exlat(μs) 파싱 → preflight settle 계산.
 
         formula: settle = (enlat_us + exlat_us) / 1_000_000 * 2 + 0.05
-                 NOPS(nops=1) 최소값: 0.5s (NAND 캐시 플러시 + retention 진입 대기)
+                 PS3 최소값: 0.5s (NAND 캐시 플러시 + retention 진입 대기)
+                 PS4 최소값: 2.0s (더 깊은 sleep → NAND flush 완료까지 추가 대기)
         파싱 실패 시 _PS_SETTLE_FALLBACK 유지.
         """
         import re as _re
-        NOPS_MIN_SETTLE = 0.5   # PS3/PS4: NAND retention 진입까지 최소 대기
+        NOPS_MIN_SETTLE  = 0.5   # PS3: NAND retention 진입까지 최소 대기
+        PS4_MIN_SETTLE   = 2.0   # PS4: 더 깊은 sleep → NAND flush 완료까지 더 긴 대기
         parsed: dict[int, float] = {}
         try:
             r = subprocess.run(
@@ -3669,7 +3658,8 @@ class NVMeFuzzer:
                     # NOPS 여부: 같은 줄에 'non-operational' 포함 여부로 판단
                     is_nops = 'non-operational' in line.lower()
                     if is_nops:
-                        settle = max(settle, NOPS_MIN_SETTLE)
+                        min_settle = PS4_MIN_SETTLE if ps >= 4 else NOPS_MIN_SETTLE
+                        settle = max(settle, min_settle)
                     parsed[ps] = max(settle, 0.05)
         except Exception as e:
             log.warning(f"[PS-Settle] id-ctrl 파싱 예외: {e} → fallback 유지")
