@@ -3274,18 +3274,7 @@ class NVMeFuzzer:
           D3 나중: D3hot config TLP가 링크를 L0으로 순간 깨우지만,
                    ASPM이 이미 활성화된 상태이므로 링크 idle 후 자동으로 L1/L1.2 재진입.
         """
-        t0 = time.monotonic()
-        # NOPS(PS3/PS4) 진입 전 write cache flush
-        # dirty write cache가 있으면 컨트롤러가 NAND를 켜둬야 해서 완전한 NOPS 진입 불가.
-        # APST도 ITST(Idle Time Seconds Threshold) 동안 I/O 없음을 확인 후 진입하는 이유.
-        if combo.nvme_ps >= 3:
-            try:
-                subprocess.run(
-                    ['nvme', 'flush', self.config.nvme_device, '-n', '1'],
-                    timeout=5.0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                log.warning(f"[PM] Flush 완료 → PS{combo.nvme_ps} NOPS 진입")
-            except Exception as e:
-                log.warning(f"[PM] Flush 실패(무시): {e}")
+        t0    = time.monotonic()
         ok_ps = self._pm_set_state(combo.nvme_ps)
         # NOPS(PS3/PS4) settle: 실제 NAND 파워다운 완료까지 대기
         # 이후 setpci(config TLP)가 링크를 깨우지 않도록 PS 안정화 후 L-state 진입
