@@ -362,11 +362,10 @@ D3_TIMEOUT_MULT = 4   # D3hot wake-up 추가 timeout 배수
 L1_SETTLE     = 5.0   # L1: idle timer + handshake 대기 (초)
 L1_2_SETTLE   = 2.0   # L1.2 추가 대기: CLKREQ# 제거 + clock off (초, L1_SETTLE 이후 추가)
 
-# v5.2: PM-Preflight 전용 PS별 settle 배수 (BASE_SETTLE=0.5s 기준)
-# PS3/PS4는 진입 시 NAND 캐시 플러시가 발생하여 ENLAT(2~3ms)과 무관하게
-# 전력 안정화까지 수백ms~수초 소요됨. EXLAT ≠ 진입 정착 시간.
-# PS4(EXLAT=46ms): NAND retention mode, cache flush 시간이 길어 10배 적용.
-PS_PREFLIGHT_SETTLE = {0: 1, 1: 1, 2: 1, 3: 4, 4: 10}  # × BASE_SETTLE(0.5s)
+# v5.2+: PS별 preflight settle 시간은 런타임에 nvme id-ctrl로 동적 계산 (_init_ps_settle).
+# formula: (enlat_us + exlat_us) × 2 / 1e6 + 0.05s
+# 파싱 실패 시 아래 fallback 값(초) 사용.
+_PS_SETTLE_FALLBACK: dict[int, float] = {0: 0.05, 1: 0.05, 2: 0.05, 3: 0.1, 4: 0.2}
 
 # PMU 스크립트 절대경로 — subprocess CWD와 무관하게 항상 올바른 파일 사용
 _PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.py')
@@ -1216,6 +1215,9 @@ class NVMeFuzzer:
         self._prev_op_combo: PowerCombo  = POWER_COMBOS[0]   # 마지막 non-PS3/4 combo
         self.combo_exec_counts: dict     = defaultdict(int)
         self.combo_enter_counts: dict    = defaultdict(int)
+
+        # v5.2+: PS별 preflight settle 시간 — _init_ps_settle() 호출 후 채워짐
+        self._ps_settle: dict[int, float] = dict(_PS_SETTLE_FALLBACK)
 
         # v5.1: 정적 분석 연동 (Ghidra export — basic_blocks.txt / functions.txt)
         self._sa_loaded: bool = False
@@ -3466,34 +3468,10 @@ class NVMeFuzzer:
         """
         res = {}
 
-        # 0. nvme get-feature FID=0x02 — 컨트롤러가 실제 보고하는 현재 PS 확인
-        #    PS4 진입 후 컨트롤러가 아직 전환 중이면 PS0을 보고할 수 있음
-        try:
-            r = subprocess.run(
-                ['nvme', 'get-feature', self.config.nvme_device, '-f', '0x02'],
-                capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
-                # "get-feature:0x2 (Power Management), Current value:0x00000004" 형태 파싱
-                raw_gf = (r.stdout + r.stderr).strip()
-                cur_ps = None
-                for tok in raw_gf.replace(',', ' ').split():
-                    if tok.startswith('0x') or tok.startswith('0X'):
-                        try:
-                            cur_ps = int(tok, 16)
-                        except ValueError:
-                            pass
-                if cur_ps is not None:
-                    exp_ps = combo.nvme_ps
-                    chk    = 'OK' if cur_ps == exp_ps else f'MISMATCH(exp=PS{exp_ps})'
-                    res['nvme_ps'] = f"PS{cur_ps} {chk}"
-                else:
-                    res['nvme_ps'] = f"parse_fail: {raw_gf[:80]}"
-            else:
-                res['nvme_ps'] = f"FAIL(rc={r.returncode}) {r.stderr.strip()[:60]}"
-        except Exception as e:
-            res['nvme_ps'] = f"ERR({e})"
-
-        # 1. PMU getcurrent
+        # 0. PMU getcurrent — NVMe 커맨드보다 반드시 먼저 측정.
+        #    PS3/PS4(NOPS)는 nvme get-feature 같은 Admin 커맨드를 받는 순간
+        #    컨트롤러가 강제 wake-up되어 NAND 재초기화 transient 전류가 발생함.
+        #    PMU 측정은 JTAG 경로(pmu_4_1.py)이므로 NVMe 링크를 건드리지 않음.
         try:
             r = subprocess.run(
                 ['python3', _PMU_SCRIPT, '3', '1'],
@@ -3502,6 +3480,39 @@ class NVMeFuzzer:
             res['pmu'] = raw if r.returncode == 0 else f"FAIL(rc={r.returncode}) {r.stderr.strip()}"
         except Exception as e:
             res['pmu'] = f"ERR({e})"
+
+        # 1. nvme get-feature FID=0x02 — PS 진입 확인 (PMU 측정 후 수행)
+        #    D3hot: NVMe BAR 접근 불가 → 커널 NVMe 드라이버가 ioctl을 blocking하여
+        #           SIGKILL도 D-sleep 중엔 무시됨 → 드라이버 자체 타임아웃(30~60s)까지 대기.
+        #           D-state는 setpci PMCSR readback으로 이미 검증하므로 skip.
+        #    NOPS(PS3/PS4): 커맨드 수신 시 컨트롤러 wake-up 후 설정된 PS값 반환.
+        if combo.pcie_d == PCIeDState.D3:
+            res['nvme_ps'] = 'skipped (D3hot: NVMe BAR inaccessible)'
+        else:
+            try:
+                r = subprocess.run(
+                    ['nvme', 'get-feature', self.config.nvme_device, '-f', '0x02'],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    # "get-feature:0x2 (Power Management), Current value:0x00000004" 형태 파싱
+                    raw_gf = (r.stdout + r.stderr).strip()
+                    cur_ps = None
+                    for tok in raw_gf.replace(',', ' ').split():
+                        if tok.startswith('0x') or tok.startswith('0X'):
+                            try:
+                                cur_ps = int(tok, 16)
+                            except ValueError:
+                                pass
+                    if cur_ps is not None:
+                        exp_ps = combo.nvme_ps
+                        chk    = 'OK' if cur_ps == exp_ps else f'MISMATCH(exp=PS{exp_ps})'
+                        res['nvme_ps'] = f"PS{cur_ps} {chk}"
+                    else:
+                        res['nvme_ps'] = f"parse_fail: {raw_gf[:80]}"
+                else:
+                    res['nvme_ps'] = f"FAIL(rc={r.returncode}) {r.stderr.strip()[:60]}"
+            except Exception as e:
+                res['nvme_ps'] = f"ERR({e})"
 
         # 2. PMCSR readback — D-state bits[1:0]
         if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
@@ -3581,6 +3592,39 @@ class NVMeFuzzer:
 
         return res
 
+    def _init_ps_settle(self) -> None:
+        """nvme id-ctrl 텍스트 출력에서 PS별 enlat/exlat(μs) 파싱 → preflight settle 계산.
+
+        formula: settle = (enlat_us + exlat_us) / 1_000_000 * 2 + 0.05
+        파싱 실패 시 _PS_SETTLE_FALLBACK 유지.
+        """
+        import re as _re
+        parsed: dict[int, float] = {}
+        try:
+            r = subprocess.run(
+                ['nvme', 'id-ctrl', self.config.nvme_device],
+                capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                m = _re.search(r'ps\s+(\d+)\s*:.*enlat:(\d+)\s+exlat:(\d+)', line)
+                if m:
+                    ps    = int(m.group(1))
+                    enlat = int(m.group(2))
+                    exlat = int(m.group(3))
+                    settle = (enlat + exlat) / 1_000_000 * 2 + 0.05
+                    parsed[ps] = max(settle, 0.05)
+        except Exception as e:
+            log.warning(f"[PS-Settle] id-ctrl 파싱 예외: {e} → fallback 유지")
+
+        if parsed:
+            self._ps_settle.update(parsed)
+            log.warning("[PS-Settle] id-ctrl 기반 settle 계산: " +
+                        ", ".join(f"PS{k}={v*1000:.0f}ms"
+                                  for k, v in sorted(self._ps_settle.items())))
+        else:
+            log.warning("[PS-Settle] id-ctrl 파싱 실패 → fallback: " +
+                        ", ".join(f"PS{k}={v*1000:.0f}ms"
+                                  for k, v in sorted(self._ps_settle.items())))
+
     def _pm_preflight_check(self) -> bool:
         """퍼징 시작 전 전체 PowerCombo(30개) 사전 동작 검증.
         idle 유니버스 수집(diagnose) 직전에 호출됨.
@@ -3598,8 +3642,11 @@ class NVMeFuzzer:
         if self.config.pm_inject_prob <= 0:
             return True
 
-        BASE_SETTLE   = 0.5   # 기본 정착 대기 (초) — L1/L1.2 settle은 _set_pcie_l_state() 내부
-        D3_EXTRA      = 1.0   # D3 wake-up 추가 대기
+        # id-ctrl에서 enlat/exlat 읽어 PS별 settle 시간 동적 계산
+        self._init_ps_settle()
+
+        RESTORE_SETTLE = 0.1   # baseline 복귀 후 안정화 대기 (초)
+        D3_EXTRA      = 1.0   # D3 wake-up 추가 대기 (setpci → NVMe 링크 재초기화)
         PROBE_TIMEOUT = 5.0   # nvme id-ctrl 타임아웃
 
         baseline = POWER_COMBOS[0]  # PS0+L0+D0
@@ -3627,9 +3674,8 @@ class NVMeFuzzer:
 
             # 2. 정착 대기
             #    L1/L1.2 settle은 _set_pcie_l_state() 내부에서 이미 처리됨
-            #    PS3/PS4는 NAND 캐시 플러시 완료까지 수초 소요되므로 PS_PREFLIGHT_SETTLE 배수 적용
-            ps_mult = PS_PREFLIGHT_SETTLE.get(combo.nvme_ps, 1)
-            settle  = BASE_SETTLE * ps_mult
+            #    PS settle은 id-ctrl enlat/exlat 기반으로 동적 계산 (_init_ps_settle)
+            settle = self._ps_settle.get(combo.nvme_ps, 0.05)
             if combo.pcie_d == PCIeDState.D3:
                 settle += D3_EXTRA
             time.sleep(settle)
@@ -3668,7 +3714,7 @@ class NVMeFuzzer:
                     ok_restore = self._pm_d3_safe_restore()
                 else:
                     self._set_power_combo(baseline)
-                time.sleep(BASE_SETTLE)
+                time.sleep(RESTORE_SETTLE)
             except Exception as e:
                 log.warning(f"    → baseline 복귀 예외: {e}")
                 ok_restore = False
@@ -3709,7 +3755,7 @@ class NVMeFuzzer:
         # 최종 baseline 복귀 보장
         try:
             self._pm_d3_safe_restore()
-            time.sleep(BASE_SETTLE)
+            time.sleep(RESTORE_SETTLE)
         except Exception:
             pass
 
