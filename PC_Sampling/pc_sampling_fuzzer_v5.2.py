@@ -3281,11 +3281,17 @@ class NVMeFuzzer:
         ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — settle sleep 포함
         ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 write — 링크 순간 깨움
 
-        # D3+L1.2: setpci write가 L1.2를 깨웠으므로 CLKREQ# 재 deassertion
-        if combo.pcie_d == PCIeDState.D3 and combo.pcie_l == PCIeLState.L1_2:
-            subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
-                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(L1_2_SETTLE)
+        # D3+L1/L1.2: D3 setpci write(config TLP)가 링크를 L0으로 순간 깨움
+        #   → L1/L1.2 idle 타이머 리셋되므로 재진입 대기 필요
+        if combo.pcie_d == PCIeDState.D3:
+            if combo.pcie_l == PCIeLState.L1_2:
+                # L1.2: CLKREQ# 재 deassertion + clock off 대기
+                subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
+                               timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(L1_SETTLE + L1_2_SETTLE)
+            elif combo.pcie_l == PCIeLState.L1:
+                # L1: idle timer 만료 + PM_Request_Ack DLLP 재대기
+                time.sleep(L1_SETTLE)
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
