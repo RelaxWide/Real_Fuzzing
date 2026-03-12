@@ -3239,15 +3239,31 @@ class NVMeFuzzer:
         """setpci로 PMCSR bits[1:0] 설정 (D0=0x00, D3hot=0x03).
         PCI PM cap + 0x04 = PMCSR 레지스터.
         BDF 미탐지 시 False 반환.
+
+        커널 NVMe 드라이버가 setpci 직후 PMCSR을 D0으로 덮어쓸 수 있으므로
+        write 후 readback 검증 + 최대 3회 retry.
         """
         if not self._pcie_bdf or self._pcie_pm_cap_offset is None:
             return False
-        val = 3 if state == PCIeDState.D3 else 0
-        ok  = self._setpci_write(
-            self._pcie_bdf, self._pcie_pm_cap_offset + 0x04, val, 0x0003, 'w')
-        if not ok:
-            log.debug("[PCIe] PMCSR setpci 실패")
-        return ok
+        val     = 3 if state == PCIeDState.D3 else 0
+        exp     = val & 0x3
+        offset  = self._pcie_pm_cap_offset + 0x04
+        for attempt in range(3):
+            ok = self._setpci_write(self._pcie_bdf, offset, val, 0x0003, 'w')
+            if not ok:
+                log.debug(f"[PCIe] PMCSR write 실패 (attempt {attempt+1})")
+                time.sleep(0.05)
+                continue
+            # readback 검증 — 커널 override 확인
+            rb = self._setpci_read(self._pcie_bdf, offset, 'w')
+            if rb is not None and (rb & 0x3) == exp:
+                if attempt > 0:
+                    log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 확인 (attempt {attempt+1})")
+                return True
+            log.debug(f"[PCIe] PMCSR readback={rb:#06x} exp={exp:#04x} — 재시도 (attempt {attempt+1})")
+            time.sleep(0.05)
+        log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 진입 실패 — 커널 override 의심")
+        return False
 
     # ── 통합 setter ──────────────────────────────────────────────────
 
