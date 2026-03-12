@@ -3640,13 +3640,8 @@ class NVMeFuzzer:
                 chk     = 'OK' if l1ss_en == exp_en else f'MISMATCH(exp={exp_en:#03x})'
                 res['l1ss'] = f"L1SS_EN={l1ss_en:#03x} {chk}"
 
-        # 5. sysfs power_state (커널 D-state 뷰)
-        if self._pcie_bdf:
-            try:
-                ps_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/power_state"
-                res['sysfs_d'] = Path(ps_path).read_text().strip()
-            except Exception:
-                res['sysfs_d'] = 'N/A'
+        # sysfs power_state는 커널 PM 뷰 — setpci 직접 write 시 하드웨어와 불일치.
+        # PMCSR readback(d_state)이 실제 하드웨어 레지스터 기준이므로 sysfs는 생략.
 
         return res
 
@@ -3756,7 +3751,7 @@ class NVMeFuzzer:
                 if 'nvme_ps' in verify:
                     log.warning(f"    [verify] NVMe PS    : {verify['nvme_ps']}")
                 if 'd_state' in verify:
-                    log.warning(f"    [verify] D-state    : {verify['d_state']}")
+                    log.warning(f"    [verify] D-state(HW): {verify['d_state']}")
                 if 'l_state_ep' in verify:
                     log.warning(f"    [verify] L-state EP : {verify['l_state_ep']}")
                 if 'l_state_rp' in verify:
@@ -3767,8 +3762,6 @@ class NVMeFuzzer:
                     log.warning(f"    [verify] lspci      : {verify['lspci_lnkctl']}")
                 if 'l1ss' in verify:
                     log.warning(f"    [verify] L1SS       : {verify['l1ss']}")
-                if 'sysfs_d' in verify:
-                    log.warning(f"    [verify] sysfs      : {verify['sysfs_d']}")
 
             # 4. PS0+L0+D0 복귀
             #    D3 포함 combo: D0 먼저(setpci) → Trst → L0 → PS0 순서 필수.
