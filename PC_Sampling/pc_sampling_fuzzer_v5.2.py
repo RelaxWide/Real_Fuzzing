@@ -3518,15 +3518,18 @@ class NVMeFuzzer:
                     ['nvme', 'get-feature', self.config.nvme_device, '-f', '0x02'],
                     capture_output=True, text=True, timeout=5)
                 if r.returncode == 0:
-                    # "get-feature:0x2 (Power Management), Current value:0x00000004" 형태 파싱
+                    # "get-feature:0x2 (Power Management), Current value:0x00000004"
+                    # "get-feature:0x02, Current value: 00000000" 등 다양한 포맷 대응
+                    import re as _re_gf
                     raw_gf = (r.stdout + r.stderr).strip()
                     cur_ps = None
-                    for tok in raw_gf.replace(',', ' ').split():
-                        if tok.startswith('0x') or tok.startswith('0X'):
-                            try:
-                                cur_ps = int(tok, 16)
-                            except ValueError:
-                                pass
+                    m = _re_gf.search(
+                        r'[Cc]urrent\s+value[:\s]+(?:0x)?([0-9a-fA-F]+)', raw_gf)
+                    if m:
+                        try:
+                            cur_ps = int(m.group(1), 16)
+                        except ValueError:
+                            pass
                     if cur_ps is not None:
                         exp_ps = combo.nvme_ps
                         chk    = 'OK' if cur_ps == exp_ps else f'MISMATCH(exp=PS{exp_ps})'
