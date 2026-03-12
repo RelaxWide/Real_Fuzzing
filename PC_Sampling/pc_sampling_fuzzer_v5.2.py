@@ -3308,16 +3308,40 @@ class NVMeFuzzer:
         if self._orig_apst_cdw11 == 0:
             log.warning("[APST] 이미 비활성화 상태 — skip")
             return
+
+        # APST(FID=0x0C)는 CDW11만으로 부족한 장치가 있음.
+        # 256바이트 APST descriptor table(all-zero)을 data buffer로 함께 전송.
+        import tempfile as _tf
+        _ok_apst = False
         try:
-            r = subprocess.run(
-                ['nvme', 'set-feature', dev, '-f', '0x0C', '-v', '0'],
-                capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
-                log.warning(f"[APST] 비활성화 완료 (원본 CDW11={self._orig_apst_cdw11:#010x})")
-            else:
-                log.warning(f"[APST] 비활성화 실패 (rc={r.returncode}): {r.stderr.strip()}")
+            with _tf.NamedTemporaryFile(suffix='.apst') as _f:
+                _f.write(b'\x00' * 256)
+                _f.flush()
+                r = subprocess.run(
+                    ['nvme', 'set-feature', dev, '-f', '0x0C', '-v', '0',
+                     '--data-len=256', f'--data={_f.name}'],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    log.warning(f"[APST] 비활성화 완료 (원본 CDW11={self._orig_apst_cdw11:#010x})")
+                    _ok_apst = True
+                else:
+                    log.warning(f"[APST] set-feature 실패 (rc={r.returncode}): {r.stderr.strip()}")
         except Exception as e:
-            log.warning(f"[APST] set-feature 실패: {e}")
+            log.warning(f"[APST] set-feature 예외: {e}")
+
+        # fallback: sysfs runtime PM 비활성화 — APST는 커널 PM 경유하므로 효과 있음
+        if not _ok_apst and self._pcie_bdf:
+            try:
+                _ctrl = Path(f'/sys/bus/pci/devices/{self._pcie_bdf}/power/control')
+                if _ctrl.exists():
+                    _ctrl.write_text('on')
+                    log.warning("[APST] sysfs power/control=on 으로 runtime PM 비활성화")
+                    _ok_apst = True
+            except Exception as e:
+                log.warning(f"[APST] sysfs fallback 실패: {e}")
+
+        if not _ok_apst:
+            log.warning("[APST] 비활성화 실패 — APST 자율 PS 전환이 MISMATCH 유발할 수 있음")
 
     def _apst_restore(self) -> None:
         """퍼징 종료 시 원본 APST 상태 복원."""
