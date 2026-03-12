@@ -3645,8 +3645,9 @@ class NVMeFuzzer:
         # id-ctrl에서 enlat/exlat 읽어 PS별 settle 시간 동적 계산
         self._init_ps_settle()
 
-        RESTORE_SETTLE = 0.1   # baseline 복귀 후 안정화 대기 (초)
-        D3_EXTRA      = 1.0   # D3 wake-up 추가 대기 (setpci → NVMe 링크 재초기화)
+        RESTORE_SETTLE     = 0.5   # baseline 복귀 후 안정화 대기 (초)
+        D3_RESTORE_SETTLE  = 1.5   # D3→D0 restore 후 NVMe 드라이버 재인식 대기
+        D3_EXTRA           = 1.0   # D3 진입 후 추가 settle (setpci → 링크 안정화)
         PROBE_TIMEOUT = 5.0   # nvme id-ctrl 타임아웃
 
         baseline = POWER_COMBOS[0]  # PS0+L0+D0
@@ -3687,9 +3688,9 @@ class NVMeFuzzer:
             verify = {}
             if ok_set:
                 verify = self._pm_verify_combo(combo)
+                log.warning(f"    [verify] PMU        : {verify.get('pmu', 'N/A')}")
                 if 'nvme_ps' in verify:
                     log.warning(f"    [verify] NVMe PS    : {verify['nvme_ps']}")
-                log.warning(f"    [verify] PMU        : {verify.get('pmu', 'N/A')}")
                 if 'd_state' in verify:
                     log.warning(f"    [verify] D-state    : {verify['d_state']}")
                 if 'l_state_ep' in verify:
@@ -3712,23 +3713,43 @@ class NVMeFuzzer:
             try:
                 if combo.pcie_d == PCIeDState.D3:
                     ok_restore = self._pm_d3_safe_restore()
+                    time.sleep(D3_RESTORE_SETTLE)
                 else:
                     self._set_power_combo(baseline)
-                time.sleep(RESTORE_SETTLE)
+                    time.sleep(RESTORE_SETTLE)
             except Exception as e:
                 log.warning(f"    → baseline 복귀 예외: {e}")
                 ok_restore = False
 
-            # 5. NVMe 생존 확인 — 복귀 완료 후 probe (D3 중에는 응답 불가)
-            ok_nvme = False
-            try:
-                r = subprocess.run(
-                    ['nvme', 'id-ctrl', self.config.nvme_device],
-                    timeout=PROBE_TIMEOUT,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                ok_nvme = (r.returncode == 0)
-            except Exception as e:
-                log.warning(f"    → nvme id-ctrl 예외: {e}")
+            # 5. 복귀 검증 — PMU current + get-feature(PS0 확인)
+            #    PMU: PS0 복귀 후 정상 전류 확인
+            #    get-feature: PS0(0x00) 반환 여부 — MISMATCH면 이전 PS가 남아있는 것
+            ok_nvme   = False
+            rv_verify = {}
+            if ok_restore:
+                rv_verify = self._pm_verify_combo(baseline)
+                rv_pmu = rv_verify.get('pmu', 'N/A')
+                log.warning(f"    [restore] PMU       : {rv_pmu}")
+                if 'nvme_ps' in rv_verify:
+                    rv_ps = rv_verify['nvme_ps']
+                    log.warning(f"    [restore] NVMe PS   : {rv_ps}")
+                    if 'MISMATCH' in rv_ps:
+                        log.warning(f"    → 복귀 실패: PS0으로 돌아오지 않음")
+                        ok_restore = False
+                # get-feature 성공 = NVMe 응답 정상
+                ok_nvme = ('nvme_ps' in rv_verify and
+                           'ERR' not in rv_verify['nvme_ps'] and
+                           'FAIL' not in rv_verify['nvme_ps'])
+            if not ok_nvme:
+                # fallback: nvme id-ctrl 로 생존만 확인
+                try:
+                    r = subprocess.run(
+                        ['nvme', 'id-ctrl', self.config.nvme_device],
+                        timeout=PROBE_TIMEOUT,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    ok_nvme = (r.returncode == 0)
+                except Exception as e:
+                    log.warning(f"    → nvme id-ctrl 예외: {e}")
 
             elapsed  = time.monotonic() - t0
             # pmu 출력은 멀티라인 (CLI 경로 echo 포함) — 숫자만 있는 줄을 추출
@@ -3755,7 +3776,7 @@ class NVMeFuzzer:
         # 최종 baseline 복귀 보장
         try:
             self._pm_d3_safe_restore()
-            time.sleep(RESTORE_SETTLE)
+            time.sleep(D3_RESTORE_SETTLE)
         except Exception:
             pass
 
