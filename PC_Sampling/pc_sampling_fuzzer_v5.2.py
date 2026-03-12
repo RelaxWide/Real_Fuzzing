@@ -3159,13 +3159,6 @@ class NVMeFuzzer:
                     f"[PCIe] L1.2: ASPM L1.2 미지원 (L1SSCAP={self._pcie_l1ss_cap:#010x})")
                 return False
 
-            # LTR threshold 상수
-            #   LL1_2TV = 0xa (value) at bits[25:16]  → Linux: PCI_L1SS_CTL1_LTR_L12_TH_VALUE
-            #   LL1_2TS = 2   (scale) at bits[31:29]  → Linux: PCI_L1SS_CTL1_LTR_L12_TH_SCALE
-            #   scale=2 → 1024ns 단위, threshold = 10 × 1024ns = 10.24µs
-            LTR_VAL  = (0xa << 16) | (2 << 29)   # 0x400A_0000
-            LTR_MASK = 0xE3FF_0000                # bits[31:29] | bits[25:16]
-
             # Step 1: L1SS enable bits 비활성화 (양측) — spec §5.5.4.1 step 2
             if el:
                 self._setpci_write(ep, el + 0x08, 0x00000000, 0x0000000F)
@@ -3178,21 +3171,11 @@ class NVMeFuzzer:
             except Exception:
                 pass
 
-            # Step 3: DEVCTL2 LTRE (bit10) 활성화 — LTR 메커니즘 필수 (양측)
-            #   PCI_EXP_DEVCTL2 = PCIe cap + 0x28
-            self._setpci_write(ep, ec + 0x28, 0x0400, 0x0400, 'w')
-            if rp and rc:
-                self._setpci_write(rp, rc + 0x28, 0x0400, 0x0400, 'w')
-
-            # Step 4: L1SSCTL1 LTR threshold 설정 (enable bits 제외) — spec step 4
-            if el:
-                self._setpci_write(ep, el + 0x08, LTR_VAL, LTR_MASK)
-            if rp and rl:
-                self._setpci_write(rp, rl + 0x08, LTR_VAL, LTR_MASK)
-
-            # Step 5: L1SSCTL1 enable bits — L1SSCAP 지원 비트만 활성화
+            # Step 3: L1SSCTL1 enable bits — L1SSCAP 지원 비트만 활성화
             #   bit0: PCI-PM L1.2, bit1: PCI-PM L1.1, bit2: ASPM L1.2, bit3: ASPM L1.1
             #   upstream(RP) 먼저 enable — spec §5.5.4.1 step 5
+            # LTRE(LTR Enable) 미사용: PMU GPIO로 CLKREQ#를 직접 제어하므로
+            #   RP 자율 판단 메커니즘(LTR) 불필요. LTRE 활성화 시 LTR 메시지 오버헤드 발생.
             l1ss_en = self._pcie_l1ss_cap & 0xF
             if rp and rl:
                 self._setpci_write(rp, rl + 0x08, l1ss_en, 0x0000000F)
@@ -3227,11 +3210,6 @@ class NVMeFuzzer:
                         log.debug(
                             f"[PCIe] L1.2 verify L1SSCTL1 enable="
                             f"{rb_l1ss & 0xF:#04x} (expected {l1ss_en:#04x})")
-                    if (rb_l1ss & LTR_MASK) != (LTR_VAL & LTR_MASK):
-                        log.debug(
-                            f"[PCIe] L1.2 verify LTR threshold="
-                            f"{rb_l1ss & LTR_MASK:#010x} "
-                            f"(expected {LTR_VAL & LTR_MASK:#010x})")
 
             # [PMU] CLKREQ# Deassert — 레지스터 설정·검증 완료 후 마지막 수행
             #   루트 포트가 CLKREQ# 비활성 감지 → 레퍼런스 클록 제거 → 실제 L1.2 진입.
