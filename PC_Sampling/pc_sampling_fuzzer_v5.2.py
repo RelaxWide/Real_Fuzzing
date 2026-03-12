@@ -3115,13 +3115,16 @@ class NVMeFuzzer:
                 self._setpci_write(ep, el + 0x08, 0x00000000, 0x0000000F)
             if rp and rl:
                 self._setpci_write(rp, rl + 0x08, 0x00000000, 0x0000000F)
-            # 2. DEVCTL2 LTRE clear (bit10) — LTR 메커니즘 비활성화
-            #    NOPS(PS3/PS4)에서 device가 CLKREQ#를 자연적으로 deassert할 수 있도록.
-            #    LTRE 활성화 상태에서는 LTR 조건 체크가 CLKREQ# deassert를 방해함.
+            # 2. DEVCTL2 LTRE clear (bit10) — L1.2 잔류 방지
             self._setpci_write(ep, ec + 0x28, 0x0000, 0x0400, 'w')
             if rp and rc:
                 self._setpci_write(rp, rc + 0x28, 0x0000, 0x0400, 'w')
-            # 3. 전역 ASPM 정책 → powersave (커널 override 방지)
+            # 3. PMU CLKREQ# Assert — NOPS device의 자연적 deassert 차단
+            #    CLKREQ#가 deassert되면 RP가 ref clock을 제거해 L1.2로 진입.
+            #    L1 조합에서는 clock을 유지해야 하므로 pin16으로 강제 assert.
+            subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
+                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 4. 전역 ASPM 정책 → powersave (커널 override 방지)
             try:
                 Path('/sys/module/pcie_aspm/parameters/policy').write_text('powersave')
             except Exception:
@@ -3132,12 +3135,12 @@ class NVMeFuzzer:
             ok = self._setpci_write(ep, ec + 0x10, aspm_val, 0x0003, 'w')   # EP 먼저
             if rp and rc:
                 self._setpci_write(rp, rc + 0x10, aspm_val, 0x0003, 'w')   # RP 나중
-            # 5. Clock PM (LNKCTL ECPM bit8) — CPM 미선언 시도 강제 활성화
+            # 6. Clock PM (LNKCTL ECPM bit8) — CPM 미선언 시도 강제 활성화
             #    LNKCAP CPM=0은 BIOS가 막은 경우가 많으므로 unconditional write
             self._setpci_write(ep, ec + 0x10, 0x0100, 0x0100, 'w')
             if rp and rc:
                 self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
-            # 6. idle window — LNKCTL 쓴 뒤 PCIe 트래픽 없는 구간 확보
+            # 7. idle window — LNKCTL 쓴 뒤 PCIe 트래픽 없는 구간 확보
             #    HW가 L1 idle timer 만료 + PM_Request_Ack DLLP 핸드셰이크 처리
             time.sleep(L1_SETTLE)
             return ok
