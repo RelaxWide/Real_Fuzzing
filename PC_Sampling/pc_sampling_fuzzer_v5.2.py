@@ -3236,34 +3236,64 @@ class NVMeFuzzer:
     # ── D-state (PCI PM) ─────────────────────────────────────────────
 
     def _set_pcie_d_state(self, state: PCIeDState) -> bool:
-        """setpci로 PMCSR bits[1:0] 설정 (D0=0x00, D3hot=0x03).
-        PCI PM cap + 0x04 = PMCSR 레지스터.
-        BDF 미탐지 시 False 반환.
+        """PCIe D-state 설정.
 
-        커널 NVMe 드라이버가 setpci 직후 PMCSR을 D0으로 덮어쓸 수 있으므로
-        write 후 readback 검증 + 최대 3회 retry.
+        D3hot: 커널 sysfs runtime PM 경로 우선 사용.
+          power/control=auto + autosuspend_delay_ms=0 → 커널이 NVMe 정지 후 D3 전환.
+          runtime_status=suspended 확인 시 링크 트래픽 없이 진짜 D3 진입.
+          sysfs 실패 시 setpci PMCSR 직접 write(fallback).
+
+        D0: power/control=on으로 복귀 후 setpci D0.
+        BDF 미탐지 시 False 반환.
         """
         if not self._pcie_bdf or self._pcie_pm_cap_offset is None:
             return False
-        val     = 3 if state == PCIeDState.D3 else 0
-        exp     = val & 0x3
-        offset  = self._pcie_pm_cap_offset + 0x04
-        for attempt in range(3):
-            ok = self._setpci_write(self._pcie_bdf, offset, val, 0x0003, 'w')
-            if not ok:
-                log.debug(f"[PCIe] PMCSR write 실패 (attempt {attempt+1})")
+
+        bdf    = self._pcie_bdf
+        offset = self._pcie_pm_cap_offset + 0x04
+
+        if state == PCIeDState.D3:
+            # ── 커널 runtime PM 경로 ──────────────────────────────────
+            _ctrl  = Path(f'/sys/bus/pci/devices/{bdf}/power/control')
+            _delay = Path(f'/sys/bus/pci/devices/{bdf}/power/autosuspend_delay_ms')
+            _status= Path(f'/sys/bus/pci/devices/{bdf}/power/runtime_status')
+            try:
+                _delay.write_text('0')
+                _ctrl.write_text('auto')
+                # runtime_status = suspended 될 때까지 대기 (최대 5s)
+                for _ in range(50):
+                    if _status.read_text().strip() == 'suspended':
+                        log.warning("[PCIe] D3hot: kernel runtime PM → suspended 확인")
+                        return True
+                    time.sleep(0.1)
+                log.warning("[PCIe] D3hot: kernel PM timeout — setpci fallback")
+            except Exception as e:
+                log.warning(f"[PCIe] D3hot: sysfs PM 실패({e}) — setpci fallback")
+
+            # ── fallback: setpci 직접 write + readback 검증 ───────────
+            for attempt in range(3):
+                self._setpci_write(bdf, offset, 3, 0x0003, 'w')
+                rb = self._setpci_read(bdf, offset, 'w')
+                if rb is not None and (rb & 0x3) == 3:
+                    return True
                 time.sleep(0.05)
-                continue
-            # readback 검증 — 커널 override 확인
-            rb = self._setpci_read(self._pcie_bdf, offset, 'w')
-            if rb is not None and (rb & 0x3) == exp:
-                if attempt > 0:
-                    log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 확인 (attempt {attempt+1})")
-                return True
-            log.debug(f"[PCIe] PMCSR readback={rb:#06x} exp={exp:#04x} — 재시도 (attempt {attempt+1})")
-            time.sleep(0.05)
-        log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 진입 실패 — 커널 override 의심")
-        return False
+            log.warning("[PCIe] PMCSR D3hot 진입 실패")
+            return False
+
+        else:  # D0
+            # ── power/control=on 복귀 후 setpci D0 ───────────────────
+            try:
+                Path(f'/sys/bus/pci/devices/{bdf}/power/control').write_text('on')
+            except Exception:
+                pass
+            for attempt in range(3):
+                self._setpci_write(bdf, offset, 0, 0x0003, 'w')
+                rb = self._setpci_read(bdf, offset, 'w')
+                if rb is not None and (rb & 0x3) == 0:
+                    return True
+                time.sleep(0.05)
+            log.warning("[PCIe] PMCSR D0 복귀 실패")
+            return False
 
     # ── 통합 setter ──────────────────────────────────────────────────
 
