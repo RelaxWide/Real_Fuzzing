@@ -3270,16 +3270,22 @@ class NVMeFuzzer:
     def _set_power_combo(self, combo: PowerCombo) -> None:
         """NVMe PS + PCIe L/D-state 동시 설정 + cmd_history 기록.
 
-        순서: NVMe PS → L-state → D-state
-          L-state를 D3보다 먼저 설정해야 L1/L1.2 ASPM 핸드셰이크가 정상 동작.
-          D3hot 진입 후에는 endpoint가 LTR·CLKREQ# 협상에 참여하지 못해
-          L1.2가 실제로 진입되지 않음.
-          D3hot은 L-state settle(L1_SETTLE) 완료 후 마지막에 적용.
+        순서: NVMe PS → L-state → D3 → (L1.2 재진입)
+          1. L-state 먼저: ASPM 핸드셰이크·CLKREQ# deassertion을 D3 전에 완료.
+          2. D3 write: setpci(config TLP)가 링크를 L0으로 순간 깨움 → L1.2 리셋.
+          3. L1.2+D3 조합: D3 write 후 CLKREQ# 재 deassertion으로 L1.2 재진입.
+             D3hot에서도 링크 idle 시 L1.2 진입 가능 (spec §5.5.3.3).
         """
         t0    = time.monotonic()
         ok_ps = self._pm_set_state(combo.nvme_ps)
         ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — settle sleep 포함
-        ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 마지막 — L-state 안정 후 적용
+        ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 write — 링크 순간 깨움
+
+        # D3+L1.2: setpci write가 L1.2를 깨웠으므로 CLKREQ# 재 deassertion
+        if combo.pcie_d == PCIeDState.D3 and combo.pcie_l == PCIeLState.L1_2:
+            subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
+                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(L1_2_SETTLE)
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
