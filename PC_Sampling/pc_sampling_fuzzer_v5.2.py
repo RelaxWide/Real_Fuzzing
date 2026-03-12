@@ -3266,15 +3266,22 @@ class NVMeFuzzer:
     def _set_power_combo(self, combo: PowerCombo) -> None:
         """NVMe PS + PCIe L/D-state 동시 설정 + cmd_history 기록.
 
-        순서: NVMe PS → D3 → L-state
-          D3 먼저 설정 후 L-state 진입: _set_pcie_l_state() 마지막에 실행되는
-          CLKREQ# deassertion(L1.2)이 D3 직후 타이밍 윈도우에서 동작.
-          device가 D3hot CLKREQ# assert를 시작하기 전에 deassert가 먹히는 구조.
+        순서: NVMe PS → L-state → D3
+          L-state 먼저: EP↔RP 간 ASPM 협상 완료 + CLKREQ# deassert(L1.2)까지 완료.
+          D3 나중: D3hot config TLP가 링크를 L0으로 순간 깨우지만,
+                   ASPM이 이미 활성화된 상태이므로 링크 idle 후 자동으로 L1/L1.2 재진입.
+          D3hot device는 I/O가 없으므로 D3 write 직후 링크가 빠르게 idle → L1/L1.2.
         """
         t0    = time.monotonic()
         ok_ps = self._pm_set_state(combo.nvme_ps)
-        ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 먼저
-        ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 마지막 — CLKREQ# deassert 포함
+        ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — ASPM 협상 완료
+        ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 나중 — 링크 idle 후 자동 재진입
+        # D3+L1/L1.2: D3 config TLP가 링크를 순간 깨움 → 재진입 대기
+        if combo.pcie_d == PCIeDState.D3:
+            if combo.pcie_l == PCIeLState.L1_2:
+                time.sleep(L1_SETTLE + L1_2_SETTLE)
+            elif combo.pcie_l == PCIeLState.L1:
+                time.sleep(L1_SETTLE)
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
