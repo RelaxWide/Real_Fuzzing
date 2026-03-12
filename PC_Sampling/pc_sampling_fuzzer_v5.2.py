@@ -3724,8 +3724,14 @@ class NVMeFuzzer:
         results: list = []
         failed_labels: list = []
 
-        for i, combo in enumerate(POWER_COMBOS):
-            log.warning(f"  [{i+1:2d}/{len(POWER_COMBOS)}] {combo.label} 진입 중...")
+        # D0 먼저 전체 L×PS, 그 다음 D3 전체 L×PS
+        _preflight_order = sorted(
+            POWER_COMBOS,
+            key=lambda c: (int(c.pcie_d), int(c.pcie_l), c.nvme_ps)
+        )
+
+        for i, combo in enumerate(_preflight_order):
+            log.warning(f"  [{i+1:2d}/{len(_preflight_order)}] {combo.label} 진입 중...")
             t0 = time.monotonic()
 
             # 1. 상태 진입
