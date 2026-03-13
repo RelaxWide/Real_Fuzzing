@@ -5748,19 +5748,32 @@ class NVMeFuzzer:
                     pt = "admin-passthru" if cmd.cmd_type == NVMeCommandType.ADMIN else "io-passthru"
                 self.passthru_stats[pt] += 1
 
-                # v5.1: 현재 PS 상태별 실행 카운트
+                # v5.4: 매 명령 직전 PM combo 진입 (per-command PM entry)
+                # preflight와 동일 패턴: enter → restore if nonop → NVMe command
                 if self.config.pm_inject_prob > 0:
-                    self.ps_exec_counts[self._current_ps] += 1
-                    self.combo_exec_counts[self._current_combo] += 1
+                    _next_combo = random.choice(POWER_COMBOS)
+                    if _next_combo.nvme_ps not in (3, 4):
+                        self._prev_op_ps    = _next_combo.nvme_ps
+                        self._prev_op_combo = _next_combo
+                    self._set_power_combo(_next_combo)
+                    self._current_combo = _next_combo
+                    self._current_ps    = _next_combo.nvme_ps
+                    self.ps_enter_counts[_next_combo.nvme_ps] += 1
+                    self.combo_enter_counts[_next_combo] += 1
 
                 # Non-Operational PM 상태 복귀 — NVMe 커맨드 전 mandatory
-                # D3hot / L1.2(CLKREQ# deasserted) / PS3/PS4(NOPS) 진입 후
-                # 트랜지션 자체를 퍼징하고, 커맨드는 복귀 후 전송하여 테스트 지속.
+                # D3hot / L1.2(CLKREQ# deasserted): 커맨드 전 반드시 복귀 필요.
+                # PS3/PS4(NOPS): 컨트롤러 자동 wake — 복귀 불필요.
                 if (self.config.pm_inject_prob > 0
                         and self._is_nonop_combo(self._current_combo)):
                     restored = self._nonop_restore(self._current_combo)
                     self._current_combo = restored
                     self._current_ps    = restored.nvme_ps
+
+                # 실제 명령 전송 상태 기준 실행 카운트 (nonop restore 반영)
+                if self.config.pm_inject_prob > 0:
+                    self.ps_exec_counts[self._current_ps] += 1
+                    self.combo_exec_counts[self._current_combo] += 1
 
                 # NVMe 커맨드 전송
                 # PS3/PS4 복귀 후라면 _current_ps=0 이므로 timeout_mult=1
@@ -5894,20 +5907,7 @@ class NVMeFuzzer:
                     _wexec = self.executions - self._window_exec0
                     _window_eps = _wexec / _wdt if _wdt > 0 else 0
 
-                    # v5.2: Power Combo 로테이션 — exec/s 계산 후 전환
-                    if self.config.pm_inject_prob > 0:
-                        next_combo = random.choice(POWER_COMBOS)
-                        # PS3/PS4 timeout 기준 업데이트 (operational PS 기준)
-                        if next_combo.nvme_ps not in (3, 4):
-                            self._prev_op_ps    = next_combo.nvme_ps
-                            self._prev_op_combo = next_combo
-                        self._set_power_combo(next_combo)
-                        self._current_combo = next_combo
-                        self._current_ps    = next_combo.nvme_ps   # 기존 timeout 로직 호환
-                        self.ps_enter_counts[next_combo.nvme_ps] += 1
-                        self.combo_enter_counts[next_combo] += 1
-
-                    # 윈도우 리셋은 PM 전환 완료 후 — 전환 시간이 다음 윈도우에도 포함되지 않음
+                    # 윈도우 리셋 (PM 전환은 per-command으로 이동됨 — v5.4)
                     self._window_t0 = datetime.now()
                     self._window_exec0 = self.executions
 
