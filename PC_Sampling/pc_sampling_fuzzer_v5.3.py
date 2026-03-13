@@ -668,6 +668,30 @@ class FuzzConfig:
     pm_inject_prob: float = 0.0
 
 
+class _FuzzingTerminalFilter(logging.Filter):
+    """메인 퍼징 루프 중 터미널 출력을 필요한 정보로만 제한.
+
+    허용 항목:
+      [Stats] / [StatCov]  — 주기 통계 (exec, corpus, coverage, ...)
+      [PM]                 — PM combo 전환 / NonOp restore
+      [+]                  — 신규 커버리지 발견
+      CRASH / FAIL CMD     — 크래시·커맨드 실패
+      =====                — 섹션 구분선
+      ERROR / CRITICAL     — 예외 없이 항상 출력
+
+    나머지는 파일 로그에만 기록됨.
+    """
+    import re as _re
+    _ALLOW = _re.compile(
+        r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR:
+            return True
+        return bool(self._ALLOW.search(record.getMessage()))
+
+
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     """파일 + 콘솔 동시 로깅 설정 (실행마다 날짜시간 로그 파일 생성)"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -685,13 +709,14 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # 파일: 매 실행마다 새 파일 생성
+    # 파일: 매 실행마다 새 파일 생성 (INFO 이상 전체 기록)
     fh = logging.FileHandler(log_file)
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    # 콘솔
+    # 콘솔: 초기화 단계에서는 WARNING 이상 전부 출력
+    # 메인 퍼징 루프 진입 시 _FuzzingTerminalFilter 추가로 제한됨
     ch = logging.StreamHandler()
     ch.setLevel(logging.WARNING)
     ch.setFormatter(fmt)
@@ -5684,6 +5709,11 @@ class NVMeFuzzer:
         self._window_t0 = self.start_time          # 구간별 exec/s 계산용
         self._window_exec0: int = 0
 
+        # 메인 퍼징 루프 진입 — 터미널 출력을 [Stats]/[PM]/[+]/CRASH 로만 제한
+        for _h in log.handlers:
+            if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
+                _h.addFilter(_FuzzingTerminalFilter())
+
         try:
             while True:
                 elapsed = (datetime.now() - self.start_time).total_seconds()
@@ -5749,9 +5779,10 @@ class NVMeFuzzer:
                     pt = "admin-passthru" if cmd.cmd_type == NVMeCommandType.ADMIN else "io-passthru"
                 self.passthru_stats[pt] += 1
 
-                # v5.4: 매 명령 직전 PM combo 진입 (per-command PM entry)
-                # preflight와 동일 패턴: enter → restore if nonop → NVMe command
-                if self.config.pm_inject_prob > 0:
+                # PM combo 로테이션 — NVMe 명령 직전, PM_ROTATE_INTERVAL마다 새 combo 진입
+                # preflight와 동일 패턴: enter combo → restore if nonop → NVMe command
+                if (self.config.pm_inject_prob > 0
+                        and self.executions % PM_ROTATE_INTERVAL == 0):
                     _next_combo = random.choice(POWER_COMBOS)
                     if _next_combo.nvme_ps not in (3, 4):
                         self._prev_op_ps    = _next_combo.nvme_ps
@@ -5880,9 +5911,9 @@ class NVMeFuzzer:
                     with open(str(corpus_file) + '.json', 'w') as f:
                         json.dump(self._seed_meta(new_seed), f)
 
-                    log.info(f"[+] New coverage! cmd={cmd.name} "
-                             f"CDW10=0x{mutated_seed.cdw10:08x} "
-                             f"+{new_pcs} PCs (total: {len(self.sampler.global_coverage)} pcs)")
+                    log.warning(f"[+] New coverage! cmd={cmd.name} "
+                                f"CDW10=0x{mutated_seed.cdw10:08x} "
+                                f"+{new_pcs} PCs (total: {len(self.sampler.global_coverage)} pcs)")
 
                     # v4.5: 새 seed에 대해 deterministic stage 등록
                     if self.config.deterministic_enabled and not new_seed.det_done:
