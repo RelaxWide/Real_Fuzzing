@@ -6392,7 +6392,7 @@ if __name__ == "__main__":
     )
 
     # v5.3: CLI 지정 L1/L1.2 settle time 전역 변수 override (항상 적용)
-    global L1_SETTLE, L1_2_SETTLE
+    # if __name__ == "__main__" 블록은 모듈 레벨이므로 global 선언 불필요
     L1_SETTLE   = args.l1_settle
     L1_2_SETTLE = args.l1_2_settle
 
