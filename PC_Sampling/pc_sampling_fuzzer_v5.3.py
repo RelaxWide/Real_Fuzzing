@@ -395,13 +395,13 @@ D3_TIMEOUT_MULT = 4   # D3hot wake-up 추가 timeout 배수
 
 # PCIe L1 / L1.2 진입 settle 시간 (v5.2 기본값)
 # --l1-settle / --l1-2-settle CLI로 런타임 조정 가능.
-L1_SETTLE     = 5.0    # L1: idle timer + PM_Request_Ack DLLP handshake 대기 (초)
-L1_2_SETTLE   = 2.0    # L1.2 추가 대기: CLKREQ# deassert → Tclkoff 완료 (초)
+L1_SETTLE     = 0.05   # L1: idle timer + PM_Request_Ack DLLP handshake 대기 (초)
+L1_2_SETTLE   = 0.05   # L1.2 추가 대기: CLKREQ# deassert → Tclkoff 완료 (초)
 
-# preflight + 메인 퍼징 공통 settle 상수 (v5.2 기본값, CLI로 동시 조정 가능)
-RESTORE_SETTLE_S      = 0.5   # baseline 복귀 후 안정화 대기 (초)
-D3_RESTORE_SETTLE_S   = 1.5   # D3→D0 restore 후 NVMe 드라이버 재인식 대기 (초)
-D3_EXTRA_S            = 1.0   # D3 진입 후 추가 settle (setpci → 링크 안정화) (초)
+# preflight + 메인 퍼징 공통 settle 상수 (CLI로 동시 조정 가능)
+RESTORE_SETTLE_S      = 0.1   # baseline 복귀 후 안정화 대기 (초)
+D3_RESTORE_SETTLE_S   = 0.5   # D3→D0 restore 후 NVMe 드라이버 재인식 대기 (초)
+D3_EXTRA_S            = 0.2   # D3 진입 후 추가 settle (setpci → 링크 안정화) (초)
 
 # v5.2+: PS별 preflight settle 시간은 런타임에 nvme id-ctrl로 동적 계산 (_init_ps_settle).
 # formula: (enlat_us + exlat_us) × 2 / 1e6 + 0.05s
@@ -414,9 +414,9 @@ _PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.
 # v4.7: Idle 유니버스 수집 (diagnose 수렴 설정, v5.2 기본값)
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
 # 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
-DIAGNOSE_STABILITY  = 100   # 새 idle PC 없이 연속 N회면 수렴으로 판정
-DIAGNOSE_MAX        = 5000  # 수렴 전 최대 샘플 수 (상한)
-DIAGNOSE_SAMPLE_MS  = 50    # diagnose() 샘플 간격 (ms). --diagnose-sleep-ms로 조정 가능.
+DIAGNOSE_STABILITY  = 50    # 새 idle PC 없이 연속 N회면 수렴으로 판정
+DIAGNOSE_MAX        = 2000  # 수렴 전 최대 샘플 수 (상한)
+DIAGNOSE_SAMPLE_MS  = 10    # diagnose() 샘플 간격 (ms). --diagnose-sleep-ms로 조정 가능.
 
 # v4.5: Calibration 설정
 CALIBRATION_RUNS  = 3      # 초기 시드당 calibration 실행 횟수 (0 = 비활성화)
