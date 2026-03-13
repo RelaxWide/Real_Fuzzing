@@ -393,14 +393,12 @@ POWER_COMBOS: list = [
 
 D3_TIMEOUT_MULT = 4   # D3hot wake-up 추가 timeout 배수
 
-# PCIe L1 진입 settle 시간
-# v5.3: 실측 기반으로 대폭 단축.
-# PCIe ASPM L1 idle timer(수 μs) + PM_Request_Ack DLLP(수 μs~ms) = 실측 <1ms.
-# CLKREQ# deassert → Tclkoff: PCIe spec Tclkoff <10ms.
-# 5s/2s는 극도로 conservative → 50ms로 단축 (throughput 98% 개선).
-# 실제 L1.2 진입 여부 검증이 필요한 경우 --l1-settle / --l1-2-settle CLI로 조정 가능.
-L1_SETTLE     = 0.05   # L1: idle timer + handshake 대기 (초). v5.3: 5.0 → 0.05
-L1_2_SETTLE   = 0.05   # L1.2 추가 대기: CLKREQ# 제거 + clock off (초). v5.3: 2.0 → 0.05
+# PCIe L1 / L1.2 / D3 진입 settle 시간
+# 제품별 링크 타이밍 편차를 고려해 v5.3 대비 보수적 값으로 상향.
+# --l1-settle / --l1-2-settle / --d3-settle CLI로 런타임 조정 가능.
+L1_SETTLE     = 0.3    # L1: idle timer + PM_Request_Ack DLLP handshake 대기 (초)
+L1_2_SETTLE   = 0.3    # L1.2 추가 대기: CLKREQ# deassert → Tclkoff 완료 (초)
+D3_SETTLE     = 0.5    # D3hot: PMCSR write 후 컨트롤러 power-down 완료 대기 (초)
 
 # v5.2+: PS별 preflight settle 시간은 런타임에 nvme id-ctrl로 동적 계산 (_init_ps_settle).
 # formula: (enlat_us + exlat_us) × 2 / 1e6 + 0.05s
@@ -644,6 +642,7 @@ class FuzzConfig:
     # v5.3: PCIe settle — 전역 상수 대신 config 필드로 관리 (CLI override 가능)
     l1_settle: float = L1_SETTLE
     l1_2_settle: float = L1_2_SETTLE
+    d3_settle: float = D3_SETTLE
 
     # v4.5: Calibration
     calibration_runs: int = CALIBRATION_RUNS
@@ -3360,12 +3359,14 @@ class NVMeFuzzer:
             time.sleep(ps_settle)
         ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — ASPM 협상 완료
         ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 나중 — 링크 idle 후 자동 재진입
-        # D3+L1/L1.2: D3 config TLP가 링크를 순간 깨움 → 재진입 대기
+        # D3 진입 후: PMCSR write → 컨트롤러 power-down + 링크 재진입 대기
         if combo.pcie_d == PCIeDState.D3:
             if combo.pcie_l == PCIeLState.L1_2:
-                time.sleep(self.config.l1_settle + self.config.l1_2_settle)
+                time.sleep(self.config.d3_settle + self.config.l1_settle + self.config.l1_2_settle)
             elif combo.pcie_l == PCIeLState.L1:
-                time.sleep(self.config.l1_settle)
+                time.sleep(self.config.d3_settle + self.config.l1_settle)
+            else:  # L0 + D3: 링크 re-entry 없음, D3 power-down settle만
+                time.sleep(self.config.d3_settle)
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
@@ -6236,10 +6237,11 @@ if __name__ == "__main__":
                              f'(default: {DIAGNOSE_SAMPLE_MS}). '
                              'SWD+레벨시프터 불안정 환경: 50으로 복원')
     parser.add_argument('--l1-settle', type=float, default=L1_SETTLE,
-                        help=f'PCIe L1 진입 후 settle 대기 (초). (default: {L1_SETTLE}). '
-                             '실제 L1 진입 검증이 필요한 경우 늘릴 것')
+                        help=f'PCIe L1 진입 후 settle 대기 (초). (default: {L1_SETTLE})')
     parser.add_argument('--l1-2-settle', type=float, default=L1_2_SETTLE,
                         help=f'PCIe L1.2 추가 settle 대기 (초, L1_SETTLE 이후). (default: {L1_2_SETTLE})')
+    parser.add_argument('--d3-settle', type=float, default=D3_SETTLE,
+                        help=f'D3hot PMCSR write 후 컨트롤러 power-down settle (초). (default: {D3_SETTLE})')
     parser.add_argument('--idle-window-size', type=int, default=IDLE_WINDOW_SIZE,
                         help=f'idle window-ratio 윈도우 크기 (default: {IDLE_WINDOW_SIZE}). '
                              '0=비활성화')
@@ -6394,6 +6396,7 @@ if __name__ == "__main__":
         ps_settle_cap=args.ps_settle_cap,
         l1_settle=args.l1_settle,
         l1_2_settle=args.l1_2_settle,
+        d3_settle=args.d3_settle,
     )
 
     fuzzer = NVMeFuzzer(config)
