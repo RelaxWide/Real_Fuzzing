@@ -641,6 +641,9 @@ class FuzzConfig:
     idle_ratio_thresh: float = IDLE_RATIO_THRESH
     # v5.3: PS settle 상한 (초)
     ps_settle_cap: float = PS_SETTLE_CAP_S
+    # v5.3: PCIe settle — 전역 상수 대신 config 필드로 관리 (CLI override 가능)
+    l1_settle: float = L1_SETTLE
+    l1_2_settle: float = L1_2_SETTLE
 
     # v4.5: Calibration
     calibration_runs: int = CALIBRATION_RUNS
@@ -3229,7 +3232,7 @@ class NVMeFuzzer:
                 self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
             # 7. idle window — LNKCTL 쓴 뒤 PCIe 트래픽 없는 구간 확보
             #    HW가 L1 idle timer 만료 + PM_Request_Ack DLLP 핸드셰이크 처리
-            time.sleep(L1_SETTLE)
+            time.sleep(self.config.l1_settle)
             return ok
 
         # ── L1.2: ASPM L1 + L1 PM Substates L1.2 활성화 ────────────
@@ -3304,7 +3307,7 @@ class NVMeFuzzer:
                            timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             # idle window — L1 idle timer + L1.2 clock off 완료 대기
-            time.sleep(L1_SETTLE + L1_2_SETTLE)
+            time.sleep(self.config.l1_settle + self.config.l1_2_settle)
             return ok
 
     # ── D-state (PCI PM) ─────────────────────────────────────────────
@@ -3360,9 +3363,9 @@ class NVMeFuzzer:
         # D3+L1/L1.2: D3 config TLP가 링크를 순간 깨움 → 재진입 대기
         if combo.pcie_d == PCIeDState.D3:
             if combo.pcie_l == PCIeLState.L1_2:
-                time.sleep(L1_SETTLE + L1_2_SETTLE)
+                time.sleep(self.config.l1_settle + self.config.l1_2_settle)
             elif combo.pcie_l == PCIeLState.L1:
-                time.sleep(L1_SETTLE)
+                time.sleep(self.config.l1_settle)
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
@@ -5521,8 +5524,8 @@ class NVMeFuzzer:
                     f"worst={_diag_worst:.0f}s")
         log.warning(f"IdleWindow  : size={self.config.idle_window_size}, "
                     f"thresh={self.config.idle_ratio_thresh:.0%}")
-        log.warning(f"PCIe settle : L1={L1_SETTLE*1000:.0f}ms, "
-                    f"L1.2+={L1_2_SETTLE*1000:.0f}ms")
+        log.warning(f"PCIe settle : L1={self.config.l1_settle*1000:.0f}ms, "
+                    f"L1.2+={self.config.l1_2_settle*1000:.0f}ms")
         log.warning(f"PS settle   : cap={self.config.ps_settle_cap}s")
         log.warning(f"Power Sched : max_energy={self.config.max_energy}")
         # v4.3: 로그 메시지 수정 — 실제 구현은 subprocess(nvme-cli) 방식
@@ -6389,12 +6392,9 @@ if __name__ == "__main__":
         idle_window_size=args.idle_window_size,
         idle_ratio_thresh=args.idle_ratio_thresh,
         ps_settle_cap=args.ps_settle_cap,
+        l1_settle=args.l1_settle,
+        l1_2_settle=args.l1_2_settle,
     )
-
-    # v5.3: CLI 지정 L1/L1.2 settle time 전역 변수 override (항상 적용)
-    # if __name__ == "__main__" 블록은 모듈 레벨이므로 global 선언 불필요
-    L1_SETTLE   = args.l1_settle
-    L1_2_SETTLE = args.l1_2_settle
 
     fuzzer = NVMeFuzzer(config)
     fuzzer.run()
