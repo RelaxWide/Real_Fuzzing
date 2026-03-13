@@ -393,12 +393,15 @@ POWER_COMBOS: list = [
 
 D3_TIMEOUT_MULT = 4   # D3hot wake-up 추가 timeout 배수
 
-# PCIe L1 / L1.2 / D3 진입 settle 시간
-# 제품별 링크 타이밍 편차를 고려해 v5.3 대비 보수적 값으로 상향.
-# --l1-settle / --l1-2-settle / --d3-settle CLI로 런타임 조정 가능.
-L1_SETTLE     = 0.3    # L1: idle timer + PM_Request_Ack DLLP handshake 대기 (초)
-L1_2_SETTLE   = 0.3    # L1.2 추가 대기: CLKREQ# deassert → Tclkoff 완료 (초)
-D3_SETTLE     = 0.5    # D3hot: PMCSR write 후 컨트롤러 power-down 완료 대기 (초)
+# PCIe L1 / L1.2 진입 settle 시간 (v5.2 기본값)
+# --l1-settle / --l1-2-settle CLI로 런타임 조정 가능.
+L1_SETTLE     = 5.0    # L1: idle timer + PM_Request_Ack DLLP handshake 대기 (초)
+L1_2_SETTLE   = 2.0    # L1.2 추가 대기: CLKREQ# deassert → Tclkoff 완료 (초)
+
+# preflight + 메인 퍼징 공통 settle 상수 (v5.2 기본값, CLI로 동시 조정 가능)
+RESTORE_SETTLE_S      = 0.5   # baseline 복귀 후 안정화 대기 (초)
+D3_RESTORE_SETTLE_S   = 1.5   # D3→D0 restore 후 NVMe 드라이버 재인식 대기 (초)
+D3_EXTRA_S            = 1.0   # D3 진입 후 추가 settle (setpci → 링크 안정화) (초)
 
 # v5.2+: PS별 preflight settle 시간은 런타임에 nvme id-ctrl로 동적 계산 (_init_ps_settle).
 # formula: (enlat_us + exlat_us) × 2 / 1e6 + 0.05s
@@ -408,23 +411,12 @@ _PS_SETTLE_FALLBACK: dict[int, float] = {0: 0.05, 1: 0.05, 2: 0.05, 3: 0.5, 4: 2
 # PMU 스크립트 절대경로 — subprocess CWD와 무관하게 항상 올바른 파일 사용
 _PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.py')
 
-# v4.7: Idle 유니버스 수집 (diagnose 수렴 설정)
+# v4.7: Idle 유니버스 수집 (diagnose 수렴 설정, v5.2 기본값)
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
 # 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
-DIAGNOSE_STABILITY  = 50    # 새 idle PC 없이 연속 N회면 수렴으로 판정. v5.3: 100 → 50
-DIAGNOSE_MAX        = 2000  # 수렴 전 최대 샘플 수 (상한). v5.3: 5000 → 2000
-DIAGNOSE_SAMPLE_MS  = 10    # v5.3: diagnose() 샘플 간격 (ms). 기존 하드코딩 50ms → 10ms.
-                             # SWD+레벨시프터 등 불안정 환경: --diagnose-sleep-ms 50 으로 복원.
-
-# v5.3: idle saturation window-ratio 기반 조기 감지
-# 마지막 IDLE_WINDOW_SIZE개 PC 중 idle_pcs 비율 ≥ IDLE_RATIO_THRESH → 조기 종료.
-# 기존 consecutive 방식과 OR 결합.
-IDLE_WINDOW_SIZE   = 30    # 마지막 N개 PC 윈도우 크기
-IDLE_RATIO_THRESH  = 0.80  # idle 비율 임계값 (0.8 = 80%)
-
-# v5.3: PS settle 상한 (cap). _init_ps_settle() 계산값을 이 값으로 clamp.
-# 기존 PS4 fallback 2.0s 등이 너무 긴 경우 방지.
-PS_SETTLE_CAP_S    = 1.0   # 초. 동적 계산 settle 상한.
+DIAGNOSE_STABILITY  = 100   # 새 idle PC 없이 연속 N회면 수렴으로 판정
+DIAGNOSE_MAX        = 5000  # 수렴 전 최대 샘플 수 (상한)
+DIAGNOSE_SAMPLE_MS  = 50    # diagnose() 샘플 간격 (ms). --diagnose-sleep-ms로 조정 가능.
 
 # v4.5: Calibration 설정
 CALIBRATION_RUNS  = 3      # 초기 시드당 calibration 실행 횟수 (0 = 비활성화)
@@ -632,17 +624,15 @@ class FuzzConfig:
     # v4.7: Idle 유니버스 수렴 설정
     diagnose_stability: int = DIAGNOSE_STABILITY  # 새 idle PC 없이 연속 N회면 수렴
     diagnose_max: int = DIAGNOSE_MAX              # 수렴 전 최대 샘플 수
-    # v5.3: diagnose() 샘플 간격 (ms)
+    # diagnose() 샘플 간격 (ms)
     diagnose_sample_ms: int = DIAGNOSE_SAMPLE_MS
-    # v5.3: idle window-ratio 기반 조기 감지
-    idle_window_size: int = IDLE_WINDOW_SIZE
-    idle_ratio_thresh: float = IDLE_RATIO_THRESH
-    # v5.3: PS settle 상한 (초)
-    ps_settle_cap: float = PS_SETTLE_CAP_S
-    # v5.3: PCIe settle — 전역 상수 대신 config 필드로 관리 (CLI override 가능)
+    # PCIe L-state settle (CLI: --l1-settle / --l1-2-settle)
     l1_settle: float = L1_SETTLE
     l1_2_settle: float = L1_2_SETTLE
-    d3_settle: float = D3_SETTLE
+    # preflight + 메인 퍼징 공통 settle (CLI로 한번에 조정)
+    restore_settle: float = RESTORE_SETTLE_S
+    d3_restore_settle: float = D3_RESTORE_SETTLE_S
+    d3_extra: float = D3_EXTRA_S
 
     # v4.5: Calibration
     calibration_runs: int = CALIBRATION_RUNS
@@ -1090,11 +1080,6 @@ class JLinkPCSampler:
         global_sat_limit = self.config.global_saturation_limit  # v4.3: 설정값 사용
         idle_pcs = self.idle_pcs     # idle 유니버스 (diagnose에서 수렴 수집)
 
-        # v5.3: window-ratio 기반 idle 조기 감지
-        _win_size   = self.config.idle_window_size
-        _win_thresh = self.config.idle_ratio_thresh
-        _recent_pcs: deque = deque(maxlen=_win_size)
-
         # global_coverage(PC 주소 set) 참조 캐싱
         # CPython set.__contains__는 GIL 하에서 안전
         global_coverage_ref = self.global_coverage
@@ -1128,18 +1113,13 @@ class JLinkPCSampler:
                     # diagnose()에서 수렴 수집한 idle_pcs = idle 상태에서 나올 수 있는 모든 PC.
                     # NVMe 커맨드 처리 코드는 idle 유니버스 밖 → 처리 중엔 consecutive_idle 리셋.
                     # idle 복귀 후 유니버스 내 PC만 연속 → sat_limit 도달 → 조기종료.
-                    _is_idle_pc = idle_pcs and pc in idle_pcs
-                    if _is_idle_pc:
+                    if idle_pcs and pc in idle_pcs:
                         consecutive_idle += 1
                     else:
                         consecutive_idle = 0
-                    # v5.3: window-ratio 추적 (in-range PC만)
-                    _recent_pcs.append(1 if _is_idle_pc else 0)
                 else:
                     self._out_of_range_count += 1
                     consecutive_idle = 0  # out-of-range는 idle로 보지 않음
-                    # v5.3: out-of-range는 non-idle로 window에 기록
-                    _recent_pcs.append(0)
 
                 sample_count += 1
                 self.total_samples += 1
@@ -1150,8 +1130,7 @@ class JLinkPCSampler:
 
                 # 조기 종료 조건 (OR)
                 # 조건1: 연속 global_sat_limit회 이미 알려진 PC (새 코드 경로 없음, global 기준)
-                # 조건2: 연속 sat_limit회 idle 유니버스 내 PC (idle 복귀 감지, 기존)
-                # 조건3: v5.3 window-ratio — 마지막 N개 중 idle 비율 ≥ 임계값
+                # 조건2: 연속 sat_limit회 idle 유니버스 내 PC (idle 복귀 감지)
                 if sat_limit > 0:
                     if global_sat_limit > 0 and since_last_global_new >= global_sat_limit:
                         self._stopped_reason = (
@@ -1165,16 +1144,6 @@ class JLinkPCSampler:
                             f"idle_saturated (idle universe hit "
                             f"{consecutive_idle} consecutive, "
                             f"universe_size={len(idle_pcs)})"
-                        )
-                        break
-                    # v5.3: window-ratio 조기 감지
-                    if (idle_pcs and _win_size > 0
-                            and len(_recent_pcs) >= _win_size
-                            and sum(_recent_pcs) / _win_size >= _win_thresh):
-                        _idle_cnt = sum(_recent_pcs)
-                        self._stopped_reason = (
-                            f"idle_window_ratio (idle {_idle_cnt}/{_win_size}="
-                            f"{_idle_cnt/_win_size:.0%} >= thresh={_win_thresh:.0%})"
                         )
                         break
 
@@ -3384,14 +3353,12 @@ class NVMeFuzzer:
             time.sleep(ps_settle)
         ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — ASPM 협상 완료
         ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 나중 — 링크 idle 후 자동 재진입
-        # D3 진입 후: PMCSR write → 컨트롤러 power-down + 링크 재진입 대기
+        # D3+L1/L1.2: D3 config TLP가 링크를 순간 깨움 → 재진입 대기
         if combo.pcie_d == PCIeDState.D3:
             if combo.pcie_l == PCIeLState.L1_2:
-                time.sleep(self.config.d3_settle + self.config.l1_settle + self.config.l1_2_settle)
+                time.sleep(self.config.l1_settle + self.config.l1_2_settle)
             elif combo.pcie_l == PCIeLState.L1:
-                time.sleep(self.config.d3_settle + self.config.l1_settle)
-            else:  # L0 + D3: 링크 re-entry 없음, D3 power-down settle만
-                time.sleep(self.config.d3_settle)
+                time.sleep(self.config.l1_settle)
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
@@ -3755,14 +3722,11 @@ class NVMeFuzzer:
         formula: settle = (enlat_us + exlat_us) / 1_000_000 * 2 + 0.05
                  PS3 최소값: 0.5s (NAND 캐시 플러시 + retention 진입 대기)
                  PS4 최소값: 2.0s (더 깊은 sleep → NAND flush 완료까지 추가 대기)
-        v5.3: 계산 후 ps_settle_cap(기본 1.0s)으로 clamp — 과도한 대기 방지.
         파싱 실패 시 _PS_SETTLE_FALLBACK 유지.
         """
         import re as _re
         NOPS_MIN_SETTLE  = 0.5   # PS3: NAND retention 진입까지 최소 대기
         PS4_MIN_SETTLE   = 2.0   # PS4: 더 깊은 sleep → NAND flush 완료까지 더 긴 대기
-        # v5.3: settle cap
-        cap = self.config.ps_settle_cap if self.config.ps_settle_cap > 0 else float('inf')
         parsed: dict[int, float] = {}
         try:
             r = subprocess.run(
@@ -3780,13 +3744,9 @@ class NVMeFuzzer:
                     if is_nops:
                         min_settle = PS4_MIN_SETTLE if ps >= 4 else NOPS_MIN_SETTLE
                         settle = max(settle, min_settle)
-                    # v5.3: cap 적용
-                    parsed[ps] = min(max(settle, 0.05), cap)
+                    parsed[ps] = max(settle, 0.05)
         except Exception as e:
             log.warning(f"[PS-Settle] id-ctrl 파싱 예외: {e} → fallback 유지")
-        # v5.3: fallback 값에도 cap 적용
-        for k in list(self._ps_settle):
-            self._ps_settle[k] = min(self._ps_settle[k], cap)
 
         if parsed:
             self._ps_settle.update(parsed)
@@ -3818,10 +3778,10 @@ class NVMeFuzzer:
         # id-ctrl에서 enlat/exlat 읽어 PS별 settle 시간 동적 계산
         self._init_ps_settle()
 
-        # v5.3: preflight settle 단축 (throughput 개선)
-        RESTORE_SETTLE     = 0.1   # baseline 복귀 후 안정화 대기 (초). v5.3: 0.5 → 0.1
-        D3_RESTORE_SETTLE  = 0.5   # D3→D0 restore 후 NVMe 드라이버 재인식 대기. v5.3: 1.5 → 0.5
-        D3_EXTRA           = 0.2   # D3 진입 후 추가 settle (setpci → 링크 안정화). v5.3: 1.0 → 0.2
+        # preflight + 메인 퍼징 공통 settle — FuzzConfig 필드로 관리 (CLI로 한번에 조정 가능)
+        RESTORE_SETTLE     = self.config.restore_settle
+        D3_RESTORE_SETTLE  = self.config.d3_restore_settle
+        D3_EXTRA           = self.config.d3_extra
         PROBE_TIMEOUT = 5.0   # nvme id-ctrl 타임아웃
 
         baseline = POWER_COMBOS[0]  # PS0+L0+D0
@@ -5542,17 +5502,16 @@ class NVMeFuzzer:
                  f"idle_sat={self.config.saturation_limit}, "
                  f"global_sat={self.config.global_saturation_limit}, "
                  f"post_cmd={self.config.post_cmd_delay_ms}ms")
-        # v5.3: idle 최적화 설정 출력
         _diag_worst = self.config.diagnose_max * self.config.diagnose_sample_ms / 1000
         log.warning(f"Diagnose    : stability={self.config.diagnose_stability}, "
                     f"max={self.config.diagnose_max}, "
                     f"sleep={self.config.diagnose_sample_ms}ms, "
                     f"worst={_diag_worst:.0f}s")
-        log.warning(f"IdleWindow  : size={self.config.idle_window_size}, "
-                    f"thresh={self.config.idle_ratio_thresh:.0%}")
         log.warning(f"PCIe settle : L1={self.config.l1_settle*1000:.0f}ms, "
                     f"L1.2+={self.config.l1_2_settle*1000:.0f}ms")
-        log.warning(f"PS settle   : cap={self.config.ps_settle_cap}s")
+        log.warning(f"PM settle   : restore={self.config.restore_settle}s, "
+                    f"d3_restore={self.config.d3_restore_settle}s, "
+                    f"d3_extra={self.config.d3_extra}s")
         log.warning(f"Power Sched : max_energy={self.config.max_energy}")
         # v4.3: 로그 메시지 수정 — 실제 구현은 subprocess(nvme-cli) 방식
         log.warning(f"NVMe I/O    : subprocess (nvme-cli passthru)")
@@ -6262,24 +6221,19 @@ if __name__ == "__main__":
                              'SWD에서 주기적 인터럽트를 모두 포함하려면 크게 설정')
     parser.add_argument('--diagnose-max', type=int, default=DIAGNOSE_MAX,
                         help=f'idle 유니버스 수집 최대 샘플 수 (default: {DIAGNOSE_MAX})')
-    # v5.3: diagnose 간격 / PCIe settle / idle window / PS settle cap
+    # PCIe settle / preflight+메인 공통 settle (CLI로 한번에 조정)
     parser.add_argument('--diagnose-sleep-ms', type=int, default=DIAGNOSE_SAMPLE_MS,
-                        help=f'diagnose() 샘플 간격 (ms). 기존 50ms. '
-                             f'(default: {DIAGNOSE_SAMPLE_MS}). '
-                             'SWD+레벨시프터 불안정 환경: 50으로 복원')
+                        help=f'diagnose() 샘플 간격 (ms). (default: {DIAGNOSE_SAMPLE_MS})')
     parser.add_argument('--l1-settle', type=float, default=L1_SETTLE,
                         help=f'PCIe L1 진입 후 settle 대기 (초). (default: {L1_SETTLE})')
     parser.add_argument('--l1-2-settle', type=float, default=L1_2_SETTLE,
                         help=f'PCIe L1.2 추가 settle 대기 (초, L1_SETTLE 이후). (default: {L1_2_SETTLE})')
-    parser.add_argument('--d3-settle', type=float, default=D3_SETTLE,
-                        help=f'D3hot PMCSR write 후 컨트롤러 power-down settle (초). (default: {D3_SETTLE})')
-    parser.add_argument('--idle-window-size', type=int, default=IDLE_WINDOW_SIZE,
-                        help=f'idle window-ratio 윈도우 크기 (default: {IDLE_WINDOW_SIZE}). '
-                             '0=비활성화')
-    parser.add_argument('--idle-ratio-thresh', type=float, default=IDLE_RATIO_THRESH,
-                        help=f'idle window-ratio 임계값 0.0~1.0 (default: {IDLE_RATIO_THRESH})')
-    parser.add_argument('--ps-settle-cap', type=float, default=PS_SETTLE_CAP_S,
-                        help=f'PS settle 상한 (초). 0=무제한. (default: {PS_SETTLE_CAP_S})')
+    parser.add_argument('--restore-settle', type=float, default=RESTORE_SETTLE_S,
+                        help=f'baseline 복귀 후 안정화 대기 (초). preflight+메인 공통. (default: {RESTORE_SETTLE_S})')
+    parser.add_argument('--d3-restore-settle', type=float, default=D3_RESTORE_SETTLE_S,
+                        help=f'D3→D0 restore 후 NVMe 드라이버 재인식 대기 (초). preflight+메인 공통. (default: {D3_RESTORE_SETTLE_S})')
+    parser.add_argument('--d3-extra', type=float, default=D3_EXTRA_S,
+                        help=f'D3 진입 후 추가 settle (초). preflight+메인 공통. (default: {D3_EXTRA_S})')
 
     # v4.5: 새 기능 CLI 옵션
     parser.add_argument('--calibration-runs', type=int, default=CALIBRATION_RUNS,
@@ -6420,14 +6374,12 @@ if __name__ == "__main__":
         fw_slot=args.fw_slot,
         # v5.1
         pm_inject_prob=1.0 if args.pm else 0.0,
-        # v5.3: idle 시간 최적화 옵션
         diagnose_sample_ms=args.diagnose_sleep_ms,
-        idle_window_size=args.idle_window_size,
-        idle_ratio_thresh=args.idle_ratio_thresh,
-        ps_settle_cap=args.ps_settle_cap,
         l1_settle=args.l1_settle,
         l1_2_settle=args.l1_2_settle,
-        d3_settle=args.d3_settle,
+        restore_settle=args.restore_settle,
+        d3_restore_settle=args.d3_restore_settle,
+        d3_extra=args.d3_extra,
     )
 
     fuzzer = NVMeFuzzer(config)
