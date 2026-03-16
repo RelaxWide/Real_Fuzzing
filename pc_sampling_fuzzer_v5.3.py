@@ -5872,7 +5872,7 @@ class NVMeFuzzer:
                     break
 
                 if rc == self.RC_ERROR:
-                    log.warning(f"[ERROR] {cmd.name} subprocess internal error — skipping")
+                    log.error(f"[ERROR] {cmd.name} subprocess internal error — skipping")
                     continue
 
                 if is_interesting:
