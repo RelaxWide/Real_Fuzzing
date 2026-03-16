@@ -452,28 +452,30 @@ class NVMeCommand:
     needs_data: bool = True
     timeout_group: str = "command"   # NVME_TIMEOUTS 키 참조
     description: str = ""
+    weight: int = 1                  # 명령어 선택 가중치 (높을수록 자주 선택)
 
 
 # 기본 활성화 (비파괴, 빠른 응답) — --commands 없이 실행 시 이것만 사용
+# weight 합계: Admin=4(1+1+1+1), IO=4(2+2) → Admin 50% / IO 50%
 NVME_COMMANDS_DEFAULT = [
-    # ── Admin Commands (읽기 전용) ──
-    NVMeCommand("Identify", 0x06, NVMeCommandType.ADMIN, needs_data=False,
+    # ── Admin Commands ──
+    NVMeCommand("Identify",    0x06, NVMeCommandType.ADMIN, needs_data=False,
                 description="장치/네임스페이스 정보 조회"),
-    NVMeCommand("GetLogPage", 0x02, NVMeCommandType.ADMIN, needs_data=False,
+    NVMeCommand("GetLogPage",  0x02, NVMeCommandType.ADMIN, needs_data=False,
                 description="로그 페이지 조회"),
     NVMeCommand("GetFeatures", 0x0A, NVMeCommandType.ADMIN, needs_data=False,
                 description="기능 조회"),
-    # ── I/O Commands ──
-    NVMeCommand("Read", 0x02, NVMeCommandType.IO, needs_data=False,
-                description="데이터 읽기"),
+    NVMeCommand("SetFeatures", 0x09, NVMeCommandType.ADMIN,
+                description="기능 설정"),
+    # ── I/O Commands (weight=2: Admin 4개 대비 I/O path 비중 균형) ──
+    NVMeCommand("Read",  0x02, NVMeCommandType.IO, needs_data=False,
+                description="데이터 읽기",  weight=2),
     NVMeCommand("Write", 0x01, NVMeCommandType.IO,
-                description="데이터 쓰기"),
+                description="데이터 쓰기", weight=2),
 ]
 
 # 전체 명령어 (위험/파괴적 포함) — --commands 또는 --all-commands로 활성화
 NVME_COMMANDS_EXTENDED = [
-    NVMeCommand("SetFeatures", 0x09, NVMeCommandType.ADMIN,
-                description="기능 설정"),
     NVMeCommand("FWDownload", 0x11, NVMeCommandType.ADMIN,
                 description="펌웨어 이미지 다운로드"),
     NVMeCommand("FWCommit", 0x10, NVMeCommandType.ADMIN,
@@ -1295,13 +1297,18 @@ class NVMeFuzzer:
 
         if config.enabled_commands:
             # --commands 지정 시: NVME_COMMANDS 전체에서 이름 매칭
-            self.commands = [c for c in NVME_COMMANDS if c.name in config.enabled_commands]
+            base = [c for c in NVME_COMMANDS if c.name in config.enabled_commands]
         elif config.all_commands:
             # --all-commands: 위험 명령어 포함 전체
-            self.commands = NVME_COMMANDS.copy()
+            base = NVME_COMMANDS.copy()
         else:
             # 기본: 안전(비파괴) 명령어만
-            self.commands = NVME_COMMANDS_DEFAULT.copy()
+            base = NVME_COMMANDS_DEFAULT.copy()
+
+        # weight에 따라 리스트 확장 — random.choice()가 가중치 선택을 자동 처리
+        self.commands = []
+        for c in base:
+            self.commands.extend([c] * c.weight)
 
         log.info(f"[Fuzzer] Enabled commands: {[c.name for c in self.commands]}")
 
@@ -1836,6 +1843,47 @@ class NVMeFuzzer:
                 dict(cdw10=0x0E, cdw11=0x00000000, description="Set Timestamp = 0 (reset)"),
                 # FID=0x10: Host Controlled Thermal Management — CDW11[0]=TMT2EN, CDW11[1]=TMT1EN
                 dict(cdw10=0x10, cdw11=0x00000003, description="Set HCTM both thresholds enabled"),
+                # FID=0x0C: Autonomous Power State Transition (APST)
+                # CDW11[0]=APSTE (APST Enable). Data=256B APST entry table.
+                # Entry[3:0]=ITPS(Idle Trans PS), Entry[31:8]=ITP(×100ms, 0=disable)
+                dict(cdw10=0x0C, cdw11=0x00000000,
+                     data=b'\x00' * 256,
+                     description="Set APST disabled (APSTE=0, table zeros)"),
+                dict(cdw10=0x0C, cdw11=0x00000001,
+                     data=b'\x00' * 256,
+                     description="Set APST enabled (APSTE=1, all ITP=0 → no transition)"),
+                # APST table: entry[0] ITP=10(1s) ITPS=3, entry[1] ITP=100(10s) ITPS=4
+                dict(cdw10=0x0C, cdw11=0x00000001,
+                     data=(
+                         (10 << 8 | 3).to_bytes(4, 'little') + b'\x00' * 4 +   # entry0: 1s→PS3
+                         (100 << 8 | 4).to_bytes(4, 'little') + b'\x00' * 4 +  # entry1: 10s→PS4
+                         b'\x00' * 240
+                     ),
+                     description="Set APST: 1s→PS3, 10s→PS4"),
+                # FID=0x0D: Host Memory Buffer (HMB)
+                # CDW11[0]=EHM(Enable HMB), CDW11[1]=MR(Memory Return)
+                dict(cdw10=0x0D, cdw11=0x00000000,
+                     description="Set HMB disabled (EHM=0)"),
+                dict(cdw10=0x0D, cdw11=0x00000002,
+                     description="Set HMB MR=1 (return previously allocated buffer)"),
+                # FID=0x0F: Keep Alive Timer — CDW11=KATO (ms, 0=disable)
+                dict(cdw10=0x0F, cdw11=0x00000000,
+                     description="Set Keep Alive Timer disabled (KATO=0)"),
+                dict(cdw10=0x0F, cdw11=0x00001388,
+                     description="Set Keep Alive Timer 5000ms"),
+                dict(cdw10=0x0F, cdw11=0xFFFFFFFF,
+                     description="Set Keep Alive Timer max (error path)"),
+                # FID=0x11: Non-Operational Power State Config
+                # CDW11[0]=NOPPME (Non-Operational PS Permissive Mode Enable)
+                dict(cdw10=0x11, cdw11=0x00000000,
+                     description="Set Non-Op PS Config NOPPME=0 (permissive mode off)"),
+                dict(cdw10=0x11, cdw11=0x00000001,
+                     description="Set Non-Op PS Config NOPPME=1 (permissive mode on)"),
+                # FID=0x12: Read Recovery Level — CDW11[3:0]=RLL (0~15)
+                dict(cdw10=0x12, cdw11=0x00000000,
+                     description="Set Read Recovery Level 0 (lowest)"),
+                dict(cdw10=0x12, cdw11=0x0000000F,
+                     description="Set Read Recovery Level 15 (highest, error path)"),
                 # SV=1 변형 (설정값 저장)
                 dict(cdw10=(1 << 31) | 0x06, cdw11=0x00000001, description="Set VWC=Enable + Save"),
             ],
@@ -1971,8 +2019,25 @@ class NVMeFuzzer:
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Compare LBA 0, 1 block zeros"),
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xFF' * 512,  description="Compare LBA 0, 1 block 0xFF"),
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xAA' * 512,  description="Compare LBA 0, 1 block 0xAA"),
-                dict(cdw10=0,     cdw11=0, cdw12=7, data=b'\x00' * (8 * 512), description="Compare LBA 0, 8 blocks"),
+                dict(cdw10=0,     cdw11=0, cdw12=7, data=b'\x00' * (8  * 512), description="Compare LBA 0, 8 blocks"),
+                dict(cdw10=0,     cdw11=0, cdw12=31, data=b'\x00' * (32 * 512), description="Compare LBA 0, 32 blocks"),
                 dict(cdw10=500,   cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Compare LBA 500"),
+                dict(cdw10=5000,  cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Compare LBA 5000"),
+                # CDW12 상위 비트: Read와 동일 구조
+                dict(cdw10=0, cdw11=0, cdw12=_FUA, data=b'\x00' * 512,
+                     description="Compare LBA 0, FUA=1 (Force Unit Access)"),
+                dict(cdw10=0, cdw11=0, cdw12=_LR, data=b'\x00' * 512,
+                     description="Compare LBA 0, LR=1 (Limited Retry)"),
+                dict(cdw10=0, cdw11=0, cdw12=_FUA | _LR, data=b'\x00' * 512,
+                     description="Compare LBA 0, FUA+LR"),
+                dict(cdw10=0, cdw11=0, cdw12=_PRINFO_ALL, data=b'\x00' * 512,
+                     description="Compare LBA 0, PRINFO=0xF (all PI bits)"),
+                dict(cdw10=0, cdw11=0, cdw12=_PRCHK_ALL, data=b'\x00' * 512,
+                     description="Compare LBA 0, PRCHK=0x7 (all check bits)"),
+                dict(cdw10=0, cdw11=0, cdw12=_PRINFO_ALL,
+                     cdw14=0xDEADBEEF, cdw15=0xFFFF0000,
+                     data=b'\x00' * 512,
+                     description="Compare LBA 0, PI all + ILBRT=0xDEADBEEF LBATM=0xFFFF"),
                 dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0, data=b'\x00' * 512,
                      description="Compare LBA 4G (OOR error path)"),
             ],
