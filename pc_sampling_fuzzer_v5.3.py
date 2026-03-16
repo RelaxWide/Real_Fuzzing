@@ -5811,7 +5811,7 @@ class NVMeFuzzer:
                     if _pm_new_cnt > 0:
                         if self._sa_loaded:
                             self._update_static_coverage(_pm_new_set)
-                        log.warning(
+                        log.info(
                             f"[+][PM-Cov] {_next_combo.label} "
                             f"+{_pm_new_cnt} new PCs "
                             f"(global={len(self.sampler.global_coverage)})")
@@ -5938,9 +5938,9 @@ class NVMeFuzzer:
                     with open(str(corpus_file) + '.json', 'w') as f:
                         json.dump(self._seed_meta(new_seed), f)
 
-                    log.warning(f"[+] New coverage! cmd={cmd.name} "
-                                f"CDW10=0x{mutated_seed.cdw10:08x} "
-                                f"+{new_pcs} PCs (total: {len(self.sampler.global_coverage)} pcs)")
+                    log.info(f"[+] New coverage! cmd={cmd.name} "
+                             f"CDW10=0x{mutated_seed.cdw10:08x} "
+                             f"+{new_pcs} PCs (total: {len(self.sampler.global_coverage)} pcs)")
 
                     # v4.5: 새 seed에 대해 deterministic stage 등록
                     if self.config.deterministic_enabled and not new_seed.det_done:
