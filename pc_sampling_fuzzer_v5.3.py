@@ -1344,6 +1344,9 @@ class NVMeFuzzer:
 
         # v4.3: timeout crash 발생 여부 — True면 finally에서 J-Link를 닫지 않음
         self._timeout_crash = False
+        # calibration 구간 stderr 억제(fd 2 → /dev/null) 중 저장된 원본 fd.
+        # _handle_timeout_crash()에서 log.error() 전에 복원하기 위해 사용.
+        self._cal_saved_stderr_fd: Optional[int] = None
         # v4.6: crash 시 보존된 nvme-cli PID (kill하지 않아 fd 유지 → SSD 상태 보존)
         self._crash_nvme_pid: Optional[int] = None
         # nvme_core 모듈 파라미터 원래 값 (종료 시 복원용)
@@ -4746,6 +4749,14 @@ class NVMeFuzzer:
         """
         from collections import Counter
 
+        # calibration 구간은 J-Link DLL 노이즈 억제를 위해 fd 2(stderr)를
+        # /dev/null로 리다이렉트한다. 이 상태에서 log.error()를 호출하면
+        # StreamHandler(sys.stderr)가 fd 2 → /dev/null로 쓰게 되어 터미널에
+        # 아무것도 출력되지 않는다. → 즉시 원본 stderr fd로 복원.
+        if self._cal_saved_stderr_fd is not None:
+            os.dup2(self._cal_saved_stderr_fd, 2)
+            self._cal_saved_stderr_fd = None   # finally 블록의 이중 복원 방지
+
         cmd = seed.cmd
         actual_opcode = (seed.opcode_override if seed.opcode_override is not None
                          else cmd.opcode)
@@ -5650,6 +5661,9 @@ class NVMeFuzzer:
             saved_stderr_fd = os.dup(2)
             os.dup2(devnull_fd, 2)
             os.close(devnull_fd)
+            # _handle_timeout_crash()이 log.error() 전에 stderr를 복원할 수 있도록
+            # 인스턴스 변수에 보관 (fd 수명: finally의 os.close까지)
+            self._cal_saved_stderr_fd = saved_stderr_fd
             try:
                 for i, seed in enumerate(self.corpus):
                     seed = self._calibrate_seed(seed)
@@ -5659,10 +5673,10 @@ class NVMeFuzzer:
                     cal_results.append((i + 1, seed.cmd.name, seed.stability,
                                         stable_cnt, all_cnt))
                     if self._timeout_crash:
-                        os.dup2(saved_stderr_fd, 2)
                         log.error("[Calibration] timeout during calibration — aborting")
                         return
             finally:
+                self._cal_saved_stderr_fd = None
                 os.dup2(saved_stderr_fd, 2)
                 os.close(saved_stderr_fd)
 
