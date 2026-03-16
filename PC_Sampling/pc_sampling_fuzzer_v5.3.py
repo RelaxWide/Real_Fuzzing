@@ -658,6 +658,39 @@ class FuzzConfig:
     pm_inject_prob: float = 0.0
 
 
+class _ColorFormatter(logging.Formatter):
+    """터미널 출력용 ANSI 컬러 포매터. 파일 핸들러에는 사용하지 않음."""
+
+    import re as _re
+
+    _RESET = "\033[0m"
+    _RULES = [
+        (_re.compile(r'CRASH'),                    "\033[1;31m"),  # 굵은 빨강
+        (_re.compile(r'FAIL CMD'),                 "\033[31m"),    # 빨강
+        (_re.compile(r'\[\+\]'),                   "\033[32m"),    # 초록
+        (_re.compile(r'\[PM\]'),                   "\033[33m"),    # 노랑
+        (_re.compile(r'\[Stats\]|\[StatCov\]'),    "\033[36m"),    # 시안
+        (_re.compile(r'={5,}'),                    "\033[34m"),    # 파랑
+    ]
+    _LEVEL_COLORS = {
+        logging.ERROR:    "\033[1;31m",   # 굵은 빨강
+        logging.CRITICAL: "\033[1;35m",   # 굵은 마젠타
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        color = self._LEVEL_COLORS.get(record.levelno)
+        if color is None:
+            msg = record.getMessage()
+            for pat, col in self._RULES:
+                if pat.search(msg):
+                    color = col
+                    break
+        if color:
+            return color + text + self._RESET
+        return text
+
+
 class _FuzzingTerminalFilter(logging.Filter):
     """메인 퍼징 루프 중 터미널 출력을 필요한 정보로만 제한.
 
@@ -709,7 +742,12 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     # 메인 퍼징 루프 진입 시 _FuzzingTerminalFilter 추가로 제한됨
     ch = logging.StreamHandler()
     ch.setLevel(logging.WARNING)
-    ch.setFormatter(fmt)
+    # TTY이면 컬러 포매터, 파이프/리다이렉트이면 일반 포매터
+    is_tty = hasattr(sys.stderr, 'isatty') and sys.stderr.isatty()
+    ch.setFormatter(_ColorFormatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ) if is_tty else fmt)
     logger.addHandler(ch)
 
     return logger, log_file
