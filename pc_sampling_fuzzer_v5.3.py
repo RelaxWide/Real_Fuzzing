@@ -5719,6 +5719,8 @@ class NVMeFuzzer:
         self.start_time = datetime.now()
         self._window_t0 = self.start_time          # 구간별 exec/s 계산용
         self._window_exec0: int = 0
+        # calibration 실행 횟수를 제외하고 main loop 기준으로 카운트 재시작
+        self.executions = 0
 
         # 메인 퍼징 루프 진입 — 터미널 출력을 [Stats]/[PM]/[+]/CRASH 로만 제한
         for _h in log.handlers:
