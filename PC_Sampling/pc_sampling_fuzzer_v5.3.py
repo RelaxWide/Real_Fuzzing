@@ -665,12 +665,14 @@ class _ColorFormatter(logging.Formatter):
 
     _RESET = "\033[0m"
     _RULES = [
-        (_re.compile(r'CRASH'),                    "\033[1;31m"),  # 굵은 빨강
-        (_re.compile(r'FAIL CMD'),                 "\033[31m"),    # 빨강
-        (_re.compile(r'\[\+\]'),                   "\033[32m"),    # 초록
-        (_re.compile(r'\[PM\]'),                   "\033[33m"),    # 노랑
-        (_re.compile(r'\[Stats\]|\[StatCov\]'),    "\033[36m"),    # 시안
-        (_re.compile(r'={5,}'),                    "\033[34m"),    # 파랑
+        (_re.compile(r'CRASH'),                              "\033[1;31m"),  # 굵은 빨강
+        (_re.compile(r'FAIL CMD'),                           "\033[31m"),    # 빨강
+        (_re.compile(r'\[TIMEOUT\]'),                        "\033[31m"),    # 빨강
+        (_re.compile(r'\[\+\]'),                             "\033[32m"),    # 초록
+        (_re.compile(r'\[PM\]'),                             "\033[33m"),    # 노랑
+        (_re.compile(r'\[Stats\]|\[StatCov\]'),              "\033[36m"),    # 시안
+        (_re.compile(r'\[UFAS\]|\[REPLAY\]'),                "\033[35m"),    # 마젠타
+        (_re.compile(r'={5,}'),                              "\033[34m"),    # 파랑
     ]
     _LEVEL_COLORS = {
         logging.ERROR:    "\033[1;31m",   # 굵은 빨강
@@ -707,6 +709,7 @@ class _FuzzingTerminalFilter(logging.Filter):
     import re as _re
     _ALLOW = _re.compile(
         r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
+        r'|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]'
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
