@@ -39,7 +39,26 @@ def main() -> None:
     print("\n[1] 연결 직후 — PMU 전류 기준값 확인 (예상: ~470mA)")
     input("    Enter to continue...")
 
-    # ── Step 2: jlink.close() ─────────────────────────────────────────────
+    # ── Step 2: jlink.close() 전에 PWRUPREQ 명시적 해제 ──
+    print("\n[2] J-Link 연결 해제 전 Debug Power Request 클리어 시도...")
+
+    try:
+        # DP(Debug Port) Register 2 (SELECT) 초기화
+        jl.coresight_write_dp(2, 0)
+        
+        # DP Register 1 (CTRL/STAT) 값을 0으로 설정하여
+        # CDBGPWRUPREQ(Bit 28) 및 CSYSPWRUPREQ(Bit 30) 강제 해제
+        jl.coresight_write_dp(1, 0)
+        print(" -> CTRL/STAT 레지스터 Clear 완료 (PWRUPREQ 해제)")
+    except Exception as e:
+        print(f" -> 레지스터 해제 실패: {e}")
+    
+    # 이후 J-Link 세션 종료
+    jl.close()
+    print("\n[2] jlink.close() 완료 — PMU 전류 확인")
+    print(" 목표: 전류 하락 (예상: ~285mA 수준)")
+    input(" Enter to continue...")
+    
     jl.close()
     print("\n[2] jlink.close() 완료 — PMU 전류 확인")
     print("    목표: 전류 하락 (예상: ~285mA 수준)")
