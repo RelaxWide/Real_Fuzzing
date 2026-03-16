@@ -5760,7 +5760,23 @@ class NVMeFuzzer:
                     if _next_combo.nvme_ps not in (3, 4):
                         self._prev_op_ps    = _next_combo.nvme_ps
                         self._prev_op_combo = _next_combo
+                    # PM combo 진입 중 PC sampling — 커버리지 수집 (corpus 판정 제외)
+                    # _sampling_worker()가 current_trace를 리셋하므로 NVMe window와 독립.
+                    # stop 후 global_coverage에만 반영 → 이후 NVMe evaluate_coverage()가
+                    # PM PCs를 "이미 알려진 PC"로 취급 → corpus 오염 없음.
+                    self.sampler.start_sampling()
                     self._set_power_combo(_next_combo)
+                    self.sampler.stop_sampling()
+                    _pm_new_set = self.sampler.current_trace - self.sampler.global_coverage
+                    _pm_new_cnt = len(_pm_new_set)
+                    self.sampler.global_coverage.update(self.sampler.current_trace)
+                    if _pm_new_cnt > 0:
+                        if self._sa_loaded:
+                            self._update_static_coverage(_pm_new_set)
+                        log.warning(
+                            f"[+][PM-Cov] {_next_combo.label} "
+                            f"+{_pm_new_cnt} new PCs "
+                            f"(global={len(self.sampler.global_coverage)})")
                     self._current_combo = _next_combo
                     self._current_ps    = _next_combo.nvme_ps
                     self.ps_enter_counts[_next_combo.nvme_ps] += 1
