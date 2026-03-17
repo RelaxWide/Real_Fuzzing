@@ -365,7 +365,7 @@ L1_2_SETTLE   = 2.0   # L1.2 추가 대기: CLKREQ# 제거 + clock off (초, L1_
 # v5.2+: PS별 preflight settle 시간은 런타임에 nvme id-ctrl로 동적 계산 (_init_ps_settle).
 # formula: (enlat_us + exlat_us) × 2 / 1e6 + 0.05s
 # 파싱 실패 시 아래 fallback 값(초) 사용.
-_PS_SETTLE_FALLBACK: dict[int, float] = {0: 0.05, 1: 0.05, 2: 0.05, 3: 0.1, 4: 0.2}
+_PS_SETTLE_FALLBACK: dict[int, float] = {0: 0.05, 1: 0.05, 2: 0.05, 3: 0.5, 4: 2.0}
 
 # PMU 스크립트 절대경로 — subprocess CWD와 무관하게 항상 올바른 파일 사용
 _PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.py')
@@ -3115,23 +3115,32 @@ class NVMeFuzzer:
                 self._setpci_write(ep, el + 0x08, 0x00000000, 0x0000000F)
             if rp and rl:
                 self._setpci_write(rp, rl + 0x08, 0x00000000, 0x0000000F)
-            # 2. 전역 ASPM 정책 → powersave (커널 override 방지)
+            # 2. DEVCTL2 LTRE clear (bit10) — L1.2 잔류 방지
+            self._setpci_write(ep, ec + 0x28, 0x0000, 0x0400, 'w')
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x28, 0x0000, 0x0400, 'w')
+            # 3. PMU CLKREQ# Assert — NOPS device의 자연적 deassert 차단
+            #    CLKREQ#가 deassert되면 RP가 ref clock을 제거해 L1.2로 진입.
+            #    L1 조합에서는 clock을 유지해야 하므로 pin16으로 강제 assert.
+            subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
+                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 4. 전역 ASPM 정책 → powersave (커널 override 방지)
             try:
                 Path('/sys/module/pcie_aspm/parameters/policy').write_text('powersave')
             except Exception:
                 pass
-            # 3. LNKCTL ASPMC = ASPMS & 0b10 — EP(downstream) 먼저, RP(upstream) 이후
+            # 4. LNKCTL ASPMC = ASPMS & 0b10 — EP(downstream) 먼저, RP(upstream) 이후
             #    Linux kernel pci-aspm.c 순서: enable 시 EP 먼저, disable 시 RP 먼저
             aspm_val = aspms & 0x2
             ok = self._setpci_write(ep, ec + 0x10, aspm_val, 0x0003, 'w')   # EP 먼저
             if rp and rc:
                 self._setpci_write(rp, rc + 0x10, aspm_val, 0x0003, 'w')   # RP 나중
-            # 4. Clock PM (LNKCTL ECPM bit8) — CPM 미선언 시도 강제 활성화
+            # 6. Clock PM (LNKCTL ECPM bit8) — CPM 미선언 시도 강제 활성화
             #    LNKCAP CPM=0은 BIOS가 막은 경우가 많으므로 unconditional write
             self._setpci_write(ep, ec + 0x10, 0x0100, 0x0100, 'w')
             if rp and rc:
                 self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
-            # 5. idle window — LNKCTL 쓴 뒤 PCIe 트래픽 없는 구간 확보
+            # 7. idle window — LNKCTL 쓴 뒤 PCIe 트래픽 없는 구간 확보
             #    HW가 L1 idle timer 만료 + PM_Request_Ack DLLP 핸드셰이크 처리
             time.sleep(L1_SETTLE)
             return ok
@@ -3150,13 +3159,6 @@ class NVMeFuzzer:
                     f"[PCIe] L1.2: ASPM L1.2 미지원 (L1SSCAP={self._pcie_l1ss_cap:#010x})")
                 return False
 
-            # LTR threshold 상수
-            #   LL1_2TV = 0xa (value) at bits[25:16]  → Linux: PCI_L1SS_CTL1_LTR_L12_TH_VALUE
-            #   LL1_2TS = 2   (scale) at bits[31:29]  → Linux: PCI_L1SS_CTL1_LTR_L12_TH_SCALE
-            #   scale=2 → 1024ns 단위, threshold = 10 × 1024ns = 10.24µs
-            LTR_VAL  = (0xa << 16) | (2 << 29)   # 0x400A_0000
-            LTR_MASK = 0xE3FF_0000                # bits[31:29] | bits[25:16]
-
             # Step 1: L1SS enable bits 비활성화 (양측) — spec §5.5.4.1 step 2
             if el:
                 self._setpci_write(ep, el + 0x08, 0x00000000, 0x0000000F)
@@ -3169,21 +3171,11 @@ class NVMeFuzzer:
             except Exception:
                 pass
 
-            # Step 3: DEVCTL2 LTRE (bit10) 활성화 — LTR 메커니즘 필수 (양측)
-            #   PCI_EXP_DEVCTL2 = PCIe cap + 0x28
-            self._setpci_write(ep, ec + 0x28, 0x0400, 0x0400, 'w')
-            if rp and rc:
-                self._setpci_write(rp, rc + 0x28, 0x0400, 0x0400, 'w')
-
-            # Step 4: L1SSCTL1 LTR threshold 설정 (enable bits 제외) — spec step 4
-            if el:
-                self._setpci_write(ep, el + 0x08, LTR_VAL, LTR_MASK)
-            if rp and rl:
-                self._setpci_write(rp, rl + 0x08, LTR_VAL, LTR_MASK)
-
-            # Step 5: L1SSCTL1 enable bits — L1SSCAP 지원 비트만 활성화
+            # Step 3: L1SSCTL1 enable bits — L1SSCAP 지원 비트만 활성화
             #   bit0: PCI-PM L1.2, bit1: PCI-PM L1.1, bit2: ASPM L1.2, bit3: ASPM L1.1
             #   upstream(RP) 먼저 enable — spec §5.5.4.1 step 5
+            # LTRE(LTR Enable) 미사용: PMU GPIO로 CLKREQ#를 직접 제어하므로
+            #   RP 자율 판단 메커니즘(LTR) 불필요. LTRE 활성화 시 LTR 메시지 오버헤드 발생.
             l1ss_en = self._pcie_l1ss_cap & 0xF
             if rp and rl:
                 self._setpci_write(rp, rl + 0x08, l1ss_en, 0x0000000F)
@@ -3218,11 +3210,6 @@ class NVMeFuzzer:
                         log.debug(
                             f"[PCIe] L1.2 verify L1SSCTL1 enable="
                             f"{rb_l1ss & 0xF:#04x} (expected {l1ss_en:#04x})")
-                    if (rb_l1ss & LTR_MASK) != (LTR_VAL & LTR_MASK):
-                        log.debug(
-                            f"[PCIe] L1.2 verify LTR threshold="
-                            f"{rb_l1ss & LTR_MASK:#010x} "
-                            f"(expected {LTR_VAL & LTR_MASK:#010x})")
 
             # [PMU] CLKREQ# Deassert — 레지스터 설정·검증 완료 후 마지막 수행
             #   루트 포트가 CLKREQ# 비활성 감지 → 레퍼런스 클록 제거 → 실제 L1.2 진입.
@@ -3239,24 +3226,56 @@ class NVMeFuzzer:
         """setpci로 PMCSR bits[1:0] 설정 (D0=0x00, D3hot=0x03).
         PCI PM cap + 0x04 = PMCSR 레지스터.
         BDF 미탐지 시 False 반환.
+
+        write 후 readback 검증 + 최대 3회 retry.
         """
         if not self._pcie_bdf or self._pcie_pm_cap_offset is None:
             return False
-        val = 3 if state == PCIeDState.D3 else 0
-        ok  = self._setpci_write(
-            self._pcie_bdf, self._pcie_pm_cap_offset + 0x04, val, 0x0003, 'w')
-        if not ok:
-            log.debug("[PCIe] PMCSR setpci 실패")
-        return ok
+        val    = 3 if state == PCIeDState.D3 else 0
+        exp    = val & 0x3
+        offset = self._pcie_pm_cap_offset + 0x04
+        for attempt in range(3):
+            ok = self._setpci_write(self._pcie_bdf, offset, val, 0x0003, 'w')
+            if not ok:
+                time.sleep(0.05)
+                continue
+            rb = self._setpci_read(self._pcie_bdf, offset, 'w')
+            if rb is not None and (rb & 0x3) == exp:
+                if attempt > 0:
+                    log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 확인 (attempt {attempt+1})")
+                return True
+            time.sleep(0.05)
+        log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 진입 실패")
+        return False
 
     # ── 통합 setter ──────────────────────────────────────────────────
 
     def _set_power_combo(self, combo: PowerCombo) -> None:
-        """NVMe PS + PCIe L/D-state 동시 설정 + cmd_history 기록."""
+        """NVMe PS + PCIe L/D-state 동시 설정 + cmd_history 기록.
+
+        순서: NVMe PS → (PS settle) → L-state → D3
+          PS settle: NOPS(PS3/PS4)는 SetFeatures 직후 바로 L-state setpci를 날리면
+                     config TLP가 컨트롤러를 깨워 PS 진입이 완료되지 않음.
+                     _ps_settle[ps]만큼 대기 후 L-state 설정 시작.
+          L-state 먼저: EP↔RP 간 ASPM 협상 완료 + CLKREQ# deassert(L1.2)까지 완료.
+          D3 나중: D3hot config TLP가 링크를 L0으로 순간 깨우지만,
+                   ASPM이 이미 활성화된 상태이므로 링크 idle 후 자동으로 L1/L1.2 재진입.
+        """
         t0    = time.monotonic()
         ok_ps = self._pm_set_state(combo.nvme_ps)
-        ok_d  = self._set_pcie_d_state(combo.pcie_d)
-        ok_l  = self._set_pcie_l_state(combo.pcie_l)  # 마지막 — sleep 후 TLP 없음
+        # NOPS(PS3/PS4) settle: 실제 NAND 파워다운 완료까지 대기
+        # 이후 setpci(config TLP)가 링크를 깨우지 않도록 PS 안정화 후 L-state 진입
+        ps_settle = self._ps_settle.get(combo.nvme_ps, 0.05)
+        if ps_settle > 0.05:
+            time.sleep(ps_settle)
+        ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — ASPM 협상 완료
+        ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 나중 — 링크 idle 후 자동 재진입
+        # D3+L1/L1.2: D3 config TLP가 링크를 순간 깨움 → 재진입 대기
+        if combo.pcie_d == PCIeDState.D3:
+            if combo.pcie_l == PCIeLState.L1_2:
+                time.sleep(L1_SETTLE + L1_2_SETTLE)
+            elif combo.pcie_l == PCIeLState.L1:
+                time.sleep(L1_SETTLE)
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
@@ -3308,16 +3327,40 @@ class NVMeFuzzer:
         if self._orig_apst_cdw11 == 0:
             log.warning("[APST] 이미 비활성화 상태 — skip")
             return
+
+        # APST(FID=0x0C)는 CDW11만으로 부족한 장치가 있음.
+        # 256바이트 APST descriptor table(all-zero)을 data buffer로 함께 전송.
+        import tempfile as _tf
+        _ok_apst = False
         try:
-            r = subprocess.run(
-                ['nvme', 'set-feature', dev, '-f', '0x0C', '-v', '0'],
-                capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
-                log.warning(f"[APST] 비활성화 완료 (원본 CDW11={self._orig_apst_cdw11:#010x})")
-            else:
-                log.warning(f"[APST] 비활성화 실패 (rc={r.returncode}): {r.stderr.strip()}")
+            with _tf.NamedTemporaryFile(suffix='.apst') as _f:
+                _f.write(b'\x00' * 256)
+                _f.flush()
+                r = subprocess.run(
+                    ['nvme', 'set-feature', dev, '-f', '0x0C', '-v', '0',
+                     '--data-len=256', f'--data={_f.name}'],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    log.warning(f"[APST] 비활성화 완료 (원본 CDW11={self._orig_apst_cdw11:#010x})")
+                    _ok_apst = True
+                else:
+                    log.warning(f"[APST] set-feature 실패 (rc={r.returncode}): {r.stderr.strip()}")
         except Exception as e:
-            log.warning(f"[APST] set-feature 실패: {e}")
+            log.warning(f"[APST] set-feature 예외: {e}")
+
+        # fallback: sysfs runtime PM 비활성화 — APST는 커널 PM 경유하므로 효과 있음
+        if not _ok_apst and self._pcie_bdf:
+            try:
+                _ctrl = Path(f'/sys/bus/pci/devices/{self._pcie_bdf}/power/control')
+                if _ctrl.exists():
+                    _ctrl.write_text('on')
+                    log.warning("[APST] sysfs power/control=on 으로 runtime PM 비활성화")
+                    _ok_apst = True
+            except Exception as e:
+                log.warning(f"[APST] sysfs fallback 실패: {e}")
+
+        if not _ok_apst:
+            log.warning("[APST] 비활성화 실패 — APST 자율 PS 전환이 MISMATCH 유발할 수 있음")
 
     def _apst_restore(self) -> None:
         """퍼징 종료 시 원본 APST 상태 복원."""
@@ -3335,6 +3378,61 @@ class NVMeFuzzer:
                 log.warning(f"[APST] 복원 실패 (rc={r.returncode}): {r.stderr.strip()}")
         except Exception as e:
             log.warning(f"[APST] 복원 실패: {e}")
+
+    def _apst_recheck(self) -> None:
+        """PM 전환 후 APST가 재활성화됐는지 확인 후 필요시 재비활성화.
+
+        calibration 또는 PM 전환 과정에서 SSD firmware가 APST를 자동으로
+        재활성화하는 경우를 감지하여 재비활성화한다.
+        fuzzing 흐름을 중단하지 않기 위해 모든 예외는 무시한다.
+        """
+        if self._orig_apst_cdw11 == 0:
+            return  # 원래 비활성화 상태였으면 확인 불필요
+        dev = self.config.nvme_device
+        try:
+            import re as _re
+            r = subprocess.run(
+                ['nvme', 'get-feature', dev, '-f', '0x0C'],
+                capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if 'value:' in line.lower() or 'Current value' in line:
+                    m = _re.search(r'0x([0-9a-fA-F]+)', line)
+                    if m:
+                        cur_val = int(m.group(1), 16)
+                        if cur_val != 0:
+                            log.warning(
+                                f"[APST-recheck] APST 재활성화 감지 "
+                                f"(CDW11={cur_val:#010x}) → 재비활성화")
+                            self._apst_disable()
+                    return
+        except Exception:
+            pass  # recheck 실패는 무시 (fuzzing 흐름 중단 방지)
+
+    def _read_pcie_regs_snapshot(self) -> dict:
+        """crash 시점 PCIe config space 핵심 레지스터 덤프.
+
+        PMCSR(Power Management Control/Status, offset 0x44)과
+        Link Control Register(offset 0x70)를 읽어 반환한다.
+        setpci 실패 시 error 키만 포함한 dict를 반환하며 예외는 발생시키지 않는다.
+        """
+        if not self._pcie_bdf:
+            return {"error": "pcie_bdf not configured"}
+        regs: dict = {}
+        try:
+            r = subprocess.run(
+                ['setpci', '-s', self._pcie_bdf, '0x44.w'],
+                capture_output=True, text=True, timeout=3)
+            regs['pmcsr_0x44'] = r.stdout.strip() if r.returncode == 0 else f"rc={r.returncode}"
+        except Exception as e:
+            regs['pmcsr_0x44'] = f"error:{e}"
+        try:
+            r2 = subprocess.run(
+                ['setpci', '-s', self._pcie_bdf, '0x70.w'],
+                capture_output=True, text=True, timeout=3)
+            regs['lnkctl_0x70'] = r2.stdout.strip() if r2.returncode == 0 else f"rc={r2.returncode}"
+        except Exception as e:
+            regs['lnkctl_0x70'] = f"error:{e}"
+        return regs
 
     def _keepalive_disable(self) -> None:
         """NVMe Keep-Alive Timer 비활성화.
@@ -3494,15 +3592,18 @@ class NVMeFuzzer:
                     ['nvme', 'get-feature', self.config.nvme_device, '-f', '0x02'],
                     capture_output=True, text=True, timeout=5)
                 if r.returncode == 0:
-                    # "get-feature:0x2 (Power Management), Current value:0x00000004" 형태 파싱
+                    # "get-feature:0x2 (Power Management), Current value:0x00000004"
+                    # "get-feature:0x02, Current value: 00000000" 등 다양한 포맷 대응
+                    import re as _re_gf
                     raw_gf = (r.stdout + r.stderr).strip()
                     cur_ps = None
-                    for tok in raw_gf.replace(',', ' ').split():
-                        if tok.startswith('0x') or tok.startswith('0X'):
-                            try:
-                                cur_ps = int(tok, 16)
-                            except ValueError:
-                                pass
+                    m = _re_gf.search(
+                        r'[Cc]urrent\s+value[:\s]+(?:0x)?([0-9a-fA-F]+)', raw_gf)
+                    if m:
+                        try:
+                            cur_ps = int(m.group(1), 16)
+                        except ValueError:
+                            pass
                     if cur_ps is not None:
                         exp_ps = combo.nvme_ps
                         chk    = 'OK' if cur_ps == exp_ps else f'MISMATCH(exp=PS{exp_ps})'
@@ -3582,13 +3683,8 @@ class NVMeFuzzer:
                 chk     = 'OK' if l1ss_en == exp_en else f'MISMATCH(exp={exp_en:#03x})'
                 res['l1ss'] = f"L1SS_EN={l1ss_en:#03x} {chk}"
 
-        # 5. sysfs power_state (커널 D-state 뷰)
-        if self._pcie_bdf:
-            try:
-                ps_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/power_state"
-                res['sysfs_d'] = Path(ps_path).read_text().strip()
-            except Exception:
-                res['sysfs_d'] = 'N/A'
+        # sysfs power_state는 커널 PM 뷰 — setpci 직접 write 시 하드웨어와 불일치.
+        # PMCSR readback(d_state)이 실제 하드웨어 레지스터 기준이므로 sysfs는 생략.
 
         return res
 
@@ -3596,9 +3692,13 @@ class NVMeFuzzer:
         """nvme id-ctrl 텍스트 출력에서 PS별 enlat/exlat(μs) 파싱 → preflight settle 계산.
 
         formula: settle = (enlat_us + exlat_us) / 1_000_000 * 2 + 0.05
+                 PS3 최소값: 0.5s (NAND 캐시 플러시 + retention 진입 대기)
+                 PS4 최소값: 2.0s (더 깊은 sleep → NAND flush 완료까지 추가 대기)
         파싱 실패 시 _PS_SETTLE_FALLBACK 유지.
         """
         import re as _re
+        NOPS_MIN_SETTLE  = 0.5   # PS3: NAND retention 진입까지 최소 대기
+        PS4_MIN_SETTLE   = 2.0   # PS4: 더 깊은 sleep → NAND flush 완료까지 더 긴 대기
         parsed: dict[int, float] = {}
         try:
             r = subprocess.run(
@@ -3611,6 +3711,11 @@ class NVMeFuzzer:
                     enlat = int(m.group(2))
                     exlat = int(m.group(3))
                     settle = (enlat + exlat) / 1_000_000 * 2 + 0.05
+                    # NOPS 여부: 같은 줄에 'non-operational' 포함 여부로 판단
+                    is_nops = 'non-operational' in line.lower()
+                    if is_nops:
+                        min_settle = PS4_MIN_SETTLE if ps >= 4 else NOPS_MIN_SETTLE
+                        settle = max(settle, min_settle)
                     parsed[ps] = max(settle, 0.05)
         except Exception as e:
             log.warning(f"[PS-Settle] id-ctrl 파싱 예외: {e} → fallback 유지")
@@ -3645,8 +3750,9 @@ class NVMeFuzzer:
         # id-ctrl에서 enlat/exlat 읽어 PS별 settle 시간 동적 계산
         self._init_ps_settle()
 
-        RESTORE_SETTLE = 0.1   # baseline 복귀 후 안정화 대기 (초)
-        D3_EXTRA      = 1.0   # D3 wake-up 추가 대기 (setpci → NVMe 링크 재초기화)
+        RESTORE_SETTLE     = 0.5   # baseline 복귀 후 안정화 대기 (초)
+        D3_RESTORE_SETTLE  = 1.5   # D3→D0 restore 후 NVMe 드라이버 재인식 대기
+        D3_EXTRA           = 1.0   # D3 진입 후 추가 settle (setpci → 링크 안정화)
         PROBE_TIMEOUT = 5.0   # nvme id-ctrl 타임아웃
 
         baseline = POWER_COMBOS[0]  # PS0+L0+D0
@@ -3660,8 +3766,14 @@ class NVMeFuzzer:
         results: list = []
         failed_labels: list = []
 
-        for i, combo in enumerate(POWER_COMBOS):
-            log.warning(f"  [{i+1:2d}/{len(POWER_COMBOS)}] {combo.label} 진입 중...")
+        # D0 먼저 전체 L×PS, 그 다음 D3 전체 L×PS
+        _preflight_order = sorted(
+            POWER_COMBOS,
+            key=lambda c: (int(c.pcie_d), int(c.pcie_l), c.nvme_ps)
+        )
+
+        for i, combo in enumerate(_preflight_order):
+            log.warning(f"  [{i+1:2d}/{len(_preflight_order)}] {combo.label} 진입 중...")
             t0 = time.monotonic()
 
             # 1. 상태 진입
@@ -3687,11 +3799,11 @@ class NVMeFuzzer:
             verify = {}
             if ok_set:
                 verify = self._pm_verify_combo(combo)
+                log.warning(f"    [verify] PMU        : {verify.get('pmu', 'N/A')}")
                 if 'nvme_ps' in verify:
                     log.warning(f"    [verify] NVMe PS    : {verify['nvme_ps']}")
-                log.warning(f"    [verify] PMU        : {verify.get('pmu', 'N/A')}")
                 if 'd_state' in verify:
-                    log.warning(f"    [verify] D-state    : {verify['d_state']}")
+                    log.warning(f"    [verify] D-state(HW): {verify['d_state']}")
                 if 'l_state_ep' in verify:
                     log.warning(f"    [verify] L-state EP : {verify['l_state_ep']}")
                 if 'l_state_rp' in verify:
@@ -3702,8 +3814,6 @@ class NVMeFuzzer:
                     log.warning(f"    [verify] lspci      : {verify['lspci_lnkctl']}")
                 if 'l1ss' in verify:
                     log.warning(f"    [verify] L1SS       : {verify['l1ss']}")
-                if 'sysfs_d' in verify:
-                    log.warning(f"    [verify] sysfs      : {verify['sysfs_d']}")
 
             # 4. PS0+L0+D0 복귀
             #    D3 포함 combo: D0 먼저(setpci) → Trst → L0 → PS0 순서 필수.
@@ -3712,23 +3822,43 @@ class NVMeFuzzer:
             try:
                 if combo.pcie_d == PCIeDState.D3:
                     ok_restore = self._pm_d3_safe_restore()
+                    time.sleep(D3_RESTORE_SETTLE)
                 else:
                     self._set_power_combo(baseline)
-                time.sleep(RESTORE_SETTLE)
+                    time.sleep(RESTORE_SETTLE)
             except Exception as e:
                 log.warning(f"    → baseline 복귀 예외: {e}")
                 ok_restore = False
 
-            # 5. NVMe 생존 확인 — 복귀 완료 후 probe (D3 중에는 응답 불가)
-            ok_nvme = False
-            try:
-                r = subprocess.run(
-                    ['nvme', 'id-ctrl', self.config.nvme_device],
-                    timeout=PROBE_TIMEOUT,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                ok_nvme = (r.returncode == 0)
-            except Exception as e:
-                log.warning(f"    → nvme id-ctrl 예외: {e}")
+            # 5. 복귀 검증 — PMU current + get-feature(PS0 확인)
+            #    PMU: PS0 복귀 후 정상 전류 확인
+            #    get-feature: PS0(0x00) 반환 여부 — MISMATCH면 이전 PS가 남아있는 것
+            ok_nvme   = False
+            rv_verify = {}
+            if ok_restore:
+                rv_verify = self._pm_verify_combo(baseline)
+                rv_pmu = rv_verify.get('pmu', 'N/A')
+                log.warning(f"    [restore] PMU       : {rv_pmu}")
+                if 'nvme_ps' in rv_verify:
+                    rv_ps = rv_verify['nvme_ps']
+                    log.warning(f"    [restore] NVMe PS   : {rv_ps}")
+                    if 'MISMATCH' in rv_ps:
+                        log.warning(f"    → 복귀 실패: PS0으로 돌아오지 않음")
+                        ok_restore = False
+                # get-feature 성공 = NVMe 응답 정상
+                ok_nvme = ('nvme_ps' in rv_verify and
+                           'ERR' not in rv_verify['nvme_ps'] and
+                           'FAIL' not in rv_verify['nvme_ps'])
+            if not ok_nvme:
+                # fallback: nvme id-ctrl 로 생존만 확인
+                try:
+                    r = subprocess.run(
+                        ['nvme', 'id-ctrl', self.config.nvme_device],
+                        timeout=PROBE_TIMEOUT,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    ok_nvme = (r.returncode == 0)
+                except Exception as e:
+                    log.warning(f"    → nvme id-ctrl 예외: {e}")
 
             elapsed  = time.monotonic() - t0
             # pmu 출력은 멀티라인 (CLI 경로 echo 포함) — 숫자만 있는 줄을 추출
@@ -3755,7 +3885,7 @@ class NVMeFuzzer:
         # 최종 baseline 복귀 보장
         try:
             self._pm_d3_safe_restore()
-            time.sleep(RESTORE_SETTLE)
+            time.sleep(D3_RESTORE_SETTLE)
         except Exception:
             pass
 
@@ -4501,7 +4631,8 @@ class NVMeFuzzer:
 
     def _save_crash(self, data: bytes, seed: Seed, reason: str = "timeout",
                     stuck_pcs: Optional[List[int]] = None,
-                    dmesg_snapshot: Optional[str] = None):
+                    dmesg_snapshot: Optional[str] = None,
+                    combo: Optional['PowerCombo'] = None):
         input_hash = hashlib.md5(data).hexdigest()[:12]
         filename = f"crash_{seed.cmd.name}_{hex(seed.cmd.opcode)}_{input_hash}"
         filepath = self.crashes_dir / filename
@@ -4512,6 +4643,18 @@ class NVMeFuzzer:
         meta = self._seed_meta(seed)
         meta["crash_reason"] = reason
         meta["timestamp"] = datetime.now().isoformat()
+
+        # v5.2: crash 시점 PM 상태 및 PCIe 레지스터 스냅샷
+        if combo is not None:
+            meta["pm_state"] = {
+                "combo_label": combo.label,
+                "nvme_ps":     combo.nvme_ps,
+                "pcie_l":      combo.pcie_l.name,
+                "pcie_d":      combo.pcie_d.name,
+            }
+        else:
+            meta["pm_state"] = {"combo_label": "unknown"}
+        meta["pcie_regs"] = self._read_pcie_regs_snapshot()
 
         # v4.3: timeout 시 SSD 펌웨어가 멈춘 PC 주소 기록
         if stuck_pcs:
@@ -4644,7 +4787,8 @@ class NVMeFuzzer:
         # 3) crash 저장
         self.crash_inputs.append((fuzz_data, cmd))
         self._save_crash(fuzz_data, seed, reason="timeout",
-                         stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot)
+                         stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot,
+                         combo=self._current_combo)
         log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
 
         # 3.5) 재현 TC replay 스크립트 생성
@@ -5721,6 +5865,7 @@ class NVMeFuzzer:
                         self._current_combo = next_combo
                         self._current_ps    = next_combo.nvme_ps   # 기존 timeout 로직 호환
                         self.ps_enter_counts[next_combo.nvme_ps] += 1
+                        self._apst_recheck()  # v5.2: PM 전환 후 APST 재활성화 감지
                         self.combo_enter_counts[next_combo] += 1
 
                     # 윈도우 리셋은 PM 전환 완료 후 — 전환 시간이 다음 윈도우에도 포함되지 않음
