@@ -1363,6 +1363,8 @@ class NVMeFuzzer:
         # v4: Seed 리스트로 변경
         self.corpus: List[Seed] = []
         self.crash_inputs: List[Tuple[bytes, NVMeCommand]] = []
+        # FWDownload: 청크 시드 목록 (corpus에는 1개만, 실제 전송 시 여기서 순서대로 전송)
+        self._fw_chunks: List[Seed] = []
 
         self.output_dir = Path(config.output_dir)
         self.crashes_dir = self.output_dir / 'crashes'
@@ -2383,19 +2385,24 @@ class NVMeFuzzer:
                         fw_data = f.read()
                     offset = 0
                     chunk_idx = 0
+                    self._fw_chunks.clear()
                     while offset < len(fw_data):
                         chunk = fw_data[offset:offset + fw_xfer]
                         if len(chunk) % 4 != 0:
                             chunk = chunk + b'\x00' * (4 - len(chunk) % 4)
                         numd = (len(chunk) // 4) - 1  # CDW10: NUMD (0-based)
                         ofst = offset // 4             # CDW11: OFST (dword offset)
-                        seed = Seed(data=chunk, cmd=cmd,
-                                    cdw10=numd, cdw11=ofst, found_at=0)
-                        seeds.append(seed)
+                        chunk_seed = Seed(data=chunk, cmd=cmd,
+                                         cdw10=numd, cdw11=ofst, found_at=0)
+                        self._fw_chunks.append(chunk_seed)
                         log.info(f"[Seed] FWDownload chunk {chunk_idx} "
                                  f"offset={offset} ({len(chunk)}B) NUMD=0x{numd:x}")
                         offset += fw_xfer
                         chunk_idx += 1
+                    # corpus에는 대표 시드 1개만 — 메인 루프에서 _fw_chunks 전체 전송
+                    seeds.append(self._fw_chunks[0])
+                    log.info(f"[Seed] FWDownload {chunk_idx}개 청크 → corpus 1개(대표 시드), "
+                             f"실행 시 전체 청크 순서대로 전송")
                 else:
                     # 더미: 1KB zeros (변이 시작점용)
                     seed = Seed(data=b'\x00' * 1024, cmd=cmd,
@@ -6050,9 +6057,23 @@ class NVMeFuzzer:
                 if (self.config.pm_inject_prob > 0
                         and self._current_combo.pcie_d == PCIeDState.D3):
                     _timeout_mult = max(_timeout_mult, D3_TIMEOUT_MULT)
-                rc = self._send_nvme_command(fuzz_data, mutated_seed,
-                                             timeout_mult=_timeout_mult)
-                last_samples = self.sampler.stop_sampling()
+                # FWDownload + 실제 청크 목록이 있으면 전체 청크를 순서대로 전송,
+                # exec 카운터는 1만 증가 (CLI 기준 1회 실행)
+                if cmd.name == "FWDownload" and self._fw_chunks:
+                    # _send_nvme_command 내부에서 start_sampling() 호출됨
+                    # alive 체크로 중복 시작 방지 → 첫 청크가 자동으로 샘플링 시작
+                    rc = self.RC_ERROR
+                    for _chunk_seed in self._fw_chunks:
+                        rc = self._send_nvme_command(_chunk_seed.data, _chunk_seed,
+                                                     timeout_mult=_timeout_mult)
+                        # 청크 중간에 타임아웃/에러 발생 시 즉시 중단
+                        if rc in (self.RC_TIMEOUT, self.RC_ERROR):
+                            break
+                    last_samples = self.sampler.stop_sampling()
+                else:
+                    rc = self._send_nvme_command(fuzz_data, mutated_seed,
+                                                 timeout_mult=_timeout_mult)
+                    last_samples = self.sampler.stop_sampling()
 
                 self.executions += 1
                 track_key = self._tracking_label(cmd, mutated_seed)
