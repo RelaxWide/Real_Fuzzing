@@ -3666,6 +3666,61 @@ class NVMeFuzzer:
         except Exception as e:
             log.warning(f"[APST] 복원 실패: {e}")
 
+    def _apst_recheck(self) -> None:
+        """PM 전환 후 APST가 재활성화됐는지 확인 후 필요시 재비활성화.
+
+        calibration 또는 PM 전환 과정에서 SSD firmware가 APST를 자동으로
+        재활성화하는 경우를 감지하여 재비활성화한다.
+        fuzzing 흐름을 중단하지 않기 위해 모든 예외는 무시한다.
+        """
+        if self._orig_apst_cdw11 == 0:
+            return  # 원래 비활성화 상태였으면 확인 불필요
+        dev = self.config.nvme_device
+        try:
+            import re as _re
+            r = subprocess.run(
+                ['nvme', 'get-feature', dev, '-f', '0x0C'],
+                capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if 'value:' in line.lower() or 'Current value' in line:
+                    m = _re.search(r'0x([0-9a-fA-F]+)', line)
+                    if m:
+                        cur_val = int(m.group(1), 16)
+                        if cur_val != 0:
+                            log.warning(
+                                f"[APST-recheck] APST 재활성화 감지 "
+                                f"(CDW11={cur_val:#010x}) → 재비활성화")
+                            self._apst_disable()
+                    return
+        except Exception:
+            pass  # recheck 실패는 무시 (fuzzing 흐름 중단 방지)
+
+    def _read_pcie_regs_snapshot(self) -> dict:
+        """crash 시점 PCIe config space 핵심 레지스터 덤프.
+
+        PMCSR(Power Management Control/Status, offset 0x44)과
+        Link Control Register(offset 0x70)를 읽어 반환한다.
+        setpci 실패 시 error 키만 포함한 dict를 반환하며 예외는 발생시키지 않는다.
+        """
+        if not self._pcie_bdf:
+            return {"error": "pcie_bdf not configured"}
+        regs: dict = {}
+        try:
+            r = subprocess.run(
+                ['setpci', '-s', self._pcie_bdf, '0x44.w'],
+                capture_output=True, text=True, timeout=3)
+            regs['pmcsr_0x44'] = r.stdout.strip() if r.returncode == 0 else f"rc={r.returncode}"
+        except Exception as e:
+            regs['pmcsr_0x44'] = f"error:{e}"
+        try:
+            r2 = subprocess.run(
+                ['setpci', '-s', self._pcie_bdf, '0x70.w'],
+                capture_output=True, text=True, timeout=3)
+            regs['lnkctl_0x70'] = r2.stdout.strip() if r2.returncode == 0 else f"rc={r2.returncode}"
+        except Exception as e:
+            regs['lnkctl_0x70'] = f"error:{e}"
+        return regs
+
     def _keepalive_disable(self) -> None:
         """NVMe Keep-Alive Timer 비활성화.
 
@@ -4868,7 +4923,8 @@ class NVMeFuzzer:
 
     def _save_crash(self, data: bytes, seed: Seed, reason: str = "timeout",
                     stuck_pcs: Optional[List[int]] = None,
-                    dmesg_snapshot: Optional[str] = None):
+                    dmesg_snapshot: Optional[str] = None,
+                    combo: Optional['PowerCombo'] = None):
         input_hash = hashlib.md5(data).hexdigest()[:12]
         filename = f"crash_{seed.cmd.name}_{hex(seed.cmd.opcode)}_{input_hash}"
         filepath = self.crashes_dir / filename
@@ -4879,6 +4935,18 @@ class NVMeFuzzer:
         meta = self._seed_meta(seed)
         meta["crash_reason"] = reason
         meta["timestamp"] = datetime.now().isoformat()
+
+        # v5.4: crash 시점 PM 상태 및 PCIe 레지스터 스냅샷
+        if combo is not None:
+            meta["pm_state"] = {
+                "combo_label": combo.label,
+                "nvme_ps":     combo.nvme_ps,
+                "pcie_l":      combo.pcie_l.name,
+                "pcie_d":      combo.pcie_d.name,
+            }
+        else:
+            meta["pm_state"] = {"combo_label": "unknown"}
+        meta["pcie_regs"] = self._read_pcie_regs_snapshot()
 
         # v4.3: timeout 시 SSD 펌웨어가 멈춘 PC 주소 기록
         if stuck_pcs:
@@ -5020,7 +5088,8 @@ class NVMeFuzzer:
         self.crash_inputs.append((fuzz_data, cmd))
         try:
             self._save_crash(fuzz_data, seed, reason="timeout",
-                             stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot)
+                             stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot,
+                             combo=self._current_combo)
             log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
         except Exception as _save_exc:
             log.error(f"  Crash 데이터 저장 실패: {_save_exc}")
@@ -6017,6 +6086,7 @@ class NVMeFuzzer:
                     self._current_ps    = _next_combo.nvme_ps
                     self.ps_enter_counts[_next_combo.nvme_ps] += 1
                     self.combo_enter_counts[_next_combo] += 1
+                    self._apst_recheck()  # v5.4: PM 전환 후 APST 재활성화 감지
 
                 # Non-Operational PM 상태 복귀 — NVMe 커맨드 전 mandatory
                 # D3hot / L1.2(CLKREQ# deasserted): 커맨드 전 반드시 복귀 필요.
