@@ -2370,7 +2370,12 @@ class NVMeFuzzer:
         else:
             log.info("[Seed] fw_bin 미지정 또는 파일 없음 → FWDownload 더미 시드 사용")
 
+        excluded = set(self.config.excluded_opcodes)
         for cmd in self.commands:
+            if cmd.opcode in excluded:
+                log.info(f"[Seed] {cmd.name} (0x{cmd.opcode:02x}) — excluded_opcodes 제외")
+                continue
+
             # ── FWDownload: fw_bin 있으면 실제 청크 시드, 없으면 더미 ──
             if cmd.name == "FWDownload":
                 if use_real_fw:
@@ -2458,7 +2463,10 @@ class NVMeFuzzer:
                     if meta_file.exists():
                         with open(meta_file, 'r') as f:
                             meta = json.load(f)
+                    _excluded = set(self.config.excluded_opcodes)
                     for cmd in self.commands:
+                        if cmd.opcode in _excluded:
+                            continue
                         if meta.get('command') and meta['command'] != cmd.name:
                             continue
                         seed = Seed(
