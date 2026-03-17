@@ -1898,8 +1898,9 @@ class NVMeFuzzer:
                 dict(cdw10=0x02, cdw11=0x00000000, nsid_override=0, description="Set Power State 0 (max performance)"),
                 dict(cdw10=0x02, cdw11=0x00000001, nsid_override=0, description="Set Power State 1"),
                 dict(cdw10=0x02, cdw11=0x00000002, nsid_override=0, description="Set Power State 2"),
-                dict(cdw10=0x02, cdw11=0x00000003, nsid_override=0, description="Set Power State 3 (NOPS)"),
-                dict(cdw10=0x02, cdw11=0x00000004, nsid_override=0, description="Set Power State 4 (low power)"),
+                # PS3/PS4 = NOPS (Non-Operational Power States) → 진입 후 다음 명령까지
+                # 수십~수백 ms wake-up latency 발생. --pm 플래그가 PS 퍼징 + PS0 복구를
+                # 담당하므로 standalone 시드에서는 제외.
                 # FID=0x04: Temperature Threshold — controller-scoped → NSID=0
                 # CDW11[15:0]=TMPTH(Kelvin), [19:16]=TMPSEL, [20]=THSEL
                 dict(cdw10=0x04, cdw11=0x0000012C, nsid_override=0, description="Set Temp Threshold 300K composite (TMPSEL=0)"),
@@ -5905,8 +5906,11 @@ class NVMeFuzzer:
             # calibration 중 SetFeatures(APST/KeepAlive) 시드가 실행되면
             # preflight의 _apst_disable()/_keepalive_disable() 효과가 무력화됨.
             # → calibration 완료 후 다시 비활성화하여 퍼징 중 자율 PS 전환 방지.
+            # SetFeatures PS 시드(PS0~PS2)가 실행된 후 컨트롤러가 PS0이 아닌 상태일
+            # 수 있으므로 명시적으로 PS0으로 복구.
             self._apst_disable()
             self._keepalive_disable()
+            self._pm_set_state(0)   # calibration 중 PS 변경 → PS0 복구
             log.warning("[Calibration] Complete. Starting fuzzing...\n")
         else:
             log.info("[Calibration] Disabled (calibration_runs=0)")
