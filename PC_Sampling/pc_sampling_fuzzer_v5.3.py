@@ -418,6 +418,10 @@ DIAGNOSE_STABILITY  = 100   # 새 idle PC 없이 연속 N회면 수렴으로 판
 DIAGNOSE_MAX        = 5000  # 수렴 전 최대 샘플 수 (상한) (v5.2 수준 복원)
 DIAGNOSE_SAMPLE_MS  = 10    # diagnose() 샘플 간격 (ms). --diagnose-sleep-ms로 조정 가능.
 
+# v5.3: window-ratio 기반 idle saturation 조기 감지
+IDLE_WINDOW_SIZE  = 30    # 슬라이딩 윈도우 크기 (최근 N개 PC 샘플)
+IDLE_RATIO_THRESH = 0.80  # 윈도우 내 idle_pcs 비율 임계값 (이상이면 idle_saturated)
+
 # v4.5: Calibration 설정
 CALIBRATION_RUNS  = 3      # 초기 시드당 calibration 실행 횟수 (0 = 비활성화)
 
@@ -704,6 +708,10 @@ class _FuzzingTerminalFilter(logging.Filter):
       [+]                  — 신규 커버리지 발견
       CRASH / FAIL CMD     — 크래시·커맨드 실패
       =====                — 섹션 구분선
+      [NVMe TIMEOUT]       — nvme-cli 타임아웃 감지 (_send_nvme_command)
+      [TIMEOUT]            — timeout 후속 처리 (_handle_timeout_crash)
+      [REPLAY]             — replay .sh 생성 완료
+      [UFAS]               — UFAS 펌웨어 덤프 진행/완료
       ERROR / CRITICAL     — 예외 없이 항상 출력
 
     나머지는 파일 로그에만 기록됨.
@@ -711,7 +719,7 @@ class _FuzzingTerminalFilter(logging.Filter):
     import re as _re
     _ALLOW = _re.compile(
         r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
-        r'|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]'
+        r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]'
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -1114,6 +1122,8 @@ class JLinkPCSampler:
         sample_count = 0
         since_last_global_new = 0   # 연속 "이미 알려진 PC" 카운터 (global 기준)
         consecutive_idle = 0         # idle 유니버스 연속 카운터
+        from collections import deque as _deque
+        _recent_pcs = _deque(maxlen=IDLE_WINDOW_SIZE)  # 최근 N개 샘플의 idle 여부
         interval = self.config.sample_interval_us / 1_000_000
         # GO_SETTLE_MS: Go() 후 CPU에 최소 실행 시간 보장 (SWD+레벨시프터 NVMe 안정성).
         # SAMPLE_INTERVAL_US(샘플 밀도 제어)와 독립적. 둘 중 큰 값이 실제 sleep.
@@ -1156,13 +1166,16 @@ class JLinkPCSampler:
                     # diagnose()에서 수렴 수집한 idle_pcs = idle 상태에서 나올 수 있는 모든 PC.
                     # NVMe 커맨드 처리 코드는 idle 유니버스 밖 → 처리 중엔 consecutive_idle 리셋.
                     # idle 복귀 후 유니버스 내 PC만 연속 → sat_limit 도달 → 조기종료.
-                    if idle_pcs and pc in idle_pcs:
+                    _is_idle = bool(idle_pcs and pc in idle_pcs)
+                    if _is_idle:
                         consecutive_idle += 1
                     else:
                         consecutive_idle = 0
+                    _recent_pcs.append(_is_idle)
                 else:
                     self._out_of_range_count += 1
                     consecutive_idle = 0  # out-of-range는 idle로 보지 않음
+                    _recent_pcs.append(False)
 
                 sample_count += 1
                 self.total_samples += 1
@@ -1174,6 +1187,7 @@ class JLinkPCSampler:
                 # 조기 종료 조건 (OR)
                 # 조건1: 연속 global_sat_limit회 이미 알려진 PC (새 코드 경로 없음, global 기준)
                 # 조건2: 연속 sat_limit회 idle 유니버스 내 PC (idle 복귀 감지)
+                # 조건3: 최근 IDLE_WINDOW_SIZE 샘플 중 IDLE_RATIO_THRESH 이상이 idle (window-ratio)
                 if sat_limit > 0:
                     if global_sat_limit > 0 and since_last_global_new >= global_sat_limit:
                         self._stopped_reason = (
@@ -1187,6 +1201,16 @@ class JLinkPCSampler:
                             f"idle_saturated (idle universe hit "
                             f"{consecutive_idle} consecutive, "
                             f"universe_size={len(idle_pcs)})"
+                        )
+                        break
+                    if (idle_pcs
+                            and len(_recent_pcs) == IDLE_WINDOW_SIZE
+                            and sum(_recent_pcs) / IDLE_WINDOW_SIZE >= IDLE_RATIO_THRESH):
+                        _ratio = sum(_recent_pcs) / IDLE_WINDOW_SIZE
+                        self._stopped_reason = (
+                            f"idle_saturated (window_ratio "
+                            f"{_ratio:.0%} >= {IDLE_RATIO_THRESH:.0%}, "
+                            f"window={IDLE_WINDOW_SIZE})"
                         )
                         break
 
@@ -1220,6 +1244,11 @@ class JLinkPCSampler:
         if self.sample_thread:
             self.stop_event.set()
             self.sample_thread.join(timeout=2.0)
+            if self.sample_thread.is_alive():
+                log.warning(
+                    "[Sampler] stop_sampling() 2.0s join timeout — "
+                    "sampling thread still alive (J-Link 응답 느림?). "
+                    "다음 start_sampling()이 skip되어 해당 명령의 커버리지가 0이 될 수 있음.")
         return len(self.current_trace)
 
     def evaluate_coverage(self) -> Tuple[bool, int]:
@@ -1526,8 +1555,10 @@ class NVMeFuzzer:
 
         for field_name in cdw_fields:
             original = getattr(seed, field_name)
-            if original == 0:
-                continue  # 미사용 가능성 높은 필드 건너뛰기
+            # cdw10(LBA low)/cdw11(LBA high)/cdw12(NLB+flags)는 0이어도 핵심 필드 — 건너뛰지 않음.
+            # cdw13~cdw15는 대부분의 명령에서 미사용(reserved=0) → 0이면 skip하여 노이즈 방지.
+            if original == 0 and field_name in ('cdw13', 'cdw14', 'cdw15'):
+                continue
 
             # Phase 1: Walking bitflip (32개)
             for bit in range(32):
@@ -1820,6 +1851,9 @@ class NVMeFuzzer:
                 dict(cdw10=0x01, cdw11=0x00000003, description="Set Arbitration (burst=8, default priority)"),
                 # FID=0x02: Power Management — CDW11[4:0]=PS (Power State)
                 dict(cdw10=0x02, cdw11=0x00000000, description="Set Power State 0 (max performance)"),
+                dict(cdw10=0x02, cdw11=0x00000001, description="Set Power State 1"),
+                dict(cdw10=0x02, cdw11=0x00000002, description="Set Power State 2"),
+                dict(cdw10=0x02, cdw11=0x00000003, description="Set Power State 3 (NOPS)"),
                 dict(cdw10=0x02, cdw11=0x00000004, description="Set Power State 4 (low power)"),
                 # FID=0x04: Temperature Threshold — CDW11[15:0]=TMPTH(Kelvin), [19:16]=TMPSEL, [20]=THSEL
                 dict(cdw10=0x04, cdw11=0x0000012C, description="Set Temp Threshold 300K composite (TMPSEL=0)"),
@@ -4919,14 +4953,20 @@ class NVMeFuzzer:
 
         # 3) crash 저장
         self.crash_inputs.append((fuzz_data, cmd))
-        self._save_crash(fuzz_data, seed, reason="timeout",
-                         stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot)
-        log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
+        try:
+            self._save_crash(fuzz_data, seed, reason="timeout",
+                             stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot)
+            log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
+        except Exception as _save_exc:
+            log.error(f"  Crash 데이터 저장 실패: {_save_exc}")
 
         # 3.5) 재현 TC replay 스크립트 생성
         _replay_tag = hashlib.md5(fuzz_data).hexdigest()[:8]
         log.warning("[TIMEOUT] 재현 TC 스크립트를 생성합니다...")
-        self._generate_replay_sh(self.crashes_dir, _replay_tag)
+        try:
+            self._generate_replay_sh(self.crashes_dir, _replay_tag)
+        except Exception as _replay_exc:
+            log.warning(f"[REPLAY] replay .sh 생성 실패: {_replay_exc}")
 
         # 3.6) UFAS 펌웨어 덤프
         log.warning("[TIMEOUT] UFAS 펌웨어 덤프를 실행합니다...")
