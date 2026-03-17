@@ -1111,26 +1111,6 @@ class JLinkPCSampler:
             return True
         return self.config.addr_range_start <= pc <= self.config.addr_range_end
 
-    def _detect_lba_size(self) -> int:
-        """네임스페이스 블록 디바이스에서 논리 섹터 크기(LBA 크기)를 자동 감지.
-
-        blockdev --getss /dev/nvme0n1 → 512 또는 4096 등.
-        실패 시 512 반환 (fallback).
-        """
-        ns_dev = f"{self.config.nvme_device}n{self.config.nvme_namespace}"
-        try:
-            r = subprocess.run(
-                ['blockdev', '--getss', ns_dev],
-                capture_output=True, text=True, timeout=5
-            )
-            if r.returncode == 0:
-                size = int(r.stdout.strip())
-                if size > 0:
-                    return size
-        except Exception:
-            pass
-        return 512
-
     def _sampling_worker(self):
         """PC 주소 기반 글로벌 포화 체크 + prev_pc 실행 간 리셋.
 
@@ -1755,6 +1735,26 @@ class NVMeFuzzer:
 
     def _setup_directories(self):
         self.crashes_dir.mkdir(parents=True, exist_ok=True)
+
+    def _detect_lba_size(self) -> int:
+        """네임스페이스 블록 디바이스에서 논리 섹터 크기(LBA 크기)를 자동 감지.
+
+        blockdev --getss /dev/nvme0n1 → 512 또는 4096 등.
+        실패 시 512 반환 (fallback).
+        """
+        ns_dev = f"{self.config.nvme_device}n{self.config.nvme_namespace}"
+        try:
+            r = subprocess.run(
+                ['blockdev', '--getss', ns_dev],
+                capture_output=True, text=True, timeout=5
+            )
+            if r.returncode == 0:
+                size = int(r.stdout.strip())
+                if size > 0:
+                    return size
+        except Exception:
+            pass
+        return 512
 
     def _generate_default_seeds(self) -> List[Seed]:
         """각 Opcode별 NVMe 스펙 기반 정상 명령어를 초기 시드로 생성"""
