@@ -272,7 +272,7 @@ FW_ADDR_END   = 0x003B7FFF
 
 # J-Link / JTAG 설정
 JLINK_DEVICE  = 'Cortex-R8'
-JLINK_SPEED   = 12000          # kHz
+JLINK_SPEED   = 4000           # kHz
 
 # NVMe 장치 설정
 NVME_DEVICE    = '/dev/nvme0'
