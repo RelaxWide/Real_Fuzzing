@@ -1852,44 +1852,52 @@ class NVMeFuzzer:
             # SetFeatures — CDW10[7:0]=FID, CDW10[31]=SV (Save), CDW11=dword value
             # ================================================================
             "SetFeatures": [
-                # FID=0x01: Arbitration — CDW11[2:0]=AB(High Priority Burst), [8:3]=HPW, [15:8]=MPW, [23:16]=LPW
-                dict(cdw10=0x01, cdw11=0x00000003, description="Set Arbitration (burst=8, default priority)"),
-                # FID=0x02: Power Management — CDW11[4:0]=PS (Power State)
-                dict(cdw10=0x02, cdw11=0x00000000, description="Set Power State 0 (max performance)"),
-                dict(cdw10=0x02, cdw11=0x00000001, description="Set Power State 1"),
-                dict(cdw10=0x02, cdw11=0x00000002, description="Set Power State 2"),
-                dict(cdw10=0x02, cdw11=0x00000003, description="Set Power State 3 (NOPS)"),
-                dict(cdw10=0x02, cdw11=0x00000004, description="Set Power State 4 (low power)"),
-                # FID=0x04: Temperature Threshold — CDW11[15:0]=TMPTH(Kelvin), [19:16]=TMPSEL, [20]=THSEL
-                dict(cdw10=0x04, cdw11=0x0000012C, description="Set Temp Threshold 300K composite (TMPSEL=0)"),
-                dict(cdw10=0x04, cdw11=0x00010050, description="Set Temp Threshold 80K (unrealistically low, error path)"),
-                dict(cdw10=0x04, cdw11=0x000107FF, description="Set Temp Threshold max (0x7FF K, TMPSEL=1 sensor1)"),
-                # FID=0x05: Error Recovery — CDW11[15:0]=TLER(ms), CDW11[16]=DULBE
+                # FID=0x01: Arbitration — controller-scoped → NSID=0
+                # CDW11[2:0]=AB(High Priority Burst), [8:3]=HPW, [15:8]=MPW, [23:16]=LPW
+                dict(cdw10=0x01, cdw11=0x00000003, nsid_override=0, description="Set Arbitration (burst=8, default priority)"),
+                # FID=0x02: Power Management — controller-scoped → NSID=0
+                # CDW11[4:0]=PS (Power State)
+                dict(cdw10=0x02, cdw11=0x00000000, nsid_override=0, description="Set Power State 0 (max performance)"),
+                dict(cdw10=0x02, cdw11=0x00000001, nsid_override=0, description="Set Power State 1"),
+                dict(cdw10=0x02, cdw11=0x00000002, nsid_override=0, description="Set Power State 2"),
+                dict(cdw10=0x02, cdw11=0x00000003, nsid_override=0, description="Set Power State 3 (NOPS)"),
+                dict(cdw10=0x02, cdw11=0x00000004, nsid_override=0, description="Set Power State 4 (low power)"),
+                # FID=0x04: Temperature Threshold — controller-scoped → NSID=0
+                # CDW11[15:0]=TMPTH(Kelvin), [19:16]=TMPSEL, [20]=THSEL
+                dict(cdw10=0x04, cdw11=0x0000012C, nsid_override=0, description="Set Temp Threshold 300K composite (TMPSEL=0)"),
+                dict(cdw10=0x04, cdw11=0x00010050, nsid_override=0, description="Set Temp Threshold 80K (unrealistically low, error path)"),
+                dict(cdw10=0x04, cdw11=0x000107FF, nsid_override=0, description="Set Temp Threshold max (0x7FF K, TMPSEL=1 sensor1)"),
+                # FID=0x05: Error Recovery — namespace-scoped → NSID=1 (default)
+                # CDW11[15:0]=TLER(ms). DULBE(CDW11[16]) 제거: 장치 미지원(rc=2)
                 dict(cdw10=0x05, cdw11=0x00000000, description="Set Error Recovery TLER=0 DULBE=0"),
-                dict(cdw10=0x05, cdw11=0x00010064, description="Set Error Recovery TLER=100ms DULBE=1"),
-                # FID=0x06: Volatile Write Cache — CDW11[0]=WCE (Write Cache Enable)
-                dict(cdw10=0x06, cdw11=0x00000001, description="Set VWC=Enable"),
-                dict(cdw10=0x06, cdw11=0x00000000, description="Set VWC=Disable"),
-                # FID=0x07: Number of Queues (기존 유지)
-                dict(cdw10=0x07, cdw11=0x00010001, description="Set Number of Queues (1 SQ + 1 CQ)"),
-                # FID=0x08: Interrupt Coalescing — CDW11[7:0]=THR, CDW11[15:8]=TIME(100us)
-                dict(cdw10=0x08, cdw11=0x00000000, description="Set Interrupt Coalescing disabled"),
-                dict(cdw10=0x08, cdw11=0x00000A04, description="Set Interrupt Coalescing THR=4 TIME=10"),
-                # FID=0x0B: Async Event Configuration — CDW11[0]=SMART Critical Warning
-                dict(cdw10=0x0B, cdw11=0x00000000, description="Set AEC all disabled"),
-                dict(cdw10=0x0B, cdw11=0x000000FF, description="Set AEC all enabled"),
-                # FID=0x0E: Timestamp — CDW11+CDW12 = 48-bit timestamp (ms since epoch)
-                dict(cdw10=0x0E, cdw11=0x00000000, description="Set Timestamp = 0 (reset)"),
-                # FID=0x10: Host Controlled Thermal Management — CDW11[0]=TMT2EN, CDW11[1]=TMT1EN
-                dict(cdw10=0x10, cdw11=0x00000003, description="Set HCTM both thresholds enabled"),
-                # FID=0x0C: Autonomous Power State Transition (APST)
+                # FID=0x06: Volatile Write Cache — controller-scoped → NSID=0
+                # CDW11[0]=WCE (Write Cache Enable)
+                dict(cdw10=0x06, cdw11=0x00000001, nsid_override=0, description="Set VWC=Enable"),
+                dict(cdw10=0x06, cdw11=0x00000000, nsid_override=0, description="Set VWC=Disable"),
+                # FID=0x07: Number of Queues — controller-scoped → NSID=0
+                dict(cdw10=0x07, cdw11=0x00010001, nsid_override=0, description="Set Number of Queues (1 SQ + 1 CQ)"),
+                # FID=0x08: Interrupt Coalescing — controller-scoped → NSID=0
+                # CDW11[7:0]=THR, CDW11[15:8]=TIME(100us)
+                dict(cdw10=0x08, cdw11=0x00000000, nsid_override=0, description="Set Interrupt Coalescing disabled"),
+                dict(cdw10=0x08, cdw11=0x00000A04, nsid_override=0, description="Set Interrupt Coalescing THR=4 TIME=10"),
+                # FID=0x0B: Async Event Configuration — controller-scoped → NSID=0
+                # CDW11[0]=SMART Critical Warning
+                dict(cdw10=0x0B, cdw11=0x00000000, nsid_override=0, description="Set AEC all disabled"),
+                dict(cdw10=0x0B, cdw11=0x000000FF, nsid_override=0, description="Set AEC all enabled"),
+                # FID=0x0E: Timestamp — controller-scoped → NSID=0
+                # CDW11+CDW12 = 48-bit timestamp (ms since epoch)
+                dict(cdw10=0x0E, cdw11=0x00000000, nsid_override=0, description="Set Timestamp = 0 (reset)"),
+                # FID=0x10: Host Controlled Thermal Management — controller-scoped → NSID=0
+                # CDW11[0]=TMT2EN, CDW11[1]=TMT1EN
+                dict(cdw10=0x10, cdw11=0x00000003, nsid_override=0, description="Set HCTM both thresholds enabled"),
+                # FID=0x0C: Autonomous Power State Transition (APST) — controller-scoped → NSID=0
                 # CDW11[0]=APSTE (APST Enable). Data=256B APST entry table.
                 # Entry[3:0]=ITPS(Idle Trans PS), Entry[31:8]=ITP(×100ms, 0=disable)
                 dict(cdw10=0x0C, cdw11=0x00000000,
-                     data=b'\x00' * 256,
+                     data=b'\x00' * 256, nsid_override=0,
                      description="Set APST disabled (APSTE=0, table zeros)"),
                 dict(cdw10=0x0C, cdw11=0x00000001,
-                     data=b'\x00' * 256,
+                     data=b'\x00' * 256, nsid_override=0,
                      description="Set APST enabled (APSTE=1, all ITP=0 → no transition)"),
                 # APST table: entry[0] ITP=10(1s) ITPS=3, entry[1] ITP=100(10s) ITPS=4
                 dict(cdw10=0x0C, cdw11=0x00000001,
@@ -1898,33 +1906,36 @@ class NVMeFuzzer:
                          (100 << 8 | 4).to_bytes(4, 'little') + b'\x00' * 4 +  # entry1: 10s→PS4
                          b'\x00' * 240
                      ),
+                     nsid_override=0,
                      description="Set APST: 1s→PS3, 10s→PS4"),
-                # FID=0x0D: Host Memory Buffer (HMB)
+                # FID=0x0D: Host Memory Buffer (HMB) — controller-scoped → NSID=0
                 # CDW11[0]=EHM(Enable HMB), CDW11[1]=MR(Memory Return)
-                dict(cdw10=0x0D, cdw11=0x00000000,
+                dict(cdw10=0x0D, cdw11=0x00000000, nsid_override=0,
                      description="Set HMB disabled (EHM=0)"),
-                dict(cdw10=0x0D, cdw11=0x00000002,
+                dict(cdw10=0x0D, cdw11=0x00000002, nsid_override=0,
                      description="Set HMB MR=1 (return previously allocated buffer)"),
-                # FID=0x0F: Keep Alive Timer — CDW11=KATO (ms, 0=disable)
-                dict(cdw10=0x0F, cdw11=0x00000000,
+                # FID=0x0F: Keep Alive Timer — controller-scoped → NSID=0
+                # CDW11=KATO (ms, 0=disable)
+                dict(cdw10=0x0F, cdw11=0x00000000, nsid_override=0,
                      description="Set Keep Alive Timer disabled (KATO=0)"),
-                dict(cdw10=0x0F, cdw11=0x00001388,
+                dict(cdw10=0x0F, cdw11=0x00001388, nsid_override=0,
                      description="Set Keep Alive Timer 5000ms"),
-                dict(cdw10=0x0F, cdw11=0xFFFFFFFF,
+                dict(cdw10=0x0F, cdw11=0xFFFFFFFF, nsid_override=0,
                      description="Set Keep Alive Timer max (error path)"),
-                # FID=0x11: Non-Operational Power State Config
+                # FID=0x11: Non-Operational Power State Config — controller-scoped → NSID=0
                 # CDW11[0]=NOPPME (Non-Operational PS Permissive Mode Enable)
-                dict(cdw10=0x11, cdw11=0x00000000,
+                dict(cdw10=0x11, cdw11=0x00000000, nsid_override=0,
                      description="Set Non-Op PS Config NOPPME=0 (permissive mode off)"),
-                dict(cdw10=0x11, cdw11=0x00000001,
+                dict(cdw10=0x11, cdw11=0x00000001, nsid_override=0,
                      description="Set Non-Op PS Config NOPPME=1 (permissive mode on)"),
-                # FID=0x12: Read Recovery Level — CDW11[3:0]=RLL (0~15)
-                dict(cdw10=0x12, cdw11=0x00000000,
+                # FID=0x12: Read Recovery Level — controller-scoped → NSID=0
+                # CDW11[3:0]=RLL (0~15)
+                dict(cdw10=0x12, cdw11=0x00000000, nsid_override=0,
                      description="Set Read Recovery Level 0 (lowest)"),
-                dict(cdw10=0x12, cdw11=0x0000000F,
+                dict(cdw10=0x12, cdw11=0x0000000F, nsid_override=0,
                      description="Set Read Recovery Level 15 (highest, error path)"),
-                # SV=1 변형 (설정값 저장)
-                dict(cdw10=(1 << 31) | 0x06, cdw11=0x00000001, description="Set VWC=Enable + Save"),
+                # SV=1 변형 (설정값 저장) — controller-scoped → NSID=0
+                dict(cdw10=(1 << 31) | 0x06, cdw11=0x00000001, nsid_override=0, description="Set VWC=Enable + Save"),
             ],
 
             # ================================================================
