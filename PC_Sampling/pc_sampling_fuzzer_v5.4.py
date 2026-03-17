@@ -5906,6 +5906,11 @@ class NVMeFuzzer:
                         self._det_queue.append((seed, gen))
                 log.warning(f"[Det] Queued {len(self._det_queue)} seeds for deterministic stage")
 
+            # calibration 중 SetFeatures(APST/KeepAlive) 시드가 실행되면
+            # preflight의 _apst_disable()/_keepalive_disable() 효과가 무력화됨.
+            # → calibration 완료 후 다시 비활성화하여 퍼징 중 자율 PS 전환 방지.
+            self._apst_disable()
+            self._keepalive_disable()
             log.warning("[Calibration] Complete. Starting fuzzing...\n")
         else:
             log.info("[Calibration] Disabled (calibration_runs=0)")
