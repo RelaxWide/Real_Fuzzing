@@ -1896,11 +1896,8 @@ class NVMeFuzzer:
                 # FID=0x02: Power Management — controller-scoped → NSID=0
                 # CDW11[4:0]=PS (Power State)
                 dict(cdw10=0x02, cdw11=0x00000000, nsid_override=0, description="Set Power State 0 (max performance)"),
-                dict(cdw10=0x02, cdw11=0x00000001, nsid_override=0, description="Set Power State 1"),
-                dict(cdw10=0x02, cdw11=0x00000002, nsid_override=0, description="Set Power State 2"),
-                # PS3/PS4 = NOPS (Non-Operational Power States) → 진입 후 다음 명령까지
-                # 수십~수백 ms wake-up latency 발생. --pm 플래그가 PS 퍼징 + PS0 복구를
-                # 담당하므로 standalone 시드에서는 제외.
+                # PS1~PS4 제외: --pm 플래그가 PS 퍼징 + PS0 복구를 담당.
+                # standalone 시드로 PS 진입하면 다음 명령까지 wake-up latency 발생.
                 # FID=0x04: Temperature Threshold — controller-scoped → NSID=0
                 # CDW11[15:0]=TMPTH(Kelvin), [19:16]=TMPSEL, [20]=THSEL
                 dict(cdw10=0x04, cdw11=0x0000012C, nsid_override=0, description="Set Temp Threshold 300K composite (TMPSEL=0)"),
