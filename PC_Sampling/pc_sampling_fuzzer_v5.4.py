@@ -1545,6 +1545,7 @@ class NVMeFuzzer:
 
         pc_appearances: Dict[int, int] = {}          # PC → 등장 횟수
         actual_runs = 0
+        self._cal_last_rc = 0  # 호출자에게 마지막 rc 전달용
 
         for run_i in range(total_runs):
             # _send_nvme_command() 내부에서 start_sampling()을 호출하므로
@@ -1554,6 +1555,7 @@ class NVMeFuzzer:
             self.sampler.stop_sampling()
             self.executions += 1
             actual_runs += 1
+            self._cal_last_rc = rc
 
             for pc in self.sampler.current_trace:
                 pc_appearances[pc] = pc_appearances.get(pc, 0) + 1
@@ -5833,6 +5835,7 @@ class NVMeFuzzer:
             # _handle_timeout_crash()이 log.error() 전에 stderr를 복원할 수 있도록
             # 인스턴스 변수에 보관 (fd 수명: finally의 os.close까지)
             self._cal_saved_stderr_fd = saved_stderr_fd
+            _cal_idx_w = len(str(total_seeds))  # 숫자 폭 (예: 총 47개 → 폭 2)
             try:
                 for i, seed in enumerate(self.corpus):
                     seed = self._calibrate_seed(seed)
@@ -5841,6 +5844,24 @@ class NVMeFuzzer:
                     all_cnt    = len(seed.covered_pcs) if seed.covered_pcs else 0
                     cal_results.append((i + 1, seed.cmd.name, seed.stability,
                                         stable_cnt, all_cnt))
+
+                    # 시드별 진행 로그 ─────────────────────────────────────────
+                    _rc = getattr(self, '_cal_last_rc', 0)
+                    _fail = _rc not in (0, self.RC_TIMEOUT, self.RC_ERROR) and all_cnt == 0
+                    _rc_str = (f"rc=TIMEOUT" if _rc == self.RC_TIMEOUT
+                               else f"rc=ERR"    if _rc == self.RC_ERROR
+                               else f"rc={_rc}")
+                    _tag = " ← FAIL" if (_fail or _rc not in (0,)) else ""
+                    log.warning(
+                        f"[Cal {i+1:{_cal_idx_w}}/{total_seeds}] "
+                        f"{seed.cmd.name:<20} "
+                        f"cdw10=0x{seed.cdw10:08x}  "
+                        f"stab={seed.stability*100:3.0f}%  "
+                        f"pcs={all_cnt:5}  "
+                        f"{_rc_str}{_tag}"
+                    )
+                    # ──────────────────────────────────────────────────────────
+
                     if self._timeout_crash:
                         log.error("[Calibration] timeout during calibration — aborting")
                         return
