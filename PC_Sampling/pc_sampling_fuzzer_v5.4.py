@@ -581,6 +581,7 @@ class FuzzConfig:
 
     nvme_device: str = NVME_DEVICE
     nvme_namespace: int = NVME_NAMESPACE
+    nvme_lba_size: int = 0  # 0 = 시작 시 자동 감지 (blockdev --getss). 명시적으로 지정 가능
     nvme_timeouts: dict = field(default_factory=lambda: NVME_TIMEOUTS.copy())
 
     enabled_commands: List[str] = field(default_factory=list)
@@ -1110,6 +1111,26 @@ class JLinkPCSampler:
             return True
         return self.config.addr_range_start <= pc <= self.config.addr_range_end
 
+    def _detect_lba_size(self) -> int:
+        """네임스페이스 블록 디바이스에서 논리 섹터 크기(LBA 크기)를 자동 감지.
+
+        blockdev --getss /dev/nvme0n1 → 512 또는 4096 등.
+        실패 시 512 반환 (fallback).
+        """
+        ns_dev = f"{self.config.nvme_device}n{self.config.nvme_namespace}"
+        try:
+            r = subprocess.run(
+                ['blockdev', '--getss', ns_dev],
+                capture_output=True, text=True, timeout=5
+            )
+            if r.returncode == 0:
+                size = int(r.stdout.strip())
+                if size > 0:
+                    return size
+        except Exception:
+            pass
+        return 512
+
     def _sampling_worker(self):
         """PC 주소 기반 글로벌 포화 체크 + prev_pc 실행 간 리셋.
 
@@ -1129,6 +1150,14 @@ class JLinkPCSampler:
         consecutive_idle = 0         # idle 유니버스 연속 카운터
         from collections import deque as _deque
         _recent_pcs = _deque(maxlen=IDLE_WINDOW_SIZE)  # 최근 N개 샘플의 idle 여부
+        _recent_idle_count = 0          # _recent_pcs 내 True 개수 (running count, O(1))
+        _idle_win_thresh = int(IDLE_WINDOW_SIZE * IDLE_RATIO_THRESH)  # 정수 임계값 사전 계산
+
+        # _in_range() 함수 호출 / None 체크를 매 샘플마다 반복하지 않도록 로컬 캐싱
+        _addr_start = self.config.addr_range_start
+        _addr_end   = self.config.addr_range_end
+        _has_range  = _addr_start is not None and _addr_end is not None
+
         interval = self.config.sample_interval_us / 1_000_000
         # GO_SETTLE_MS: Go() 후 CPU에 최소 실행 시간 보장 (SWD+레벨시프터 NVMe 안정성).
         # SAMPLE_INTERVAL_US(샘플 밀도 제어)와 독립적. 둘 중 큰 값이 실제 sleep.
@@ -1151,7 +1180,7 @@ class JLinkPCSampler:
             if pc is not None:
                 self._last_raw_pcs.append(pc)
 
-                if self._in_range(pc):
+                if not _has_range or (_addr_start <= pc <= _addr_end):
                     if prev_pc == 0xFFFFFFFF:
                         # 첫 번째 in-range PC: sentinel이므로 edge 생성하지 않음
                         prev_pc = pc
@@ -1176,11 +1205,16 @@ class JLinkPCSampler:
                         consecutive_idle += 1
                     else:
                         consecutive_idle = 0
+                    # running count 유지: 꽉 찬 deque에서 밀려나는 원소를 먼저 차감
+                    _evicted = _recent_pcs[0] if len(_recent_pcs) == IDLE_WINDOW_SIZE else False
                     _recent_pcs.append(_is_idle)
+                    _recent_idle_count += int(_is_idle) - int(_evicted)
                 else:
                     self._out_of_range_count += 1
                     consecutive_idle = 0  # out-of-range는 idle로 보지 않음
+                    _evicted = _recent_pcs[0] if len(_recent_pcs) == IDLE_WINDOW_SIZE else False
                     _recent_pcs.append(False)
+                    _recent_idle_count -= int(_evicted)
 
                 sample_count += 1
                 self.total_samples += 1
@@ -1210,8 +1244,8 @@ class JLinkPCSampler:
                         break
                     if (idle_pcs
                             and len(_recent_pcs) == IDLE_WINDOW_SIZE
-                            and sum(_recent_pcs) / IDLE_WINDOW_SIZE >= IDLE_RATIO_THRESH):
-                        _ratio = sum(_recent_pcs) / IDLE_WINDOW_SIZE
+                            and _recent_idle_count >= _idle_win_thresh):
+                        _ratio = _recent_idle_count / IDLE_WINDOW_SIZE  # O(1)
                         self._stopped_reason = (
                             f"idle_saturated (window_ratio "
                             f"{_ratio:.0%} >= {IDLE_RATIO_THRESH:.0%}, "
@@ -4152,8 +4186,10 @@ class NVMeFuzzer:
             write_data = True
         elif cmd.cmd_type == NVMeCommandType.IO and cmd.name not in IO_NO_NLB_DATA:
             # Read / Compare / Write 계열: CDW12[15:0] = NLB → 전송 크기 산출
+            # nvme_lba_size는 run() 시작 시 blockdev --getss 로 자동 감지 (기본 512)
+            _lba_sz = self.config.nvme_lba_size or 512
             nlb = seed.cdw12 & 0xFFFF
-            data_len = min(max(512, (nlb + 1) * 512), MAX_DATA_BUF)
+            data_len = min(max(_lba_sz, (nlb + 1) * _lba_sz), MAX_DATA_BUF)
         elif cmd.name == "GetLogPage":
             numdl = (seed.cdw10 >> 16) & 0x7FF
             data_len = min(max(4, (numdl + 1) * 4), MAX_DATA_BUF)
@@ -4175,7 +4211,9 @@ class NVMeFuzzer:
                 if seed.data_len_override is not None:
                     f.write(data[:data_len].ljust(data_len, b'\x00'))
                 else:
-                    f.write(data)
+                    # LBA 크기와 data 길이가 불일치하면 data_len에 맞게 조정
+                    # (예: Write 시드가 512B 고정인데 LBA=4096인 경우 패딩)
+                    f.write(data[:data_len].ljust(data_len, b'\x00'))
             input_file = self._nvme_input_path
 
         # --- 타임아웃 ---
@@ -5735,6 +5773,14 @@ class NVMeFuzzer:
             return
         log.info(f"[Pre-flight] NVMe 디바이스 확인: {nvme_dev} ✓")
 
+        # LBA 크기 자동 감지 (0 = auto)
+        if self.config.nvme_lba_size == 0:
+            self.config.nvme_lba_size = self._detect_lba_size()
+            log.warning(f"[Pre-flight] LBA size 자동 감지: {self.config.nvme_lba_size}B "
+                        f"(변경: --lba-size 로 수동 지정)")
+        else:
+            log.warning(f"[Pre-flight] LBA size 수동 지정: {self.config.nvme_lba_size}B")
+
         # 이전 커버리지 로드 (resume)
         if self.config.resume_coverage:
             self.sampler.load_coverage(self.config.resume_coverage)
@@ -6337,6 +6383,8 @@ if __name__ == "__main__":
     parser.add_argument('--device', default=JLINK_DEVICE, help='J-Link target')
     parser.add_argument('--nvme', default=NVME_DEVICE, help='NVMe device')
     parser.add_argument('--namespace', type=int, default=NVME_NAMESPACE)
+    parser.add_argument('--lba-size', type=int, default=0,
+                        help='NVMe LBA 크기(바이트). 0=자동 감지 (blockdev --getss)')
     parser.add_argument('--commands', nargs='+', default=[],
                         help='Commands to use (e.g., Read Write GetFeatures FormatNVM)')
     parser.add_argument('--all-commands', action='store_true', default=False,
@@ -6527,6 +6575,7 @@ if __name__ == "__main__":
         pc_reg_index=args.pc_reg_index,
         nvme_device=args.nvme,
         nvme_namespace=args.namespace,
+        nvme_lba_size=args.lba_size,
         nvme_timeouts=nvme_timeouts,
         enabled_commands=args.commands,
         all_commands=args.all_commands,
