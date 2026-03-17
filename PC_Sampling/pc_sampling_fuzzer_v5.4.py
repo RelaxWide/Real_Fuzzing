@@ -5839,7 +5839,7 @@ class NVMeFuzzer:
             devnull_fd = os.open(os.devnull, os.O_WRONLY)
             saved_stderr_fd = os.dup(2)
             os.dup2(devnull_fd, 2)
-            os.close(devnull_fd)
+            # devnull_fd를 닫지 않고 유지 → 루프 중 [Cal] 로그 출력 후 재억제에 재사용
             # _handle_timeout_crash()이 log.error() 전에 stderr를 복원할 수 있도록
             # 인스턴스 변수에 보관 (fd 수명: finally의 os.close까지)
             self._cal_saved_stderr_fd = saved_stderr_fd
@@ -5854,12 +5854,13 @@ class NVMeFuzzer:
                                         stable_cnt, all_cnt))
 
                     # 시드별 진행 로그 ─────────────────────────────────────────
+                    # stderr가 억제된 상태이므로 출력 전에 복원 후 다시 억제
                     _rc = getattr(self, '_cal_last_rc', 0)
-                    _fail = _rc not in (0, self.RC_TIMEOUT, self.RC_ERROR) and all_cnt == 0
                     _rc_str = (f"rc=TIMEOUT" if _rc == self.RC_TIMEOUT
                                else f"rc=ERR"    if _rc == self.RC_ERROR
                                else f"rc={_rc}")
-                    _tag = " ← FAIL" if (_fail or _rc not in (0,)) else ""
+                    _tag = " ← FAIL" if _rc not in (0,) else ""
+                    os.dup2(saved_stderr_fd, 2)   # stderr 복원
                     log.warning(
                         f"[Cal {i+1:{_cal_idx_w}}/{total_seeds}] "
                         f"{seed.cmd.name:<20} "
@@ -5868,14 +5869,17 @@ class NVMeFuzzer:
                         f"pcs={all_cnt:5}  "
                         f"{_rc_str}{_tag}"
                     )
+                    os.dup2(devnull_fd, 2)        # 다시 억제
                     # ──────────────────────────────────────────────────────────
 
                     if self._timeout_crash:
+                        os.dup2(saved_stderr_fd, 2)
                         log.error("[Calibration] timeout during calibration — aborting")
                         return
             finally:
                 self._cal_saved_stderr_fd = None
                 os.dup2(saved_stderr_fd, 2)
+                os.close(devnull_fd)
                 os.close(saved_stderr_fd)
 
             self.corpus = calibrated_corpus
