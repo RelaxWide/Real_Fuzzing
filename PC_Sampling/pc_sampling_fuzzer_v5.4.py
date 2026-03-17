@@ -5891,27 +5891,12 @@ class NVMeFuzzer:
 
             self.corpus = calibrated_corpus
 
-            # ── Calibration 결과 요약 테이블 ──────────────────────────────
-            W_IDX, W_CMD, W_STA, W_STB, W_ALL = 4, 20, 11, 12, 10
-            sep = (f"{'─'*W_IDX}─{'─'*W_CMD}─{'─'*W_STA}─"
-                   f"{'─'*W_STB}─{'─'*W_ALL}")
-            hdr = (f"{'#':>{W_IDX}} {'Command':<{W_CMD}} {'Stability':>{W_STA}} "
-                   f"{'StablePCs':>{W_STB}} {'AllPCs':>{W_ALL}}")
-            log.warning("[Calibration] Results:")
-            log.warning(sep)
-            log.warning(hdr)
-            log.warning(sep)
-            for idx, cmd_name, stab, stable_cnt, all_cnt in cal_results:
-                stab_str = f"{stab*100:.1f}%"
-                log.warning(f"{idx:>{W_IDX}} {cmd_name:<{W_CMD}} "
-                            f"{stab_str:>{W_STA}} "
-                            f"{stable_cnt:>{W_STB}} {all_cnt:>{W_ALL}}")
-            log.warning(sep)
+            # ── Calibration 결과 요약 ──────────────────────────────────────
             avg_stab = sum(r[2] for r in cal_results) / max(len(cal_results), 1)
-            log.warning(f"  Seeds: {total_seeds}  |  "
+            log.warning(f"[Calibration] Done — "
+                        f"Seeds: {total_seeds}  |  "
                         f"Global PCs: {len(self.sampler.global_coverage)}  |  "
                         f"Avg stability: {avg_stab*100:.1f}%")
-            log.warning(sep)
 
             # v4.5: Calibration 완료된 초기 시드에 대해 deterministic stage 등록
             if self.config.deterministic_enabled:
