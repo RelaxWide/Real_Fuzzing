@@ -2288,24 +2288,20 @@ class NVMeFuzzer:
             #              CDW10[8]=MSET, CDW10[12]=PI, CDW10[13]=PIL, CDW10[14]=METC
             #              SES=0: no erase, 1: user data erase, 2: cryptographic erase
             # ================================================================
+            # FormatNVM — SES=0(비파괴)만 유지. SES=1(user data erase)/SES=2(crypto erase)는
+            # 실행 즉시 전체 미디어 소거가 시작되므로 제외.
             "FormatNVM": [
                 dict(cdw10=0x0000, description="Format LBAF=0, SES=0 (no secure erase)"),
-                dict(cdw10=0x0200, description="Format LBAF=0, SES=1 (user data erase)"),
-                dict(cdw10=0x0400, description="Format LBAF=0, SES=2 (cryptographic erase)"),
-                dict(cdw10=0x0001, description="Format LBAF=1, SES=0"),
-                dict(cdw10=0x0002, description="Format LBAF=2, SES=0"),
-                # PI 활성화 (메타데이터 + 보호정보)
-                dict(cdw10=0x1000, description="Format LBAF=0, PI Type 0 (PI field disabled)"),
-                dict(cdw10=0x1100, description="Format LBAF=0, PI=1 (Type 1 protection)"),
             ],
 
             # ================================================================
-            # Sanitize — 기본 시드 없음 (rc=0이면 즉시 SSD 전체 소거 시작)
-            # CDW10[2:0]=SANACT: 1=Block Erase, 2=Overwrite, 3=Crypto Erase, 4=Exit Failure
-            # CDW10[4]=AUSE (Allow Unrestricted Sanitize Exit)
-            # CDW10[5]=NODAS (No Deallocate After Sanitize)
-            # 필요 시 --seed-dir로 직접 주입
+            # Sanitize — SANACT=4(Exit Failure Mode)만 허용.
+            # 1=Block Erase / 2=Overwrite / 3=Crypto Erase는 즉시 전체 소거 시작.
+            # 4=Exit Failure: sanitize failure 상태 해제 (비파괴, 미진입 시 오류 반환)
             # ================================================================
+            "Sanitize": [
+                dict(cdw10=0x04, nsid_override=0, description="Sanitize Exit Failure Mode (SANACT=4, non-destructive)"),
+            ],
 
             # ================================================================
             # TelemetryHostInitiated — GetLogPage LID=0x07
