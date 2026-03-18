@@ -14,7 +14,7 @@ _PRCHK_ALL = (1 << 26) | (1 << 27) | (1 << 28)  # 3-bit PRCHK 전체 set
 _PRINFO_ALL = _PRACT | _PRCHK_ALL                # PRACT + PRCHK 전체
 _DEAC      = 1 << 25   # WriteZeroes: deallocate after zeroing
 
-SEED_TEMPLATES: dict[str, list] = {
+SEED_TEMPLATES = {
     # Identify — CDW10[7:0]=CNS, CDW10[31:16]=CNTID
     "Identify": [
         # CNS=0x01(Controller): NSID는 Reserved → nsid_override=0
