@@ -1538,10 +1538,10 @@ class NVMeFuzzer:
                              f"실행 시 전체 청크 순서대로 전송")
                 else:
                     # 더미: 1KB zeros (변이 시작점용)
-                    seed = Seed(data=b'\x00' * 1024, cmd=cmd,
-                                cdw10=0xFF, cdw11=0, found_at=0)
+                    seed = Seed(data=b'\x00' * 32768, cmd=cmd,
+                                cdw10=0x1FFF, cdw11=0, found_at=0)
                     seeds.append(seed)
-                    log.info("[Seed] FWDownload dummy 1KB (fw_bin 없음)")
+                    log.info("[Seed] FWDownload dummy 32KB (fw_bin 없음)")
                 continue
 
             if cmd.name == "FWCommit":

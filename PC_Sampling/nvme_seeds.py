@@ -352,8 +352,9 @@ SEED_TEMPLATES = {
     ],
 
     # FWDownload — CDW10=NUMD (0-based dwords), CDW11=OFST (dword offset)
+    # NUMD = (32768 / 4) - 1 = 0x1FFF, 기본 -x 32768 와 동일
     "FWDownload": [
-        dict(cdw10=0xFF, cdw11=0, data=b'\x00' * 1024),
+        dict(cdw10=0x1FFF, cdw11=0, data=b'\x00' * 32768),
     ],
 
     # FWCommit — CDW10[2:0]=CA (Commit Action), CDW10[5:3]=FS (Firmware Slot)
