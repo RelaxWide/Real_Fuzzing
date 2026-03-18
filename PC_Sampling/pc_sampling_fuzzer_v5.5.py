@@ -6,7 +6,26 @@ J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
 v5.5 변경사항:
-- [Refactor] 코드 정리: 중복 subprocess 패턴 → _run_cmd() 헬퍼, 불필요 주석 제거
+- [Refactor] 시드 템플릿 분리:
+    SEED_TEMPLATES 딕셔너리(~500줄)를 nvme_seeds.py 모듈로 추출.
+    _generate_default_seeds()가 nvme_seeds.py를 import하여 사용.
+    시드 수정/추가 시 nvme_seeds.py만 편집하면 됨.
+- [Refactor] CLI 인자 제거 — 하드코딩 상수로 대체:
+    --saturation-limit         → SATURATION_LIMIT
+    --global-saturation-limit  → GLOBAL_SATURATION_LIMIT
+    --l1-settle                → L1_SETTLE
+    --l1-2-settle              → L1_2_SETTLE
+    --idle-window-size         → IDLE_WINDOW_SIZE
+    --idle-ratio-thresh        → IDLE_RATIO_THRESH
+    --ps-settle-cap            → PS_SETTLE_CAP_S
+    --mut-prob                 → MOpt 내부 가중치 (MUT_WEIGHTS)
+    --max-energy               → MAX_ENERGY 상수
+    --no-det                   제거 (deterministic stage 상시 활성화)
+    --no-mopt                  제거 (MOpt scheduling 상시 활성화)
+    --bb-addrs / --func-addrs  제거 (자동 탐지 유지)
+- [Fix] FWDownload 기본 청크 크기 1KB → 32KB:
+    더미 시드: data=b'\x00' * 32768, cdw10(NUMD)=0x1FFF (-x 32768 기본값과 일치)
+    nvme_seeds.py FWDownload 항목도 동일하게 적용.
 
 v5.4 변경사항:
 - [Fix] [Stats] 로그에서 crashes 항목 제거:
