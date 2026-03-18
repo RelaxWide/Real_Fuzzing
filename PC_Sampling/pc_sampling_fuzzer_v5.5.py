@@ -412,9 +412,6 @@ class FuzzConfig:
     sample_interval_us: int = SAMPLE_INTERVAL_US
     go_settle_ms: int = GO_SETTLE_MS  # Go() 후 CPU 최소 실행 보장 (ms). 0 = 비활성화
     max_samples_per_run: int = MAX_SAMPLES_PER_RUN
-    saturation_limit: int = SATURATION_LIMIT
-
-    global_saturation_limit: int = GLOBAL_SATURATION_LIMIT
 
     # NVMe 커맨드 완료 후 추가 샘플링 시간 (ms)
     post_cmd_delay_ms: int = POST_CMD_DELAY_MS
@@ -437,38 +434,18 @@ class FuzzConfig:
     # 이전 세션 커버리지 파일 (resume용)
     resume_coverage: Optional[str] = RESUME_COVERAGE
 
-    # Power Schedule 설정 (v4 추가)
-    max_energy: float = MAX_ENERGY
-
     random_gen_ratio: float = RANDOM_GEN_RATIO
 
     excluded_opcodes: List[int] = field(default_factory=lambda: EXCLUDED_OPCODES.copy())
 
-    opcode_mut_prob: float = OPCODE_MUT_PROB
-    nsid_mut_prob: float = NSID_MUT_PROB
     admin_swap_prob: float = ADMIN_SWAP_PROB
-    datalen_mut_prob: float = DATALEN_MUT_PROB
 
     diagnose_stability: int = DIAGNOSE_STABILITY  # 새 idle PC 없이 연속 N회면 수렴
     diagnose_max: int = DIAGNOSE_MAX              # 수렴 전 최대 샘플 수
     # diagnose() 샘플 간격 (ms)
     diagnose_sample_ms: int = DIAGNOSE_SAMPLE_MS
-    # PCIe L-state settle (CLI: --l1-settle / --l1-2-settle)
-    l1_settle: float = L1_SETTLE
-    l1_2_settle: float = L1_2_SETTLE
-    # preflight + 메인 퍼징 공통 settle (CLI로 한번에 조정)
-    restore_settle: float = RESTORE_SETTLE_S
-    d3_restore_settle: float = D3_RESTORE_SETTLE_S
-    d3_extra: float = D3_EXTRA_S
 
     calibration_runs: int = CALIBRATION_RUNS
-
-    deterministic_enabled: bool = DETERMINISTIC_ENABLED
-    deterministic_arith_max: int = DETERMINISTIC_ARITH_MAX
-
-    mopt_enabled: bool = MOPT_ENABLED
-    mopt_pilot_period: int = MOPT_PILOT_PERIOD
-    mopt_core_period: int = MOPT_CORE_PERIOD
 
     # v4.5+: Corpus 하드 상한 (0 = 무제한)
     max_corpus_hard_limit: int = MAX_CORPUS_HARD_LIMIT
@@ -943,8 +920,8 @@ class JLinkPCSampler:
         # SAMPLE_INTERVAL_US(샘플 밀도 제어)와 독립적. 둘 중 큰 값이 실제 sleep.
         settle_s  = self.config.go_settle_ms / 1_000.0
         effective_interval = max(interval, settle_s)
-        sat_limit = self.config.saturation_limit
-        global_sat_limit = self.config.global_saturation_limit  # v4.3: 설정값 사용
+        sat_limit = SATURATION_LIMIT
+        global_sat_limit = GLOBAL_SATURATION_LIMIT
         idle_pcs = self.idle_pcs     # idle 유니버스 (diagnose에서 수렴 수집)
 
         # global_coverage(PC 주소 set) 참조 캐싱
@@ -1345,7 +1322,7 @@ class NVMeFuzzer:
         """CDW 필드에 대한 체계적 경계값 탐색 (제너레이터).
         대상: cdw10~cdw15 중 값이 0이 아닌 필드."""
         cdw_fields = ['cdw10', 'cdw11', 'cdw12', 'cdw13', 'cdw14', 'cdw15']
-        arith_max = self.config.deterministic_arith_max
+        arith_max = DETERMINISTIC_ARITH_MAX
 
         for field_name in cdw_fields:
             original = getattr(seed, field_name)
@@ -1405,13 +1382,10 @@ class NVMeFuzzer:
 
     def _mopt_update_phase(self):
         """MOpt: pilot/core 모드 전환 및 가중치 갱신."""
-        if not self.config.mopt_enabled:
-            return
-
         self.mopt_pilot_rounds += 1
 
         if self.mopt_mode == 'pilot':
-            if self.mopt_pilot_rounds >= self.config.mopt_pilot_period:
+            if self.mopt_pilot_rounds >= MOPT_PILOT_PERIOD:
                 # Pilot → Core: 성공률 기반 가중치 계산
                 weights = []
                 for i in range(self.NUM_MUTATION_OPS):
@@ -1446,7 +1420,7 @@ class NVMeFuzzer:
                 log.info(f"[MOpt] Pilot→Core: {weight_str}")
 
         elif self.mopt_mode == 'core':
-            if self.mopt_pilot_rounds >= self.config.mopt_core_period:
+            if self.mopt_pilot_rounds >= MOPT_CORE_PERIOD:
                 # Core → Pilot: 통계 리셋
                 self.mopt_finds = [0] * self.NUM_MUTATION_OPS
                 self.mopt_uses = [0] * self.NUM_MUTATION_OPS
@@ -1652,7 +1626,7 @@ class NVMeFuzzer:
     def _calculate_energy(self, seed: Seed) -> float:
         """v4: AFLfast 'explore' 스케줄 - 적게 실행된 시드에 높은 에너지"""
         if seed.exec_count == 0:
-            return self.config.max_energy  # 새 시드는 최대 에너지
+            return MAX_ENERGY  # 새 시드는 최대 에너지
 
         # factor = min(MAX_ENERGY, 2^(log2(total_execs / exec_count)))
         ratio = self.executions / seed.exec_count
@@ -1662,7 +1636,7 @@ class NVMeFuzzer:
         # bit_length()는 정수에만 사용 가능하므로 math.log2 사용
         try:
             power = int(math.log2(ratio))
-            factor = min(self.config.max_energy, 2 ** power)
+            factor = min(MAX_ENERGY, 2 ** power)
         except (ValueError, OverflowError):
             factor = 1.0
 
@@ -1768,11 +1742,8 @@ class NVMeFuzzer:
         for _ in range(num_mutations):
             if not buf:
                 buf = bytearray(b'\x00')
-            if self.config.mopt_enabled:
-                mut = self._mopt_select_operator()
-                self._current_mutations.append(mut)
-            else:
-                mut = random.randint(0, 15)
+            mut = self._mopt_select_operator()
+            self._current_mutations.append(mut)
 
             if mut == 0:
                 # --- bitflip 1/1 ---
@@ -2029,7 +2000,7 @@ class NVMeFuzzer:
         # --- 확장 mutation (각각 독립 확률) ---
 
         # [1] opcode mutation — 미정의/vendor-specific opcode로 dispatch 테이블 탐색
-        if self.config.opcode_mut_prob > 0 and random.random() < self.config.opcode_mut_prob:
+        if OPCODE_MUT_PROB > 0 and random.random() < OPCODE_MUT_PROB:
             excluded = set(self.config.excluded_opcodes)
             mut_type = random.randint(0, 3)
             if mut_type == 0:
@@ -2052,7 +2023,7 @@ class NVMeFuzzer:
                 new_seed.opcode_override = None
 
         # [2] nsid mutation — 잘못된 namespace로 에러 핸들링 코드 탐색
-        if self.config.nsid_mut_prob > 0 and random.random() < self.config.nsid_mut_prob:
+        if NSID_MUT_PROB > 0 and random.random() < NSID_MUT_PROB:
             new_seed.nsid_override = random.choice([
                 0x00000000,       # nsid=0 (보통 "all namespaces" 또는 invalid)
                 0xFFFFFFFF,       # broadcast nsid
@@ -2068,7 +2039,7 @@ class NVMeFuzzer:
             new_seed.force_admin = (seed.cmd.cmd_type != NVMeCommandType.ADMIN)
 
         # [4] data_len 의도적 불일치 — 커널은 통과, SSD DMA 엔진에 혼란
-        if self.config.datalen_mut_prob > 0 and random.random() < self.config.datalen_mut_prob:
+        if DATALEN_MUT_PROB > 0 and random.random() < DATALEN_MUT_PROB:
             new_seed.data_len_override = random.choice([
                 0,                 # 빈 버퍼
                 4,                 # 극소
@@ -2541,7 +2512,7 @@ class NVMeFuzzer:
                 self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
             # 7. idle window — LNKCTL 쓴 뒤 PCIe 트래픽 없는 구간 확보
             #    HW가 L1 idle timer 만료 + PM_Request_Ack DLLP 핸드셰이크 처리
-            time.sleep(self.config.l1_settle)
+            time.sleep(L1_SETTLE)
             return ok
 
         else:  # PCIeLState.L1_2
@@ -2615,7 +2586,7 @@ class NVMeFuzzer:
                            timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             # idle window — L1 idle timer + L1.2 clock off 완료 대기
-            time.sleep(self.config.l1_settle + self.config.l1_2_settle)
+            time.sleep(L1_SETTLE + L1_2_SETTLE)
             return ok
 
     def _set_pcie_d_state(self, state: PCIeDState) -> bool:
@@ -2660,9 +2631,9 @@ class NVMeFuzzer:
         # D3+L1/L1.2: D3 config TLP가 링크를 순간 깨움 → 재진입 대기
         if combo.pcie_d == PCIeDState.D3:
             if combo.pcie_l == PCIeLState.L1_2:
-                time.sleep(self.config.l1_settle + self.config.l1_2_settle)
+                time.sleep(L1_SETTLE + L1_2_SETTLE)
             elif combo.pcie_l == PCIeLState.L1:
-                time.sleep(self.config.l1_settle)
+                time.sleep(L1_SETTLE)
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
@@ -3026,10 +2997,10 @@ class NVMeFuzzer:
         # id-ctrl에서 enlat/exlat 읽어 PS별 settle 시간 동적 계산
         self._init_ps_settle()
 
-        # preflight + 메인 퍼징 공통 settle — FuzzConfig 필드로 관리 (CLI로 한번에 조정 가능)
-        RESTORE_SETTLE     = self.config.restore_settle
-        D3_RESTORE_SETTLE  = self.config.d3_restore_settle
-        D3_EXTRA           = self.config.d3_extra
+        # preflight + 메인 퍼징 공통 settle — 전역 상수 사용
+        RESTORE_SETTLE     = RESTORE_SETTLE_S
+        D3_RESTORE_SETTLE  = D3_RESTORE_SETTLE_S
+        D3_EXTRA           = D3_EXTRA_S
         PROBE_TIMEOUT = 5.0   # nvme id-ctrl 타임아웃
 
         baseline = POWER_COMBOS[0]  # PS0+L0+D0
@@ -4735,20 +4706,20 @@ class NVMeFuzzer:
         log.warning(f"Sampling    : interval={self.config.sample_interval_us}us, "
                  f"go_settle={self.config.go_settle_ms}ms, "
                  f"max={self.config.max_samples_per_run}/run, "
-                 f"idle_sat={self.config.saturation_limit}, "
-                 f"global_sat={self.config.global_saturation_limit}, "
+                 f"idle_sat={SATURATION_LIMIT}, "
+                 f"global_sat={GLOBAL_SATURATION_LIMIT}, "
                  f"post_cmd={self.config.post_cmd_delay_ms}ms")
         _diag_worst = self.config.diagnose_max * self.config.diagnose_sample_ms / 1000
         log.warning(f"Diagnose    : stability={self.config.diagnose_stability}, "
                     f"max={self.config.diagnose_max}, "
                     f"sleep={self.config.diagnose_sample_ms}ms, "
                     f"worst={_diag_worst:.0f}s")
-        log.warning(f"PCIe settle : L1={self.config.l1_settle*1000:.0f}ms, "
-                    f"L1.2+={self.config.l1_2_settle*1000:.0f}ms")
-        log.warning(f"PM settle   : restore={self.config.restore_settle}s, "
-                    f"d3_restore={self.config.d3_restore_settle}s, "
-                    f"d3_extra={self.config.d3_extra}s")
-        log.warning(f"Power Sched : max_energy={self.config.max_energy}")
+        log.warning(f"PCIe settle : L1={L1_SETTLE*1000:.0f}ms, "
+                    f"L1.2+={L1_2_SETTLE*1000:.0f}ms")
+        log.warning(f"PM settle   : restore={RESTORE_SETTLE_S}s, "
+                    f"d3_restore={D3_RESTORE_SETTLE_S}s, "
+                    f"d3_extra={D3_EXTRA_S}s")
+        log.warning(f"Power Sched : max_energy={MAX_ENERGY}")
         log.warning(f"NVMe I/O    : subprocess (nvme-cli passthru)")
         if self.config.pm_inject_prob > 0:
             self._detect_pcie_info()
@@ -4902,12 +4873,11 @@ class NVMeFuzzer:
                         f"Global PCs: {len(self.sampler.global_coverage)}  |  "
                         f"Avg stability: {avg_stab*100:.1f}%")
 
-            if self.config.deterministic_enabled:
-                for seed in self.corpus:
-                    if not seed.det_done:
-                        gen = self._deterministic_stage(seed)
-                        self._det_queue.append((seed, gen))
-                log.warning(f"[Det] Queued {len(self._det_queue)} seeds for deterministic stage")
+            for seed in self.corpus:
+                if not seed.det_done:
+                    gen = self._deterministic_stage(seed)
+                    self._det_queue.append((seed, gen))
+            log.warning(f"[Det] Queued {len(self._det_queue)} seeds for deterministic stage")
 
             # calibration 중 SetFeatures(APST/KeepAlive) 시드가 실행되면
             # preflight의 _apst_disable()/_keepalive_disable() 효과가 무력화됨.
@@ -5097,7 +5067,7 @@ class NVMeFuzzer:
                 raw_count = len(self.sampler._last_raw_pcs)
                 oor_count = self.sampler._out_of_range_count
                 det_tag = " [Det]" if is_det_stage else ""
-                mopt_tag = f" mopt={self.mopt_mode}" if self.config.mopt_enabled else ""
+                mopt_tag = f" mopt={self.mopt_mode}"
                 log.info(f"exec={self.executions}{det_tag} cmd={cmd.name} "
                           f"raw_samples={raw_count} pcs_this_run={len(self.sampler.current_trace)} "
                           f"out_of_range={oor_count} new_pcs={new_pcs} "
@@ -5157,13 +5127,13 @@ class NVMeFuzzer:
                              f"CDW10=0x{mutated_seed.cdw10:08x} "
                              f"+{new_pcs} PCs (total: {len(self.sampler.global_coverage)} pcs)")
 
-                    if self.config.deterministic_enabled and not new_seed.det_done:
+                    if not new_seed.det_done:
                         gen = self._deterministic_stage(new_seed)
                         self._det_queue.append((new_seed, gen))
                         log.info(f"[Det] Queued {new_seed.cmd.name} "
                                  f"(queue size: {len(self._det_queue)})")
 
-                if self.config.mopt_enabled and self._current_mutations:
+                if self._current_mutations:
                     if is_interesting:
                         for op in self._current_mutations:
                             self.mopt_finds[op] += 1
@@ -5337,20 +5307,19 @@ class NVMeFuzzer:
                             f"Func Coverage    : {fpct:.2f}%"
                             f" ({n_f} / {self._sa_total_funcs} functions)")
 
-                if self.config.mopt_enabled:
-                    op_names = ['bitflip1', 'int8', 'int16', 'int32',
-                                'arith8', 'arith16', 'arith32', 'randbyte',
-                                'byteswap', 'delete', 'insert', 'overwrite',
-                                'splice', 'shuffle', 'blockfill', 'asciiint']
-                    summary_lines.append(f"MOpt mode        : {self.mopt_mode}")
-                    mopt_detail = []
-                    for i in range(self.NUM_MUTATION_OPS):
-                        if self.mopt_uses[i] > 0:
-                            rate = self.mopt_finds[i] / self.mopt_uses[i]
-                            mopt_detail.append(f"{op_names[i]}={self.mopt_finds[i]}/"
-                                               f"{self.mopt_uses[i]}({rate:.3f})")
-                    if mopt_detail:
-                        summary_lines.append(f"MOpt finds/uses  : {', '.join(mopt_detail)}")
+                op_names = ['bitflip1', 'int8', 'int16', 'int32',
+                            'arith8', 'arith16', 'arith32', 'randbyte',
+                            'byteswap', 'delete', 'insert', 'overwrite',
+                            'splice', 'shuffle', 'blockfill', 'asciiint']
+                summary_lines.append(f"MOpt mode        : {self.mopt_mode}")
+                mopt_detail = []
+                for i in range(self.NUM_MUTATION_OPS):
+                    if self.mopt_uses[i] > 0:
+                        rate = self.mopt_finds[i] / self.mopt_uses[i]
+                        mopt_detail.append(f"{op_names[i]}={self.mopt_finds[i]}/"
+                                           f"{self.mopt_uses[i]}({rate:.3f})")
+                if mopt_detail:
+                    summary_lines.append(f"MOpt finds/uses  : {', '.join(mopt_detail)}")
 
                 summary_lines.append("=" * 60)
 
@@ -5464,25 +5433,13 @@ if __name__ == "__main__":
                         help='Firmware .text end (hex)')
     parser.add_argument('--resume-coverage', default=RESUME_COVERAGE,
                         help='Path to previous coverage.txt')
-    parser.add_argument('--saturation-limit', type=int, default=SATURATION_LIMIT,
-                        help='Stop sampling after N consecutive idle PCs (0=disable)')
-    parser.add_argument('--global-saturation-limit', type=int, default=GLOBAL_SATURATION_LIMIT,
-                        help='Stop sampling after N consecutive non-new global PCs (0=disable)')
-    parser.add_argument('--max-energy', type=float, default=MAX_ENERGY,
-                        help='Max energy for power schedule')
     parser.add_argument('--random-gen-ratio', type=float, default=RANDOM_GEN_RATIO,
                         help='Ratio of fully random inputs (0.0~1.0, default 0.2)')
     parser.add_argument('--exclude-opcodes', type=str, default='',
                         help='Comma-separated hex opcodes to exclude from fuzzing, '
                              'e.g. "0xC1,0xC0" or "C1,C0"')
-    parser.add_argument('--opcode-mut-prob', type=float, default=OPCODE_MUT_PROB,
-                        help='Opcode mutation probability (0.0=disable, default 0.10)')
-    parser.add_argument('--nsid-mut-prob', type=float, default=NSID_MUT_PROB,
-                        help='NSID mutation probability (0.0=disable, default 0.10)')
     parser.add_argument('--admin-swap-prob', type=float, default=ADMIN_SWAP_PROB,
                         help='Admin/IO swap probability (0.0=disable, default 0.05)')
-    parser.add_argument('--datalen-mut-prob', type=float, default=DATALEN_MUT_PROB,
-                        help='Data length mismatch probability (0.0=disable, default 0.08)')
     parser.add_argument('--timeout', nargs=2, action='append', metavar=('GROUP', 'MS'),
                         help='Set timeout per group, e.g. --timeout command 8000 '
                              '--timeout format 600000. '
@@ -5493,32 +5450,11 @@ if __name__ == "__main__":
                              'SWD에서 주기적 인터럽트를 모두 포함하려면 크게 설정')
     parser.add_argument('--diagnose-max', type=int, default=DIAGNOSE_MAX,
                         help=f'idle 유니버스 수집 최대 샘플 수 (default: {DIAGNOSE_MAX})')
-    # PCIe settle / preflight+메인 공통 settle (CLI로 한번에 조정)
     parser.add_argument('--diagnose-sleep-ms', type=int, default=DIAGNOSE_SAMPLE_MS,
                         help=f'diagnose() 샘플 간격 (ms). (default: {DIAGNOSE_SAMPLE_MS})')
-    parser.add_argument('--l1-settle', type=float, default=L1_SETTLE,
-                        help=f'PCIe L1 진입 후 settle 대기 (초). (default: {L1_SETTLE})')
-    parser.add_argument('--l1-2-settle', type=float, default=L1_2_SETTLE,
-                        help=f'PCIe L1.2 추가 settle 대기 (초, L1_SETTLE 이후). (default: {L1_2_SETTLE})')
-    parser.add_argument('--restore-settle', type=float, default=RESTORE_SETTLE_S,
-                        help=f'baseline 복귀 후 안정화 대기 (초). preflight+메인 공통. (default: {RESTORE_SETTLE_S})')
-    parser.add_argument('--d3-restore-settle', type=float, default=D3_RESTORE_SETTLE_S,
-                        help=f'D3→D0 restore 후 NVMe 드라이버 재인식 대기 (초). preflight+메인 공통. (default: {D3_RESTORE_SETTLE_S})')
-    parser.add_argument('--d3-extra', type=float, default=D3_EXTRA_S,
-                        help=f'D3 진입 후 추가 settle (초). preflight+메인 공통. (default: {D3_EXTRA_S})')
 
     parser.add_argument('--calibration-runs', type=int, default=CALIBRATION_RUNS,
                         help='Calibration runs per initial seed (0=disable, default 3)')
-    parser.add_argument('--no-deterministic', action='store_true', default=False,
-                        help='Disable deterministic stage')
-    parser.add_argument('--det-arith-max', type=int, default=DETERMINISTIC_ARITH_MAX,
-                        help='Deterministic stage arithmetic max delta (default 10)')
-    parser.add_argument('--no-mopt', action='store_true', default=False,
-                        help='Disable MOpt mutation scheduling')
-    parser.add_argument('--mopt-pilot-period', type=int, default=MOPT_PILOT_PERIOD,
-                        help='MOpt pilot phase length in executions (default 5000)')
-    parser.add_argument('--mopt-core-period', type=int, default=MOPT_CORE_PERIOD,
-                        help='MOpt core phase length in executions (default 50000)')
 
     parser.add_argument('--pm', action='store_true', default=False,
                         help=f'PM 로테이션 활성화: {PM_ROTATE_INTERVAL}명령마다 PS0→PS1→PS2→PS3→PS4 순환. '
@@ -5582,10 +5518,8 @@ if __name__ == "__main__":
     print("  - Per-command CFG graph generation")
     print(f"  - [v4.5] Hit count bucketing (AFL++ log buckets)")
     print(f"  - [v4.5] Calibration (runs={args.calibration_runs})")
-    print(f"  - [v4.5] Deterministic stage (enabled={not args.no_deterministic}, "
-          f"arith_max={args.det_arith_max})")
-    print(f"  - [v4.5] MOpt mutation scheduling (enabled={not args.no_mopt}, "
-          f"pilot={args.mopt_pilot_period}, core={args.mopt_core_period})")
+    print(f"  - [v4.5] Deterministic stage (arith_max={DETERMINISTIC_ARITH_MAX})")
+    print(f"  - [v4.5] MOpt mutation scheduling (pilot={MOPT_PILOT_PERIOD}, core={MOPT_CORE_PERIOD})")
     print(f"  - [v4.6] io-passthru → namespace device (/dev/nvme0n1, deprecated ioctl 제거)")
     passthru_days = args.passthru_timeout / 86_400_000
     print(f"  - [v4.6] Passthru timeout={args.passthru_timeout}ms ({passthru_days:.1f}일, "
@@ -5620,25 +5554,14 @@ if __name__ == "__main__":
         addr_range_start=args.addr_start,
         addr_range_end=args.addr_end,
         resume_coverage=args.resume_coverage,
-        saturation_limit=args.saturation_limit,
-        global_saturation_limit=args.global_saturation_limit,
-        max_energy=args.max_energy,
         random_gen_ratio=args.random_gen_ratio,
         excluded_opcodes=excluded_opcodes,
-        opcode_mut_prob=args.opcode_mut_prob,
-        nsid_mut_prob=args.nsid_mut_prob,
         admin_swap_prob=args.admin_swap_prob,
-        datalen_mut_prob=args.datalen_mut_prob,
         # v4.7
         diagnose_stability=args.diagnose_stability,
         diagnose_max=args.diagnose_max,
         # v4.5
         calibration_runs=args.calibration_runs,
-        deterministic_enabled=not args.no_deterministic,
-        deterministic_arith_max=args.det_arith_max,
-        mopt_enabled=not args.no_mopt,
-        mopt_pilot_period=args.mopt_pilot_period,
-        mopt_core_period=args.mopt_core_period,
         # v4.7
         fw_bin=args.fw_bin,
         fw_xfer_size=args.fw_xfer,
@@ -5646,11 +5569,6 @@ if __name__ == "__main__":
         # v5.1
         pm_inject_prob=1.0 if args.pm else 0.0,
         diagnose_sample_ms=args.diagnose_sleep_ms,
-        l1_settle=args.l1_settle,
-        l1_2_settle=args.l1_2_settle,
-        restore_settle=args.restore_settle,
-        d3_restore_settle=args.d3_restore_settle,
-        d3_extra=args.d3_extra,
     )
 
     fuzzer = NVMeFuzzer(config)
