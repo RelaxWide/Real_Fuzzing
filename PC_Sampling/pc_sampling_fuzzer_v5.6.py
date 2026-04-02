@@ -1346,6 +1346,8 @@ class NVMeFuzzer:
 
         # global_coverage에 관측된 전체 PC 합집합을 반영
         self.sampler.global_coverage.update(all_seen_pcs)
+        # calibration PC를 BB/func 커버리지 통계에도 반영
+        self._update_static_coverage(all_seen_pcs)
 
         return seed
 
@@ -5099,6 +5101,8 @@ class NVMeFuzzer:
             return
 
         if self.sampler.idle_pcs:
+            # idle_pcs를 BB/func 커버리지에 반영 (global_coverage엔 추가 안 함 — saturation 설계 유지)
+            self._update_static_coverage(self.sampler.idle_pcs)
             pcs_str = ', '.join(hex(p) for p in sorted(self.sampler.idle_pcs))
             log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
         else:
