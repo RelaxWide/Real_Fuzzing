@@ -1,217 +1,237 @@
 """
-scan.py — CoreSight 컴포넌트 스캔 + 멀티코어 PC 읽기 테스트
+scan.py — CTI 검증 + DCC Instruction Injection PC 읽기
 
-진단 순서:
-  1. DLL 가용 함수 탐색
-  2. 전원 레지스터(0x30313f30) 활성화 시도
-  3. Core 0/1/2 DBGDSCR 직접 비교 → Configure가 실제로 코어를 전환하는지 확인
-  4. 멀티코어 PC 읽기
-  5. CoreSight 컴포넌트 스캔
+핵심 테스트:
+  [Step 1] CTI 검증: Core 0 halt 유지 상태에서 Core 1/2 DBGDSCR 읽기
+           → HALTED=1이면 CTI 동작, HALTED=0이면 CTI 미동작
+  [Step 2] DCC injection 검증: Core 0에서 먼저 테스트
+           MCR p14,0,R15,c0,c5,0 (0xEE00FE15) → DBGITR write → DBGDTRTX read
+           → Core 0 known PC와 일치하면 방법 유효
+  [Step 3] DCC injection으로 Core 1/2 PC 읽기 (CTI 동작 전제)
+
+설계 근거:
+  - DBGDSCR read  = CoreBase + 0x084
+  - DBGITR write  = CoreBase + 0x084 (core halted 시 write → instruction 실행)
+  - DBGDTRTX read = CoreBase + 0x080 (DCC TX result)
+  - jl.halt()      → Core 0만 halt (SWD connection 고정)
+  - memory_read32  → Configure로 지정한 CoreBase 주소 사용
 """
 
 import ctypes
 import pylink
 import logging
+import time
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
-CORE_DEBUG_BASES = [0x80030000, 0x80032000, 0x80034000]
-DBGDSCR_OFFSET   = 0x084   # Debug Status and Control Register
-PWR_REG_ADDR     = 0x30313f30
+CORE_BASES  = [0x80030000, 0x80032000, 0x80034000]
+PWR_REG     = 0x30313f30
 
-_PART_NAMES = {
-    0xC18: "Cortex-R8 CPU Debug",
-    0x906: "CTI",  0x907: "ETB",   0x908: "CSTF",
-    0x912: "TPIU", 0x925: "ETMv3", 0x961: "TMC/ETB",
-    0x9E8: "TMC-ETR", 0x95D: "ETMv4",
-}
+# DCC instruction injection 상수
+MCR_R15_TO_DCC = 0xEE00FE15   # MCR p14, 0, R15, c0, c5, 0
+DBGDSCR_OFF    = 0x084         # read = DBGDSCR / write (halted) = DBGITR
+DBGDTRTX_OFF   = 0x080         # read = DBGDTRTX (DCC result)
 
 
-# ── DLL 함수 초기화 ───────────────────────────────────────────────────────
-def probe_and_setup_dll(dll):
-    available = {}
-    candidates = {
-        "JLINKARM_CORESIGHT_Configure": ([ctypes.c_char_p],          ctypes.c_int),
-        "JLINKARM_WriteU32":            ([ctypes.c_uint32, ctypes.c_uint32], None),
-        "JLINKARM_ReadU32":             ([ctypes.c_uint32],           ctypes.c_uint32),
+# ── DLL 설정 ──────────────────────────────────────────────────────────────
+def setup_dll(dll):
+    fns = {}
+    spec = {
+        "JLINKARM_CORESIGHT_Configure": ([ctypes.c_char_p],                     ctypes.c_int),
+        "JLINKARM_WriteU32":            ([ctypes.c_uint32, ctypes.c_uint32],     None),
+        "JLINKARM_ReadU32":             ([ctypes.c_uint32],                      ctypes.c_uint32),
         "JLINKARM_ExecCommand":         ([ctypes.c_char_p, ctypes.c_char_p,
-                                          ctypes.c_int],              ctypes.c_int),
-        "JLINKARM_Halt":                ([],                          ctypes.c_int),
-        "JLINKARM_Go":                  ([],                          None),
+                                          ctypes.c_int],                          ctypes.c_int),
+        "JLINKARM_Go":                  ([],                                      None),
+        "JLINKARM_Halt":                ([],                                      ctypes.c_int),
     }
-    print("\n=== DLL 함수 가용성 ===")
-    for name, (args, ret) in candidates.items():
+    for name, (args, ret) in spec.items():
         try:
             fn = getattr(dll, name)
             fn.argtypes = args
             fn.restype  = ret
-            available[name] = fn
-            print(f"  {name:50s}  ✓")
+            fns[name]   = fn
         except AttributeError:
-            print(f"  {name:50s}  ✗")
-    return available
+            pass
+    return fns
 
 
-# ── 전원 레지스터 활성화 ──────────────────────────────────────────────────
-def enable_cores_debug(jl, dll_fns):
-    """0x30313f30에 3개 코어 디버그 활성화 비트 set.
-    방법 1: JLINKARM_WriteU32 (AXI-AP 라우팅 가능성)
-    방법 2: jl.memory_write32 (fallback)
-    """
-    print(f"\n=== [Step 1] 전원 레지스터 0x{PWR_REG_ADDR:08X} 활성화 ===")
+def configure_core(fns, base):
+    if "JLINKARM_CORESIGHT_Configure" in fns:
+        fns["JLINKARM_CORESIGHT_Configure"](f"CoreBaseAddr={base:#010x}".encode())
 
-    def _read():
-        if "JLINKARM_ReadU32" in dll_fns:
-            return dll_fns["JLINKARM_ReadU32"](PWR_REG_ADDR)
-        return jl.memory_read32(PWR_REG_ADDR, 1)[0]
 
-    def _write(val):
-        if "JLINKARM_WriteU32" in dll_fns:
-            dll_fns["JLINKARM_WriteU32"](PWR_REG_ADDR, ctypes.c_uint32(val))
-            return "JLINKARM_WriteU32"
-        jl.memory_write32(PWR_REG_ADDR, [val])
-        return "memory_write32"
+def go(jl, fns):
+    if "JLINKARM_Go" in fns:
+        fns["JLINKARM_Go"]()
+    else:
+        jl.go()
 
+
+# ── 전원 활성화 ───────────────────────────────────────────────────────────
+def enable_power(jl, fns):
+    print(f"\n=== 전원 레지스터 0x{PWR_REG:08X} 활성화 ===")
     try:
-        cur = _read()
-        print(f"  현재값: {cur:#010x}")
-        new_val = cur | 0x00010101
-        method = _write(new_val)
-        verify = _read()
+        if "JLINKARM_WriteU32" in fns and "JLINKARM_ReadU32" in fns:
+            cur = fns["JLINKARM_ReadU32"](PWR_REG)
+            fns["JLINKARM_WriteU32"](PWR_REG, ctypes.c_uint32(cur | 0x00010101))
+            verify = fns["JLINKARM_ReadU32"](PWR_REG)
+        else:
+            cur = jl.memory_read32(PWR_REG, 1)[0]
+            jl.memory_write32(PWR_REG, [cur | 0x00010101])
+            verify = jl.memory_read32(PWR_REG, 1)[0]
         ok = (verify & 0x00010101) == 0x00010101
-        print(f"  쓰기 후: {verify:#010x}  ({method} 사용)")
-        print(f"  결과: {'활성화 성공 ✓' if ok else '비트 미반영 ✗ — APB-AP는 이 주소 불가, AXI-AP 필요'}")
-        return ok
+        print(f"  전: {cur:#010x} → 후: {verify:#010x}  {'✓' if ok else '✗ (APB-AP 불가)'}")
     except Exception as e:
         print(f"  실패: {e}")
-        return False
 
 
-# ── 핵심 진단: DBGDSCR 직접 비교 ─────────────────────────────────────────
-def diagnose_core_switch(jl, dll_fns):
-    """Configure 전환 전후 DBGDSCR을 직접 읽어 실제로 다른 코어를 보는지 확인.
-    DBGDSCR 주소: CoreBase + 0x084
-    """
-    print("\n=== [Step 2] DBGDSCR 직접 비교 (Configure 유효성 검증) ===")
+# ── Step 1: CTI 검증 ─────────────────────────────────────────────────────
+def test_cti(jl, fns):
+    """Core 0 halt 상태를 유지하면서 Core 1/2 DBGDSCR 읽기
+    memory_read32는 이미 halted 상태에서는 추가 halt 없이 AP 통해 직접 읽음"""
+    print("\n=== [Step 1] CTI 검증: Core 0 halt 유지 중 Core 1/2 DBGDSCR 읽기 ===")
 
-    has_configure = "JLINKARM_CORESIGHT_Configure" in dll_fns
+    # Core 0 설정 후 halt
+    configure_core(fns, CORE_BASES[0])
+    jl.halt()
+    c0_pc   = jl.register_read(15)
+    c0_dscr = jl.memory_read32(CORE_BASES[0] + DBGDSCR_OFF, 1)[0]
+    print(f"  Core 0  DBGDSCR={c0_dscr:#010x}  PC={c0_pc:#010x}  HALTED={bool(c0_dscr&1)}")
 
-    for i, base in enumerate(CORE_DEBUG_BASES):
-        dscr_addr = base + DBGDSCR_OFFSET
+    # Core 0 resume 없이 Core 1/2 DBGDSCR 읽기
+    results = {}
+    for i in [1, 2]:
+        configure_core(fns, CORE_BASES[i])
+        dscr = jl.memory_read32(CORE_BASES[i] + DBGDSCR_OFF, 1)[0]
+        halted = bool(dscr & 0x1)
+        results[i] = (dscr, halted)
+        status = "HALTED ← CTI 동작 ✓" if halted else "NOT HALTED → CTI 미동작"
+        print(f"  Core {i}  DBGDSCR={dscr:#010x}  {status}")
 
-        if has_configure and i > 0:
-            dll_fns["JLINKARM_CORESIGHT_Configure"](
-                f"CoreBaseAddr={base:#010x}".encode())
+    configure_core(fns, CORE_BASES[0])
 
-        try:
-            dscr = jl.memory_read32(dscr_addr, 1)[0]
-        except Exception as e:
-            dscr = None
-            print(f"  Core {i}  0x{dscr_addr:08X} DBGDSCR = 읽기 실패: {e}")
-            continue
+    cti_ok = all(r[1] for r in results.values())
+    if cti_ok:
+        print("  → 전체 코어 CTI halt 확인. DCC injection 진행 가능.")
+    else:
+        print("  → CTI 미동작. Core 0 resume 후 수동 halt 시도 필요.")
 
-        halted = dscr & 0x1 if dscr is not None else None
-        if dscr == 0xFFFFFFFF:
-            status = "⚠ debug block 미응답 (전원 비활성화 or 잘못된 주소)"
-        elif dscr is None:
-            status = "읽기 실패"
-        else:
-            status = f"HALTED={halted}"
-        print(f"  Core {i}  0x{dscr_addr:08X} DBGDSCR = {dscr:#010x}  {status}")
+    return c0_pc, cti_ok, results
 
-    # Core 0 DBGDSCR vs Core 1 DBGDSCR 비교 요약
+
+# ── Step 2: DCC injection Core 0 검증 ────────────────────────────────────
+def dcc_read_pc(jl, core_base):
+    """MCR p14,0,R15,c0,c5,0 → DBGITR write → DBGDTRTX read
+    전제: 코어가 halted 상태여야 함"""
+    dbgitr  = core_base + DBGDSCR_OFF   # write path → DBGITR
+    dtrtx   = core_base + DBGDTRTX_OFF  # read path  → DBGDTRTX
+
     try:
-        if has_configure:
-            dll_fns["JLINKARM_CORESIGHT_Configure"](b"CoreBaseAddr=0x80030000")
-        d0 = jl.memory_read32(CORE_DEBUG_BASES[0] + DBGDSCR_OFFSET, 1)[0]
-        if has_configure:
-            dll_fns["JLINKARM_CORESIGHT_Configure"](b"CoreBaseAddr=0x80032000")
-        d1 = jl.memory_read32(CORE_DEBUG_BASES[1] + DBGDSCR_OFFSET, 1)[0]
+        # DCC TX 비어있는지 확인 (DBGDSCR bit 29 = TXfull_l)
+        dscr_before = jl.memory_read32(core_base + DBGDSCR_OFF, 1)[0]
+        if not (dscr_before & 0x1):
+            return None, f"코어 미halt (DBGDSCR={dscr_before:#010x})"
 
-        print()
-        if d0 == d1 and d1 != 0xFFFFFFFF:
-            print("  ⚠ Core 0 DBGDSCR == Core 1 DBGDSCR")
-            print("    → Configure가 코어를 전환하지 않거나, 두 주소가 같은 레지스터를 가리킴")
-        elif d1 == 0xFFFFFFFF:
-            print("  ✗ Core 1 debug block 응답 없음 → 전원 레지스터 write 실패")
-        else:
-            print(f"  ✓ Core 0 DBGDSCR({d0:#010x}) ≠ Core 1 DBGDSCR({d1:#010x})")
-            print("    → 독립적인 debug block 접근 확인, Configure 유효")
+        tx_was_full = bool((dscr_before >> 29) & 0x1)
+        if tx_was_full:
+            # 기존 데이터 drain
+            _ = jl.memory_read32(dtrtx, 1)[0]
+
+        # MCR p14,0,R15,c0,c5,0 주입
+        jl.memory_write32(dbgitr, [MCR_R15_TO_DCC])
+        time.sleep(0.002)
+
+        # DBGDSCR에서 TXfull 확인
+        dscr_after = jl.memory_read32(core_base + DBGDSCR_OFF, 1)[0]
+        tx_full = bool((dscr_after >> 29) & 0x1)
+
+        # DBGDTRTX 읽기
+        pc_dcc = jl.memory_read32(dtrtx, 1)[0]
+
+        return pc_dcc, f"TXfull_before={tx_was_full} TXfull_after={tx_full} → {pc_dcc:#010x}"
     except Exception as e:
-        print(f"  비교 실패: {e}")
-
-    # Core 0 복귀
-    if has_configure:
-        dll_fns["JLINKARM_CORESIGHT_Configure"](b"CoreBaseAddr=0x80030000")
+        return None, f"예외: {e}"
 
 
-# ── 멀티코어 PC 읽기 ──────────────────────────────────────────────────────
-def read_all_pcs(jl, dll_fns):
-    """Core 0 여러 번 샘플 vs Core 1/2 비교.
-    Core 0을 3번 읽어 idle loop 여부 확인 후, Core 1/2 비교.
-    """
-    print("\n=== [Step 3] PC 읽기 ===")
-    has_configure = "JLINKARM_CORESIGHT_Configure" in dll_fns
-    go = dll_fns.get("JLINKARM_Go")
+def verify_dcc_on_core0(jl, fns, known_pc):
+    """DCC injection을 Core 0에서 먼저 검증 (known_pc와 비교)"""
+    print(f"\n=== [Step 2] DCC injection Core 0 검증 (expected PC ≈ {known_pc:#010x}) ===")
+    configure_core(fns, CORE_BASES[0])
 
-    def _read_pc():
-        jl.halt()
-        pc = jl.register_read(15)
-        if go:
-            go()
+    # Core 0는 이미 halt된 상태
+    pc_dcc, detail = dcc_read_pc(jl, CORE_BASES[0])
+    print(f"  DCC 결과: {detail}")
+
+    if pc_dcc is not None:
+        diff = abs(pc_dcc - known_pc)
+        if diff <= 8:
+            print(f"  ✓ known PC와 {diff}바이트 차이 → DCC injection 유효")
+            return True
         else:
-            jl.go()
-        return pc
-
-    # Core 0 idle loop 확인 (3회 샘플)
-    if has_configure:
-        dll_fns["JLINKARM_CORESIGHT_Configure"](b"CoreBaseAddr=0x80030000")
-    c0_samples = [_read_pc() for _ in range(3)]
-    all_same = len(set(c0_samples)) == 1
-    print(f"  Core 0 × 3회: {[f'{p:#010x}' for p in c0_samples]}")
-    print(f"  {'  → idle loop 확인 (동일 PC 반복)' if all_same else '  → PC가 변화 중 (정상 실행)'}")
-
-    # Core 1, 2
-    for i, base in enumerate(CORE_DEBUG_BASES):
-        if has_configure:
-            dll_fns["JLINKARM_CORESIGHT_Configure"](
-                f"CoreBaseAddr={base:#010x}".encode())
-        try:
-            pc = _read_pc()
-            same_as_c0 = (pc == c0_samples[0])
-            note = "  ← Core 0와 동일 (코어 전환 실패 의심)" if (same_as_c0 and i > 0) else ""
-            print(f"  Core {i}  base={base:#010x}  PC = {pc:#010x}{note}")
-        except Exception as e:
-            print(f"  Core {i}  PC 읽기 실패: {e}")
-
-    if has_configure:
-        dll_fns["JLINKARM_CORESIGHT_Configure"](b"CoreBaseAddr=0x80030000")
+            print(f"  ✗ known PC({known_pc:#010x})와 차이 큼({diff}) → DBGDTRTX 오프셋 불일치 가능")
+            # 다른 오프셋 시도
+            for alt_off in [0x084, 0x090, 0x08C]:
+                alt_dtrtx = CORE_BASES[0] + alt_off
+                try:
+                    alt_val = jl.memory_read32(alt_dtrtx, 1)[0]
+                    diff2 = abs(alt_val - known_pc)
+                    print(f"    offset 0x{alt_off:03X}: {alt_val:#010x}  (diff={diff2})")
+                    if diff2 <= 8:
+                        print(f"    → ✓ 실제 DBGDTRTX offset = 0x{alt_off:03X}")
+                except Exception:
+                    pass
+    return False
 
 
-# ── CoreSight 컴포넌트 스캔 ───────────────────────────────────────────────
-def scan_coresight(jl, start=0x80000000, end=0x80060000, step=0x1000):
-    print("\n=== [Step 4] CoreSight 컴포넌트 스캔 ===")
+# ── Step 3: Core 1/2 PC 읽기 ─────────────────────────────────────────────
+def read_multicore_pcs(jl, fns, c0_pc, cti_ok, dcc_valid):
+    print(f"\n=== [Step 3] 멀티코어 PC 읽기 ===")
+    print(f"  Core 0 (기준): {c0_pc:#010x}  [jl.register_read]")
+
+    if not cti_ok:
+        print("  CTI 미동작 → Core 1/2 halt 불가. PC 읽기 skip.")
+        print("  → CTI 레지스터 직접 설정 또는 J-Link 업그레이드 필요")
+        return
+
+    if not dcc_valid:
+        print("  DCC injection 검증 실패 → DBGDTRTX 오프셋 확인 필요")
+
+    for i in [1, 2]:
+        configure_core(fns, CORE_BASES[i])
+        pc_dcc, detail = dcc_read_pc(jl, CORE_BASES[i])
+        if pc_dcc is not None:
+            same = (pc_dcc == c0_pc)
+            note = "  ← Core 0와 동일 (DCC 오동작?)" if same else "  ✓ 독립 PC"
+            print(f"  Core {i}: {pc_dcc:#010x}{note}  [{detail}]")
+        else:
+            print(f"  Core {i}: 읽기 실패  [{detail}]")
+
+    configure_core(fns, CORE_BASES[0])
+
+
+# ── CoreSight 스캔 ────────────────────────────────────────────────────────
+_PART = {0xC18:"Cortex-R8 Debug", 0x906:"CTI", 0x907:"ETB",
+         0x912:"TPIU", 0x925:"ETMv3", 0x961:"TMC/ETB", 0x95D:"ETMv4"}
+
+def scan_coresight(jl):
+    print("\n=== CoreSight 스캔 (0x80000000-0x80060000) ===")
     found = []
-    addr = start
-    while addr < end:
+    for addr in range(0x80000000, 0x80060000, 0x1000):
         try:
-            cidr = jl.memory_read32(addr + 0xFF0, 4)
-            if cidr[0] != 0x0D or cidr[2] != 0x05 or cidr[3] != 0xB1:
-                addr += step
+            c = jl.memory_read32(addr + 0xFF0, 4)
+            if c[0] != 0x0D or c[2] != 0x05 or c[3] != 0xB1:
                 continue
-            pidr = jl.memory_read32(addr + 0xFE0, 4)
-            part = (pidr[0] & 0xFF) | ((pidr[1] & 0x0F) << 8)
-            cls  = (cidr[1] >> 4) & 0xF
-            name = _PART_NAMES.get(part, f"Unknown(0x{part:03X})")
-            found.append({"base": addr, "part": part, "name": name, "class": cls})
-            print(f"  0x{addr:08X}  {name}  Part=0x{part:03X}  Class=0x{cls:X}")
+            p = jl.memory_read32(addr + 0xFE0, 4)
+            part = (p[0] & 0xFF) | ((p[1] & 0x0F) << 8)
+            name = _PART.get(part, f"Unknown(0x{part:03X})")
+            found.append((addr, part, name))
+            print(f"  0x{addr:08X}  {name}  Part=0x{part:03X}")
         except Exception:
             pass
-        addr += step
     if not found:
-        print("  컴포넌트 없음")
-    return found
+        print("  없음")
 
 
 # ── main ──────────────────────────────────────────────────────────────────
@@ -220,15 +240,25 @@ def main():
     jl.open()
     jl.set_tif(pylink.enums.JLinkInterfaces.SWD)
     jl.connect("Cortex-R8", speed=4000)
-    log.info("J-Link SWD 연결 완료")
+    log.info("SWD 연결 완료")
 
-    dll_fns = probe_and_setup_dll(jl._dll)
+    fns = setup_dll(jl._dll)
 
-    enable_cores_debug(jl, dll_fns)
-    diagnose_core_switch(jl, dll_fns)
-    read_all_pcs(jl, dll_fns)
+    enable_power(jl, fns)
+
+    # Step 1: CTI 검증 (Core 0 halt 유지 상태로 진행)
+    c0_pc, cti_ok, _ = test_cti(jl, fns)
+
+    # Step 2: DCC injection Core 0 검증 (Core 0 아직 halt 상태)
+    dcc_valid = verify_dcc_on_core0(jl, fns, c0_pc)
+
+    # Step 3: Core 1/2 PC (CTI + DCC 모두 성공 시)
+    read_multicore_pcs(jl, fns, c0_pc, cti_ok, dcc_valid)
+
+    # Core 0 resume
+    go(jl, fns)
+
     scan_coresight(jl)
-
     jl.close()
     print("\n완료")
 
