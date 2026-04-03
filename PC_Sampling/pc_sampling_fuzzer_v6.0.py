@@ -169,6 +169,7 @@ import hashlib
 import random
 import logging
 import math
+import re
 from collections import defaultdict, deque
 from typing import Set, List, Optional, Tuple, Dict
 from dataclasses import dataclass, field
@@ -862,8 +863,9 @@ class OpenOCDPCSampler:
         try:
             resp = self._telnet_cmd('read_all_pcs')
             log.warning(f"[OpenOCD] read_all_pcs 원시: {repr(resp)}")
-            parts = resp.strip().split()
-            if len(parts) < 3:
+            parts = re.findall(r'0x[0-9a-fA-F]+', resp)
+            #parts = resp.strip().split()
+            if len(parts) != 3:
                 log.warning(f"[OpenOCD] 파싱 실패 (토큰 {len(parts)}개): {repr(resp)}")
                 return None
             pc0, pc1, pc2 = [int(p, 16) & ~1 for p in parts[:3]]
