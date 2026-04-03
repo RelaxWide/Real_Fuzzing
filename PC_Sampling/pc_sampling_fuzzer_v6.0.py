@@ -659,21 +659,38 @@ class OpenOCDPCSampler:
                 log.warning("[OpenOCD] 연결 성공: PCSR read 검증 완료 (3코어).")
             else:
                 log.error("[OpenOCD] PCSR 검증 실패 — r8_pcsr.cfg 및 대상 전원 확인.")
+                self._close_telnet()
+                self._terminate_proc()
             return ok
         except Exception as e:
             log.error(f"[OpenOCD] connect() 오류: {e}")
+            self._close_telnet()
+            self._terminate_proc()
             return False
 
+    def _terminate_proc(self):
+        """OpenOCD 서브프로세스 강제 종료."""
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        self._proc = None
+
     def _kill_stale_openocd(self):
-        """포트 충돌 방지: 기존 OpenOCD 프로세스 종료."""
+        """포트 충돌 방지: 기존 OpenOCD 프로세스 종료 (포트+이름 양쪽)."""
         try:
-            subprocess.run(
-                ['fuser', '-k', f'{self.config.openocd_port}/tcp'],
-                capture_output=True, timeout=3.0
-            )
+            subprocess.run(['fuser', '-k', f'{self.config.openocd_port}/tcp'],
+                           capture_output=True, timeout=3.0)
         except Exception:
             pass
-        time.sleep(0.3)
+        try:
+            subprocess.run(['pkill', '-x', 'openocd'],
+                           capture_output=True, timeout=3.0)
+        except Exception:
+            pass
+        time.sleep(1.0)   # USB 장치 해제 대기
 
     def _launch_openocd(self) -> bool:
         """OpenOCD 서브프로세스 시작 후 포트 대기."""
@@ -800,6 +817,12 @@ class OpenOCDPCSampler:
         )
 
     def _verify_pcsr(self) -> bool:
+        # proc 정의 확인
+        resp = self._telnet_cmd('info commands read_all_pcs')
+        log.warning(f"[OpenOCD] proc 존재 확인: {repr(resp)}")
+        # 실제 읽기
+        raw = self._telnet_cmd('read_all_pcs')
+        log.warning(f"[OpenOCD] read_all_pcs 원시 응답: {repr(raw)}")
         result = self._read_all_pcs()
         return result is not None
 
@@ -813,13 +836,16 @@ class OpenOCDPCSampler:
             resp = self._telnet_cmd('read_all_pcs')
             parts = resp.strip().split()
             if len(parts) < 3:
+                log.debug(f"[OpenOCD] read_all_pcs 응답 파싱 실패: {repr(resp)}")
                 return None
             pc0, pc1, pc2 = [int(p, 16) & ~1 for p in parts[:3]]
             # 완전 무효값 필터 (전체가 0 또는 0xFFFFFFFE이면 전원/연결 문제)
             if pc0 in (0, 0xFFFFFFFE) and pc1 in (0, 0xFFFFFFFE) and pc2 in (0, 0xFFFFFFFE):
+                log.debug(f"[OpenOCD] 무효 PC 튜플: ({hex(pc0)}, {hex(pc1)}, {hex(pc2)})")
                 return None
             return (pc0, pc1, pc2)
-        except Exception:
+        except Exception as e:
+            log.debug(f"[OpenOCD] _read_all_pcs 예외: {e}")
             return None
 
     # ------------------------------------------------------------------
@@ -1152,12 +1178,7 @@ class OpenOCDPCSampler:
         if self.sample_thread:
             self.sample_thread.join(timeout=2.0)
         self._close_telnet()
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
+        self._terminate_proc()
 
 class NVMeFuzzer:
     """다중 Opcode 지원 NVMe 퍼저 (v4.3: subprocess nvme-cli + 글로벌 포화 설정 분리)"""
