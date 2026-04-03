@@ -31,7 +31,8 @@ PWR_REG     = 0x30313f30
 # DCC instruction injection 상수
 MCR_R15_TO_DCC = 0xEE00FE15   # MCR p14, 0, R15, c0, c5, 0
 DBGDSCR_OFF    = 0x084         # read = DBGDSCR / write (halted) = DBGITR
-DBGDTRTX_OFF   = 0x080         # read = DBGDTRTX (DCC result)
+DBGDTRTX_OFF   = 0x08C         # read = DBGDTRTX (DCC result, core→debugger)
+DBGDTRRX_OFF   = 0x080         # write = DBGDTRRX (debugger→core) — 읽으면 0xffffffff
 
 
 # ── DLL 설정 ──────────────────────────────────────────────────────────────
@@ -147,10 +148,20 @@ def dcc_read_pc(jl, core_base):
         dscr_after = jl.memory_read32(core_base + DBGDSCR_OFF, 1)[0]
         tx_full = bool((dscr_after >> 29) & 0x1)
 
-        # DBGDTRTX 읽기
+        # DBGDTRTX 읽기 (0x08C)
         pc_dcc = jl.memory_read32(dtrtx, 1)[0]
 
-        return pc_dcc, f"TXfull_before={tx_was_full} TXfull_after={tx_full} → {pc_dcc:#010x}"
+        # 진단: 0x080~0x08C 전 오프셋 스캔
+        scan_vals = {}
+        for off in [0x080, 0x084, 0x088, 0x08C]:
+            try:
+                scan_vals[off] = jl.memory_read32(core_base + off, 1)[0]
+            except Exception:
+                scan_vals[off] = None
+        scan_str = "  ".join(f"[{off:#05x}]={v:#010x}" if v is not None else f"[{off:#05x}]=ERR"
+                             for off, v in scan_vals.items())
+
+        return pc_dcc, f"TXfull_before={tx_was_full} TXfull_after={tx_full} DCC={pc_dcc:#010x}\n    scan: {scan_str}"
     except Exception as e:
         return None, f"예외: {e}"
 
