@@ -1,183 +1,112 @@
 """
-scan.py — JLinkScript 방식 멀티코어 PC 읽기
+scan.py — 단일 세션 멀티코어 PC 읽기
 
-핵심 원리:
-  - exec_command('scriptfile "coreN.JLinkScript"') → connect() 순서로
-    J-Link가 AP[0]=APB-AP, AP[1]=AXI-AP 로 올바르게 설정됨
-  - register_read(15) 가 해당 스크립트 코어의 실제 PC 반환
-  - Core 0 halt → CTI로 Core 1/2 동시 halt → 각 코어 스크립트로 재연결해 PC 읽기
-  - DCC injection 불필요
+전략:
+  core0.JLinkScript로 한 번 연결 → AP[0]=APB-AP 세션 내 유지
+  JLINKARM_CORESIGHT_Configure("CoreBaseAddr=...") 로 코어 전환
+  각 코어 halt() + register_read(15) → PC
 
-AP 구조 (JLinkScript에서 확인):
-  AP[0] = APB-AP  (CORESIGHT_AddAP(0, CORESIGHT_APB_AP)) → 디버그 레지스터
-  AP[1] = AXI-AP  (_INDEX_AXI_AP = 1)                    → 시스템 메모리
-  AP[2] = AHB-AP  (_INDEX_AHB_AP = 2)                    → Cortex-M 메모리
+  재연결 없음. 전체 3코어를 한 세션에서 처리.
+  PC가 전부 동일하면 CORESIGHT_Configure 코어 전환이 미동작임을 확인.
 """
 
-import os
-import ctypes
-import pylink
-import logging
-import time
+import os, ctypes, pylink, logging, time
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
-# JLinkScript 파일 경로 (WSL에서 Windows 경로 접근)
-SCRIPT_DIR = "/mnt/c/Users/Quiruri/Downloads/0L15RYM7_20260327_JLINKTool/0L15RYM7_20260327_JLINKTool/jlink_dump"
-SCRIPTS = {
-    0: os.path.join(SCRIPT_DIR, "core0.JLinkScript"),
-    1: os.path.join(SCRIPT_DIR, "core1.JLinkScript"),
-    2: os.path.join(SCRIPT_DIR, "core2.JLinkScript"),
-}
-
-CORE_BASES = [0x80030000, 0x80032000, 0x80034000]
-PWR_REG    = 0x30313f30
+SCRIPT_DIR  = "/mnt/c/Users/Quiruri/Downloads/0L15RYM7_20260327_JLINKTool/0L15RYM7_20260327_JLINKTool/jlink_dump"
+SCRIPT_C0   = os.path.join(SCRIPT_DIR, "core0.JLinkScript")
+CORE_BASES  = [0x80030000, 0x80032000, 0x80034000]
+PWR_REG     = 0x30313f30
 
 
-def make_jlink():
-    return pylink.JLink()
-
-
-def get_dll_go(jl):
-    """JLINKARM_Go 직접 바인딩 (jl.go() 버그 우회)"""
+def bind(dll, name, argtypes, restype):
     try:
-        fn = getattr(jl._dll, "JLINKARM_Go")
-        fn.argtypes = []
-        fn.restype  = None
+        fn = getattr(dll, name)
+        fn.argtypes = argtypes
+        fn.restype  = restype
         return fn
     except AttributeError:
         return None
 
 
-def connect_core(jl, core_idx, speed=4000):
-    """지정 코어 스크립트로 J-Link 연결"""
-    script = SCRIPTS[core_idx]
-    if not os.path.isfile(script):
-        raise FileNotFoundError(f"JLinkScript 없음: {script}")
-    jl.set_tif(pylink.enums.JLinkInterfaces.SWD)
-    jl.exec_command(f'scriptfile "{script}"')
-    jl.connect("Cortex-R8", speed=speed)
-    log.info(f"Core {core_idx} 연결 완료 (script: {os.path.basename(script)})")
-
-
-def halt_and_keep(jl):
-    """halt 후 close — J-Link는 go() 없이 닫으면 halt 상태 유지"""
-    try:
-        jl.halt()
-        time.sleep(0.05)
-    except Exception as e:
-        log.warning(f"halt 실패: {e}")
-    jl.close()
-
-
-# ── Step 1: Core 0 halt ───────────────────────────────────────────────────
-def step1_halt_core0():
-    """Core 0 halt 후 disconnect (halt 상태 유지 — CTI로 Core 1/2 전파 기대)"""
-    print("\n=== [Step 1] Core 0 halt ===")
-
-    jl = make_jlink()
-    jl.open()
-    connect_core(jl, 0)
-
-    jl.halt()
-    time.sleep(0.05)
-    c0_pc = jl.register_read(15)
-    print(f"  Core 0  PC={c0_pc:#010x}")
-    print(f"  halted={jl.halted()}  → disconnect (halt 유지)")
-
-    # halt 상태 유지하며 disconnect (go() 호출 없음)
-    halt_and_keep(jl)
-    return c0_pc
-
-
-# ── Step 2/3: 각 코어 스크립트로 재연결 → halted() 확인 후 register_read ─
-def step2_read_core_pc(core_idx, c0_pc):
-    print(f"\n=== [Step {core_idx + 1}] Core {core_idx} 재연결 — CTI halt 유지 확인 ===")
-
-    jl = make_jlink()
-    jl.open()
-    try:
-        connect_core(jl, core_idx)
-        time.sleep(0.1)
-
-        is_halted = jl.halted()
-        print(f"  연결 직후 halted={is_halted}")
-
-        if is_halted:
-            print(f"  ✓ CTI halt 유지됨 → register_read(15)")
-            pc = jl.register_read(15)
-            same = (pc == c0_pc)
-            note = " ← Core 0와 동일 (의심)" if same else " ✓ 독립 PC"
-            print(f"  Core {core_idx}  PC={pc:#010x}{note}")
-            halt_and_keep(jl)
-            return pc
-        else:
-            print(f"  ✗ CTI 미동작 — Core {core_idx} 독립 실행 중")
-            print(f"    → 강제 halt 후 PC 읽기 (실행 중 PC, 참고용)")
-            jl.halt()
-            time.sleep(0.05)
-            pc = jl.register_read(15)
-            print(f"  Core {core_idx}  PC={pc:#010x} (강제 halt, CTI 미동작)")
-            halt_and_keep(jl)
-            return None   # CTI 미동작이므로 None 반환
-
-    except Exception as e:
-        print(f"  Core {core_idx} 읽기 실패: {e}")
-        try:
-            jl.close()
-        except Exception:
-            pass
-        return None
-
-
-# ── Step 4: Core 0 재연결 후 resume ──────────────────────────────────────
-def step4_resume_all():
-    print("\n=== [Step 4] Core 0 재연결 → resume ===")
-    jl = make_jlink()
-    jl.open()
-    connect_core(jl, 0)
-
-    dll_go = get_dll_go(jl)
-    if dll_go:
-        dll_go()
-        print("  JLINKARM_Go() 호출 완료")
-    else:
-        try:
-            jl.go()
-        except Exception as e:
-            print(f"  go() 실패: {e}")
-
-    time.sleep(0.1)
-    print(f"  halted after go: {jl.halted()}")
-    jl.close()
-
-
-# ── main ──────────────────────────────────────────────────────────────────
 def main():
-    # 스크립트 파일 존재 확인
-    for i, path in SCRIPTS.items():
-        if not os.path.isfile(path):
-            print(f"[ERROR] JLinkScript 없음: {path}")
-            print("  SCRIPT_DIR를 실제 경로로 수정하세요.")
-            return
+    if not os.path.isfile(SCRIPT_C0):
+        print(f"[ERROR] JLinkScript 없음: {SCRIPT_C0}")
+        return
 
-    c0_pc = step1_halt_core0()
+    jl = pylink.JLink()
+    jl.open()
+    jl.set_tif(pylink.enums.JLinkInterfaces.SWD)
+    jl.exec_command(f'scriptfile "{SCRIPT_C0}"')
+    jl.connect("Cortex-R8", speed=4000)
+    log.info("연결 완료 (core0.JLinkScript)")
 
-    pcs = {0: c0_pc}
+    dll = jl._dll
+    cfg = bind(dll, "JLINKARM_CORESIGHT_Configure",
+               [ctypes.c_char_p], ctypes.c_int)
+    go  = bind(dll, "JLINKARM_Go", [], None)
 
-    # CTI 동작 여부는 재연결 후 jl.halted()로 직접 확인 — DBGDSCR 읽기 불필요
-    for i in [1, 2]:
-        pcs[i] = step2_read_core_pc(i, c0_pc)
+    def switch(i):
+        if cfg:
+            cfg(f"CoreBaseAddr={CORE_BASES[i]:#010x}".encode())
 
-    step4_resume_all()
+    def resume():
+        if go: go()
+        else:
+            try: jl.go()
+            except Exception: pass
 
+    # ── 전체 코어 디버그 전원 활성화 (AXI-AP 경유) ──────────────────────
+    print(f"\n=== 전원 활성화 (0x{PWR_REG:08X}) ===")
+    try:
+        cur = jl.memory_read32(PWR_REG, 1)[0]
+        jl.memory_write32(PWR_REG, [cur | 0x00010101])
+        ver = jl.memory_read32(PWR_REG, 1)[0]
+        print(f"  {cur:#010x} → {ver:#010x}  (Core0=bit0, Core1=bit8, Core2=bit16)")
+    except Exception as e:
+        print(f"  실패: {e}")
+
+    # ── 코어별 halt + PC 읽기 ─────────────────────────────────────────────
+    print("\n=== 멀티코어 PC 샘플링 (단일 세션) ===")
+    pcs = {}
+
+    for i in range(3):
+        switch(i)
+        time.sleep(0.01)
+        try:
+            jl.halt()
+            time.sleep(0.02)
+            pc = jl.register_read(15)
+            pcs[i] = pc
+            print(f"  Core {i}  halted={jl.halted()}  PC={pc:#010x}")
+        except Exception as e:
+            print(f"  Core {i}  오류: {e}")
+            pcs[i] = None
+
+        if i < 2:
+            resume()
+            time.sleep(0.02)
+
+    # 마지막 코어 resume
+    resume()
+    switch(0)
+    jl.close()
+
+    # ── 결과 요약 ─────────────────────────────────────────────────────────
     print("\n=== 결과 요약 ===")
     for i, pc in pcs.items():
-        if pc is not None:
-            print(f"  Core {i}: {pc:#010x}")
-        else:
-            print(f"  Core {i}: 읽기 실패")
+        print(f"  Core {i}: {pc:#010x}" if pc else f"  Core {i}: 읽기 실패")
+
+    valid = [v for v in pcs.values() if v]
+    if len(valid) > 1 and len(set(valid)) == 1:
+        print("\n  ⚠ 전 코어 PC 동일 → CORESIGHT_Configure 코어 전환 미동작")
+        print("  → halt/register_read 가 여전히 Core 0만 참조하는 것으로 추정")
+        print("  → 이 칩에서 멀티코어 PC 샘플링 불가 (SWD 단일코어 한계)")
+    elif len(set(valid)) > 1:
+        print("\n  ✓ 코어별 독립 PC 확인 → 멀티코어 샘플링 유효")
+
     print("완료")
 
 
