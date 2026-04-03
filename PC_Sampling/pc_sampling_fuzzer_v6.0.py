@@ -770,7 +770,21 @@ class OpenOCDPCSampler:
         s.settimeout(self._SOCK_TIMEOUT)
         s.connect((self.config.openocd_host, self.config.openocd_port))
         self._sock = s
-        self._sock_read_until('> ')   # 초기 배너/프롬프트 소비
+        self._sock_buf = b''
+        # 초기 배너 전체 drain: OpenOCD가 > 를 여러 번 보낼 수 있음.
+        # 0.5초 대기 후 수신 가능한 데이터를 모두 버려 clean slate 확보.
+        time.sleep(0.5)
+        self._sock.settimeout(0.2)
+        try:
+            while True:
+                chunk = self._sock.recv(self._RECV_BUF)
+                if not chunk:
+                    break
+        except socket.timeout:
+            pass
+        finally:
+            self._sock.settimeout(self._SOCK_TIMEOUT)
+        self._sock_buf = b''   # 버퍼 완전 초기화
 
     def _close_telnet(self):
         if self._sock:
@@ -811,12 +825,16 @@ class OpenOCDPCSampler:
 
     def _send_startup_tcl(self):
         """전원 활성화 + read_all_pcs proc 정의 (connect/reconnect 공통)."""
-        # 전원 활성화: AXI-AP 경유 power register에 3코어 비트 OR
+        # 전원 활성화: 읽기→쓰기 분리 (working test script 방식과 동일)
+        r0 = self._telnet_cmd(
+            f'set _pwr [lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0]'
+        )
+        log.warning(f"[OpenOCD] 전원 읽기 응답: {repr(r0)}")
         r1 = self._telnet_cmd(
             f'r8.axi write_memory {hex(PCSR_POWER_ADDR)} 32 '
-            f'[expr {{[lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0] | {hex(PCSR_POWER_MASK)}}}]'
+            f'[expr {{$_pwr | {hex(PCSR_POWER_MASK)}}}]'
         )
-        log.warning(f"[OpenOCD] 전원 활성화 응답: {repr(r1)}")
+        log.warning(f"[OpenOCD] 전원 쓰기 응답: {repr(r1)}")
         # 배치 읽기 proc 정의 (1 RTT = 3코어 PC)
         r2 = self._telnet_cmd(
             'proc read_all_pcs {} {'
