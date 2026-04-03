@@ -812,12 +812,13 @@ class OpenOCDPCSampler:
     def _send_startup_tcl(self):
         """전원 활성화 + read_all_pcs proc 정의 (connect/reconnect 공통)."""
         # 전원 활성화: AXI-AP 경유 power register에 3코어 비트 OR
-        self._telnet_cmd(
+        r1 = self._telnet_cmd(
             f'r8.axi write_memory {hex(PCSR_POWER_ADDR)} 32 '
             f'[expr {{[lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0] | {hex(PCSR_POWER_MASK)}}}]'
         )
+        log.warning(f"[OpenOCD] 전원 활성화 응답: {repr(r1)}")
         # 배치 읽기 proc 정의 (1 RTT = 3코어 PC)
-        self._telnet_cmd(
+        r2 = self._telnet_cmd(
             'proc read_all_pcs {} {'
             f' set pc0 [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0];'
             f' set pc1 [lindex [r8.abp read_memory {hex(PCSR_CORE1)} 32 1] 0];'
@@ -825,6 +826,7 @@ class OpenOCDPCSampler:
             ' return "$pc0 $pc1 $pc2"'
             ' }'
         )
+        log.warning(f"[OpenOCD] proc 정의 응답: {repr(r2)}")
 
     def _verify_pcsr(self) -> bool:
         result = self._read_all_pcs()
@@ -841,18 +843,18 @@ class OpenOCDPCSampler:
         """PCSR 배치 읽기: 1 RTT = (pc0, pc1, pc2). Thumb bit 마스킹 포함."""
         try:
             resp = self._telnet_cmd('read_all_pcs')
+            log.warning(f"[OpenOCD] read_all_pcs 원시: {repr(resp)}")
             parts = resp.strip().split()
             if len(parts) < 3:
-                log.debug(f"[OpenOCD] read_all_pcs 응답 파싱 실패: {repr(resp)}")
+                log.warning(f"[OpenOCD] 파싱 실패 (토큰 {len(parts)}개): {repr(resp)}")
                 return None
             pc0, pc1, pc2 = [int(p, 16) & ~1 for p in parts[:3]]
-            # 완전 무효값 필터 (전체가 0 또는 0xFFFFFFFE이면 전원/연결 문제)
             if pc0 in (0, 0xFFFFFFFE) and pc1 in (0, 0xFFFFFFFE) and pc2 in (0, 0xFFFFFFFE):
-                log.debug(f"[OpenOCD] 무효 PC 튜플: ({hex(pc0)}, {hex(pc1)}, {hex(pc2)})")
+                log.warning(f"[OpenOCD] 무효 PC 튜플: ({hex(pc0)}, {hex(pc1)}, {hex(pc2)})")
                 return None
             return (pc0, pc1, pc2)
         except Exception as e:
-            log.debug(f"[OpenOCD] _read_all_pcs 예외: {e}")
+            log.warning(f"[OpenOCD] _read_all_pcs 예외: {e}")
             return None
 
     # ------------------------------------------------------------------
