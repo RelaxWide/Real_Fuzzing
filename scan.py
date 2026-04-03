@@ -33,7 +33,6 @@ SCRIPTS = {
 
 CORE_BASES = [0x80030000, 0x80032000, 0x80034000]
 PWR_REG    = 0x30313f30
-DBGDSCR_OFF = 0x034   # Cortex-R8 APB-AP 기준 실제 DBGDSCR 오프셋
 
 
 def make_jlink():
@@ -72,17 +71,10 @@ def halt_and_keep(jl):
     jl.close()
 
 
-def read_dbgdscr(jl, core_base):
-    """APB-AP 통해 DBGDSCR 읽기 (JLinkScript 연결 후에만 유효)"""
-    try:
-        return jl.memory_read32(core_base + DBGDSCR_OFF, 1)[0]
-    except Exception:
-        return None
-
-
-# ── Step 1: Core 0 halt + CTI 확인 ───────────────────────────────────────
-def step1_halt_core0_check_cti():
-    print("\n=== [Step 1] Core 0 halt → CTI로 Core 1/2 halt 확인 ===")
+# ── Step 1: Core 0 halt ───────────────────────────────────────────────────
+def step1_halt_core0():
+    """Core 0 halt 후 disconnect (halt 상태 유지 — CTI로 Core 1/2 전파 기대)"""
+    print("\n=== [Step 1] Core 0 halt ===")
 
     jl = make_jlink()
     jl.open()
@@ -91,36 +83,17 @@ def step1_halt_core0_check_cti():
     jl.halt()
     time.sleep(0.05)
     c0_pc = jl.register_read(15)
-    print(f"  Core 0  PC={c0_pc:#010x}  (register_read 기준)")
+    print(f"  Core 0  PC={c0_pc:#010x}")
+    print(f"  halted={jl.halted()}  → disconnect (halt 유지)")
 
-    # APB-AP로 Core 1/2 DBGDSCR 읽기 (Core 0 halt 유지 상태)
-    cti_ok = True
-    for i in [1, 2]:
-        dscr = read_dbgdscr(jl, CORE_BASES[i])
-        if dscr is None:
-            print(f"  Core {i}  DBGDSCR=읽기실패")
-            cti_ok = False
-        else:
-            halted = bool(dscr & 0x1)
-            status = "HALTED ← CTI 동작 ✓" if halted else "NOT HALTED → CTI 미동작"
-            print(f"  Core {i}  DBGDSCR={dscr:#010x}  {status}")
-            if not halted:
-                cti_ok = False
-
-    # halt 상태 유지하며 disconnect
+    # halt 상태 유지하며 disconnect (go() 호출 없음)
     halt_and_keep(jl)
-
-    if cti_ok:
-        print("  → CTI 확인됨. Core 1/2 halt 상태로 재연결 시도.")
-    else:
-        print("  → CTI 미동작. Core 1/2 PC 읽기 불가.")
-
-    return c0_pc, cti_ok
+    return c0_pc
 
 
-# ── Step 2/3: 각 코어 스크립트로 재연결 → register_read(15) ─────────────
+# ── Step 2/3: 각 코어 스크립트로 재연결 → halted() 확인 후 register_read ─
 def step2_read_core_pc(core_idx, c0_pc):
-    print(f"\n=== [Step {core_idx + 1}] Core {core_idx} PC 읽기 (재연결) ===")
+    print(f"\n=== [Step {core_idx + 1}] Core {core_idx} 재연결 — CTI halt 유지 확인 ===")
 
     jl = make_jlink()
     jl.open()
@@ -128,23 +101,26 @@ def step2_read_core_pc(core_idx, c0_pc):
         connect_core(jl, core_idx)
         time.sleep(0.1)
 
-        # 이미 halt 상태여야 함 (CTI 유지)
         is_halted = jl.halted()
         print(f"  연결 직후 halted={is_halted}")
 
-        if not is_halted:
-            # CTI가 유지됐다면 이미 halt — 아니면 직접 halt
-            print("  → halt 시도")
+        if is_halted:
+            print(f"  ✓ CTI halt 유지됨 → register_read(15)")
+            pc = jl.register_read(15)
+            same = (pc == c0_pc)
+            note = " ← Core 0와 동일 (의심)" if same else " ✓ 독립 PC"
+            print(f"  Core {core_idx}  PC={pc:#010x}{note}")
+            halt_and_keep(jl)
+            return pc
+        else:
+            print(f"  ✗ CTI 미동작 — Core {core_idx} 독립 실행 중")
+            print(f"    → 강제 halt 후 PC 읽기 (실행 중 PC, 참고용)")
             jl.halt()
             time.sleep(0.05)
-
-        pc = jl.register_read(15)
-        same = (pc == c0_pc)
-        note = "  ← Core 0와 동일 (CTI halt 이전 상태?)" if same else "  ✓ 독립 PC"
-        print(f"  Core {core_idx}  PC={pc:#010x}{note}")
-
-        halt_and_keep(jl)
-        return pc
+            pc = jl.register_read(15)
+            print(f"  Core {core_idx}  PC={pc:#010x} (강제 halt, CTI 미동작)")
+            halt_and_keep(jl)
+            return None   # CTI 미동작이므로 None 반환
 
     except Exception as e:
         print(f"  Core {core_idx} 읽기 실패: {e}")
@@ -186,15 +162,13 @@ def main():
             print("  SCRIPT_DIR를 실제 경로로 수정하세요.")
             return
 
-    c0_pc, cti_ok = step1_halt_core0_check_cti()
+    c0_pc = step1_halt_core0()
 
     pcs = {0: c0_pc}
 
-    if cti_ok:
-        for i in [1, 2]:
-            pcs[i] = step2_read_core_pc(i, c0_pc)
-    else:
-        print("\n  CTI 미동작 → Core 1/2 PC 읽기 skip")
+    # CTI 동작 여부는 재연결 후 jl.halted()로 직접 확인 — DBGDSCR 읽기 불필요
+    for i in [1, 2]:
+        pcs[i] = step2_read_core_pc(i, c0_pc)
 
     step4_resume_all()
 
