@@ -641,6 +641,7 @@ class OpenOCDPCSampler:
 
         self.idle_pc:  Optional[int] = None
         self.idle_pcs: Set[int]      = set()
+        self._sock_buf: bytes        = b''   # 소켓 읽기 잔여 버퍼
 
     # ------------------------------------------------------------------
     # Module 1: 서브프로세스 라이프사이클
@@ -778,22 +779,31 @@ class OpenOCDPCSampler:
             except Exception:
                 pass
             self._sock = None
+        self._sock_buf = b''
 
     def _sock_read_until(self, marker: str) -> str:
-        buf = b''
+        """marker가 나올 때까지 읽기. 잔여 데이터는 _sock_buf에 보존."""
         marker_b = marker.encode()
         while True:
+            # 이미 버퍼에 marker가 있으면 바로 반환
+            idx = self._sock_buf.find(marker_b)
+            if idx != -1:
+                result = self._sock_buf[:idx]
+                # marker 이후 남은 데이터 보존 (다음 호출에 사용)
+                self._sock_buf = self._sock_buf[idx + len(marker_b):]
+                return result.decode(errors='replace').strip()
+            # 더 읽기
             try:
                 chunk = self._sock.recv(self._RECV_BUF)
             except socket.timeout:
-                break
+                result = self._sock_buf
+                self._sock_buf = b''
+                return result.decode(errors='replace').strip()
             if not chunk:
-                break
-            buf += chunk
-            if marker_b in buf:
-                idx = buf.rfind(marker_b)
-                return buf[:idx].decode(errors='replace').strip()
-        return buf.decode(errors='replace').strip()
+                result = self._sock_buf
+                self._sock_buf = b''
+                return result.decode(errors='replace').strip()
+            self._sock_buf += chunk
 
     def _telnet_cmd(self, cmd: str) -> str:
         self._sock.sendall((cmd + '\n').encode())
@@ -817,13 +827,10 @@ class OpenOCDPCSampler:
         )
 
     def _verify_pcsr(self) -> bool:
-        # proc 정의 확인
-        resp = self._telnet_cmd('info commands read_all_pcs')
-        log.warning(f"[OpenOCD] proc 존재 확인: {repr(resp)}")
-        # 실제 읽기
-        raw = self._telnet_cmd('read_all_pcs')
-        log.warning(f"[OpenOCD] read_all_pcs 원시 응답: {repr(raw)}")
         result = self._read_all_pcs()
+        if result is not None:
+            log.warning(f"[OpenOCD] PCSR 검증 OK: Core0={hex(result[0])}, "
+                        f"Core1={hex(result[1])}, Core2={hex(result[2])}")
         return result is not None
 
     # ------------------------------------------------------------------
