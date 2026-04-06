@@ -830,12 +830,12 @@ class OpenOCDPCSampler:
         r0 = self._telnet_cmd(
             f'set _pwr [lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0]'
         )
-        log.warning(f"[OpenOCD] 전원 읽기 응답: {repr(r0)}")
+        log.debug(f"[OpenOCD] 전원 읽기 응답: {repr(r0)}")
         r1 = self._telnet_cmd(
             f'r8.axi write_memory {hex(PCSR_POWER_ADDR)} 32 '
             f'[expr {{$_pwr | {hex(PCSR_POWER_MASK)}}}]'
         )
-        log.warning(f"[OpenOCD] 전원 쓰기 응답: {repr(r1)}")
+        log.debug(f"[OpenOCD] 전원 쓰기 응답: {repr(r1)}")
         # 배치 읽기 proc 정의 (1 RTT = 3코어 PC)
         r2 = self._telnet_cmd(
             'proc read_all_pcs {} {'
@@ -845,13 +845,13 @@ class OpenOCDPCSampler:
             ' return "$pc0 $pc1 $pc2"'
             ' }'
         )
-        log.warning(f"[OpenOCD] proc 정의 응답: {repr(r2)}")
+        log.debug(f"[OpenOCD] proc 정의 응답: {repr(r2)}")
 
     def _verify_pcsr(self) -> bool:
         result = self._read_all_pcs()
         if result is not None:
-            log.warning(f"[OpenOCD] PCSR 검증 OK: Core0={hex(result[0])}, "
-                        f"Core1={hex(result[1])}, Core2={hex(result[2])}")
+            log.info(f"[OpenOCD] PCSR 검증 OK: Core0={hex(result[0])} "
+                     f"Core1={hex(result[1])} Core2={hex(result[2])}")
         return result is not None
 
     # ------------------------------------------------------------------
@@ -862,16 +862,15 @@ class OpenOCDPCSampler:
         """PCSR 배치 읽기: 1 RTT = (pc0, pc1, pc2). Thumb bit 마스킹 포함."""
         try:
             resp = self._telnet_cmd('read_all_pcs')
-            log.warning(f"[OpenOCD] read_all_pcs 원시: {repr(resp)}")
             parts = re.findall(r'0x[0-9a-fA-F]+', resp)
-            #parts = resp.strip().split()
             if len(parts) != 3:
                 log.warning(f"[OpenOCD] 파싱 실패 (토큰 {len(parts)}개): {repr(resp)}")
                 return None
             pc0, pc1, pc2 = [int(p, 16) & ~1 for p in parts[:3]]
             if pc0 in (0, 0xFFFFFFFE) and pc1 in (0, 0xFFFFFFFE) and pc2 in (0, 0xFFFFFFFE):
-                log.warning(f"[OpenOCD] 무효 PC 튜플: ({hex(pc0)}, {hex(pc1)}, {hex(pc2)})")
+                log.warning(f"[OpenOCD] 무효 PC 튜플: Core0={hex(pc0)} Core1={hex(pc1)} Core2={hex(pc2)}")
                 return None
+            log.debug(f"[PCSR] Core0={hex(pc0)} Core1={hex(pc1)} Core2={hex(pc2)}")
             return (pc0, pc1, pc2)
         except Exception as e:
             log.warning(f"[OpenOCD] _read_all_pcs 예외: {e}")
