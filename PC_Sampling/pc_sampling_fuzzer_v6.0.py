@@ -1609,10 +1609,16 @@ class NVMeFuzzer:
         else:
             log.info("[Seed] fw_bin 미지정 또는 파일 없음 → FWDownload 더미 시드 사용")
 
+        # FormatNVM / Sanitize는 파괴적 동작이므로 시드에서 제외
+        _DESTRUCTIVE = {"FormatNVM", "Sanitize"}
+
         excluded = set(self.config.excluded_opcodes)
         for cmd in self.commands:
             if cmd.opcode in excluded:
                 log.info(f"[Seed] {cmd.name} (0x{cmd.opcode:02x}) — excluded_opcodes 제외")
+                continue
+            if cmd.name in _DESTRUCTIVE:
+                log.info(f"[Seed] {cmd.name} (0x{cmd.opcode:02x}) — 파괴적 명령어 제외")
                 continue
 
             if cmd.name == "FWDownload":
@@ -1688,6 +1694,15 @@ class NVMeFuzzer:
             else:
                 # 알 수 없는 명령어는 기본 시드
                 seeds.append(Seed(data=b'\x00' * 64, cmd=cmd, found_at=0))
+
+        # Read / Write 시드를 corpus 앞으로 — I/O 위주 커버리지 우선 수집
+        _IO_PRIORITY = {"Read", "Write"}
+        io_seeds    = [s for s in seeds if s.cmd.name in _IO_PRIORITY]
+        other_seeds = [s for s in seeds if s.cmd.name not in _IO_PRIORITY]
+        seeds = io_seeds + other_seeds
+        if io_seeds:
+            log.info(f"[Seed] I/O 우선 정렬: Read/Write {len(io_seeds)}개 → 앞, "
+                     f"나머지 {len(other_seeds)}개 → 뒤 (총 {len(seeds)}개)")
 
         return seeds
 
