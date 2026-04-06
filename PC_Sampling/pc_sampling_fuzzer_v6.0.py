@@ -737,6 +737,29 @@ class OpenOCDPCSampler:
     def _openocd_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def _reinit_target(self) -> bool:
+        """OpenOCD 프로세스 유지 + 타겟 디버그 전원 재활성화 + proc 재정의.
+
+        SSD 펌웨어 reset 등으로 APB-AP 접근이 끊어졌을 때 사용.
+        OpenOCD를 재시작하지 않으므로 빠름 (~1초).
+        실패 시 False 반환 → 호출자가 _reconnect()로 escalate.
+        """
+        if not self._openocd_alive():
+            return False
+        try:
+            log.warning("[OpenOCD] 타겟 재초기화 시도 (전원 재활성화 + proc 재정의)...")
+            self._send_startup_tcl()
+            result = self._read_all_pcs()
+            if result is not None:
+                log.warning(f"[OpenOCD] 타겟 재초기화 성공: "
+                            f"Core0={hex(result[0])} Core1={hex(result[1])} Core2={hex(result[2])}")
+                return True
+            log.warning("[OpenOCD] 타겟 재초기화 후 PCSR 읽기 실패 — OpenOCD 재시작으로 전환")
+            return False
+        except Exception as e:
+            log.warning(f"[OpenOCD] 타겟 재초기화 예외: {e}")
+            return False
+
     def _reconnect(self) -> bool:
         log.warning("[OpenOCD] 재시작 시도...")
         self._close_telnet()
@@ -5430,14 +5453,19 @@ class NVMeFuzzer:
                                                  timeout_mult=_timeout_mult)
                     last_samples = self.sampler.stop_sampling()
 
-                # OpenOCD 연속 실패 감지 → 재시작 시도, 실패 시 퍼저 종료
+                # OpenOCD 연속 실패 감지 → 2단계 복구
+                # 1단계: 타겟 재초기화 (OpenOCD 유지, 전원 레지스터 재활성화)
+                # 2단계: OpenOCD 완전 재시작
                 if self.sampler.openocd_error.is_set():
                     self.sampler.openocd_error.clear()
-                    log.warning("[OpenOCD] 연결 오류 감지 — 재시작 시도...")
-                    if not self.sampler._reconnect():
-                        log.error("[OpenOCD] 재시작 실패 — 퍼저를 종료합니다.")
-                        break
-                    log.warning("[OpenOCD] 재시작 성공 — 퍼징 재개")
+                    if not self.sampler._reinit_target():
+                        log.warning("[OpenOCD] 타겟 재초기화 실패 — OpenOCD 재시작 시도...")
+                        if not self.sampler._reconnect():
+                            log.error("[OpenOCD] 재시작 실패 — 퍼저를 종료합니다.")
+                            break
+                        log.warning("[OpenOCD] OpenOCD 재시작 성공 — 퍼징 재개")
+                    else:
+                        log.warning("[OpenOCD] 타겟 재초기화 성공 — 퍼징 재개")
 
                 self.executions += 1
                 track_key = self._tracking_label(cmd, mutated_seed)
