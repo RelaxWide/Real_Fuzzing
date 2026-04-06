@@ -1022,6 +1022,45 @@ class OpenOCDPCSampler:
             time.sleep(0.05)
         return samples
 
+    def read_halted_pcs(self) -> Optional[List[int]]:
+        """각 코어를 halt시킨 뒤 정확한 PC를 읽어 반환.
+
+        PCSR 통계 샘플링과 달리 단일 스냅샷이므로 hang 지점의 정확한 PC를 확인할 수 있다.
+        반환값: [core0_pc, core1_pc, core2_pc] 또는 실패 시 None.
+        주의: halt 후 resume하지 않으므로 코어는 halted 상태로 유지된다.
+        """
+        if not self._sock or not self._openocd_alive():
+            log.warning("[OpenOCD] telnet 없음 — halted PC 읽기 스킵")
+            return None
+        try:
+            # OpenOCD target 이름: r8.cpu0 / r8.cpu1 / r8.cpu2
+            # targets 명령으로 전환 후 halt → reg pc
+            results = []
+            for core_idx in range(3):
+                tgt = f'r8.cpu{core_idx}'
+                self._telnet_cmd(f'targets {tgt}')
+                self._telnet_cmd('halt')
+                resp = self._telnet_cmd('reg pc')
+                # 응답 예: "pc (/32): 0x00001620"
+                pc = None
+                for tok in resp.split():
+                    if tok.startswith('0x') or tok.startswith('0X'):
+                        try:
+                            pc = int(tok, 16) & ~1  # Thumb bit 제거
+                        except ValueError:
+                            pass
+                        break
+                if pc is None:
+                    log.warning(f"[OpenOCD] Core{core_idx} halted PC 파싱 실패: {resp!r}")
+                    pc = 0
+                results.append(pc)
+                log.error(f"  [Core{core_idx}] Halted PC: {hex(pc)}"
+                          + (" [IDLE]" if pc in self.idle_pcs else " [NON-IDLE]"))
+            return results
+        except Exception as e:
+            log.warning(f"[OpenOCD] halted PC 읽기 오류: {e}")
+            return None
+
     def _in_range(self, pc: int) -> bool:
         """PC가 펌웨어 주소 범위 내인지 확인"""
         if self.config.addr_range_start is None or self.config.addr_range_end is None:
@@ -4316,6 +4355,11 @@ class NVMeFuzzer:
             f"  커널 reset까지 최대 {timeout_val}초 유예 "
             f"(nvme_core admin/io_timeout 설정값)")
         log.error("")
+
+        # 5.5) halt PC — PCSR 통계 외에 실제 halt 시점의 정확한 PC 확인
+        if stuck_pcs and self.sampler._openocd_alive():
+            log.error("  [Halted PC] 코어 halt 후 정확한 PC 확인:")
+            self.sampler.read_halted_pcs()
 
         # 6) PC 분석 완료 — OpenOCD를 종료하지 않고 telnet만 닫아 hang 상태 보존
         # OpenOCD kill(SIGKILL) 시 J-Link 하드웨어가 USB 연결 끊김을 감지하고
