@@ -1648,24 +1648,22 @@ class NVMeFuzzer:
                 log.warning(f"[POR] PCIe 장치 제거 실패 (무시): {e}")
 
         # 2. 전원 OFF
-        r = subprocess.run(
-            ['python3', _PMU_SCRIPT, '7', '1'],
-            capture_output=True, timeout=5,
-        )
-        if r.returncode != 0:
-            log.warning(f"[POR] PowerOffAll 오류 (rc={r.returncode}): "
-                        f"{r.stderr.decode(errors='replace').strip()}")
+        _off_cmd = ['python3', _PMU_SCRIPT, '7', '1']
+        log.warning(f"[POR] CMD: {' '.join(_off_cmd)}")
+        r = subprocess.run(_off_cmd, capture_output=True, timeout=5)
+        log.warning(f"[POR] PowerOffAll rc={r.returncode} "
+                    f"stdout={r.stdout.decode(errors='replace').strip()!r} "
+                    f"stderr={r.stderr.decode(errors='replace').strip()!r}")
         log.warning(f"[POR] 전원 OFF — {self.config.por_poweroff_wait:.1f}초 방전 대기...")
         time.sleep(self.config.por_poweroff_wait)
 
         # 3. 전원 ON
-        r = subprocess.run(
-            ['python3', _PMU_SCRIPT, '4', '1', '3300', '0', '12000', '0', '0'],
-            capture_output=True, timeout=10,
-        )
-        if r.returncode != 0:
-            log.warning(f"[POR] PowerOnAll 오류 (rc={r.returncode}): "
-                        f"{r.stderr.decode(errors='replace').strip()}")
+        _on_cmd = ['python3', _PMU_SCRIPT, '4', '1', '3300', '0', '12000', '0', '0']
+        log.warning(f"[POR] CMD: {' '.join(_on_cmd)}")
+        r = subprocess.run(_on_cmd, capture_output=True, timeout=10)
+        log.warning(f"[POR] PowerOnAll rc={r.returncode} "
+                    f"stdout={r.stdout.decode(errors='replace').strip()!r} "
+                    f"stderr={r.stderr.decode(errors='replace').strip()!r}")
         log.warning(f"[POR] 전원 ON — {self.config.por_boot_wait:.1f}초 부팅 대기...")
         time.sleep(self.config.por_boot_wait)
 
