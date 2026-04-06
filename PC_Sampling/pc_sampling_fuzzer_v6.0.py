@@ -4094,38 +4094,55 @@ class NVMeFuzzer:
             stuck_pcs = []
         else:
             log.warning("[TIMEOUT] 인프라 정상 — SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
-            stuck_pcs = self.sampler.read_stuck_pcs(count=20)
+            stuck_pcs = self.sampler.read_stuck_pcs(count=50)
 
         if stuck_pcs:
             pc_counts = Counter(stuck_pcs)
-            most_common_pc, _ = pc_counts.most_common(1)[0]
+            most_common_pc, most_common_cnt = pc_counts.most_common(1)[0]
             unique_stuck = set(stuck_pcs)
+            total_samples = len(stuck_pcs)
+            top_ratio = most_common_cnt / total_samples
+            idle_pcs = self.sampler.idle_pcs
+
+            # idle_pcs와 교차 확인
+            stuck_in_idle  = unique_stuck & idle_pcs
+            stuck_non_idle = unique_stuck - idle_pcs
+            all_in_idle    = len(stuck_non_idle) == 0
 
             log.error(
                 f"[TIMEOUT CRASH] {cmd.name} "
                 f"actual_opcode=0x{actual_opcode:02x} "
                 f"timeout_group={cmd.timeout_group}")
             log.error(
-                f"  Stuck PCs ({len(stuck_pcs)} samples, "
-                f"{len(unique_stuck)} unique):")
+                f"  Stuck PCs ({total_samples} samples, "
+                f"{len(unique_stuck)} unique / "
+                f"idle={len(stuck_in_idle)} non-idle={len(stuck_non_idle)}):")
             for pc, cnt in pc_counts.most_common(5):
                 in_range = " [IN RANGE]" if self.sampler._in_range(pc) else " [OUT]"
+                is_idle  = " [IDLE]" if pc in idle_pcs else " [NON-IDLE]"
                 log.error(
-                    f"    {hex(pc)}: {cnt}/{len(stuck_pcs)} "
-                    f"({100*cnt/len(stuck_pcs):.0f}%){in_range}")
+                    f"    {hex(pc)}: {cnt}/{total_samples} "
+                    f"({100*cnt/total_samples:.0f}%){in_range}{is_idle}")
 
-            if len(unique_stuck) == 1:
+            # 판단: 비율 기반 + idle 교차
+            if all_in_idle:
                 log.error(
-                    f"  → 펌웨어가 {hex(most_common_pc)}에서 "
-                    f"완전히 멈춤 (hang/deadlock)")
-            elif len(unique_stuck) <= 3:
+                    f"  → 관측된 PC가 모두 idle 유니버스 내 — "
+                    f"펌웨어 정상 동작 중 (timeout은 HW/인프라 문제 가능성)")
+            elif top_ratio >= 0.70:
+                idle_tag = " (idle 주소)" if most_common_pc in idle_pcs else " (비idle 주소 — hang 확실)"
                 log.error(
-                    f"  → 펌웨어가 {len(unique_stuck)}개 주소에서 "
-                    f"루프 중 (에러 핸들링 또는 busy-wait)")
+                    f"  → 최빈 PC {hex(most_common_pc)} 집중도 {top_ratio:.0%}{idle_tag}")
+                log.error(
+                    f"  → 펌웨어 hang/deadlock 가능성 높음")
+            elif top_ratio >= 0.40:
+                log.error(
+                    f"  → 최빈 PC {hex(most_common_pc)} 집중도 {top_ratio:.0%} — "
+                    f"busy-wait 또는 에러 핸들링 루프")
             else:
                 log.error(
-                    f"  → 펌웨어가 {len(unique_stuck)}개 주소를 "
-                    f"순회 중 (복구 루틴 진행 중일 수 있음)")
+                    f"  → PC 분산 (최빈 {top_ratio:.0%}) — "
+                    f"복구 루틴 진행 중이거나 정상 동작에 근접")
         else:
             log.error(
                 f"[TIMEOUT CRASH] {cmd.name} "
