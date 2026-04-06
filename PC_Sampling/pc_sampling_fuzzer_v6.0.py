@@ -333,6 +333,11 @@ _PS_SETTLE_FALLBACK: dict[int, float] = {0: 0.05, 1: 0.05, 2: 0.05, 3: 0.5, 4: 2
 # PMU 스크립트 절대경로 — subprocess CWD와 무관하게 항상 올바른 파일 사용
 _PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.py')
 
+# POR (Power-On Reset) 설정
+ENABLE_POR        = True   # 퍼저 시작 시 SSD 전원 사이클 수행
+POR_POWEROFF_WAIT = 3.0    # 전원 OFF 후 방전 대기 (초)
+POR_BOOT_WAIT     = 8.0    # 전원 ON 후 부팅 완료 대기 (초)
+
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
 # 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
 DIAGNOSE_STABILITY  = 100   # 새 idle PC 없이 연속 N회면 수렴으로 판정 (v5.2 수준 복원)
@@ -495,6 +500,11 @@ class FuzzConfig:
     diagnose_sample_ms: int = DIAGNOSE_SAMPLE_MS
 
     calibration_runs: int = CALIBRATION_RUNS
+
+    # POR
+    enable_por:        bool  = ENABLE_POR
+    por_poweroff_wait: float = POR_POWEROFF_WAIT
+    por_boot_wait:     float = POR_BOOT_WAIT
 
     # v4.5+: Corpus 하드 상한 (0 = 무제한)
     max_corpus_hard_limit: int = MAX_CORPUS_HARD_LIMIT
@@ -1614,6 +1624,72 @@ class NVMeFuzzer:
         else:
             log.warning(f"[SMART] smart-log 실패 (rc={proc.returncode}): "
                         f"{stderr_data.decode(errors='replace').strip()}")
+
+    def _power_cycle_ssd(self) -> bool:
+        """PMU 보드를 이용한 SSD POR (Power-On Reset).
+
+        순서: PCIe 제거 → 전원 OFF → 방전 대기 → 전원 ON → 부팅 대기
+              → PCIe rescan → NVMe id-ctrl 확인
+        """
+        if not os.path.isfile(_PMU_SCRIPT):
+            log.error(f"[POR] PMU 스크립트 없음: {_PMU_SCRIPT} — POR 스킵")
+            return False
+
+        log.warning("[POR] SSD 전원 사이클 시작...")
+
+        # 1. PCIe 장치 제거 (커널이 사라진 장치에 접근하는 것 방지)
+        if self._pcie_bdf:
+            remove_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/remove"
+            try:
+                with open(remove_path, 'w') as f:
+                    f.write('1')
+                log.warning(f"[POR] PCIe 장치 제거: {self._pcie_bdf}")
+            except Exception as e:
+                log.warning(f"[POR] PCIe 장치 제거 실패 (무시): {e}")
+
+        # 2. 전원 OFF
+        r = subprocess.run(
+            ['python3', _PMU_SCRIPT, '7', '1'],
+            capture_output=True, timeout=5,
+        )
+        if r.returncode != 0:
+            log.warning(f"[POR] PowerOffAll 오류 (rc={r.returncode}): "
+                        f"{r.stderr.decode(errors='replace').strip()}")
+        log.warning(f"[POR] 전원 OFF — {self.config.por_poweroff_wait:.1f}초 방전 대기...")
+        time.sleep(self.config.por_poweroff_wait)
+
+        # 3. 전원 ON
+        r = subprocess.run(
+            ['python3', _PMU_SCRIPT, '4', '1', '3300', '12000', '0', '0'],
+            capture_output=True, timeout=10,
+        )
+        if r.returncode != 0:
+            log.warning(f"[POR] PowerOnAll 오류 (rc={r.returncode}): "
+                        f"{r.stderr.decode(errors='replace').strip()}")
+        log.warning(f"[POR] 전원 ON — {self.config.por_boot_wait:.1f}초 부팅 대기...")
+        time.sleep(self.config.por_boot_wait)
+
+        # 4. PCIe rescan
+        try:
+            with open('/sys/bus/pci/rescan', 'w') as f:
+                f.write('1')
+            log.warning("[POR] PCIe rescan 완료")
+            time.sleep(1.5)
+        except Exception as e:
+            log.warning(f"[POR] PCIe rescan 실패: {e}")
+
+        # 5. NVMe 장치 응답 확인
+        r = subprocess.run(
+            ['nvme', 'id-ctrl', self.config.nvme_device],
+            capture_output=True, timeout=10,
+        )
+        if r.returncode == 0:
+            log.warning(f"[POR] NVMe 장치 응답 확인: {self.config.nvme_device} ✓")
+            return True
+
+        log.error(f"[POR] NVMe 장치 미응답 — 부팅 대기 부족 가능성 "
+                  f"(--por-boot-wait 값을 늘려보세요)")
+        return False
 
     def _setup_directories(self):
         self.crashes_dir.mkdir(parents=True, exist_ok=True)
@@ -5243,6 +5319,18 @@ class NVMeFuzzer:
         if self.config.resume_coverage:
             self.sampler.load_coverage(self.config.resume_coverage)
 
+        # POR: OpenOCD 연결 전에 SSD 전원 사이클 수행
+        # (이전 실행의 디버그 도메인 전원이 SSD PM 상태에 영향을 줄 수 있음)
+        if self.config.enable_por:
+            if self._pcie_bdf is None:
+                # PCIe BDF가 아직 감지되지 않은 경우 먼저 감지 시도
+                self._detect_pcie_info()
+            por_ok = self._power_cycle_ssd()
+            if not por_ok:
+                log.warning("[POR] 전원 사이클 실패 — 계속 진행하지만 상태가 불안정할 수 있습니다")
+        else:
+            log.info("[POR] 비활성화됨 (--no-por)")
+
         if not self.sampler.connect():
             log.error("J-Link connection failed, aborting")
             return
@@ -5954,6 +6042,12 @@ if __name__ == "__main__":
                         help=f'PM 로테이션 활성화: {PM_ROTATE_INTERVAL}명령마다 PS0→PS1→PS2→PS3→PS4 순환. '
                              f'PS1 timeout×{PS_TIMEOUT_MULT[1]}, PS2 timeout×{PS_TIMEOUT_MULT[2]}, '
                              f'PS3/PS4 Admin 명령만 허용')
+    parser.add_argument('--no-por', action='store_true', default=False,
+                        help='시작 시 SSD POR(전원 사이클) 건너뜀 (기본: POR 수행)')
+    parser.add_argument('--por-boot-wait', type=float, default=POR_BOOT_WAIT,
+                        help=f'POR 후 부팅 완료 대기 시간 (초, 기본={POR_BOOT_WAIT})')
+    parser.add_argument('--por-poweroff-wait', type=float, default=POR_POWEROFF_WAIT,
+                        help=f'POR 전원 OFF 후 방전 대기 시간 (초, 기본={POR_POWEROFF_WAIT})')
 
     args = parser.parse_args()
 
@@ -6059,6 +6153,10 @@ if __name__ == "__main__":
         # v5.1
         pm_inject_prob=1.0 if args.pm else 0.0,
         diagnose_sample_ms=args.diagnose_sleep_ms,
+        # v6.0 POR
+        enable_por=not args.no_por,
+        por_poweroff_wait=args.por_poweroff_wait,
+        por_boot_wait=args.por_boot_wait,
     )
 
     fuzzer = NVMeFuzzer(config)
