@@ -4315,18 +4315,15 @@ class NVMeFuzzer:
             f"(nvme_core admin/io_timeout 설정값)")
         log.error("")
 
-        # 6) PC 분석 완료 — OpenOCD 즉시 shutdown (J-Link USB 해제)
-        # 이후 수동 J-Link 연결이 필요하므로 퍼저가 종료되기 전에 먼저 해제
+        # 6) PC 분석 완료 — OpenOCD 프로세스 강제 종료 (shutdown 명령 없이)
+        # shutdown 명령을 보내면 OpenOCD가 CoreSight 디버그 도메인을 정상 해제하면서
+        # 펌웨어 상태가 변한다 (리셋/에러핸들러로 전환).
+        # SIGKILL로 프로세스만 죽이면 OS가 USB FD를 해제해 J-Link 재연결 가능하고,
+        # 디버그 파워 레지스터(0x30313f30) 값은 그대로 유지되어 hang 상태가 보존된다.
         if self.sampler._openocd_alive():
-            try:
-                if self.sampler._sock:
-                    self.sampler._sock.sendall(b'shutdown\n')
-                import time as _t; _t.sleep(0.5)
-            except Exception:
-                pass
             self.sampler._close_telnet()
             self.sampler._terminate_proc()
-            log.warning("[TIMEOUT] OpenOCD shutdown 완료 — J-Link를 즉시 사용할 수 있습니다.")
+            log.warning("[TIMEOUT] OpenOCD 종료 완료 — J-Link로 hang 지점을 즉시 확인할 수 있습니다.")
 
         # 7) 플래그 설정 — caller가 break로 루프 탈출
         self._timeout_crash = True
