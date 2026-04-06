@@ -4317,15 +4317,22 @@ class NVMeFuzzer:
             f"(nvme_core admin/io_timeout 설정값)")
         log.error("")
 
-        # 6) PC 분석 완료 — OpenOCD 프로세스 강제 종료 (shutdown 명령 없이)
-        # shutdown 명령을 보내면 OpenOCD가 CoreSight 디버그 도메인을 정상 해제하면서
-        # 펌웨어 상태가 변한다 (리셋/에러핸들러로 전환).
-        # SIGKILL로 프로세스만 죽이면 OS가 USB FD를 해제해 J-Link 재연결 가능하고,
-        # 디버그 파워 레지스터(0x30313f30) 값은 그대로 유지되어 hang 상태가 보존된다.
+        # 6) PC 분석 완료 — OpenOCD를 종료하지 않고 telnet만 닫아 hang 상태 보존
+        # OpenOCD kill(SIGKILL) 시 J-Link 하드웨어가 USB 연결 끊김을 감지하고
+        # nSRST를 assert할 수 있어 SSD가 리셋되고 펌웨어가 리셋 벡터로 점프한다.
+        # OpenOCD를 살려둔 채 telnet 소켓만 닫으면 J-Link가 JTAG 연결을 유지하므로
+        # 펌웨어 hang 상태가 그대로 보존된다.
+        # hang PC 확인: OpenOCD telnet(port 4444)에 직접 접속해서 확인.
+        # 확인 완료 후 수동으로 'sudo pkill openocd' 실행.
         if self.sampler._openocd_alive():
             self.sampler._close_telnet()
-            self.sampler._terminate_proc()
-            log.warning("[TIMEOUT] OpenOCD 종료 완료 — J-Link로 hang 지점을 즉시 확인할 수 있습니다.")
+            _ocd_port = self.config.openocd_port
+            log.warning("[TIMEOUT] OpenOCD를 종료하지 않고 유지합니다 — hang 상태 보존")
+            log.warning(f"[TIMEOUT] hang PC 확인 방법:")
+            log.warning(f"[TIMEOUT]   telnet 127.0.0.1 {_ocd_port}")
+            log.warning(f"[TIMEOUT]   > halt")
+            log.warning(f"[TIMEOUT]   > reg pc")
+            log.warning(f"[TIMEOUT] 확인 완료 후: sudo pkill openocd")
 
         # 7) 플래그 설정 — caller가 break로 루프 탈출
         self._timeout_crash = True
