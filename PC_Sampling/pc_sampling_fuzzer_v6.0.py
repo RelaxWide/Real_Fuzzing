@@ -4077,16 +4077,23 @@ class NVMeFuzzer:
 
         # 1) 디버그 인프라 상태 확인 후 stuck PC 읽기
         # OpenOCD/J-Link 문제면 stuck PC를 읽을 수 없어 펌웨어 hang 판단 불가
+        _nvme_dev = self.config.nvme_device
         log.warning("[TIMEOUT] 디버그 인프라 상태 확인 중...")
         _infra_ok = self.sampler._reinit_target()
-        if not _infra_ok and not self.sampler._openocd_alive():
-            log.error("[TIMEOUT] OpenOCD/J-Link 연결 불가 — "
-                      "인프라 문제로 펌웨어 hang 여부 판단 불가 (timeout이 실제 crash인지 미확정)")
+        if not _infra_ok:
+            log.error("[TIMEOUT] 디버그 인프라 접근 불가 — 펌웨어 hang 여부 자동 판단 불가")
+            log.error("[TIMEOUT] ── 수동 확인 절차 ──────────────────────────────────")
+            log.error(f"[TIMEOUT]  1) sudo pkill -9 openocd")
+            log.error(f"[TIMEOUT]  2) nvme id-ctrl {_nvme_dev}")
+            log.error(f"[TIMEOUT]     응답 있음  → SSD 생존 (인프라 문제였을 가능성)")
+            log.error(f"[TIMEOUT]     응답 없음  → SSD 사망 (펌웨어 crash 가능성)")
+            log.error(f"[TIMEOUT]  3) J-Link 재연결 후 PC 확인:")
+            log.error(f"[TIMEOUT]     같은 PC 반복 → 펌웨어 hang 확정")
+            log.error(f"[TIMEOUT]     PC 변화 중  → 인프라 문제였음")
+            log.error("[TIMEOUT] ────────────────────────────────────────────────────")
             stuck_pcs = []
         else:
-            if not _infra_ok:
-                log.warning("[TIMEOUT] 타겟 재초기화 실패 — stuck PC 읽기 신뢰도 낮음")
-            log.warning("[TIMEOUT] SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
+            log.warning("[TIMEOUT] 인프라 정상 — SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
             stuck_pcs = self.sampler.read_stuck_pcs(count=20)
 
         if stuck_pcs:
