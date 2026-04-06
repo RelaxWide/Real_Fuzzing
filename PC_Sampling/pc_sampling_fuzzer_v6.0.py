@@ -5551,12 +5551,12 @@ class NVMeFuzzer:
                 if self.executions % 1000 == 0 and self.executions > 0:
                     self._cull_corpus()
                     self._mopt_update_phase()
-                    # J-Link 연결 상태 확인
-                    test_pc = self.sampler._read_pc()
-                    if test_pc is None:
-                        log.error("[J-Link] heartbeat 실패 — JTAG 연결이 끊어진 것 같습니다.")
-                        log.error("  USB 케이블/J-Link 상태를 확인하세요.")
-                        break
+                    # OpenOCD 연결 상태 확인
+                    if not self.sampler._openocd_alive():
+                        log.error("[OpenOCD] heartbeat 실패 — OpenOCD 프로세스가 종료됐습니다.")
+                        if not self.sampler._reconnect():
+                            log.error("  재시작 실패. USB 케이블/J-Link 상태를 확인하세요.")
+                            break
 
                 # 주기적 그래프 갱신 (CFG/graphviz 제외 — 빠른 차트만)
                 if (self.executions % GRAPH_REFRESH_INTERVAL == 0
