@@ -629,7 +629,8 @@ class OpenOCDPCSampler:
         self.global_coverage: Set[int] = set()
         self.current_trace:   Set[int] = set()
 
-        self.stop_event   = threading.Event()
+        self.stop_event    = threading.Event()
+        self.openocd_error = threading.Event()  # 연속 실패로 샘플링 불가 → 메인 루프에 통보
         self.sample_thread: Optional[threading.Thread] = None
         self.total_samples    = 0
         self.interesting_inputs = 0
@@ -977,6 +978,9 @@ class OpenOCDPCSampler:
         """crash/timeout 후 SSD 펌웨어 위치를 반복 샘플링.
         PCSR 방식: halt 없이 읽으므로 펌웨어 동작에 무관.
         동일 PC 반복 → hang (무한루프/대기), 다른 PC → 에러 핸들링 루프."""
+        if not self._openocd_alive():
+            log.warning("[OpenOCD] 프로세스 없음 — stuck PC 읽기 스킵")
+            return []
         pcs = []
         for _ in range(count):
             result = self._read_all_pcs()
@@ -1038,6 +1042,7 @@ class OpenOCDPCSampler:
                 if _consecutive_fail >= self._CONSECUTIVE_FAIL_LIMIT:
                     log.error(f"[OpenOCD] PCSR read 연속 {_consecutive_fail}회 실패 — 샘플링 중단")
                     self.stop_event.set()
+                    self.openocd_error.set()
                     break
                 if effective_interval > 0:
                     time.sleep(effective_interval)
@@ -5424,6 +5429,15 @@ class NVMeFuzzer:
                     rc = self._send_nvme_command(fuzz_data, mutated_seed,
                                                  timeout_mult=_timeout_mult)
                     last_samples = self.sampler.stop_sampling()
+
+                # OpenOCD 연속 실패 감지 → 재시작 시도, 실패 시 퍼저 종료
+                if self.sampler.openocd_error.is_set():
+                    self.sampler.openocd_error.clear()
+                    log.warning("[OpenOCD] 연결 오류 감지 — 재시작 시도...")
+                    if not self.sampler._reconnect():
+                        log.error("[OpenOCD] 재시작 실패 — 퍼저를 종료합니다.")
+                        break
+                    log.warning("[OpenOCD] 재시작 성공 — 퍼징 재개")
 
                 self.executions += 1
                 track_key = self._tracking_label(cmd, mutated_seed)
