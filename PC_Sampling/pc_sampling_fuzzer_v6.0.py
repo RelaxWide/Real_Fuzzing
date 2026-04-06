@@ -1805,14 +1805,16 @@ class NVMeFuzzer:
                 # 알 수 없는 명령어는 기본 시드
                 seeds.append(Seed(data=b'\x00' * 64, cmd=cmd, found_at=0))
 
-        # Read / Write 시드를 corpus 앞으로 — I/O 위주 커버리지 우선 수집
-        _IO_PRIORITY = {"Read", "Write"}
-        io_seeds    = [s for s in seeds if s.cmd.name in _IO_PRIORITY]
-        other_seeds = [s for s in seeds if s.cmd.name not in _IO_PRIORITY]
+        # Write → Read 순서로 corpus 앞에 배치 — I/O 위주 커버리지 우선 수집
+        _IO_ORDER = ["Write", "Read"]
+        write_seeds = [s for s in seeds if s.cmd.name == "Write"]
+        read_seeds  = [s for s in seeds if s.cmd.name == "Read"]
+        other_seeds = [s for s in seeds if s.cmd.name not in {"Write", "Read"}]
+        io_seeds = write_seeds + read_seeds
         seeds = io_seeds + other_seeds
         if io_seeds:
-            log.info(f"[Seed] I/O 우선 정렬: Read/Write {len(io_seeds)}개 → 앞, "
-                     f"나머지 {len(other_seeds)}개 → 뒤 (총 {len(seeds)}개)")
+            log.info(f"[Seed] I/O 우선 정렬: Write {len(write_seeds)}개 → Read {len(read_seeds)}개 → "
+                     f"나머지 {len(other_seeds)}개 (총 {len(seeds)}개)")
 
         return seeds
 
