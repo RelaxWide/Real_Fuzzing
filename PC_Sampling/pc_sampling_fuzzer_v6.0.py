@@ -1233,6 +1233,14 @@ class OpenOCDPCSampler:
         self.stop_event.set()
         if self.sample_thread:
             self.sample_thread.join(timeout=2.0)
+        # OpenOCD shutdown 명령으로 USB 정상 해제 (kill보다 먼저)
+        # 'shutdown' 없이 kill하면 libjaylink가 USB를 잠근 채 종료 → J-Link 재연결 필요
+        if self._sock and self._openocd_alive():
+            try:
+                self._sock.sendall(b'shutdown\n')
+                time.sleep(0.5)   # OpenOCD가 USB 해제하고 종료할 시간
+            except Exception:
+                pass
         self._close_telnet()
         self._terminate_proc()
 
@@ -4067,9 +4075,19 @@ class NVMeFuzzer:
         actual_opcode = (seed.opcode_override if seed.opcode_override is not None
                          else cmd.opcode)
 
-        # 1) stuck PC 읽기
-        log.warning("[TIMEOUT] SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
-        stuck_pcs = self.sampler.read_stuck_pcs(count=20)
+        # 1) 디버그 인프라 상태 확인 후 stuck PC 읽기
+        # OpenOCD/J-Link 문제면 stuck PC를 읽을 수 없어 펌웨어 hang 판단 불가
+        log.warning("[TIMEOUT] 디버그 인프라 상태 확인 중...")
+        _infra_ok = self.sampler._reinit_target()
+        if not _infra_ok and not self.sampler._openocd_alive():
+            log.error("[TIMEOUT] OpenOCD/J-Link 연결 불가 — "
+                      "인프라 문제로 펌웨어 hang 여부 판단 불가 (timeout이 실제 crash인지 미확정)")
+            stuck_pcs = []
+        else:
+            if not _infra_ok:
+                log.warning("[TIMEOUT] 타겟 재초기화 실패 — stuck PC 읽기 신뢰도 낮음")
+            log.warning("[TIMEOUT] SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
+            stuck_pcs = self.sampler.read_stuck_pcs(count=20)
 
         if stuck_pcs:
             pc_counts = Counter(stuck_pcs)
