@@ -997,20 +997,20 @@ class OpenOCDPCSampler:
     # Module 5: read_stuck_pcs
     # ------------------------------------------------------------------
 
-    def read_stuck_pcs(self, count: int = 10) -> List[int]:
+    def read_stuck_pcs(self, count: int = 10) -> List[Tuple[int, int, int]]:
         """crash/timeout 후 SSD 펌웨어 위치를 반복 샘플링.
         PCSR 방식: halt 없이 읽으므로 펌웨어 동작에 무관.
-        동일 PC 반복 → hang (무한루프/대기), 다른 PC → 에러 핸들링 루프."""
+        반환값: [(core0_pc, core1_pc, core2_pc), ...] — 코어 구분 보존."""
         if not self._openocd_alive():
             log.warning("[OpenOCD] 프로세스 없음 — stuck PC 읽기 스킵")
             return []
-        pcs = []
+        samples = []
         for _ in range(count):
             result = self._read_all_pcs()
             if result:
-                pcs.extend(result)
+                samples.append(result)
             time.sleep(0.05)
-        return pcs
+        return samples
 
     def _in_range(self, pc: int) -> bool:
         """PC가 펌웨어 주소 범위 내인지 확인"""
@@ -4097,52 +4097,46 @@ class NVMeFuzzer:
             stuck_pcs = self.sampler.read_stuck_pcs(count=50)
 
         if stuck_pcs:
-            pc_counts = Counter(stuck_pcs)
-            most_common_pc, most_common_cnt = pc_counts.most_common(1)[0]
-            unique_stuck = set(stuck_pcs)
-            total_samples = len(stuck_pcs)
-            top_ratio = most_common_cnt / total_samples
-            idle_pcs = self.sampler.idle_pcs
+            idle_pcs    = self.sampler.idle_pcs
+            n_samples   = len(stuck_pcs)
 
-            # idle_pcs와 교차 확인
-            stuck_in_idle  = unique_stuck & idle_pcs
-            stuck_non_idle = unique_stuck - idle_pcs
-            all_in_idle    = len(stuck_non_idle) == 0
+            # 코어별 Counter 분리 (튜플 인덱스 0=Core0, 1=Core1, 2=Core2)
+            core_counters = [Counter(t[i] for t in stuck_pcs) for i in range(3)]
 
             log.error(
                 f"[TIMEOUT CRASH] {cmd.name} "
                 f"actual_opcode=0x{actual_opcode:02x} "
-                f"timeout_group={cmd.timeout_group}")
-            log.error(
-                f"  Stuck PCs ({total_samples} samples, "
-                f"{len(unique_stuck)} unique / "
-                f"idle={len(stuck_in_idle)} non-idle={len(stuck_non_idle)}):")
-            for pc, cnt in pc_counts.most_common(5):
-                in_range = " [IN RANGE]" if self.sampler._in_range(pc) else " [OUT]"
-                is_idle  = " [IDLE]" if pc in idle_pcs else " [NON-IDLE]"
-                log.error(
-                    f"    {hex(pc)}: {cnt}/{total_samples} "
-                    f"({100*cnt/total_samples:.0f}%){in_range}{is_idle}")
+                f"timeout_group={cmd.timeout_group} "
+                f"({n_samples} samples)")
 
-            # 판단: 비율 기반 + idle 교차
-            if all_in_idle:
-                log.error(
-                    f"  → 관측된 PC가 모두 idle 유니버스 내 — "
-                    f"펌웨어 정상 동작 중 (timeout은 HW/인프라 문제 가능성)")
-            elif top_ratio >= 0.70:
-                idle_tag = " (idle 주소)" if most_common_pc in idle_pcs else " (비idle 주소 — hang 확실)"
-                log.error(
-                    f"  → 최빈 PC {hex(most_common_pc)} 집중도 {top_ratio:.0%}{idle_tag}")
-                log.error(
-                    f"  → 펌웨어 hang/deadlock 가능성 높음")
-            elif top_ratio >= 0.40:
-                log.error(
-                    f"  → 최빈 PC {hex(most_common_pc)} 집중도 {top_ratio:.0%} — "
-                    f"busy-wait 또는 에러 핸들링 루프")
-            else:
-                log.error(
-                    f"  → PC 분산 (최빈 {top_ratio:.0%}) — "
-                    f"복구 루틴 진행 중이거나 정상 동작에 근접")
+            core_verdicts = []
+            for core_idx, cc in enumerate(core_counters):
+                if not cc:
+                    continue
+                top_pc, top_cnt = cc.most_common(1)[0]
+                top_ratio  = top_cnt / n_samples
+                unique_pcs = set(cc.keys())
+                non_idle   = unique_pcs - idle_pcs
+
+                log.error(f"  [Core{core_idx}] {len(unique_pcs)} unique PCs "
+                          f"(non-idle={len(non_idle)}):")
+                for pc, cnt in cc.most_common(3):
+                    in_range = " [IN RANGE]" if self.sampler._in_range(pc) else " [OUT]"
+                    idle_tag = " [IDLE]" if pc in idle_pcs else " [NON-IDLE]"
+                    log.error(f"    {hex(pc)}: {cnt}/{n_samples} "
+                              f"({100*cnt/n_samples:.0f}%){in_range}{idle_tag}")
+
+                # 코어별 판정
+                if len(non_idle) == 0:
+                    verdict = "정상 idle"
+                elif top_ratio >= 0.70 and top_pc not in idle_pcs:
+                    verdict = f"HANG — {hex(top_pc)} 집중도 {top_ratio:.0%}"
+                elif top_ratio >= 0.40:
+                    verdict = f"busy-wait/에러루프 — {hex(top_pc)} {top_ratio:.0%}"
+                else:
+                    verdict = f"PC 분산 ({top_ratio:.0%}) — 복구 중 또는 정상"
+                log.error(f"  [Core{core_idx}] 판정: {verdict}")
+                core_verdicts.append((core_idx, verdict))
         else:
             log.error(
                 f"[TIMEOUT CRASH] {cmd.name} "
