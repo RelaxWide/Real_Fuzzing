@@ -1660,7 +1660,7 @@ class NVMeFuzzer:
 
         # 3. 전원 ON
         r = subprocess.run(
-            ['python3', _PMU_SCRIPT, '4', '1', '3300', '12000', '0', '0'],
+            ['python3', _PMU_SCRIPT, '4', '1', '3300', '0', '12000', '0', '0'],
             capture_output=True, timeout=10,
         )
         if r.returncode != 0:
