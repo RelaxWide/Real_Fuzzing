@@ -4303,9 +4303,6 @@ class NVMeFuzzer:
         log.error(
             "  SSD 펌웨어를 resume 상태로 유지합니다. "
             "(halt하지 않음 — 불량 현상 보존)")
-        log.error(
-            "  J-Link 디버거로 연결하여 현재 상태를 "
-            "관찰할 수 있습니다.")
 
         # 5) nvme-cli PID 기록
         log.error("")
