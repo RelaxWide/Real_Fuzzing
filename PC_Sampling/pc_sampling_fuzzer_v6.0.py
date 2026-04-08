@@ -4177,7 +4177,7 @@ class NVMeFuzzer:
             stuck_pcs = []
         else:
             log.warning("[TIMEOUT] 인프라 정상 — SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
-            stuck_pcs = self.sampler.read_stuck_pcs(count=50)
+            stuck_pcs = self.sampler.read_stuck_pcs(count=100)
 
         if stuck_pcs:
             idle_pcs    = self.sampler.idle_pcs
@@ -4324,22 +4324,12 @@ class NVMeFuzzer:
             f"(nvme_core admin/io_timeout 설정값)")
         log.error("")
 
-        # 6) PC 분석 완료 — OpenOCD를 종료하지 않고 telnet만 닫아 hang 상태 보존
-        # OpenOCD kill(SIGKILL) 시 J-Link 하드웨어가 USB 연결 끊김을 감지하고
-        # nSRST를 assert할 수 있어 SSD가 리셋되고 펌웨어가 리셋 벡터로 점프한다.
-        # OpenOCD를 살려둔 채 telnet 소켓만 닫으면 J-Link가 JTAG 연결을 유지하므로
-        # 펌웨어 hang 상태가 그대로 보존된다.
-        # hang PC 확인: OpenOCD telnet(port 4444)에 직접 접속해서 확인.
-        # 확인 완료 후 수동으로 'sudo pkill openocd' 실행.
+        # 6) PC 분석 완료 — OpenOCD + telnet 유지 (hang 상태 보존)
+        # run()의 모니터링 루프에서 10초 간격으로 PC를 계속 찍기 위해
+        # 여기서는 telnet을 닫지 않는다. OpenOCD kill 시 J-Link가 nSRST를
+        # assert할 수 있어 펌웨어 상태가 바뀌므로 OpenOCD도 종료하지 않는다.
         if self.sampler._openocd_alive():
-            self.sampler._close_telnet()
-            _ocd_port = self.config.openocd_port
-            log.warning("[TIMEOUT] OpenOCD를 종료하지 않고 유지합니다 — hang 상태 보존")
-            log.warning(f"[TIMEOUT] hang PC 확인 방법:")
-            log.warning(f"[TIMEOUT]   telnet 127.0.0.1 {_ocd_port}")
-            log.warning(f"[TIMEOUT]   > halt")
-            log.warning(f"[TIMEOUT]   > reg pc")
-            log.warning(f"[TIMEOUT] 확인 완료 후: sudo pkill openocd")
+            log.warning("[TIMEOUT] OpenOCD + telnet 유지 — 시각화 후 PC 모니터링 진입")
 
         # 7) 플래그 설정 — caller가 break로 루프 탈출
         self._timeout_crash = True
@@ -5952,11 +5942,45 @@ class NVMeFuzzer:
             except Exception:
                 pass
 
-            # SSD 펌웨어가 resume 상태로 계속 동작하도록 유지
+            # timeout crash: PC 모니터링 루프 (10초 간격, Ctrl+C로 종료)
+            # OpenOCD는 종료하지 않아 hang 상태 보존. 다음 실행 시 자동 정리됨.
             if self._timeout_crash:
-                log.warning(
-                    "[J-Link] timeout crash 상태이므로 J-Link 연결을 "
-                    "유지합니다. SSD 펌웨어는 resume 상태로 동작 중입니다.")
+                _ocd_port = self.config.openocd_port
+                log.warning("[MONITOR] PC 모니터링 시작 (10초 간격)")
+                log.warning("[MONITOR] Ctrl+C → 모니터링 종료 (OpenOCD는 유지됨)")
+                log.warning(f"[MONITOR] 다음 실행 시 OpenOCD 자동 정리 (port {_ocd_port})")
+
+                import threading as _threading
+                _monitor_stop = _threading.Event()
+
+                def _sigint_monitor(sig, frame):
+                    _monitor_stop.set()
+
+                try:
+                    _signal.signal(_signal.SIGINT, _sigint_monitor)
+                except Exception:
+                    pass
+
+                idle_pcs = self.sampler.idle_pcs
+                while not _monitor_stop.is_set():
+                    if self.sampler._openocd_alive() and self.sampler._sock:
+                        result = self.sampler._read_all_pcs()
+                        if result:
+                            tags = []
+                            for i, pc in enumerate(result):
+                                idle_tag = "[IDLE]" if pc in idle_pcs else "[NON-IDLE]"
+                                tags.append(f"Core{i}={hex(pc)}{idle_tag}")
+                            log.warning("[MONITOR] " + "  ".join(tags))
+                        else:
+                            log.warning("[MONITOR] PCSR 읽기 실패")
+                    else:
+                        log.warning("[MONITOR] OpenOCD 연결 끊김")
+                        break
+                    _monitor_stop.wait(10.0)
+
+                # 루프 종료 — telnet만 닫고 OpenOCD는 유지
+                self.sampler._close_telnet()
+                log.warning("[MONITOR] 모니터링 종료 — OpenOCD 유지 중 (sudo pkill openocd 로 수동 종료)")
             else:
                 try:
                     self.sampler.close()
