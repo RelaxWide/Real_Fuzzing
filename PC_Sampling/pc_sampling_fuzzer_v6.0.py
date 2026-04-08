@@ -953,15 +953,19 @@ class OpenOCDPCSampler:
             return False
 
         # 2단계: 수렴 기반 adaptive 샘플링
+        # 수렴 조건: stability회 연속 새 PC 없음 AND 최소 min_samples 이상 수집
+        # min_samples 보장 이유: 주기적 IRQ 핸들러가 stability 간격보다 긴 주기로 뜨면
+        # 조기 수렴으로 해당 PC가 idle_pcs에서 누락됨
+        min_samples = max(stability * 3, 500)  # 최소 보장 샘플 수
         idle_universe: Set[int] = set(pcs_initial)
         consecutive_no_new = 0
         total = initial
         consecutive_failures = 0
 
         log.warning(f"[Diagnose] 초기 {initial}회 완료, unique PCs={len(idle_universe)}. "
-                    f"idle 유니버스 수렴 샘플링 시작...")
+                    f"idle 유니버스 수렴 샘플링 시작 (최소 {min_samples}회 보장)...")
 
-        while consecutive_no_new < stability and total < max_samples:
+        while total < max_samples:
             result = self._read_all_pcs()
             total += 1
             if result is not None:
@@ -984,6 +988,9 @@ class OpenOCDPCSampler:
                                 f"— OpenOCD 연결 불안정 가능성")
             if _diag_sleep > 0:
                 time.sleep(_diag_sleep)
+            # 수렴: stability 연속 AND 최소 샘플 수 충족
+            if consecutive_no_new >= stability and total >= min_samples:
+                break
 
         if consecutive_no_new >= stability:
             log.warning(f"[Diagnose] idle 유니버스 수렴 완료: "
