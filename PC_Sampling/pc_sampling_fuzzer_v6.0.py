@@ -341,7 +341,7 @@ POR_BOOT_WAIT     = 8.0    # 전원 ON 후 부팅 완료 대기 (초)
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
 # 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
 DIAGNOSE_STABILITY  = 100   # 새 idle PC 없이 연속 N회면 수렴으로 판정 (v5.2 수준 복원)
-DIAGNOSE_MAX        = 5000  # 수렴 전 최대 샘플 수 (상한) (v5.2 수준 복원)
+DIAGNOSE_MAX        = 10000 # 수렴 전 최대 샘플 수 (상한)
 DIAGNOSE_SAMPLE_MS  = 10    # diagnose() 샘플 간격 (ms). --diagnose-sleep-ms로 조정 가능.
 
 IDLE_WINDOW_SIZE  = 30    # 슬라이딩 윈도우 크기 (최근 N개 PC 샘플)
