@@ -5999,11 +5999,13 @@ class NVMeFuzzer:
                     else:
                         log.warning("[MONITOR] OpenOCD 연결 끊김")
                         break
-                    _monitor_stop.wait(10.0)
+                    _monitor_stop.wait(30.0)
 
                 # 루프 종료 — telnet만 닫고 OpenOCD는 유지
                 self.sampler._close_telnet()
-                log.warning("[MONITOR] 모니터링 종료 — OpenOCD 유지 중 (sudo pkill openocd 로 수동 종료)")
+                _end_msg = "[MONITOR] 모니터링 종료 — OpenOCD 유지 중 (sudo pkill openocd 로 수동 종료)"
+                log.warning(_end_msg)
+                print(_end_msg, flush=True)
             else:
                 try:
                     self.sampler.close()
