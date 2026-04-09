@@ -20,8 +20,34 @@ v6.0 변경사항:
 - [Config] J-Link 관련 설정 제거, OpenOCD 설정 추가:
     제거: device_name, interface, jtag_speed, pc_reg_index, go_settle_ms
     추가: openocd_binary, openocd_config, openocd_host, openocd_port, openocd_timeout
-- [Reliability] OpenOCD 크래시 자동 재시작:
-    _openocd_alive() + _reconnect() — start_sampling() 진입 시 체크.
+- [Reliability] OpenOCD 2단계 복구:
+    _reinit_target(): OpenOCD 유지, _send_startup_tcl() 재전송 (빠른 복구).
+    _reconnect(): OpenOCD 재시작 (느린 복구). 두 단계 순차 시도.
+    openocd_error 이벤트로 샘플링 스레드→메인 루프 즉시 감지.
+- [Feature] POR (Power-On Reset): run() 시작 시 PMU 보드 전원 사이클.
+    _power_cycle_ssd(): PMU OFF(opcode 7) → 방전 대기 → ON(opcode 4) → PCIe rescan.
+    CLI: --no-por / --por-poweroff-wait / --por-boot-wait.
+    이유: 이전 실행의 디버그 도메인 파워가 SSD PM 상태에 영향을 줄 수 있음.
+- [Feature] timeout crash 분석 강화:
+    인프라 실패(OpenOCD) vs 펌웨어 hang 자동 구분.
+    _reinit_target() 성공 시: read_stuck_pcs(count=100) PCSR 샘플링.
+    코어별 Counter 분석: top_ratio≥70% → HANG, 40~70% → busy-wait,
+      <40% → 분산(복구 중). idle_pcs 교차 확인으로 정상 idle 구분.
+    인프라 실패 시: 수동 확인 절차(nvme id-ctrl, J-Link) 로그 출력.
+- [Feature] timeout crash 후 PC 모니터링 루프:
+    시각화 완료 후 10초 간격으로 Core0/1/2 PC + [IDLE]/[NON-IDLE] 태그 출력.
+    Ctrl+C → 루프만 종료, telnet 닫기. OpenOCD는 유지(hang 상태 보존).
+    이유: OpenOCD kill 시 J-Link가 nSRST assert → 펌웨어 상태 변경.
+    다음 실행 시 connect()의 _kill_stale_openocd()가 자동 정리.
+- [Feature] timeout crash 시 J-Link USB 정상 해제:
+    정상 종료 경로: close()에서 OpenOCD shutdown 명령 전송 후 종료.
+    crash 경로: OpenOCD 유지 (nSRST 방지), telnet만 닫음.
+- [Fix] idle_pcs 수집 신뢰도 개선:
+    DIAGNOSE_MAX: 5000 → 10000 (최대 100초).
+    수렴 조건에 min_samples = max(stability×3, 500) 최소 보장.
+    주기가 긴 IRQ 핸들러가 stability 간격보다 늦게 등장해도 누락 방지.
+- [Fix] 시드 순서: Write → Read 명시적 정렬 (set 순서 비결정성 제거).
+    FormatNVM / Sanitize 시드에서 제외 (파괴적 동작 방지).
 
 v5.6 변경사항:
 - [Viz] coverage_growth.png: X축에 wall-clock time 이중 축 추가
