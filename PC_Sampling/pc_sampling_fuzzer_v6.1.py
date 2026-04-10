@@ -1427,8 +1427,6 @@ class OpenOCDPCSampler:
         total = initial
         consecutive_failures = 0
         total_failures = 0
-        _REINIT_THRESHOLD = 20   # 연속 실패 이 횟수마다 debug power 재활성화 시도
-        _ABORT_THRESHOLD  = 100  # 누적 실패 이 횟수 초과 시 경고 (수렴 불가 가능성)
 
         log.warning(f"[Diagnose] 초기 {initial}회 완료, unique PCs={len(idle_universe)}. "
                     f"idle 유니버스 수렴 샘플링 시작 (최소 {min_samples}회 보장)...")
@@ -1452,14 +1450,6 @@ class OpenOCDPCSampler:
                 consecutive_failures += 1
                 total_failures += 1
                 consecutive_no_new += 1
-                if consecutive_failures % _REINIT_THRESHOLD == 0:
-                    log.warning(f"[Diagnose] PCSR read 연속 실패 {consecutive_failures}회 "
-                                f"— debug power 재활성화 시도...")
-                    self._send_startup_tcl()
-                if total_failures == _ABORT_THRESHOLD:
-                    log.error(f"[Diagnose] PCSR read 누적 실패 {total_failures}회 "
-                              f"(전체 {total}회 중 {total_failures/total*100:.0f}%). "
-                              f"J-Link SWD 연결 / r8_pcsr.cfg / debug power를 확인하세요.")
             if _diag_sleep > 0:
                 time.sleep(_diag_sleep)
             # 수렴: stability 연속 AND 최소 샘플 수 충족
