@@ -595,8 +595,6 @@ CMD_SCHEMAS: dict = {
         _F("CID",  10, 31, 16, _SL, max_val=0xFFFF),
     ]),
 
-    "AER": CmdSchema("AER", []),  # No CDW parameters
-
     "NamespaceAttachment": CmdSchema("NamespaceAttachment", [
         # SEL=0 only (Attach). Detach=1 is excluded.
         _F("SEL", 10, 3, 0, _E, valid=[0x0]),
@@ -836,7 +834,8 @@ NVME_COMMANDS_EXTENDED = [
     NVMeCommand("MigrationReceive",      0x42, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
     NVMeCommand("ControllerDataQueue",   0x45, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
     NVMeCommand("Abort",                 0x08, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
-    NVMeCommand("AER",                   0x0C, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
+    # AER(0x0C) 제외: 컨트롤러가 Thermal/SMART 등 이벤트 발생 시 자동 완료하는 명령.
+    # 퍼저가 직접 보내면 이벤트 없이 indefinite block → timeout만 발생.
     NVMeCommand("Copy",                  0x19, NVMeCommandType.IO),
     NVMeCommand("ReservationRegister",   0x0D, NVMeCommandType.IO),
     NVMeCommand("ReservationReport",     0x0E, NVMeCommandType.IO,    needs_data=False),

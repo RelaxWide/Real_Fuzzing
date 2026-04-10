@@ -431,11 +431,6 @@ SEED_TEMPLATES = {
         dict(cdw10=(0x0001 << 16) | 0x0001, nsid_override=0),
     ],
 
-    # AER — no CDW parameters (Admin 0x0C)
-    "AER": [
-        dict(nsid_override=0),
-    ],
-
     # NamespaceAttachment — SEL=0 (Attach only; SEL=1 Detach is excluded) (Admin 0x15)
     "NamespaceAttachment": [
         dict(cdw10=0x0, nsid_override=0),
