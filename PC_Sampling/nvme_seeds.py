@@ -383,7 +383,8 @@ SEED_TEMPLATES = {
     # 1=Block Erase / 2=Overwrite / 3=Crypto Erase는 즉시 전체 소거 시작.
     # 4=Exit Failure: sanitize failure 상태 해제 (비파괴, 미진입 시 오류 반환)
     "Sanitize": [
-        dict(cdw10=0x04, nsid_override=0),
+        dict(cdw10=0x04, nsid_override=0),  # SANACT=100: Exit Failure Mode
+        dict(cdw10=0x05, nsid_override=0),  # SANACT=101: Exit Media Verification State (NVMe 2.2)
     ],
 
     # TelemetryHostInitiated — GetLogPage LID=0x07
@@ -416,5 +417,122 @@ SEED_TEMPLATES = {
              data=struct.pack('<IIQ', 0, 8, 0) + struct.pack('<IIQ', 0, 8, 100)),
         # NR=max (256 ranges): AD=1 — 범위 최대치
         dict(cdw10=0xFF, cdw11=0x04, data=struct.pack('<IIQ', 0, 1, 0) * 256),
+    ],
+
+    # NamespaceManagement — SEL=0 (Create only; SEL=1 Delete is excluded) (Admin 0x0D)
+    #                         CDW10[3:0]=SEL, CDW11[31:24]=CSI
+    "NamespaceManagement": [
+        dict(cdw10=0x0, cdw11=(0x00 << 24), data=b'\x00' * 4096, nsid_override=0),  # SEL=0, CSI=NVM
+    ],
+
+    # Abort — CDW10[15:0]=SQID, CDW10[31:16]=CID (Admin 0x08)
+    "Abort": [
+        dict(cdw10=0, nsid_override=0),
+        dict(cdw10=(0x0001 << 16) | 0x0001, nsid_override=0),
+    ],
+
+    # AER — no CDW parameters (Admin 0x0C)
+    "AER": [
+        dict(nsid_override=0),
+    ],
+
+    # NamespaceAttachment — SEL=0 (Attach only; SEL=1 Detach is excluded) (Admin 0x15)
+    "NamespaceAttachment": [
+        dict(cdw10=0x0, nsid_override=0),
+    ],
+
+    # KeepAlive — no CDW parameters (Admin 0x18)
+    "KeepAlive": [
+        dict(nsid_override=0),
+    ],
+
+    # DirectiveSend — CDW10=NUMD, CDW11[7:0]=DOPER, CDW11[15:8]=DTYPE (Admin 0x19)
+    "DirectiveSend": [
+        dict(cdw10=0x7F, cdw11=(0x01 << 8) | 0x00, data=b'\x00' * 512, nsid_override=0),
+    ],
+
+    # DirectiveReceive — CDW10=NUMD, CDW11[7:0]=DOPER, CDW11[15:8]=DTYPE (Admin 0x1A)
+    "DirectiveReceive": [
+        dict(cdw10=0x7F, cdw11=(0x01 << 8) | 0x01, nsid_override=0),
+    ],
+
+    # VirtMgmt — CDW10[3:0]=ACT, CDW10[6:5]=RT (Admin 0x1C)
+    "VirtMgmt": [
+        dict(cdw10=0x01, nsid_override=0),  # ACT=1
+        dict(cdw10=0x07, nsid_override=0),  # ACT=7
+    ],
+
+    # CapacityMgmt — CDW10[7:0]=OP, CDW10[31:16]=EGID (Admin 0x20)
+    "CapacityMgmt": [
+        dict(cdw10=0x00, nsid_override=0),  # OP=0: Query
+    ],
+
+    # Lockdown — PRHBT=0 only (Admin 0x24)
+    "Lockdown": [
+        dict(cdw10=0x0000, nsid_override=0),
+    ],
+
+    # MigrationSend — CDW10=NUMD, CDW11[1:0]=SEQIND (Admin 0x41)
+    "MigrationSend": [
+        dict(cdw10=0x7F, cdw11=0x00, data=b'\x00' * 512, nsid_override=0),
+    ],
+
+    # MigrationReceive — CDW10=NUMD (Admin 0x42)
+    "MigrationReceive": [
+        dict(cdw10=0x7F, cdw11=0x00, nsid_override=0),
+    ],
+
+    # ControllerDataQueue — CDW10[3:0]=OP (Admin 0x45)
+    "ControllerDataQueue": [
+        dict(cdw10=0x01, nsid_override=0),
+    ],
+
+    # Copy (IO 0x19) — CDW10/11=SDLBA, CDW12[7:4]=DF, CDW12[11:8]=NR
+    #                   data: Source Range Entry list (32B per entry for Format 0h)
+    "Copy": [
+        # Format 0h, NR=0 (1 range), src SLBA=0, NLB=1 → dst SLBA=0
+        dict(cdw10=0, cdw11=0, cdw12=0x00,
+             data=struct.pack('<QHH', 0, 1, 0) + b'\x00' * 20),
+    ],
+
+    # ReservationRegister (IO 0x0D) — CDW10[2:0]=RREGA, CDW10[3]=IEKEY, CDW10[31:30]=CPTPL
+    #                                   data: 16B (CRKEY 8B + NRKEY 8B)
+    "ReservationRegister": [
+        dict(cdw10=0x00, data=b'\x00' * 16),  # RREGA=0: Register
+        dict(cdw10=0x01, data=b'\x00' * 16),  # RREGA=1: Unregister
+    ],
+
+    # ReservationReport (IO 0x0E) — CDW10=NUMD, CDW11[0]=EDS
+    "ReservationReport": [
+        dict(cdw10=0xFF, cdw11=0),
+        dict(cdw10=0xFF, cdw11=1),  # EDS=1: Extended Data Structure
+    ],
+
+    # ReservationAcquire (IO 0x11) — CDW10[2:0]=RACQA, CDW10[15:8]=RTYPE
+    #                                  data: 16B (CRKEY 8B + PRKEY 8B)
+    "ReservationAcquire": [
+        dict(cdw10=0x00, data=b'\x00' * 16),  # RACQA=0: Acquire
+    ],
+
+    # ReservationRelease (IO 0x15) — CDW10[2:0]=RRELA, CDW10[15:8]=RTYPE
+    #                                  data: 8B (CRKEY)
+    "ReservationRelease": [
+        dict(cdw10=0x00, data=b'\x00' * 8),  # RRELA=0: Release
+    ],
+
+    # Cancel (IO 0x18) — CDW10[15:0]=SQID, CDW10[31:16]=CID, CDW11[3:0]=CA
+    "Cancel": [
+        dict(cdw10=0, cdw11=0),   # CA=0: Single command
+        dict(cdw10=0, cdw11=2),   # CA=2: All in namespace
+    ],
+
+    # IOMgmtReceive (IO 0x12) — CDW10=NUMD, CDW11[7:0]=MO
+    "IOMgmtReceive": [
+        dict(cdw10=0xFF, cdw11=0x00),  # MO=0: RUH Status
+    ],
+
+    # IOMgmtSend (IO 0x1D) — CDW10=NUMD, CDW11[7:0]=MO
+    "IOMgmtSend": [
+        dict(cdw10=0x7F, cdw11=0x01, data=b'\x00' * 512),  # MO=1: RUH Update
     ],
 }

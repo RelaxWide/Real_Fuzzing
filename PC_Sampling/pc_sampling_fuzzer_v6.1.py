@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v6.1
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v6.2
 
 OpenOCD PCSR(PC Sampling Register) 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
-v6.1 변경사항:
-- [Mutation] LBA 경계값 의미론적 변형 (Read/Write/Compare):
-    LBA_BOUNDARY_MUT_PROB=0.10 확률로 cdw10(SLBA_LOW)/cdw11(SLBA_HIGH) 경계값 대입.
-    경계값: 0x0, 0x1, 0xFFFF, 0x10000, 0xFFFFFFFE, 0xFFFFFFFF.
-    NLB(cdw12 lower 16bits) 30% 추가 변형: 0x0/0x1/0xFFFF/0xFFFFFFFF.
-    효과: 네임스페이스 처음/끝/오버플로 LBA 경로 탐색.
-- [Mutation] Feature ID 의미론적 변형 (GetFeatures/SetFeatures):
-    FID_MUT_PROB=0.15 확률로 cdw10[7:0](FID) 대입.
-    범위: 표준(0x01~0x0C), 예약(0x0D~0x7F), vendor-specific(0x80~0xFF), 0x00/0xFF.
-    효과: 구현된 FID 핸들러 외 미구현 FID 에러 경로 탐색.
-- [Mutation] CNS 의미론적 변형 (Identify):
-    CNS_MUT_PROB=0.10 확률로 cdw10[7:0](CNS) 대입.
-    표준 CNS(0x00~0x1E) + 예약/vendor 범위 포함.
-    효과: Identify 응답 로직의 CNS 분기 탐색.
+v6.2 변경사항:
+- [Mutation] 규칙 기반 스키마 뮤테이터 도입 (libFuzzer 스타일):
+    각 NVMe 커맨드의 CDW 필드를 FieldType(ENUM/LBA/FLAGS/SIZE_DW 등)으로 정의.
+    SCHEMA_MUT_PROB=0.30 확률로 CMD_SCHEMAS에서 필드를 무작위 선택, 타입별 전략 적용.
+    기존 슬롯 [5]LBA경계값/[6]FID/[7]CNS/[8]NUMDL → 단일 schema_mutate 슬롯으로 통합.
+    총 39개 커맨드 스키마 정의 (Admin 21 + I/O 18).
+- [Command] 신규 커맨드 10개 추가 (거절 경로 탐색):
+    Abort, AER, Copy, Reservation×4, Cancel, NamespaceAttachment(SEL=0),
+    KeepAlive, DirectiveSend/Receive, VirtMgmt, CapacityMgmt, Lockdown(PRHBT=0),
+    MigrationSend/Receive, ControllerDataQueue, IOMgmtSend/Receive.
+- [Seed] 최소 앵커 시드 방식 + IO_ADMIN_RATIO=3 (75% I/O, 25% Admin):
+    I/O 풀과 Admin 풀을 분리하여 I/O 커맨드 발행 빈도 증가.
 - [Corpus] Epoch 기반 주기적 리셋 (CORPUS_EPOCH_SIZE, 기본 0=비활성):
     CORPUS_EPOCH_SIZE>0 이면 해당 exec마다 _epoch_reset_corpus() 호출.
     favored 시드 + found_at==0(초기 시드)만 유지, exec_count를 1/4로 감쇠.
@@ -320,9 +318,8 @@ OPCODE_MUT_PROB        = 0.10   # opcode override 확률 (기본 10%)
 NSID_MUT_PROB          = 0.10   # namespace ID override 확률 (기본 10%)
 ADMIN_SWAP_PROB        = 0.05   # Admin↔IO 교차 전송 확률 (기본 5%)
 DATALEN_MUT_PROB       = 0.08   # data_len 불일치 확률 (기본 8%)
-LBA_BOUNDARY_MUT_PROB  = 0.10   # Read/Write/Compare LBA 경계값 변형 확률 (기본 10%)
-FID_MUT_PROB           = 0.15   # GetFeatures/SetFeatures Feature ID 변형 확률 (기본 15%)
-CNS_MUT_PROB           = 0.10   # Identify CNS 필드 변형 확률 (기본 10%)
+SCHEMA_MUT_PROB        = 0.30   # 스키마 기반 CDW 필드 변형 확률 (기본 30%)
+IO_ADMIN_RATIO         = 3      # I/O 커맨드 선택 비율 (Admin 대비)
 CORPUS_EPOCH_SIZE      = 0      # Epoch 기반 corpus 리셋 주기 (0=비활성, N=N exec마다 리셋)
 
 PM_ROTATE_INTERVAL = 100   # 이 횟수마다 PS 상태 전환 (PS0→PS1→PS2→PS3→PS4→PS0...)
@@ -426,6 +423,378 @@ class NVMeCommand:
     description: str = ""
     weight: int = 1                  # 명령어 선택 가중치 (높을수록 자주 선택)
 
+# ─────────────────────────────────────────────────────────────────
+# Rule-based Schema Mutation (v6.2)
+# ─────────────────────────────────────────────────────────────────
+
+class FieldType(Enum):
+    ENUM       = "enum"
+    LBA        = "lba"
+    LBA_CNT    = "lba_cnt"
+    FLAGS      = "flags"
+    SIZE_DW    = "size_dw"
+    OFFSET_DW  = "offset_dw"
+    SLOT       = "slot"
+    OPAQUE     = "opaque"
+
+@dataclass
+class CDWField:
+    name: str
+    word: int        # 10-15
+    hi: int          # inclusive high bit
+    lo: int          # inclusive low bit
+    ftype: FieldType
+    valid: list = field(default_factory=list)
+    reserved: tuple = ()   # (min, max) inclusive range for reserved values
+    vendor: tuple = ()     # (min, max) inclusive range for vendor-specific
+    max_val: int = 0       # for SLOT type
+
+@dataclass
+class CmdSchema:
+    cmd_name: str
+    fields: list  # List[CDWField]
+
+def _F(name, word, hi, lo, ftype, valid=None, reserved=(), vendor=(), max_val=0):
+    """CDWField 생성 단축함수."""
+    return CDWField(name, word, hi, lo, ftype,
+                    valid=valid or [], reserved=reserved, vendor=vendor, max_val=max_val)
+
+_E = FieldType.ENUM
+_L = FieldType.LBA
+_LC = FieldType.LBA_CNT
+_FL = FieldType.FLAGS
+_S = FieldType.SIZE_DW
+_O = FieldType.OFFSET_DW
+_SL = FieldType.SLOT
+_OP = FieldType.OPAQUE
+
+CMD_SCHEMAS: dict = {
+
+    # ── Admin Commands ──────────────────────────────────────────────
+
+    "Identify": CmdSchema("Identify", [
+        _F("CNS",   10,  7,  0, _E,
+           valid=[0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,
+                  0x10,0x11,0x12,0x13,0x14,0x1A,0x1C,0x1D,0x1E],
+           reserved=(0x1F, 0x6F), vendor=(0x70, 0xFF)),
+        _F("CNTID", 10, 31, 16, _SL, max_val=0xFFFF),
+        _F("CNSSI", 11, 15,  0, _OP),
+        _F("CSI",   11, 31, 24, _E,  valid=[0x00, 0x02]),
+        _F("UIDX",  14,  6,  0, _SL, max_val=0x7F),
+    ]),
+
+    "GetLogPage": CmdSchema("GetLogPage", [
+        _F("LID",   10,  7,  0, _E,
+           valid=list(range(0x01, 0x0C)) + [0x0D,0x0E,0x0F,0x10,0x11,0x12,0x13,
+                                             0x14,0x15,0x19,0x1A,0x1B,
+                                             0x20,0x21,0x22,0x23,
+                                             0x70,0x71,0x72,0x73,0x80,0x81],
+           vendor=(0xC0, 0xFF)),
+        _F("LSP",   10, 14,  8, _OP),
+        _F("RAE",   10, 15, 15, _FL, valid=[0, 1]),
+        _F("NUMDL", 10, 31, 16, _S),
+        _F("NUMDU", 11, 15,  0, _S),
+        _F("LSI",   11, 31, 16, _OP),
+        _F("LPOL",  12, 31,  0, _O),
+        _F("LPOU",  13, 31,  0, _O),
+    ]),
+
+    "GetFeatures": CmdSchema("GetFeatures", [
+        _F("FID", 10,  7,  0, _E,
+           valid=list(range(0x01, 0x16)) + [0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+                                             0x7E, 0x7F,
+                                             0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D],
+           reserved=(0x16, 0x77), vendor=(0x80, 0xFF)),
+        _F("SEL", 10, 10,  8, _E, valid=[0, 1, 2, 3]),
+        _F("UIDX", 14,  6,  0, _SL, max_val=0x7F),
+    ]),
+
+    "SetFeatures": CmdSchema("SetFeatures", [
+        _F("FID", 10,  7,  0, _E,
+           valid=list(range(0x01, 0x16)) + [0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+                                             0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F],
+           reserved=(0x16, 0x77), vendor=(0x80, 0xFF)),
+        _F("SV",  10, 31, 31, _FL, valid=[0, 1]),
+        _F("CDW11", 11, 31, 0, _OP),
+        _F("UIDX", 14,  6,  0, _SL, max_val=0x7F),
+    ]),
+
+    "DeviceSelfTest": CmdSchema("DeviceSelfTest", [
+        _F("STC", 10, 3, 0, _E,
+           valid=[0x1, 0x2, 0x3, 0xE, 0xF],
+           reserved=(0x4, 0xD)),
+    ]),
+
+    "FWCommit": CmdSchema("FWCommit", [
+        _F("FS",   10,  2,  0, _SL, max_val=7),
+        _F("CA",   10,  5,  3, _E,  valid=[0, 1, 2, 3, 4, 5]),
+        _F("BPID", 10, 31, 31, _FL, valid=[0, 1]),
+    ]),
+
+    "FWDownload": CmdSchema("FWDownload", [
+        _F("NUMD", 10, 31,  0, _S),
+        _F("OFST", 11, 31,  0, _O),
+    ]),
+
+    "FormatNVM": CmdSchema("FormatNVM", [
+        _F("LBAFL", 10,  3,  0, _SL, max_val=0xF),
+        _F("MSET",  10,  4,  4, _FL, valid=[0, 1]),
+        _F("PI",    10,  7,  5, _E,  valid=[0, 1, 2, 3, 4]),
+        _F("PIL",   10,  8,  8, _FL, valid=[0, 1]),
+        # SES bits [11:9] intentionally omitted (erase = destructive)
+        _F("LBAFU", 10, 13, 12, _SL, max_val=3),
+    ]),
+
+    "Sanitize": CmdSchema("Sanitize", [
+        # Only safe SANACT values: 001=Exit Failure, 101=Exit Media Verification
+        _F("SANACT", 10, 2, 0, _E, valid=[0x1, 0x5]),
+    ]),
+
+    "SecuritySend": CmdSchema("SecuritySend", [
+        _F("NSSF",  10,  7,  0, _OP),
+        _F("SPSP0", 10, 15,  8, _OP),
+        _F("SPSP1", 10, 23, 16, _OP),
+        _F("SECP",  10, 31, 24, _E,
+           valid=[0x00, 0x01, 0x02, 0xEA, 0xEF],
+           vendor=(0xF0, 0xFF)),
+        _F("TL",    11, 31,  0, _S),
+    ]),
+
+    "SecurityReceive": CmdSchema("SecurityReceive", [
+        _F("NSSF",  10,  7,  0, _OP),
+        _F("SPSP0", 10, 15,  8, _OP),
+        _F("SPSP1", 10, 23, 16, _OP),
+        _F("SECP",  10, 31, 24, _E,
+           valid=[0x00, 0x01, 0x02, 0xEA, 0xEF],
+           vendor=(0xF0, 0xFF)),
+        _F("AL",    11, 31,  0, _S),
+    ]),
+
+    "GetLBAStatus": CmdSchema("GetLBAStatus", [
+        _F("SLBA_LO", 10, 31,  0, _L),
+        _F("SLBA_HI", 11, 31,  0, _L),
+        _F("MNDW",    12, 31,  0, _S),
+        _F("RL",      13, 15,  0, _SL, max_val=0xFFFF),
+        _F("ATYPE",   13, 31, 16, _E, valid=[0, 1, 2]),
+    ]),
+
+    "NamespaceManagement": CmdSchema("NamespaceManagement", [
+        # SEL=0 only (Create). Delete=1 is excluded.
+        _F("SEL", 10,  3,  0, _E, valid=[0x0]),
+        _F("CSI", 11, 31, 24, _E, valid=[0x00, 0x02]),
+    ]),
+
+    "TelemetryHostInitiated": CmdSchema("TelemetryHostInitiated", [
+        _F("CTHID", 10,  8,  8, _FL, valid=[0, 1]),
+        _F("RAE",   10, 15, 15, _FL, valid=[0, 1]),
+        _F("NUMDL", 10, 31, 16, _S),
+    ]),
+
+    "Abort": CmdSchema("Abort", [
+        _F("SQID", 10, 15,  0, _SL, max_val=0xFFFF),
+        _F("CID",  10, 31, 16, _SL, max_val=0xFFFF),
+    ]),
+
+    "AER": CmdSchema("AER", []),  # No CDW parameters
+
+    "NamespaceAttachment": CmdSchema("NamespaceAttachment", [
+        # SEL=0 only (Attach). Detach=1 is excluded.
+        _F("SEL", 10, 3, 0, _E, valid=[0x0]),
+    ]),
+
+    "KeepAlive": CmdSchema("KeepAlive", []),  # No CDW parameters
+
+    "DirectiveSend": CmdSchema("DirectiveSend", [
+        _F("NUMD",  10, 31,  0, _S),
+        _F("DOPER", 11,  7,  0, _E, valid=[0x00, 0x01, 0x02]),
+        _F("DTYPE", 11, 15,  8, _E, valid=[0x00, 0x01]),
+        _F("DSPEC", 11, 31, 16, _OP),
+    ]),
+
+    "DirectiveReceive": CmdSchema("DirectiveReceive", [
+        _F("NUMD",  10, 31,  0, _S),
+        _F("DOPER", 11,  7,  0, _E, valid=[0x00, 0x01]),
+        _F("DTYPE", 11, 15,  8, _E, valid=[0x00, 0x01]),
+        _F("DSPEC", 11, 31, 16, _OP),
+    ]),
+
+    "VirtMgmt": CmdSchema("VirtMgmt", [
+        _F("ACT",  10,  3,  0, _E, valid=[0x1, 0x7, 0x8, 0x9]),
+        _F("RT",   10,  6,  5, _E, valid=[0x0, 0x1]),
+        _F("CNTLID", 10, 31, 16, _SL, max_val=0xFFFF),
+        _F("NR",   11, 15,  0, _SL, max_val=0xFFFF),
+    ]),
+
+    "CapacityMgmt": CmdSchema("CapacityMgmt", [
+        _F("OP",   10,  7,  0, _E, valid=[0x0, 0x1]),
+        _F("EGID", 10, 31, 16, _SL, max_val=0xFFFF),
+        _F("EGCAP_LO", 11, 31,  0, _S),
+        _F("EGCAP_HI", 12, 31,  0, _S),
+    ]),
+
+    "Lockdown": CmdSchema("Lockdown", [
+        # PRHBT=0 only (no prohibition / unlock). PRHBT=1 could permanently disable commands.
+        _F("OFI",   10,  7,  0, _E, valid=[0x0, 0x1, 0x2, 0x3]),
+        _F("UUID",  10, 14,  9, _SL, max_val=0x3F),
+        _F("PRHBT", 10, 15, 15, _E, valid=[0x0]),  # 0 only
+        _F("SCP",   10, 19, 16, _E, valid=[0x0, 0x1, 0x2, 0x3, 0x4]),
+        _F("IFC",   10, 25, 24, _E, valid=[0x0, 0x1, 0x2]),
+    ]),
+
+    "MigrationSend": CmdSchema("MigrationSend", [
+        _F("NUMD",   10, 31,  0, _S),
+        _F("SEQIND", 11,  1,  0, _E, valid=[0x0, 0x1, 0x2, 0x3]),
+        _F("CSVI",   11, 15,  8, _SL, max_val=0xFF),
+    ]),
+
+    "MigrationReceive": CmdSchema("MigrationReceive", [
+        _F("NUMD",   10, 31,  0, _S),
+        _F("CSVI",   11, 15,  8, _SL, max_val=0xFF),
+    ]),
+
+    "ControllerDataQueue": CmdSchema("ControllerDataQueue", [
+        _F("OP",   10,  3,  0, _E, valid=[0x0, 0x1]),
+        _F("CNTLID", 10, 31, 16, _SL, max_val=0xFFFF),
+        _F("NUMD",  11, 31,  0, _S),
+    ]),
+
+    # ── I/O Commands ────────────────────────────────────────────────
+
+    "Read": CmdSchema("Read", [
+        _F("SLBA_LO", 10, 31,  0, _L),
+        _F("SLBA_HI", 11, 31,  0, _L),
+        _F("NLB",     12, 15,  0, _LC),
+        _F("STCR",    12, 25, 25, _FL, valid=[0, 1]),
+        _F("PRINFO",  12, 29, 26, _FL, valid=[0,1,2,4,8,0xF]),
+        _F("LR",      12, 30, 30, _FL, valid=[0, 1]),
+        _F("FUA",     12, 31, 31, _FL, valid=[0, 1]),
+        _F("DSM",     13,  3,  0, _OP),
+        _F("ILBRT",   14, 31,  0, _OP),
+        _F("ELBAT",   15, 15,  0, _OP),
+        _F("ELBATM",  15, 31, 16, _OP),
+    ]),
+
+    "Write": CmdSchema("Write", [
+        _F("SLBA_LO", 10, 31,  0, _L),
+        _F("SLBA_HI", 11, 31,  0, _L),
+        _F("NLB",     12, 15,  0, _LC),
+        _F("STCW",    12, 25, 25, _FL, valid=[0, 1]),
+        _F("CETYPE",  12, 19, 16, _E,  valid=[0, 1]),
+        _F("DTYPE",   12, 23, 20, _E,  valid=[0, 1]),
+        _F("PRINFO",  12, 29, 26, _FL, valid=[0,1,2,4,8,0xF]),
+        _F("LR",      12, 30, 30, _FL, valid=[0, 1]),
+        _F("FUA",     12, 31, 31, _FL, valid=[0, 1]),
+        _F("DSPEC",   13, 31, 16, _OP),
+        _F("DSM",     13,  3,  0, _OP),
+        _F("ILBRT",   14, 31,  0, _OP),
+        _F("LBAT",    15, 15,  0, _OP),
+        _F("LBATM",   15, 31, 16, _OP),
+    ]),
+
+    "WriteUncorrectable": CmdSchema("WriteUncorrectable", [
+        _F("SLBA_LO", 10, 31,  0, _L),
+        _F("SLBA_HI", 11, 31,  0, _L),
+        _F("NLB",     12, 15,  0, _LC),
+    ]),
+
+    "Compare": CmdSchema("Compare", [
+        _F("SLBA_LO", 10, 31,  0, _L),
+        _F("SLBA_HI", 11, 31,  0, _L),
+        _F("NLB",     12, 15,  0, _LC),
+        _F("STCR",    12, 25, 25, _FL, valid=[0, 1]),
+        _F("PRINFO",  12, 29, 26, _FL, valid=[0,1,2,4,8,0xF]),
+        _F("LR",      12, 30, 30, _FL, valid=[0, 1]),
+        _F("FUA",     12, 31, 31, _FL, valid=[0, 1]),
+        _F("ELBRT",   14, 31,  0, _OP),
+        _F("ELBAT",   15, 15,  0, _OP),
+        _F("ELBATM",  15, 31, 16, _OP),
+    ]),
+
+    "WriteZeroes": CmdSchema("WriteZeroes", [
+        _F("SLBA_LO", 10, 31,  0, _L),
+        _F("SLBA_HI", 11, 31,  0, _L),
+        _F("NLB",     12, 15,  0, _LC),
+        _F("DEAC",    12, 25, 25, _FL, valid=[0, 1]),
+        _F("PRINFO",  12, 29, 26, _FL, valid=[0,1,2,4,8,0xF]),
+        _F("LR",      12, 30, 30, _FL, valid=[0, 1]),
+        _F("FUA",     12, 31, 31, _FL, valid=[0, 1]),
+    ]),
+
+    "Verify": CmdSchema("Verify", [
+        _F("SLBA_LO", 10, 31,  0, _L),
+        _F("SLBA_HI", 11, 31,  0, _L),
+        _F("NLB",     12, 15,  0, _LC),
+        _F("STC",     12, 25, 25, _FL, valid=[0, 1]),
+        _F("PRINFO",  12, 29, 26, _FL, valid=[0,1,2,4,8,0xF]),
+        _F("LR",      12, 30, 30, _FL, valid=[0, 1]),
+    ]),
+
+    "Flush": CmdSchema("Flush", []),  # No CDW parameters
+
+    "DatasetManagement": CmdSchema("DatasetManagement", [
+        _F("NR",  10,  7,  0, _LC),
+        _F("IDR", 11,  0,  0, _FL, valid=[0, 1]),
+        _F("IDW", 11,  1,  1, _FL, valid=[0, 1]),
+        _F("AD",  11,  2,  2, _FL, valid=[0, 1]),
+    ]),
+
+    "Copy": CmdSchema("Copy", [
+        _F("SDLBA_LO", 10, 31,  0, _L),
+        _F("SDLBA_HI", 11, 31,  0, _L),
+        _F("DF",       12,  7,  4, _E,  valid=[0, 1, 2, 3]),
+        _F("NR",       12, 11,  8, _SL, max_val=0xFF),
+        _F("PRINFOR",  12, 15, 12, _FL),
+        _F("STCW",     12, 24, 24, _FL, valid=[0, 1]),
+        _F("STCR",     12, 25, 25, _FL, valid=[0, 1]),
+        _F("PRINFOW",  12, 29, 26, _FL),
+        _F("FUA",      12, 30, 30, _FL, valid=[0, 1]),
+        _F("LR",       12, 31, 31, _FL, valid=[0, 1]),
+    ]),
+
+    "ReservationRegister": CmdSchema("ReservationRegister", [
+        _F("RREGA",   10,  2,  0, _E, valid=[0, 1, 2]),
+        _F("IEKEY",   10,  3,  3, _FL, valid=[0, 1]),
+        _F("DISNSRS", 10,  4,  4, _FL, valid=[0, 1]),
+        _F("CPTPL",   10, 31, 30, _E, valid=[0, 2, 3]),
+    ]),
+
+    "ReservationReport": CmdSchema("ReservationReport", [
+        _F("NUMD", 10, 31,  0, _S),
+        _F("EDS",  11,  0,  0, _FL, valid=[0, 1]),
+    ]),
+
+    "ReservationAcquire": CmdSchema("ReservationAcquire", [
+        _F("RACQA",   10,  2,  0, _E, valid=[0, 1, 2]),
+        _F("IEKEY",   10,  3,  3, _FL, valid=[0, 1]),
+        _F("DISNSRS", 10,  4,  4, _FL, valid=[0, 1]),
+        _F("RTYPE",   10, 15,  8, _E, valid=list(range(0, 7))),
+    ]),
+
+    "ReservationRelease": CmdSchema("ReservationRelease", [
+        _F("RRELA",   10,  2,  0, _E, valid=[0, 1]),
+        _F("IEKEY",   10,  3,  3, _FL, valid=[0, 1]),
+        _F("RTYPE",   10, 15,  8, _E, valid=list(range(0, 7))),
+    ]),
+
+    "Cancel": CmdSchema("Cancel", [
+        _F("SQID", 10, 15,  0, _SL, max_val=0xFFFF),
+        _F("CID",  10, 31, 16, _SL, max_val=0xFFFF),
+        _F("CA",   11,  3,  0, _E,  valid=[0, 1, 2]),
+    ]),
+
+    "IOMgmtReceive": CmdSchema("IOMgmtReceive", [
+        _F("NUMD",  10, 31,  0, _S),
+        _F("MO",    11,  7,  0, _E, valid=[0x0, 0x1]),
+        _F("MOSPC", 11, 31, 16, _SL, max_val=0xFFFF),
+    ]),
+
+    "IOMgmtSend": CmdSchema("IOMgmtSend", [
+        _F("NUMD",  10, 31,  0, _S),
+        _F("MO",    11,  7,  0, _E, valid=[0x1, 0x2]),
+        _F("MOSPC", 11, 31, 16, _SL, max_val=0xFFFF),
+    ]),
+}
+
 # 기본 활성화 (비파괴, 빠른 응답) — --commands 없이 실행 시 이것만 사용
 # weight 합계: Admin=4(1+1+1+1), IO=4(2+2) → Admin 50% / IO 50%
 NVME_COMMANDS_DEFAULT = [
@@ -454,6 +823,28 @@ NVME_COMMANDS_EXTENDED = [
     NVMeCommand("SecuritySend",          0x81, NVMeCommandType.ADMIN, needs_namespace=False, timeout_group="security"),
     NVMeCommand("SecurityReceive",       0x82, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False, timeout_group="security"),
     NVMeCommand("GetLBAStatus",          0x86, NVMeCommandType.ADMIN, needs_data=False),
+    # New commands (rejection path fuzzing + new functionality)
+    NVMeCommand("NamespaceManagement",   0x0D, NVMeCommandType.ADMIN, needs_namespace=False),
+    NVMeCommand("NamespaceAttachment",   0x15, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
+    NVMeCommand("KeepAlive",             0x18, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
+    NVMeCommand("DirectiveSend",         0x19, NVMeCommandType.ADMIN, needs_namespace=False),
+    NVMeCommand("DirectiveReceive",      0x1A, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
+    NVMeCommand("VirtMgmt",              0x1C, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
+    NVMeCommand("CapacityMgmt",          0x20, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
+    NVMeCommand("Lockdown",              0x24, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
+    NVMeCommand("MigrationSend",         0x41, NVMeCommandType.ADMIN, needs_namespace=False),
+    NVMeCommand("MigrationReceive",      0x42, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
+    NVMeCommand("ControllerDataQueue",   0x45, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
+    NVMeCommand("Abort",                 0x08, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
+    NVMeCommand("AER",                   0x0C, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False),
+    NVMeCommand("Copy",                  0x19, NVMeCommandType.IO),
+    NVMeCommand("ReservationRegister",   0x0D, NVMeCommandType.IO),
+    NVMeCommand("ReservationReport",     0x0E, NVMeCommandType.IO,    needs_data=False),
+    NVMeCommand("ReservationAcquire",    0x11, NVMeCommandType.IO),
+    NVMeCommand("ReservationRelease",    0x15, NVMeCommandType.IO),
+    NVMeCommand("Cancel",                0x18, NVMeCommandType.IO,    needs_data=False),
+    NVMeCommand("IOMgmtReceive",         0x12, NVMeCommandType.IO,    needs_data=False),
+    NVMeCommand("IOMgmtSend",            0x1D, NVMeCommandType.IO),
 ]
 
 # 전체 명령어 (이름으로 조회용)
@@ -1331,9 +1722,11 @@ class NVMeFuzzer:
             base = NVME_COMMANDS_DEFAULT.copy()
 
         # weight에 따라 리스트 확장 — random.choice()가 가중치 선택을 자동 처리
+        # IO_ADMIN_RATIO: I/O 커맨드를 Admin 대비 추가 weight 부여 (75%:25% 비율)
         self.commands = []
         for c in base:
-            self.commands.extend([c] * c.weight)
+            extra = IO_ADMIN_RATIO if c.cmd_type == NVMeCommandType.IO else 1
+            self.commands.extend([c] * (c.weight * extra))
 
         log.info(f"[Fuzzer] Enabled commands: {[c.name for c in self.commands]}")
 
@@ -1400,12 +1793,12 @@ class NVMeFuzzer:
             "nsid_override": 0,       # nsid가 변형된 횟수
             "force_admin_swap": 0,    # Admin↔IO 교차 전송 횟수
             "data_len_override": 0,   # data_len 불일치 횟수
-            "lba_boundary": 0,        # LBA 경계값 변형 횟수
-            "fid_mutation": 0,        # Feature ID 변형 횟수
-            "cns_mutation": 0,        # Identify CNS 변형 횟수
+            "schema_field": 0,        # 스키마 기반 CDW 필드 변형 횟수
             "random_gen": 0,          # 완전 랜덤 생성 횟수
             "corpus_mutated": 0,      # corpus 기반 mutation 횟수
         }
+        self._nsze_cache: Optional[int] = None
+        self._nsze_cache_at: int = 0
         # 실제 전송된 opcode 분포 (원본과 다른 경우만)
         self.actual_opcode_dist: dict[int, int] = defaultdict(int)
         # 실제 전송된 passthru 타입 분포
@@ -2206,6 +2599,69 @@ class NVMeFuzzer:
 
         return bytes(buf[:self.config.max_input_len])
 
+    # ── NSZE cache ───────────────────────────────────────────────────
+    NSZE_CACHE_TTL = 5000
+
+    def _get_nsze(self) -> int:
+        """Namespace Size (NSZE) 조회 및 캐싱 (5000 exec 마다 갱신)."""
+        if (self._nsze_cache is None or
+                self.executions - self._nsze_cache_at > self.NSZE_CACHE_TTL):
+            try:
+                out = subprocess.check_output(
+                    ["nvme", "id-ns", self.config.nvme_device, "-n", "1", "-o", "json"],
+                    timeout=3, stderr=subprocess.DEVNULL)
+                ns_info = json.loads(out)
+                self._nsze_cache = int(ns_info.get("nsze", 0x100000))
+            except Exception:
+                self._nsze_cache = 0x100000   # 1M blocks fallback
+            self._nsze_cache_at = self.executions
+        return self._nsze_cache
+
+    def _mutate_field_by_type(self, f: CDWField, nsze: int) -> int:
+        """CDWField 타입별 변형 값 생성."""
+        ft = f.ftype
+        if ft == FieldType.ENUM:
+            pool = list(f.valid)
+            if f.reserved:
+                pool.append(random.randint(f.reserved[0], f.reserved[1]))
+            if f.vendor:
+                pool.append(random.randint(f.vendor[0], f.vendor[1]))
+            return random.choice(pool) if pool else 0
+        elif ft == FieldType.LBA:
+            return random.choice([
+                0, 1, max(0, nsze - 1), nsze, nsze + 1,
+                0xFFFF, 0xFFFFFFFF, random.randint(0, max(1, nsze)),
+            ])
+        elif ft == FieldType.LBA_CNT:
+            return random.choice([
+                0, 1, 7, 0xFF, 0xFFFF, 0xFFFFFFFF,
+                random.randint(0, 0xFFFF),
+            ])
+        elif ft == FieldType.FLAGS:
+            mask = (1 << (f.hi - f.lo + 1)) - 1
+            if f.valid:
+                return random.choice(f.valid)
+            return random.randint(0, mask)
+        elif ft == FieldType.SIZE_DW:
+            return random.choice([
+                0, 1, 0x7F, 0xFF, 0x3FF, 0x7FF, 0xFFFF,
+                random.randint(0, 0xFFFF),
+            ])
+        elif ft == FieldType.OFFSET_DW:
+            return random.choice([
+                0, 1, 0x100, 0x1000, 0xFFFF, 0xFFFFFFFF,
+                random.randint(0, 0xFFFFFF),
+            ])
+        elif ft == FieldType.SLOT:
+            return random.choice([
+                0, 1, f.max_val, f.max_val + 1,
+                random.randint(0, max(1, f.max_val + 2)),
+            ])
+        else:  # OPAQUE
+            width = f.hi - f.lo + 1
+            mask = (1 << width) - 1
+            return self._mutate_cdw(0) & mask
+
     def _mutate_cdw(self, value: int) -> int:
         """AFL++ 스타일 CDW (32-bit) 변형"""
         mut = random.randint(0, 5)
@@ -2359,66 +2815,19 @@ class NVMeFuzzer:
                 random.randint(1, 2 * 1024 * 1024),  # 랜덤 (max 2MB)
             ])
 
-        # [5] LBA 경계값 변형 — Read/Write/Compare LBA 오버플로·경계 코드경로 탐색
-        if LBA_BOUNDARY_MUT_PROB > 0 and random.random() < LBA_BOUNDARY_MUT_PROB:
-            if new_seed.cmd.name in ("Read", "Write", "Compare"):
-                self.mutation_stats["lba_boundary"] += 1
-                lba_val = random.choice([
-                    0x00000000,   # 네임스페이스 시작
-                    0x00000001,
-                    0x0000FFFF,   # 16-bit 경계
-                    0x00010000,
-                    0xFFFFFFFE,   # 32-bit 경계 근방
-                    0xFFFFFFFF,   # 32-bit 최대
-                ])
-                if random.random() < 0.5:
-                    new_seed.cdw10 = lba_val          # SLBA[31:0]
-                else:
-                    new_seed.cdw11 = lba_val          # SLBA[63:32]
-                if random.random() < 0.3:             # NLB(cdw12 lower 16bits) 추가 변형
-                    new_seed.cdw12 = (new_seed.cdw12 & 0xFFFF0000) | random.choice(
-                        [0x0000, 0x0001, 0xFFFF, random.randint(0, 0xFFFF)])
-
-        # [6] Feature ID 변형 — GetFeatures/SetFeatures 미구현 FID 에러 경로 탐색
-        if FID_MUT_PROB > 0 and random.random() < FID_MUT_PROB:
-            if new_seed.cmd.name in ("GetFeatures", "SetFeatures"):
-                self.mutation_stats["fid_mutation"] += 1
-                fid = random.choice([
-                    0x00,                              # 예약 (invalid)
-                    *range(0x01, 0x0D),               # 표준 Feature ID
-                    random.randint(0x0D, 0x7F),       # 예약 범위
-                    random.randint(0x80, 0xFF),       # vendor-specific 범위
-                    0xFF,                              # vendor-specific 최대
-                ])
-                new_seed.cdw10 = (new_seed.cdw10 & 0xFFFFFF00) | (fid & 0xFF)
-
-        # [7] CNS 변형 — Identify CNS 분기 탐색 (표준+예약+vendor 범위)
-        if CNS_MUT_PROB > 0 and random.random() < CNS_MUT_PROB:
-            if new_seed.cmd.name == "Identify":
-                self.mutation_stats["cns_mutation"] += 1
-                cns = random.choice([
-                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05,   # 표준 CNS (NS/Ctrl/List)
-                    0x10, 0x11, 0x12, 0x13, 0x14,          # 표준 CNS (extended)
-                    0x1A, 0x1C, 0x1E,                      # I/O Cmd Set 관련
-                    random.randint(0x1F, 0x6F),            # 예약 범위
-                    random.randint(0x70, 0xFF),            # vendor-specific 범위
-                    0xFF,
-                ])
-                new_seed.cdw10 = (new_seed.cdw10 & 0xFFFFFF00) | (cns & 0xFF)
-
-        # [8] GetLogPage NUMDL 과대 요청 (GetLogPage일 때 15%)
-        #     data_len을 NUMDL에 맞춰서 커널은 통과, SSD에 스펙 초과 크기 요청
-        if seed.cmd.name == "GetLogPage" and random.random() < 0.15:
-            lid = new_seed.cdw10 & 0xFF
-            # NUMDL을 스펙보다 크게 설정
-            oversized_numdl = random.choice([
-                0x7FF,              # 11-bit 최대 (8192 bytes)
-                0x3FF,              # 4096 bytes
-                random.randint(0x100, 0x7FF),
-            ])
-            new_seed.cdw10 = (new_seed.cdw10 & 0xF800FFFF) | (oversized_numdl << 16)
-            # data_len을 NUMDL에 맞춤 → 커널 통과 보장
-            new_seed.data_len_override = (oversized_numdl + 1) * 4
+        # [5] Schema-guided field mutation
+        if SCHEMA_MUT_PROB > 0 and random.random() < SCHEMA_MUT_PROB:
+            schema = CMD_SCHEMAS.get(new_seed.cmd.name)
+            if schema and schema.fields:
+                f = random.choice(schema.fields)
+                nsze = self._get_nsze()
+                new_val = self._mutate_field_by_type(f, nsze)
+                cdw_attr = f"cdw{f.word}"
+                old = getattr(new_seed, cdw_attr, 0)
+                width = f.hi - f.lo + 1
+                mask = ((1 << width) - 1) << f.lo
+                setattr(new_seed, cdw_attr, (old & ~mask) | ((new_val << f.lo) & mask))
+                self.mutation_stats["schema_field"] += 1
 
         return new_seed
 
@@ -5252,14 +5661,15 @@ class NVMeFuzzer:
         src_values = [ms.get('corpus_mutated', 0), ms.get('random_gen', 0)]
 
         # mutation 유형 (소스 외 필드)
-        mut_labels = ['opcode\noverride', 'nsid\noverride', 'admin↔io\nswap', 'datalen\noverride']
+        mut_labels = ['opcode\noverride', 'nsid\noverride', 'admin↔io\nswap', 'datalen\noverride', 'schema\nfield']
         mut_values = [ms.get('opcode_override', 0), ms.get('nsid_override', 0),
-                      ms.get('force_admin_swap', 0), ms.get('data_len_override', 0)]
+                      ms.get('force_admin_swap', 0), ms.get('data_len_override', 0),
+                      ms.get('schema_field', 0)]
 
         all_labels = src_labels + mut_labels
         all_values = src_values + mut_values
         all_colors = ['#4e9af1', '#a8d8ea',  # 소스 (파란 계열)
-                      '#f4a261', '#e76f51', '#e9c46a', '#2a9d8f']  # mutation 유형
+                      '#f4a261', '#e76f51', '#e9c46a', '#2a9d8f', '#8ecae6']  # mutation 유형
 
         bars3 = ax3.barh(range(len(all_labels)), all_values,
                          color=all_colors, edgecolor='none', height=0.65)
@@ -5479,6 +5889,25 @@ class NVMeFuzzer:
         # smart-log ioctl이 제출되어, SSD 응답이 조금 느릴 때 커널이 계속 기다리고
         # Python 10초 timeout이 먼저 터지는 문제 방지.
         self._configure_nvme_timeouts()
+
+        # FormatNVM + Sanitize 1회 실행 — calibration 직전 FTL 상태 초기화
+        # Read/Write로 쌓인 mapping 복잡도를 알려진 깨끗한 상태로 리셋한 뒤 fuzzing 시작.
+        # 이후 self.commands에서 제거 → 메인 루프에서는 절대 선택되지 않음.
+        _fmt_cmd = next((c for c in NVME_COMMANDS if c.name == "FormatNVM"), None)
+        if _fmt_cmd and any(c.name == "FormatNVM" for c in self.commands):
+            log.warning("[Calibration] FormatNVM 1회 실행 (SES=0, FTL 리셋) ...")
+            _fmt_seed = Seed(data=b'', cmd=_fmt_cmd, cdw10=0x0000)
+            _fmt_rc = self._send_nvme_command(b'', _fmt_seed)
+            log.warning(f"[Calibration] FormatNVM 완료 (rc={_fmt_rc})")
+            _san_cmd = next((c for c in NVME_COMMANDS if c.name == "Sanitize"), None)
+            if _san_cmd:
+                log.warning("[Calibration] Sanitize 1회 실행 (SANACT=001, Exit Failure Mode) ...")
+                _san_seed = Seed(data=b'', cmd=_san_cmd, cdw10=0x04)
+                _san_rc = self._send_nvme_command(b'', _san_seed)
+                log.warning(f"[Calibration] Sanitize 완료 (rc={_san_rc})")
+            # 메인 루프에서 재실행되지 않도록 제거
+            self.commands = [c for c in self.commands if c.name not in ("FormatNVM", "Sanitize")]
+            log.info("[Calibration] FormatNVM/Sanitize self.commands에서 제거됨")
 
         if self.config.calibration_runs > 0:
             total_seeds = len(self.corpus)
