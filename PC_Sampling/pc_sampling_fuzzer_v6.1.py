@@ -1311,11 +1311,15 @@ class OpenOCDPCSampler:
         )
         log.debug(f"[OpenOCD] 전원 쓰기 응답: {repr(r1)}")
         # 배치 읽기 proc 정의 (1 RTT = 3코어 PC)
+        # catch: read_memory 실패(DAP fault, 디버그 도메인 꺼짐) 시 에러 메시지가
+        # 텔넷 스트림에 섞이지 않도록 Tcl 레벨에서 잡아 sentinel 0xFFFFFFFF 반환.
         r2 = self._telnet_cmd(
             'proc read_all_pcs {} {'
-            f' set pc0 [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0];'
-            f' set pc1 [lindex [r8.abp read_memory {hex(PCSR_CORE1)} 32 1] 0];'
-            f' set pc2 [lindex [r8.abp read_memory {hex(PCSR_CORE2)} 32 1] 0];'
+            ' if {[catch {'
+            f'  set pc0 [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0];'
+            f'  set pc1 [lindex [r8.abp read_memory {hex(PCSR_CORE1)} 32 1] 0];'
+            f'  set pc2 [lindex [r8.abp read_memory {hex(PCSR_CORE2)} 32 1] 0];'
+            ' } _err]} { return "0xFFFFFFFF 0xFFFFFFFF 0xFFFFFFFF" };'
             ' return "$pc0 $pc1 $pc2"'
             ' }'
         )
@@ -1332,17 +1336,38 @@ class OpenOCDPCSampler:
     # Module 3: 3코어 PC 읽기
     # ------------------------------------------------------------------
 
+    # PCSR 유효 PC 판별에서 제외할 알려진 비-PC 값
+    # 0x6ba02477: SWD DPIDR — OpenOCD 에러 메시지에 포함되는 DAP 식별자
+    # PCSR_CORE*: 읽기 대상 주소 자체가 에러 메시지에 노출되는 경우
+    _INVALID_PC_MASK = frozenset({
+        0x6ba02476, 0x6ba02477,          # DPIDR (Thumb-bit 마스킹 전·후)
+        PCSR_CORE0, PCSR_CORE0 & ~1,     # 0x80030084
+        PCSR_CORE1, PCSR_CORE1 & ~1,     # 0x80032084
+        PCSR_CORE2, PCSR_CORE2 & ~1,     # 0x80034084
+    })
+
     def _read_all_pcs(self) -> Optional[Tuple[int, int, int]]:
         """PCSR 배치 읽기: 1 RTT = (pc0, pc1, pc2). Thumb bit 마스킹 포함."""
         try:
             resp = self._telnet_cmd('read_all_pcs')
+            # OpenOCD 에러 응답 조기 탈출 — 에러 메시지의 hex 값이 파싱에 오염되는 것을 방지
+            if 'Error' in resp or 'failed' in resp or 'error' in resp:
+                log.warning(f"[OpenOCD] 에러 응답 감지: {repr(resp)}")
+                return None
             parts = re.findall(r'0x[0-9a-fA-F]+', resp)
             if len(parts) != 3:
                 log.warning(f"[OpenOCD] 파싱 실패 (토큰 {len(parts)}개): {repr(resp)}")
                 return None
             pc0, pc1, pc2 = [int(p, 16) & ~1 for p in parts[:3]]
+            # 무효 PC 필터 1: sentinel(0xFFFFFFFE) 또는 0 — 모두 해당할 때만
             if pc0 in (0, 0xFFFFFFFE) and pc1 in (0, 0xFFFFFFFE) and pc2 in (0, 0xFFFFFFFE):
-                log.warning(f"[OpenOCD] 무효 PC 튜플: Core0={hex(pc0)} Core1={hex(pc1)} Core2={hex(pc2)}")
+                log.warning(f"[OpenOCD] 무효 PC 튜플 (sentinel): "
+                            f"Core0={hex(pc0)} Core1={hex(pc1)} Core2={hex(pc2)}")
+                return None
+            # 무효 PC 필터 2: DPIDR / PCSR 주소 자체 — 에러 메시지 오염 잔류 방어
+            if any(p in self._INVALID_PC_MASK for p in (pc0, pc1, pc2)):
+                log.warning(f"[OpenOCD] 무효 PC 튜플 (비-PC 값 포함): "
+                            f"Core0={hex(pc0)} Core1={hex(pc1)} Core2={hex(pc2)}")
                 return None
             log.debug(f"[PCSR] Core0={hex(pc0)} Core1={hex(pc1)} Core2={hex(pc2)}")
             return (pc0, pc1, pc2)
