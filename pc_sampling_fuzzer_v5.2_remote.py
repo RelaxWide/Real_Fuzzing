@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v5.1
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v5.2
 
 J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
+
+v5.2 변경사항:
+- [Feature] Power Combo — NVMe PS + PCIe L-state(L0/L1/L1.2) + D-state(D0/D3) 동시 제어:
+    PowerCombo(nvme_ps, pcie_l, pcie_d) 전체 30개 조합(5×3×2) 랜덤 전환.
+    _detect_pcie_info(): BDF + PCIe Express / PCI PM / L1SS capability offset 탐지.
+    _set_pcie_l_state(): setpci LNKCTL bits[1:0] + L1SS cap L1.2 enable.
+    _set_pcie_d_state(): setpci PMCSR bits[1:0] (D0=0x0000, D3hot=0x0003).
+    _set_power_combo(): 3개 setter 통합, cmd_history에 pcie_state 항목 기록.
+    D3 timeout 배수(D3_TIMEOUT_MULT=4) 추가.
+    Stats 태그: "PS3+L1.2+D3(×4TO)" 형태로 현재 combo 표시.
+    Summary: Power Combo Stats 섹션 추가.
+    Replay .sh: pcie_state → setpci 커맨드 포함.
+- [BugFix] --pm 없을 때 combo 관련 코드 완전 비활성화 유지.
 
 v5.1 변경사항:
 - [Feature] PM Rotation: --pm 플래그로 매 PM_ROTATE_INTERVAL(기본 100)회 명령마다
@@ -201,12 +214,12 @@ from typing import Set, List, Optional, Tuple, Dict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from enum import Enum
+from enum import Enum, IntEnum
 import contextlib
 import bisect
 
 # 버전
-FUZZER_VERSION = "5.1"
+FUZZER_VERSION = "5.2"
 
 # =============================================================================
 # USER CONFIGURATION - 여기만 수정하세요
@@ -310,6 +323,52 @@ DATALEN_MUT_PROB  = 0.08   # data_len 불일치 확률 (기본 8%)
 PM_ROTATE_INTERVAL = 100   # 이 횟수마다 PS 상태 전환 (PS0→PS1→PS2→PS3→PS4→PS0...)
 # PS별 subprocess 감지 timeout 배수 (PS1/PS2는 응답 지연 허용)
 PS_TIMEOUT_MULT    = {0: 1, 1: 16, 2: 32, 3: 1, 4: 1}
+
+# v5.2: PCIe L/D-state + PowerCombo
+class PCIeLState(IntEnum):
+    L0   = 0   # ASPM 비활성 (항상 L0 active)
+    L1   = 1   # ASPM L1 활성
+    L1_2 = 2   # ASPM L1 + L1.2 활성
+
+class PCIeDState(IntEnum):
+    D0 = 0   # D0 (fully active)
+    D3 = 3   # D3hot (절전)
+
+@dataclass(frozen=True)
+class PowerCombo:
+    """NVMe PS + PCIe L-state + PCIe D-state 조합."""
+    nvme_ps: int
+    pcie_l:  PCIeLState
+    pcie_d:  PCIeDState
+
+    @property
+    def label(self) -> str:
+        ln = {0: 'L0', 1: 'L1', 2: 'L1.2'}[int(self.pcie_l)]
+        dn = 'D0' if self.pcie_d == PCIeDState.D0 else 'D3'
+        return f"PS{self.nvme_ps}+{ln}+{dn}"
+
+# 전체 30개 조합 (PS0~4 × L0/L1/L1.2 × D0/D3)
+POWER_COMBOS: list = [
+    PowerCombo(ps, PCIeLState(l), PCIeDState(d))
+    for ps in range(5)
+    for l  in (0, 1, 2)
+    for d  in (0, 3)
+]
+
+D3_TIMEOUT_MULT = 4   # D3hot wake-up 추가 timeout 배수
+
+# PCIe L1 진입 settle 시간
+# LNKCTL 쓴 뒤 link idle → L1 idle timer 만료 → PM_Request_Ack DLLP 핸드셰이크 완료까지
+L1_SETTLE     = 5.0   # L1: idle timer + handshake 대기 (초)
+L1_2_SETTLE   = 2.0   # L1.2 추가 대기: CLKREQ# 제거 + clock off (초, L1_SETTLE 이후 추가)
+
+# v5.2+: PS별 preflight settle 시간은 런타임에 nvme id-ctrl로 동적 계산 (_init_ps_settle).
+# formula: (enlat_us + exlat_us) × 2 / 1e6 + 0.05s
+# 파싱 실패 시 아래 fallback 값(초) 사용.
+_PS_SETTLE_FALLBACK: dict[int, float] = {0: 0.05, 1: 0.05, 2: 0.05, 3: 0.5, 4: 2.0}
+
+# PMU 스크립트 절대경로 — subprocess CWD와 무관하게 항상 올바른 파일 사용
+_PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pmu_4_1.py')
 
 # v4.7: Idle 유니버스 수집 (diagnose 수렴 설정)
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
@@ -1134,10 +1193,31 @@ class NVMeFuzzer:
         # v5.1: PM 로테이션 상태
         self._current_ps: int = 0                              # 현재 PS 상태
         self._prev_op_ps: int = 0                             # 마지막 operational PS (0~2) — PS3/4 timeout 기준
-        # _ps_cmd_counter 제거 — PM 전환을 executions % 100 경계에서 처리
-        # _ps_idx 제거 — 랜덤 전환으로 변경
         self.ps_exec_counts: dict[int, int] = {i: 0 for i in range(5)}  # PS별 실행 횟수
         self.ps_enter_counts: dict[int, int] = {i: 0 for i in range(5)} # PS별 진입 횟수
+
+        # v5.2: PCIe BDF + capability offsets + register cache
+        self._pcie_bdf: Optional[str]              = None
+        self._pcie_cap_offset: Optional[int]       = None  # PCIe Express cap (LNKCTL, DEVCTL2)
+        self._pcie_pm_cap_offset: Optional[int]    = None  # PCI PM cap (PMCSR)
+        self._pcie_l1ss_offset: Optional[int]      = None  # L1 Sub-States cap (L1.2)
+        self._pcie_lnkcap: Optional[int]           = None  # LNKCAP 캐시 (ASPMS bit[11:10], CPM bit18)
+        self._pcie_l1ss_cap: Optional[int]         = None  # L1SSCAP 캐시 (지원 substate 비트)
+        self._pcie_root_bdf: Optional[str]         = None  # 루트 포트 BDF
+        self._pcie_root_cap_offset: Optional[int]  = None  # 루트 포트 PCIe Express cap
+        self._pcie_root_l1ss_offset: Optional[int] = None  # 루트 포트 L1SS cap
+        self._orig_aspm_policy: str                = 'default'  # 원본 ASPM 정책 복원용
+        self._orig_apst_cdw11: Optional[int]       = None       # 원본 APST CDW11 (복원용)
+        self._orig_keepalive_val: int              = 0          # 원본 Keep-Alive Timer (복원용)
+
+        # v5.2: 현재 / 이전 operational PowerCombo
+        self._current_combo: PowerCombo  = POWER_COMBOS[0]   # PS0+L0+D0
+        self._prev_op_combo: PowerCombo  = POWER_COMBOS[0]   # 마지막 non-PS3/4 combo
+        self.combo_exec_counts: dict     = defaultdict(int)
+        self.combo_enter_counts: dict    = defaultdict(int)
+
+        # v5.2+: PS별 preflight settle 시간 — _init_ps_settle() 호출 후 채워짐
+        self._ps_settle: dict[int, float] = dict(_PS_SETTLE_FALLBACK)
 
         # v5.1: 정적 분석 연동 (Ghidra export — basic_blocks.txt / functions.txt)
         self._sa_loaded: bool = False
@@ -2752,6 +2832,1035 @@ class NVMeFuzzer:
             log.warning(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label}) → FAIL(exception: {e}) ({_pm_elapsed:.3f}s)")
             return False
 
+    # ------------------------------------------------------------------
+    # v5.2: PCIe L/D-state 제어  (PCIe spec r5.0 §5.5.4 기준)
+    # ------------------------------------------------------------------
+
+    # ── setpci 헬퍼 ──────────────────────────────────────────────────
+
+    def _setpci_read(self, bdf: str, offset: int, width: str = 'l') -> Optional[int]:
+        """setpci로 PCI config 레지스터 읽기. 실패 시 None 반환.
+        width: 'b'=1B 'w'=2B 'l'=4B
+        """
+        try:
+            r = subprocess.run(
+                ['setpci', '-s', bdf, f'{offset:#x}.{width}'],
+                capture_output=True, text=True, timeout=3)
+            if r.returncode == 0 and r.stdout.strip():
+                return int(r.stdout.strip(), 16)
+        except Exception:
+            pass
+        return None
+
+    def _setpci_write(self, bdf: str, offset: int, value: int, mask: int,
+                      width: str = 'l') -> bool:
+        """setpci write-with-mask. mask=1인 비트만 수정, 나머지 보존.
+        width: 'b'=1B 'w'=2B 'l'=4B
+        반환: setpci returncode == 0 여부.
+        """
+        nchars = {'b': 2, 'w': 4, 'l': 8}[width]
+        spec = (f'{offset:#x}.{width}='
+                f'{value & mask:0{nchars}x}:{mask:0{nchars}x}')
+        try:
+            r = subprocess.run(
+                ['setpci', '-s', bdf, spec],
+                timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    # ── 탐지 ─────────────────────────────────────────────────────────
+
+    def _detect_pcie_info(self) -> None:
+        """NVMe 디바이스의 PCIe BDF + capability offsets + 루트 포트 탐지.
+
+        저장 변수:
+          _pcie_bdf              : "0000:02:00.0"   (endpoint)
+          _pcie_cap_offset       : PCIe Express cap (LNKCTL, DEVCTL2)
+          _pcie_pm_cap_offset    : PCI PM cap (PMCSR)
+          _pcie_l1ss_offset      : L1 Sub-States cap (없을 수 있음)
+          _pcie_lnkcap           : LNKCAP 레지스터 (ASPMS bit[11:10], CPM bit18)
+          _pcie_l1ss_cap         : L1SSCAP 레지스터 (지원 substate 비트[3:0])
+          _pcie_root_bdf         : 루트 포트 BDF
+          _pcie_root_cap_offset  : 루트 포트 PCIe Express cap
+          _pcie_root_l1ss_offset : 루트 포트 L1SS cap
+          _orig_aspm_policy      : 원본 ASPM policy (복원용)
+        실패해도 _pcie_bdf=None → L/D-state 제어 비활성화.
+        """
+        import re as _re
+
+        # ── 1. endpoint BDF 탐지 ────────────────────────────────────
+        dev = os.path.basename(self.config.nvme_device)
+        m = _re.match(r'(nvme\d+)', dev)
+        if m:
+            addr_file = f'/sys/class/nvme/{m.group(1)}/address'
+            try:
+                self._pcie_bdf = Path(addr_file).read_text().strip()
+            except Exception:
+                pass
+        if not self._pcie_bdf:
+            try:
+                r = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    if 'nvme' in line.lower() or 'non-volatile' in line.lower():
+                        bdf = line.split()[0]
+                        if bdf.count(':') == 1:
+                            bdf = '0000:' + bdf
+                        self._pcie_bdf = bdf
+                        break
+            except Exception:
+                pass
+
+        if not self._pcie_bdf:
+            log.warning("[PCIe] BDF 탐지 실패 — L/D-state 제어 비활성화")
+            return
+
+        # ── 2. lspci -v capability offsets 파싱 (공통 헬퍼) ─────────
+        def _parse_caps(bdf_str: str) -> dict:
+            caps: dict = {}
+            try:
+                r = subprocess.run(['lspci', '-v', '-s', bdf_str],
+                                   capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    mm = _re.search(r'Capabilities: \[([0-9a-fA-F]+)\]\s+(.*)', line)
+                    if not mm:
+                        continue
+                    off  = int(mm.group(1), 16)
+                    desc = mm.group(2)
+                    if 'Express' in desc and 'exp' not in caps:
+                        caps['exp'] = off
+                    elif 'Power Management' in desc and 'pm' not in caps:
+                        caps['pm'] = off
+                    elif ('L1 PM' in desc or 'Substates' in desc) and 'l1ss' not in caps:
+                        caps['l1ss'] = off
+            except Exception as e:
+                log.warning(f"[PCIe] lspci cap 파싱 실패({bdf_str}): {e}")
+            return caps
+
+        ep_caps = _parse_caps(self._pcie_bdf)
+        self._pcie_cap_offset    = ep_caps.get('exp')
+        self._pcie_pm_cap_offset = ep_caps.get('pm')
+        self._pcie_l1ss_offset   = ep_caps.get('l1ss')
+
+        # ── 3. LNKCAP / L1SSCAP 레지스터 읽기 ──────────────────────
+        #   LNKCAP: PCIe Express cap + 0x0C  (PCI_EXP_LNKCAP)
+        #   L1SSCAP: L1SS cap + 0x04         (PCI_L1SS_CAP)
+        if self._pcie_cap_offset is not None:
+            self._pcie_lnkcap = self._setpci_read(
+                self._pcie_bdf, self._pcie_cap_offset + 0x0C)
+        if self._pcie_l1ss_offset is not None:
+            self._pcie_l1ss_cap = self._setpci_read(
+                self._pcie_bdf, self._pcie_l1ss_offset + 0x04)
+
+        # ── 4. 루트 포트 BDF 탐지 (sysfs 심볼릭 링크 역추적) ───────
+        #   /sys/bus/pci/devices/<EP_BDF> → realpath → 부모 디렉터리명 = RP BDF
+        try:
+            ep_real = os.path.realpath(f'/sys/bus/pci/devices/{self._pcie_bdf}')
+            parent_bdf = os.path.basename(os.path.dirname(ep_real))
+            if _re.match(r'^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$',
+                         parent_bdf):
+                self._pcie_root_bdf = parent_bdf
+        except Exception as e:
+            log.debug(f"[PCIe] 루트 포트 BDF 탐지 실패: {e}")
+
+        # ── 5. 루트 포트 capability offsets ──────────────────────────
+        if self._pcie_root_bdf:
+            rp_caps = _parse_caps(self._pcie_root_bdf)
+            self._pcie_root_cap_offset  = rp_caps.get('exp')
+            self._pcie_root_l1ss_offset = rp_caps.get('l1ss')
+
+        # ── 6. 원본 ASPM 정책 저장 ──────────────────────────────────
+        #   /sys/module/pcie_aspm/parameters/policy 형식 예:
+        #   "default [powersave] performance" → 현재 선택은 [괄호] 안
+        try:
+            raw = Path('/sys/module/pcie_aspm/parameters/policy').read_text().strip()
+            for tok in raw.split():
+                if tok.startswith('[') and tok.endswith(']'):
+                    self._orig_aspm_policy = tok[1:-1]
+                    break
+            else:
+                self._orig_aspm_policy = raw  # 단일 값이면 그대로
+        except Exception:
+            self._orig_aspm_policy = 'default'
+
+        # ── 루트 포트 LNKCAP ASPMS 읽기 ─────────────────────────────
+        rp_lnkcap = None
+        if self._pcie_root_bdf and self._pcie_root_cap_offset is not None:
+            rp_lnkcap = self._setpci_read(
+                self._pcie_root_bdf, self._pcie_root_cap_offset + 0x0C)
+
+        # ── 커널 ASPM 활성화 여부 확인 ───────────────────────────────
+        aspm_disabled = False
+        try:
+            cmdline = Path('/proc/cmdline').read_text()
+            if 'pcie_aspm=off' in cmdline or 'pcie_aspm=force_disable' in cmdline:
+                aspm_disabled = True
+                log.warning("[PCIe] !!! 커널 cmdline에 pcie_aspm=off 감지 — "
+                            "LNKCTL 쓰기가 커널에 의해 override될 수 있음 !!!")
+        except Exception:
+            pass
+
+        # ── 로그 ────────────────────────────────────────────────────
+        aspms    = None if self._pcie_lnkcap is None else (self._pcie_lnkcap >> 10) & 0x3
+        cpm      = None if self._pcie_lnkcap is None else (self._pcie_lnkcap >> 18) & 0x1
+        rp_aspms = None if rp_lnkcap is None else (rp_lnkcap >> 10) & 0x3
+        l1ss_cap_str = (f'{self._pcie_l1ss_cap:#010x}'
+                        if self._pcie_l1ss_cap is not None else 'None')
+
+        log.warning(
+            f"[PCIe] EP={self._pcie_bdf}  "
+            f"EXP={self._pcie_cap_offset!r}  PM={self._pcie_pm_cap_offset!r}  "
+            f"L1SS={self._pcie_l1ss_offset!r}  "
+            f"ASPMS={aspms!r}  CPM={cpm!r}  L1SSCAP={l1ss_cap_str}")
+        log.warning(
+            f"[PCIe] RP={self._pcie_root_bdf}  "
+            f"RP_EXP={self._pcie_root_cap_offset!r}  "
+            f"RP_L1SS={self._pcie_root_l1ss_offset!r}  "
+            f"RP_ASPMS={rp_aspms!r}  "
+            f"ASPM_policy_orig={self._orig_aspm_policy!r}  "
+            f"aspm_disabled={aspm_disabled}")
+
+        # ── ASPM 진입 가능 여부 최종 판단 ────────────────────────────
+        if self._pcie_root_bdf is None:
+            log.warning("[PCIe] !!! RP BDF 미탐지 — L1/L1.2 진입 불가 (EP만 ASPMC 세팅됨) !!!")
+        elif self._pcie_root_cap_offset is None:
+            log.warning("[PCIe] !!! RP PCIe cap offset 없음 — RP LNKCTL 세팅 불가 !!!")
+        elif aspms is not None and not (aspms & 0x2):
+            log.warning(f"[PCIe] !!! EP LNKCAP ASPMS={aspms:#04x} — L1 미지원 !!!")
+        elif rp_aspms is not None and not (rp_aspms & 0x2):
+            log.warning(f"[PCIe] !!! RP LNKCAP ASPMS={rp_aspms:#04x} — RP L1 미지원 !!!")
+        else:
+            log.warning("[PCIe] L1 진입 조건 충족 (EP/RP 양측 L1 지원 확인)")
+
+    # ── L-state (ASPM) ───────────────────────────────────────────────
+
+    def _set_pcie_l_state(self, state: PCIeLState) -> bool:
+        """PCIe L-state 설정 (PCIe spec r5.0 §5.5.4.1 절차 준수).
+
+        L0  : ASPM 전체 비활성화
+              → LNKCTL ASPMC=00, L1SSCTL1 enable bits=0, DEVCTL2 LTRE=0, ECPM=0
+        L1  : ASPM L1 활성화 (LNKCAP.ASPMS 확인, 루트 포트→endpoint 순서)
+              → policy=powersave, LNKCTL ASPMC=ASPMS&0x2, ECPM if CPM
+        L1.2: L1 + L1 PM Substates L1.2 활성화 (spec §5.5.4.1 6단계)
+              Step1: L1SS enable bits 비활성화 (양측)
+              Step2: DEVCTL2 LTRE 활성화 (양측)
+              Step3: L1SSCTL1 LTR threshold 설정 (양측)
+                     LL1_2TV=0xa at bits[25:16], LL1_2TS=2 at bits[31:29]
+                     → threshold = 10 × 1024ns = 10.24µs
+              Step4: L1SSCTL1 enable bits 활성화 — upstream(RP) 먼저
+              Step5: LNKCTL ASPMC 활성화 (양측)
+              Step6: ECPM if CPM
+        BDF 미탐지 시 False 반환 (퍼징 흐름 영향 없음).
+        """
+        if not self._pcie_bdf or self._pcie_cap_offset is None:
+            return False
+
+        ep = self._pcie_bdf
+        rp = self._pcie_root_bdf            # None이면 루트 포트 skip
+        ec = self._pcie_cap_offset
+        rc = self._pcie_root_cap_offset     # None이면 skip
+        el = self._pcie_l1ss_offset
+        rl = self._pcie_root_l1ss_offset
+
+        # LNKCAP에서 ASPMS(bits[11:10]), CPM(bit18) 파싱
+        # LNKCAP 읽기 실패 시 L1 지원(0x2)·CPM 미지원(0) 으로 가정
+        aspms = ((self._pcie_lnkcap >> 10) & 0x3) if self._pcie_lnkcap is not None else 0x2
+        cpm   = ((self._pcie_lnkcap >> 18) & 0x1) if self._pcie_lnkcap is not None else 0
+
+        # ── L0: ASPM 전체 비활성화 ──────────────────────────────────
+        if state == PCIeLState.L0:
+            # [PMU] CLKREQ# Assert — 클록 복원 먼저, 링크 L0 재진입 후 레지스터 해제
+            #   L1.2 상태에서는 클록이 없으므로 setpci(config space write) 전에 반드시 수행.
+            #   클록 안정화(T_COMMON_MODE) 대기 후 레지스터 조작.
+            subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
+                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.001)
+
+            # 1. LNKCTL ASPMC = 0b00 (spec: ASPM disable 먼저)
+            ok = self._setpci_write(ep, ec + 0x10, 0x0000, 0x0003, 'w')
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x10, 0x0000, 0x0003, 'w')
+            # 2. L1SS enable bits clear (양측)
+            if el:
+                self._setpci_write(ep, el + 0x08, 0x00000000, 0x0000000F)
+            if rp and rl:
+                self._setpci_write(rp, rl + 0x08, 0x00000000, 0x0000000F)
+            # 3. DEVCTL2 LTRE clear (bit10) — LTR 비활성화
+            self._setpci_write(ep, ec + 0x28, 0x0000, 0x0400, 'w')
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x28, 0x0000, 0x0400, 'w')
+            # 4. LNKCTL ECPM clear (bit8)
+            self._setpci_write(ep, ec + 0x10, 0x0000, 0x0100, 'w')
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x10, 0x0000, 0x0100, 'w')
+            # 5. ASPM 정책 복원
+            try:
+                Path('/sys/module/pcie_aspm/parameters/policy').write_text(
+                    self._orig_aspm_policy)
+            except Exception:
+                pass
+            # 6. 검증: endpoint LNKCTL ASPMC == 0
+            rb = self._setpci_read(ep, ec + 0x10, 'w')
+            if rb is not None and (rb & 0x0003) != 0:
+                log.debug(f"[PCIe] L0 verify: LNKCTL ASPMC={rb & 0x3:#04x} (expected 0x00)")
+            return ok
+
+        # ── L1: ASPM L1 활성화 ──────────────────────────────────────
+        elif state == PCIeLState.L1:
+            if not (aspms & 0x2):
+                log.warning(f"[PCIe] L1 미지원 (LNKCAP.ASPMS={aspms:#04x})")
+                return False
+            # 1. 기존 L1SS enable bits 비활성화 (L1.2 잔류 방지)
+            if el:
+                self._setpci_write(ep, el + 0x08, 0x00000000, 0x0000000F)
+            if rp and rl:
+                self._setpci_write(rp, rl + 0x08, 0x00000000, 0x0000000F)
+            # 2. DEVCTL2 LTRE clear (bit10) — L1.2 잔류 방지
+            self._setpci_write(ep, ec + 0x28, 0x0000, 0x0400, 'w')
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x28, 0x0000, 0x0400, 'w')
+            # 3. PMU CLKREQ# Assert — NOPS device의 자연적 deassert 차단
+            #    CLKREQ#가 deassert되면 RP가 ref clock을 제거해 L1.2로 진입.
+            #    L1 조합에서는 clock을 유지해야 하므로 pin16으로 강제 assert.
+            subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
+                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 4. 전역 ASPM 정책 → powersave (커널 override 방지)
+            try:
+                Path('/sys/module/pcie_aspm/parameters/policy').write_text('powersave')
+            except Exception:
+                pass
+            # 4. LNKCTL ASPMC = ASPMS & 0b10 — EP(downstream) 먼저, RP(upstream) 이후
+            #    Linux kernel pci-aspm.c 순서: enable 시 EP 먼저, disable 시 RP 먼저
+            aspm_val = aspms & 0x2
+            ok = self._setpci_write(ep, ec + 0x10, aspm_val, 0x0003, 'w')   # EP 먼저
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x10, aspm_val, 0x0003, 'w')   # RP 나중
+            # 6. Clock PM (LNKCTL ECPM bit8) — CPM 미선언 시도 강제 활성화
+            #    LNKCAP CPM=0은 BIOS가 막은 경우가 많으므로 unconditional write
+            self._setpci_write(ep, ec + 0x10, 0x0100, 0x0100, 'w')
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
+            # 7. idle window — LNKCTL 쓴 뒤 PCIe 트래픽 없는 구간 확보
+            #    HW가 L1 idle timer 만료 + PM_Request_Ack DLLP 핸드셰이크 처리
+            time.sleep(L1_SETTLE)
+            return ok
+
+        # ── L1.2: ASPM L1 + L1 PM Substates L1.2 활성화 ────────────
+        else:  # PCIeLState.L1_2
+            # 전제 조건 확인
+            if not (aspms & 0x2):
+                log.warning(f"[PCIe] L1.2: L1 미지원 (LNKCAP.ASPMS={aspms:#04x})")
+                return False
+            if self._pcie_l1ss_cap is None:
+                log.warning("[PCIe] L1.2: L1SS cap 없음 — L1.2 불가")
+                return False
+            if not (self._pcie_l1ss_cap & 0x4):  # ASPM L1.2 Support (bit2)
+                log.warning(
+                    f"[PCIe] L1.2: ASPM L1.2 미지원 (L1SSCAP={self._pcie_l1ss_cap:#010x})")
+                return False
+
+            # Step 1: L1SS enable bits 비활성화 (양측) — spec §5.5.4.1 step 2
+            if el:
+                self._setpci_write(ep, el + 0x08, 0x00000000, 0x0000000F)
+            if rp and rl:
+                self._setpci_write(rp, rl + 0x08, 0x00000000, 0x0000000F)
+
+            # Step 2: 전역 ASPM 정책
+            try:
+                Path('/sys/module/pcie_aspm/parameters/policy').write_text('powersave')
+            except Exception:
+                pass
+
+            # Step 3: L1SSCTL1 enable bits — L1SSCAP 지원 비트만 활성화
+            #   bit0: PCI-PM L1.2, bit1: PCI-PM L1.1, bit2: ASPM L1.2, bit3: ASPM L1.1
+            #   upstream(RP) 먼저 enable — spec §5.5.4.1 step 5
+            # LTRE(LTR Enable) 미사용: PMU GPIO로 CLKREQ#를 직접 제어하므로
+            #   RP 자율 판단 메커니즘(LTR) 불필요. LTRE 활성화 시 LTR 메시지 오버헤드 발생.
+            l1ss_en = self._pcie_l1ss_cap & 0xF
+            if rp and rl:
+                self._setpci_write(rp, rl + 0x08, l1ss_en, 0x0000000F)
+            ok = True
+            if el:
+                ok = self._setpci_write(ep, el + 0x08, l1ss_en, 0x0000000F)
+
+            # Step 6: LNKCTL ASPMC — upstream(RP) 먼저, endpoint 이후 — spec step 6
+            aspm_val = aspms & 0x2
+            if rp and rc:
+                self._setpci_write(rp, rc + 0x10, aspm_val, 0x0003, 'w')
+            ok &= self._setpci_write(ep, ec + 0x10, aspm_val, 0x0003, 'w')
+
+            # Step 7: ECPM (Clock PM)
+            if cpm:
+                if rp and rc:
+                    self._setpci_write(rp, rc + 0x10, 0x0100, 0x0100, 'w')
+                self._setpci_write(ep, ec + 0x10, 0x0100, 0x0100, 'w')
+
+            # Step 8: 검증 (endpoint LNKCTL + L1SSCTL1) — CLKREQ# deassert 이전 필수
+            #   deassert 후에는 클록이 없어 config space read 불가.
+            rb_lnk = self._setpci_read(ep, ec + 0x10, 'w')
+            if rb_lnk is not None and (rb_lnk & 0x0003) != aspm_val:
+                log.debug(
+                    f"[PCIe] L1.2 verify LNKCTL ASPMC={rb_lnk & 0x3:#04x} "
+                    f"(expected {aspm_val:#04x})")
+                ok = False
+            if el:
+                rb_l1ss = self._setpci_read(ep, el + 0x08)
+                if rb_l1ss is not None:
+                    if (rb_l1ss & 0xF) != l1ss_en:
+                        log.debug(
+                            f"[PCIe] L1.2 verify L1SSCTL1 enable="
+                            f"{rb_l1ss & 0xF:#04x} (expected {l1ss_en:#04x})")
+
+            # [PMU] CLKREQ# Deassert — 레지스터 설정·검증 완료 후 마지막 수행
+            #   루트 포트가 CLKREQ# 비활성 감지 → 레퍼런스 클록 제거 → 실제 L1.2 진입.
+            subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
+                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # idle window — L1 idle timer + L1.2 clock off 완료 대기
+            time.sleep(L1_SETTLE + L1_2_SETTLE)
+            return ok
+
+    # ── D-state (PCI PM) ─────────────────────────────────────────────
+
+    def _set_pcie_d_state(self, state: PCIeDState) -> bool:
+        """setpci로 PMCSR bits[1:0] 설정 (D0=0x00, D3hot=0x03).
+        PCI PM cap + 0x04 = PMCSR 레지스터.
+        BDF 미탐지 시 False 반환.
+
+        write 후 readback 검증 + 최대 3회 retry.
+        """
+        if not self._pcie_bdf or self._pcie_pm_cap_offset is None:
+            return False
+        val    = 3 if state == PCIeDState.D3 else 0
+        exp    = val & 0x3
+        offset = self._pcie_pm_cap_offset + 0x04
+        for attempt in range(3):
+            ok = self._setpci_write(self._pcie_bdf, offset, val, 0x0003, 'w')
+            if not ok:
+                time.sleep(0.05)
+                continue
+            rb = self._setpci_read(self._pcie_bdf, offset, 'w')
+            if rb is not None and (rb & 0x3) == exp:
+                if attempt > 0:
+                    log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 확인 (attempt {attempt+1})")
+                return True
+            time.sleep(0.05)
+        log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 진입 실패")
+        return False
+
+    # ── 통합 setter ──────────────────────────────────────────────────
+
+    def _set_power_combo(self, combo: PowerCombo) -> None:
+        """NVMe PS + PCIe L/D-state 동시 설정 + cmd_history 기록.
+
+        순서: NVMe PS → (PS settle) → L-state → D3
+          PS settle: NOPS(PS3/PS4)는 SetFeatures 직후 바로 L-state setpci를 날리면
+                     config TLP가 컨트롤러를 깨워 PS 진입이 완료되지 않음.
+                     _ps_settle[ps]만큼 대기 후 L-state 설정 시작.
+          L-state 먼저: EP↔RP 간 ASPM 협상 완료 + CLKREQ# deassert(L1.2)까지 완료.
+          D3 나중: D3hot config TLP가 링크를 L0으로 순간 깨우지만,
+                   ASPM이 이미 활성화된 상태이므로 링크 idle 후 자동으로 L1/L1.2 재진입.
+        """
+        t0    = time.monotonic()
+        ok_ps = self._pm_set_state(combo.nvme_ps)
+        # NOPS(PS3/PS4) settle: 실제 NAND 파워다운 완료까지 대기
+        # 이후 setpci(config TLP)가 링크를 깨우지 않도록 PS 안정화 후 L-state 진입
+        ps_settle = self._ps_settle.get(combo.nvme_ps, 0.05)
+        if ps_settle > 0.05:
+            time.sleep(ps_settle)
+        ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — ASPM 협상 완료
+        ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 나중 — 링크 idle 후 자동 재진입
+        # D3+L1/L1.2: D3 config TLP가 링크를 순간 깨움 → 재진입 대기
+        if combo.pcie_d == PCIeDState.D3:
+            if combo.pcie_l == PCIeLState.L1_2:
+                time.sleep(L1_SETTLE + L1_2_SETTLE)
+            elif combo.pcie_l == PCIeLState.L1:
+                time.sleep(L1_SETTLE)
+        elapsed = time.monotonic() - t0
+        status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
+                   f"L={'OK' if ok_l else 'FAIL'} "
+                   f"D={'OK' if ok_d else 'FAIL'}")
+        log.warning(f"[PM] → {combo.label}  {status}  ({elapsed:.3f}s)")
+
+        # PCIe 상태 변화를 별도 항목으로 기록 → replay .sh에서 setpci 재현
+        if self._pcie_bdf:
+            self._cmd_history.append({
+                'kind':                  'pcie_state',
+                'label':                 f'PCIe {combo.label}',
+                'pcie_l':                int(combo.pcie_l),
+                'pcie_d':                int(combo.pcie_d),
+                'pcie_bdf':              self._pcie_bdf,
+                'pcie_cap_offset':       self._pcie_cap_offset,
+                'pcie_pm_cap_offset':    self._pcie_pm_cap_offset,
+                'pcie_l1ss_offset':      self._pcie_l1ss_offset,
+                'pcie_lnkcap':           self._pcie_lnkcap,
+                'pcie_l1ss_cap':         self._pcie_l1ss_cap,
+                'pcie_root_bdf':         self._pcie_root_bdf,
+                'pcie_root_cap_offset':  self._pcie_root_cap_offset,
+                'pcie_root_l1ss_offset': self._pcie_root_l1ss_offset,
+            })
+
+    def _apst_disable(self) -> None:
+        """NVMe APST(Autonomous Power State Transition) 비활성화.
+
+        APST 활성화 상태에서는 NVMe 컨트롤러가 자율적으로 PS 전환을 하면서
+        PCIe 트래픽을 발생시켜 L1/L1.2 idle window를 깨뜨림.
+        퍼징 시작 전 비활성화하여 PM 상태가 fuzzer 제어 하에만 전환되도록 함.
+        """
+        dev = self.config.nvme_device
+        # 현재 APST CDW11 값 저장
+        try:
+            r = subprocess.run(
+                ['nvme', 'get-feature', dev, '-f', '0x0C'],
+                capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if 'value:' in line.lower() or 'Current value' in line:
+                    import re as _re
+                    m = _re.search(r'0x([0-9a-fA-F]+)', line)
+                    if m:
+                        self._orig_apst_cdw11 = int(m.group(1), 16)
+                        break
+        except Exception as e:
+            log.warning(f"[APST] get-feature 실패: {e}")
+
+        # APST 비활성화 (APSTE=0)
+        if self._orig_apst_cdw11 == 0:
+            log.warning("[APST] 이미 비활성화 상태 — skip")
+            return
+
+        # APST(FID=0x0C)는 CDW11만으로 부족한 장치가 있음.
+        # 256바이트 APST descriptor table(all-zero)을 data buffer로 함께 전송.
+        import tempfile as _tf
+        _ok_apst = False
+        try:
+            with _tf.NamedTemporaryFile(suffix='.apst') as _f:
+                _f.write(b'\x00' * 256)
+                _f.flush()
+                r = subprocess.run(
+                    ['nvme', 'set-feature', dev, '-f', '0x0C', '-v', '0',
+                     '--data-len=256', f'--data={_f.name}'],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    log.warning(f"[APST] 비활성화 완료 (원본 CDW11={self._orig_apst_cdw11:#010x})")
+                    _ok_apst = True
+                else:
+                    log.warning(f"[APST] set-feature 실패 (rc={r.returncode}): {r.stderr.strip()}")
+        except Exception as e:
+            log.warning(f"[APST] set-feature 예외: {e}")
+
+        # fallback: sysfs runtime PM 비활성화 — APST는 커널 PM 경유하므로 효과 있음
+        if not _ok_apst and self._pcie_bdf:
+            try:
+                _ctrl = Path(f'/sys/bus/pci/devices/{self._pcie_bdf}/power/control')
+                if _ctrl.exists():
+                    _ctrl.write_text('on')
+                    log.warning("[APST] sysfs power/control=on 으로 runtime PM 비활성화")
+                    _ok_apst = True
+            except Exception as e:
+                log.warning(f"[APST] sysfs fallback 실패: {e}")
+
+        if not _ok_apst:
+            log.warning("[APST] 비활성화 실패 — APST 자율 PS 전환이 MISMATCH 유발할 수 있음")
+
+    def _apst_restore(self) -> None:
+        """퍼징 종료 시 원본 APST 상태 복원."""
+        if self._orig_apst_cdw11 is None or self._orig_apst_cdw11 == 0:
+            return  # 원래 비활성화 상태였으면 복원 불필요
+        dev = self.config.nvme_device
+        try:
+            r = subprocess.run(
+                ['nvme', 'set-feature', dev, '-f', '0x0C',
+                 '-v', str(self._orig_apst_cdw11)],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                log.warning(f"[APST] 복원 완료 (CDW11={self._orig_apst_cdw11:#010x})")
+            else:
+                log.warning(f"[APST] 복원 실패 (rc={r.returncode}): {r.stderr.strip()}")
+        except Exception as e:
+            log.warning(f"[APST] 복원 실패: {e}")
+
+    def _keepalive_disable(self) -> None:
+        """NVMe Keep-Alive Timer 비활성화.
+
+        Keep-Alive 활성화 시 드라이버가 주기적으로 NVMe admin command를 전송,
+        PS3/PS4 deep sleep에서 컨트롤러를 wake-up시켜 PCIe 트래픽 발생.
+        L1/L1.2 idle window를 깨뜨리므로 퍼징 전 비활성화.
+        """
+        dev = self.config.nvme_device
+        # 현재 Keep-Alive 값 저장
+        try:
+            r = subprocess.run(
+                ['nvme', 'get-feature', dev, '-f', '0x0F'],
+                capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if 'value:' in line.lower() or 'Current value' in line:
+                    import re as _re
+                    m = _re.search(r'0x([0-9a-fA-F]+)', line)
+                    if m:
+                        self._orig_keepalive_val = int(m.group(1), 16)
+                        break
+        except Exception as e:
+            log.warning(f"[KeepAlive] get-feature 실패: {e}")
+
+        if self._orig_keepalive_val == 0:
+            log.warning("[KeepAlive] 이미 비활성화 상태 — skip")
+            return
+        try:
+            r = subprocess.run(
+                ['nvme', 'set-feature', dev, '-f', '0x0F', '-v', '0'],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                log.warning(f"[KeepAlive] 비활성화 완료 "
+                            f"(원본={self._orig_keepalive_val:#010x})")
+            else:
+                log.warning(f"[KeepAlive] 비활성화 실패 (rc={r.returncode}): "
+                            f"{r.stderr.strip()}")
+        except Exception as e:
+            log.warning(f"[KeepAlive] set-feature 실패: {e}")
+
+    def _keepalive_restore(self) -> None:
+        """퍼징 종료 시 원본 Keep-Alive 상태 복원."""
+        if self._orig_keepalive_val == 0:
+            return
+        dev = self.config.nvme_device
+        try:
+            r = subprocess.run(
+                ['nvme', 'set-feature', dev, '-f', '0x0F',
+                 '-v', str(self._orig_keepalive_val)],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                log.warning(f"[KeepAlive] 복원 완료 "
+                            f"(val={self._orig_keepalive_val:#010x})")
+            else:
+                log.warning(f"[KeepAlive] 복원 실패 (rc={r.returncode}): "
+                            f"{r.stderr.strip()}")
+        except Exception as e:
+            log.warning(f"[KeepAlive] 복원 실패: {e}")
+
+    def _pm_d3_safe_restore(self) -> bool:
+        """D3hot / L1.2+D3 상태에서 안전하게 PS0+L0+D0 으로 복귀.
+
+        복귀 순서:
+          1. _set_pcie_l_state(L0) — L1.2 시 CLKREQ# assert로 clock 복원 먼저.
+                                     clock 없는 상태(L1.2)에서 config write하면 hang.
+          2. setpci PMCSR=D0       — clock 복원 후 config space 접근 가능
+          3. 10ms Trst 대기        — PCI spec §5.3.1.4
+          4. NVMe SetFeatures PS0  — D0 복귀 후 NVMe 커맨드 가능
+        """
+        ok = True
+        # Step 1: L0 먼저 — L1.2이면 CLKREQ# assert로 clock 복원 (TLP 전 필수)
+        if self._pcie_bdf and self._pcie_cap_offset is not None:
+            self._set_pcie_l_state(PCIeLState.L0)
+        # Step 2: D3 → D0 (clock 복원 후 config space 접근)
+        if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
+            ok &= self._set_pcie_d_state(PCIeDState.D0)
+        # Step 3: Trst
+        time.sleep(0.01)
+        # Step 4: NVMe PS0
+        ok &= self._pm_set_state(0)
+        return ok
+
+    @staticmethod
+    def _is_nonop_combo(combo: PowerCombo) -> bool:
+        """NVMe 커맨드 전송 전 반드시 복귀가 필요한 상태 판정.
+
+        복귀 필요:
+          D3hot : PCIe 컨트롤러 core 전원 차단 → NVMe 커맨드 hang, HW 자동 wake 없음
+          L1.2  : PMU CLKREQ# deasserted → 레퍼런스 클록 없음 → TLP 전송 불가
+
+        복귀 불필요:
+          PS3/PS4 : 커맨드 수신 시 컨트롤러 자동 wake-up 후 처리
+          L1      : HW가 TLP 수신 시 자동 wake (클록 유지)
+          PS1/PS2 : Operational lower-power, 커맨드 가능
+        """
+        return (combo.pcie_d  == PCIeDState.D3
+                or combo.pcie_l == PCIeLState.L1_2)
+
+    def _nonop_restore(self, combo: PowerCombo) -> PowerCombo:
+        """D3hot / L1.2 상태에서 NVMe 커맨드 가능 상태로 복귀.
+
+        복귀 순서:
+          D3hot 포함: L0(CLKREQ# assert) → setpci D0 → Trst 10ms → SetFeatures PS0
+                      L1.2+D3 시 clock 없는 상태에서 config write 금지
+          L1.2 (D0) : PMU CLKREQ# assert 포함 _set_pcie_l_state(L0)
+
+        반환값: 복귀 후 실제 상태를 나타내는 PowerCombo
+        """
+        if combo.pcie_d == PCIeDState.D3:
+            # D3hot: config space만 가능, NVMe 불가 → D0 먼저
+            log.warning(f"[PM] NonOp restore: {combo.label} → D0+L0+PS0 "
+                        f"(D3hot: setpci D0 → Trst → L0 → SetFeatures PS0)")
+            self._pm_d3_safe_restore()
+            return POWER_COMBOS[0]  # PS0+L0+D0
+
+        # L1.2 (D0): PMU CLKREQ# deasserted → assert 포함한 L0 복귀 필수
+        log.warning(f"[PM] NonOp restore: {combo.label} → L0 "
+                    f"(L1.2: PMU CLKREQ# assert + setpci L0)")
+        self._set_pcie_l_state(PCIeLState.L0)
+        return PowerCombo(combo.nvme_ps, PCIeLState.L0, PCIeDState.D0)
+
+    def _pm_verify_combo(self, combo: PowerCombo) -> dict:
+        """현재 PM 상태를 다중 방법으로 검증하여 dict로 반환.
+
+        검증 항목:
+          pmu       : python3 pmu_4_1.py 3 1 (getcurrent) 원시 출력값
+          d_state   : setpci PMCSR bits[1:0] 실제값 vs 기대값
+          l_state   : setpci LNKCTL bits[1:0] ASPM 실제값 vs 기대값
+          l1ss      : setpci L1SSCTL1 bits[3:0] 실제값 (L1SS cap 있을 때)
+          sysfs_d   : /sys/bus/pci/devices/<BDF>/power_state 커널 뷰
+        """
+        res = {}
+
+        # 0. PMU getcurrent — NVMe 커맨드보다 반드시 먼저 측정.
+        #    PS3/PS4(NOPS)는 nvme get-feature 같은 Admin 커맨드를 받는 순간
+        #    컨트롤러가 강제 wake-up되어 NAND 재초기화 transient 전류가 발생함.
+        #    PMU 측정은 JTAG 경로(pmu_4_1.py)이므로 NVMe 링크를 건드리지 않음.
+        try:
+            r = subprocess.run(
+                ['python3', _PMU_SCRIPT, '3', '1'],
+                capture_output=True, text=True, timeout=3)
+            raw = r.stdout.strip()
+            res['pmu'] = raw if r.returncode == 0 else f"FAIL(rc={r.returncode}) {r.stderr.strip()}"
+        except Exception as e:
+            res['pmu'] = f"ERR({e})"
+
+        # 1. nvme get-feature FID=0x02 — PS 진입 확인 (PMU 측정 후 수행)
+        #    D3hot: NVMe BAR 접근 불가 → 커널 NVMe 드라이버가 ioctl을 blocking하여
+        #           SIGKILL도 D-sleep 중엔 무시됨 → 드라이버 자체 타임아웃(30~60s)까지 대기.
+        #           D-state는 setpci PMCSR readback으로 이미 검증하므로 skip.
+        #    NOPS(PS3/PS4): 커맨드 수신 시 컨트롤러 wake-up 후 설정된 PS값 반환.
+        if combo.pcie_d == PCIeDState.D3:
+            res['nvme_ps'] = 'skipped (D3hot: NVMe BAR inaccessible)'
+        else:
+            try:
+                r = subprocess.run(
+                    ['nvme', 'get-feature', self.config.nvme_device, '-f', '0x02'],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    # "get-feature:0x2 (Power Management), Current value:0x00000004"
+                    # "get-feature:0x02, Current value: 00000000" 등 다양한 포맷 대응
+                    import re as _re_gf
+                    raw_gf = (r.stdout + r.stderr).strip()
+                    cur_ps = None
+                    m = _re_gf.search(
+                        r'[Cc]urrent\s+value[:\s]+(?:0x)?([0-9a-fA-F]+)', raw_gf)
+                    if m:
+                        try:
+                            cur_ps = int(m.group(1), 16)
+                        except ValueError:
+                            pass
+                    if cur_ps is not None:
+                        exp_ps = combo.nvme_ps
+                        chk    = 'OK' if cur_ps == exp_ps else f'MISMATCH(exp=PS{exp_ps})'
+                        res['nvme_ps'] = f"PS{cur_ps} {chk}"
+                    else:
+                        res['nvme_ps'] = f"parse_fail: {raw_gf[:80]}"
+                else:
+                    res['nvme_ps'] = f"FAIL(rc={r.returncode}) {r.stderr.strip()[:60]}"
+            except Exception as e:
+                res['nvme_ps'] = f"ERR({e})"
+
+        # 2. PMCSR readback — D-state bits[1:0]
+        if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
+            v = self._setpci_read(self._pcie_bdf, self._pcie_pm_cap_offset + 0x04, 'w')
+            if v is not None:
+                dval  = v & 0x3
+                dname = {0: 'D0', 1: 'D1', 2: 'D2', 3: 'D3hot'}.get(dval, 'D?')
+                exp   = 3 if combo.pcie_d == PCIeDState.D3 else 0
+                chk   = 'OK' if dval == exp else f'MISMATCH(exp={exp})'
+                res['d_state'] = f"{dname}(raw={dval:#04x}) {chk}"
+            else:
+                res['d_state'] = 'read_fail'
+
+        # 3. LNKCTL readback — EP ASPM bits[1:0]
+        if self._pcie_bdf and self._pcie_cap_offset is not None:
+            v = self._setpci_read(self._pcie_bdf, self._pcie_cap_offset + 0x10, 'w')
+            if v is not None:
+                aspm  = v & 0x3
+                aname = {0: 'L0/disabled', 1: 'L0s', 2: 'L1', 3: 'L0s+L1'}.get(aspm, '?')
+                exp   = 0 if combo.pcie_l == PCIeLState.L0 else 2
+                chk   = 'OK' if aspm == exp else f'MISMATCH(exp={exp})'
+                res['l_state_ep'] = f"EP ASPM={aname}(raw={aspm:#04x}) {chk}"
+            else:
+                res['l_state_ep'] = 'read_fail'
+
+        # 3b. RP LNKCTL readback — L1은 EP+RP 양측 모두 설정되어야 진입 가능
+        if self._pcie_root_bdf and self._pcie_root_cap_offset is not None:
+            v = self._setpci_read(self._pcie_root_bdf,
+                                  self._pcie_root_cap_offset + 0x10, 'w')
+            if v is not None:
+                aspm  = v & 0x3
+                aname = {0: 'L0/disabled', 1: 'L0s', 2: 'L1', 3: 'L0s+L1'}.get(aspm, '?')
+                exp   = 0 if combo.pcie_l == PCIeLState.L0 else 2
+                chk   = 'OK' if aspm == exp else f'MISMATCH(exp={exp})'
+                res['l_state_rp'] = f"RP ASPM={aname}(raw={aspm:#04x}) {chk}"
+            else:
+                res['l_state_rp'] = 'read_fail'
+        else:
+            res['l_state_rp'] = f"RP not detected (bdf={self._pcie_root_bdf!r} cap={self._pcie_root_cap_offset!r})"
+
+        # 3c. ASPM 정책 실제값 확인 (커널 override 감지)
+        try:
+            raw = Path('/sys/module/pcie_aspm/parameters/policy').read_text().strip()
+            res['aspm_policy'] = raw
+        except Exception:
+            res['aspm_policy'] = 'N/A'
+
+        # 3d. lspci -vv 로 실제 링크 ASPM 상태 확인 (LnkCtl: ASPM ... line)
+        if self._pcie_bdf:
+            try:
+                r = subprocess.run(
+                    ['lspci', '-vv', '-s', self._pcie_bdf],
+                    capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    if 'LnkCtl' in line and 'ASPM' in line:
+                        res['lspci_lnkctl'] = line.strip()
+                        break
+            except Exception:
+                pass
+
+        # 4. L1SSCTL1 readback — enable bits[3:0] (cap 있을 때만)
+        if self._pcie_bdf and self._pcie_l1ss_offset is not None:
+            v = self._setpci_read(self._pcie_bdf, self._pcie_l1ss_offset + 0x08, 'l')
+            if v is not None:
+                l1ss_en = v & 0xF
+                exp_en  = 0xF if combo.pcie_l == PCIeLState.L1_2 else 0x0
+                chk     = 'OK' if l1ss_en == exp_en else f'MISMATCH(exp={exp_en:#03x})'
+                res['l1ss'] = f"L1SS_EN={l1ss_en:#03x} {chk}"
+
+        # sysfs power_state는 커널 PM 뷰 — setpci 직접 write 시 하드웨어와 불일치.
+        # PMCSR readback(d_state)이 실제 하드웨어 레지스터 기준이므로 sysfs는 생략.
+
+        return res
+
+    def _init_ps_settle(self) -> None:
+        """nvme id-ctrl 텍스트 출력에서 PS별 enlat/exlat(μs) 파싱 → preflight settle 계산.
+
+        formula: settle = (enlat_us + exlat_us) / 1_000_000 * 2 + 0.05
+                 PS3 최소값: 0.5s (NAND 캐시 플러시 + retention 진입 대기)
+                 PS4 최소값: 2.0s (더 깊은 sleep → NAND flush 완료까지 추가 대기)
+        파싱 실패 시 _PS_SETTLE_FALLBACK 유지.
+        """
+        import re as _re
+        NOPS_MIN_SETTLE  = 0.5   # PS3: NAND retention 진입까지 최소 대기
+        PS4_MIN_SETTLE   = 2.0   # PS4: 더 깊은 sleep → NAND flush 완료까지 더 긴 대기
+        parsed: dict[int, float] = {}
+        try:
+            r = subprocess.run(
+                ['nvme', 'id-ctrl', self.config.nvme_device],
+                capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                m = _re.search(r'ps\s+(\d+)\s*:.*enlat:(\d+)\s+exlat:(\d+)', line)
+                if m:
+                    ps    = int(m.group(1))
+                    enlat = int(m.group(2))
+                    exlat = int(m.group(3))
+                    settle = (enlat + exlat) / 1_000_000 * 2 + 0.05
+                    # NOPS 여부: 같은 줄에 'non-operational' 포함 여부로 판단
+                    is_nops = 'non-operational' in line.lower()
+                    if is_nops:
+                        min_settle = PS4_MIN_SETTLE if ps >= 4 else NOPS_MIN_SETTLE
+                        settle = max(settle, min_settle)
+                    parsed[ps] = max(settle, 0.05)
+        except Exception as e:
+            log.warning(f"[PS-Settle] id-ctrl 파싱 예외: {e} → fallback 유지")
+
+        if parsed:
+            self._ps_settle.update(parsed)
+            log.warning("[PS-Settle] id-ctrl 기반 settle 계산: " +
+                        ", ".join(f"PS{k}={v*1000:.0f}ms"
+                                  for k, v in sorted(self._ps_settle.items())))
+        else:
+            log.warning("[PS-Settle] id-ctrl 파싱 실패 → fallback: " +
+                        ", ".join(f"PS{k}={v*1000:.0f}ms"
+                                  for k, v in sorted(self._ps_settle.items())))
+
+    def _pm_preflight_check(self) -> bool:
+        """퍼징 시작 전 전체 PowerCombo(30개) 사전 동작 검증.
+        idle 유니버스 수집(diagnose) 직전에 호출됨.
+
+        각 조합에 대해:
+          1. _set_power_combo() 로 상태 진입
+          2. 정착 대기 (L1.2/D3는 추가 대기)
+          3. PS0+L0+D0 (baseline) 으로 복귀
+             - D3 포함 combo: _pm_d3_safe_restore() 사용 (D0 먼저, NVMe 나중)
+             - D0 combo    : _set_power_combo(baseline) 사용
+          4. 복귀 후 nvme id-ctrl 로 NVMe 생존 확인
+        결과 요약 테이블 출력.
+        실패 조합이 있어도 fuzzing 계속 (경고만 출력).
+        """
+        if self.config.pm_inject_prob <= 0:
+            return True
+
+        # id-ctrl에서 enlat/exlat 읽어 PS별 settle 시간 동적 계산
+        self._init_ps_settle()
+
+        RESTORE_SETTLE     = 0.5   # baseline 복귀 후 안정화 대기 (초)
+        D3_RESTORE_SETTLE  = 1.5   # D3→D0 restore 후 NVMe 드라이버 재인식 대기
+        D3_EXTRA           = 1.0   # D3 진입 후 추가 settle (setpci → 링크 안정화)
+        PROBE_TIMEOUT = 5.0   # nvme id-ctrl 타임아웃
+
+        baseline = POWER_COMBOS[0]  # PS0+L0+D0
+
+        log.warning("=" * 60)
+        log.warning(f"[PM-Preflight] 전체 PowerCombo 사전 검증 시작 "
+                    f"({len(POWER_COMBOS)}개 조합)")
+        log.warning("=" * 60)
+
+        # (combo, ok_set, ok_restore, ok_nvme, elapsed)
+        results: list = []
+        failed_labels: list = []
+
+        # D0 먼저 전체 L×PS, 그 다음 D3 전체 L×PS
+        _preflight_order = sorted(
+            POWER_COMBOS,
+            key=lambda c: (int(c.pcie_d), int(c.pcie_l), c.nvme_ps)
+        )
+
+        for i, combo in enumerate(_preflight_order):
+            log.warning(f"  [{i+1:2d}/{len(_preflight_order)}] {combo.label} 진입 중...")
+            t0 = time.monotonic()
+
+            # 1. 상태 진입
+            ok_set = True
+            try:
+                self._set_power_combo(combo)
+            except Exception as e:
+                log.warning(f"    → _set_power_combo 예외: {e}")
+                ok_set = False
+
+            # 2. 정착 대기
+            #    L1/L1.2 settle은 _set_pcie_l_state() 내부에서 이미 처리됨
+            #    PS settle은 id-ctrl enlat/exlat 기반으로 동적 계산 (_init_ps_settle)
+            settle = self._ps_settle.get(combo.nvme_ps, 0.05)
+            if combo.pcie_d == PCIeDState.D3:
+                settle += D3_EXTRA
+            time.sleep(settle)
+
+            # 3. PM 상태 다중 검증 (진입 직후, 복귀 전)
+            #    - PMU getcurrent (pmu_4_1.py 3 1)
+            #    - setpci PMCSR / LNKCTL / L1SSCTL1 readback
+            #    - sysfs power_state
+            verify = {}
+            if ok_set:
+                verify = self._pm_verify_combo(combo)
+                log.warning(f"    [verify] PMU        : {verify.get('pmu', 'N/A')}")
+                if 'nvme_ps' in verify:
+                    log.warning(f"    [verify] NVMe PS    : {verify['nvme_ps']}")
+                if 'd_state' in verify:
+                    log.warning(f"    [verify] D-state(HW): {verify['d_state']}")
+                if 'l_state_ep' in verify:
+                    log.warning(f"    [verify] L-state EP : {verify['l_state_ep']}")
+                if 'l_state_rp' in verify:
+                    log.warning(f"    [verify] L-state RP : {verify['l_state_rp']}")
+                if 'aspm_policy' in verify:
+                    log.warning(f"    [verify] ASPM policy: {verify['aspm_policy']}")
+                if 'lspci_lnkctl' in verify:
+                    log.warning(f"    [verify] lspci      : {verify['lspci_lnkctl']}")
+                if 'l1ss' in verify:
+                    log.warning(f"    [verify] L1SS       : {verify['l1ss']}")
+
+            # 4. PS0+L0+D0 복귀
+            #    D3 포함 combo: D0 먼저(setpci) → Trst → L0 → PS0 순서 필수.
+            #    D3hot 상태에서 NVMe 커맨드를 먼저 보내면 hang 발생.
+            ok_restore = True
+            try:
+                if combo.pcie_d == PCIeDState.D3:
+                    ok_restore = self._pm_d3_safe_restore()
+                    time.sleep(D3_RESTORE_SETTLE)
+                else:
+                    self._set_power_combo(baseline)
+                    time.sleep(RESTORE_SETTLE)
+            except Exception as e:
+                log.warning(f"    → baseline 복귀 예외: {e}")
+                ok_restore = False
+
+            # 5. 복귀 검증 — PMU current + get-feature(PS0 확인)
+            #    PMU: PS0 복귀 후 정상 전류 확인
+            #    get-feature: PS0(0x00) 반환 여부 — MISMATCH면 이전 PS가 남아있는 것
+            ok_nvme   = False
+            rv_verify = {}
+            if ok_restore:
+                rv_verify = self._pm_verify_combo(baseline)
+                rv_pmu = rv_verify.get('pmu', 'N/A')
+                log.warning(f"    [restore] PMU       : {rv_pmu}")
+                if 'nvme_ps' in rv_verify:
+                    rv_ps = rv_verify['nvme_ps']
+                    log.warning(f"    [restore] NVMe PS   : {rv_ps}")
+                    if 'MISMATCH' in rv_ps:
+                        log.warning(f"    → 복귀 실패: PS0으로 돌아오지 않음")
+                        ok_restore = False
+                # get-feature 성공 = NVMe 응답 정상
+                ok_nvme = ('nvme_ps' in rv_verify and
+                           'ERR' not in rv_verify['nvme_ps'] and
+                           'FAIL' not in rv_verify['nvme_ps'])
+            if not ok_nvme:
+                # fallback: nvme id-ctrl 로 생존만 확인
+                try:
+                    r = subprocess.run(
+                        ['nvme', 'id-ctrl', self.config.nvme_device],
+                        timeout=PROBE_TIMEOUT,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    ok_nvme = (r.returncode == 0)
+                except Exception as e:
+                    log.warning(f"    → nvme id-ctrl 예외: {e}")
+
+            elapsed  = time.monotonic() - t0
+            # pmu 출력은 멀티라인 (CLI 경로 echo 포함) — 숫자만 있는 줄을 추출
+            _pmu_raw = verify.get('pmu', 'N/A')
+            pmu_val  = 'N/A'
+            for _line in _pmu_raw.splitlines():
+                _tok = _line.strip()
+                if _tok and _tok.lstrip('-').replace('.', '', 1).isdigit():
+                    pmu_val = _tok
+                    break
+            if pmu_val == 'N/A' and _pmu_raw not in ('N/A', ''):
+                pmu_val = _pmu_raw.strip().splitlines()[-1].strip() or 'N/A'
+            results.append((combo, ok_set, ok_restore, ok_nvme, elapsed, pmu_val))
+
+            ok_all = ok_set and ok_restore and ok_nvme
+            mark   = "OK  " if ok_all else "FAIL"
+            log.warning(f"    → SET={'OK' if ok_set else 'FAIL'} "
+                        f"RESTORE={'OK' if ok_restore else 'FAIL'} "
+                        f"NVMe={'OK' if ok_nvme else 'FAIL'} "
+                        f"[{mark}]  ({elapsed:.2f}s)")
+            if not ok_all:
+                failed_labels.append(combo.label)
+
+        # 최종 baseline 복귀 보장
+        try:
+            self._pm_d3_safe_restore()
+            time.sleep(D3_RESTORE_SETTLE)
+        except Exception:
+            pass
+
+        # ── 요약 테이블 ──
+        log.warning("=" * 60)
+        log.warning("[PM-Preflight] 결과 요약")
+        log.warning(f"  {'Combo':<20} {'PMU(mA)':>9} {'SET':>5} {'RESTORE':>8} {'NVMe':>6} {'Time':>7}  ")
+        log.warning("  " + "-" * 60)
+        for combo, ok_set, ok_restore, ok_nvme, elapsed, pmu_val in results:
+            mark = "✓" if (ok_set and ok_restore and ok_nvme) else "✗"
+            log.warning(
+                f"  {combo.label:<20} "
+                f"{pmu_val:>9} "
+                f"{'OK' if ok_set else 'FAIL':>5} "
+                f"{'OK' if ok_restore else 'FAIL':>8} "
+                f"{'OK' if ok_nvme else 'FAIL':>6} "
+                f"{elapsed:>6.2f}s  {mark}")
+        log.warning("  " + "-" * 60)
+        passed = len(results) - len(failed_labels)
+        log.warning(f"[PM-Preflight] 통과: {passed}/{len(POWER_COMBOS)}")
+        if failed_labels:
+            log.warning(f"[PM-Preflight] 실패 조합: {', '.join(failed_labels)}")
+            log.warning("[PM-Preflight] 실패 조합은 퍼징 중 예상치 못한 동작 유발 가능 — 확인 권장")
+        else:
+            log.warning("[PM-Preflight] 모든 조합 정상 — PM 퍼징 준비 완료")
+        log.warning("=" * 60)
+
+        # 실패 조합이 있어도 fuzzing 계속 (abort하지 않음)
+        return True
+
     def _send_nvme_command(self, data: bytes, seed: Seed, timeout_mult: int = 1) -> int:
         """subprocess(nvme-cli) 기반 NVMe passthru 명령 전송.
         반환값:
@@ -3265,6 +4374,144 @@ class NVMeFuzzer:
             marker = "  <- CRASH CMD" if is_last else ""
             step_str = f"[{i:03d}/{len(history)}] {label}{marker}"
             lines.append(f"# {step_str}")
+
+            # v5.2: pcie_state 항목 → PCIe spec 준수 setpci 시퀀스
+            if entry.get('kind') == 'pcie_state':
+                bdf      = entry.get('pcie_bdf', '')
+                pcie_l   = PCIeLState(entry.get('pcie_l', 0))
+                pcie_d   = PCIeDState(entry.get('pcie_d', 0))
+                cap_off  = entry.get('pcie_cap_offset')
+                pm_off   = entry.get('pcie_pm_cap_offset')
+                l1ss_off = entry.get('pcie_l1ss_offset')
+                lnkcap   = entry.get('pcie_lnkcap')
+                l1ss_cap = entry.get('pcie_l1ss_cap')
+                r_bdf    = entry.get('pcie_root_bdf', '')
+                r_cap    = entry.get('pcie_root_cap_offset')
+                r_l1ss   = entry.get('pcie_root_l1ss_offset')
+
+                aspms    = ((lnkcap >> 10) & 0x3) if lnkcap else 0x2
+                cpm      = ((lnkcap >> 18) & 0x1) if lnkcap else 0
+                aspm_val = aspms & 0x2
+                LTR_VAL  = f'{(0xa << 16) | (2 << 29):08x}'   # 400a0000
+                LTR_MASK = 'e3ff0000'
+
+                lines.append(f'echo ">>> {step_str}"')
+                pcmds: list = []  # 이 항목의 setpci 커맨드 목록
+
+                if bdf and cap_off is not None:
+                    if pcie_l == PCIeLState.L0:
+                        pcmds += [
+                            f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w=0000:0003"
+                            f"  # EP LNKCTL ASPMC=00 (L0)",
+                            f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w=0000:0100"
+                            f"  # EP LNKCTL ECPM=0",
+                        ]
+                        if l1ss_off:
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {l1ss_off+0x8:#x}.l=00000000:0000000f"
+                                f"  # EP L1SSCTL1 enable bits=0")
+                        pcmds.append(
+                            f"sudo setpci -s {bdf} {cap_off+0x28:#x}.w=0000:0400"
+                            f"  # EP DEVCTL2 LTRE=0")
+                        if r_bdf and r_cap:
+                            pcmds += [
+                                f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w=0000:0003"
+                                f"  # RP LNKCTL ASPMC=00",
+                                f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w=0000:0100"
+                                f"  # RP LNKCTL ECPM=0",
+                            ]
+                            if r_l1ss:
+                                pcmds.append(
+                                    f"sudo setpci -s {r_bdf} {r_l1ss+0x8:#x}.l=00000000:0000000f"
+                                    f"  # RP L1SSCTL1 enable bits=0")
+
+                    elif pcie_l == PCIeLState.L1:
+                        pcmds.append("# echo powersave > /sys/module/pcie_aspm/parameters/policy")
+                        if r_bdf and r_cap:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w={aspm_val:04x}:0003"
+                                f"  # RP LNKCTL ASPMC=L1")
+                        pcmds.append(
+                            f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w={aspm_val:04x}:0003"
+                            f"  # EP LNKCTL ASPMC=L1")
+                        if cpm:
+                            if r_bdf and r_cap:
+                                pcmds.append(
+                                    f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w=0100:0100"
+                                    f"  # RP LNKCTL ECPM=1")
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w=0100:0100"
+                                f"  # EP LNKCTL ECPM=1")
+
+                    else:  # L1.2 — spec §5.5.4.1 6단계
+                        l1ss_en = (l1ss_cap & 0xF) if l1ss_cap else 0x5
+                        pcmds.append("# echo powersave > /sys/module/pcie_aspm/parameters/policy")
+                        # Step1: L1SS disable
+                        if l1ss_off:
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {l1ss_off+0x8:#x}.l=00000000:0000000f"
+                                f"  # Step1 EP L1SSCTL1 enable bits=0")
+                        if r_bdf and r_l1ss:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_l1ss+0x8:#x}.l=00000000:0000000f"
+                                f"  # Step1 RP L1SSCTL1 enable bits=0")
+                        # Step3: DEVCTL2 LTRE
+                        pcmds.append(
+                            f"sudo setpci -s {bdf} {cap_off+0x28:#x}.w=0400:0400"
+                            f"  # Step3 EP DEVCTL2 LTRE=1")
+                        if r_bdf and r_cap:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_cap+0x28:#x}.w=0400:0400"
+                                f"  # Step3 RP DEVCTL2 LTRE=1")
+                        # Step4: LTR threshold (LL1_2TV=0xa bits[25:16], LL1_2TS=2 bits[31:29])
+                        if l1ss_off:
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {l1ss_off+0x8:#x}.l={LTR_VAL}:{LTR_MASK}"
+                                f"  # Step4 EP LTR threshold=10.24µs")
+                        if r_bdf and r_l1ss:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_l1ss+0x8:#x}.l={LTR_VAL}:{LTR_MASK}"
+                                f"  # Step4 RP LTR threshold=10.24µs")
+                        # Step5: L1SS enable (upstream=RP 먼저)
+                        if r_bdf and r_l1ss:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_l1ss+0x8:#x}.l={l1ss_en:08x}:0000000f"
+                                f"  # Step5 RP L1SSCTL1 enable={l1ss_en:#04x}")
+                        if l1ss_off:
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {l1ss_off+0x8:#x}.l={l1ss_en:08x}:0000000f"
+                                f"  # Step5 EP L1SSCTL1 enable={l1ss_en:#04x}")
+                        # Step6: LNKCTL ASPMC (RP 먼저)
+                        if r_bdf and r_cap:
+                            pcmds.append(
+                                f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w={aspm_val:04x}:0003"
+                                f"  # Step6 RP LNKCTL ASPMC=L1")
+                        pcmds.append(
+                            f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w={aspm_val:04x}:0003"
+                            f"  # Step6 EP LNKCTL ASPMC=L1")
+                        if cpm:
+                            if r_bdf and r_cap:
+                                pcmds.append(
+                                    f"sudo setpci -s {r_bdf} {r_cap+0x10:#x}.w=0100:0100"
+                                    f"  # RP LNKCTL ECPM=1")
+                            pcmds.append(
+                                f"sudo setpci -s {bdf} {cap_off+0x10:#x}.w=0100:0100"
+                                f"  # EP LNKCTL ECPM=1")
+
+                # D-state
+                if bdf and pm_off is not None:
+                    dval = 3 if pcie_d == PCIeDState.D3 else 0
+                    pcmds.append(
+                        f"sudo setpci -s {bdf} {pm_off+0x4:#x}.w={dval:04x}:0003"
+                        f"  # PMCSR D-state={'D3hot' if dval else 'D0'}")
+
+                for pcmd in pcmds:
+                    lines.append(f'echo "    {pcmd}"')
+                    lines.append(pcmd)
+                    lines.append('echo "    rc=$?"')
+                lines.append("sleep 0.1")
+                lines.append("")
+                continue
 
             cmd_parts = [
                 "nvme", entry['passthru_type'], entry['device'],
@@ -4120,8 +5367,9 @@ class NVMeFuzzer:
         if self.config.pm_inject_prob > 0:
             _ps_to = (self._prev_op_ps if self._current_ps in (3, 4) else self._current_ps)
             _mult  = PS_TIMEOUT_MULT.get(_ps_to, 1)
-            _prev  = f",prev=PS{self._prev_op_ps}" if self._current_ps in (3, 4) else ""
-            ps_tag = f" | PS{self._current_ps}(×{_mult}TO{_prev})"
+            if self._current_combo.pcie_d == PCIeDState.D3:
+                _mult = max(_mult, D3_TIMEOUT_MULT)
+            ps_tag = f" | {self._current_combo.label}(×{_mult}TO)"
         else:
             ps_tag = ""
         log.warning(f"[Stats] exec: {stats['executions']:,} | "
@@ -4174,10 +5422,11 @@ class NVMeFuzzer:
         # v4.3: 로그 메시지 수정 — 실제 구현은 subprocess(nvme-cli) 방식
         log.warning(f"NVMe I/O    : subprocess (nvme-cli passthru)")
         if self.config.pm_inject_prob > 0:
+            self._detect_pcie_info()
             log.warning(f"PM Rotate   : interval={PM_ROTATE_INTERVAL}cmds, "
-                        f"mode=random(PS0~PS4), "
+                        f"combos={len(POWER_COMBOS)}개(PS0~4×L0/L1/L1.2×D0/D3), "
                         f"timeout_mult=PS1×{PS_TIMEOUT_MULT[1]} PS2×{PS_TIMEOUT_MULT[2]} "
-                        f"PS3/PS4=prev_op_PS 기준, IO 필터 없음")
+                        f"D3×{D3_TIMEOUT_MULT}, PS3/PS4=prev_op_PS 기준")
         if self._sa_loaded:
             sa_info = []
             if self._sa_total_bbs > 0:
@@ -4227,6 +5476,16 @@ class NVMeFuzzer:
         if not self.sampler.connect():
             log.error("J-Link connection failed, aborting")
             return
+
+        # APST / Keep-Alive 비활성화 — NVMe 컨트롤러 자율 트래픽 제거
+        # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
+        # Keep-Alive: 주기적 admin cmd → PS3/PS4 wake-up → L1 진입 불가
+        self._apst_disable()
+        self._keepalive_disable()
+
+        # PM preflight: idle 유니버스 수집 전에 전체 PowerCombo 검증.
+        # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
+        self._pm_preflight_check()
 
         # J-Link PC 읽기 진단 + idle PC 감지
         if not self.sampler.diagnose():
@@ -4383,17 +5642,29 @@ class NVMeFuzzer:
                 # v5.1: 현재 PS 상태별 실행 카운트
                 if self.config.pm_inject_prob > 0:
                     self.ps_exec_counts[self._current_ps] += 1
+                    self.combo_exec_counts[self._current_combo] += 1
 
-                # PS3/PS4에서도 IO 명령 포함 모든 타입 허용 — 필터링 없음
+                # Non-Operational PM 상태 복귀 — NVMe 커맨드 전 mandatory
+                # D3hot / L1.2(CLKREQ# deasserted) / PS3/PS4(NOPS) 진입 후
+                # 트랜지션 자체를 퍼징하고, 커맨드는 복귀 후 전송하여 테스트 지속.
+                if (self.config.pm_inject_prob > 0
+                        and self._is_nonop_combo(self._current_combo)):
+                    restored = self._nonop_restore(self._current_combo)
+                    self._current_combo = restored
+                    self._current_ps    = restored.nvme_ps
 
                 # NVMe 커맨드 전송
-                # PS3/PS4: 디바이스가 복귀할 operational PS 기준으로 timeout 결정
+                # PS3/PS4 복귀 후라면 _current_ps=0 이므로 timeout_mult=1
+                # L1/L0+PS1/2: operational이므로 PS_TIMEOUT_MULT 그대로 사용
                 _ps_for_timeout = (self._prev_op_ps
                                    if self.config.pm_inject_prob > 0
                                       and self._current_ps in (3, 4)
                                    else self._current_ps)
                 _timeout_mult = PS_TIMEOUT_MULT.get(_ps_for_timeout, 1) \
                     if self.config.pm_inject_prob > 0 else 1
+                if (self.config.pm_inject_prob > 0
+                        and self._current_combo.pcie_d == PCIeDState.D3):
+                    _timeout_mult = max(_timeout_mult, D3_TIMEOUT_MULT)
                 rc = self._send_nvme_command(fuzz_data, mutated_seed,
                                              timeout_mult=_timeout_mult)
                 last_samples = self.sampler.stop_sampling()
@@ -4514,23 +5785,18 @@ class NVMeFuzzer:
                     _wexec = self.executions - self._window_exec0
                     _window_eps = _wexec / _wdt if _wdt > 0 else 0
 
-                    # v5.1: PM 로테이션 — exec/s 계산 후 PS 전환
+                    # v5.2: Power Combo 로테이션 — exec/s 계산 후 전환
                     if self.config.pm_inject_prob > 0:
-                        next_ps = random.randint(0, 4)
-                        # PS3/PS4 timeout은 진입 전 operational PS(0~2) 기준
-                        if next_ps not in (3, 4):
-                            self._prev_op_ps = next_ps
-                        _eff_mult = PS_TIMEOUT_MULT.get(
-                            next_ps if next_ps not in (3, 4) else self._prev_op_ps, 1)
-                        log.warning(
-                            f"[PM] PS 상태 전환: PS{self._current_ps} → PS{next_ps}"
-                            + (f" (timeout ×{_eff_mult}, prev_op=PS{self._prev_op_ps})"
-                               if next_ps in (3, 4) else
-                               (f" (timeout ×{_eff_mult})" if _eff_mult > 1 else ""))
-                        )
-                        self._pm_set_state(next_ps)
-                        self._current_ps = next_ps
-                        self.ps_enter_counts[next_ps] += 1
+                        next_combo = random.choice(POWER_COMBOS)
+                        # PS3/PS4 timeout 기준 업데이트 (operational PS 기준)
+                        if next_combo.nvme_ps not in (3, 4):
+                            self._prev_op_ps    = next_combo.nvme_ps
+                            self._prev_op_combo = next_combo
+                        self._set_power_combo(next_combo)
+                        self._current_combo = next_combo
+                        self._current_ps    = next_combo.nvme_ps   # 기존 timeout 로직 호환
+                        self.ps_enter_counts[next_combo.nvme_ps] += 1
+                        self.combo_enter_counts[next_combo] += 1
 
                     # 윈도우 리셋은 PM 전환 완료 후 — 전환 시간이 다음 윈도우에도 포함되지 않음
                     self._window_t0 = datetime.now()
@@ -4660,17 +5926,27 @@ class NVMeFuzzer:
                     f"  Passthru type  : admin={pt.get('admin-passthru', 0)}, "
                     f"io={pt.get('io-passthru', 0)}")
                 if self.config.pm_inject_prob > 0:
-                    summary_lines.append(f"PM Rotate interval: {PM_ROTATE_INTERVAL}cmds (random PS0~PS4)")
-                    for ps in range(5):
-                        cnt = self.ps_exec_counts.get(ps, 0)
-                        enters = self.ps_enter_counts.get(ps, 0)
-                        if cnt > 0 or enters > 0:
-                            pct = 100 * cnt / total
-                            mult = PS_TIMEOUT_MULT.get(ps, 1)
-                            note = (f" [TO×{mult}]" if mult > 1 else "") + \
-                                   (" [TO=prev_op_PS]" if ps in (3, 4) else "")
-                            summary_lines.append(
-                                f"  PS{ps}: 실행 {cnt}회 ({pct:.1f}%), 진입 {enters}회{note}")
+                    summary_lines.append(
+                        f"PM Rotate interval: {PM_ROTATE_INTERVAL}cmds "
+                        f"(Power Combo: {len(POWER_COMBOS)}개 조합)")
+                    # Power Combo 통계 (실행 횟수 내림차순)
+                    combo_rows = sorted(
+                        self.combo_exec_counts.items(),
+                        key=lambda x: x[1], reverse=True)
+                    for combo, cnt in combo_rows:
+                        if cnt == 0:
+                            continue
+                        enters = self.combo_enter_counts.get(combo, 0)
+                        pct    = 100 * cnt / total
+                        ps_to  = (self._prev_op_ps
+                                  if combo.nvme_ps in (3, 4) else combo.nvme_ps)
+                        mult   = PS_TIMEOUT_MULT.get(ps_to, 1)
+                        if combo.pcie_d == PCIeDState.D3:
+                            mult = max(mult, D3_TIMEOUT_MULT)
+                        note = f" [TO×{mult}]" if mult > 1 else ""
+                        summary_lines.append(
+                            f"  {combo.label:<18}: 실행 {cnt}회 ({pct:.1f}%), "
+                            f"진입 {enters}회{note}")
 
                 # v5.1: 정적 분석 커버리지 요약
                 if self._sa_loaded:
@@ -4748,7 +6024,9 @@ class NVMeFuzzer:
                     self.sampler.close()
                 except Exception:
                     pass
-                # timeout crash가 아닌 정상 종료 시에만 타임아웃 복원
+                # timeout crash가 아닌 정상 종료 시에만 타임아웃/APST 복원
+                self._apst_restore()
+                self._keepalive_restore()
                 self._restore_nvme_timeouts()
 
             # 정리 완료 — SIGINT 핸들러 복원

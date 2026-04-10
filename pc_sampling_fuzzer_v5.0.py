@@ -171,7 +171,7 @@ FW_ADDR_END   = 0x00147FFF
 
 # J-Link / JTAG 설정
 JLINK_DEVICE  = 'Cortex-R8'
-JLINK_SPEED   = 12000          # kHz
+JLINK_SPEED   = 4000           # kHz
 
 # NVMe 장치 설정
 NVME_DEVICE    = '/dev/nvme0'
@@ -187,10 +187,25 @@ NVME_TIMEOUTS = {
     'telemetry':    30_000,    # Telemetry Host/Controller — 대용량 로그 수집
     'dsm':          30_000,    # Dataset Management (TRIM/Deallocate)
     'flush':        30_000,    # Flush — 캐시 플러시, 미디어 기록 완료 대기
+    'selftest':     30_000,    # Device Self-test START — 즉시 반환, 테스트는 백그라운드 실행
+    'security':     30_000,    # Security Send/Receive — TCG/OPAL 프로토콜
 }
 
 # PC 샘플링 설정
-SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
+SAMPLE_INTERVAL_US    = 0      # 샘플 간격 (us). 0 = halt-as-fast-as-possible (최대 밀도).
+                               # 다른 제품(JTAG/정상 SWD)은 0으로도 안정적으로 동작한다.
+                               # NVMe 안정성이 필요한 경우 아래 GO_SETTLE_MS 를 사용할 것.
+
+# Go() 후 CPU 최소 실행 보장 시간 (ms)
+# SAMPLE_INTERVAL_US 와 독립적인 하드웨어 안정성 파라미터.
+# 기본값 0 = 비활성화 (JTAG / 정상 SWD 환경 — 하위 호환성 유지).
+# SWD + 1.8V 레벨시프터 환경: NVMe DMA/클럭 게이팅으로 Go() 직후
+#   halt 시 CPU 실행 시간이 너무 짧아 NVMe 커맨드 타임아웃 발생.
+#   diagnose() 경험: 5ms 미만 → 불안정, 50ms → 안정.
+#   이 값을 50 으로 설정하면 Go() 후 CPU에 최소 50ms 실행 시간 보장.
+GO_SETTLE_MS          = 0      # ms. 0 = 비활성화 (기본값, JTAG/정상 SWD 환경).
+                               # SWD + 1.8V 레벨시프터 등 불안정 환경에서 NVMe 타임아웃 발생 시
+                               # --go-settle 50 등으로 올려서 시도.
 MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수 (상한)
 SATURATION_LIMIT      = 10    # idle 유니버스 연속 카운터: idle_pcs 내 PC가 N회 연속이면 조기 종료.
                                # diagnose()에서 수렴 수집한 idle 유니버스 기반 → JTAG/SWD 공통 동작.
@@ -218,6 +233,16 @@ TOTAL_RUNTIME_SEC = 604_800   # 총 퍼징 시간 (초) — 1주일
 OUTPUT_DIR        = f'./output/pc_sampling_v{FUZZER_VERSION}/'
 SEED_DIR          = None      # 시드 폴더 경로 (없으면 None)
 RESUME_COVERAGE   = None      # 이전 coverage.txt 경로 (없으면 None)
+
+# v5.0: 펌웨어 바이너리 파일명 (FWDownload 시드 생성용)
+# .py 파일과 같은 디렉토리에 있는 파일명만 입력하세요.
+# 예: FW_BIN_FILENAME = 'FW.bin'
+# None 또는 파일이 없으면 더미 1KB zeros 시드로 대체됩니다.
+FW_BIN_FILENAME   = None
+_FW_BIN_PATH = (
+    str(Path(__file__).parent / FW_BIN_FILENAME)
+    if FW_BIN_FILENAME else None
+)
 
 # Power Schedule 설정 (v4 추가)
 MAX_ENERGY        = 16.0      # 최대 에너지 값
@@ -316,6 +341,26 @@ NVME_COMMANDS_EXTENDED = [
     NVMeCommand("DatasetManagement", 0x09, NVMeCommandType.IO,
                 timeout_group="dsm",
                 description="데이터셋 관리 (TRIM/Deallocate)"),
+    # ── v5.1: 즉시 추가 명령어 ──
+    NVMeCommand("WriteZeroes", 0x08, NVMeCommandType.IO, needs_data=False,
+                description="LBA 범위를 0으로 기록 (DMA 없음, DEAC 지원)"),
+    NVMeCommand("Compare", 0x05, NVMeCommandType.IO,
+                description="LBA 읽기 후 호스트 버퍼와 비교 (miscompare → error)"),
+    NVMeCommand("WriteUncorrectable", 0x04, NVMeCommandType.IO, needs_data=False,
+                description="LBA를 uncorrectable 상태로 마킹 (에러 주입)"),
+    NVMeCommand("Verify", 0x0C, NVMeCommandType.IO, needs_data=False,
+                description="LBA 읽기 후 CRC/PI 검증 (데이터 반환 없음)"),
+    NVMeCommand("DeviceSelfTest", 0x14, NVMeCommandType.ADMIN, needs_data=False,
+                needs_namespace=False, timeout_group="selftest",
+                description="자가 진단 시작/중단 (백그라운드 실행, 즉시 반환)"),
+    NVMeCommand("SecuritySend", 0x81, NVMeCommandType.ADMIN,
+                needs_namespace=False, timeout_group="security",
+                description="보안 프로토콜 전송 (TCG/OPAL/IEEE1667)"),
+    NVMeCommand("SecurityReceive", 0x82, NVMeCommandType.ADMIN, needs_data=False,
+                needs_namespace=False, timeout_group="security",
+                description="보안 프로토콜 수신 (TCG/OPAL/IEEE1667)"),
+    NVMeCommand("GetLBAStatus", 0x86, NVMeCommandType.ADMIN, needs_data=False,
+                description="LBA 범위별 할당/미할당 상태 조회"),
 ]
 
 # 전체 명령어 (이름으로 조회용)
@@ -379,6 +424,7 @@ class FuzzConfig:
 
     # 샘플링 설정
     sample_interval_us: int = SAMPLE_INTERVAL_US
+    go_settle_ms: int = GO_SETTLE_MS  # Go() 후 CPU 최소 실행 보장 (ms). 0 = 비활성화
     max_samples_per_run: int = MAX_SAMPLES_PER_RUN
     saturation_limit: int = SATURATION_LIMIT
 
@@ -552,16 +598,15 @@ class JLinkPCSampler:
                     # ★ JTAG 검증 완료 후 즉시 resume.
                     # halt() 상태로 반환하면 connect() 이후 _log_smart() 등 NVMe
                     # 명령이 펌웨어를 못 받아 10초 타임아웃이 바로 발생한다.
-                    # JLINKARM_GoEx는 ctypes DLL 호출이므로 실패해도 Python 예외를
-                    # 던지지 않고 int(ret)를 반환할 뿐이다.
-                    # ret != 0 이면 raise해서 SWD fallback을 트리거한다.
-                    _go_ret = self.jlink._dll.JLINKARM_GoEx(0, 0)
-                    if _go_ret != 0:
+                    # JLINKARM_Go() — jlink_reg_diag.py에서 실증된 resume 방식.
+                    # ctypes 호출이므로 Python 예외 없음, 실패 시 JLINKARM_IsHalted로 확인.
+                    self.jlink._dll.JLINKARM_Go()
+                    if bool(self.jlink._dll.JLINKARM_IsHalted()):
                         raise Exception(
-                            f"JLINKARM_GoEx(0,0) 실패 (ret={_go_ret}) — "
+                            "JLINKARM_Go() 호출 후 CPU 여전히 halt — "
                             "JTAG CPU resume 불가, SWD fallback 시도"
                         )
-                    log.warning("[J-Link] JTAG 검증용 halt 해제 — CPU resumed (GoEx OK).")
+                    log.warning("[J-Link] JTAG 검증용 halt 해제 — CPU resumed (Go OK).")
                     iface_name = "JTAG (auto)"
                 except Exception as jtag_err:
                     log.warning(f"[J-Link] JTAG 연결/검증 실패 ({jtag_err}), SWD로 재시도...")
@@ -594,7 +639,7 @@ class JLinkPCSampler:
             # DLL 함수 참조 캐싱 (pylink wrapper 우회, 매 호출 attribute lookup 제거)
             self._halt_func = self.jlink._dll.JLINKARM_Halt
             self._read_reg_func = self.jlink._dll.JLINKARM_ReadReg
-            self._go_func = lambda: self.jlink._dll.JLINKARM_GoEx(0, 0)
+            self._go_func = self.jlink._dll.JLINKARM_Go
 
             return True
         except Exception as e:
@@ -752,19 +797,30 @@ class JLinkPCSampler:
         return True
 
     def _ensure_running(self, settle_ms: int = 100) -> None:
-        """샘플링 루프 후 CPU가 running 상태임을 보장한다.
+        """샘플링 루프 후 CPU가 running 상태임을 보장한다."""
+        ok = self._go_with_retry()
+        if not ok:
+            log.warning("[J-Link] _ensure_running: Go() 재시도 후에도 CPU halted 상태")
 
-        JLINKARM_GoEx는 이미 running CPU에 호출해도 무해하다.
-        halted() 대신 GoEx를 무조건 호출하는 이유: DLL 내부 캐시가 실제 CPU 상태와
-        달리 False를 반환하는 경우가 있어 GoEx ret 값이 더 신뢰성 있다.
+    def _go_with_retry(self, max_attempts: int = 5, retry_delay_s: float = 0.05) -> bool:
+        """JLINKARM_Go() 재시도 래퍼.
+
+        JLINKARM_Go()는 실패해도 Python exception을 발생시키지 않고 음수를 반환한다.
+        "Could not start CPU core. (ErrorCode: -1)" 메시지는 J-Link DLL이 stderr에 직접
+        출력하며, Python 레이어에서는 반환값을 확인해야만 감지 가능하다.
+
+        NVMe DMA 처리 중 CPU 클럭 게이팅 등으로 Go()가 일시적으로 실패할 수 있으므로
+        실패 시에만 짧은 대기 후 재시도한다. 성공 시 즉시 반환하여 오버헤드 최소화.
         """
-        try:
-            ret = self.jlink._dll.JLINKARM_GoEx(0, 0)
-            time.sleep(settle_ms / 1000)
-            if ret != 0 and bool(self.jlink._dll.JLINKARM_IsHalted()):
-                log.warning("[J-Link] GoEx 후에도 CPU halted 상태 — NVMe 명령이 지연될 수 있음")
-        except Exception as e:
-            log.warning(f"[J-Link] _ensure_running 실패: {e}")
+        for attempt in range(max_attempts):
+            ret = self._go_func()   # 0 = 성공, 음수 = 실패 (exception 없음)
+            if ret == 0:
+                return True         # 성공 시 즉시 반환 — sleep 없음
+            # 실패 시에만 대기 후 재시도
+            log.debug(f"[J-Link] Go() 재시도 {attempt + 1}/{max_attempts} (ret={ret})")
+            time.sleep(retry_delay_s)
+        log.warning(f"[J-Link] Go() {max_attempts}회 재시도 후에도 CPU halt 상태")
+        return False
 
     def _read_pc(self) -> Optional[int]:
         try:
@@ -774,10 +830,7 @@ class JLinkPCSampler:
         except Exception:
             return None
         finally:
-            try:
-                self._go_func()
-            except Exception:
-                pass
+            self._go_with_retry()
 
     def read_stuck_pcs(self, count: int = 10) -> List[int]:
         """v4.3: timeout/crash 후 SSD 펌웨어가 멈춘 PC를 읽는다.
@@ -824,6 +877,10 @@ class JLinkPCSampler:
         since_last_global_new = 0   # 연속 "이미 알려진 PC" 카운터 (global 기준)
         consecutive_idle = 0         # idle 유니버스 연속 카운터
         interval = self.config.sample_interval_us / 1_000_000
+        # GO_SETTLE_MS: Go() 후 CPU에 최소 실행 시간 보장 (SWD+레벨시프터 NVMe 안정성).
+        # SAMPLE_INTERVAL_US(샘플 밀도 제어)와 독립적. 둘 중 큰 값이 실제 sleep.
+        settle_s  = self.config.go_settle_ms / 1_000.0
+        effective_interval = max(interval, settle_s)
         sat_limit = self.config.saturation_limit
         global_sat_limit = self.config.global_saturation_limit  # v4.3: 설정값 사용
         idle_pcs = self.idle_pcs     # idle 유니버스 (diagnose에서 수렴 수집)
@@ -895,8 +952,8 @@ class JLinkPCSampler:
                         )
                         break
 
-            if interval > 0:
-                time.sleep(interval)
+            if effective_interval > 0:
+                time.sleep(effective_interval)
 
         if not self._stopped_reason:
             if self.stop_event.is_set():
@@ -974,6 +1031,13 @@ class JLinkPCSampler:
         if self.sample_thread:
             self.sample_thread.join(timeout=1.0)
         if self.jlink:
+            # 종료 전 CPU resume 보장 — halt 상태로 J-Link를 닫으면
+            # SSD 펌웨어가 영구 정지 상태로 남는다.
+            if self._go_func is not None:
+                try:
+                    self._go_with_retry(max_attempts=3, retry_delay_s=0.05)
+                except Exception:
+                    pass
             try:
                 self.jlink.close()
             except Exception:
@@ -1326,108 +1390,531 @@ class NVMeFuzzer:
         """각 Opcode별 NVMe 스펙 기반 정상 명령어를 초기 시드로 생성"""
         seeds: List[Seed] = []
 
-        # 명령어별 정상 파라미터 템플릿: (cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data, 설명)
+        # 명령어별 정상 파라미터 템플릿
+        # CDW12 Protection/Access 비트 (NVMe 2.0 기준):
+        #   [25]    DEAC  — WriteZeroes: deallocate after zeroing
+        #   [26]    PRCHK[2] — Guard field check
+        #   [27]    PRCHK[1] — Application Tag check
+        #   [28]    PRCHK[0] — Reference Tag check
+        #   [29]    PRACT  — Protection Info Action (insert/strip)
+        #   [30]    LR     — Limited Retry
+        #   [31]    FUA    — Force Unit Access
+        # CDW13[15:0] = DSPEC — Directive Specific (Streams: Stream ID)
+        # CDW14[31:0] = ILBRT — Initial Logical Block Reference Tag (E2E PI)
+        # CDW15[15:0] = LBAT  — Logical Block Application Tag (E2E PI)
+        # CDW15[31:16]= LBATM — LB Application Tag Mask (E2E PI)
+        _FUA  = 1 << 31
+        _LR   = 1 << 30
+        _PRACT = 1 << 29
+        _PRCHK_ALL = (1 << 26) | (1 << 27) | (1 << 28)  # 3-bit PRCHK 전체 set
+        _PRINFO_ALL = _PRACT | _PRCHK_ALL                 # PRACT + PRCHK 전체
+        _DEAC = 1 << 25                                   # WriteZeroes deallocate
+
         SEED_TEMPLATES: dict[str, list] = {
+            # ================================================================
+            # Identify — CDW10[7:0]=CNS, CDW10[31:16]=CNTID
+            # ================================================================
             "Identify": [
-                # CDW10 = CNS (Controller or Namespace Structure)
                 # CNS=0x01(Controller): NSID는 Reserved → nsid_override=0
-                dict(cdw10=0x01, nsid_override=0, description="Identify Controller"),
-                dict(cdw10=0x00, description="Identify Namespace"),
-                dict(cdw10=0x02, description="Active NS ID list"),
-                dict(cdw10=0x03, description="NS Identification Descriptor list"),
+                dict(cdw10=0x0001, nsid_override=0,           description="Identify Controller"),
+                dict(cdw10=0x0000,                            description="Identify Namespace (NSID=1)"),
+                dict(cdw10=0x0002, nsid_override=0,           description="Active NS ID list"),
+                dict(cdw10=0x0003,                            description="NS Identification Descriptor list"),
+                dict(cdw10=0x0004,                            description="Allocated NS ID List (incl. deleted)"),
+                dict(cdw10=0x0005,                            description="I/O Command Set specific Identify NS"),
+                dict(cdw10=0x0006, nsid_override=0,           description="Identify Primary Controller Capabilities"),
+                dict(cdw10=0x0007, nsid_override=0,           description="Secondary Controller list"),
+                dict(cdw10=0x0008, nsid_override=0,           description="Namespace Granularity List"),
+                dict(cdw10=0x0009, nsid_override=0,           description="UUID List"),
+                dict(cdw10=0x001C,                            description="I/O Cmd Set Allocated NS ID list"),
+                dict(cdw10=0x001D,                            description="I/O Cmd Set Namespace ID Descriptor"),
+                # CNTID 필드 포함 (CNS=0x06/0x07에서 특정 컨트롤러 조회)
+                dict(cdw10=(0x0001 << 16) | 0x0006, nsid_override=0, description="Primary Ctrl Cap CNTID=1"),
+                # 미지원 CNS — 에러 경로 탐색
+                dict(cdw10=0x00FF, nsid_override=0,           description="CNS=0xFF (undefined, error path)"),
             ],
+
+            # ================================================================
+            # GetLogPage — CDW10[7:0]=LID, CDW10[26:16]=NUMDL, CDW10[15]=RAE
+            #              CDW10[12:8]=LSP, CDW11[15:0]=NUMDH
+            #              CDW12=LPOL (Log Page Offset Lower dword)
+            #              CDW13=LPOU (Log Page Offset Upper dword)
+            # ================================================================
             "GetLogPage": [
-                # CDW10[7:0]=LID, CDW10[26:16]=NUMDL (Number of Dwords Lower, 0-based)
-                # LID=0x01(Error Info), 0x02(SMART): 컨트롤러 범위 → nsid_override=0
+                # ── Mandatory (NVMe 2.0 §5.14) ──
                 dict(cdw10=(0x0F << 16) | 0x01, nsid_override=0, description="Error Information Log (64B)"),
                 dict(cdw10=(0x7F << 16) | 0x02, nsid_override=0, description="SMART / Health Log (512B)"),
+                dict(cdw10=(0x0F << 16) | 0x03, nsid_override=0, description="Firmware Slot Information (64B)"),
+                dict(cdw10=(0xFF << 16) | 0x04, nsid_override=0xFFFFFFFF, description="Changed NS List (4KB, NSID=broadcast)"),
+                dict(cdw10=(0xFF << 16) | 0x05, nsid_override=0, description="Commands Supported and Effects (4KB)"),
+                dict(cdw10=(0x8F << 16) | 0x06, nsid_override=0, description="Device Self-test Log (564B)"),
+                dict(cdw10=(0x1FF << 16) | 0x07, nsid_override=0, description="Telemetry Host-Initiated (CDW10[8]=Create)"),
+                dict(cdw10=(0x1FF << 16) | 0x08, nsid_override=0, description="Telemetry Controller-Initiated"),
+                # ── Optional ──
+                dict(cdw10=(0x7F << 16) | 0x09,                  description="Endurance Group Information (512B)"),
+                dict(cdw10=(0x1FF << 16) | 0x0A, nsid_override=0, description="Predictive Failure Analysis"),
+                dict(cdw10=(0x7F << 16) | 0x0B,                  description="Asymmetric Namespace Access (ANA)"),
+                dict(cdw10=(0xFFF << 16) | 0x0C, nsid_override=0, description="Persistent Event Log (header 512B)"),
+                dict(cdw10=(0xFF << 16) | 0x0D, nsid_override=0, description="Endurance Group Event Aggregate"),
+                dict(cdw10=(0xFF << 16) | 0x0E, nsid_override=0, description="Media Unit Status"),
+                dict(cdw10=(0xFF << 16) | 0x0F, nsid_override=0, description="Supported Capacity Config List"),
+                dict(cdw10=(0xFF << 16) | 0x10, nsid_override=0, description="Feature Identifiers Supported & Effects (4KB)"),
+                dict(cdw10=(0xFF << 16) | 0x11, nsid_override=0, description="NVMe-MI Commands Supported & Effects"),
+                dict(cdw10=(0xFF << 16) | 0x12, nsid_override=0, description="Command and Feature Lockdown Log"),
+                dict(cdw10=(0x1FF << 16) | 0x13, nsid_override=0, description="Boot Partition Log"),
+                dict(cdw10=(0xFF << 16) | 0x70, nsid_override=0, description="Discovery Log (Fabrics, error path expected)"),
+                dict(cdw10=(0xFF << 16) | 0x80,                  description="Reservation Notification Log"),
+                dict(cdw10=(0xFF << 16) | 0x81, nsid_override=0, description="Sanitize Status Log"),
+                # ── RAE=1 (Retain Async Event) 변형 ──
+                dict(cdw10=(0x7F << 16) | (1 << 15) | 0x02, nsid_override=0,
+                     description="SMART Log RAE=1 (CDW10[15]=1, retain async event)"),
+                # ── LPOL 오프셋 (CDW12) ── 큰 로그의 중간부터 읽기
+                dict(cdw10=(0x7F << 16) | 0x02, cdw12=0x200, nsid_override=0,
+                     description="SMART Log LPOL=0x200 (middle offset)"),
+                # ── NUMDH (CDW11[15:0]) — 4GB 초과 로그 ──
+                dict(cdw10=(0xFFF << 16) | 0x0C, cdw11=0x0001, nsid_override=0,
+                     description="Persistent Event Log NUMDH=1 (large request)"),
+                # ── 미지원 LID — 에러 핸들러 경로 ──
+                dict(cdw10=(0xFF << 16) | 0xFF, nsid_override=0, description="LID=0xFF (undefined, error path)"),
             ],
+
+            # ================================================================
+            # GetFeatures — CDW10[7:0]=FID, CDW10[9:8]=SEL (current/default/saved/supported)
+            # ================================================================
             "GetFeatures": [
-                # CDW10[7:0]=FID (Feature Identifier)
+                dict(cdw10=0x01, description="Arbitration (burst size, priority weight)"),
+                dict(cdw10=0x02, description="Power Management (power state)"),
+                dict(cdw10=0x03, description="LBA Range Type"),
+                dict(cdw10=0x04, description="Temperature Threshold (TMPTH, TMPSEL, THSEL)"),
+                dict(cdw10=0x05, description="Error Recovery (DULBE, TLER)"),
                 dict(cdw10=0x06, description="Volatile Write Cache"),
                 dict(cdw10=0x07, description="Number of Queues"),
+                dict(cdw10=0x08, description="Interrupt Coalescing"),
+                dict(cdw10=0x09, description="Interrupt Vector Configuration"),
+                dict(cdw10=0x0A, description="Write Atomicity Normal"),
                 dict(cdw10=0x0B, description="Async Event Configuration"),
+                dict(cdw10=0x0C, description="Autonomous Power State Transition"),
+                dict(cdw10=0x0D, description="Host Memory Buffer"),
+                dict(cdw10=0x0E, description="Timestamp"),
+                dict(cdw10=0x0F, description="Keep Alive Timer"),
+                dict(cdw10=0x10, description="Host Controlled Thermal Management"),
+                dict(cdw10=0x11, description="Non-Operational Power State Config"),
+                dict(cdw10=0x12, description="Read Recovery Level Config"),
+                dict(cdw10=0x7E, description="Host Identifier (128-bit)"),
+                dict(cdw10=0x7F, description="Reservation Notification Mask"),
+                dict(cdw10=0x80, description="Reservation Persistence"),
+                # SEL=1 (default value) 변형
+                dict(cdw10=(1 << 8) | 0x06, description="Volatile Write Cache SEL=default"),
+                dict(cdw10=(1 << 8) | 0x02, description="Power Management SEL=default"),
+                # SEL=2 (saved) 변형
+                dict(cdw10=(2 << 8) | 0x06, description="Volatile Write Cache SEL=saved"),
+                # SEL=3 (supported capabilities) 변형
+                dict(cdw10=(3 << 8) | 0x06, description="Volatile Write Cache SEL=capabilities"),
+                # 미지원 FID — 에러 경로
+                dict(cdw10=0xFF, description="FID=0xFF (undefined, error path)"),
             ],
+
+            # ================================================================
+            # SetFeatures — CDW10[7:0]=FID, CDW10[31]=SV (Save), CDW11=dword value
+            # ================================================================
+            "SetFeatures": [
+                # FID=0x01: Arbitration — CDW11[2:0]=AB(High Priority Burst), [8:3]=HPW, [15:8]=MPW, [23:16]=LPW
+                dict(cdw10=0x01, cdw11=0x00000003, description="Set Arbitration (burst=8, default priority)"),
+                # FID=0x02: Power Management — CDW11[4:0]=PS (Power State)
+                dict(cdw10=0x02, cdw11=0x00000000, description="Set Power State 0 (max performance)"),
+                dict(cdw10=0x02, cdw11=0x00000004, description="Set Power State 4 (low power)"),
+                # FID=0x04: Temperature Threshold — CDW11[15:0]=TMPTH(Kelvin), [19:16]=TMPSEL, [20]=THSEL
+                dict(cdw10=0x04, cdw11=0x0000012C, description="Set Temp Threshold 300K composite (TMPSEL=0)"),
+                dict(cdw10=0x04, cdw11=0x00010050, description="Set Temp Threshold 80K (unrealistically low, error path)"),
+                dict(cdw10=0x04, cdw11=0x000107FF, description="Set Temp Threshold max (0x7FF K, TMPSEL=1 sensor1)"),
+                # FID=0x05: Error Recovery — CDW11[15:0]=TLER(ms), CDW11[16]=DULBE
+                dict(cdw10=0x05, cdw11=0x00000000, description="Set Error Recovery TLER=0 DULBE=0"),
+                dict(cdw10=0x05, cdw11=0x00010064, description="Set Error Recovery TLER=100ms DULBE=1"),
+                # FID=0x06: Volatile Write Cache — CDW11[0]=WCE (Write Cache Enable)
+                dict(cdw10=0x06, cdw11=0x00000001, description="Set VWC=Enable"),
+                dict(cdw10=0x06, cdw11=0x00000000, description="Set VWC=Disable"),
+                # FID=0x07: Number of Queues (기존 유지)
+                dict(cdw10=0x07, cdw11=0x00010001, description="Set Number of Queues (1 SQ + 1 CQ)"),
+                # FID=0x08: Interrupt Coalescing — CDW11[7:0]=THR, CDW11[15:8]=TIME(100us)
+                dict(cdw10=0x08, cdw11=0x00000000, description="Set Interrupt Coalescing disabled"),
+                dict(cdw10=0x08, cdw11=0x00000A04, description="Set Interrupt Coalescing THR=4 TIME=10"),
+                # FID=0x0B: Async Event Configuration — CDW11[0]=SMART Critical Warning
+                dict(cdw10=0x0B, cdw11=0x00000000, description="Set AEC all disabled"),
+                dict(cdw10=0x0B, cdw11=0x000000FF, description="Set AEC all enabled"),
+                # FID=0x0E: Timestamp — CDW11+CDW12 = 48-bit timestamp (ms since epoch)
+                dict(cdw10=0x0E, cdw11=0x00000000, description="Set Timestamp = 0 (reset)"),
+                # FID=0x10: Host Controlled Thermal Management — CDW11[0]=TMT2EN, CDW11[1]=TMT1EN
+                dict(cdw10=0x10, cdw11=0x00000003, description="Set HCTM both thresholds enabled"),
+                # SV=1 변형 (설정값 저장)
+                dict(cdw10=(1 << 31) | 0x06, cdw11=0x00000001, description="Set VWC=Enable + Save"),
+            ],
+
+            # ================================================================
+            # Read — CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB
+            #         CDW12[29]=PRACT, CDW12[30]=LR, CDW12[31]=FUA
+            #         CDW13[15:0]=DSPEC (Streams ID), CDW14=ILBRT, CDW15=LBAT/LBATM
+            # ================================================================
             "Read": [
-                # CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB (0-based, 스펙 max=0xFFFF)
-                # ── 일반 LBA 범위 ──
-                dict(cdw10=0,      cdw11=0, cdw12=0,      description="Read LBA 0, 1 block"),
-                dict(cdw10=1,      cdw11=0, cdw12=0,      description="Read LBA 1, 1 block"),
-                dict(cdw10=0,      cdw11=0, cdw12=7,      description="Read LBA 0, 8 blocks"),
-                dict(cdw10=0,      cdw11=0, cdw12=31,     description="Read LBA 0, 32 blocks"),
-                dict(cdw10=0,      cdw11=0, cdw12=127,    description="Read LBA 0, 128 blocks"),
-                dict(cdw10=0,      cdw11=0, cdw12=255,    description="Read LBA 0, 256 blocks (128KB)"),
-                dict(cdw10=0,      cdw11=0, cdw12=0xFFFF, description="Read LBA 0, NLB max (65536 blocks, 32MB)"),
-                dict(cdw10=500,    cdw11=0, cdw12=0,      description="Read LBA 500, 1 block"),
-                dict(cdw10=1000,   cdw11=0, cdw12=0,      description="Read LBA 1000, 1 block"),
-                dict(cdw10=5000,   cdw11=0, cdw12=0,      description="Read LBA 5000, 1 block"),
-                dict(cdw10=10000,  cdw11=0, cdw12=0,      description="Read LBA 10000, 1 block"),
-                dict(cdw10=0,      cdw11=0, cdw12=(1 << 29), description="Read LBA 0, FUA (Force Unit Access, CDW12[29])"),
-                # ── 64비트 LBA 경계 (CDW11=SLBA[63:32]) ──
+                # ── 기본 LBA 범위 ──
+                dict(cdw10=0,     cdw11=0, cdw12=0,      description="Read LBA 0, 1 block"),
+                dict(cdw10=1,     cdw11=0, cdw12=0,      description="Read LBA 1, 1 block"),
+                dict(cdw10=0,     cdw11=0, cdw12=7,      description="Read LBA 0, 8 blocks (4KB)"),
+                dict(cdw10=0,     cdw11=0, cdw12=31,     description="Read LBA 0, 32 blocks (16KB)"),
+                dict(cdw10=0,     cdw11=0, cdw12=127,    description="Read LBA 0, 128 blocks (64KB)"),
+                dict(cdw10=0,     cdw11=0, cdw12=255,    description="Read LBA 0, 256 blocks (128KB)"),
+                dict(cdw10=0,     cdw11=0, cdw12=0xFFFF, description="Read LBA 0, NLB max (65536 blocks)"),
+                dict(cdw10=500,   cdw11=0, cdw12=0,      description="Read LBA 500"),
+                dict(cdw10=1000,  cdw11=0, cdw12=0,      description="Read LBA 1000"),
+                dict(cdw10=5000,  cdw11=0, cdw12=0,      description="Read LBA 5000"),
+                dict(cdw10=10000, cdw11=0, cdw12=0,      description="Read LBA 10000"),
+                # ── 64비트 LBA 경계 ──
                 dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0,
-                     description="Read LBA 4G (SLBA=0x1_0000_0000), OOR 에러 경로"),
+                     description="Read LBA 4G (OOR error path)"),
                 dict(cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0,
-                     description="Read SLBA near 64-bit max, OOR 에러 경로"),
+                     description="Read SLBA near 64-bit max (OOR error path)"),
+                # ── CDW12 상위 비트: Protection / Access ──
+                dict(cdw10=0, cdw11=0, cdw12=_PRACT,
+                     description="Read LBA 0, PRACT=1 (CDW12[29], PI action)"),
+                dict(cdw10=0, cdw11=0, cdw12=_LR,
+                     description="Read LBA 0, LR=1 (Limited Retry, CDW12[30])"),
+                dict(cdw10=0, cdw11=0, cdw12=_FUA,
+                     description="Read LBA 0, FUA=1 (Force Unit Access, CDW12[31])"),
+                dict(cdw10=0, cdw11=0, cdw12=_PRINFO_ALL,
+                     description="Read LBA 0, PRINFO=0xF (PRACT+PRCHK[2:0] all set)"),
+                dict(cdw10=0, cdw11=0, cdw12=_FUA | _LR,
+                     description="Read LBA 0, FUA+LR"),
+                dict(cdw10=0, cdw11=0, cdw12=_PRCHK_ALL,
+                     description="Read LBA 0, PRCHK=0x7 (guard+apptag+reftag check)"),
+                # ── E2E Protection: CDW14=ILBRT, CDW15=LBAT/LBATM ──
+                dict(cdw10=0, cdw11=0, cdw12=_PRINFO_ALL,
+                     cdw14=0xDEADBEEF, cdw15=0xFFFF0000,
+                     description="Read LBA 0, PI all + ILBRT=0xDEADBEEF LBATM=0xFFFF"),
+                dict(cdw10=0, cdw11=0, cdw12=_PRACT,
+                     cdw14=0x00000001, cdw15=0x00010001,
+                     description="Read LBA 0, PRACT + ILBRT=1 LBATM=1 LBAT=1"),
+                # ── Streams Directive (DTYPE=1) ──
+                # CDW12[31:30]=0b01(DTYPE=1), CDW13[15:0]=Stream ID
+                dict(cdw10=0, cdw11=0, cdw12=(1 << 30), cdw13=0x0001,
+                     description="Read LBA 0, DTYPE=1 (Streams) DSPEC=1"),
+                dict(cdw10=0, cdw11=0, cdw12=(1 << 30), cdw13=0x0002,
+                     description="Read LBA 0, DTYPE=1 (Streams) DSPEC=2"),
             ],
+
+            # ================================================================
+            # Write — CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB
+            #          CDW12[29]=PRACT, CDW12[30]=LR, CDW12[31]=FUA
+            #          CDW13[15:0]=DSPEC, CDW14=ILBRT, CDW15=LBAT/LBATM
+            # ================================================================
             "Write": [
-                # CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB (0-based)
-                # data 크기 = (NLB+1) × 512B — 스펙상 NLB와 data 크기 일치 필수
                 # ── 1 block ──
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Write LBA 0, 1 block zeros"),
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xAA' * 512,  description="Write LBA 0, 1 block 0xAA"),
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xFF' * 512,  description="Write LBA 0, 1 block 0xFF"),
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=bytes(range(256)) * 2,
-                     description="Write LBA 0, 1 block sequential 0x00-0xFF"),
-                # ── 다중 block (NLB와 data 일치) ──
-                dict(cdw10=0,     cdw11=0, cdw12=7,   data=b'\x00' * (8   * 512), description="Write LBA 0, 8 blocks (4KB)"),
-                dict(cdw10=0,     cdw11=0, cdw12=31,  data=b'\x00' * (32  * 512), description="Write LBA 0, 32 blocks (16KB)"),
-                dict(cdw10=0,     cdw11=0, cdw12=127, data=b'\x00' * (128 * 512), description="Write LBA 0, 128 blocks (64KB)"),
-                dict(cdw10=0,     cdw11=0, cdw12=255, data=b'\x00' * (256 * 512), description="Write LBA 0, 256 blocks (128KB)"),
+                     description="Write LBA 0, sequential 0x00-0xFF"),
+                # ── 다중 block ──
+                dict(cdw10=0, cdw11=0, cdw12=7,   data=b'\x00' * (8   * 512), description="Write LBA 0, 8 blocks (4KB)"),
+                dict(cdw10=0, cdw11=0, cdw12=31,  data=b'\x00' * (32  * 512), description="Write LBA 0, 32 blocks (16KB)"),
+                dict(cdw10=0, cdw11=0, cdw12=127, data=b'\x00' * (128 * 512), description="Write LBA 0, 128 blocks (64KB)"),
+                dict(cdw10=0, cdw11=0, cdw12=255, data=b'\x00' * (256 * 512), description="Write LBA 0, 256 blocks (128KB)"),
                 # ── 다양한 SLBA ──
-                dict(cdw10=500,   cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 500, 1 block"),
-                dict(cdw10=1000,  cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 1000, 1 block"),
-                dict(cdw10=5000,  cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 5000, 1 block"),
-                dict(cdw10=10000, cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 10000, 1 block"),
-                # ── FUA ──
-                dict(cdw10=0, cdw11=0, cdw12=(1 << 29), data=b'\x00' * 512,
-                     description="Write LBA 0, FUA (Force Unit Access, CDW12[29])"),
-                # ── 64비트 LBA 경계 (CDW11=SLBA[63:32]) ──
+                dict(cdw10=500,   cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 500"),
+                dict(cdw10=1000,  cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 1000"),
+                dict(cdw10=5000,  cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 5000"),
+                dict(cdw10=10000, cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 10000"),
+                # ── 64비트 LBA 경계 ──
                 dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0, data=b'\x00' * 512,
-                     description="Write LBA 4G (SLBA=0x1_0000_0000), OOR 에러 경로"),
+                     description="Write LBA 4G (OOR error path)"),
                 dict(cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0, data=b'\x00' * 512,
-                     description="Write SLBA near 64-bit max, OOR 에러 경로"),
+                     description="Write SLBA near 64-bit max (OOR error path)"),
+                # ── CDW12 상위 비트 ──
+                dict(cdw10=0, cdw11=0, cdw12=_PRACT, data=b'\x00' * 512,
+                     description="Write LBA 0, PRACT=1 (PI action)"),
+                dict(cdw10=0, cdw11=0, cdw12=_LR, data=b'\x00' * 512,
+                     description="Write LBA 0, LR=1 (Limited Retry)"),
+                dict(cdw10=0, cdw11=0, cdw12=_FUA, data=b'\x00' * 512,
+                     description="Write LBA 0, FUA=1 (Force Unit Access)"),
+                dict(cdw10=0, cdw11=0, cdw12=_PRINFO_ALL, data=b'\x00' * 512,
+                     description="Write LBA 0, PRINFO=0xF (all PI bits)"),
+                dict(cdw10=0, cdw11=0, cdw12=_FUA | _LR, data=b'\x00' * 512,
+                     description="Write LBA 0, FUA+LR"),
+                # ── E2E Protection: CDW14=ILBRT, CDW15=LBAT/LBATM ──
+                dict(cdw10=0, cdw11=0, cdw12=_PRINFO_ALL,
+                     cdw14=0xDEADBEEF, cdw15=0xFFFF0000,
+                     data=b'\x00' * 512,
+                     description="Write LBA 0, PI all + ILBRT=0xDEADBEEF LBATM=0xFFFF"),
+                # ── Streams Directive (DTYPE=1) ──
+                dict(cdw10=0, cdw11=0, cdw12=(1 << 30), cdw13=0x0001,
+                     data=b'\x00' * 512,
+                     description="Write LBA 0, DTYPE=1 (Streams) DSPEC=1"),
+                # ── Dataset Management attributes (CDW13[3:0]=DSMA) ──
+                dict(cdw10=0, cdw11=0, cdw12=0, cdw13=0x4,  # IDR (Random)
+                     data=b'\x00' * 512, description="Write LBA 0, DSMA=IDR (Random access hint)"),
+                dict(cdw10=0, cdw11=0, cdw12=0, cdw13=0x8,  # IDW (Incompressible)
+                     data=b'\x00' * 512, description="Write LBA 0, DSMA=IDW (Incompressible hint)"),
             ],
-            "SetFeatures": [
-                # CDW10[7:0]=FID, CDW10[31]=SV(Save)
-                dict(cdw10=0x07, cdw11=0x00010001, description="Set Number of Queues (1 SQ + 1 CQ)"),
+
+            # ================================================================
+            # WriteZeroes — CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB
+            #                CDW12[25]=DEAC, CDW12[29]=PRACT, CDW12[30]=LR, CDW12[31]=FUA
+            #                (데이터 전송 없음 — DMA 없이 펌웨어가 직접 0 기록)
+            # ================================================================
+            "WriteZeroes": [
+                dict(cdw10=0,     cdw11=0, cdw12=0,                       description="WriteZeroes LBA 0, 1 block"),
+                dict(cdw10=0,     cdw11=0, cdw12=7,                       description="WriteZeroes LBA 0, 8 blocks"),
+                dict(cdw10=0,     cdw11=0, cdw12=255,                     description="WriteZeroes LBA 0, 256 blocks"),
+                dict(cdw10=0,     cdw11=0, cdw12=0xFFFF,                  description="WriteZeroes LBA 0, NLB max"),
+                dict(cdw10=0,     cdw11=0, cdw12=_DEAC,                   description="WriteZeroes LBA 0, DEAC=1 (deallocate)"),
+                dict(cdw10=0,     cdw11=0, cdw12=_FUA,                    description="WriteZeroes LBA 0, FUA=1"),
+                dict(cdw10=0,     cdw11=0, cdw12=_DEAC | _FUA,            description="WriteZeroes LBA 0, DEAC+FUA"),
+                dict(cdw10=500,   cdw11=0, cdw12=0,                       description="WriteZeroes LBA 500"),
+                dict(cdw10=5000,  cdw11=0, cdw12=0,                       description="WriteZeroes LBA 5000"),
+                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0,         description="WriteZeroes LBA 4G (OOR error path)"),
             ],
+
+            # ================================================================
+            # Compare — Read처럼 LBA에서 읽어 호스트 버퍼와 비교
+            #            CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB
+            # ================================================================
+            "Compare": [
+                dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Compare LBA 0, 1 block zeros"),
+                dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xFF' * 512,  description="Compare LBA 0, 1 block 0xFF"),
+                dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xAA' * 512,  description="Compare LBA 0, 1 block 0xAA"),
+                dict(cdw10=0,     cdw11=0, cdw12=7, data=b'\x00' * (8 * 512), description="Compare LBA 0, 8 blocks"),
+                dict(cdw10=500,   cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Compare LBA 500"),
+                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0, data=b'\x00' * 512,
+                     description="Compare LBA 4G (OOR error path)"),
+            ],
+
+            # ================================================================
+            # WriteUncorrectable — LBA를 uncorrectable 상태로 마킹 (에러 주입)
+            #                       CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB
+            #                       데이터 전송 없음
+            # ================================================================
+            "WriteUncorrectable": [
+                dict(cdw10=0,    cdw11=0, cdw12=0,      description="WriteUncorrectable LBA 0, 1 block"),
+                dict(cdw10=0,    cdw11=0, cdw12=7,      description="WriteUncorrectable LBA 0, 8 blocks"),
+                dict(cdw10=0,    cdw11=0, cdw12=0xFFFF, description="WriteUncorrectable LBA 0, NLB max"),
+                dict(cdw10=500,  cdw11=0, cdw12=0,      description="WriteUncorrectable LBA 500"),
+                dict(cdw10=5000, cdw11=0, cdw12=0,      description="WriteUncorrectable LBA 5000"),
+                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0,
+                     description="WriteUncorrectable LBA 4G (OOR error path)"),
+            ],
+
+            # ================================================================
+            # Verify — LBA 읽기 후 CRC/PI 검증 (데이터 호스트 반환 없음)
+            #           CDW12[29]=PRACT, CDW12[28:26]=PRCHK, CDW12[30]=LR
+            # ================================================================
+            "Verify": [
+                dict(cdw10=0,    cdw11=0, cdw12=0,         description="Verify LBA 0, 1 block"),
+                dict(cdw10=0,    cdw11=0, cdw12=7,         description="Verify LBA 0, 8 blocks"),
+                dict(cdw10=0,    cdw11=0, cdw12=255,       description="Verify LBA 0, 256 blocks"),
+                dict(cdw10=0,    cdw11=0, cdw12=0xFFFF,    description="Verify LBA 0, NLB max"),
+                dict(cdw10=0,    cdw11=0, cdw12=_PRINFO_ALL,
+                     description="Verify LBA 0, PRINFO=0xF (all PI bits)"),
+                dict(cdw10=0,    cdw11=0, cdw12=_LR,       description="Verify LBA 0, LR=1 (Limited Retry)"),
+                dict(cdw10=0,    cdw11=0, cdw12=_PRCHK_ALL, description="Verify LBA 0, PRCHK=0x7 (all check bits)"),
+                dict(cdw10=0,    cdw11=0, cdw12=_PRACT | _LR,
+                     cdw14=0xDEADBEEF, description="Verify LBA 0, PRACT+LR+ILBRT=0xDEADBEEF"),
+                dict(cdw10=500,  cdw11=0, cdw12=0,         description="Verify LBA 500"),
+                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0,
+                     description="Verify LBA 4G (OOR error path)"),
+            ],
+
+            # ================================================================
+            # DeviceSelfTest — CDW10[3:0]=STC (Self-test Code)
+            #                   0x1=Short, 0x2=Extended, 0xE=Vendor, 0xF=Abort
+            #                   명령은 즉시 반환, 테스트는 백그라운드 실행
+            # ================================================================
+            "DeviceSelfTest": [
+                dict(cdw10=0x01, nsid_override=0, description="Short Self-test (background, ~2min max)"),
+                dict(cdw10=0x02, nsid_override=0, description="Extended Self-test (background, duration varies)"),
+                dict(cdw10=0x0E, nsid_override=0, description="Vendor specific self-test"),
+                dict(cdw10=0x0F, nsid_override=0, description="Abort current self-test"),
+                # NSID=1 (NS-scope self-test) — 일부 구현에서 NS별 테스트 지원
+                dict(cdw10=0x01, description="Short Self-test (NS-scope, NSID=1)"),
+                # 미지원 STC — 에러 경로
+                dict(cdw10=0x03, nsid_override=0, description="STC=0x03 (undefined, error path)"),
+            ],
+
+            # ================================================================
+            # SecuritySend — CDW10[31:24]=SECP, CDW10[23:8]=SPSP, CDW10[7:0]=NSSF
+            #                 CDW11=TL (Transfer Length, bytes)
+            #                 데이터: 호스트→SSD
+            # ================================================================
+            "SecuritySend": [
+                # SECP=0x00: Security Protocol Information (Protocol List)
+                dict(cdw10=(0x00 << 24), cdw11=512, data=b'\x00' * 512,
+                     description="SecuritySend SECP=0x00 (Protocol List)"),
+                # SECP=0x01: TCG (NVMe에서 가장 일반적)
+                dict(cdw10=(0x01 << 24) | (0x0001 << 8), cdw11=512, data=b'\x00' * 512,
+                     description="SecuritySend SECP=0x01 (TCG) SPSP=0x0001"),
+                dict(cdw10=(0x01 << 24) | (0x0007 << 8), cdw11=512, data=b'\x00' * 512,
+                     description="SecuritySend SECP=0x01 (TCG) SPSP=0x0007 (TCG SSC)"),
+                # SECP=0x02: IEEE 1667 (USB-style storage authentication)
+                dict(cdw10=(0x02 << 24), cdw11=512, data=b'\x00' * 512,
+                     description="SecuritySend SECP=0x02 (IEEE 1667)"),
+                # SECP=0xEA: NVMe-specific Security
+                dict(cdw10=(0xEA << 24), cdw11=512, data=b'\x00' * 512,
+                     description="SecuritySend SECP=0xEA (NVMe-specific)"),
+                # SECP=0xEF: ATA Security (SATA 이식 제품 일부 구현)
+                dict(cdw10=(0xEF << 24), cdw11=0, data=b'',
+                     description="SecuritySend SECP=0xEF (ATA Security, TL=0)"),
+                # 미지원 SECP — 에러 경로
+                dict(cdw10=(0xFF << 24), cdw11=512, data=b'\x00' * 512,
+                     description="SecuritySend SECP=0xFF (undefined, error path)"),
+            ],
+
+            # ================================================================
+            # SecurityReceive — CDW10[31:24]=SECP, CDW10[23:8]=SPSP, CDW10[7:0]=NSSF
+            #                    CDW11=AL (Allocation Length, bytes)
+            #                    데이터: SSD→호스트 (data_len = CDW11 by _send_nvme_command)
+            # ================================================================
+            "SecurityReceive": [
+                # SECP=0x00: Protocol list 조회 — 지원 프로토콜 목록
+                dict(cdw10=(0x00 << 24), cdw11=512,
+                     description="SecurityReceive SECP=0x00 (Protocol List), AL=512"),
+                # SECP=0x01: TCG
+                dict(cdw10=(0x01 << 24) | (0x0001 << 8), cdw11=512,
+                     description="SecurityReceive SECP=0x01 (TCG) SPSP=0x0001, AL=512"),
+                dict(cdw10=(0x01 << 24) | (0x0001 << 8), cdw11=4096,
+                     description="SecurityReceive SECP=0x01 (TCG) SPSP=0x0001, AL=4KB"),
+                # SECP=0x02: IEEE 1667
+                dict(cdw10=(0x02 << 24), cdw11=512,
+                     description="SecurityReceive SECP=0x02 (IEEE 1667), AL=512"),
+                # SECP=0xEA: NVMe-specific
+                dict(cdw10=(0xEA << 24), cdw11=512,
+                     description="SecurityReceive SECP=0xEA (NVMe-specific), AL=512"),
+                # AL=0 — 크기 0 조회 (지원 여부 확인용)
+                dict(cdw10=(0x01 << 24), cdw11=0,
+                     description="SecurityReceive SECP=0x01 AL=0 (capability probe)"),
+                # 미지원 SECP
+                dict(cdw10=(0xFF << 24), cdw11=512,
+                     description="SecurityReceive SECP=0xFF (undefined, error path)"),
+            ],
+
+            # ================================================================
+            # GetLBAStatus — CDW10=SLBA[31:0], CDW11=SLBA[63:32]
+            #                 CDW12=MNDW (Max Number of Dwords, 0-based)
+            #                 CDW13[15:0]=RL (Range Length), CDW13[31:16]=ATYPE
+            #                   ATYPE=0: All LBAs, 1: Allocated, 2: Unallocated
+            # ================================================================
+            "GetLBAStatus": [
+                dict(cdw10=0, cdw11=0, cdw12=0xFF, cdw13=(0x0000 << 16) | 0x0010,
+                     description="GetLBAStatus LBA 0, ATYPE=0 (all), RL=16"),
+                dict(cdw10=0, cdw11=0, cdw12=0xFF, cdw13=(0x0001 << 16) | 0x0010,
+                     description="GetLBAStatus LBA 0, ATYPE=1 (allocated), RL=16"),
+                dict(cdw10=0, cdw11=0, cdw12=0xFF, cdw13=(0x0002 << 16) | 0x0010,
+                     description="GetLBAStatus LBA 0, ATYPE=2 (unallocated/deallocated), RL=16"),
+                dict(cdw10=0, cdw11=0, cdw12=0xFF, cdw13=(0x0001 << 16) | 0xFFFF,
+                     description="GetLBAStatus LBA 0, ATYPE=1 RL=max"),
+                dict(cdw10=5000, cdw11=0, cdw12=0xFF, cdw13=(0x0001 << 16) | 0x0010,
+                     description="GetLBAStatus LBA 5000, ATYPE=1, RL=16"),
+                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0xFF, cdw13=0x0010,
+                     description="GetLBAStatus LBA 4G (OOR error path)"),
+            ],
+
+            # ================================================================
+            # FWDownload — CDW10=NUMD (0-based dwords), CDW11=OFST (dword offset)
+            # ================================================================
             "FWDownload": [
-                # CDW10=NUMD (0-based dwords), CDW11=OFST (dword offset)
                 dict(cdw10=0xFF, cdw11=0, data=b'\x00' * 1024, description="FW Download offset=0, 1KB"),
             ],
+
+            # ================================================================
+            # FWCommit — CDW10[2:0]=CA (Commit Action), CDW10[5:3]=FS (Firmware Slot)
+            #             CA=0: replace, no activate
+            #             CA=1: replace, activate on next reset
+            #             CA=2: replace + activate on next reset (w/ reset)
+            #             CA=3: activate without replace (existing slot)
+            #             CA=5: replace + activate immediately (NVMe 1.3+)
+            # ================================================================
             "FWCommit": [
-                # CDW10[2:0]=CA(Commit Action), CDW10[5:3]=FS(Firmware Slot)
-                dict(cdw10=0x01, description="Commit Action 1, Slot 0 (replace without activate)"),
-                dict(cdw10=0x09, description="Commit Action 1, Slot 1"),
+                dict(cdw10=0x00, description="CA=0: replace image, no activate (Slot 0)"),
+                dict(cdw10=0x01, description="CA=1: replace + activate on next reset (Slot 0)"),
+                dict(cdw10=0x09, description="CA=1: replace + activate on next reset (Slot 1)"),
+                dict(cdw10=0x02, description="CA=2: replace + activate on next reset (Slot 0)"),
+                dict(cdw10=0x03, description="CA=3: activate without replace (Slot 0)"),
+                dict(cdw10=0x05, description="CA=5: replace + activate immediately (Slot 0, NVMe 1.3+)"),
+                dict(cdw10=0x0D, description="CA=5: replace + activate immediately (Slot 1, NVMe 1.3+)"),
             ],
+
+            # ================================================================
+            # FormatNVM — CDW10[3:0]=LBAF, CDW10[11:9]=SES (Secure Erase Settings)
+            #              CDW10[8]=MSET, CDW10[12]=PI, CDW10[13]=PIL, CDW10[14]=METC
+            #              SES=0: no erase, 1: user data erase, 2: cryptographic erase
+            # ================================================================
             "FormatNVM": [
-                # CDW10[3:0]=LBAF, CDW10[11:9]=SES(Secure Erase)
-                dict(cdw10=0x00, description="Format LBAF 0, no secure erase"),
+                dict(cdw10=0x0000, description="Format LBAF=0, SES=0 (no secure erase)"),
+                dict(cdw10=0x0200, description="Format LBAF=0, SES=1 (user data erase)"),
+                dict(cdw10=0x0400, description="Format LBAF=0, SES=2 (cryptographic erase)"),
+                dict(cdw10=0x0001, description="Format LBAF=1, SES=0"),
+                dict(cdw10=0x0002, description="Format LBAF=2, SES=0"),
+                # PI 활성화 (메타데이터 + 보호정보)
+                dict(cdw10=0x1000, description="Format LBAF=0, PI Type 0 (PI field disabled)"),
+                dict(cdw10=0x1100, description="Format LBAF=0, PI=1 (Type 1 protection)"),
             ],
-            # Sanitize: 기본 시드에서 제거 (rc=0이면 즉시 SSD 전체 데이터 소거 시작 — 위험)
-            # 필요 시 사용자 시드 디렉토리로 직접 주입 가능.
+
+            # ================================================================
+            # Sanitize — 기본 시드 없음 (rc=0이면 즉시 SSD 전체 소거 시작)
+            # CDW10[2:0]=SANACT: 1=Block Erase, 2=Overwrite, 3=Crypto Erase, 4=Exit Failure
+            # CDW10[4]=AUSE (Allow Unrestricted Sanitize Exit)
+            # CDW10[5]=NODAS (No Deallocate After Sanitize)
+            # 필요 시 --seed-dir로 직접 주입
+            # ================================================================
+
+            # ================================================================
+            # TelemetryHostInitiated — GetLogPage LID=0x07
+            # CDW10[8]=Create Telemetry (1=새 데이터 생성, 0=기존 반환)
+            # ================================================================
             "TelemetryHostInitiated": [
-                # GetLogPage LID=0x07 + CDW10[8]=Create Telemetry
-                # 컨트롤러 범위 → nsid_override=0
-                dict(cdw10=(0x1FF << 16) | 0x07, nsid_override=0, description="Telemetry Host-Initiated Log"),
+                dict(cdw10=(0x1FF << 16) | 0x07, nsid_override=0,
+                     description="Telemetry Host-Initiated, Create=0 (return existing)"),
+                dict(cdw10=(0x1FF << 16) | (1 << 8) | 0x07, nsid_override=0,
+                     description="Telemetry Host-Initiated, Create=1 (create new snapshot)"),
             ],
+
+            # ================================================================
+            # Flush — 파라미터 없음
+            # ================================================================
             "Flush": [
                 dict(description="Flush (no parameters)"),
             ],
+
+            # ================================================================
+            # DatasetManagement — CDW10[7:0]=NR (Number of Ranges, 0-based)
+            #                      CDW11[2]=AD (Attribute Deallocate)
+            #                      CDW11[0]=IDR, CDW11[1]=IDW (access hints)
+            #                      data: 16B per range (Context Attrs + LBA Count + SLBA)
+            # ================================================================
             "DatasetManagement": [
-                # CDW10[7:0]=NR (Number of Ranges, 0-based), CDW11[2]=AD(Attribute Deallocate)
-                dict(cdw10=0, cdw11=0x04, data=struct.pack('<IIIII', 0, 0, 0, 0, 8),
-                     description="TRIM LBA 0, 8 blocks"),
+                # Range Entry 구조 (16B): [Context Attrs 4B][LBA Count 4B][SLBA 8B]
+                # AD=1: TRIM (deallocate) — 가장 일반적인 용도
+                dict(cdw10=0, cdw11=0x04,
+                     data=struct.pack('<IIQ', 0, 8, 0),
+                     description="TRIM LBA 0, 8 blocks (AD=1)"),
+                dict(cdw10=0, cdw11=0x04,
+                     data=struct.pack('<IIQ', 0, 256, 0),
+                     description="TRIM LBA 0, 256 blocks (AD=1)"),
+                dict(cdw10=0, cdw11=0x04,
+                     data=struct.pack('<IIQ', 0, 8, 500),
+                     description="TRIM LBA 500, 8 blocks (AD=1)"),
+                # IDR=1: Sequential Read access hint
+                dict(cdw10=0, cdw11=0x01,
+                     data=struct.pack('<IIQ', 0, 8, 0),
+                     description="DSM IDR=1 (Sequential Read hint), LBA 0, 8 blocks"),
+                # IDW=1: Sequential Write access hint
+                dict(cdw10=0, cdw11=0x02,
+                     data=struct.pack('<IIQ', 0, 8, 0),
+                     description="DSM IDW=1 (Sequential Write hint), LBA 0, 8 blocks"),
+                # NR=1 (2 ranges): AD=1
+                dict(cdw10=1, cdw11=0x04,
+                     data=struct.pack('<IIQ', 0, 8, 0) + struct.pack('<IIQ', 0, 8, 100),
+                     description="TRIM 2 ranges: LBA 0+8blk, LBA 100+8blk (NR=1, AD=1)"),
+                # NR=max (256 ranges): AD=1 — 범위 최대치
+                dict(cdw10=0xFF, cdw11=0x04,
+                     data=struct.pack('<IIQ', 0, 1, 0) * 256,
+                     description="TRIM 256 ranges (NR=0xFF, AD=1)"),
             ],
         }
 
@@ -2030,7 +2517,13 @@ class NVMeFuzzer:
             "Identify": 4096,
             "GetFeatures": 4096,
             "TelemetryHostInitiated": 4096,
+            "DeviceSelfTest": 0,       # 데이터 전송 없음
         }
+
+        # IO 명령어 중 NLB 기반 data_len 계산을 생략할 명령어
+        # (데이터 전송 자체가 없거나 별도 처리하는 명령어)
+        IO_NO_NLB_DATA = ("Flush", "DatasetManagement",
+                          "WriteZeroes", "WriteUncorrectable", "Verify")
 
         # --- data_len 결정 ---
         data_len = 0
@@ -2043,12 +2536,19 @@ class NVMeFuzzer:
         elif cmd.needs_data and data:
             data_len = len(data)
             write_data = True
-        elif cmd.cmd_type == NVMeCommandType.IO and cmd.name not in ("Flush", "DatasetManagement"):
+        elif cmd.cmd_type == NVMeCommandType.IO and cmd.name not in IO_NO_NLB_DATA:
+            # Read / Compare / Write 계열: CDW12[15:0] = NLB → 전송 크기 산출
             nlb = seed.cdw12 & 0xFFFF
             data_len = min(max(512, (nlb + 1) * 512), MAX_DATA_BUF)
         elif cmd.name == "GetLogPage":
             numdl = (seed.cdw10 >> 16) & 0x7FF
             data_len = min(max(4, (numdl + 1) * 4), MAX_DATA_BUF)
+        elif cmd.name == "SecurityReceive":
+            # CDW11 = AL (Allocation Length, bytes)
+            data_len = min(max(512, seed.cdw11), MAX_DATA_BUF)
+        elif cmd.name == "GetLBAStatus":
+            # CDW12 = MNDW (Max Number of Dwords, 0-based) → bytes = (MNDW+1)*4
+            data_len = min(max(8, (seed.cdw12 + 1) * 4), MAX_DATA_BUF)
         elif cmd.name in ADMIN_FIXED_RESPONSE:
             data_len = ADMIN_FIXED_RESPONSE[cmd.name]
 
@@ -2870,6 +3370,7 @@ class NVMeFuzzer:
         else:
             log.warning("Addr filter : NONE (all PCs collected - noisy!)")
         log.warning(f"Sampling    : interval={self.config.sample_interval_us}us, "
+                 f"go_settle={self.config.go_settle_ms}ms, "
                  f"max={self.config.max_samples_per_run}/run, "
                  f"idle_sat={self.config.saturation_limit}, "
                  f"global_sat={self.config.global_saturation_limit}, "
@@ -3380,9 +3881,9 @@ if __name__ == "__main__":
     parser.add_argument('--output', default=OUTPUT_DIR, help='Output dir')
     parser.add_argument('--seed-dir', default=SEED_DIR,
                         help='Seed directory path (load previous corpus as seeds)')
-    parser.add_argument('--fw-bin', default=None,
+    parser.add_argument('--fw-bin', default=_FW_BIN_PATH,
                         help='[v4.7] 펌웨어 바이너리 경로 (FWDownload 실제 시드 생성, '
-                             '없으면 더미 1KB 시드)')
+                             '없으면 더미 1KB 시드). 기본값: FW_BIN_FILENAME 설정')
     parser.add_argument('--fw-xfer', type=int, default=32768,
                         help='[v4.7] FWDownload 청크 크기(바이트), nvme fw-download -x 와 동일 '
                              '(default: 32768)')
@@ -3390,7 +3891,11 @@ if __name__ == "__main__":
                         help='[v4.7] FWCommit 슬롯 번호 (default: 1)')
     parser.add_argument('--samples', type=int, default=MAX_SAMPLES_PER_RUN)
     parser.add_argument('--interval', type=int, default=SAMPLE_INTERVAL_US,
-                        help='Sample interval (us)')
+                        help='Sample interval (us). 0 = max density (기본값)')
+    parser.add_argument('--go-settle', type=int, default=GO_SETTLE_MS,
+                        help='Go() 후 CPU 최소 실행 보장 시간 (ms). '
+                             '0=비활성화(JTAG/정상SWD). SWD+레벨시프터=50 권장. '
+                             f'(default: {GO_SETTLE_MS})')
     parser.add_argument('--post-cmd-delay', type=int, default=POST_CMD_DELAY_MS,
                         help='Post-command sampling delay (ms)')
     parser.add_argument('--passthru-timeout', type=int, default=NVME_PASSTHRU_TIMEOUT_MS,
@@ -3537,6 +4042,7 @@ if __name__ == "__main__":
         seed_dir=args.seed_dir,
         max_samples_per_run=args.samples,
         sample_interval_us=args.interval,
+        go_settle_ms=args.go_settle,
         post_cmd_delay_ms=args.post_cmd_delay,
         nvme_passthru_timeout_ms=args.passthru_timeout,
         nvme_kernel_timeout_sec=args.kernel_timeout,

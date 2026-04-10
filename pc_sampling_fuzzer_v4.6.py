@@ -1,95 +1,9 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v5.1
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v4.6
 
 J-Link V9 Halt-Sample-Resume 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
-
-v5.1 변경사항:
-- [Feature] PM Rotation: --pm 플래그로 매 PM_ROTATE_INTERVAL(기본 100)회 명령마다
-    random.randint(0,4)로 PS0~PS4 중 랜덤 전환 (같은 PS 재진입 허용).
-    _pm_set_state() → bool: SetFeatures(FID=0x02, CDW11=ps) 전송, rc·소요시간 로그 출력.
-    [Stats] 출력과 동일 경계(executions % 100)에서 PS 전환.
-    PS별 실행 횟수 / 진입 횟수 통계 — 종료 summary에 출력.
-    PS3/PS4: 명령 타입 필터 없음(IO 포함 모든 명령 허용).
-             timeout_mult는 진입 전 마지막 operational PS(0~2)인 _prev_op_ps 기준.
-- [Feature] 정적 분석 커버리지 연동 (Basic Block 기준):
-    퍼저 동일 디렉토리에 basic_blocks.txt / functions.txt(Ghidra ghidra_export.py 생성) 두면
-    자동 탐지 · 로드 (CLI 인자 불필요). 파일 없으면 기존 동작 유지.
-    BB 커버리지: bisect O(log N)으로 샘플된 PC → BB(start/end) 탐색.
-    BB 내 어느 instruction이든 1회 샘플 = 해당 BB 전체 실행으로 판단
-    (instruction 단위 집계보다 샘플링 노이즈에 강인).
-    [Stats] 출력 시 [StatCov] BB: X.X% | funcs: N/M (Y.Y%) 행 추가.
-    종료 summary에 BB Coverage / Func Coverage 섹션 추가.
-- [Feature] 정적 분석 시각화 그래프 3종 (graphs/ 에 자동 생성):
-    coverage_growth.png  : BB_cov% / funcs_cov% 성장 곡선 (100회마다 스냅샷)
-    firmware_map.png     : 펌웨어 함수 공간 전체 맵 (커버=초록 / 미커버=회색)
-    uncovered_funcs.png  : 미커버 함수 Top-30 크기 내림차순 막대 차트
-- [Tune] DIAGNOSE_STABILITY: 50 → 100, DIAGNOSE_MAX: 1000 → 5000
-    idle PC 100개+ 환경(복잡한 RTOS, 주기 인터럽트)에서 최대 샘플 도달로
-    idle 유니버스 수렴 미완료 발생 → 상한 확장으로 완전 수렴 보장.
-    최대 소요 시간: 5000 × 50ms ≈ 4분 (퍼저 시작 시 1회).
-- [BugFix] idle_pcs addr_range 필터 제거:
-    RTOS/IRQ 핸들러(0x10000000+) 등 범위 밖 PC가 idle_pcs에서 빠지면
-    consecutive_idle 카운터가 리셋되어 idle saturation이 동작하지 않는 문제 수정.
-    idle_pcs는 전체 idle 유니버스를 포함, addr_range 필터는 coverage 추적에만 적용.
-- [Feature] Crash 시 FAIL CMD 상세 출력:
-    timeout crash 발생 시 dmesg 캡처 직후, 실패한 NVMe 명령의
-    cmd/opcode/device/nsid/cdw2~15/data_len/data hex/mutations 전체를
-    "!! FAIL CMD !!" 블록으로 강조 출력.
-- [Feature] Crash 시 UFAS 펌웨어 덤프 자동 실행:
-    fuzzer 동일 디렉토리의 ./ufas 파일이 있으면 crash 저장 직후 자동 실행.
-    PCIe bus 번호는 /sys/class/nvme/<ctrl>/address sysfs 우선 탐지,
-    실패 시 lspci fallback. 덤프 파일명: <YYYYMMDD>_UFAS_Dump.bin.
-- [Feature] Crash 재현 TC replay .sh 자동 생성:
-    _cmd_history(deque maxlen=100)에 NVMe 명령 + PM 동작을 순서대로 기록.
-    crash 발생 시 crashes/replay_<tag>.sh 생성 — sudo bash replay_<tag>.sh 로 바로 실행.
-    마지막 항목(CRASH CMD) 주석 표기, write 데이터는 replay_data_<tag>/data_NNN.bin 저장.
-    --input-file 절대경로 저장 (실행 위치 무관), stdout > /dev/null 으로 response buffer 억제,
-    명령어 CLI 전체 + rc=$? echo 출력, set +e 로 중간 실패 시에도 전체 시퀀스 실행.
-    nvme-cli --timeout=3600000(1시간): crash 발생 명령에서 blocking 유지 → crash state 보존.
-    스크립트 헤더에서 nvme_core.admin_timeout/io_timeout을 30일로 설정 → 커널 abort/reset 방지.
-
-v5.0 변경사항:
-- [Feature] --interface auto/jtag/swd: J-Link 인터페이스 자동 탐지
-    기본값 auto: JTAG 연결 시도 → 실패 시 SWD로 자동 전환.
-    SWD 전용 SSD 제품에서도 별도 옵션 없이 자동 연결 가능.
-    FuzzConfig.interface: int → Optional[int] (None=auto).
-- [Feature] --pc-reg-index N: PC 레지스터 인덱스 수동 지정
-    자동 탐지 실패 시 jlink_reg_diag.py로 인덱스 확인 후 강제 지정.
-    _find_pc_register_index() 탐색 패턴 강화: R15/PC/EPC/MEPC/SEPC.
-    Cortex-R8(=9), Cortex-M(=15), RISC-V 등 아키텍처별 대응.
-- [Redesign] diagnose(): 수렴 기반 idle 유니버스 수집
-    기존: 고정 횟수 샘플 후 빈도 임계값으로 idle PC 추정.
-    문제: SWD에서 WFI wake로 20+개 PC 등장 → 단일 idle_pc 감지 불가.
-    해결: 새 PC가 DIAGNOSE_STABILITY(기본 50)회 연속 나타나지 않을 때까지
-          adaptive 샘플링 (최대 DIAGNOSE_MAX=1000회).
-    수집된 모든 unique PC (범위 내) = "idle 유니버스":
-      JTAG: WFI 고정 → 수십 샘플에 수렴, idle_pcs 1~2개.
-      SWD:  주기적 인터럽트 핸들러까지 포함 → 더 많은 샘플 후 수렴, idle_pcs 20+개.
-    --diagnose-stability, --diagnose-max CLI 옵션 추가.
-- [BugFix] _sampling_worker(): idle 감지를 idle 유니버스 기반으로 교체
-    기존 단일 idle_pc → SWD에서 None이 되어 idle saturation 완전 비작동.
-    idle_pcs(유니버스) 내 PC가 sat_limit회 연속 → idle_saturated 조기종료.
-    NVMe 커맨드 처리 코드는 idle 유니버스 밖에 있으므로 처리 중 오발동 없음:
-      idle 유니버스 밖 PC 한 번이라도 나오면 consecutive_idle 리셋.
-
-v4.7 변경사항:
-- [BugFix] FUA 비트 위치 수정: CDW12[14] → CDW12[29] (NVMe spec 1.4 §6.3)
-    기존 (1<<14)=0x4000은 NLB 필드 상위비트를 오염시켜 rc=2 발생.
-    올바른 FUA 위치: CDW12[29] = Force Unit Access.
-    Read LBA 0 FUA, Write LBA 0 FUA 시드 모두 수정.
-- [BugFix] 컨트롤러 범위 명령의 NSID 수정: nsid_override=0 적용
-    Identify Controller(CNS=0x01), GetLogPage LID=0x01/0x02,
-    TelemetryHostInitiated는 네임스페이스 범위가 아닌 컨트롤러 범위.
-    NVMe spec에서 해당 명령들의 NSID 필드는 Reserved → 0으로 전송.
-    기존: cmd.namespace_id(=1) 사용 → rc=2 발생.
-- [BugFix] Sanitize 초기 시드에서 제거
-    Sanitize(Block Erase)는 rc=0 즉시 SSD 전체 데이터 소거 시작.
-    퍼저 시작 시 자동 실행되어 데이터 파괴 위험 → 기본 시드에서 제거.
-- [Feature] nsid_override 시드 템플릿 지원
-    SEED_TEMPLATES dict에 nsid_override 키 추가,
-    _generate_default_seeds() 루프에서 Seed 생성 시 반영.
 
 v4.6 변경사항:
 - [BugFix] io-passthru deprecated ioctl 경고 제거: nvme io-passthru를
@@ -189,7 +103,6 @@ import time
 import threading
 import subprocess
 import os
-import sys
 import shutil
 import json
 import hashlib
@@ -203,10 +116,9 @@ from datetime import datetime
 from pathlib import Path
 from enum import Enum
 import contextlib
-import bisect
 
 # 버전
-FUZZER_VERSION = "5.1"
+FUZZER_VERSION = "4.6"
 
 # =============================================================================
 # USER CONFIGURATION - 여기만 수정하세요
@@ -218,7 +130,7 @@ FW_ADDR_END   = 0x00147FFF
 
 # J-Link / JTAG 설정
 JLINK_DEVICE  = 'Cortex-R8'
-JLINK_SPEED   = 4000           # kHz
+JLINK_SPEED   = 12000          # kHz
 
 # NVMe 장치 설정
 NVME_DEVICE    = '/dev/nvme0'
@@ -227,36 +139,20 @@ NVME_NAMESPACE = 1
 # NVMe 명령어 그룹별 타임아웃 (ms)
 # 그룹에 속하지 않는 명령어는 모두 'command'에 해당
 NVME_TIMEOUTS = {
-    'command':      18_000,    # 일반 명령어 (Identify, GetLogPage, GetFeatures, Read, Write 등)
+    'command':      8_000,     # 일반 명령어 (Identify, GetLogPage, GetFeatures, Read, Write 등)
     'format':       600_000,   # Format NVM — 전체 미디어 포맷, 수 분 소요 가능
     'sanitize':     600_000,   # Sanitize — 보안 삭제, 수 분~수십 분 소요
     'fw_commit':    120_000,   # Firmware Commit — 펌웨어 슬롯 활성화, 리셋 포함 가능
     'telemetry':    30_000,    # Telemetry Host/Controller — 대용량 로그 수집
     'dsm':          30_000,    # Dataset Management (TRIM/Deallocate)
     'flush':        30_000,    # Flush — 캐시 플러시, 미디어 기록 완료 대기
-    'selftest':     30_000,    # Device Self-test START — 즉시 반환, 테스트는 백그라운드 실행
-    'security':     30_000,    # Security Send/Receive — TCG/OPAL 프로토콜
 }
 
 # PC 샘플링 설정
-SAMPLE_INTERVAL_US    = 0      # 샘플 간격 (us). 0 = halt-as-fast-as-possible (최대 밀도).
-                               # 다른 제품(JTAG/정상 SWD)은 0으로도 안정적으로 동작한다.
-                               # NVMe 안정성이 필요한 경우 아래 GO_SETTLE_MS 를 사용할 것.
-
-# Go() 후 CPU 최소 실행 보장 시간 (ms)
-# SAMPLE_INTERVAL_US 와 독립적인 하드웨어 안정성 파라미터.
-# 기본값 0 = 비활성화 (JTAG / 정상 SWD 환경 — 하위 호환성 유지).
-# SWD + 1.8V 레벨시프터 환경: NVMe DMA/클럭 게이팅으로 Go() 직후
-#   halt 시 CPU 실행 시간이 너무 짧아 NVMe 커맨드 타임아웃 발생.
-#   diagnose() 경험: 5ms 미만 → 불안정, 50ms → 안정.
-#   이 값을 50 으로 설정하면 Go() 후 CPU에 최소 50ms 실행 시간 보장.
-GO_SETTLE_MS          = 0      # ms. 0 = 비활성화 (기본값, JTAG/정상 SWD 환경).
-                               # SWD + 1.8V 레벨시프터 등 불안정 환경에서 NVMe 타임아웃 발생 시
-                               # --go-settle 50 등으로 올려서 시도.
+SAMPLE_INTERVAL_US    = 0     # 샘플 간격 (us), 0 = halt 직후 바로 다음 halt
 MAX_SAMPLES_PER_RUN   = 500   # NVMe 커맨드 1회당 최대 샘플 수 (상한)
-SATURATION_LIMIT      = 10    # idle 유니버스 연속 카운터: idle_pcs 내 PC가 N회 연속이면 조기 종료.
-                               # diagnose()에서 수렴 수집한 idle 유니버스 기반 → JTAG/SWD 공통 동작.
-GLOBAL_SATURATION_LIMIT = 20  # 연속 N회 새 global PC 없으면 조기 종료 (global_coverage 기준).
+SATURATION_LIMIT      = 10    # idle PC 연속 N회 감지 시 샘플링 조기 종료
+GLOBAL_SATURATION_LIMIT = 20  # 연속 N회 새 global PC 없으면 조기 종료 (v4.5+: edge→PC 기준 전환)
 POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 
 # v4.6: NVMe passthru 명령 자체의 timeout (nvme-cli --timeout 인자)
@@ -272,7 +168,7 @@ NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일 (커널 reset 방지, u32 max 
 # 기본값: admin_timeout=60s, io_timeout=30s → 펌웨어 crash 후 ~60초면 reset됨.
 # 이 값을 크게 설정하면 crash 상태가 장기간 보존되어 JTAG 분석 가능.
 # 적용 대상: 설정 이후 새로 제출되는 NVMe 명령 (기존 in-flight AER 제외)
-NVME_KERNEL_TIMEOUT_SEC = 2_592_000  # 30일 (30 * 24 * 3600)
+NVME_KERNEL_TIMEOUT_SEC = 86_400  # 24시간
 
 # 퍼징 설정
 MAX_INPUT_LEN     = 131072    # 최대 입력 바이트 (128KB = 256 blocks, Write 대용량 시드 지원)
@@ -280,16 +176,6 @@ TOTAL_RUNTIME_SEC = 604_800   # 총 퍼징 시간 (초) — 1주일
 OUTPUT_DIR        = f'./output/pc_sampling_v{FUZZER_VERSION}/'
 SEED_DIR          = None      # 시드 폴더 경로 (없으면 None)
 RESUME_COVERAGE   = None      # 이전 coverage.txt 경로 (없으면 None)
-
-# v5.0: 펌웨어 바이너리 파일명 (FWDownload 시드 생성용)
-# .py 파일과 같은 디렉토리에 있는 파일명만 입력하세요.
-# 예: FW_BIN_FILENAME = 'FW.bin'
-# None 또는 파일이 없으면 더미 1KB zeros 시드로 대체됩니다.
-FW_BIN_FILENAME   = None
-_FW_BIN_PATH = (
-    str(Path(__file__).parent / FW_BIN_FILENAME)
-    if FW_BIN_FILENAME else None
-)
 
 # Power Schedule 설정 (v4 추가)
 MAX_ENERGY        = 16.0      # 최대 에너지 값
@@ -305,17 +191,6 @@ OPCODE_MUT_PROB   = 0.10   # opcode override 확률 (기본 10%)
 NSID_MUT_PROB     = 0.10   # namespace ID override 확률 (기본 10%)
 ADMIN_SWAP_PROB   = 0.05   # Admin↔IO 교차 전송 확률 (기본 5%)
 DATALEN_MUT_PROB  = 0.08   # data_len 불일치 확률 (기본 8%)
-
-# v5.1: PM 로테이션 설정 (--pm 플래그로 활성화)
-PM_ROTATE_INTERVAL = 100   # 이 횟수마다 PS 상태 전환 (PS0→PS1→PS2→PS3→PS4→PS0...)
-# PS별 subprocess 감지 timeout 배수 (PS1/PS2는 응답 지연 허용)
-PS_TIMEOUT_MULT    = {0: 1, 1: 16, 2: 32, 3: 1, 4: 1}
-
-# v4.7: Idle 유니버스 수집 (diagnose 수렴 설정)
-# SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
-# 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
-DIAGNOSE_STABILITY = 100   # 새 idle PC 없이 연속 N회면 수렴으로 판정
-DIAGNOSE_MAX       = 5000  # 수렴 전 최대 샘플 수 (상한)
 
 # v4.5: Calibration 설정
 CALIBRATION_RUNS  = 3      # 초기 시드당 calibration 실행 횟수 (0 = 비활성화)
@@ -393,26 +268,6 @@ NVME_COMMANDS_EXTENDED = [
     NVMeCommand("DatasetManagement", 0x09, NVMeCommandType.IO,
                 timeout_group="dsm",
                 description="데이터셋 관리 (TRIM/Deallocate)"),
-    # ── v5.1: 즉시 추가 명령어 ──
-    NVMeCommand("WriteZeroes", 0x08, NVMeCommandType.IO, needs_data=False,
-                description="LBA 범위를 0으로 기록 (DMA 없음, DEAC 지원)"),
-    NVMeCommand("Compare", 0x05, NVMeCommandType.IO,
-                description="LBA 읽기 후 호스트 버퍼와 비교 (miscompare → error)"),
-    NVMeCommand("WriteUncorrectable", 0x04, NVMeCommandType.IO, needs_data=False,
-                description="LBA를 uncorrectable 상태로 마킹 (에러 주입)"),
-    NVMeCommand("Verify", 0x0C, NVMeCommandType.IO, needs_data=False,
-                description="LBA 읽기 후 CRC/PI 검증 (데이터 반환 없음)"),
-    NVMeCommand("DeviceSelfTest", 0x14, NVMeCommandType.ADMIN, needs_data=False,
-                needs_namespace=False, timeout_group="selftest",
-                description="자가 진단 시작/중단 (백그라운드 실행, 즉시 반환)"),
-    NVMeCommand("SecuritySend", 0x81, NVMeCommandType.ADMIN,
-                needs_namespace=False, timeout_group="security",
-                description="보안 프로토콜 전송 (TCG/OPAL/IEEE1667)"),
-    NVMeCommand("SecurityReceive", 0x82, NVMeCommandType.ADMIN, needs_data=False,
-                needs_namespace=False, timeout_group="security",
-                description="보안 프로토콜 수신 (TCG/OPAL/IEEE1667)"),
-    NVMeCommand("GetLBAStatus", 0x86, NVMeCommandType.ADMIN, needs_data=False,
-                description="LBA 범위별 할당/미할당 상태 조회"),
 ]
 
 # 전체 명령어 (이름으로 조회용)
@@ -463,20 +318,18 @@ class Seed:
 @dataclass
 class FuzzConfig:
     device_name: str = JLINK_DEVICE
-    interface: Optional[int] = None  # None=auto(JTAG→SWD), 또는 JLinkInterfaces.JTAG/SWD
+    interface: int = pylink.enums.JLinkInterfaces.JTAG
     jtag_speed: int = JLINK_SPEED
-    pc_reg_index: Optional[int] = None  # None = auto-detect, 정수 = 강제 지정
 
     nvme_device: str = NVME_DEVICE
     nvme_namespace: int = NVME_NAMESPACE
     nvme_timeouts: dict = field(default_factory=lambda: NVME_TIMEOUTS.copy())
 
     enabled_commands: List[str] = field(default_factory=list)
-    all_commands: bool = False   # True면 위험(파괴적) 명령어 포함 전체 활성화
+    all_commands: bool = True    # True면 위험(파괴적) 명령어 포함 전체 활성화
 
     # 샘플링 설정
     sample_interval_us: int = SAMPLE_INTERVAL_US
-    go_settle_ms: int = GO_SETTLE_MS  # Go() 후 CPU 최소 실행 보장 (ms). 0 = 비활성화
     max_samples_per_run: int = MAX_SAMPLES_PER_RUN
     saturation_limit: int = SATURATION_LIMIT
 
@@ -520,10 +373,6 @@ class FuzzConfig:
     admin_swap_prob: float = ADMIN_SWAP_PROB
     datalen_mut_prob: float = DATALEN_MUT_PROB
 
-    # v4.7: Idle 유니버스 수렴 설정
-    diagnose_stability: int = DIAGNOSE_STABILITY  # 새 idle PC 없이 연속 N회면 수렴
-    diagnose_max: int = DIAGNOSE_MAX              # 수렴 전 최대 샘플 수
-
     # v4.5: Calibration
     calibration_runs: int = CALIBRATION_RUNS
 
@@ -538,14 +387,6 @@ class FuzzConfig:
 
     # v4.5+: Corpus 하드 상한 (0 = 무제한)
     max_corpus_hard_limit: int = MAX_CORPUS_HARD_LIMIT
-
-    # v4.7: FWDownload 실제 펌웨어 시드 지원
-    fw_bin: Optional[str] = None        # 펌웨어 바이너리 경로 (없으면 더미 시드)
-    fw_xfer_size: int = 32768           # FWDownload 청크 크기(바이트), nvme fw-download -x 와 동일
-    fw_slot: int = 1                    # FWCommit 슬롯 번호
-
-    # v5.1: PM 로테이션 활성화 플래그 (0.0=비활성화, 1.0=활성화 — --pm 플래그로 설정)
-    pm_inject_prob: float = 0.0
 
 
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
@@ -608,12 +449,9 @@ class JLinkPCSampler:
         self.interesting_inputs = 0
         self._last_raw_pcs: List[int] = []
         self._out_of_range_count = 0
-        self._last_new_pcs: set = set()   # evaluate_coverage()에서 노출 — 정적 분석 연동용
 
         # v4.2: idle PC — diagnose()에서 가장 빈도 높은 PC로 설정
         self.idle_pc: Optional[int] = None
-        # v4.7: idle PC 집합 — SWD에서 WFI wake로 여러 주소가 관찰될 때 대응
-        self.idle_pcs: Set[int] = set()
 
     def connect(self) -> bool:
         try:
@@ -622,76 +460,16 @@ class JLinkPCSampler:
 
             self.jlink = pylink.JLink()
             self.jlink.open()
+            self.jlink.set_tif(self.config.interface)
+            self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
 
-            # 인터페이스 결정: None=auto(JTAG 먼저 시도 → 실패 시 SWD fallback)
-            _JTAG = pylink.enums.JLinkInterfaces.JTAG
-            _SWD  = pylink.enums.JLinkInterfaces.SWD
-            _jtag_pc_idx: Optional[int] = None  # auto JTAG 검증 중 탐지된 PC 인덱스 캐시
-            if self.config.interface is not None:
-                # 명시적 지정: 그대로 사용
-                self.jlink.set_tif(self.config.interface)
-                self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
-                iface_name = "JTAG" if self.config.interface == _JTAG else "SWD"
-            else:
-                # auto: JTAG 먼저 시도 + 실제 CPU 응답 검증 후 SWD fallback
-                # register_list()/register_name()은 J-Link 내부 DB를 읽으므로
-                # CPU 비응답 상태에서도 성공한다. 따라서 halt() 후 halted() 상태로
-                # 실제 CPU 통신 여부를 판별한다.
-                try:
-                    self.jlink.set_tif(_JTAG)
-                    self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
-                    # 실제 CPU halt 응답으로 JTAG 연결 검증
-                    self.jlink.halt()
-                    _jtag_halted = False
-                    for _ in range(20):
-                        if self.jlink.halted():
-                            _jtag_halted = True
-                            break
-                        time.sleep(0.005)
-                    if not _jtag_halted:
-                        raise Exception("JTAG halt 미응답 (100ms 초과) — SWD 전용 타깃으로 판단")
-                    _jtag_pc_idx = self._probe_pc_register_index()
-                    # ★ JTAG 검증 완료 후 즉시 resume.
-                    # halt() 상태로 반환하면 connect() 이후 _log_smart() 등 NVMe
-                    # 명령이 펌웨어를 못 받아 10초 타임아웃이 바로 발생한다.
-                    # JLINKARM_Go() — jlink_reg_diag.py에서 실증된 resume 방식.
-                    # ctypes 호출이므로 Python 예외 없음, 실패 시 JLINKARM_IsHalted로 확인.
-                    self.jlink._dll.JLINKARM_Go()
-                    if bool(self.jlink._dll.JLINKARM_IsHalted()):
-                        raise Exception(
-                            "JLINKARM_Go() 호출 후 CPU 여전히 halt — "
-                            "JTAG CPU resume 불가, SWD fallback 시도"
-                        )
-                    log.warning("[J-Link] JTAG 검증용 halt 해제 — CPU resumed (Go OK).")
-                    iface_name = "JTAG (auto)"
-                except Exception as jtag_err:
-                    log.warning(f"[J-Link] JTAG 연결/검증 실패 ({jtag_err}), SWD로 재시도...")
-                    self.jlink.close()
-                    self.jlink = pylink.JLink()
-                    self.jlink.open()
-                    self.jlink.set_tif(_SWD)
-                    self.jlink.connect(self.config.device_name, speed=self.config.jtag_speed)
-                    iface_name = "SWD (auto-fallback)"
+            log.warning(f"[J-Link] Connected: {self.config.device_name} @ {self.config.jtag_speed}kHz")
 
-            log.warning(f"[J-Link] Connected: {self.config.device_name} @ {self.config.jtag_speed}kHz [{iface_name}]")
+            # R15(PC)의 실제 레지스터 인덱스를 동적으로 탐색
+            self._pc_reg_index = self._find_pc_register_index()
+            log.warning(f"[J-Link] PC register index: {self._pc_reg_index} "
+                     f"(name: {self.jlink.register_name(self._pc_reg_index)})")
 
-            # R15(PC)의 실제 레지스터 인덱스 결정
-            if self.config.pc_reg_index is not None:
-                # 사용자가 --pc-reg-index로 강제 지정
-                self._pc_reg_index = self.config.pc_reg_index
-                log.warning(f"[J-Link] PC register index: {self._pc_reg_index} (--pc-reg-index 강제 지정)")
-            elif _jtag_pc_idx is not None:
-                # auto JTAG 검증 중 이미 탐지됨 → 재호출 불필요
-                self._pc_reg_index = _jtag_pc_idx
-                log.warning(f"[J-Link] PC register index: {self._pc_reg_index} "
-                         f"(name: {self.jlink.register_name(self._pc_reg_index)}, JTAG auto)")
-            else:
-                # SWD fallback 또는 explicit interface 경로 → 여기서 탐색
-                self._pc_reg_index = self._find_pc_register_index()
-                log.warning(f"[J-Link] PC register index: {self._pc_reg_index} "
-                         f"(name: {self.jlink.register_name(self._pc_reg_index)})")
-
-            # DLL 함수 참조 캐싱 (pylink wrapper 우회, 매 호출 attribute lookup 제거)
             # DLL 함수 참조 캐싱 (pylink wrapper 우회, 매 호출 attribute lookup 제거)
             self._halt_func = self.jlink._dll.JLINKARM_Halt
             self._read_reg_func = self.jlink._dll.JLINKARM_ReadReg
@@ -702,178 +480,68 @@ class JLinkPCSampler:
             log.error(f"[J-Link Error] {e}")
             return False
 
-    def _probe_pc_register_index(self) -> int:
-        """JTAG 연결 검증 겸 PC 레지스터 인덱스 탐색 (예외를 그대로 raise).
-
-        _find_pc_register_index()와 동일한 로직이지만 예외를 삼키지 않는다.
-        auto-detect 시 JTAG try 블록 안에서 호출해 register_name() 실패까지
-        SWD fallback 트리거로 사용한다.
-        연결 유효하지만 PC 이름을 못 찾으면 15를 반환 (예외 없음).
-        """
-        _PC_NAMES = {'R15', 'PC', 'EPC', 'MEPC', 'SEPC'}
-        all_regs = list(self.jlink.register_list())   # 실패 시 그대로 raise
-        for idx in all_regs:
-            name = self.jlink.register_name(idx).upper().strip()  # 실패 시 그대로 raise
-            if name in _PC_NAMES:
-                return idx
-        for idx in all_regs:
-            name = self.jlink.register_name(idx).upper().strip()
-            if 'R15' in name:
-                return idx
-        return 15  # 연결은 유효하나 이름 매칭 실패 → fallback
-
     def _find_pc_register_index(self) -> int:
-        """register_list()에서 PC 레지스터의 실제 인덱스를 찾는다.
-
-        아키텍처별 PC 레지스터 이름:
-          ARM Cortex-R/A : R15, r15
-          ARM Cortex-M   : PC, R15
-          RISC-V         : PC, mepc, pc
-          MIPS           : PC, EPC
-        자동 탐색 실패 시 --pc-reg-index N 으로 수동 지정 가능.
-        """
-        _PC_NAMES = {'R15', 'PC', 'EPC', 'MEPC', 'SEPC'}
+        """register_list()에서 R15(PC)의 실제 인덱스를 찾는다.
+        Cortex-R8 등에서는 레지스터 인덱스가 0-15 순서가 아닐 수 있음."""
         try:
-            all_regs = list(self.jlink.register_list())
-            # 1단계: 이름이 정확히 PC 계열인 것
-            for idx in all_regs:
-                name = self.jlink.register_name(idx).upper().strip()
-                if name in _PC_NAMES:
-                    return idx
-            # 2단계: 이름에 R15 포함 (e.g. "R15_USR", "ARM_R15")
-            for idx in all_regs:
-                name = self.jlink.register_name(idx).upper().strip()
-                if 'R15' in name:
+            for idx in self.jlink.register_list():
+                name = self.jlink.register_name(idx)
+                if 'R15' in name or name.upper() == 'PC':
                     return idx
         except Exception as e:
             log.warning(f"[J-Link] register_list() 탐색 실패: {e}")
-        log.warning("[J-Link] PC 레지스터를 자동으로 찾지 못했습니다. fallback=15 사용.")
-        log.warning("[J-Link] 올바른 인덱스를 jlink_reg_diag.py 로 확인 후 --pc-reg-index N 으로 지정하세요.")
+        log.warning("[J-Link] R15 인덱스를 찾지 못함, 기본값 15 사용")
         return 15
 
     def diagnose(self, count: int = 20) -> bool:
-        """시작 전 PC 읽기 진단 — J-Link 동작 검증 + idle 유니버스 수집 (v4.7)
-
-        idle_pcs 구성 전략 (JTAG/SWD 공통):
-          새 PC가 DIAGNOSE_STABILITY회 연속 나타나지 않을 때까지 샘플링 (최대 DIAGNOSE_MAX회).
-          JTAG: WFI 고정 → 수십 샘플에 수렴.
-          SWD:  WFI wake로 주기적 인터럽트 핸들러까지 포함 → 더 많은 샘플 필요.
-          수집된 idle_pcs = "idle 유니버스" — 퍼징 중 이 집합 밖 PC가 나오면 active 실행 중.
-        """
-        stability = self.config.diagnose_stability
-        max_samples = self.config.diagnose_max
-
-        log.warning(f"[Diagnose] idle 유니버스 수집 시작 "
-                    f"(수렴 조건: 새 PC 없이 {stability}회 연속, 최대 {max_samples}회)...")
-
-        # 1단계: 초기 20회 — 기본 동작 검증 및 로그 출력
-        initial = min(count, 20)
-        pcs_initial = []
+        """시작 전 PC 읽기 진단 — J-Link 동작 검증 + idle PC 감지 (v4.2)"""
+        log.warning(f"[Diagnose] PC를 {count}회 읽어서 J-Link 상태를 확인합니다...")
+        pcs = []
         failures = 0
-        for i in range(initial):
+        for i in range(count):
             pc = self._read_pc()
             if pc is not None:
-                pcs_initial.append(pc)
+                pcs.append(pc)
                 in_range = ""
                 if self.config.addr_range_start is not None and self.config.addr_range_end is not None:
-                    in_range = (" [IN RANGE]"
-                                if self.config.addr_range_start <= pc <= self.config.addr_range_end
-                                else " [OUT OF RANGE]")
+                    if self.config.addr_range_start <= pc <= self.config.addr_range_end:
+                        in_range = " [IN RANGE]"
+                    else:
+                        in_range = " [OUT OF RANGE]"
                 log.warning(f"  [{i+1:2d}] PC = {hex(pc)}{in_range}")
             else:
                 failures += 1
                 log.warning(f"  [{i+1:2d}] PC read FAILED")
             time.sleep(0.05)
 
-        if not pcs_initial:
+        if not pcs:
             log.error("[Diagnose] PC를 한 번도 읽지 못했습니다. JTAG 연결을 확인하세요.")
             return False
 
-        # 2단계: 수렴 기반 adaptive 샘플링 — idle 유니버스 완성
-        idle_universe: Set[int] = set(pcs_initial)
-        consecutive_no_new = 0
-        total = len(pcs_initial)
+        unique_pcs = set(pcs)
+        log.warning(f"[Diagnose] 결과: {len(pcs)}/{count} 성공, "
+                 f"failures={failures}, unique PCs={len(unique_pcs)}")
 
-        log.warning(f"[Diagnose] 초기 {initial}회 완료, unique PCs={len(idle_universe)}. "
-                    f"idle 유니버스 수렴 샘플링 시작...")
-
-        consecutive_failures = 0
-        while consecutive_no_new < stability and total < max_samples:
-            pc = self._read_pc()
-            total += 1
-            if pc is not None and pc not in idle_universe:
-                # 새 PC 발견 → 카운터 리셋
-                idle_universe.add(pc)
-                consecutive_no_new = 0
-                consecutive_failures = 0
-                log.warning(f"  [+{total:4d}] 새 idle PC: {hex(pc)} "
-                            f"(누적 {len(idle_universe)}개)")
-            else:
-                # 기존 PC 재등장 또는 read 실패 → 수렴 카운터 증가
-                consecutive_no_new += 1
-                if pc is None:
-                    consecutive_failures += 1
-                    if consecutive_failures % 10 == 0:
-                        log.warning(f"[Diagnose] J-Link read 연속 실패 {consecutive_failures}회 "
-                                    f"— 연결 불안정 또는 CPU halt 방치 가능성")
-                else:
-                    consecutive_failures = 0
-            # NVMe 보호: 5ms(이전)는 너무 짧아 펌웨어가 NVMe 큐 처리를 완료하기 전에
-            # 다시 halt되어 컨트롤러가 불안정해진다.
-            # 50ms: 펌웨어가 pending 인터럽트·AER·완료큐 처리 후 WFI로 돌아갈 시간 확보.
-            # diagnose 총 시간: ~200샘플 × 50ms ≈ 10초 (허용 범위)
-            time.sleep(0.05)
-
-        if consecutive_no_new >= stability:
-            log.warning(f"[Diagnose] idle 유니버스 수렴 완료: "
-                        f"{len(idle_universe)}개 PC, {total}회 샘플 "
-                        f"(새 PC 없이 {consecutive_no_new}회 연속)")
-        else:
-            log.warning(f"[Diagnose] 최대 샘플({max_samples}회) 도달. "
-                        f"idle 유니버스 {len(idle_universe)}개 (수렴 미완료, 이대로 사용)")
-
-        # idle_pcs = 수집된 전체 idle 유니버스 (범위 필터 없음)
-        # addr_range 필터는 커버리지 추적(global_coverage, current_trace)에만 적용.
-        # idle 감지용 idle_pcs는 out-of-range PC(RTOS 스케줄러, 인터럽트 핸들러 등)도
-        # 포함해야 consecutive_idle 카운터가 리셋되지 않고 정상 동작함.
-        self.idle_pcs = set(idle_universe)
-
+        # v4.2: 가장 빈도 높은 PC를 idle PC로 설정
         from collections import Counter
-        pc_counts = Counter(pcs_initial)
-        self.idle_pc = pc_counts.most_common(1)[0][0]  # 대표값 (로그/호환성)
+        pc_counts = Counter(pcs)
+        most_common_pc, most_common_count = pc_counts.most_common(1)[0]
+        idle_ratio = most_common_count / len(pcs)
 
-        log.warning(f"[Diagnose] idle_pcs = {len(self.idle_pcs)}개 "
-                    f"(범위 내), 대표 PC = {hex(self.idle_pc)}")
+        if idle_ratio >= 0.3:
+            # 30% 이상 동일 PC면 idle로 판정
+            self.idle_pc = most_common_pc
+            log.warning(f"[Diagnose] idle PC 감지: {hex(most_common_pc)} "
+                        f"(빈도: {most_common_count}/{len(pcs)} = {idle_ratio:.0%})")
+        else:
+            self.idle_pc = None
+            log.warning(f"[Diagnose] idle PC 없음 (최다 PC {hex(most_common_pc)}: "
+                        f"{idle_ratio:.0%} < 30% 임계값)")
 
-        # 샘플링 루프 종료 후 CPU가 running 상태임을 보장한다.
-        self._ensure_running()
+        if len(unique_pcs) <= 1:
+            log.warning(f"[Diagnose] PC가 항상 같은 값입니다 ({hex(pcs[0])}). "
+                        f"CPU가 멈춰있거나 idle loop에 있을 수 있습니다.")
         return True
-
-    def _ensure_running(self, settle_ms: int = 100) -> None:
-        """샘플링 루프 후 CPU가 running 상태임을 보장한다."""
-        ok = self._go_with_retry()
-        if not ok:
-            log.warning("[J-Link] _ensure_running: Go() 재시도 후에도 CPU halted 상태")
-
-    def _go_with_retry(self, max_attempts: int = 5, retry_delay_s: float = 0.05) -> bool:
-        """JLINKARM_Go() 재시도 래퍼.
-
-        JLINKARM_Go()는 실패해도 Python exception을 발생시키지 않고 음수를 반환한다.
-        "Could not start CPU core. (ErrorCode: -1)" 메시지는 J-Link DLL이 stderr에 직접
-        출력하며, Python 레이어에서는 반환값을 확인해야만 감지 가능하다.
-
-        NVMe DMA 처리 중 CPU 클럭 게이팅 등으로 Go()가 일시적으로 실패할 수 있으므로
-        실패 시에만 짧은 대기 후 재시도한다. 성공 시 즉시 반환하여 오버헤드 최소화.
-        """
-        for attempt in range(max_attempts):
-            ret = self._go_func()   # 0 = 성공, 음수 = 실패 (exception 없음)
-            if ret == 0:
-                return True         # 성공 시 즉시 반환 — sleep 없음
-            # 실패 시에만 대기 후 재시도
-            log.debug(f"[J-Link] Go() 재시도 {attempt + 1}/{max_attempts} (ret={ret})")
-            time.sleep(retry_delay_s)
-        log.warning(f"[J-Link] Go() {max_attempts}회 재시도 후에도 CPU halt 상태")
-        return False
 
     def _read_pc(self) -> Optional[int]:
         try:
@@ -883,7 +551,10 @@ class JLinkPCSampler:
         except Exception:
             return None
         finally:
-            self._go_with_retry()
+            try:
+                self._go_func()
+            except Exception:
+                pass
 
     def read_stuck_pcs(self, count: int = 10) -> List[int]:
         """v4.3: timeout/crash 후 SSD 펌웨어가 멈춘 PC를 읽는다.
@@ -927,16 +598,12 @@ class JLinkPCSampler:
         self._stopped_reason = ""
 
         sample_count = 0
-        since_last_global_new = 0   # 연속 "이미 알려진 PC" 카운터 (global 기준)
-        consecutive_idle = 0         # idle 유니버스 연속 카운터
+        since_last_global_new = 0   # 연속 "이미 알려진 PC" 카운터
+        consecutive_idle = 0         # v4.2: 연속 idle PC 카운터
         interval = self.config.sample_interval_us / 1_000_000
-        # GO_SETTLE_MS: Go() 후 CPU에 최소 실행 시간 보장 (SWD+레벨시프터 NVMe 안정성).
-        # SAMPLE_INTERVAL_US(샘플 밀도 제어)와 독립적. 둘 중 큰 값이 실제 sleep.
-        settle_s  = self.config.go_settle_ms / 1_000.0
-        effective_interval = max(interval, settle_s)
         sat_limit = self.config.saturation_limit
         global_sat_limit = self.config.global_saturation_limit  # v4.3: 설정값 사용
-        idle_pcs = self.idle_pcs     # idle 유니버스 (diagnose에서 수렴 수집)
+        idle_pc = self.idle_pc       # v4.2: 로컬 캐싱
 
         # global_coverage(PC 주소 set) 참조 캐싱
         # CPython set.__contains__는 GIL 하에서 안전
@@ -961,23 +628,22 @@ class JLinkPCSampler:
                         prev_pc = pc
 
                     # v4.5+: PC 기반 글로벌 포화 판단
+                    # 모든 in-range PC(첫 번째 포함)에 대해 체크
                     if pc not in global_coverage_ref:
                         self._last_new_at = sample_count
                         since_last_global_new = 0
                     else:
                         since_last_global_new += 1
 
-                    # v4.7: idle 유니버스 기반 연속 카운터
-                    # diagnose()에서 수렴 수집한 idle_pcs = idle 상태에서 나올 수 있는 모든 PC.
-                    # NVMe 커맨드 처리 코드는 idle 유니버스 밖 → 처리 중엔 consecutive_idle 리셋.
-                    # idle 복귀 후 유니버스 내 PC만 연속 → sat_limit 도달 → 조기종료.
-                    if idle_pcs and pc in idle_pcs:
+                    # v4.2: idle PC 연속 카운터
+                    if idle_pc is not None and pc == idle_pc:
                         consecutive_idle += 1
                     else:
                         consecutive_idle = 0
                 else:
                     self._out_of_range_count += 1
-                    consecutive_idle = 0  # out-of-range는 idle로 보지 않음
+                    # out-of-range도 idle 판정에 포함하지 않음
+                    consecutive_idle = 0
 
                 sample_count += 1
                 self.total_samples += 1
@@ -987,8 +653,8 @@ class JLinkPCSampler:
                     self._unique_at_intervals[sample_count] = len(self.current_trace)
 
                 # 조기 종료 조건 (OR)
-                # 조건1: 연속 global_sat_limit회 이미 알려진 PC (새 코드 경로 없음, global 기준)
-                # 조건2: 연속 sat_limit회 idle 유니버스 내 PC (idle 복귀 감지)
+                # 조건1: 연속 global_sat_limit회 이미 알려진 PC (새 코드 경로 없음)
+                # 조건2: 연속 sat_limit회 idle PC에 머물러 있음
                 if sat_limit > 0:
                     if global_sat_limit > 0 and since_last_global_new >= global_sat_limit:
                         self._stopped_reason = (
@@ -997,16 +663,15 @@ class JLinkPCSampler:
                             f"limit={global_sat_limit})"
                         )
                         break
-                    if idle_pcs and consecutive_idle >= sat_limit:
+                    if idle_pc is not None and consecutive_idle >= sat_limit:
                         self._stopped_reason = (
-                            f"idle_saturated (idle universe hit "
-                            f"{consecutive_idle} consecutive, "
-                            f"universe_size={len(idle_pcs)})"
+                            f"idle_saturated (idle PC {hex(idle_pc)} "
+                            f"x{consecutive_idle} consecutive)"
                         )
                         break
 
-            if effective_interval > 0:
-                time.sleep(effective_interval)
+            if interval > 0:
+                time.sleep(interval)
 
         if not self._stopped_reason:
             if self.stop_event.is_set():
@@ -1019,9 +684,6 @@ class JLinkPCSampler:
         # 서로 다른 명령어 간의 가짜 edge를 방지하기 위해 제거
 
     def start_sampling(self):
-        # 이미 샘플링 중이면 스킵 (PM 구간에서 먼저 시작한 경우 중복 방지)
-        if self.sample_thread and self.sample_thread.is_alive():
-            return
         self.stop_event.clear()
         self.sample_thread = threading.Thread(target=self._sampling_worker, daemon=True)
         self.sample_thread.start()
@@ -1045,10 +707,9 @@ class JLinkPCSampler:
         - corpus 크기가 펌웨어 실제 코드 크기에 자연스럽게 수렴
         - confirmation 없이도 신뢰 가능
         """
-        new_pc_set = self.current_trace - self.global_coverage
-        self._last_new_pcs = new_pc_set
+        initial_pcs = len(self.global_coverage)
         self.global_coverage.update(self.current_trace)
-        new_pcs = len(new_pc_set)
+        new_pcs = len(self.global_coverage) - initial_pcs
 
         is_interesting = new_pcs > 0
         return is_interesting, new_pcs
@@ -1088,13 +749,6 @@ class JLinkPCSampler:
         if self.sample_thread:
             self.sample_thread.join(timeout=1.0)
         if self.jlink:
-            # 종료 전 CPU resume 보장 — halt 상태로 J-Link를 닫으면
-            # SSD 펌웨어가 영구 정지 상태로 남는다.
-            if self._go_func is not None:
-                try:
-                    self._go_with_retry(max_attempts=3, retry_delay_s=0.05)
-                except Exception:
-                    pass
             try:
                 self.jlink.close()
             except Exception:
@@ -1131,30 +785,6 @@ class NVMeFuzzer:
 
         self.executions = 0
         self.start_time: Optional[datetime] = None
-        # v5.1: PM 로테이션 상태
-        self._current_ps: int = 0                              # 현재 PS 상태
-        self._prev_op_ps: int = 0                             # 마지막 operational PS (0~2) — PS3/4 timeout 기준
-        # _ps_cmd_counter 제거 — PM 전환을 executions % 100 경계에서 처리
-        # _ps_idx 제거 — 랜덤 전환으로 변경
-        self.ps_exec_counts: dict[int, int] = {i: 0 for i in range(5)}  # PS별 실행 횟수
-        self.ps_enter_counts: dict[int, int] = {i: 0 for i in range(5)} # PS별 진입 횟수
-
-        # v5.1: 정적 분석 연동 (Ghidra export — basic_blocks.txt / functions.txt)
-        self._sa_loaded: bool = False
-        self._sa_bb_starts: Optional[list] = None  # sorted BB start addrs (bisect용)
-        self._sa_bb_ends: Optional[list] = None    # parallel BB end addrs (exclusive)
-        self._sa_total_bbs: int = 0
-        self._sa_covered_bbs: set = set()          # 커버된 BB start addr 집합
-        self._sa_func_entries: Optional[list] = None  # sorted by entry, bisect용
-        self._sa_func_ends: Optional[list] = None
-        self._sa_func_names: Optional[list] = None
-        self._sa_total_funcs: int = 0
-        self._sa_entered_funcs: set = set()   # 진입한 함수 entry point 집합
-        self._sa_thumb_mask: bool = False     # True면 PC & ~1 로 비교 (Thumb bit 자동 보정)
-        self._sa_diag_done: bool = False      # 첫 update 진단 출력 완료 여부
-        # 성장 곡선 이력: [(executions, elapsed_s, bb_pct, funcs_pct), ...]
-        self._sa_cov_history: list = []
-        self._load_static_analysis()
 
         self.cmd_stats: dict[str, dict] = defaultdict(lambda: {"exec": 0, "interesting": 0})
         for c in self.commands:
@@ -1206,9 +836,6 @@ class NVMeFuzzer:
 
         # v4.2: subprocess 입력 파일 경로 (재사용)
         self._nvme_input_path: Optional[str] = None
-
-        # v5.1: 재현 TC용 명령 히스토리 (최근 100개, PM 포함)
-        self._cmd_history: deque = deque(maxlen=100)
 
     @staticmethod
     def _tracking_label(cmd: 'NVMeCommand', seed: 'Seed') -> str:
@@ -1276,11 +903,7 @@ class NVMeFuzzer:
             for pc in self.sampler.current_trace:
                 pc_appearances[pc] = pc_appearances.get(pc, 0) + 1
 
-            if rc == self.RC_TIMEOUT:
-                log.error(f"[Calibration] {seed.cmd.name} timeout at run {run_i+1} — treating as crash")
-                self._handle_timeout_crash(seed, seed.data)
-                break
-            elif rc == self.RC_ERROR:
+            if rc in (self.RC_TIMEOUT, self.RC_ERROR):
                 log.warning(f"[Calibration] {seed.cmd.name} rc={rc} at run {run_i+1} — stopping early")
                 break
 
@@ -1440,7 +1063,7 @@ class NVMeFuzzer:
             return
 
         try:
-            stdout_data, stderr_data = proc.communicate(timeout=60)
+            stdout_data, stderr_data = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             # D-state 프로세스는 SIGKILL도 무시 → communicate() 재호출 금지.
             # 파이프를 닫고 non-blocking poll만 해서 계속 진행한다.
@@ -1456,7 +1079,7 @@ class NVMeFuzzer:
                     except Exception:
                         pass
             proc.poll()
-            log.warning("[SMART] smart-log 타임아웃 (60s) — NVMe 장치 무응답")
+            log.warning("[SMART] smart-log 타임아웃 (10s) — NVMe 장치 응답 없음")
             return
 
         if proc.returncode == 0 and stdout_data.strip():
@@ -1474,591 +1097,111 @@ class NVMeFuzzer:
         """각 Opcode별 NVMe 스펙 기반 정상 명령어를 초기 시드로 생성"""
         seeds: List[Seed] = []
 
-        # 명령어별 정상 파라미터 템플릿
-        # CDW12 Protection/Access 비트 (NVMe 2.0 기준):
-        #   [25]    DEAC  — WriteZeroes: deallocate after zeroing
-        #   [26]    PRCHK[2] — Guard field check
-        #   [27]    PRCHK[1] — Application Tag check
-        #   [28]    PRCHK[0] — Reference Tag check
-        #   [29]    PRACT  — Protection Info Action (insert/strip)
-        #   [30]    LR     — Limited Retry
-        #   [31]    FUA    — Force Unit Access
-        # CDW13[15:0] = DSPEC — Directive Specific (Streams: Stream ID)
-        # CDW14[31:0] = ILBRT — Initial Logical Block Reference Tag (E2E PI)
-        # CDW15[15:0] = LBAT  — Logical Block Application Tag (E2E PI)
-        # CDW15[31:16]= LBATM — LB Application Tag Mask (E2E PI)
-        _FUA  = 1 << 31
-        _LR   = 1 << 30
-        _PRACT = 1 << 29
-        _PRCHK_ALL = (1 << 26) | (1 << 27) | (1 << 28)  # 3-bit PRCHK 전체 set
-        _PRINFO_ALL = _PRACT | _PRCHK_ALL                 # PRACT + PRCHK 전체
-        _DEAC = 1 << 25                                   # WriteZeroes deallocate
-
+        # 명령어별 정상 파라미터 템플릿: (cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data, 설명)
         SEED_TEMPLATES: dict[str, list] = {
-            # ================================================================
-            # Identify — CDW10[7:0]=CNS, CDW10[31:16]=CNTID
-            # ================================================================
             "Identify": [
-                # CNS=0x01(Controller): NSID는 Reserved → nsid_override=0
-                dict(cdw10=0x0001, nsid_override=0,           description="Identify Controller"),
-                dict(cdw10=0x0000,                            description="Identify Namespace (NSID=1)"),
-                dict(cdw10=0x0002, nsid_override=0,           description="Active NS ID list"),
-                dict(cdw10=0x0003,                            description="NS Identification Descriptor list"),
-                dict(cdw10=0x0004,                            description="Allocated NS ID List (incl. deleted)"),
-                dict(cdw10=0x0005,                            description="I/O Command Set specific Identify NS"),
-                dict(cdw10=0x0006, nsid_override=0,           description="Identify Primary Controller Capabilities"),
-                dict(cdw10=0x0007, nsid_override=0,           description="Secondary Controller list"),
-                dict(cdw10=0x0008, nsid_override=0,           description="Namespace Granularity List"),
-                dict(cdw10=0x0009, nsid_override=0,           description="UUID List"),
-                dict(cdw10=0x001C,                            description="I/O Cmd Set Allocated NS ID list"),
-                dict(cdw10=0x001D,                            description="I/O Cmd Set Namespace ID Descriptor"),
-                # CNTID 필드 포함 (CNS=0x06/0x07에서 특정 컨트롤러 조회)
-                dict(cdw10=(0x0001 << 16) | 0x0006, nsid_override=0, description="Primary Ctrl Cap CNTID=1"),
-                # 미지원 CNS — 에러 경로 탐색
-                dict(cdw10=0x00FF, nsid_override=0,           description="CNS=0xFF (undefined, error path)"),
+                # CDW10 = CNS (Controller or Namespace Structure)
+                dict(cdw10=0x01, description="Identify Controller"),
+                dict(cdw10=0x00, description="Identify Namespace"),
+                dict(cdw10=0x02, description="Active NS ID list"),
+                dict(cdw10=0x03, description="NS Identification Descriptor list"),
             ],
-
-            # ================================================================
-            # GetLogPage — CDW10[7:0]=LID, CDW10[26:16]=NUMDL, CDW10[15]=RAE
-            #              CDW10[12:8]=LSP, CDW11[15:0]=NUMDH
-            #              CDW12=LPOL (Log Page Offset Lower dword)
-            #              CDW13=LPOU (Log Page Offset Upper dword)
-            # ================================================================
             "GetLogPage": [
-                # ── Mandatory (NVMe 2.0 §5.14) ──
-                dict(cdw10=(0x0F << 16) | 0x01, nsid_override=0, description="Error Information Log (64B)"),
-                dict(cdw10=(0x7F << 16) | 0x02, nsid_override=0, description="SMART / Health Log (512B)"),
-                dict(cdw10=(0x0F << 16) | 0x03, nsid_override=0, description="Firmware Slot Information (64B)"),
-                dict(cdw10=(0xFF << 16) | 0x04, nsid_override=0xFFFFFFFF, description="Changed NS List (4KB, NSID=broadcast)"),
-                dict(cdw10=(0xFF << 16) | 0x05, nsid_override=0, description="Commands Supported and Effects (4KB)"),
-                dict(cdw10=(0x8F << 16) | 0x06, nsid_override=0, description="Device Self-test Log (564B)"),
-                dict(cdw10=(0x1FF << 16) | 0x07, nsid_override=0, description="Telemetry Host-Initiated (CDW10[8]=Create)"),
-                dict(cdw10=(0x1FF << 16) | 0x08, nsid_override=0, description="Telemetry Controller-Initiated"),
-                # ── Optional ──
-                dict(cdw10=(0x7F << 16) | 0x09,                  description="Endurance Group Information (512B)"),
-                dict(cdw10=(0x1FF << 16) | 0x0A, nsid_override=0, description="Predictive Failure Analysis"),
-                dict(cdw10=(0x7F << 16) | 0x0B,                  description="Asymmetric Namespace Access (ANA)"),
-                dict(cdw10=(0xFFF << 16) | 0x0C, nsid_override=0, description="Persistent Event Log (header 512B)"),
-                dict(cdw10=(0xFF << 16) | 0x0D, nsid_override=0, description="Endurance Group Event Aggregate"),
-                dict(cdw10=(0xFF << 16) | 0x0E, nsid_override=0, description="Media Unit Status"),
-                dict(cdw10=(0xFF << 16) | 0x0F, nsid_override=0, description="Supported Capacity Config List"),
-                dict(cdw10=(0xFF << 16) | 0x10, nsid_override=0, description="Feature Identifiers Supported & Effects (4KB)"),
-                dict(cdw10=(0xFF << 16) | 0x11, nsid_override=0, description="NVMe-MI Commands Supported & Effects"),
-                dict(cdw10=(0xFF << 16) | 0x12, nsid_override=0, description="Command and Feature Lockdown Log"),
-                dict(cdw10=(0x1FF << 16) | 0x13, nsid_override=0, description="Boot Partition Log"),
-                dict(cdw10=(0xFF << 16) | 0x70, nsid_override=0, description="Discovery Log (Fabrics, error path expected)"),
-                dict(cdw10=(0xFF << 16) | 0x80,                  description="Reservation Notification Log"),
-                dict(cdw10=(0xFF << 16) | 0x81, nsid_override=0, description="Sanitize Status Log"),
-                # ── RAE=1 (Retain Async Event) 변형 ──
-                dict(cdw10=(0x7F << 16) | (1 << 15) | 0x02, nsid_override=0,
-                     description="SMART Log RAE=1 (CDW10[15]=1, retain async event)"),
-                # ── LPOL 오프셋 (CDW12) ── 큰 로그의 중간부터 읽기
-                dict(cdw10=(0x7F << 16) | 0x02, cdw12=0x200, nsid_override=0,
-                     description="SMART Log LPOL=0x200 (middle offset)"),
-                # ── NUMDH (CDW11[15:0]) — 4GB 초과 로그 ──
-                dict(cdw10=(0xFFF << 16) | 0x0C, cdw11=0x0001, nsid_override=0,
-                     description="Persistent Event Log NUMDH=1 (large request)"),
-                # ── 미지원 LID — 에러 핸들러 경로 ──
-                dict(cdw10=(0xFF << 16) | 0xFF, nsid_override=0, description="LID=0xFF (undefined, error path)"),
+                # CDW10[7:0]=LID, CDW10[26:16]=NUMDL (Number of Dwords Lower, 0-based)
+                dict(cdw10=(0x0F << 16) | 0x01, description="Error Information Log (64B)"),
+                dict(cdw10=(0x7F << 16) | 0x02, description="SMART / Health Log (512B)"),
             ],
-
-            # ================================================================
-            # GetFeatures — CDW10[7:0]=FID, CDW10[9:8]=SEL (current/default/saved/supported)
-            # ================================================================
             "GetFeatures": [
-                dict(cdw10=0x01, description="Arbitration (burst size, priority weight)"),
-                dict(cdw10=0x02, description="Power Management (power state)"),
-                dict(cdw10=0x03, description="LBA Range Type"),
-                dict(cdw10=0x04, description="Temperature Threshold (TMPTH, TMPSEL, THSEL)"),
-                dict(cdw10=0x05, description="Error Recovery (DULBE, TLER)"),
+                # CDW10[7:0]=FID (Feature Identifier)
                 dict(cdw10=0x06, description="Volatile Write Cache"),
                 dict(cdw10=0x07, description="Number of Queues"),
-                dict(cdw10=0x08, description="Interrupt Coalescing"),
-                dict(cdw10=0x09, description="Interrupt Vector Configuration"),
-                dict(cdw10=0x0A, description="Write Atomicity Normal"),
                 dict(cdw10=0x0B, description="Async Event Configuration"),
-                dict(cdw10=0x0C, description="Autonomous Power State Transition"),
-                dict(cdw10=0x0D, description="Host Memory Buffer"),
-                dict(cdw10=0x0E, description="Timestamp"),
-                dict(cdw10=0x0F, description="Keep Alive Timer"),
-                dict(cdw10=0x10, description="Host Controlled Thermal Management"),
-                dict(cdw10=0x11, description="Non-Operational Power State Config"),
-                dict(cdw10=0x12, description="Read Recovery Level Config"),
-                dict(cdw10=0x7E, description="Host Identifier (128-bit)"),
-                dict(cdw10=0x7F, description="Reservation Notification Mask"),
-                dict(cdw10=0x80, description="Reservation Persistence"),
-                # SEL=1 (default value) 변형
-                dict(cdw10=(1 << 8) | 0x06, description="Volatile Write Cache SEL=default"),
-                dict(cdw10=(1 << 8) | 0x02, description="Power Management SEL=default"),
-                # SEL=2 (saved) 변형
-                dict(cdw10=(2 << 8) | 0x06, description="Volatile Write Cache SEL=saved"),
-                # SEL=3 (supported capabilities) 변형
-                dict(cdw10=(3 << 8) | 0x06, description="Volatile Write Cache SEL=capabilities"),
-                # 미지원 FID — 에러 경로
-                dict(cdw10=0xFF, description="FID=0xFF (undefined, error path)"),
             ],
-
-            # ================================================================
-            # SetFeatures — CDW10[7:0]=FID, CDW10[31]=SV (Save), CDW11=dword value
-            # ================================================================
-            "SetFeatures": [
-                # FID=0x01: Arbitration — CDW11[2:0]=AB(High Priority Burst), [8:3]=HPW, [15:8]=MPW, [23:16]=LPW
-                dict(cdw10=0x01, cdw11=0x00000003, description="Set Arbitration (burst=8, default priority)"),
-                # FID=0x02: Power Management — CDW11[4:0]=PS (Power State)
-                dict(cdw10=0x02, cdw11=0x00000000, description="Set Power State 0 (max performance)"),
-                dict(cdw10=0x02, cdw11=0x00000004, description="Set Power State 4 (low power)"),
-                # FID=0x04: Temperature Threshold — CDW11[15:0]=TMPTH(Kelvin), [19:16]=TMPSEL, [20]=THSEL
-                dict(cdw10=0x04, cdw11=0x0000012C, description="Set Temp Threshold 300K composite (TMPSEL=0)"),
-                dict(cdw10=0x04, cdw11=0x00010050, description="Set Temp Threshold 80K (unrealistically low, error path)"),
-                dict(cdw10=0x04, cdw11=0x000107FF, description="Set Temp Threshold max (0x7FF K, TMPSEL=1 sensor1)"),
-                # FID=0x05: Error Recovery — CDW11[15:0]=TLER(ms), CDW11[16]=DULBE
-                dict(cdw10=0x05, cdw11=0x00000000, description="Set Error Recovery TLER=0 DULBE=0"),
-                dict(cdw10=0x05, cdw11=0x00010064, description="Set Error Recovery TLER=100ms DULBE=1"),
-                # FID=0x06: Volatile Write Cache — CDW11[0]=WCE (Write Cache Enable)
-                dict(cdw10=0x06, cdw11=0x00000001, description="Set VWC=Enable"),
-                dict(cdw10=0x06, cdw11=0x00000000, description="Set VWC=Disable"),
-                # FID=0x07: Number of Queues (기존 유지)
-                dict(cdw10=0x07, cdw11=0x00010001, description="Set Number of Queues (1 SQ + 1 CQ)"),
-                # FID=0x08: Interrupt Coalescing — CDW11[7:0]=THR, CDW11[15:8]=TIME(100us)
-                dict(cdw10=0x08, cdw11=0x00000000, description="Set Interrupt Coalescing disabled"),
-                dict(cdw10=0x08, cdw11=0x00000A04, description="Set Interrupt Coalescing THR=4 TIME=10"),
-                # FID=0x0B: Async Event Configuration — CDW11[0]=SMART Critical Warning
-                dict(cdw10=0x0B, cdw11=0x00000000, description="Set AEC all disabled"),
-                dict(cdw10=0x0B, cdw11=0x000000FF, description="Set AEC all enabled"),
-                # FID=0x0E: Timestamp — CDW11+CDW12 = 48-bit timestamp (ms since epoch)
-                dict(cdw10=0x0E, cdw11=0x00000000, description="Set Timestamp = 0 (reset)"),
-                # FID=0x10: Host Controlled Thermal Management — CDW11[0]=TMT2EN, CDW11[1]=TMT1EN
-                dict(cdw10=0x10, cdw11=0x00000003, description="Set HCTM both thresholds enabled"),
-                # SV=1 변형 (설정값 저장)
-                dict(cdw10=(1 << 31) | 0x06, cdw11=0x00000001, description="Set VWC=Enable + Save"),
-            ],
-
-            # ================================================================
-            # Read — CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB
-            #         CDW12[29]=PRACT, CDW12[30]=LR, CDW12[31]=FUA
-            #         CDW13[15:0]=DSPEC (Streams ID), CDW14=ILBRT, CDW15=LBAT/LBATM
-            # ================================================================
             "Read": [
-                # ── 기본 LBA 범위 ──
-                dict(cdw10=0,     cdw11=0, cdw12=0,      description="Read LBA 0, 1 block"),
-                dict(cdw10=1,     cdw11=0, cdw12=0,      description="Read LBA 1, 1 block"),
-                dict(cdw10=0,     cdw11=0, cdw12=7,      description="Read LBA 0, 8 blocks (4KB)"),
-                dict(cdw10=0,     cdw11=0, cdw12=31,     description="Read LBA 0, 32 blocks (16KB)"),
-                dict(cdw10=0,     cdw11=0, cdw12=127,    description="Read LBA 0, 128 blocks (64KB)"),
-                dict(cdw10=0,     cdw11=0, cdw12=255,    description="Read LBA 0, 256 blocks (128KB)"),
-                dict(cdw10=0,     cdw11=0, cdw12=0xFFFF, description="Read LBA 0, NLB max (65536 blocks)"),
-                dict(cdw10=500,   cdw11=0, cdw12=0,      description="Read LBA 500"),
-                dict(cdw10=1000,  cdw11=0, cdw12=0,      description="Read LBA 1000"),
-                dict(cdw10=5000,  cdw11=0, cdw12=0,      description="Read LBA 5000"),
-                dict(cdw10=10000, cdw11=0, cdw12=0,      description="Read LBA 10000"),
-                # ── 64비트 LBA 경계 ──
+                # CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB (0-based, 스펙 max=0xFFFF)
+                # ── 일반 LBA 범위 ──
+                dict(cdw10=0,      cdw11=0, cdw12=0,      description="Read LBA 0, 1 block"),
+                dict(cdw10=1,      cdw11=0, cdw12=0,      description="Read LBA 1, 1 block"),
+                dict(cdw10=0,      cdw11=0, cdw12=7,      description="Read LBA 0, 8 blocks"),
+                dict(cdw10=0,      cdw11=0, cdw12=31,     description="Read LBA 0, 32 blocks"),
+                dict(cdw10=0,      cdw11=0, cdw12=127,    description="Read LBA 0, 128 blocks"),
+                dict(cdw10=0,      cdw11=0, cdw12=255,    description="Read LBA 0, 256 blocks (128KB)"),
+                dict(cdw10=0,      cdw11=0, cdw12=0xFFFF, description="Read LBA 0, NLB max (65536 blocks, 32MB)"),
+                dict(cdw10=500,    cdw11=0, cdw12=0,      description="Read LBA 500, 1 block"),
+                dict(cdw10=1000,   cdw11=0, cdw12=0,      description="Read LBA 1000, 1 block"),
+                dict(cdw10=5000,   cdw11=0, cdw12=0,      description="Read LBA 5000, 1 block"),
+                dict(cdw10=10000,  cdw11=0, cdw12=0,      description="Read LBA 10000, 1 block"),
+                dict(cdw10=0,      cdw11=0, cdw12=(1 << 14), description="Read LBA 0, FUA (Force Unit Access)"),
+                # ── 64비트 LBA 경계 (CDW11=SLBA[63:32]) ──
                 dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0,
-                     description="Read LBA 4G (OOR error path)"),
+                     description="Read LBA 4G (SLBA=0x1_0000_0000), OOR 에러 경로"),
                 dict(cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0,
-                     description="Read SLBA near 64-bit max (OOR error path)"),
-                # ── CDW12 상위 비트: Protection / Access ──
-                dict(cdw10=0, cdw11=0, cdw12=_PRACT,
-                     description="Read LBA 0, PRACT=1 (CDW12[29], PI action)"),
-                dict(cdw10=0, cdw11=0, cdw12=_LR,
-                     description="Read LBA 0, LR=1 (Limited Retry, CDW12[30])"),
-                dict(cdw10=0, cdw11=0, cdw12=_FUA,
-                     description="Read LBA 0, FUA=1 (Force Unit Access, CDW12[31])"),
-                dict(cdw10=0, cdw11=0, cdw12=_PRINFO_ALL,
-                     description="Read LBA 0, PRINFO=0xF (PRACT+PRCHK[2:0] all set)"),
-                dict(cdw10=0, cdw11=0, cdw12=_FUA | _LR,
-                     description="Read LBA 0, FUA+LR"),
-                dict(cdw10=0, cdw11=0, cdw12=_PRCHK_ALL,
-                     description="Read LBA 0, PRCHK=0x7 (guard+apptag+reftag check)"),
-                # ── E2E Protection: CDW14=ILBRT, CDW15=LBAT/LBATM ──
-                dict(cdw10=0, cdw11=0, cdw12=_PRINFO_ALL,
-                     cdw14=0xDEADBEEF, cdw15=0xFFFF0000,
-                     description="Read LBA 0, PI all + ILBRT=0xDEADBEEF LBATM=0xFFFF"),
-                dict(cdw10=0, cdw11=0, cdw12=_PRACT,
-                     cdw14=0x00000001, cdw15=0x00010001,
-                     description="Read LBA 0, PRACT + ILBRT=1 LBATM=1 LBAT=1"),
-                # ── Streams Directive (DTYPE=1) ──
-                # CDW12[31:30]=0b01(DTYPE=1), CDW13[15:0]=Stream ID
-                dict(cdw10=0, cdw11=0, cdw12=(1 << 30), cdw13=0x0001,
-                     description="Read LBA 0, DTYPE=1 (Streams) DSPEC=1"),
-                dict(cdw10=0, cdw11=0, cdw12=(1 << 30), cdw13=0x0002,
-                     description="Read LBA 0, DTYPE=1 (Streams) DSPEC=2"),
+                     description="Read SLBA near 64-bit max, OOR 에러 경로"),
             ],
-
-            # ================================================================
-            # Write — CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB
-            #          CDW12[29]=PRACT, CDW12[30]=LR, CDW12[31]=FUA
-            #          CDW13[15:0]=DSPEC, CDW14=ILBRT, CDW15=LBAT/LBATM
-            # ================================================================
             "Write": [
+                # CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB (0-based)
+                # data 크기 = (NLB+1) × 512B — 스펙상 NLB와 data 크기 일치 필수
                 # ── 1 block ──
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Write LBA 0, 1 block zeros"),
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xAA' * 512,  description="Write LBA 0, 1 block 0xAA"),
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xFF' * 512,  description="Write LBA 0, 1 block 0xFF"),
                 dict(cdw10=0,     cdw11=0, cdw12=0, data=bytes(range(256)) * 2,
-                     description="Write LBA 0, sequential 0x00-0xFF"),
-                # ── 다중 block ──
-                dict(cdw10=0, cdw11=0, cdw12=7,   data=b'\x00' * (8   * 512), description="Write LBA 0, 8 blocks (4KB)"),
-                dict(cdw10=0, cdw11=0, cdw12=31,  data=b'\x00' * (32  * 512), description="Write LBA 0, 32 blocks (16KB)"),
-                dict(cdw10=0, cdw11=0, cdw12=127, data=b'\x00' * (128 * 512), description="Write LBA 0, 128 blocks (64KB)"),
-                dict(cdw10=0, cdw11=0, cdw12=255, data=b'\x00' * (256 * 512), description="Write LBA 0, 256 blocks (128KB)"),
+                     description="Write LBA 0, 1 block sequential 0x00-0xFF"),
+                # ── 다중 block (NLB와 data 일치) ──
+                dict(cdw10=0,     cdw11=0, cdw12=7,   data=b'\x00' * (8   * 512), description="Write LBA 0, 8 blocks (4KB)"),
+                dict(cdw10=0,     cdw11=0, cdw12=31,  data=b'\x00' * (32  * 512), description="Write LBA 0, 32 blocks (16KB)"),
+                dict(cdw10=0,     cdw11=0, cdw12=127, data=b'\x00' * (128 * 512), description="Write LBA 0, 128 blocks (64KB)"),
+                dict(cdw10=0,     cdw11=0, cdw12=255, data=b'\x00' * (256 * 512), description="Write LBA 0, 256 blocks (128KB)"),
                 # ── 다양한 SLBA ──
-                dict(cdw10=500,   cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 500"),
-                dict(cdw10=1000,  cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 1000"),
-                dict(cdw10=5000,  cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 5000"),
-                dict(cdw10=10000, cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 10000"),
-                # ── 64비트 LBA 경계 ──
+                dict(cdw10=500,   cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 500, 1 block"),
+                dict(cdw10=1000,  cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 1000, 1 block"),
+                dict(cdw10=5000,  cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 5000, 1 block"),
+                dict(cdw10=10000, cdw11=0, cdw12=0, data=b'\x00' * 512, description="Write LBA 10000, 1 block"),
+                # ── FUA ──
+                dict(cdw10=0, cdw11=0, cdw12=(1 << 14), data=b'\x00' * 512,
+                     description="Write LBA 0, FUA (Force Unit Access)"),
+                # ── 64비트 LBA 경계 (CDW11=SLBA[63:32]) ──
                 dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0, data=b'\x00' * 512,
-                     description="Write LBA 4G (OOR error path)"),
+                     description="Write LBA 4G (SLBA=0x1_0000_0000), OOR 에러 경로"),
                 dict(cdw10=0xFFFF0000, cdw11=0xFFFFFFFF, cdw12=0, data=b'\x00' * 512,
-                     description="Write SLBA near 64-bit max (OOR error path)"),
-                # ── CDW12 상위 비트 ──
-                dict(cdw10=0, cdw11=0, cdw12=_PRACT, data=b'\x00' * 512,
-                     description="Write LBA 0, PRACT=1 (PI action)"),
-                dict(cdw10=0, cdw11=0, cdw12=_LR, data=b'\x00' * 512,
-                     description="Write LBA 0, LR=1 (Limited Retry)"),
-                dict(cdw10=0, cdw11=0, cdw12=_FUA, data=b'\x00' * 512,
-                     description="Write LBA 0, FUA=1 (Force Unit Access)"),
-                dict(cdw10=0, cdw11=0, cdw12=_PRINFO_ALL, data=b'\x00' * 512,
-                     description="Write LBA 0, PRINFO=0xF (all PI bits)"),
-                dict(cdw10=0, cdw11=0, cdw12=_FUA | _LR, data=b'\x00' * 512,
-                     description="Write LBA 0, FUA+LR"),
-                # ── E2E Protection: CDW14=ILBRT, CDW15=LBAT/LBATM ──
-                dict(cdw10=0, cdw11=0, cdw12=_PRINFO_ALL,
-                     cdw14=0xDEADBEEF, cdw15=0xFFFF0000,
-                     data=b'\x00' * 512,
-                     description="Write LBA 0, PI all + ILBRT=0xDEADBEEF LBATM=0xFFFF"),
-                # ── Streams Directive (DTYPE=1) ──
-                dict(cdw10=0, cdw11=0, cdw12=(1 << 30), cdw13=0x0001,
-                     data=b'\x00' * 512,
-                     description="Write LBA 0, DTYPE=1 (Streams) DSPEC=1"),
-                # ── Dataset Management attributes (CDW13[3:0]=DSMA) ──
-                dict(cdw10=0, cdw11=0, cdw12=0, cdw13=0x4,  # IDR (Random)
-                     data=b'\x00' * 512, description="Write LBA 0, DSMA=IDR (Random access hint)"),
-                dict(cdw10=0, cdw11=0, cdw12=0, cdw13=0x8,  # IDW (Incompressible)
-                     data=b'\x00' * 512, description="Write LBA 0, DSMA=IDW (Incompressible hint)"),
+                     description="Write SLBA near 64-bit max, OOR 에러 경로"),
             ],
-
-            # ================================================================
-            # WriteZeroes — CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB
-            #                CDW12[25]=DEAC, CDW12[29]=PRACT, CDW12[30]=LR, CDW12[31]=FUA
-            #                (데이터 전송 없음 — DMA 없이 펌웨어가 직접 0 기록)
-            # ================================================================
-            "WriteZeroes": [
-                dict(cdw10=0,     cdw11=0, cdw12=0,                       description="WriteZeroes LBA 0, 1 block"),
-                dict(cdw10=0,     cdw11=0, cdw12=7,                       description="WriteZeroes LBA 0, 8 blocks"),
-                dict(cdw10=0,     cdw11=0, cdw12=255,                     description="WriteZeroes LBA 0, 256 blocks"),
-                dict(cdw10=0,     cdw11=0, cdw12=0xFFFF,                  description="WriteZeroes LBA 0, NLB max"),
-                dict(cdw10=0,     cdw11=0, cdw12=_DEAC,                   description="WriteZeroes LBA 0, DEAC=1 (deallocate)"),
-                dict(cdw10=0,     cdw11=0, cdw12=_FUA,                    description="WriteZeroes LBA 0, FUA=1"),
-                dict(cdw10=0,     cdw11=0, cdw12=_DEAC | _FUA,            description="WriteZeroes LBA 0, DEAC+FUA"),
-                dict(cdw10=500,   cdw11=0, cdw12=0,                       description="WriteZeroes LBA 500"),
-                dict(cdw10=5000,  cdw11=0, cdw12=0,                       description="WriteZeroes LBA 5000"),
-                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0,         description="WriteZeroes LBA 4G (OOR error path)"),
+            "SetFeatures": [
+                # CDW10[7:0]=FID, CDW10[31]=SV(Save)
+                dict(cdw10=0x07, cdw11=0x00010001, description="Set Number of Queues (1 SQ + 1 CQ)"),
             ],
-
-            # ================================================================
-            # Compare — Read처럼 LBA에서 읽어 호스트 버퍼와 비교
-            #            CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB
-            # ================================================================
-            "Compare": [
-                dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Compare LBA 0, 1 block zeros"),
-                dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xFF' * 512,  description="Compare LBA 0, 1 block 0xFF"),
-                dict(cdw10=0,     cdw11=0, cdw12=0, data=b'\xAA' * 512,  description="Compare LBA 0, 1 block 0xAA"),
-                dict(cdw10=0,     cdw11=0, cdw12=7, data=b'\x00' * (8 * 512), description="Compare LBA 0, 8 blocks"),
-                dict(cdw10=500,   cdw11=0, cdw12=0, data=b'\x00' * 512,  description="Compare LBA 500"),
-                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0, data=b'\x00' * 512,
-                     description="Compare LBA 4G (OOR error path)"),
-            ],
-
-            # ================================================================
-            # WriteUncorrectable — LBA를 uncorrectable 상태로 마킹 (에러 주입)
-            #                       CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12[15:0]=NLB
-            #                       데이터 전송 없음
-            # ================================================================
-            "WriteUncorrectable": [
-                dict(cdw10=0,    cdw11=0, cdw12=0,      description="WriteUncorrectable LBA 0, 1 block"),
-                dict(cdw10=0,    cdw11=0, cdw12=7,      description="WriteUncorrectable LBA 0, 8 blocks"),
-                dict(cdw10=0,    cdw11=0, cdw12=0xFFFF, description="WriteUncorrectable LBA 0, NLB max"),
-                dict(cdw10=500,  cdw11=0, cdw12=0,      description="WriteUncorrectable LBA 500"),
-                dict(cdw10=5000, cdw11=0, cdw12=0,      description="WriteUncorrectable LBA 5000"),
-                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0,
-                     description="WriteUncorrectable LBA 4G (OOR error path)"),
-            ],
-
-            # ================================================================
-            # Verify — LBA 읽기 후 CRC/PI 검증 (데이터 호스트 반환 없음)
-            #           CDW12[29]=PRACT, CDW12[28:26]=PRCHK, CDW12[30]=LR
-            # ================================================================
-            "Verify": [
-                dict(cdw10=0,    cdw11=0, cdw12=0,         description="Verify LBA 0, 1 block"),
-                dict(cdw10=0,    cdw11=0, cdw12=7,         description="Verify LBA 0, 8 blocks"),
-                dict(cdw10=0,    cdw11=0, cdw12=255,       description="Verify LBA 0, 256 blocks"),
-                dict(cdw10=0,    cdw11=0, cdw12=0xFFFF,    description="Verify LBA 0, NLB max"),
-                dict(cdw10=0,    cdw11=0, cdw12=_PRINFO_ALL,
-                     description="Verify LBA 0, PRINFO=0xF (all PI bits)"),
-                dict(cdw10=0,    cdw11=0, cdw12=_LR,       description="Verify LBA 0, LR=1 (Limited Retry)"),
-                dict(cdw10=0,    cdw11=0, cdw12=_PRCHK_ALL, description="Verify LBA 0, PRCHK=0x7 (all check bits)"),
-                dict(cdw10=0,    cdw11=0, cdw12=_PRACT | _LR,
-                     cdw14=0xDEADBEEF, description="Verify LBA 0, PRACT+LR+ILBRT=0xDEADBEEF"),
-                dict(cdw10=500,  cdw11=0, cdw12=0,         description="Verify LBA 500"),
-                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0,
-                     description="Verify LBA 4G (OOR error path)"),
-            ],
-
-            # ================================================================
-            # DeviceSelfTest — CDW10[3:0]=STC (Self-test Code)
-            #                   0x1=Short, 0x2=Extended, 0xE=Vendor, 0xF=Abort
-            #                   명령은 즉시 반환, 테스트는 백그라운드 실행
-            # ================================================================
-            "DeviceSelfTest": [
-                dict(cdw10=0x01, nsid_override=0, description="Short Self-test (background, ~2min max)"),
-                dict(cdw10=0x02, nsid_override=0, description="Extended Self-test (background, duration varies)"),
-                dict(cdw10=0x0E, nsid_override=0, description="Vendor specific self-test"),
-                dict(cdw10=0x0F, nsid_override=0, description="Abort current self-test"),
-                # NSID=1 (NS-scope self-test) — 일부 구현에서 NS별 테스트 지원
-                dict(cdw10=0x01, description="Short Self-test (NS-scope, NSID=1)"),
-                # 미지원 STC — 에러 경로
-                dict(cdw10=0x03, nsid_override=0, description="STC=0x03 (undefined, error path)"),
-            ],
-
-            # ================================================================
-            # SecuritySend — CDW10[31:24]=SECP, CDW10[23:8]=SPSP, CDW10[7:0]=NSSF
-            #                 CDW11=TL (Transfer Length, bytes)
-            #                 데이터: 호스트→SSD
-            # ================================================================
-            "SecuritySend": [
-                # SECP=0x00: Security Protocol Information (Protocol List)
-                dict(cdw10=(0x00 << 24), cdw11=512, data=b'\x00' * 512,
-                     description="SecuritySend SECP=0x00 (Protocol List)"),
-                # SECP=0x01: TCG (NVMe에서 가장 일반적)
-                dict(cdw10=(0x01 << 24) | (0x0001 << 8), cdw11=512, data=b'\x00' * 512,
-                     description="SecuritySend SECP=0x01 (TCG) SPSP=0x0001"),
-                dict(cdw10=(0x01 << 24) | (0x0007 << 8), cdw11=512, data=b'\x00' * 512,
-                     description="SecuritySend SECP=0x01 (TCG) SPSP=0x0007 (TCG SSC)"),
-                # SECP=0x02: IEEE 1667 (USB-style storage authentication)
-                dict(cdw10=(0x02 << 24), cdw11=512, data=b'\x00' * 512,
-                     description="SecuritySend SECP=0x02 (IEEE 1667)"),
-                # SECP=0xEA: NVMe-specific Security
-                dict(cdw10=(0xEA << 24), cdw11=512, data=b'\x00' * 512,
-                     description="SecuritySend SECP=0xEA (NVMe-specific)"),
-                # SECP=0xEF: ATA Security (SATA 이식 제품 일부 구현)
-                dict(cdw10=(0xEF << 24), cdw11=0, data=b'',
-                     description="SecuritySend SECP=0xEF (ATA Security, TL=0)"),
-                # 미지원 SECP — 에러 경로
-                dict(cdw10=(0xFF << 24), cdw11=512, data=b'\x00' * 512,
-                     description="SecuritySend SECP=0xFF (undefined, error path)"),
-            ],
-
-            # ================================================================
-            # SecurityReceive — CDW10[31:24]=SECP, CDW10[23:8]=SPSP, CDW10[7:0]=NSSF
-            #                    CDW11=AL (Allocation Length, bytes)
-            #                    데이터: SSD→호스트 (data_len = CDW11 by _send_nvme_command)
-            # ================================================================
-            "SecurityReceive": [
-                # SECP=0x00: Protocol list 조회 — 지원 프로토콜 목록
-                dict(cdw10=(0x00 << 24), cdw11=512,
-                     description="SecurityReceive SECP=0x00 (Protocol List), AL=512"),
-                # SECP=0x01: TCG
-                dict(cdw10=(0x01 << 24) | (0x0001 << 8), cdw11=512,
-                     description="SecurityReceive SECP=0x01 (TCG) SPSP=0x0001, AL=512"),
-                dict(cdw10=(0x01 << 24) | (0x0001 << 8), cdw11=4096,
-                     description="SecurityReceive SECP=0x01 (TCG) SPSP=0x0001, AL=4KB"),
-                # SECP=0x02: IEEE 1667
-                dict(cdw10=(0x02 << 24), cdw11=512,
-                     description="SecurityReceive SECP=0x02 (IEEE 1667), AL=512"),
-                # SECP=0xEA: NVMe-specific
-                dict(cdw10=(0xEA << 24), cdw11=512,
-                     description="SecurityReceive SECP=0xEA (NVMe-specific), AL=512"),
-                # AL=0 — 크기 0 조회 (지원 여부 확인용)
-                dict(cdw10=(0x01 << 24), cdw11=0,
-                     description="SecurityReceive SECP=0x01 AL=0 (capability probe)"),
-                # 미지원 SECP
-                dict(cdw10=(0xFF << 24), cdw11=512,
-                     description="SecurityReceive SECP=0xFF (undefined, error path)"),
-            ],
-
-            # ================================================================
-            # GetLBAStatus — CDW10=SLBA[31:0], CDW11=SLBA[63:32]
-            #                 CDW12=MNDW (Max Number of Dwords, 0-based)
-            #                 CDW13[15:0]=RL (Range Length), CDW13[31:16]=ATYPE
-            #                   ATYPE=0: All LBAs, 1: Allocated, 2: Unallocated
-            # ================================================================
-            "GetLBAStatus": [
-                dict(cdw10=0, cdw11=0, cdw12=0xFF, cdw13=(0x0000 << 16) | 0x0010,
-                     description="GetLBAStatus LBA 0, ATYPE=0 (all), RL=16"),
-                dict(cdw10=0, cdw11=0, cdw12=0xFF, cdw13=(0x0001 << 16) | 0x0010,
-                     description="GetLBAStatus LBA 0, ATYPE=1 (allocated), RL=16"),
-                dict(cdw10=0, cdw11=0, cdw12=0xFF, cdw13=(0x0002 << 16) | 0x0010,
-                     description="GetLBAStatus LBA 0, ATYPE=2 (unallocated/deallocated), RL=16"),
-                dict(cdw10=0, cdw11=0, cdw12=0xFF, cdw13=(0x0001 << 16) | 0xFFFF,
-                     description="GetLBAStatus LBA 0, ATYPE=1 RL=max"),
-                dict(cdw10=5000, cdw11=0, cdw12=0xFF, cdw13=(0x0001 << 16) | 0x0010,
-                     description="GetLBAStatus LBA 5000, ATYPE=1, RL=16"),
-                dict(cdw10=0x00000000, cdw11=0x00000001, cdw12=0xFF, cdw13=0x0010,
-                     description="GetLBAStatus LBA 4G (OOR error path)"),
-            ],
-
-            # ================================================================
-            # FWDownload — CDW10=NUMD (0-based dwords), CDW11=OFST (dword offset)
-            # ================================================================
             "FWDownload": [
+                # CDW10=NUMD (0-based dwords), CDW11=OFST (dword offset)
                 dict(cdw10=0xFF, cdw11=0, data=b'\x00' * 1024, description="FW Download offset=0, 1KB"),
             ],
-
-            # ================================================================
-            # FWCommit — CDW10[2:0]=CA (Commit Action), CDW10[5:3]=FS (Firmware Slot)
-            #             CA=0: replace, no activate
-            #             CA=1: replace, activate on next reset
-            #             CA=2: replace + activate on next reset (w/ reset)
-            #             CA=3: activate without replace (existing slot)
-            #             CA=5: replace + activate immediately (NVMe 1.3+)
-            # ================================================================
             "FWCommit": [
-                dict(cdw10=0x00, description="CA=0: replace image, no activate (Slot 0)"),
-                dict(cdw10=0x01, description="CA=1: replace + activate on next reset (Slot 0)"),
-                dict(cdw10=0x09, description="CA=1: replace + activate on next reset (Slot 1)"),
-                dict(cdw10=0x02, description="CA=2: replace + activate on next reset (Slot 0)"),
-                dict(cdw10=0x03, description="CA=3: activate without replace (Slot 0)"),
-                dict(cdw10=0x05, description="CA=5: replace + activate immediately (Slot 0, NVMe 1.3+)"),
-                dict(cdw10=0x0D, description="CA=5: replace + activate immediately (Slot 1, NVMe 1.3+)"),
+                # CDW10[2:0]=CA(Commit Action), CDW10[5:3]=FS(Firmware Slot)
+                dict(cdw10=0x01, description="Commit Action 1, Slot 0 (replace without activate)"),
+                dict(cdw10=0x09, description="Commit Action 1, Slot 1"),
             ],
-
-            # ================================================================
-            # FormatNVM — CDW10[3:0]=LBAF, CDW10[11:9]=SES (Secure Erase Settings)
-            #              CDW10[8]=MSET, CDW10[12]=PI, CDW10[13]=PIL, CDW10[14]=METC
-            #              SES=0: no erase, 1: user data erase, 2: cryptographic erase
-            # ================================================================
             "FormatNVM": [
-                dict(cdw10=0x0000, description="Format LBAF=0, SES=0 (no secure erase)"),
-                dict(cdw10=0x0200, description="Format LBAF=0, SES=1 (user data erase)"),
-                dict(cdw10=0x0400, description="Format LBAF=0, SES=2 (cryptographic erase)"),
-                dict(cdw10=0x0001, description="Format LBAF=1, SES=0"),
-                dict(cdw10=0x0002, description="Format LBAF=2, SES=0"),
-                # PI 활성화 (메타데이터 + 보호정보)
-                dict(cdw10=0x1000, description="Format LBAF=0, PI Type 0 (PI field disabled)"),
-                dict(cdw10=0x1100, description="Format LBAF=0, PI=1 (Type 1 protection)"),
+                # CDW10[3:0]=LBAF, CDW10[11:9]=SES(Secure Erase)
+                dict(cdw10=0x00, description="Format LBAF 0, no secure erase"),
             ],
-
-            # ================================================================
-            # Sanitize — 기본 시드 없음 (rc=0이면 즉시 SSD 전체 소거 시작)
-            # CDW10[2:0]=SANACT: 1=Block Erase, 2=Overwrite, 3=Crypto Erase, 4=Exit Failure
-            # CDW10[4]=AUSE (Allow Unrestricted Sanitize Exit)
-            # CDW10[5]=NODAS (No Deallocate After Sanitize)
-            # 필요 시 --seed-dir로 직접 주입
-            # ================================================================
-
-            # ================================================================
-            # TelemetryHostInitiated — GetLogPage LID=0x07
-            # CDW10[8]=Create Telemetry (1=새 데이터 생성, 0=기존 반환)
-            # ================================================================
+            "Sanitize": [
+                # CDW10[2:0]=SANACT(Sanitize Action), CDW10[3]=AUSE, CDW10[7:4]=OWPASS
+                dict(cdw10=0x01, description="Block Erase"),
+            ],
             "TelemetryHostInitiated": [
-                dict(cdw10=(0x1FF << 16) | 0x07, nsid_override=0,
-                     description="Telemetry Host-Initiated, Create=0 (return existing)"),
-                dict(cdw10=(0x1FF << 16) | (1 << 8) | 0x07, nsid_override=0,
-                     description="Telemetry Host-Initiated, Create=1 (create new snapshot)"),
+                # GetLogPage LID=0x07 + CDW10[8]=Create Telemetry
+                dict(cdw10=(0x1FF << 16) | 0x07, description="Telemetry Host-Initiated Log"),
             ],
-
-            # ================================================================
-            # Flush — 파라미터 없음
-            # ================================================================
             "Flush": [
                 dict(description="Flush (no parameters)"),
             ],
-
-            # ================================================================
-            # DatasetManagement — CDW10[7:0]=NR (Number of Ranges, 0-based)
-            #                      CDW11[2]=AD (Attribute Deallocate)
-            #                      CDW11[0]=IDR, CDW11[1]=IDW (access hints)
-            #                      data: 16B per range (Context Attrs + LBA Count + SLBA)
-            # ================================================================
             "DatasetManagement": [
-                # Range Entry 구조 (16B): [Context Attrs 4B][LBA Count 4B][SLBA 8B]
-                # AD=1: TRIM (deallocate) — 가장 일반적인 용도
-                dict(cdw10=0, cdw11=0x04,
-                     data=struct.pack('<IIQ', 0, 8, 0),
-                     description="TRIM LBA 0, 8 blocks (AD=1)"),
-                dict(cdw10=0, cdw11=0x04,
-                     data=struct.pack('<IIQ', 0, 256, 0),
-                     description="TRIM LBA 0, 256 blocks (AD=1)"),
-                dict(cdw10=0, cdw11=0x04,
-                     data=struct.pack('<IIQ', 0, 8, 500),
-                     description="TRIM LBA 500, 8 blocks (AD=1)"),
-                # IDR=1: Sequential Read access hint
-                dict(cdw10=0, cdw11=0x01,
-                     data=struct.pack('<IIQ', 0, 8, 0),
-                     description="DSM IDR=1 (Sequential Read hint), LBA 0, 8 blocks"),
-                # IDW=1: Sequential Write access hint
-                dict(cdw10=0, cdw11=0x02,
-                     data=struct.pack('<IIQ', 0, 8, 0),
-                     description="DSM IDW=1 (Sequential Write hint), LBA 0, 8 blocks"),
-                # NR=1 (2 ranges): AD=1
-                dict(cdw10=1, cdw11=0x04,
-                     data=struct.pack('<IIQ', 0, 8, 0) + struct.pack('<IIQ', 0, 8, 100),
-                     description="TRIM 2 ranges: LBA 0+8blk, LBA 100+8blk (NR=1, AD=1)"),
-                # NR=max (256 ranges): AD=1 — 범위 최대치
-                dict(cdw10=0xFF, cdw11=0x04,
-                     data=struct.pack('<IIQ', 0, 1, 0) * 256,
-                     description="TRIM 256 ranges (NR=0xFF, AD=1)"),
+                # CDW10[7:0]=NR (Number of Ranges, 0-based), CDW11[2]=AD(Attribute Deallocate)
+                dict(cdw10=0, cdw11=0x04, data=struct.pack('<IIIII', 0, 0, 0, 0, 8),
+                     description="TRIM LBA 0, 8 blocks"),
             ],
         }
 
-        # v4.7: fw_bin이 제공된 경우 FWDownload/FWCommit 실제 시드 생성
-        fw_bin  = self.config.fw_bin
-        fw_xfer = self.config.fw_xfer_size
-        fw_slot = self.config.fw_slot
-        use_real_fw = bool(fw_bin and os.path.isfile(fw_bin))
-        if use_real_fw:
-            log.info(f"[Seed] fw_bin={fw_bin} (xfer={fw_xfer}B slot={fw_slot}) → 실제 FWDownload 시드 생성")
-        else:
-            log.info("[Seed] fw_bin 미지정 또는 파일 없음 → FWDownload 더미 시드 사용")
-
         for cmd in self.commands:
-            # ── FWDownload: fw_bin 있으면 실제 청크 시드, 없으면 더미 ──
-            if cmd.name == "FWDownload":
-                if use_real_fw:
-                    with open(fw_bin, "rb") as f:
-                        fw_data = f.read()
-                    offset = 0
-                    chunk_idx = 0
-                    while offset < len(fw_data):
-                        chunk = fw_data[offset:offset + fw_xfer]
-                        if len(chunk) % 4 != 0:
-                            chunk = chunk + b'\x00' * (4 - len(chunk) % 4)
-                        numd = (len(chunk) // 4) - 1  # CDW10: NUMD (0-based)
-                        ofst = offset // 4             # CDW11: OFST (dword offset)
-                        seed = Seed(data=chunk, cmd=cmd,
-                                    cdw10=numd, cdw11=ofst, found_at=0)
-                        seeds.append(seed)
-                        log.info(f"[Seed] FWDownload chunk {chunk_idx} "
-                                 f"offset={offset} ({len(chunk)}B) NUMD=0x{numd:x}")
-                        offset += fw_xfer
-                        chunk_idx += 1
-                else:
-                    # 더미: 1KB zeros (변이 시작점용)
-                    seed = Seed(data=b'\x00' * 1024, cmd=cmd,
-                                cdw10=0xFF, cdw11=0, found_at=0)
-                    seeds.append(seed)
-                    log.info("[Seed] FWDownload dummy 1KB (fw_bin 없음)")
-                continue
-
-            # ── FWCommit: fw_bin 있으면 올바른 슬롯으로, 없으면 기본 2개 ──
-            if cmd.name == "FWCommit":
-                if use_real_fw:
-                    cdw10_commit = (fw_slot << 3) | 0x01  # CA=1: replace, activate on reset
-                    seed = Seed(data=b'', cmd=cmd, cdw10=cdw10_commit, found_at=0)
-                    seeds.append(seed)
-                    log.info(f"[Seed] FWCommit slot={fw_slot} action=1 "
-                             f"CDW10=0x{cdw10_commit:08x}")
-                else:
-                    for tmpl in SEED_TEMPLATES["FWCommit"]:
-                        seed = Seed(data=b'', cmd=cmd,
-                                    cdw10=tmpl.get('cdw10', 0), found_at=0)
-                        seeds.append(seed)
-                        log.info(f"[Seed] FWCommit CDW10=0x{seed.cdw10:08x} "
-                                 f"({tmpl.get('description','')})")
-                continue
-
-            # ── 나머지 명령어: SEED_TEMPLATES 사용 ──
             templates = SEED_TEMPLATES.get(cmd.name, [])
             if templates:
                 for tmpl in templates:
@@ -2075,7 +1218,6 @@ class NVMeFuzzer:
                         cdw13=tmpl.get('cdw13', 0),
                         cdw14=tmpl.get('cdw14', 0),
                         cdw15=tmpl.get('cdw15', 0),
-                        nsid_override=tmpl.get('nsid_override', None),
                         found_at=0,
                     )
                     seeds.append(seed)
@@ -2574,185 +1716,7 @@ class NVMeFuzzer:
     RC_TIMEOUT   = -1001   # NVMe 타임아웃 (의미 있는 이벤트)
     RC_ERROR     = -1002   # subprocess 에러 (내부 문제)
 
-    def _load_static_analysis(self) -> None:
-        """같은 디렉토리의 basic_blocks.txt / functions.txt 자동 탐지 후 로드.
-
-        파일이 없으면 아무것도 하지 않음 (기존 동작 유지).
-        Ghidra의 ghidra_export.py 스크립트로 생성한 파일을 기대함.
-        """
-        script_dir = Path(__file__).parent.resolve()
-        bb_file   = script_dir / 'basic_blocks.txt'
-        func_file = script_dir / 'functions.txt'
-
-        if not bb_file.exists() and not func_file.exists():
-            return  # 파일 없음 — 로그 없이 조용히 넘어감
-
-        # --- basic_blocks.txt ---
-        # format: 0xSTART 0xEND  (END is exclusive)
-        if bb_file.exists():
-            starts: list = []
-            ends_bb: list = []
-            with open(bb_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        try:
-                            starts.append(int(parts[0], 16))
-                            ends_bb.append(int(parts[1], 16))
-                        except ValueError:
-                            pass
-            sorted_pairs = sorted(zip(starts, ends_bb))
-            if sorted_pairs:
-                self._sa_bb_starts = [p[0] for p in sorted_pairs]
-                self._sa_bb_ends   = [p[1] for p in sorted_pairs]
-                self._sa_total_bbs = len(self._sa_bb_starts)
-                print(f"[StaticAnalysis] basic_blocks.txt: {self._sa_total_bbs:,}개 BB "
-                      f"(0x{self._sa_bb_starts[0]:08x} ~ 0x{self._sa_bb_ends[-1]:08x})")
-
-        # --- functions.txt ---
-        if func_file.exists():
-            entries: list = []
-            ends: list = []
-            names: list = []
-            with open(func_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split(None, 2)
-                    if len(parts) >= 2:
-                        try:
-                            entry = int(parts[0], 16)
-                            size  = int(parts[1])
-                            name  = parts[2].strip() if len(parts) > 2 else f"FUN_{entry:08x}"
-                            entries.append(entry)
-                            ends.append(entry + size)
-                            names.append(name)
-                        except ValueError:
-                            pass
-            sorted_tuples = sorted(zip(entries, ends, names))
-            if sorted_tuples:
-                self._sa_func_entries = [t[0] for t in sorted_tuples]
-                self._sa_func_ends    = [t[1] for t in sorted_tuples]
-                self._sa_func_names   = [t[2] for t in sorted_tuples]
-                self._sa_total_funcs  = len(self._sa_func_entries)
-                print(f"[StaticAnalysis] functions.txt: {self._sa_total_funcs:,}개 함수")
-
-        self._sa_loaded = self._sa_total_bbs > 0 or self._sa_total_funcs > 0
-
-        if self._sa_func_entries:
-            print(f"[StaticAnalysis] 함수 주소 범위: "
-                  f"0x{self._sa_func_entries[0]:08x} ~ 0x{self._sa_func_entries[-1]:08x}")
-
-        self._sa_diag_done = False   # 첫 update 시 1회만 진단 로그 출력
-
-    def _update_static_coverage(self, new_pcs: set) -> None:
-        """새로 발견된 PC 집합으로 정적 분석 커버리지를 증분 업데이트.
-
-        BB 커버리지: bisect로 PC가 속한 BB를 O(log N)에 탐색.
-        함수 커버리지: bisect로 O(log N) 함수 탐색.
-        """
-        if not new_pcs:
-            return
-
-        # 첫 호출 시 1회 진단: PC 샘플과 BB 범위의 매칭 여부 + Thumb bit 자동 감지
-        if not self._sa_diag_done:
-            self._sa_diag_done = True
-            sample = sorted(new_pcs)[:10]
-            if self._sa_bb_starts:
-                def _pc_in_bb(pc):
-                    idx = bisect.bisect_right(self._sa_bb_starts, pc) - 1
-                    return idx >= 0 and pc < self._sa_bb_ends[idx]
-
-                matched       = [pc for pc in sample if _pc_in_bb(pc)]
-                matched_thumb = [pc for pc in sample if _pc_in_bb(pc & ~1)]
-                log.warning(
-                    f"[StatDiag] 첫 new_pcs 샘플(최대10개): "
-                    f"{[hex(p) for p in sample]}")
-                log.warning(
-                    f"[StatDiag] BB 직접 매칭: {len(matched)}/{len(sample)}개  "
-                    f"| Thumb bit(bit0) 마스킹 후 매칭: {len(matched_thumb)}/{len(sample)}개")
-                if len(matched) == 0 and len(matched_thumb) > 0:
-                    log.warning(
-                        "[StatDiag] *** Thumb bit 불일치 감지! "
-                        "J-Link PC의 bit0이 set된 것으로 보임 → 자동 마스킹 적용 ***")
-                    self._sa_thumb_mask = True
-                elif len(matched) == 0 and len(matched_thumb) == 0:
-                    _pc_min = min(new_pcs)
-                    _pc_max = max(new_pcs)
-                    log.warning(
-                        f"[StatDiag] *** 주소 범위 불일치! "
-                        f"PC 범위: 0x{_pc_min:08x}~0x{_pc_max:08x}  "
-                        f"BB 범위: 0x{self._sa_bb_starts[0]:08x}~0x{self._sa_bb_ends[-1]:08x} ***")
-
-        mask = self._sa_thumb_mask
-
-        # BB 커버리지 — bisect로 PC가 속한 BB 탐색
-        if self._sa_bb_starts is not None:
-            for pc in new_pcs:
-                pc_key = (pc & ~1) if mask else pc
-                idx = bisect.bisect_right(self._sa_bb_starts, pc_key) - 1
-                if idx >= 0 and pc_key < self._sa_bb_ends[idx]:
-                    self._sa_covered_bbs.add(self._sa_bb_starts[idx])
-
-        # 함수 커버리지 — bisect로 O(log N) 함수 탐색
-        if self._sa_func_entries is not None:
-            for pc in new_pcs:
-                pc_key = (pc & ~1) if mask else pc
-                idx = bisect.bisect_right(self._sa_func_entries, pc_key) - 1
-                if idx >= 0 and pc_key < self._sa_func_ends[idx]:
-                    self._sa_entered_funcs.add(self._sa_func_entries[idx])
-
-    def _pm_set_state(self, ps: int) -> bool:
-        """SetFeatures(FID=0x02) 전송 — PM 상태 진입/복귀용.
-        반환값: True=성공(rc==0), False=실패(rc!=0 또는 예외).
-        실패해도 fuzzing 흐름에 영향 없음.
-        """
-        sf = next((c for c in NVME_COMMANDS if c.name == "SetFeatures"), None)
-        if sf is None:
-            return False
-        nvme_cmd = [
-            'nvme', 'admin-passthru', self.config.nvme_device,
-            f'--opcode={sf.opcode:#x}',
-            '--namespace-id=0',
-            '--cdw2=0x0', '--cdw3=0x0',
-            f'--cdw10=0x02',
-            f'--cdw11={ps:#x}',
-            '--cdw12=0x0', '--cdw13=0x0', '--cdw14=0x0', '--cdw15=0x0',
-            '--timeout=3000',
-        ]
-        label = f"PS{ps}" if ps > 0 else "PS0(복귀)"
-        # 재현 TC 히스토리 기록 (PM 진입/복귀도 포함)
-        self._cmd_history.append({
-            'kind': 'pm',
-            'label': f'PM {label}',
-            'passthru_type': 'admin-passthru',
-            'device': self.config.nvme_device,
-            'opcode': sf.opcode,
-            'nsid': 0,
-            'cdw2': 0, 'cdw3': 0,
-            'cdw10': 0x02, 'cdw11': ps,
-            'cdw12': 0, 'cdw13': 0, 'cdw14': 0, 'cdw15': 0,
-            'data': None, 'data_len': 0, 'is_write': False,
-        })
-        _pm_t0 = time.monotonic()
-        try:
-            result = subprocess.run(nvme_cmd, timeout=5.0,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            ok = (result.returncode == 0)
-            status = "OK" if ok else f"FAIL(rc={result.returncode})"
-            _pm_elapsed = time.monotonic() - _pm_t0
-            log.warning(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label}) → {status} ({_pm_elapsed:.3f}s)")
-            return ok
-        except Exception as e:
-            _pm_elapsed = time.monotonic() - _pm_t0
-            log.warning(f"[PM] SetFeatures cdw11=0x{ps:02x} ({label}) → FAIL(exception: {e}) ({_pm_elapsed:.3f}s)")
-            return False
-
-    def _send_nvme_command(self, data: bytes, seed: Seed, timeout_mult: int = 1) -> int:
+    def _send_nvme_command(self, data: bytes, seed: Seed) -> int:
         """subprocess(nvme-cli) 기반 NVMe passthru 명령 전송.
         반환값:
           >= 0: nvme-cli returncode (0=성공, 양수=NVMe 에러)
@@ -2779,13 +1743,7 @@ class NVMeFuzzer:
             "Identify": 4096,
             "GetFeatures": 4096,
             "TelemetryHostInitiated": 4096,
-            "DeviceSelfTest": 0,       # 데이터 전송 없음
         }
-
-        # IO 명령어 중 NLB 기반 data_len 계산을 생략할 명령어
-        # (데이터 전송 자체가 없거나 별도 처리하는 명령어)
-        IO_NO_NLB_DATA = ("Flush", "DatasetManagement",
-                          "WriteZeroes", "WriteUncorrectable", "Verify")
 
         # --- data_len 결정 ---
         data_len = 0
@@ -2798,19 +1756,12 @@ class NVMeFuzzer:
         elif cmd.needs_data and data:
             data_len = len(data)
             write_data = True
-        elif cmd.cmd_type == NVMeCommandType.IO and cmd.name not in IO_NO_NLB_DATA:
-            # Read / Compare / Write 계열: CDW12[15:0] = NLB → 전송 크기 산출
+        elif cmd.cmd_type == NVMeCommandType.IO and cmd.name not in ("Flush", "DatasetManagement"):
             nlb = seed.cdw12 & 0xFFFF
             data_len = min(max(512, (nlb + 1) * 512), MAX_DATA_BUF)
         elif cmd.name == "GetLogPage":
             numdl = (seed.cdw10 >> 16) & 0x7FF
             data_len = min(max(4, (numdl + 1) * 4), MAX_DATA_BUF)
-        elif cmd.name == "SecurityReceive":
-            # CDW11 = AL (Allocation Length, bytes)
-            data_len = min(max(512, seed.cdw11), MAX_DATA_BUF)
-        elif cmd.name == "GetLBAStatus":
-            # CDW12 = MNDW (Max Number of Dwords, 0-based) → bytes = (MNDW+1)*4
-            data_len = min(max(8, (seed.cdw12 + 1) * 4), MAX_DATA_BUF)
         elif cmd.name in ADMIN_FIXED_RESPONSE:
             data_len = ADMIN_FIXED_RESPONSE[cmd.name]
 
@@ -2832,8 +1783,6 @@ class NVMeFuzzer:
             cmd.timeout_group,
             self.config.nvme_timeouts.get('command', 8000)
         )
-        if timeout_mult > 1:
-            timeout_ms = int(timeout_ms * timeout_mult)
         # nvme-cli --timeout: 커널이 NVMe 명령을 포기하는 시점 (v4.6: 분리)
         # 이 값을 길게 유지하면 crash 시 커널이 controller reset을 하지 않아
         # SSD 펌웨어 상태를 그대로 보존할 수 있다 (JTAG 분석 용이).
@@ -2870,23 +1819,6 @@ class NVMeFuzzer:
                 nvme_cmd.extend([f'--input-file={input_file}', '-w'])
             else:
                 nvme_cmd.append('-r')
-
-        # 재현 TC 히스토리 기록 (crash 시 replay .sh 생성에 사용)
-        self._cmd_history.append({
-            'kind': 'nvme',
-            'label': cmd.name,
-            'passthru_type': passthru_type,
-            'device': target_device,
-            'opcode': actual_opcode,
-            'nsid': actual_nsid,
-            'cdw2': seed.cdw2, 'cdw3': seed.cdw3,
-            'cdw10': seed.cdw10, 'cdw11': seed.cdw11,
-            'cdw12': seed.cdw12, 'cdw13': seed.cdw13,
-            'cdw14': seed.cdw14, 'cdw15': seed.cdw15,
-            'data': bytes(data[:data_len]) if (write_data and data_len > 0 and data) else None,
-            'data_len': data_len,
-            'is_write': bool(write_data and data_len > 0),
-        })
 
         # 로그: mutation된 필드는 별도 표시
         mut_flags = []
@@ -3044,269 +1976,6 @@ class NVMeFuzzer:
             except OSError as e:
                 log.warning(f"[TimeoutCfg] {path} 복원 실패: {e}")
 
-    def _get_nvme_pcie_bus(self) -> Optional[str]:
-        """NVMe 장치의 PCIe bus 번호를 자동 탐지한다.
-
-        1차: /sys/class/nvme/<ctrl>/address → "0000:01:00.0" → "01"
-        2차 fallback: lspci | grep nvme
-        반환값 예: "01" (hex 문자열), 탐지 실패 시 None.
-        """
-        import re as _re
-        dev_name = os.path.basename(self.config.nvme_device)  # e.g. "nvme0" or "nvme0n1"
-        log.warning(f"[UFAS] PCIe bus 탐지 시작: nvme_device={self.config.nvme_device}")
-        m = _re.match(r'(nvme\d+)', dev_name)
-        if m:
-            ctrl = m.group(1)  # "nvme0"
-            addr_file = f'/sys/class/nvme/{ctrl}/address'
-            log.warning(f"[UFAS] sysfs 경로 시도: {addr_file}")
-            try:
-                addr = Path(addr_file).read_text().strip()  # e.g. "0000:01:00.0"
-                parts = addr.split(':')
-                if len(parts) >= 3:
-                    bus = parts[-2]  # "01"
-                    log.warning(f"[UFAS] sysfs 탐지 성공: {addr} → bus={bus}")
-                    return bus
-                else:
-                    log.warning(f"[UFAS] sysfs 주소 형식 이상: '{addr}' — lspci fallback")
-            except Exception as e:
-                log.warning(f"[UFAS] sysfs read 실패: {e} — lspci fallback")
-        else:
-            log.warning(f"[UFAS] 디바이스명에서 nvme 컨트롤러 파싱 실패: '{dev_name}' — lspci fallback")
-
-        # fallback: lspci
-        log.warning("[UFAS] lspci로 NVMe 장치 탐색 중...")
-        try:
-            result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
-            nvme_lines = [l for l in result.stdout.splitlines()
-                          if 'nvme' in l.lower() or 'non-volatile' in l.lower()]
-            if nvme_lines:
-                log.warning(f"[UFAS] lspci NVMe 장치 목록:")
-                for line in nvme_lines:
-                    log.warning(f"  {line.strip()}")
-                bus = nvme_lines[0].split(':')[0]
-                log.warning(f"[UFAS] lspci 탐지 성공: bus={bus}")
-                return bus
-            else:
-                log.warning("[UFAS] lspci에서 NVMe 장치를 찾지 못함")
-        except Exception as e:
-            log.warning(f"[UFAS] lspci 실행 실패: {e}")
-
-        log.warning("[UFAS] PCIe bus 번호 자동 탐지 실패 — UFAS 덤프 건너뜀")
-        return None
-
-    def _run_ufas_dump(self) -> None:
-        """crash 발생 시 UFAS 펌웨어 덤프를 실행한다.
-
-        실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./ufas
-        명령: sudo ./ufas <pcie_bus> 1 <YYYYMMDD>_UFAS_Dump.bin --ini=./SnapShot/A815.ini
-        Popen으로 PID 추적, timeout 후 D-state 대비 포기 처리.
-        """
-        TIMEOUT = 600   # 10분 — 펌웨어 덤프는 수 분 소요됨
-
-        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-        ufas_path = os.path.join(script_dir, 'ufas')
-
-        log.warning(f"[UFAS] 실행 파일 경로: {ufas_path}")
-        if not os.path.isfile(ufas_path):
-            log.warning("[UFAS] 실행 파일 없음 — 덤프 건너뜀")
-            return
-        if not os.access(ufas_path, os.X_OK):
-            log.warning("[UFAS] 실행 권한 없음 (chmod +x 필요) — 덤프 건너뜀")
-            return
-        log.warning("[UFAS] 실행 파일 확인 OK")
-
-        pcie_bus = self._get_nvme_pcie_bus()
-        if pcie_bus is None:
-            return
-
-        date_str = datetime.now().strftime('%Y%m%d')
-        dump_filename = f"{date_str}_UFAS_Dump.bin"
-        dump_path = os.path.join(script_dir, dump_filename)
-
-        cmd = ['sudo', ufas_path, pcie_bus, '1', dump_path, '--ini=A815.ini']
-        log.warning(f"[UFAS] 실행 명령: {' '.join(cmd)}")
-        log.warning(f"[UFAS] 작업 디렉토리: {script_dir}")
-        log.warning(f"[UFAS] 덤프 출력 파일: {dump_path}")
-
-        try:
-            proc = subprocess.Popen(
-                cmd, cwd=script_dir,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,  # sudo 패스워드 프롬프트 방지
-            )
-        except Exception as e:
-            log.warning(f"[UFAS] Popen 실패: {e}")
-            return
-
-        log.warning(f"[UFAS] 프로세스 시작 PID={proc.pid} — 최대 {TIMEOUT}초 대기")
-
-        # communicate()는 블로킹이라 진행 상황을 알 수 없으므로
-        # 30초마다 파일 크기를 확인해 진행 중임을 표시
-        import threading
-
-        _result: dict = {}
-
-        def _communicate():
-            try:
-                out, err = proc.communicate()
-                _result['stdout'] = out
-                _result['stderr'] = err
-                _result['rc'] = proc.returncode
-            except Exception as ex:
-                _result['error'] = ex
-
-        t = threading.Thread(target=_communicate, daemon=True)
-        t.start()
-
-        POLL_INTERVAL = 30
-        waited = 0
-        while waited < TIMEOUT:
-            t.join(timeout=POLL_INTERVAL)
-            if not t.is_alive():
-                break
-            waited += POLL_INTERVAL
-            # 덤프 파일이 생성 중이면 크기 확인
-            if os.path.exists(dump_path):
-                fsize = os.path.getsize(dump_path)
-                log.warning(f"[UFAS] 진행 중... {waited}s 경과, "
-                             f"덤프 파일 크기: {fsize:,} bytes")
-            else:
-                log.warning(f"[UFAS] 진행 중... {waited}s 경과 (덤프 파일 미생성)")
-
-        if t.is_alive():
-            # timeout 초과
-            log.warning(f"[UFAS] {TIMEOUT}초 timeout — SIGKILL 전송 (PID={proc.pid})")
-            try:
-                proc.kill()
-            except Exception as e:
-                log.warning(f"[UFAS] kill 실패: {e}")
-            t.join(timeout=5)
-            if t.is_alive():
-                log.warning("[UFAS] kill 후에도 프로세스 미종료 — D-state 의심, 포기")
-            else:
-                log.warning("[UFAS] kill 후 프로세스 종료 확인")
-            return
-
-        # 정상 완료
-        if 'error' in _result:
-            log.warning(f"[UFAS] communicate 오류: {_result['error']}")
-            return
-
-        rc = _result.get('rc', -1)
-        out = _result.get('stdout', b'').decode(errors='replace').strip()
-        err = _result.get('stderr', b'').decode(errors='replace').strip()
-        if out:
-            log.warning(f"[UFAS] stdout:\n{out}")
-        if err:
-            log.warning(f"[UFAS] stderr:\n{err}")
-        if rc == 0:
-            log.warning(f"[UFAS] 덤프 완료 (rc=0) → {dump_path}")
-        else:
-            log.warning(f"[UFAS] 덤프 실패 (rc={rc})")
-
-    def _generate_replay_sh(self, crash_dir: Path, tag: str) -> None:
-        """crash 발생 직전 최대 100개 명령어(PM 포함)를 재현 가능한 .sh 파일로 저장.
-
-        쓰기 데이터가 있는 명령은 replay_data_<tag>/ 하위에 바이너리 파일로 함께 저장.
-        생성된 .sh는 chmod +x 로 바로 실행 가능.
-        """
-        history = list(self._cmd_history)
-        if not history:
-            log.warning("[REPLAY] 히스토리 없음 — replay .sh 생성 건너뜀")
-            return
-
-        sh_path  = crash_dir / f"replay_{tag}.sh"
-        data_dir = crash_dir / f"replay_data_{tag}"
-        data_dir.mkdir(exist_ok=True)
-        # 절대경로로 변환 — 스크립트를 어느 디렉토리에서 실행해도 경로가 깨지지 않음
-        data_dir_abs = data_dir.resolve()
-
-        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        # nvme_core 모듈 타임아웃 — 퍼저와 동일한 값
-        _kt_sec = self.config.nvme_kernel_timeout_sec
-        lines = [
-            "#!/bin/bash",
-            f"# Auto-generated replay script — {len(history)} commands before crash",
-            f"# Generated : {now_str}",
-            f"# Device    : {self.config.nvme_device}",
-            f"# Tag       : {tag}",
-            "#",
-            "# 실행 방법:",
-            f"#   sudo bash {sh_path.name}",
-            "#",
-            # set -e 대신 set +e — rc를 직접 캡처하기 위해 오류 즉시 종료 비활성화
-            "set +e",
-            "",
-            "# ── nvme_core 커널 timeout 설정 ─────────────────────────────────────",
-            "# crash 발생 후 커널이 abort/reset_controller 를 수행하지 않도록",
-            "# admin_timeout / io_timeout 을 큰 값으로 설정한다.",
-            "# (기본값: admin=60s / io=30s → crash 후 60초면 커널이 상태 소멸)",
-            f"_NVME_KT={_kt_sec}",
-            "_set_kernel_timeout() {",
-            "    for _p in /sys/module/nvme_core/parameters/admin_timeout \\",
-            "               /sys/module/nvme_core/parameters/io_timeout; do",
-            "        [ -f \"$_p\" ] || continue",
-            "        _old=$(cat \"$_p\" 2>/dev/null)",
-            "        echo \"$1\" > \"$_p\" 2>/dev/null \\",
-            "            && echo \"  [TimeoutCfg] $_p : ${_old}s -> $1 s\" \\",
-            "            || echo \"  [TimeoutCfg] $_p 설정 실패 (root 필요)\"",
-            "    done",
-            "}",
-            "echo '>>> [SETUP] nvme_core kernel timeout 설정 (crash 상태 보존)'",
-            "_set_kernel_timeout ${_NVME_KT}",
-            "",
-            "# ────────────────────────────────────────────────────────────────────",
-            "",
-        ]
-
-        for i, entry in enumerate(history, 1):
-            label = entry['label']
-            is_last = (i == len(history))
-            marker = "  <- CRASH CMD" if is_last else ""
-            step_str = f"[{i:03d}/{len(history)}] {label}{marker}"
-            lines.append(f"# {step_str}")
-
-            cmd_parts = [
-                "nvme", entry['passthru_type'], entry['device'],
-                f"--opcode={entry['opcode']:#x}",
-                f"--namespace-id={entry['nsid']}",
-                f"--cdw2={entry['cdw2']:#x}",
-                f"--cdw3={entry['cdw3']:#x}",
-                f"--cdw10={entry['cdw10']:#x}",
-                f"--cdw11={entry['cdw11']:#x}",
-                f"--cdw12={entry['cdw12']:#x}",
-                f"--cdw13={entry['cdw13']:#x}",
-                f"--cdw14={entry['cdw14']:#x}",
-                f"--cdw15={entry['cdw15']:#x}",
-                "--timeout=3600000",  # 1시간: crash 시 blocking 유지 (커널 abort 방지), 분석 후 Ctrl+C
-            ]
-
-            if entry['is_write'] and entry['data']:
-                # 절대경로로 data bin 파일 저장 — 스크립트 실행 위치 무관
-                data_file_abs = data_dir_abs / f"data_{i:03d}.bin"
-                data_file_abs.write_bytes(entry['data'])
-                cmd_parts += [f"--data-len={entry['data_len']}",
-                               f"--input-file={data_file_abs}", "-w"]
-            elif entry['data_len'] > 0:
-                cmd_parts += [f"--data-len={entry['data_len']}", "-r"]
-
-            # CLI 한 줄로 echo (인수를 공백으로 이어서 출력)
-            cmd_oneline = "sudo " + " ".join(cmd_parts)
-            lines.append(f'echo ">>> {step_str}"')
-            lines.append(f'echo "    {cmd_oneline}"')
-            # stdout(response buffer)은 /dev/null 억제, stderr(에러 메시지)만 출력
-            lines.append("sudo " + " \\\n  ".join(cmd_parts) + " > /dev/null")
-            lines.append('echo "    rc=$?"')
-            lines.append("sleep 0.1")
-            lines.append("")
-
-        lines.append('echo "Replay complete."')
-
-        sh_path.write_text("\n".join(lines) + "\n")
-        sh_path.chmod(0o755)
-        log.warning(f"[REPLAY] 재현 스크립트 → {sh_path}  ({len(history)}개 명령)")
-        log.warning(f"[REPLAY] 실행: sudo bash {sh_path}")
-
     def _capture_dmesg(self, lines: int = 80) -> str:
         """v4.4: 커널 로그(dmesg) 마지막 N줄을 캡처한다.
         timeout 시 커널 NVMe 드라이버의 동작(abort, reset, FLR 등)을
@@ -3368,156 +2037,6 @@ class NVMeFuzzer:
 
         with open(str(filepath) + '.json', 'w') as f:
             json.dump(meta, f, indent=2)
-
-    def _handle_timeout_crash(self, seed: Seed, fuzz_data: bytes) -> None:
-        """RC_TIMEOUT 발생 시 공통 처리 (Calibration/Main loop 공용).
-
-        stuck PC 분석 → dmesg 캡처 → crash 저장 → _timeout_crash 플래그 설정.
-        호출 후 caller는 break로 현재 루프를 탈출해야 한다.
-        """
-        from collections import Counter
-
-        cmd = seed.cmd
-        actual_opcode = (seed.opcode_override if seed.opcode_override is not None
-                         else cmd.opcode)
-
-        # 1) stuck PC 읽기
-        log.warning("[TIMEOUT] SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
-        stuck_pcs = self.sampler.read_stuck_pcs(count=20)
-
-        if stuck_pcs:
-            pc_counts = Counter(stuck_pcs)
-            most_common_pc, _ = pc_counts.most_common(1)[0]
-            unique_stuck = set(stuck_pcs)
-
-            log.error(
-                f"[TIMEOUT CRASH] {cmd.name} "
-                f"actual_opcode=0x{actual_opcode:02x} "
-                f"timeout_group={cmd.timeout_group}")
-            log.error(
-                f"  Stuck PCs ({len(stuck_pcs)} samples, "
-                f"{len(unique_stuck)} unique):")
-            for pc, cnt in pc_counts.most_common(5):
-                in_range = " [IN RANGE]" if self.sampler._in_range(pc) else " [OUT]"
-                log.error(
-                    f"    {hex(pc)}: {cnt}/{len(stuck_pcs)} "
-                    f"({100*cnt/len(stuck_pcs):.0f}%){in_range}")
-
-            if len(unique_stuck) == 1:
-                log.error(
-                    f"  → 펌웨어가 {hex(most_common_pc)}에서 "
-                    f"완전히 멈춤 (hang/deadlock)")
-            elif len(unique_stuck) <= 3:
-                log.error(
-                    f"  → 펌웨어가 {len(unique_stuck)}개 주소에서 "
-                    f"루프 중 (에러 핸들링 또는 busy-wait)")
-            else:
-                log.error(
-                    f"  → 펌웨어가 {len(unique_stuck)}개 주소를 "
-                    f"순회 중 (복구 루틴 진행 중일 수 있음)")
-        else:
-            log.error(
-                f"[TIMEOUT CRASH] {cmd.name} "
-                f"actual_opcode=0x{actual_opcode:02x} "
-                f"— J-Link PC 읽기 실패 (JTAG 연결 확인 필요)")
-
-        # 2) dmesg 캡처
-        log.warning("[TIMEOUT] 커널 로그(dmesg)를 캡처합니다...")
-        dmesg_snapshot = self._capture_dmesg(lines=80)
-        nvme_lines = [l for l in dmesg_snapshot.splitlines()
-                      if 'nvme' in l.lower() or 'blk_update' in l.lower()
-                      or 'reset' in l.lower() or 'timeout' in l.lower()]
-        if nvme_lines:
-            log.error(f"  dmesg NVMe 관련 ({len(nvme_lines)}줄):")
-            for line in nvme_lines[-10:]:
-                log.error(f"    {line}")
-        else:
-            log.error("  dmesg에 NVMe 관련 메시지 없음")
-
-        # 2.5) FAIL CMD — 실패한 명령어 및 파라미터 전체 출력
-        _nsid_str = (f"0x{seed.nsid_override:x} (override)"
-                     if seed.nsid_override is not None else "1 (default)")
-        _mut_parts = []
-        if seed.opcode_override is not None:
-            _mut_parts.append(f"opcode_override=0x{seed.opcode_override:02x}")
-        if seed.nsid_override is not None:
-            _mut_parts.append(f"nsid_override=0x{seed.nsid_override:x}")
-        if seed.force_admin is not None:
-            _mut_parts.append(f"force_admin={seed.force_admin}")
-        if seed.data_len_override is not None:
-            _mut_parts.append(f"data_len_override={seed.data_len_override}")
-        _data_hex = fuzz_data[:64].hex() if fuzz_data else "N/A"
-        _data_suffix = "..." if fuzz_data and len(fuzz_data) > 64 else ""
-        _sep = "=" * 64
-        log.error(_sep)
-        log.error("  !! FAIL CMD !!")
-        log.error(f"  cmd       : {cmd.name} ({cmd.cmd_type.name})")
-        log.error(f"  opcode    : 0x{actual_opcode:02x}")
-        log.error(f"  device    : {self.config.nvme_device}")
-        log.error(f"  nsid      : {_nsid_str}")
-        log.error(f"  cdw2      : 0x{seed.cdw2:08x}")
-        log.error(f"  cdw3      : 0x{seed.cdw3:08x}")
-        log.error(f"  cdw10     : 0x{seed.cdw10:08x}")
-        log.error(f"  cdw11     : 0x{seed.cdw11:08x}")
-        log.error(f"  cdw12     : 0x{seed.cdw12:08x}")
-        log.error(f"  cdw13     : 0x{seed.cdw13:08x}")
-        log.error(f"  cdw14     : 0x{seed.cdw14:08x}")
-        log.error(f"  cdw15     : 0x{seed.cdw15:08x}")
-        log.error(f"  data_len  : {len(fuzz_data) if fuzz_data else 0} bytes")
-        log.error(f"  data(hex) : {_data_hex}{_data_suffix}")
-        if _mut_parts:
-            log.error(f"  mutations : {', '.join(_mut_parts)}")
-        log.error(_sep)
-
-        # 3) crash 저장
-        self.crash_inputs.append((fuzz_data, cmd))
-        self._save_crash(fuzz_data, seed, reason="timeout",
-                         stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot)
-        log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
-
-        # 3.5) 재현 TC replay 스크립트 생성
-        _replay_tag = hashlib.md5(fuzz_data).hexdigest()[:8]
-        log.warning("[TIMEOUT] 재현 TC 스크립트를 생성합니다...")
-        self._generate_replay_sh(self.crashes_dir, _replay_tag)
-
-        # 3.6) UFAS 펌웨어 덤프
-        log.warning("[TIMEOUT] UFAS 펌웨어 덤프를 실행합니다...")
-        try:
-            self._run_ufas_dump()
-        except Exception as _ufas_exc:
-            log.warning(f"[UFAS] _run_ufas_dump 예기치 않은 예외: {_ufas_exc}")
-        log.warning("[UFAS] _run_ufas_dump 반환")
-
-        # 4) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
-        log.error(
-            "  SSD 펌웨어를 resume 상태로 유지합니다. "
-            "(halt하지 않음 — 불량 현상 보존)")
-        log.error(
-            "  J-Link 디버거로 연결하여 현재 상태를 "
-            "관찰할 수 있습니다.")
-
-        # 5) nvme-cli PID 기록
-        log.error("")
-        if self._crash_nvme_pid is not None:
-            pid_file = self.crashes_dir / "crash_nvme_pid.txt"
-            try:
-                pid_file.write_text(f"{self._crash_nvme_pid}\n")
-            except OSError:
-                pass
-            log.error(
-                f"  [참고] nvme-cli PID={self._crash_nvme_pid} "
-                f"(D-state 대기 중)")
-        timeout_val = self.config.nvme_kernel_timeout_sec
-        log.error(
-            f"  커널 reset까지 최대 {timeout_val}초 유예 "
-            f"(nvme_core admin/io_timeout 설정값)")
-        log.error("")
-
-        # 6) 플래그 설정 — caller가 break로 루프 탈출
-        self._timeout_crash = True
-        log.error(
-            "  퍼징을 중단합니다. SSD와 NVMe 장치 상태를 "
-            "그대로 유지합니다.")
 
     def _save_per_command_data(self):
         """명령어별 PC/trace 데이터를 JSON 파일로 저장"""
@@ -3731,187 +2250,6 @@ class NVMeFuzzer:
         plt.close()
         log.info(f"[Graph] 명령어 비교 차트 → {chart_file}")
 
-    def _generate_static_coverage_graphs(self):
-        """정적 분석 커버리지 시각화 3종 생성 (파일 미로드 시 조용히 스킵).
-
-        1. coverage_growth.png  — 성장 곡선 (code_cov% / funcs_cov% vs executions)
-        2. firmware_map.png     — 펌웨어 주소 공간 커버리지 맵
-        3. uncovered_funcs.png  — 미커버 함수 Top-30 (크기 순)
-        """
-        if not self._sa_loaded:
-            return
-
-        try:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            import matplotlib.patches as mpatches
-        except ImportError:
-            log.warning("[StatGraph] matplotlib 미설치 — 정적 분석 그래프 생략")
-            return
-
-        graph_dir = self.output_dir / 'graphs'
-        graph_dir.mkdir(parents=True, exist_ok=True)
-
-        # ------------------------------------------------------------------ #
-        # 1. Coverage growth curve
-        # ------------------------------------------------------------------ #
-        if len(self._sa_cov_history) >= 2:
-            execs  = [h[0] for h in self._sa_cov_history]
-            c_pcts = [h[2] for h in self._sa_cov_history]
-            f_pcts = [h[3] for h in self._sa_cov_history]
-
-            fig, ax = plt.subplots(figsize=(10, 5))
-            if self._sa_total_bbs > 0:
-                ax.plot(execs, c_pcts, color='steelblue', linewidth=1.5,
-                        label=f'Basic Blocks ({self._sa_total_bbs:,})')
-            if self._sa_total_funcs > 0:
-                ax.plot(execs, f_pcts, color='coral', linewidth=1.5,
-                        label=f'Functions ({self._sa_total_funcs:,})')
-
-            ax.set_xlabel('Executions')
-            ax.set_ylabel('Coverage (%)')
-            ax.set_title('Coverage Growth — PC Sampling Fuzzer')
-            ax.legend(loc='lower right')
-            ax.set_ylim(0, max(max(c_pcts, default=0), max(f_pcts, default=0)) * 1.15 + 1)
-            ax.grid(True, alpha=0.3)
-
-            # 최종 값 annotation
-            if c_pcts:
-                ax.annotate(f'{c_pcts[-1]:.1f}%',
-                            xy=(execs[-1], c_pcts[-1]),
-                            xytext=(8, 4), textcoords='offset points',
-                            color='steelblue', fontsize=9)
-            if f_pcts:
-                ax.annotate(f'{f_pcts[-1]:.1f}%',
-                            xy=(execs[-1], f_pcts[-1]),
-                            xytext=(8, -12), textcoords='offset points',
-                            color='coral', fontsize=9)
-
-            plt.tight_layout()
-            growth_file = graph_dir / 'coverage_growth.png'
-            plt.savefig(growth_file, dpi=150, bbox_inches='tight')
-            plt.close()
-            log.info(f"[StatGraph] 성장 곡선 → {growth_file}")
-
-        # ------------------------------------------------------------------ #
-        # 2. Firmware address-space map
-        # ------------------------------------------------------------------ #
-        if self._sa_func_entries and self._sa_total_funcs > 0:
-            entries = self._sa_func_entries
-            ends    = self._sa_func_ends
-            entered = self._sa_entered_funcs
-
-            # 함수를 entry 순으로 정렬 (이미 정렬됨)
-            # 최대 400개까지만 표시 (너무 많으면 가독성 저하)
-            MAX_FUNCS = 400
-            step = max(1, len(entries) // MAX_FUNCS)
-            sampled_idx = list(range(0, len(entries), step))
-
-            n_show = len(sampled_idx)
-            # 행 수: 20개씩 1행
-            cols = 20
-            rows = (n_show + cols - 1) // cols
-
-            fig, ax = plt.subplots(figsize=(min(cols * 0.6, 14), max(rows * 0.4, 3)))
-            ax.set_xlim(0, cols)
-            ax.set_ylim(0, rows)
-            ax.set_aspect('equal')
-            ax.axis('off')
-
-            fig.patch.set_facecolor('#1a1a2e')
-            ax.set_facecolor('#1a1a2e')
-
-            COLOR_COV   = '#00c875'   # 커버됨 (초록)
-            COLOR_UNCOV = '#444466'   # 미커버 (어두운 보라)
-
-            for plot_i, func_i in enumerate(sampled_idx):
-                row = plot_i // cols
-                col = plot_i % cols
-                y   = rows - 1 - row  # 위에서 아래로
-
-                # 크기에 비례한 너비 (시각적 강조)
-                func_size = ends[func_i] - entries[func_i]
-                w = 0.85
-                h = min(0.85, 0.4 + func_size / 8000.0)
-                h = min(h, 0.85)
-
-                color = COLOR_COV if entries[func_i] in entered else COLOR_UNCOV
-                rect = mpatches.FancyBboxPatch(
-                    (col + 0.075, y + (0.85 - h) / 2), w, h,
-                    boxstyle="round,pad=0.02",
-                    facecolor=color, edgecolor='none', alpha=0.9)
-                ax.add_patch(rect)
-
-            n_cov   = len(entered)
-            n_uncov = self._sa_total_funcs - n_cov
-            cov_pct = 100.0 * n_cov / self._sa_total_funcs
-
-            legend_patches = [
-                mpatches.Patch(color=COLOR_COV,   label=f'Covered ({n_cov})'),
-                mpatches.Patch(color=COLOR_UNCOV, label=f'Not covered ({n_uncov})'),
-            ]
-            ax.legend(handles=legend_patches, loc='upper right',
-                      facecolor='#2a2a3e', edgecolor='gray',
-                      labelcolor='white', fontsize=9)
-
-            note = f'  (showing {n_show}/{self._sa_total_funcs} funcs)' \
-                   if n_show < self._sa_total_funcs else ''
-            ax.set_title(
-                f'Firmware Function Map — {cov_pct:.1f}% covered{note}',
-                color='white', fontsize=11, pad=8)
-
-            map_file = graph_dir / 'firmware_map.png'
-            plt.savefig(map_file, dpi=150, bbox_inches='tight',
-                        facecolor=fig.get_facecolor())
-            plt.close()
-            log.info(f"[StatGraph] 펌웨어 맵 → {map_file}")
-
-        # ------------------------------------------------------------------ #
-        # 3. Top uncovered functions (by size)
-        # ------------------------------------------------------------------ #
-        if self._sa_func_entries and self._sa_total_funcs > 0:
-            entered = self._sa_entered_funcs
-            uncov = [
-                (self._sa_func_names[i],
-                 self._sa_func_ends[i] - self._sa_func_entries[i],
-                 self._sa_func_entries[i])
-                for i in range(len(self._sa_func_entries))
-                if self._sa_func_entries[i] not in entered
-            ]
-            # 크기(bytes) 내림차순
-            uncov.sort(key=lambda x: x[1], reverse=True)
-            top = uncov[:30]
-
-            if top:
-                names_top  = [f"{n}  (0x{addr:08x})" for n, _, addr in top]
-                sizes_top  = [sz for _, sz, _ in top]
-
-                fig, ax = plt.subplots(figsize=(10, max(4, len(top) * 0.35)))
-                bars = ax.barh(range(len(top)), sizes_top,
-                               color='#e05a5a', edgecolor='none', height=0.7)
-                ax.set_yticks(range(len(top)))
-                ax.set_yticklabels(names_top, fontsize=8)
-                ax.invert_yaxis()
-                ax.set_xlabel('Function size (bytes)')
-                ax.set_title(
-                    f'Top {len(top)} Uncovered Functions (by size)\n'
-                    f'Total uncovered: {len(uncov):,} / {self._sa_total_funcs:,}',
-                    fontsize=11)
-                ax.grid(True, axis='x', alpha=0.3)
-
-                # 막대 끝에 크기 숫자
-                for bar, sz in zip(bars, sizes_top):
-                    ax.text(bar.get_width() + max(sizes_top) * 0.01,
-                            bar.get_y() + bar.get_height() / 2,
-                            str(sz), va='center', fontsize=7, color='#555')
-
-                plt.tight_layout()
-                uncov_file = graph_dir / 'uncovered_funcs.png'
-                plt.savefig(uncov_file, dpi=150, bbox_inches='tight')
-                plt.close()
-                log.info(f"[StatGraph] 미커버 함수 Top-{len(top)} → {uncov_file}")
-
     def _generate_heatmaps(self):
         """1D 주소 커버리지 히트맵 + 2D edge 히트맵 생성"""
         try:
@@ -4115,36 +2453,14 @@ class NVMeFuzzer:
             'passthru_stats': dict(self.passthru_stats),
         }
 
-    def _print_status(self, stats: dict, last_samples: int = 0,
-                      window_eps: float = 0.0):
-        if self.config.pm_inject_prob > 0:
-            _ps_to = (self._prev_op_ps if self._current_ps in (3, 4) else self._current_ps)
-            _mult  = PS_TIMEOUT_MULT.get(_ps_to, 1)
-            _prev  = f",prev=PS{self._prev_op_ps}" if self._current_ps in (3, 4) else ""
-            ps_tag = f" | PS{self._current_ps}(×{_mult}TO{_prev})"
-        else:
-            ps_tag = ""
+    def _print_status(self, stats: dict, last_samples: int = 0):
         log.warning(f"[Stats] exec: {stats['executions']:,} | "
                  f"corpus: {stats['corpus_size']} | "
                  f"crashes: {stats['crashes']} | "
                  f"pcs: {stats['coverage_unique_pcs']:,} | "
                  f"samples: {stats['total_samples']:,} | "
                  f"last_run: {last_samples} | "
-                 f"exec/s(avg): {stats['exec_per_sec']:.1f} | "
-                 f"exec/s(win): {window_eps:.1f}"
-                 f"{ps_tag}")
-        if self._sa_loaded:
-            sa_parts = []
-            if self._sa_total_bbs > 0:
-                n_bb = len(self._sa_covered_bbs)
-                pct  = 100.0 * n_bb / self._sa_total_bbs
-                sa_parts.append(f"BB: {pct:.1f}% ({n_bb:,}/{self._sa_total_bbs:,})")
-            if self._sa_total_funcs > 0:
-                n_f  = len(self._sa_entered_funcs)
-                fpct = 100.0 * n_f / self._sa_total_funcs
-                sa_parts.append(f"funcs: {n_f}/{self._sa_total_funcs} ({fpct:.1f}%)")
-            if sa_parts:
-                log.warning(f"[StatCov] {' | '.join(sa_parts)}")
+                 f"exec/s: {stats['exec_per_sec']:.1f}")
 
     def run(self):
         global log
@@ -4165,7 +2481,6 @@ class NVMeFuzzer:
         else:
             log.warning("Addr filter : NONE (all PCs collected - noisy!)")
         log.warning(f"Sampling    : interval={self.config.sample_interval_us}us, "
-                 f"go_settle={self.config.go_settle_ms}ms, "
                  f"max={self.config.max_samples_per_run}/run, "
                  f"idle_sat={self.config.saturation_limit}, "
                  f"global_sat={self.config.global_saturation_limit}, "
@@ -4173,20 +2488,6 @@ class NVMeFuzzer:
         log.warning(f"Power Sched : max_energy={self.config.max_energy}")
         # v4.3: 로그 메시지 수정 — 실제 구현은 subprocess(nvme-cli) 방식
         log.warning(f"NVMe I/O    : subprocess (nvme-cli passthru)")
-        if self.config.pm_inject_prob > 0:
-            log.warning(f"PM Rotate   : interval={PM_ROTATE_INTERVAL}cmds, "
-                        f"mode=random(PS0~PS4), "
-                        f"timeout_mult=PS1×{PS_TIMEOUT_MULT[1]} PS2×{PS_TIMEOUT_MULT[2]} "
-                        f"PS3/PS4=prev_op_PS 기준, IO 필터 없음")
-        if self._sa_loaded:
-            sa_info = []
-            if self._sa_total_bbs > 0:
-                sa_info.append(f"basic_blocks={self._sa_total_bbs:,}")
-            if self._sa_total_funcs > 0:
-                sa_info.append(f"funcs={self._sa_total_funcs:,}")
-            log.warning(f"StaticAnalysis: {', '.join(sa_info)}")
-        else:
-            log.warning("StaticAnalysis: not loaded (basic_blocks.txt / functions.txt 없음)")
         log.warning(f"Random gen  : {self.config.random_gen_ratio:.0%}")
         timeout_str = ", ".join(f"{k}={v}ms" for k, v in self.config.nvme_timeouts.items())
         log.warning(f"Timeouts    : subprocess={timeout_str}")
@@ -4220,6 +2521,9 @@ class NVMeFuzzer:
             return
         log.info(f"[Pre-flight] NVMe 디바이스 확인: {nvme_dev} ✓")
 
+        # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존)
+        self._configure_nvme_timeouts()
+
         # 이전 커버리지 로드 (resume)
         if self.config.resume_coverage:
             self.sampler.load_coverage(self.config.resume_coverage)
@@ -4233,17 +2537,13 @@ class NVMeFuzzer:
             log.error("J-Link PC read diagnosis failed, aborting")
             return
 
-        if self.sampler.idle_pcs:
-            pcs_str = ', '.join(hex(p) for p in sorted(self.sampler.idle_pcs))
-            log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
+        if self.sampler.idle_pc is not None:
+            log.warning(f"Idle PC     : {hex(self.sampler.idle_pc)}")
         else:
-            log.warning("Idle PCs    : not detected (saturation = global PC only)")
+            log.warning("Idle PC     : not detected (saturation = global PC only)")
 
-        # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
-        # _log_smart() 이후에 설정: 이전에 실행하면 admin_timeout=30일 상태에서
-        # smart-log ioctl이 제출되어, SSD 응답이 조금 느릴 때 커널이 계속 기다리고
-        # Python 10초 timeout이 먼저 터지는 문제 방지.
-        self._configure_nvme_timeouts()
+        # v4.3: 퍼징 시작 전 SMART baseline 기록
+        self._log_smart()
 
         # v4.5: 초기 시드 Calibration
         if self.config.calibration_runs > 0:
@@ -4312,8 +2612,6 @@ class NVMeFuzzer:
             log.info("[Calibration] Disabled (calibration_runs=0)")
 
         self.start_time = datetime.now()
-        self._window_t0 = self.start_time          # 구간별 exec/s 계산용
-        self._window_exec0: int = 0
 
         try:
             while True:
@@ -4343,16 +2641,10 @@ class NVMeFuzzer:
                     # v4.3: 완전 랜덤 비율을 설정값으로 분리
                     if self.corpus and random.random() >= self.config.random_gen_ratio:
                         base_seed = self._select_seed()
-                        if base_seed is None:
-                            cmd = random.choice(self.commands)
-                            fuzz_data = os.urandom(random.randint(64, 512))
-                            mutated_seed = Seed(data=fuzz_data, cmd=cmd)
-                            self.mutation_stats["random_gen"] += 1
-                        else:
-                            mutated_seed = self._mutate(base_seed)
-                            fuzz_data = mutated_seed.data
-                            cmd = mutated_seed.cmd
-                            self.mutation_stats["corpus_mutated"] += 1
+                        mutated_seed = self._mutate(base_seed)
+                        fuzz_data = mutated_seed.data
+                        cmd = mutated_seed.cmd
+                        self.mutation_stats["corpus_mutated"] += 1
                     else:
                         cmd = random.choice(self.commands)
                         fuzz_data = os.urandom(random.randint(64, 512))
@@ -4380,22 +2672,8 @@ class NVMeFuzzer:
                     pt = "admin-passthru" if cmd.cmd_type == NVMeCommandType.ADMIN else "io-passthru"
                 self.passthru_stats[pt] += 1
 
-                # v5.1: 현재 PS 상태별 실행 카운트
-                if self.config.pm_inject_prob > 0:
-                    self.ps_exec_counts[self._current_ps] += 1
-
-                # PS3/PS4에서도 IO 명령 포함 모든 타입 허용 — 필터링 없음
-
                 # NVMe 커맨드 전송
-                # PS3/PS4: 디바이스가 복귀할 operational PS 기준으로 timeout 결정
-                _ps_for_timeout = (self._prev_op_ps
-                                   if self.config.pm_inject_prob > 0
-                                      and self._current_ps in (3, 4)
-                                   else self._current_ps)
-                _timeout_mult = PS_TIMEOUT_MULT.get(_ps_for_timeout, 1) \
-                    if self.config.pm_inject_prob > 0 else 1
-                rc = self._send_nvme_command(fuzz_data, mutated_seed,
-                                             timeout_mult=_timeout_mult)
+                rc = self._send_nvme_command(fuzz_data, mutated_seed)
                 last_samples = self.sampler.stop_sampling()
 
                 self.executions += 1
@@ -4412,10 +2690,6 @@ class NVMeFuzzer:
 
                 # v4.5+: PC 기반 커버리지 평가 (primary signal)
                 is_interesting, new_pcs = self.sampler.evaluate_coverage()
-
-                # v5.1: 정적 분석 커버리지 증분 업데이트
-                if self._sa_loaded and self.sampler._last_new_pcs:
-                    self._update_static_coverage(self.sampler._last_new_pcs)
 
                 # v4.3: 실제 실행 opcode 기준으로 분류하여 기록
                 self.cmd_pcs[track_key].update(self.sampler.current_trace)
@@ -4446,7 +2720,107 @@ class NVMeFuzzer:
 
                 # --- Timeout / Error 처리 ---
                 if rc == self.RC_TIMEOUT:
-                    self._handle_timeout_crash(mutated_seed, fuzz_data)
+                    # v4.3: timeout 시 SSD 불량 현상 유지 전략
+                    # J-Link reconnect 하지 않음 — 펌웨어 상태를 있는 그대로 보존
+
+                    # 1) J-Link로 SSD 펌웨어가 멈춘 PC를 읽기 (halt-read-go 반복)
+                    log.warning("[TIMEOUT] SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
+                    stuck_pcs = self.sampler.read_stuck_pcs(count=20)
+
+                    actual_opcode = mutated_seed.opcode_override \
+                        if mutated_seed.opcode_override is not None \
+                        else cmd.opcode
+
+                    if stuck_pcs:
+                        from collections import Counter
+                        pc_counts = Counter(stuck_pcs)
+                        most_common_pc, most_common_count = pc_counts.most_common(1)[0]
+                        unique_stuck = set(stuck_pcs)
+
+                        log.error(
+                            f"[TIMEOUT CRASH] {cmd.name} "
+                            f"actual_opcode=0x{actual_opcode:02x} "
+                            f"timeout_group={cmd.timeout_group}")
+                        log.error(
+                            f"  Stuck PCs ({len(stuck_pcs)} samples, "
+                            f"{len(unique_stuck)} unique):")
+                        for pc, cnt in pc_counts.most_common(5):
+                            in_range = " [IN RANGE]" if self.sampler._in_range(pc) else " [OUT]"
+                            log.error(
+                                f"    {hex(pc)}: {cnt}/{len(stuck_pcs)} "
+                                f"({100*cnt/len(stuck_pcs):.0f}%){in_range}")
+
+                        if len(unique_stuck) == 1:
+                            log.error(
+                                f"  → 펌웨어가 {hex(most_common_pc)}에서 "
+                                f"완전히 멈춤 (hang/deadlock)")
+                        elif len(unique_stuck) <= 3:
+                            log.error(
+                                f"  → 펌웨어가 {len(unique_stuck)}개 주소에서 "
+                                f"루프 중 (에러 핸들링 또는 busy-wait)")
+                        else:
+                            log.error(
+                                f"  → 펌웨어가 {len(unique_stuck)}개 주소를 "
+                                f"순회 중 (복구 루틴 진행 중일 수 있음)")
+                    else:
+                        log.error(
+                            f"[TIMEOUT CRASH] {cmd.name} "
+                            f"actual_opcode=0x{actual_opcode:02x} "
+                            f"— J-Link PC 읽기 실패 (JTAG 연결 확인 필요)")
+
+                    # 3) dmesg 캡처 — unbind 직후라 reset 메시지 없는 게 정상
+                    log.warning("[TIMEOUT] 커널 로그(dmesg)를 캡처합니다...")
+                    dmesg_snapshot = self._capture_dmesg(lines=80)
+                    # dmesg에서 NVMe 관련 라인만 요약 출력
+                    nvme_lines = [l for l in dmesg_snapshot.splitlines()
+                                  if 'nvme' in l.lower() or 'blk_update' in l.lower()
+                                  or 'reset' in l.lower() or 'timeout' in l.lower()]
+                    if nvme_lines:
+                        log.error(f"  dmesg NVMe 관련 ({len(nvme_lines)}줄):")
+                        for line in nvme_lines[-10:]:
+                            log.error(f"    {line}")
+                    else:
+                        log.error("  dmesg에 NVMe 관련 메시지 없음")
+
+                    # 4) crash 저장 (stuck PC + dmesg 포함)
+                    self.crash_inputs.append((fuzz_data, cmd))
+                    self._save_crash(fuzz_data, mutated_seed,
+                                     reason="timeout", stuck_pcs=stuck_pcs,
+                                     dmesg_snapshot=dmesg_snapshot)
+                    log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
+
+                    # 5) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
+                    # halt하면 불량 현상이 멈추므로, 펌웨어가 돌고 있는
+                    # 그대로 두어야 hang/loop 등의 현상을 외부에서 관찰 가능
+                    log.error(
+                        "  SSD 펌웨어를 resume 상태로 유지합니다. "
+                        "(halt하지 않음 — 불량 현상 보존)")
+                    log.error(
+                        "  J-Link 디버거로 연결하여 현재 상태를 "
+                        "관찰할 수 있습니다.")
+
+                    # 6) nvme-cli 프로세스 정보 기록
+                    log.error("")
+                    if self._crash_nvme_pid is not None:
+                        pid_file = self.crashes_dir / "crash_nvme_pid.txt"
+                        try:
+                            pid_file.write_text(f"{self._crash_nvme_pid}\n")
+                        except OSError:
+                            pass
+                        log.error(
+                            f"  [참고] nvme-cli PID={self._crash_nvme_pid} "
+                            f"(D-state 대기 중)")
+                    timeout_val = self.config.nvme_kernel_timeout_sec
+                    log.error(
+                        f"  커널 reset까지 최대 {timeout_val}초 유예 "
+                        f"(nvme_core admin/io_timeout 설정값)")
+                    log.error("")
+
+                    # 7) 퍼징 중단 — reconnect/continue/rescan 하지 않음
+                    self._timeout_crash = True
+                    log.error(
+                        "  퍼징을 중단합니다. SSD와 NVMe 장치 상태를 "
+                        "그대로 유지합니다.")
                     break
 
                 if rc == self.RC_ERROR:
@@ -4506,50 +2880,8 @@ class NVMeFuzzer:
                         self.mopt_uses[op] += 1
 
                 if self.executions % 100 == 0:
-                    # exec/s(win) 계산을 PM 전환 전에 먼저 수행:
-                    # PM 전환 시간(wake-up latency 등)이 직전 100개 명령의 속도를
-                    # 왜곡하지 않도록, 명령 실행이 끝난 시점 기준으로 계산.
-                    _now = datetime.now()
-                    _wdt = (_now - self._window_t0).total_seconds()
-                    _wexec = self.executions - self._window_exec0
-                    _window_eps = _wexec / _wdt if _wdt > 0 else 0
-
-                    # v5.1: PM 로테이션 — exec/s 계산 후 PS 전환
-                    if self.config.pm_inject_prob > 0:
-                        next_ps = random.randint(0, 4)
-                        # PS3/PS4 timeout은 진입 전 operational PS(0~2) 기준
-                        if next_ps not in (3, 4):
-                            self._prev_op_ps = next_ps
-                        _eff_mult = PS_TIMEOUT_MULT.get(
-                            next_ps if next_ps not in (3, 4) else self._prev_op_ps, 1)
-                        log.warning(
-                            f"[PM] PS 상태 전환: PS{self._current_ps} → PS{next_ps}"
-                            + (f" (timeout ×{_eff_mult}, prev_op=PS{self._prev_op_ps})"
-                               if next_ps in (3, 4) else
-                               (f" (timeout ×{_eff_mult})" if _eff_mult > 1 else ""))
-                        )
-                        self._pm_set_state(next_ps)
-                        self._current_ps = next_ps
-                        self.ps_enter_counts[next_ps] += 1
-
-                    # 윈도우 리셋은 PM 전환 완료 후 — 전환 시간이 다음 윈도우에도 포함되지 않음
-                    self._window_t0 = datetime.now()
-                    self._window_exec0 = self.executions
-
-                    # v5.1: 정적 분석 성장 곡선 스냅샷
-                    if self._sa_loaded:
-                        _elapsed_snap = (datetime.now() - self.start_time).total_seconds() \
-                                        if self.start_time else 0
-                        _bbpct = (100.0 * len(self._sa_covered_bbs) / self._sa_total_bbs
-                                  if self._sa_total_bbs > 0 else 0.0)
-                        _fpct  = (100.0 * len(self._sa_entered_funcs) / self._sa_total_funcs
-                                  if self._sa_total_funcs > 0 else 0.0)
-                        self._sa_cov_history.append(
-                            (self.executions, _elapsed_snap, _bbpct, _fpct))
-
                     stats = self._collect_stats()
-                    self._print_status(stats, last_samples,
-                                       window_eps=_window_eps)
+                    self._print_status(stats, last_samples)
                     # OS 버퍼까지 강제 flush (파일 핸들러만)
                     for h in log.handlers:
                         h.flush()
@@ -4659,33 +2991,6 @@ class NVMeFuzzer:
                 summary_lines.append(
                     f"  Passthru type  : admin={pt.get('admin-passthru', 0)}, "
                     f"io={pt.get('io-passthru', 0)}")
-                if self.config.pm_inject_prob > 0:
-                    summary_lines.append(f"PM Rotate interval: {PM_ROTATE_INTERVAL}cmds (random PS0~PS4)")
-                    for ps in range(5):
-                        cnt = self.ps_exec_counts.get(ps, 0)
-                        enters = self.ps_enter_counts.get(ps, 0)
-                        if cnt > 0 or enters > 0:
-                            pct = 100 * cnt / total
-                            mult = PS_TIMEOUT_MULT.get(ps, 1)
-                            note = (f" [TO×{mult}]" if mult > 1 else "") + \
-                                   (" [TO=prev_op_PS]" if ps in (3, 4) else "")
-                            summary_lines.append(
-                                f"  PS{ps}: 실행 {cnt}회 ({pct:.1f}%), 진입 {enters}회{note}")
-
-                # v5.1: 정적 분석 커버리지 요약
-                if self._sa_loaded:
-                    if self._sa_total_bbs > 0:
-                        n_bb = len(self._sa_covered_bbs)
-                        pct  = 100.0 * n_bb / self._sa_total_bbs
-                        summary_lines.append(
-                            f"BB Coverage      : {pct:.2f}%"
-                            f" ({n_bb:,} / {self._sa_total_bbs:,} basic blocks)")
-                    if self._sa_total_funcs > 0:
-                        n_f  = len(self._sa_entered_funcs)
-                        fpct = 100.0 * n_f / self._sa_total_funcs
-                        summary_lines.append(
-                            f"Func Coverage    : {fpct:.2f}%"
-                            f" ({n_f} / {self._sa_total_funcs} functions)")
 
                 # v4.5: MOpt 통계
                 if self.config.mopt_enabled:
@@ -4723,11 +3028,6 @@ class NVMeFuzzer:
                 self._generate_heatmaps()
             except Exception as e:
                 log.error(f"Graph/heatmap generation failed: {e}")
-
-            try:
-                self._generate_static_coverage_graphs()
-            except Exception as e:
-                log.error(f"Static coverage graph generation failed: {e}")
 
             try:
                 for h in log.handlers:
@@ -4768,37 +3068,17 @@ if __name__ == "__main__":
     parser.add_argument('--namespace', type=int, default=NVME_NAMESPACE)
     parser.add_argument('--commands', nargs='+', default=[],
                         help='Commands to use (e.g., Read Write GetFeatures FormatNVM)')
-    parser.add_argument('--all-commands', action='store_true', default=False,
+    parser.add_argument('--all-commands', action='store_true', default=True,
                         help='Enable ALL commands including destructive ones '
                              '(FormatNVM, Sanitize, FWCommit, etc.)')
     parser.add_argument('--speed', type=int, default=JLINK_SPEED, help='JTAG speed (kHz)')
-    parser.add_argument('--interface', choices=['auto', 'jtag', 'swd'], default='auto',
-                        help='J-Link 인터페이스 (default: auto). '
-                             'auto=JTAG 먼저 시도 후 실패 시 SWD로 자동 전환. '
-                             'jtag/swd=강제 지정')
-    parser.add_argument('--pc-reg-index', type=int, default=None,
-                        help='PC 레지스터 J-Link 인덱스 수동 지정. '
-                             '자동 탐색 실패 시 jlink_reg_diag.py 로 확인 후 사용 '
-                             '(Cortex-R8=9, Cortex-M=15, 아키텍처마다 다름)')
     parser.add_argument('--runtime', type=int, default=TOTAL_RUNTIME_SEC)
     parser.add_argument('--output', default=OUTPUT_DIR, help='Output dir')
     parser.add_argument('--seed-dir', default=SEED_DIR,
                         help='Seed directory path (load previous corpus as seeds)')
-    parser.add_argument('--fw-bin', default=_FW_BIN_PATH,
-                        help='[v4.7] 펌웨어 바이너리 경로 (FWDownload 실제 시드 생성, '
-                             '없으면 더미 1KB 시드). 기본값: FW_BIN_FILENAME 설정')
-    parser.add_argument('--fw-xfer', type=int, default=32768,
-                        help='[v4.7] FWDownload 청크 크기(바이트), nvme fw-download -x 와 동일 '
-                             '(default: 32768)')
-    parser.add_argument('--fw-slot', type=int, default=1,
-                        help='[v4.7] FWCommit 슬롯 번호 (default: 1)')
     parser.add_argument('--samples', type=int, default=MAX_SAMPLES_PER_RUN)
     parser.add_argument('--interval', type=int, default=SAMPLE_INTERVAL_US,
-                        help='Sample interval (us). 0 = max density (기본값)')
-    parser.add_argument('--go-settle', type=int, default=GO_SETTLE_MS,
-                        help='Go() 후 CPU 최소 실행 보장 시간 (ms). '
-                             '0=비활성화(JTAG/정상SWD). SWD+레벨시프터=50 권장. '
-                             f'(default: {GO_SETTLE_MS})')
+                        help='Sample interval (us)')
     parser.add_argument('--post-cmd-delay', type=int, default=POST_CMD_DELAY_MS,
                         help='Post-command sampling delay (ms)')
     parser.add_argument('--passthru-timeout', type=int, default=NVME_PASSTHRU_TIMEOUT_MS,
@@ -4837,13 +3117,6 @@ if __name__ == "__main__":
                              '--timeout format 600000. '
                              f'Groups: {", ".join(NVME_TIMEOUTS.keys())}')
 
-    # v4.7: idle 유니버스 수렴 설정
-    parser.add_argument('--diagnose-stability', type=int, default=DIAGNOSE_STABILITY,
-                        help=f'idle 유니버스 수렴 조건: 새 PC 없이 연속 N회 (default: {DIAGNOSE_STABILITY}). '
-                             'SWD에서 주기적 인터럽트를 모두 포함하려면 크게 설정')
-    parser.add_argument('--diagnose-max', type=int, default=DIAGNOSE_MAX,
-                        help=f'idle 유니버스 수집 최대 샘플 수 (default: {DIAGNOSE_MAX})')
-
     # v4.5: 새 기능 CLI 옵션
     parser.add_argument('--calibration-runs', type=int, default=CALIBRATION_RUNS,
                         help='Calibration runs per initial seed (0=disable, default 3)')
@@ -4857,12 +3130,6 @@ if __name__ == "__main__":
                         help='MOpt pilot phase length in executions (default 5000)')
     parser.add_argument('--mopt-core-period', type=int, default=MOPT_CORE_PERIOD,
                         help='MOpt core phase length in executions (default 50000)')
-
-    # v5.1: PM injection
-    parser.add_argument('--pm', action='store_true', default=False,
-                        help=f'PM 로테이션 활성화: {PM_ROTATE_INTERVAL}명령마다 PS0→PS1→PS2→PS3→PS4 순환. '
-                             f'PS1 timeout×{PS_TIMEOUT_MULT[1]}, PS2 timeout×{PS_TIMEOUT_MULT[2]}, '
-                             f'PS3/PS4 Admin 명령만 허용')
 
     args = parser.parse_args()
 
@@ -4934,13 +3201,7 @@ if __name__ == "__main__":
 
     config = FuzzConfig(
         device_name=args.device,
-        interface={
-            'auto': None,
-            'jtag': pylink.enums.JLinkInterfaces.JTAG,
-            'swd':  pylink.enums.JLinkInterfaces.SWD,
-        }[args.interface],
         jtag_speed=args.speed,
-        pc_reg_index=args.pc_reg_index,
         nvme_device=args.nvme,
         nvme_namespace=args.namespace,
         nvme_timeouts=nvme_timeouts,
@@ -4951,7 +3212,6 @@ if __name__ == "__main__":
         seed_dir=args.seed_dir,
         max_samples_per_run=args.samples,
         sample_interval_us=args.interval,
-        go_settle_ms=args.go_settle,
         post_cmd_delay_ms=args.post_cmd_delay,
         nvme_passthru_timeout_ms=args.passthru_timeout,
         nvme_kernel_timeout_sec=args.kernel_timeout,
@@ -4967,9 +3227,6 @@ if __name__ == "__main__":
         nsid_mut_prob=args.nsid_mut_prob,
         admin_swap_prob=args.admin_swap_prob,
         datalen_mut_prob=args.datalen_mut_prob,
-        # v4.7
-        diagnose_stability=args.diagnose_stability,
-        diagnose_max=args.diagnose_max,
         # v4.5
         calibration_runs=args.calibration_runs,
         deterministic_enabled=not args.no_deterministic,
@@ -4977,12 +3234,6 @@ if __name__ == "__main__":
         mopt_enabled=not args.no_mopt,
         mopt_pilot_period=args.mopt_pilot_period,
         mopt_core_period=args.mopt_core_period,
-        # v4.7
-        fw_bin=args.fw_bin,
-        fw_xfer_size=args.fw_xfer,
-        fw_slot=args.fw_slot,
-        # v5.1
-        pm_inject_prob=1.0 if args.pm else 0.0,
     )
 
     fuzzer = NVMeFuzzer(config)
