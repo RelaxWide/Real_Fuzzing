@@ -963,7 +963,18 @@ class FuzzConfig:
 
     pm_inject_prob: float = 0.0
 
-class _ColorFormatter(logging.Formatter):
+class _MsFormatter(logging.Formatter):
+    """ms 단위 타임스탬프 포매터 (datefmt는 초까지만 지원하므로 formatTime 오버라이드)."""
+    def formatTime(self, record: logging.LogRecord, datefmt=None) -> str:
+        ct = self.converter(record.created)
+        if datefmt:
+            s = time.strftime(datefmt, ct)
+        else:
+            s = time.strftime('%Y-%m-%d %H:%M:%S', ct)
+        return f"{s}.{int(record.msecs):03d}"
+
+
+class _ColorFormatter(_MsFormatter):
     """터미널 출력용 ANSI 컬러 포매터. 파일 핸들러에는 사용하지 않음."""
 
     import re as _re
@@ -1037,7 +1048,7 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     # 이전 핸들러 제거 (중복 방지)
     logger.handlers.clear()
 
-    fmt = logging.Formatter(
+    fmt = _MsFormatter(
         '%(asctime)s [%(levelname)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
