@@ -145,7 +145,7 @@ v5.2 변경사항:
     _set_pcie_l_state(): setpci LNKCTL bits[1:0] + L1SS cap L1.2 enable.
     _set_pcie_d_state(): setpci PMCSR bits[1:0] (D0=0x0000, D3hot=0x0003).
     _set_power_combo(): 3개 setter 통합, cmd_history에 pcie_state 항목 기록.
-    D3 timeout 배수(D3_TIMEOUT_MULT=4) 추가.
+    D3 timeout: PS_ENTRY_EXIT_MARGIN_MS(105ms) 고정 마진으로 통합.
     Stats 태그: "PS3+L1.2+D3(×4TO)" 형태로 현재 combo 표시.
     Summary: Power Combo Stats 섹션 추가.
     Replay .sh: pcie_state → setpci 커맨드 포함.
@@ -6590,15 +6590,9 @@ class NVMeFuzzer:
                             continue
                         enters = self.combo_enter_counts.get(combo, 0)
                         pct    = 100 * cnt / total
-                        ps_to  = (self._prev_op_ps
-                                  if combo.nvme_ps in (3, 4) else combo.nvme_ps)
-                        mult   = PS_TIMEOUT_MULT.get(ps_to, 1)
-                        if combo.pcie_d == PCIeDState.D3:
-                            mult = max(mult, D3_TIMEOUT_MULT)
-                        note = f" [TO×{mult}]" if mult > 1 else ""
                         summary_lines.append(
                             f"  {combo.label:<18}: 실행 {cnt}회 ({pct:.1f}%), "
-                            f"진입 {enters}회{note}")
+                            f"진입 {enters}회")
 
                 if self._sa_loaded:
                     if self._sa_total_bbs > 0:
