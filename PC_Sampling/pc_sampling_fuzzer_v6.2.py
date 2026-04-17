@@ -6802,8 +6802,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--pm', action='store_true', default=False,
                         help=f'PM 로테이션 활성화: {PM_ROTATE_INTERVAL}명령마다 PS0→PS1→PS2→PS3→PS4 순환. '
-                             f'PS1 timeout×{PS_TIMEOUT_MULT[1]}, PS2 timeout×{PS_TIMEOUT_MULT[2]}, '
-                             f'PS3/PS4 Admin 명령만 허용')
+                             f'timeout +{PS_ENTRY_EXIT_MARGIN_MS}ms 고정 마진 적용')
     parser.add_argument('--no-por', action='store_true', default=False,
                         help='시작 시 SSD POR(전원 사이클) 건너뜀 (기본: POR 수행)')
     parser.add_argument('--no-ufas', action='store_true', default=False,
