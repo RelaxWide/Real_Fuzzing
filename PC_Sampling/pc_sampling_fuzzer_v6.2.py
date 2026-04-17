@@ -2266,9 +2266,9 @@ class NVMeFuzzer:
         log.warning(f"[POR] PowerOnAll rc={r.returncode} "
                     f"stdout={r.stdout.decode(errors='replace').strip()!r} "
                     f"stderr={r.stderr.decode(errors='replace').strip()!r}")
-        log.warning(f"[POR] 전원 ON — SWD 준비 대기 {self.config.por_swd_wait:.1f}초 ...")
-        time.sleep(self.config.por_swd_wait)
-        log.warning("[POR] Phase 1 완료 — OpenOCD 연결 후 boot sweep, 이후 PCIe rescan")
+        log.warning(f"[POR] 전원 ON — OpenOCD 즉시 연결 시도 (최대 {self.config.por_swd_wait:.1f}초 대기)...")
+        # por_swd_wait는 고정 sleep이 아닌 최대 대기 상한.
+        # SWD debug IF가 준비되는 즉시 연결 성공 → boot sweep으로 진입.
         return True
 
     def _por_pcie_rescan(self) -> bool:
@@ -6063,7 +6063,23 @@ class NVMeFuzzer:
         else:
             log.info("[POR] 비활성화됨 (--no-por)")
 
-        if not self.sampler.connect():
+        # OpenOCD 연결: 전원 ON 직후부터 SWD 준비될 때까지 재시도
+        # por_swd_wait는 고정 sleep이 아닌 최대 대기 상한 — 준비되는 즉시 성공.
+        _swd_deadline = time.monotonic() + (
+            self.config.por_swd_wait if self.config.enable_por else 0
+        )
+        _connect_ok = False
+        while True:
+            if self.sampler.connect():
+                _connect_ok = True
+                break
+            if time.monotonic() >= _swd_deadline:
+                break
+            log.warning("[POR] SWD 준비 안 됨 — 0.5초 후 재시도...")
+            # 실패한 OpenOCD 프로세스 정리 후 재시도
+            self.sampler._terminate_proc()
+            time.sleep(0.5)
+        if not _connect_ok:
             log.error("J-Link connection failed, aborting")
             return
 
