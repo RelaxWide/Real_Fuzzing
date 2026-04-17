@@ -257,15 +257,17 @@ NVME_NAMESPACE = 1
 # NVMe 명령어 그룹별 타임아웃 (ms)
 # 그룹에 속하지 않는 명령어는 모두 'command'에 해당
 NVME_TIMEOUTS = {
-    'command':      18_000,    # 일반 명령어 (Identify, GetLogPage, GetFeatures, Read, Write 등)
-    'format':       600_000,   # Format NVM — 전체 미디어 포맷, 수 분 소요 가능
-    'sanitize':     600_000,   # Sanitize — 보안 삭제, 수 분~수십 분 소요
-    'fw_commit':    120_000,   # Firmware Commit — 펌웨어 슬롯 활성화, 리셋 포함 가능
-    'telemetry':    30_000,    # Telemetry Host/Controller — 대용량 로그 수집
-    'dsm':          30_000,    # Dataset Management (TRIM/Deallocate)
-    'flush':        30_000,    # Flush — 캐시 플러시, 미디어 기록 완료 대기
-    'selftest':     30_000,    # Device Self-test START — 즉시 반환, 테스트는 백그라운드 실행
-    'security':     30_000,    # Security Send/Receive — TCG/OPAL 프로토콜
+    'command':          8_000,   # 일반 명령어 default (Identify, GetLogPage, Read, Write 등)
+    'format':         120_000,   # Format NVM — 전체 미디어 포맷
+    'flush':            2_000,   # Flush — 캐시 플러시, 미디어 기록 완료 대기
+    'selftest_short': 120_000,   # Device Self-test Short DST (STC=0x1) — 2분
+    'selftest_ext':   900_000,   # Device Self-test Extended DST (STC=0x2) — 15분
+    # 아래는 'command' fallback(8,000ms)으로 처리
+    # 'sanitize':      sanitize는 FuzzConfig 초기화 전용 → 풀에서 제거됨
+    # 'fw_commit':     8,000ms
+    # 'telemetry':     8,000ms
+    # 'dsm':           8,000ms
+    # 'security':      8,000ms
 }
 
 # PC 샘플링 설정
@@ -817,7 +819,7 @@ NVME_COMMANDS_EXTENDED = [
     NVMeCommand("Compare",               0x05, NVMeCommandType.IO),
     NVMeCommand("WriteUncorrectable",    0x04, NVMeCommandType.IO,    needs_data=False),
     NVMeCommand("Verify",                0x0C, NVMeCommandType.IO,    needs_data=False),
-    NVMeCommand("DeviceSelfTest",        0x14, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False, timeout_group="selftest"),
+    NVMeCommand("DeviceSelfTest",        0x14, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False, timeout_group="selftest_short"),
     NVMeCommand("SecuritySend",          0x81, NVMeCommandType.ADMIN, needs_namespace=False, timeout_group="security"),
     NVMeCommand("SecurityReceive",       0x82, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False, timeout_group="security"),
     NVMeCommand("GetLBAStatus",          0x86, NVMeCommandType.ADMIN, needs_data=False),
@@ -945,6 +947,7 @@ class FuzzConfig:
     enable_por:        bool  = ENABLE_POR
     por_poweroff_wait: float = POR_POWEROFF_WAIT
     por_boot_wait:     float = POR_BOOT_WAIT
+    boot_sweep_s:      float = 10.0   # connect() 직후 boot-phase PC 수집 창 (초, 0=비활성화)
 
     # v4.5+: Corpus 하드 상한 (0 = 무제한)
     max_corpus_hard_limit: int = MAX_CORPUS_HARD_LIMIT
@@ -2274,6 +2277,42 @@ class NVMeFuzzer:
         log.error(f"[POR] NVMe 장치 미응답 — 부팅 대기 부족 가능성 "
                   f"(--por-boot-wait 값을 늘려보세요)")
         return False
+
+    def _collect_boot_coverage(self, duration_s: float) -> int:
+        """connect() 직후 부팅 중 PC를 연속 수집하여 global_coverage에 추가.
+
+        POR 후 firmware 초기화 경로(FTL 테이블 로드, 캐시 워밍 등)의 PC를 조기 확보.
+        duration_s 초 동안 PCSR을 as-fast-as-possible로 폴링.
+        수집된 PC는 global_coverage 및 static coverage(BB/func)에 반영한다.
+        """
+        if duration_s <= 0:
+            log.info("[BootSweep] 비활성화됨 (--boot-sweep-s 0)")
+            return 0
+
+        t_end = time.monotonic() + duration_s
+        new_pcs: set = set()
+        samples = 0
+        failures = 0
+
+        log.warning(f"[BootSweep] POR 직후 boot-phase PC 수집 시작 ({duration_s:.0f}초)...")
+        while time.monotonic() < t_end:
+            result = self.sampler._read_all_pcs()
+            samples += 1
+            if result is not None:
+                for pc in result:
+                    if pc not in self.sampler.global_coverage:
+                        new_pcs.add(pc)
+                        self.sampler.global_coverage.add(pc)
+            else:
+                failures += 1
+
+        if new_pcs:
+            self._update_static_coverage(new_pcs)
+        log.warning(
+            f"[BootSweep] 완료: {samples}회 샘플, 신규 PC {len(new_pcs)}개, "
+            f"실패={failures}회 → global_coverage={len(self.sampler.global_coverage)}개"
+        )
+        return len(new_pcs)
 
     def _setup_directories(self):
         self.crashes_dir.mkdir(parents=True, exist_ok=True)
@@ -4140,8 +4179,16 @@ class NVMeFuzzer:
 
         # --- 타임아웃 ---
         # subprocess 감지 timeout: 퍼저가 "이 명령은 crash"라고 판단하는 창
+        # DeviceSelfTest: CDW10[3:0] STC 값으로 Short(0x1)/Extended(0x2) 구분
+        effective_tg = cmd.timeout_group
+        if cmd.name == "DeviceSelfTest":
+            stc = seed.cdw10 & 0xF  # CDW10[3:0]
+            if stc == 0x2:
+                effective_tg = "selftest_ext"
+            else:
+                effective_tg = "selftest_short"  # 0x1 또는 기타 → short 기본값
         timeout_ms = self.config.nvme_timeouts.get(
-            cmd.timeout_group,
+            effective_tg,
             self.config.nvme_timeouts.get('command', 8000)
         )
         if timeout_mult > 1:
@@ -5979,12 +6026,6 @@ class NVMeFuzzer:
         if self.config.resume_coverage:
             self.sampler.load_coverage(self.config.resume_coverage)
 
-        # Prefill: POR 전 드라이브 전체 쓰기 (GC/Wear Leveling 트리거)
-        if self.config.prefill:
-            self._prefill_drive()
-        else:
-            log.info("[Prefill] 비활성화됨 (--prefill 로 활성화)")
-
         # POR: OpenOCD 연결 전에 SSD 전원 사이클 수행
         # (이전 실행의 디버그 도메인 전원이 SSD PM 상태에 영향을 줄 수 있음)
         if self.config.enable_por:
@@ -6001,17 +6042,18 @@ class NVMeFuzzer:
             log.error("J-Link connection failed, aborting")
             return
 
-        # APST / Keep-Alive 비활성화 — NVMe 컨트롤러 자율 트래픽 제거
-        # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
-        # Keep-Alive: 주기적 admin cmd → PS3/PS4 wake-up → L1 진입 불가
-        self._apst_disable()
-        self._keepalive_disable()
+        # Boot-phase PC 수집: connect() 성공 = PCSR 읽기 가능 상태
+        # firmware 초기화 경로(FTL 테이블 로드 등) PC를 global_coverage에 조기 반영.
+        # APST/KeepAlive 비활성화보다 먼저 실행 — NVMe 명령 없이 순수 PCSR 폴링.
+        self._collect_boot_coverage(self.config.boot_sweep_s)
 
         # PM preflight: idle 유니버스 수집 전에 전체 PowerCombo 검증.
         # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
         self._pm_preflight_check()
 
         # J-Link PC 읽기 진단 + idle PC 감지
+        # APST/KeepAlive 비활성화 전에 실행: 아직 자율 트래픽이 없는 상태에서
+        # 순수 firmware idle 유니버스를 수집.
         if not self.sampler.diagnose():
             log.error("J-Link PC read diagnosis failed, aborting")
             return
@@ -6023,6 +6065,13 @@ class NVMeFuzzer:
             log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
         else:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
+
+        # APST / Keep-Alive 비활성화 — idle 유니버스 수집 완료 후 실행
+        # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
+        # Keep-Alive: 주기적 admin cmd → PS3/PS4 wake-up → L1 진입 불가
+        # idle 수집 중에 NVMe 명령을 보내면 idle_pcs가 오염되므로 반드시 diagnose() 이후에 실행.
+        self._apst_disable()
+        self._keepalive_disable()
 
         # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
         # _log_smart() 이후에 설정: 이전에 실행하면 admin_timeout=30일 상태에서
@@ -6048,6 +6097,13 @@ class NVMeFuzzer:
             # 메인 루프에서 재실행되지 않도록 제거
             self.commands = [c for c in self.commands if c.name not in ("FormatNVM", "Sanitize")]
             log.info("[Calibration] FormatNVM/Sanitize self.commands에서 제거됨")
+
+        # Prefill: FormatNVM/Sanitize 이후 드라이브 전체 쓰기 (Verify 등이 참조할 데이터 확보)
+        # FormatNVM이 LBA 맵핑을 초기화하므로 prefill은 반드시 format 완료 후 실행해야 의미 있음.
+        if self.config.prefill:
+            self._prefill_drive()
+        else:
+            log.info("[Prefill] 비활성화됨 (--prefill 로 활성화)")
 
         if self.config.calibration_runs > 0:
             total_seeds = len(self.corpus)
@@ -6778,6 +6834,8 @@ if __name__ == "__main__":
                         help='prefill dd 블록 크기 (바이트, 기본: 4194304 = 4MB)')
     parser.add_argument('--por-boot-wait', type=float, default=POR_BOOT_WAIT,
                         help=f'POR 후 부팅 완료 대기 시간 (초, 기본={POR_BOOT_WAIT})')
+    parser.add_argument('--boot-sweep-s', type=float, default=10.0,
+                        help='connect() 직후 boot-phase PC 수집 창 (초, 기본=10.0, 0=비활성화)')
     parser.add_argument('--por-poweroff-wait', type=float, default=POR_POWEROFF_WAIT,
                         help=f'POR 전원 OFF 후 방전 대기 시간 (초, 기본={POR_POWEROFF_WAIT})')
 
@@ -6889,6 +6947,7 @@ if __name__ == "__main__":
         enable_por=not args.no_por,
         por_poweroff_wait=args.por_poweroff_wait,
         por_boot_wait=args.por_boot_wait,
+        boot_sweep_s=args.boot_sweep_s,
         enable_ufas=not args.no_ufas,
         prefill=args.prefill,
         prefill_bs=args.prefill_bs,
