@@ -953,6 +953,8 @@ class FuzzConfig:
     fw_xfer_size: int = 32768           # FWDownload 청크 크기(바이트), nvme fw-download -x 와 동일
     fw_slot: int = 1                    # FWCommit 슬롯 번호
 
+    enable_ufas: bool = True            # crash 시 UFAS 펌웨어 덤프 실행 여부 (--no-ufas로 비활성화)
+
     pm_inject_prob: float = 0.0
 
 class _ColorFormatter(logging.Formatter):
@@ -4849,12 +4851,15 @@ class NVMeFuzzer:
             log.warning(f"[REPLAY] replay .sh 생성 실패: {_replay_exc}")
 
         # 3.6) UFAS 펌웨어 덤프
-        log.warning("[TIMEOUT] UFAS 펌웨어 덤프를 실행합니다...")
-        try:
-            self._run_ufas_dump()
-        except Exception as _ufas_exc:
-            log.warning(f"[UFAS] _run_ufas_dump 예기치 않은 예외: {_ufas_exc}")
-        log.warning("[UFAS] _run_ufas_dump 반환")
+        if self.config.enable_ufas:
+            log.warning("[TIMEOUT] UFAS 펌웨어 덤프를 실행합니다...")
+            try:
+                self._run_ufas_dump()
+            except Exception as _ufas_exc:
+                log.warning(f"[UFAS] _run_ufas_dump 예기치 않은 예외: {_ufas_exc}")
+            log.warning("[UFAS] _run_ufas_dump 반환")
+        else:
+            log.warning("[TIMEOUT] UFAS 덤프 건너뜀 (--no-ufas)")
 
         # 4) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
         log.error(
@@ -6660,6 +6665,8 @@ if __name__ == "__main__":
                              f'PS3/PS4 Admin 명령만 허용')
     parser.add_argument('--no-por', action='store_true', default=False,
                         help='시작 시 SSD POR(전원 사이클) 건너뜀 (기본: POR 수행)')
+    parser.add_argument('--no-ufas', action='store_true', default=False,
+                        help='crash 시 UFAS 펌웨어 덤프 건너뜀 (기본: ./ufas 파일이 있으면 자동 실행)')
     parser.add_argument('--por-boot-wait', type=float, default=POR_BOOT_WAIT,
                         help=f'POR 후 부팅 완료 대기 시간 (초, 기본={POR_BOOT_WAIT})')
     parser.add_argument('--por-poweroff-wait', type=float, default=POR_POWEROFF_WAIT,
@@ -6773,6 +6780,7 @@ if __name__ == "__main__":
         enable_por=not args.no_por,
         por_poweroff_wait=args.por_poweroff_wait,
         por_boot_wait=args.por_boot_wait,
+        enable_ufas=not args.no_ufas,
     )
 
     fuzzer = NVMeFuzzer(config)
