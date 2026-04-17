@@ -946,8 +946,9 @@ class FuzzConfig:
     # POR
     enable_por:        bool  = ENABLE_POR
     por_poweroff_wait: float = POR_POWEROFF_WAIT
-    por_boot_wait:     float = POR_BOOT_WAIT
-    boot_sweep_s:      float = 10.0   # connect() 직후 boot-phase PC 수집 창 (초, 0=비활성화)
+    por_boot_wait:     float = POR_BOOT_WAIT   # PCIe rescan 후 NVMe 응답 최대 대기 (초)
+    por_swd_wait:      float = 2.0             # 전원 ON 후 SWD debug IF 준비 대기 (초)
+    boot_sweep_s:      float = 10.0            # connect() 직후 boot-phase PC 수집 창 (초, 0=비활성화)
 
     # v4.5+: Corpus 하드 상한 (0 = 무제한)
     max_corpus_hard_limit: int = MAX_CORPUS_HARD_LIMIT
@@ -2226,10 +2227,11 @@ class NVMeFuzzer:
             return False
 
     def _power_cycle_ssd(self) -> bool:
-        """PMU 보드를 이용한 SSD POR (Power-On Reset).
+        """PMU 보드를 이용한 SSD POR Phase 1: 전원 사이클 + SWD 준비 대기.
 
-        순서: PCIe 제거 → 전원 OFF → 방전 대기 → 전원 ON → 부팅 대기
-              → PCIe rescan → NVMe id-ctrl 확인
+        순서: PCIe 제거 → 전원 OFF → 방전 대기 → 전원 ON → SWD 준비 대기(por_swd_wait)
+        PCIe rescan / NVMe 확인은 boot sweep 이후 _por_pcie_rescan()에서 수행.
+        J-Link SWD는 USB 연결로 PCIe와 독립적 — 전원 ON 직후 접근 가능.
         """
         if not os.path.isfile(_PMU_SCRIPT):
             log.error(f"[POR] PMU 스크립트 없음: {_PMU_SCRIPT} — POR 스킵")
@@ -2257,17 +2259,25 @@ class NVMeFuzzer:
         log.warning(f"[POR] 전원 OFF — {self.config.por_poweroff_wait:.1f}초 방전 대기...")
         time.sleep(self.config.por_poweroff_wait)
 
-        # 3. 전원 ON
+        # 3. 전원 ON + SWD 준비 대기 (PCIe 부팅 대기는 boot sweep 이후로 분리)
         _on_cmd = ['python3', _PMU_SCRIPT, '4', '1', '3300', '0', '12000', '0', '0']
         log.warning(f"[POR] CMD: {' '.join(_on_cmd)}")
         r = subprocess.run(_on_cmd, capture_output=True, timeout=10)
         log.warning(f"[POR] PowerOnAll rc={r.returncode} "
                     f"stdout={r.stdout.decode(errors='replace').strip()!r} "
                     f"stderr={r.stderr.decode(errors='replace').strip()!r}")
-        log.warning(f"[POR] 전원 ON — {self.config.por_boot_wait:.1f}초 부팅 대기...")
-        time.sleep(self.config.por_boot_wait)
+        log.warning(f"[POR] 전원 ON — SWD 준비 대기 {self.config.por_swd_wait:.1f}초 ...")
+        time.sleep(self.config.por_swd_wait)
+        log.warning("[POR] Phase 1 완료 — OpenOCD 연결 후 boot sweep, 이후 PCIe rescan")
+        return True
 
-        # 4. PCIe rescan
+    def _por_pcie_rescan(self) -> bool:
+        """POR Phase 2: PCIe rescan + NVMe 장치 응답 확인 (boot sweep 완료 후 호출).
+
+        boot sweep 동안 firmware가 부팅을 완료했을 것으로 기대.
+        NVMe 응답이 없으면 por_boot_wait 내에서 재시도.
+        """
+        # PCIe rescan
         try:
             with open('/sys/bus/pci/rescan', 'w') as f:
                 f.write('1')
@@ -2276,17 +2286,29 @@ class NVMeFuzzer:
         except Exception as e:
             log.warning(f"[POR] PCIe rescan 실패: {e}")
 
-        # 5. NVMe 장치 응답 확인
-        r = subprocess.run(
-            ['nvme', 'id-ctrl', self.config.nvme_device],
-            capture_output=True, timeout=10,
-        )
-        if r.returncode == 0:
-            log.warning(f"[POR] NVMe 장치 응답 확인: {self.config.nvme_device} ✓")
-            return True
+        # NVMe 장치 응답 확인 — por_boot_wait 내에서 재시도
+        deadline = time.monotonic() + self.config.por_boot_wait
+        attempt = 0
+        while True:
+            attempt += 1
+            r = subprocess.run(
+                ['nvme', 'id-ctrl', self.config.nvme_device],
+                capture_output=True, timeout=10,
+            )
+            if r.returncode == 0:
+                log.warning(f"[POR] NVMe 장치 응답 확인: {self.config.nvme_device} ✓ "
+                            f"(시도 {attempt}회)")
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait = min(1.0, remaining)
+            log.warning(f"[POR] NVMe 미응답 (시도 {attempt}회) — {wait:.1f}초 후 재시도 "
+                        f"(남은 대기 {remaining:.1f}초)...")
+            time.sleep(wait)
 
-        log.error(f"[POR] NVMe 장치 미응답 — 부팅 대기 부족 가능성 "
-                  f"(--por-boot-wait 값을 늘려보세요)")
+        log.error(f"[POR] NVMe 장치 미응답 — boot sweep + por_boot_wait({self.config.por_boot_wait:.0f}s) "
+                  f"내 응답 없음. --por-boot-wait 또는 --boot-sweep-s 값을 늘려보세요.")
         return False
 
     def _collect_boot_coverage(self, duration_s: float) -> int:
@@ -6045,11 +6067,18 @@ class NVMeFuzzer:
             log.error("J-Link connection failed, aborting")
             return
 
-        # Boot-phase PC 수집: connect() 직후 가장 먼저 실행
-        # firmware 초기화 경로(FTL 테이블 로드 등) PC를 global_coverage에 조기 반영.
+        # Boot-phase PC 수집: connect() 직후 즉시 실행
+        # 전원 ON 후 SWD 준비 대기(por_swd_wait)만 하고 OpenOCD를 연결했으므로,
+        # firmware 부팅 중 초기화 경로(FTL 테이블 로드 등) PC를 여기서 수집.
+        # 이 시점은 PCIe rescan 전이므로 NVMe 명령 없이 순수 PCSR 폴링만 수행.
         self._collect_boot_coverage(self.config.boot_sweep_s)
 
-        # APST / Keep-Alive 비활성화 — PM 동작을 위해 boot sweep 직후 실행
+        # POR Phase 2: boot sweep 완료 후 PCIe rescan + NVMe 응답 확인
+        # firmware 부팅이 완료됐을 것으로 기대하므로 대부분 즉시 성공.
+        if self.config.enable_por:
+            self._por_pcie_rescan()
+
+        # APST / Keep-Alive 비활성화 — NVMe 접근 가능 상태에서 실행
         # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
         # Keep-Alive: 주기적 admin cmd → PS3/PS4 wake-up → L1 진입 불가
         self._apst_disable()
@@ -6813,7 +6842,9 @@ if __name__ == "__main__":
     parser.add_argument('--prefill-bs', type=int, default=4 * 1024 * 1024,
                         help='prefill dd 블록 크기 (바이트, 기본: 4194304 = 4MB)')
     parser.add_argument('--por-boot-wait', type=float, default=POR_BOOT_WAIT,
-                        help=f'POR 후 부팅 완료 대기 시간 (초, 기본={POR_BOOT_WAIT})')
+                        help=f'PCIe rescan 후 NVMe 응답 최대 대기 시간 (초, 기본={POR_BOOT_WAIT})')
+    parser.add_argument('--por-swd-wait', type=float, default=2.0,
+                        help='전원 ON 후 SWD debug IF 준비 대기 (초, 기본=2.0)')
     parser.add_argument('--boot-sweep-s', type=float, default=10.0,
                         help='connect() 직후 boot-phase PC 수집 창 (초, 기본=10.0, 0=비활성화)')
     parser.add_argument('--por-poweroff-wait', type=float, default=POR_POWEROFF_WAIT,
@@ -6927,6 +6958,7 @@ if __name__ == "__main__":
         enable_por=not args.no_por,
         por_poweroff_wait=args.por_poweroff_wait,
         por_boot_wait=args.por_boot_wait,
+        por_swd_wait=args.por_swd_wait,
         boot_sweep_s=args.boot_sweep_s,
         enable_ufas=not args.no_ufas,
         prefill=args.prefill,
