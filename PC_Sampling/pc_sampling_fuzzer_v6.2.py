@@ -262,6 +262,7 @@ NVME_TIMEOUTS = {
     'flush':            2_000,   # Flush — 캐시 플러시, 미디어 기록 완료 대기
     'selftest_short': 120_000,   # Device Self-test Short DST (STC=0x1) — 2분
     'selftest_ext':   900_000,   # Device Self-test Extended DST (STC=0x2) — 15분
+    'verify':          20_000,   # Verify — 미디어 ECC 검증, LBA 범위에 따라 지연 가능
     # 아래는 'command' fallback(8,000ms)으로 처리
     # 'sanitize':      sanitize는 FuzzConfig 초기화 전용 → 풀에서 제거됨
     # 'fw_commit':     8,000ms
@@ -817,7 +818,7 @@ NVME_COMMANDS_EXTENDED = [
     NVMeCommand("WriteZeroes",           0x08, NVMeCommandType.IO,    needs_data=False),
     NVMeCommand("Compare",               0x05, NVMeCommandType.IO),
     NVMeCommand("WriteUncorrectable",    0x04, NVMeCommandType.IO,    needs_data=False),
-    NVMeCommand("Verify",                0x0C, NVMeCommandType.IO,    needs_data=False),
+    NVMeCommand("Verify",                0x0C, NVMeCommandType.IO,    needs_data=False, timeout_group="verify"),
     NVMeCommand("DeviceSelfTest",        0x14, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False, timeout_group="selftest_short"),
     NVMeCommand("SecuritySend",          0x81, NVMeCommandType.ADMIN, needs_namespace=False, timeout_group="security"),
     NVMeCommand("SecurityReceive",       0x82, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False, timeout_group="security"),
