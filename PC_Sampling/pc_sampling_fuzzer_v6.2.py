@@ -6045,18 +6045,21 @@ class NVMeFuzzer:
             log.error("J-Link connection failed, aborting")
             return
 
-        # Boot-phase PC 수집: connect() 성공 = PCSR 읽기 가능 상태
+        # Boot-phase PC 수집: connect() 직후 가장 먼저 실행
         # firmware 초기화 경로(FTL 테이블 로드 등) PC를 global_coverage에 조기 반영.
-        # APST/KeepAlive 비활성화보다 먼저 실행 — NVMe 명령 없이 순수 PCSR 폴링.
         self._collect_boot_coverage(self.config.boot_sweep_s)
+
+        # APST / Keep-Alive 비활성화 — PM 동작을 위해 boot sweep 직후 실행
+        # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
+        # Keep-Alive: 주기적 admin cmd → PS3/PS4 wake-up → L1 진입 불가
+        self._apst_disable()
+        self._keepalive_disable()
 
         # PM preflight: idle 유니버스 수집 전에 전체 PowerCombo 검증.
         # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
         self._pm_preflight_check()
 
         # J-Link PC 읽기 진단 + idle PC 감지
-        # APST/KeepAlive 비활성화 전에 실행: 아직 자율 트래픽이 없는 상태에서
-        # 순수 firmware idle 유니버스를 수집.
         if not self.sampler.diagnose():
             log.error("J-Link PC read diagnosis failed, aborting")
             return
@@ -6068,13 +6071,6 @@ class NVMeFuzzer:
             log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
         else:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
-
-        # APST / Keep-Alive 비활성화 — idle 유니버스 수집 완료 후 실행
-        # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
-        # Keep-Alive: 주기적 admin cmd → PS3/PS4 wake-up → L1 진입 불가
-        # idle 수집 중에 NVMe 명령을 보내면 idle_pcs가 오염되므로 반드시 diagnose() 이후에 실행.
-        self._apst_disable()
-        self._keepalive_disable()
 
         # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
         # _log_smart() 이후에 설정: 이전에 실행하면 admin_timeout=30일 상태에서
