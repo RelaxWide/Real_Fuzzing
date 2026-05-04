@@ -1344,22 +1344,32 @@ class OpenOCDPCSampler:
 
     def _send_startup_tcl(self):
         """전원 활성화 + read_all_pcs proc 정의 (connect/reconnect 공통)."""
-        # 전원 활성화: 읽기→쓰기 분리 (working test script 방식과 동일)
+        # Step 1: DP CTRL/STAT로 debug/system power domain 직접 요청.
+        # SWD: J-Link가 연결 시 자동으로 처리하므로 이미 켜져 있음 (무해).
+        # JTAG+mem_ap: OpenOCD가 CDBGPWRUPREQ를 자동 설정하지 않으므로 명시적으로 해야 함.
+        # CTRL/STAT(DP 주소 0x4): bit30=CSYSPWRUPREQ, bit28=CDBGPWRUPREQ → 0x50000000
+        r_pwr = self._telnet_cmd('catch {r8.dap dpreg 4 0x50000000}')
+        log.debug(f"[OpenOCD] DP CTRL/STAT power-up 응답: {repr(r_pwr)}")
+        time.sleep(0.05)  # power ACK 대기
+        # Step 2: ABORT 레지스터(DP 주소 0x0)로 sticky error 클리어.
+        # power-up 이전 AP 접근 실패로 STICKY ERROR가 set되어 있을 수 있음.
+        r_clr = self._telnet_cmd('catch {r8.dap dpreg 0 0x1e}')
+        log.debug(f"[OpenOCD] DAP sticky error 클리어 응답: {repr(r_clr)}")
+        # Step 3: 칩 고유 debug power enable (AXI AP 경유).
+        # JTAG에서 AXI AP(ap-num 1)가 안 잡히면 실패할 수 있으나,
+        # Step 1에서 DP CTRL/STAT로 이미 power-up 했으므로 PCSR 접근에는 무관.
         r0 = self._telnet_cmd(
-            f'set _pwr [lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0]'
+            f'catch {{set _pwr [lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0]}}'
         )
         log.debug(f"[OpenOCD] 전원 읽기 응답: {repr(r0)}")
         r1 = self._telnet_cmd(
-            f'r8.axi write_memory {hex(PCSR_POWER_ADDR)} 32 '
-            f'[expr {{$_pwr | {hex(PCSR_POWER_MASK)}}}]'
+            f'catch {{r8.axi write_memory {hex(PCSR_POWER_ADDR)} 32 '
+            f'[expr {{$_pwr | {hex(PCSR_POWER_MASK)}}}]}}'
         )
         log.debug(f"[OpenOCD] 전원 쓰기 응답: {repr(r1)}")
-        # JTAG-DP STICKY ERROR 클리어: power enable 과정에서 AP 접근 실패 시
-        # JTAG-DP sticky error 비트가 set되어 이후 모든 read가 연쇄 실패한다.
-        # DP ABORT 레지스터(주소 0x0)에 0x1e를 쓰면 sticky 비트 전체 클리어.
-        # SWD에서는 무해(SWD도 동일 ABORT 레지스터 사용).
-        r_clr = self._telnet_cmd('catch {r8.dap dpreg 0 0x1e}')
-        log.debug(f"[OpenOCD] DAP sticky error 클리어 응답: {repr(r_clr)}")
+        # AXI AP 접근 실패 시 생긴 sticky error를 다시 클리어
+        self._telnet_cmd('catch {r8.dap dpreg 0 0x1e}')
+        log.debug("[OpenOCD] AXI 후 sticky error 클리어")
         # 배치 읽기 proc 정의 (1 RTT = 3코어 PC)
         # catch: read_memory 실패(DAP fault, 디버그 도메인 꺼짐) 시 에러 메시지가
         # 텔넷 스트림에 섞이지 않도록 Tcl 레벨에서 잡아 sentinel 0xFFFFFFFF 반환.
