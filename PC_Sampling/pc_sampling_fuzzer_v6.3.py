@@ -1360,19 +1360,22 @@ class OpenOCDPCSampler:
         r_clr = self._telnet_cmd('r8.dap dpreg 0 0x1e')
         log.warning(f"[Startup] dpreg0 abort-clr: {repr(r_clr)}")
 
-        # Step 4: AXI AP power enable (SWD 전용)
-        if self.config.transport != 'jtag':
-            r0 = self._telnet_cmd(
-                f'set _pwr [lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0]'
-            )
-            log.warning(f"[Startup] AXI read power: {repr(r0)}")
-            r1 = self._telnet_cmd(
-                f'r8.axi write_memory {hex(PCSR_POWER_ADDR)} 32 '
-                f'[expr {{$_pwr | {hex(PCSR_POWER_MASK)}}}]'
-            )
-            log.warning(f"[Startup] AXI write power: {repr(r1)}")
-        else:
-            log.warning("[Startup] JTAG 모드 — AXI power write 스킵")
+        # Step 4: 칩 고유 per-core debug power enable (AXI AP 경유, SWD/JTAG 공통)
+        # PCSR_POWER_MASK=0x00010101: bit0=Core0, bit8=Core1, bit16=Core2
+        # JTAG에서도 Core2 전원은 이 레지스터로 켜야 함 (global dpreg만으로는 Core2 미작동)
+        # AXI write 후 sticky error가 생길 수 있으므로 즉시 클리어
+        r0 = self._telnet_cmd(
+            f'catch {{set _pwr [lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0]}}'
+        )
+        log.warning(f"[Startup] AXI read power: {repr(r0)}")
+        r1 = self._telnet_cmd(
+            f'catch {{r8.axi write_memory {hex(PCSR_POWER_ADDR)} 32 '
+            f'[expr {{$_pwr | {hex(PCSR_POWER_MASK)}}}]}}'
+        )
+        log.warning(f"[Startup] AXI write power: {repr(r1)}")
+        # AXI write로 인한 sticky error 즉시 클리어 (proc 정의 전에 처리)
+        self._telnet_cmd('r8.dap dpreg 0 0x1e')
+        log.warning("[Startup] AXI 후 sticky error 클리어")
 
         # Step 5: PCSR raw read (catch 없이 실제 반환값 확인)
         r_test = self._telnet_cmd(f'r8.abp read_memory {hex(PCSR_CORE0)} 32 1')
