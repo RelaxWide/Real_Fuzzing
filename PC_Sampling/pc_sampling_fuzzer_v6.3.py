@@ -1347,20 +1347,20 @@ class OpenOCDPCSampler:
         """전원 활성화 + read_all_pcs proc 정의 (connect/reconnect 공통)."""
         log.warning(f"[Startup] transport={self.config.transport!r}")
 
-        # Step 1: DP CTRL/STAT power-up
-        r_pwr = self._telnet_cmd('catch {r8.dap dpreg 4 0x50000000}')
-        log.warning(f"[Startup] dpreg4 power-up: {repr(r_pwr)}")
+        # Step 1: DP CTRL/STAT power-up (catch 없이 실제값 확인)
+        r_pwr = self._telnet_cmd('r8.dap dpreg 4 0x50000000')
+        log.warning(f"[Startup] dpreg4 power-up write: {repr(r_pwr)}")
         time.sleep(0.05)
 
-        # Step 2: ABORT 레지스터로 sticky error 클리어
-        r_clr = self._telnet_cmd('catch {r8.dap dpreg 0 0x1e}')
+        # Step 2: CTRL/STAT 읽기 — CDBGPWRUPACK(bit29) 확인
+        r_stat = self._telnet_cmd('r8.dap dpreg 4')
+        log.warning(f"[Startup] dpreg4 CTRL/STAT read: {repr(r_stat)}")
+
+        # Step 3: ABORT으로 sticky error 클리어
+        r_clr = self._telnet_cmd('r8.dap dpreg 0 0x1e')
         log.warning(f"[Startup] dpreg0 abort-clr: {repr(r_clr)}")
 
-        # CTRL/STAT 읽기로 power ACK 확인
-        r_stat = self._telnet_cmd('catch {r8.dap dpreg 4}')
-        log.warning(f"[Startup] dpreg4 read (CTRL/STAT): {repr(r_stat)}")
-
-        # Step 3: AXI AP power enable (SWD 전용)
+        # Step 4: AXI AP power enable (SWD 전용)
         if self.config.transport != 'jtag':
             r0 = self._telnet_cmd(
                 f'set _pwr [lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0]'
@@ -1374,13 +1374,18 @@ class OpenOCDPCSampler:
         else:
             log.warning("[Startup] JTAG 모드 — AXI power write 스킵")
 
-        # Step 4: PCSR 직접 read 테스트 (proc 정의 전 원시 확인)
-        r_test = self._telnet_cmd(
-            f'catch {{r8.abp read_memory {hex(PCSR_CORE0)} 32 1}}'
-        )
+        # Step 5: PCSR raw read (catch 없이 실제 반환값 확인)
+        r_test = self._telnet_cmd(f'r8.abp read_memory {hex(PCSR_CORE0)} 32 1')
         log.warning(f"[Startup] PCSR Core0 raw read: {repr(r_test)}")
 
-        # Step 5: read_all_pcs proc 정의
+        # Step 6: lindex 테스트 — proc과 동일한 방식으로 값 추출
+        r_lindex = self._telnet_cmd(
+            f'catch {{set _t [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0]}} _e; '
+            f'list $_t $_e'
+        )
+        log.warning(f"[Startup] lindex 추출 테스트: {repr(r_lindex)}")
+
+        # Step 7: read_all_pcs proc 정의 — 에러 시 메시지 반환
         r2 = self._telnet_cmd(
             'proc read_all_pcs {} {'
             ' catch {r8.dap dpreg 0 0x1e};'
@@ -1388,13 +1393,13 @@ class OpenOCDPCSampler:
             f'  set pc0 [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0];'
             f'  set pc1 [lindex [r8.abp read_memory {hex(PCSR_CORE1)} 32 1] 0];'
             f'  set pc2 [lindex [r8.abp read_memory {hex(PCSR_CORE2)} 32 1] 0];'
-            ' } _err]} { return "0xFFFFFFFF 0xFFFFFFFF 0xFFFFFFFF" };'
+            ' } _err]} { return "ERR:$_err" };'
             ' return "$pc0 $pc1 $pc2"'
             ' }'
         )
         log.warning(f"[Startup] proc 정의: {repr(r2)}")
 
-        # Step 6: proc 호출 테스트
+        # Step 8: proc 첫 호출 — ERR: 로 시작하면 에러 메시지 그대로 출력
         r3 = self._telnet_cmd('read_all_pcs')
         log.warning(f"[Startup] read_all_pcs 첫 호출: {repr(r3)}")
 
@@ -1428,7 +1433,7 @@ class OpenOCDPCSampler:
             # OpenOCD 에러 응답 조기 탈출 — 에러 메시지의 hex 값이 파싱에 오염되는 것을 방지
             # 대소문자 무관 체크 ('Failed' / 'Error' 등 OpenOCD 출력 포함)
             _resp_lower = resp.lower()
-            if 'error' in _resp_lower or 'failed' in _resp_lower:
+            if resp.startswith('ERR:') or 'error' in _resp_lower or 'failed' in _resp_lower:
                 log.warning(f"[OpenOCD] 에러 응답 감지: {repr(resp)}")
                 return None
             parts = re.findall(r'0x[0-9a-fA-F]+', resp)
