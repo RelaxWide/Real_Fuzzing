@@ -6,9 +6,14 @@ OpenOCD PCSR(PC Sampling Register) 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
 v6.4 변경사항:
-- [PM] PS3/PS4 강제 진입 슬롯 추가:
-    PM 로테이션 중 하나로 PS3/PS4 idle 진입 테스트 추가.
-    enlat/exlat 기반 최소 진입 시간 설정 + 명시적 idle 부여로 실제 NOPS 진입 보장.
+- [PM] PS3/PS4 강제 idle 진입 슬롯 추가 (NOPS 커버리지 확보):
+    배경: POST_CMD_DELAY_MS=0 + APST 비활성화 환경에서는 명령 사이 idle이 없어
+          PS3/PS4(Non-Operational Power State)에 자동 진입하지 않음.
+    구현: PM 로테이션(매 100회 실행) 시 1/6 확률로 일반 combo 전환 대신 NOPS 슬롯 실행.
+          PS3 또는 PS4 중 랜덤 선택 → enlat 기반 최소 진입 시간(_ps_settle) × 2 idle 대기.
+          이후 PS0 복귀. 커버리지 갱신(global_coverage.update) 및 ps_enter_counts 기록.
+    조건: L0+D0 조합의 POWER_COMBOS에서 해당 PS 항목 검색 — 없으면 슬롯 건너뜀.
+    확률: randint(0, 5) == 0 → 약 16.7% 확률 (6회 중 1회).
 
 v6.3 변경사항:
 - [Transport] JTAG 지원 추가:
