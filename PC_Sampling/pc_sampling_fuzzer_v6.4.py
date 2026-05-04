@@ -4562,14 +4562,15 @@ class NVMeFuzzer:
         # OpenOCD shutdown — J-Link USB 점유 해제
         # shutdown 없이 kill하면 libjaylink가 USB를 잠근 채 종료 → JLink 연결 불가
         log.warning("[JLINK DUMP] OpenOCD shutdown (J-Link 해제)...")
-        if self._sock and self._openocd_alive():
+        sampler = self.sampler
+        if sampler._sock and sampler._openocd_alive():
             try:
-                self._sock.sendall(b'shutdown\n')
-                time.sleep(1.0)
+                sampler._sock.sendall(b'shutdown\n')
+                time.sleep(1.5)
             except Exception:
                 pass
-        self._close_telnet()
-        self._terminate_proc()
+        sampler._close_telnet()
+        sampler._terminate_proc()
         log.warning("[JLINK DUMP] OpenOCD 종료 완료")
 
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
@@ -6943,27 +6944,49 @@ class NVMeFuzzer:
                 idle_pcs = self.sampler.idle_pcs
 
                 def _read_pc_via_jlink() -> Optional[List[int]]:
-                    cmds = []
-                    for i in range(_n_cores):
-                        if _n_cores > 1:
-                            cmds.append(f'core {i}')
-                        cmds.append('h')
-                        cmds.append('r')
-                        cmds.append('go')
-                    cmds.append('exit')
-                    cmd_input = ('\n'.join(cmds) + '\n').encode()
-                    try:
+                    # JTAG 멀티코어: 'core N'이 JLinkExe에서 지원 안 될 수 있음.
+                    # 1차 시도: core N + h + r + go (전코어)
+                    # 2차 시도(JTAG fallback): h + r + go만 (Core0만 읽기)
+                    def _run(cmd_list):
+                        cmd_input = ('\n'.join(cmd_list) + '\nexit\n').encode()
                         proc = subprocess.run(
                             [JLINK_BINARY, '-if', _jlink_if, '-speed', '4000',
                              '-device', _jlink_dev, '-autoconnect', '1'],
                             input=cmd_input,
                             capture_output=True, timeout=15
                         )
-                        output = proc.stdout.decode(errors='replace')
+                        out = proc.stdout.decode(errors='replace')
+                        return out
+
+                    try:
+                        cmds = []
+                        for i in range(_n_cores):
+                            if _n_cores > 1:
+                                cmds.append(f'core {i}')
+                            cmds.append('h')
+                            cmds.append('r')
+                            cmds.append('go')
+                        output = _run(cmds)
                         pcs = [int(p, 16) & ~1
                                for p in _re.findall(r'\bPC\s*=\s*([0-9A-Fa-f]+)', output)]
-                        return pcs[:_n_cores] if len(pcs) >= _n_cores else None
-                    except Exception:
+                        if len(pcs) >= _n_cores:
+                            return pcs[:_n_cores]
+
+                        # PC가 부족하면 출력 일부를 로그로 남기고 fallback 시도
+                        log.warning(f"[MONITOR] JLink 출력 PC={len(pcs)}개 "
+                                    f"(기대={_n_cores}). 출력 앞부분:\n"
+                                    + output[:400])
+                        if _n_cores > 1:
+                            # fallback: core N 없이 Core0만
+                            output2 = _run(['h', 'r', 'go'])
+                            pcs2 = [int(p, 16) & ~1
+                                    for p in _re.findall(r'\bPC\s*=\s*([0-9A-Fa-f]+)', output2)]
+                            if pcs2:
+                                log.warning("[MONITOR] fallback: Core0만 읽음 (core N 미지원 가능성)")
+                                return pcs2[:1]
+                        return None
+                    except Exception as e:
+                        log.warning(f"[MONITOR] JLink 예외: {e}")
                         return None
 
                 log.warning("[MONITOR] JLink PC 모니터링 시작 (30초 간격)")
