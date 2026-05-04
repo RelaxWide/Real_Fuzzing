@@ -1200,6 +1200,13 @@ class OpenOCDPCSampler:
             log.error(f"[OpenOCD] 포트 {self.config.openocd_port} 대기 타임아웃 "
                       f"({self.config.openocd_timeout}s). OpenOCD 시작 실패.")
             self._proc.terminate()
+            try:
+                _, stderr_data = self._proc.communicate(timeout=2.0)
+                if stderr_data:
+                    for line in stderr_data.decode(errors='replace').splitlines():
+                        log.error(f"[OpenOCD stderr] {line}")
+            except Exception:
+                pass
             return False
         return True
 
@@ -1347,11 +1354,19 @@ class OpenOCDPCSampler:
             f'[expr {{$_pwr | {hex(PCSR_POWER_MASK)}}}]'
         )
         log.debug(f"[OpenOCD] 전원 쓰기 응답: {repr(r1)}")
+        # JTAG-DP STICKY ERROR 클리어: power enable 과정에서 AP 접근 실패 시
+        # JTAG-DP sticky error 비트가 set되어 이후 모든 read가 연쇄 실패한다.
+        # DP ABORT 레지스터(주소 0x0)에 0x1e를 쓰면 sticky 비트 전체 클리어.
+        # SWD에서는 무해(SWD도 동일 ABORT 레지스터 사용).
+        r_clr = self._telnet_cmd('catch {r8.dap dpreg 0 0x1e}')
+        log.debug(f"[OpenOCD] DAP sticky error 클리어 응답: {repr(r_clr)}")
         # 배치 읽기 proc 정의 (1 RTT = 3코어 PC)
         # catch: read_memory 실패(DAP fault, 디버그 도메인 꺼짐) 시 에러 메시지가
         # 텔넷 스트림에 섞이지 않도록 Tcl 레벨에서 잡아 sentinel 0xFFFFFFFF 반환.
+        # r8.dap dpreg 0 0x1e: 각 read 직전 sticky error 클리어 (JTAG 연속 오류 방지)
         r2 = self._telnet_cmd(
             'proc read_all_pcs {} {'
+            ' catch {r8.dap dpreg 0 0x1e};'
             ' if {[catch {'
             f'  set pc0 [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0];'
             f'  set pc1 [lindex [r8.abp read_memory {hex(PCSR_CORE1)} 32 1] 0];'
