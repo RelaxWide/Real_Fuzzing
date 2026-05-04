@@ -278,6 +278,12 @@ PCSR_POWER_MASK = 0x00010101   # Core0=bit0, Core1=bit8, Core2=bit16
 PCSR_ADDRS_SWD  = [PCSR_CORE0, PCSR_CORE1, PCSR_CORE2]
 PCSR_ADDRS_JTAG = [PCSR_CORE0, PCSR_CORE1]
 
+# 제품별 설정 (--product 옵션)
+PRODUCT_CONFIGS = {
+    'PM9M1': {'interface': 'swd', 'openocd_config': OPENOCD_CONFIG},
+    'BM9H1': {'interface': 'jtag', 'openocd_config': OPENOCD_CONFIG_JTAG},
+}
+
 # NVMe 장치 설정
 NVME_DEVICE    = '/dev/nvme0'
 NVME_NAMESPACE = 1
@@ -6866,8 +6872,13 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=f'PC Sampling SSD Fuzzer v{FUZZER_VERSION}')
+    parser.add_argument('--product', choices=list(PRODUCT_CONFIGS.keys()), default=None,
+                        help=f'제품 선택 (interface/cfg 자동 설정). '
+                             f'선택지: {", ".join(PRODUCT_CONFIGS.keys())}. '
+                             f'--interface보다 우선 적용')
     parser.add_argument('--interface', choices=['swd', 'jtag'], default='swd',
-                        help='디버그 transport (swd: r8_pcsr.cfg, jtag: r8_pcsr_jtag.cfg)')
+                        help='디버그 transport (swd: r8_pcsr.cfg, jtag: r8_pcsr_jtag.cfg). '
+                             '--product 지정 시 무시됨')
     parser.add_argument('--openocd-binary', default=OPENOCD_BINARY,
                         help=f'OpenOCD 바이너리 경로 (default: {OPENOCD_BINARY})')
     parser.add_argument('--openocd-config', default=None,
@@ -7023,18 +7034,25 @@ if __name__ == "__main__":
     print(f"  - [v4.6] Crash 시 nvme-cli 프로세스 보존 (fd 유지 → SSD 상태 {passthru_days:.1f}일 보존)")
     print()
 
-    # --interface로 cfg 자동 선택 (--openocd-config 명시 시 우선)
-    if args.openocd_config is not None:
-        resolved_cfg = args.openocd_config
-    elif args.interface == 'jtag':
-        resolved_cfg = OPENOCD_CONFIG_JTAG
+    # --product → interface/cfg 자동 결정 (--openocd-config 명시 시 cfg만 우선)
+    if args.product is not None:
+        _pcfg = PRODUCT_CONFIGS[args.product]
+        resolved_interface = _pcfg['interface']
+        resolved_cfg = args.openocd_config if args.openocd_config else _pcfg['openocd_config']
+        print(f"Product={args.product}: interface={resolved_interface}, cfg={resolved_cfg}")
     else:
-        resolved_cfg = OPENOCD_CONFIG
+        resolved_interface = args.interface
+        if args.openocd_config is not None:
+            resolved_cfg = args.openocd_config
+        elif args.interface == 'jtag':
+            resolved_cfg = OPENOCD_CONFIG_JTAG
+        else:
+            resolved_cfg = OPENOCD_CONFIG
 
     config = FuzzConfig(
         openocd_binary=args.openocd_binary,
         openocd_config=resolved_cfg,
-        interface=args.interface,
+        interface=resolved_interface,
         openocd_host=args.openocd_host,
         openocd_port=args.openocd_port,
         openocd_timeout=args.openocd_timeout,
