@@ -258,6 +258,9 @@ FW_ADDR_START = 0x00000000
 FW_ADDR_END   = 0x003B7FFF
 
 # OpenOCD 설정
+JLINK_BINARY            = 'JLinkExe'
+JLINK_DEVICE            = 'Cortex-R8'   # JLinkExe -device 옵션값
+
 OPENOCD_BINARY          = 'openocd'
 OPENOCD_CONFIG          = 'r8_pcsr.cfg'        # SWD용 cfg (퍼저 스크립트 디렉토리 기준 경로)
 OPENOCD_CONFIG_JTAG     = 'r8_pcsr_jtag.cfg'  # JTAG용 cfg (--interface jtag 시 자동 선택)
@@ -931,6 +934,7 @@ class FuzzConfig:
     openocd_port:    int   = OPENOCD_TELNET_PORT
     openocd_timeout: float = OPENOCD_STARTUP_TIMEOUT
     interface:       str   = 'swd'   # 'swd' | 'jtag'
+    jlink_device:    str   = JLINK_DEVICE
 
     nvme_device: str = NVME_DEVICE
     nvme_namespace: int = NVME_NAMESPACE
@@ -6882,15 +6886,44 @@ class NVMeFuzzer:
             except Exception:
                 pass
 
-            # timeout crash: PC 모니터링 루프 (10초 간격, Ctrl+C로 종료)
-            # OpenOCD는 종료하지 않아 hang 상태 보존. 다음 실행 시 자동 정리됨.
+            # timeout crash: JLink 기반 PC 모니터링 루프 (30초 간격, Ctrl+C로 종료)
+            # OpenOCD는 JLink dump 전에 이미 종료됨 → JLink 직접 연결로 PC 읽기
             if self._timeout_crash:
-                _ocd_port = self.config.openocd_port
-                log.warning("[MONITOR] PC 모니터링 시작 (10초 간격)")
-                log.warning("[MONITOR] Ctrl+C → 모니터링 종료 (OpenOCD는 유지됨)")
-                log.warning(f"[MONITOR] 다음 실행 시 OpenOCD 자동 정리 (port {_ocd_port})")
-
                 import threading as _threading
+                import re as _re
+
+                _n_cores = len(self.sampler._pcsr_addrs)
+                _jlink_if = 'JTAG' if self.config.interface == 'jtag' else 'SWD'
+                _jlink_dev = self.config.jlink_device
+                idle_pcs = self.sampler.idle_pcs
+
+                def _read_pc_via_jlink() -> Optional[List[int]]:
+                    cmds = []
+                    for i in range(_n_cores):
+                        if _n_cores > 1:
+                            cmds.append(f'core {i}')
+                        cmds.append('h')
+                        cmds.append('r')
+                        cmds.append('go')
+                    cmds.append('exit')
+                    cmd_input = ('\n'.join(cmds) + '\n').encode()
+                    try:
+                        proc = subprocess.run(
+                            [JLINK_BINARY, '-if', _jlink_if, '-speed', '4000',
+                             '-device', _jlink_dev, '-autoconnect', '1'],
+                            input=cmd_input,
+                            capture_output=True, timeout=15
+                        )
+                        output = proc.stdout.decode(errors='replace')
+                        pcs = [int(p, 16) & ~1
+                               for p in _re.findall(r'\bPC\s*=\s*([0-9A-Fa-f]+)', output)]
+                        return pcs[:_n_cores] if len(pcs) >= _n_cores else None
+                    except Exception:
+                        return None
+
+                log.warning("[MONITOR] JLink PC 모니터링 시작 (30초 간격)")
+                log.warning("[MONITOR] Ctrl+C → 모니터링 종료")
+
                 _monitor_stop = _threading.Event()
 
                 def _sigint_monitor(sig, frame):
@@ -6901,28 +6934,18 @@ class NVMeFuzzer:
                 except Exception:
                     pass
 
-                idle_pcs = self.sampler.idle_pcs
                 while not _monitor_stop.is_set():
-                    if self.sampler._openocd_alive() and self.sampler._sock:
-                        result = self.sampler._read_all_pcs()
-                        if result:
-                            tags = []
-                            for i, pc in enumerate(result):
-                                idle_tag = "[IDLE]" if pc in idle_pcs else "[NON-IDLE]"
-                                tags.append(f"Core{i}={hex(pc)}{idle_tag}")
-                            log.warning("[MONITOR] " + "  ".join(tags))
-                        else:
-                            log.warning("[MONITOR] PCSR 읽기 실패")
+                    pcs = _read_pc_via_jlink()
+                    if pcs:
+                        tags = [f"Core{i}={hex(pc)}"
+                                + (" [IDLE]" if pc in idle_pcs else " [NON-IDLE]")
+                                for i, pc in enumerate(pcs)]
+                        log.warning("[MONITOR] " + "  ".join(tags))
                     else:
-                        log.warning("[MONITOR] OpenOCD 연결 끊김")
-                        break
+                        log.warning("[MONITOR] JLink PC 읽기 실패")
                     _monitor_stop.wait(30.0)
 
-                # 루프 종료 — telnet만 닫고 OpenOCD는 유지
-                self.sampler._close_telnet()
-                _end_msg = "[MONITOR] 모니터링 종료 — OpenOCD 유지 중 (sudo pkill openocd 로 수동 종료)"
-                log.warning(_end_msg)
-                print(_end_msg, flush=True)
+                log.warning("[MONITOR] 모니터링 종료")
             else:
                 try:
                     self.sampler.close()
