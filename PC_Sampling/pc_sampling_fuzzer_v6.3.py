@@ -12,9 +12,19 @@ v6.3 변경사항:
     jtag: r8_pcsr_jtag.cfg 자동 선택 (ARM Cortex-R8, IDCODE=0x6BA00477, irlen=4).
     --openocd-config 명시 시 --transport 무시하고 지정 cfg 우선 사용.
     OPENOCD_CONFIG_JTAG = 'r8_pcsr_jtag.cfg' 상수 추가.
-- [Fix] _INVALID_PC_MASK에 JTAG DPIDR 추가:
+- [Fix] JTAG-DP STICKY ERROR 수정:
+    r8_pcsr_jtag.cfg: transport select jtag을 adapter driver보다 앞에 배치.
+    init 직후 DP CTRL/STAT(0x4)=0x50000000으로 debug power-up, ABORT(0x0)=0x1e로 sticky 클리어.
+    read_all_pcs proc 내부에서 dpreg 0 0x1e 제거 (JTAG 상태머신 간섭 방지).
+    AXI write 후 즉시 sticky error 클리어.
+- [Config] PCSR 주소 CLI 설정 추가:
+    --pcsr-addrs 0xADDR0,0xADDR1[,0xADDR2] 옵션으로 코어별 PCSR 주소 오버라이드.
+    미지정 시 기본값(0x80030084, 0x80032084, 0x80034084) 사용.
+    코어 수가 다른 제품(2코어 등)도 지원. proc, 파싱, 마스크 모두 코어 수에 자동 적응.
+    FuzzConfig.pcsr_addrs 필드 추가.
+- [Fix] _INVALID_PC_MASK에 JTAG DPIDR 추가 및 인스턴스 기반으로 전환:
     0x6ba00476 / 0x6ba00477 (ARM Cortex-R8 JTAG IDCODE, Thumb-bit 전·후).
-    JTAG 연결 시 OpenOCD 에러 메시지에 섞이는 IDCODE가 유효 PC로 오인되는 문제 방지.
+    클래스 변수에서 인스턴스 변수(_invalid_pc_mask)로 변경 — pcsr_addrs 반영.
 
 v6.2 변경사항:
 - [Mutation] 규칙 기반 스키마 뮤테이터 도입 (libFuzzer 스타일):
@@ -909,6 +919,7 @@ class FuzzConfig:
     openocd_port:    int   = OPENOCD_TELNET_PORT
     openocd_timeout: float = OPENOCD_STARTUP_TIMEOUT
     transport:       str   = 'swd'   # 'swd' | 'jtag'
+    pcsr_addrs: Optional[List[int]] = None  # None = 기본값 사용 (PCSR_CORE0/1/2)
 
     nvme_device: str = NVME_DEVICE
     nvme_namespace: int = NVME_NAMESPACE
@@ -1128,6 +1139,20 @@ class OpenOCDPCSampler:
         self.idle_pcs: Set[int]      = set()
         self._sock_buf: bytes        = b''   # 소켓 읽기 잔여 버퍼
 
+        # 유효 PCSR 주소 목록 — CLI --pcsr-addrs 또는 기본값 (CORE0/1/2)
+        self._pcsr_addrs: List[int] = (
+            config.pcsr_addrs if config.pcsr_addrs
+            else [PCSR_CORE0, PCSR_CORE1, PCSR_CORE2]
+        )
+        # PCSR 주소 자체가 에러 메시지에 노출될 경우 무효 PC로 필터링
+        _addr_mask: Set[int] = set()
+        for _a in self._pcsr_addrs:
+            _addr_mask.add(_a); _addr_mask.add(_a & ~1)
+        self._invalid_pc_mask: frozenset = frozenset({
+            0x6ba02476, 0x6ba02477,   # SWD DPIDR
+            0x6ba00476, 0x6ba00477,   # JTAG IDCODE/DPIDR (Cortex-R8)
+        } | _addr_mask)
+
     # ------------------------------------------------------------------
     # Module 1: 서브프로세스 라이프사이클
     # ------------------------------------------------------------------
@@ -1246,8 +1271,8 @@ class OpenOCDPCSampler:
             self._send_startup_tcl()
             result = self._read_all_pcs()
             if result is not None:
-                log.warning(f"[OpenOCD] 타겟 재초기화 성공: "
-                            f"Core0={hex(result[0])} Core1={hex(result[1])} Core2={hex(result[2])}")
+                _cs = ' '.join(f'Core{i}={hex(pc)}' for i, pc in enumerate(result))
+                log.warning(f"[OpenOCD] 타겟 재초기화 성공: {_cs}")
                 return True
             log.warning("[OpenOCD] 타겟 재초기화 후 PCSR 읽기 실패 — OpenOCD 재시작으로 전환")
             return False
@@ -1378,29 +1403,32 @@ class OpenOCDPCSampler:
         log.warning("[Startup] AXI 후 sticky error 클리어")
 
         # Step 5: PCSR raw read (catch 없이 실제 반환값 확인)
-        r_test = self._telnet_cmd(f'r8.abp read_memory {hex(PCSR_CORE0)} 32 1')
+        r_test = self._telnet_cmd(f'r8.abp read_memory {hex(self._pcsr_addrs[0])} 32 1')
         log.warning(f"[Startup] PCSR Core0 raw read: {repr(r_test)}")
 
         # Step 6: lindex 테스트 — proc과 동일한 방식으로 값 추출
         r_lindex = self._telnet_cmd(
-            f'catch {{set _t [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0]}} _e; '
+            f'catch {{set _t [lindex [r8.abp read_memory {hex(self._pcsr_addrs[0])} 32 1] 0]}} _e; '
             f'list $_t $_e'
         )
         log.warning(f"[Startup] lindex 추출 테스트: {repr(r_lindex)}")
 
-        # Step 7: read_all_pcs proc 정의
+        # Step 7: read_all_pcs proc 정의 — self._pcsr_addrs 기반으로 코어 수 유연하게 구성
         # JTAG: dpreg 0 0x1e(ABORT write)가 JTAG 상태머신을 건드려 이후 read 실패시킴
         #       → proc 내 dpreg 제거, read만 수행
         # SWD: dpreg 0 0x1e로 sticky error 사전 클리어 유지
+        _read_stmts = ''.join(
+            f'  set pc{i} [lindex [r8.abp read_memory {hex(addr)} 32 1] 0];'
+            for i, addr in enumerate(self._pcsr_addrs)
+        )
+        _ret_vars = ' '.join(f'$pc{i}' for i in range(len(self._pcsr_addrs)))
         if self.config.transport == 'jtag':
             proc_body = (
                 'proc read_all_pcs {} {'
                 ' if {[catch {'
-                f'  set pc0 [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0];'
-                f'  set pc1 [lindex [r8.abp read_memory {hex(PCSR_CORE1)} 32 1] 0];'
-                f'  set pc2 [lindex [r8.abp read_memory {hex(PCSR_CORE2)} 32 1] 0];'
+                + _read_stmts +
                 ' } _err]} { return "ERR:$_err" };'
-                ' return "$pc0 $pc1 $pc2"'
+                f' return "{_ret_vars}"'
                 ' }'
             )
         else:
@@ -1408,11 +1436,9 @@ class OpenOCDPCSampler:
                 'proc read_all_pcs {} {'
                 ' catch {r8.dap dpreg 0 0x1e};'
                 ' if {[catch {'
-                f'  set pc0 [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0];'
-                f'  set pc1 [lindex [r8.abp read_memory {hex(PCSR_CORE1)} 32 1] 0];'
-                f'  set pc2 [lindex [r8.abp read_memory {hex(PCSR_CORE2)} 32 1] 0];'
+                + _read_stmts +
                 ' } _err]} { return "ERR:$_err" };'
-                ' return "$pc0 $pc1 $pc2"'
+                f' return "{_ret_vars}"'
                 ' }'
             )
         r2 = self._telnet_cmd(proc_body)
@@ -1425,53 +1451,41 @@ class OpenOCDPCSampler:
     def _verify_pcsr(self) -> bool:
         result = self._read_all_pcs()
         if result is not None:
-            log.info(f"[OpenOCD] PCSR 검증 OK: Core0={hex(result[0])} "
-                     f"Core1={hex(result[1])} Core2={hex(result[2])}")
+            cores_str = ' '.join(f'Core{i}={hex(pc)}' for i, pc in enumerate(result))
+            log.info(f"[OpenOCD] PCSR 검증 OK: {cores_str}")
         return result is not None
 
     # ------------------------------------------------------------------
     # Module 3: 3코어 PC 읽기
     # ------------------------------------------------------------------
 
-    # PCSR 유효 PC 판별에서 제외할 알려진 비-PC 값
-    # 0x6ba02477: SWD DPIDR, 0x6ba00477: JTAG IDCODE/DPIDR (ARM Cortex-R8)
-    # OpenOCD 에러 메시지에 DAP 식별자가 섞여 유효 PC로 오인되는 것을 방지
-    # PCSR_CORE*: 읽기 대상 주소 자체가 에러 메시지에 노출되는 경우
-    _INVALID_PC_MASK = frozenset({
-        0x6ba02476, 0x6ba02477,          # SWD DPIDR (Thumb-bit 마스킹 전·후)
-        0x6ba00476, 0x6ba00477,          # JTAG IDCODE/DPIDR (Cortex-R8)
-        PCSR_CORE0, PCSR_CORE0 & ~1,     # 0x80030084
-        PCSR_CORE1, PCSR_CORE1 & ~1,     # 0x80032084
-        PCSR_CORE2, PCSR_CORE2 & ~1,     # 0x80034084
-    })
-
-    def _read_all_pcs(self) -> Optional[Tuple[int, int, int]]:
-        """PCSR 배치 읽기: 1 RTT = (pc0, pc1, pc2). Thumb bit 마스킹 포함."""
+    def _read_all_pcs(self) -> Optional[Tuple[int, ...]]:
+        """PCSR 배치 읽기: 1 RTT = N코어 PC 튜플. Thumb bit 마스킹 포함."""
+        n = len(self._pcsr_addrs)
         try:
             resp = self._telnet_cmd('read_all_pcs')
-            # OpenOCD 에러 응답 조기 탈출 — 에러 메시지의 hex 값이 파싱에 오염되는 것을 방지
-            # 대소문자 무관 체크 ('Failed' / 'Error' 등 OpenOCD 출력 포함)
             _resp_lower = resp.lower()
             if resp.startswith('ERR:') or 'error' in _resp_lower or 'failed' in _resp_lower:
                 log.warning(f"[OpenOCD] 에러 응답 감지: {repr(resp)}")
                 return None
             parts = re.findall(r'0x[0-9a-fA-F]+', resp)
-            if len(parts) != 3:
-                log.warning(f"[OpenOCD] 파싱 실패 (토큰 {len(parts)}개): {repr(resp)}")
+            if len(parts) != n:
+                log.warning(f"[OpenOCD] 파싱 실패 (토큰 {len(parts)}개, 기대 {n}개): {repr(resp)}")
                 return None
-            pc0, pc1, pc2 = [int(p, 16) & ~1 for p in parts[:3]]
+            pcs = tuple(int(p, 16) & ~1 for p in parts[:n])
             # 무효 PC 필터 1: sentinel(0xFFFFFFFE) 또는 0 — 모두 해당할 때만
-            if pc0 in (0, 0xFFFFFFFE) and pc1 in (0, 0xFFFFFFFE) and pc2 in (0, 0xFFFFFFFE):
+            _sentinel = {0, 0xFFFFFFFE}
+            if all(pc in _sentinel for pc in pcs):
                 log.warning(f"[OpenOCD] 무효 PC 튜플 (sentinel): "
-                            f"Core0={hex(pc0)} Core1={hex(pc1)} Core2={hex(pc2)}")
+                            f"{' '.join(f'Core{i}={hex(pc)}' for i, pc in enumerate(pcs))}")
                 return None
             # 무효 PC 필터 2: DPIDR / PCSR 주소 자체 — 에러 메시지 오염 잔류 방어
-            if any(p in self._INVALID_PC_MASK for p in (pc0, pc1, pc2)):
+            if any(pc in self._invalid_pc_mask for pc in pcs):
                 log.warning(f"[OpenOCD] 무효 PC 튜플 (비-PC 값 포함): "
-                            f"Core0={hex(pc0)} Core1={hex(pc1)} Core2={hex(pc2)}")
+                            f"{' '.join(f'Core{i}={hex(pc)}' for i, pc in enumerate(pcs))}")
                 return None
-            log.debug(f"[PCSR] Core0={hex(pc0)} Core1={hex(pc1)} Core2={hex(pc2)}")
-            return (pc0, pc1, pc2)
+            log.debug(f"[PCSR] {' '.join(f'Core{i}={hex(pc)}' for i, pc in enumerate(pcs))}")
+            return pcs
         except Exception as e:
             log.warning(f"[OpenOCD] _read_all_pcs 예외: {e}")
             return None
@@ -4995,8 +5009,9 @@ class NVMeFuzzer:
             idle_pcs    = self.sampler.idle_pcs
             n_samples   = len(stuck_pcs)
 
-            # 코어별 Counter 분리 (튜플 인덱스 0=Core0, 1=Core1, 2=Core2)
-            core_counters = [Counter(t[i] for t in stuck_pcs) for i in range(3)]
+            # 코어별 Counter 분리 (실제 코어 수 기반)
+            _n_cores = len(stuck_pcs[0]) if stuck_pcs else 0
+            core_counters = [Counter(t[i] for t in stuck_pcs) for i in range(_n_cores)]
 
             log.error(
                 f"[TIMEOUT CRASH] {cmd.name} "
@@ -6849,6 +6864,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=f'PC Sampling SSD Fuzzer v{FUZZER_VERSION}')
     parser.add_argument('--transport', choices=['swd', 'jtag'], default='swd',
                         help='디버그 transport (swd: r8_pcsr.cfg, jtag: r8_pcsr_jtag.cfg)')
+    parser.add_argument('--pcsr-addrs', default=None,
+                        help='쉼표로 구분된 PCSR 주소 목록 (hex). '
+                             '미지정 시 기본값 사용 (0x80030084,0x80032084,0x80034084). '
+                             '예: --pcsr-addrs 0x80030084,0x80032084 (2코어 제품)')
     parser.add_argument('--openocd-binary', default=OPENOCD_BINARY,
                         help=f'OpenOCD 바이너리 경로 (default: {OPENOCD_BINARY})')
     parser.add_argument('--openocd-config', default=None,
@@ -7004,6 +7023,14 @@ if __name__ == "__main__":
     print(f"  - [v4.6] Crash 시 nvme-cli 프로세스 보존 (fd 유지 → SSD 상태 {passthru_days:.1f}일 보존)")
     print()
 
+    # --pcsr-addrs 파싱
+    parsed_pcsr_addrs = None
+    if args.pcsr_addrs:
+        parsed_pcsr_addrs = [int(x.strip(), 0) for x in args.pcsr_addrs.split(',') if x.strip()]
+        if not parsed_pcsr_addrs:
+            parser.error('--pcsr-addrs: 유효한 주소가 없습니다.')
+        print(f"PCSR 주소 오버라이드: {[hex(a) for a in parsed_pcsr_addrs]}")
+
     # --transport로 cfg 자동 선택 (--openocd-config 명시 시 우선)
     if args.openocd_config is not None:
         resolved_cfg = args.openocd_config
@@ -7016,6 +7043,7 @@ if __name__ == "__main__":
         openocd_binary=args.openocd_binary,
         openocd_config=resolved_cfg,
         transport=args.transport,
+        pcsr_addrs=parsed_pcsr_addrs,
         openocd_host=args.openocd_host,
         openocd_port=args.openocd_port,
         openocd_timeout=args.openocd_timeout,
