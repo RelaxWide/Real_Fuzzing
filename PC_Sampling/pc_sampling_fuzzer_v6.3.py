@@ -7,10 +7,10 @@ subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
 
 v6.3 변경사항:
 - [Transport] JTAG 지원 추가:
-    --transport swd|jtag CLI 옵션으로 디버그 transport 선택.
+    --interface swd|jtag CLI 옵션으로 디버그 transport 선택.
     swd(기본): r8_pcsr.cfg 사용 (기존 동작 유지).
     jtag: r8_pcsr_jtag.cfg 자동 선택 (ARM Cortex-R8, IDCODE=0x6BA00477, irlen=4).
-    --openocd-config 명시 시 --transport 무시하고 지정 cfg 우선 사용.
+    --openocd-config 명시 시 --interface 무시하고 지정 cfg 우선 사용.
     OPENOCD_CONFIG_JTAG = 'r8_pcsr_jtag.cfg' 상수 추가.
 - [Fix] JTAG-DP STICKY ERROR 수정:
     r8_pcsr_jtag.cfg: transport select jtag을 adapter driver보다 앞에 배치.
@@ -260,7 +260,7 @@ FW_ADDR_END   = 0x003B7FFF
 # OpenOCD 설정
 OPENOCD_BINARY          = 'openocd'
 OPENOCD_CONFIG          = 'r8_pcsr.cfg'        # SWD용 cfg (퍼저 스크립트 디렉토리 기준 경로)
-OPENOCD_CONFIG_JTAG     = 'r8_pcsr_jtag.cfg'  # JTAG용 cfg (--transport jtag 시 자동 선택)
+OPENOCD_CONFIG_JTAG     = 'r8_pcsr_jtag.cfg'  # JTAG용 cfg (--interface jtag 시 자동 선택)
 OPENOCD_TELNET_HOST     = '127.0.0.1'
 OPENOCD_TELNET_PORT     = 4444
 OPENOCD_STARTUP_TIMEOUT = 10.0                 # 초
@@ -924,7 +924,7 @@ class FuzzConfig:
     openocd_host:    str   = OPENOCD_TELNET_HOST
     openocd_port:    int   = OPENOCD_TELNET_PORT
     openocd_timeout: float = OPENOCD_STARTUP_TIMEOUT
-    transport:       str   = 'swd'   # 'swd' | 'jtag'
+    interface:       str   = 'swd'   # 'swd' | 'jtag'
 
     nvme_device: str = NVME_DEVICE
     nvme_namespace: int = NVME_NAMESPACE
@@ -1146,7 +1146,7 @@ class OpenOCDPCSampler:
 
         # transport별 PCSR 주소 목록 (jtag=2코어, swd=3코어)
         self._pcsr_addrs: List[int] = (
-            PCSR_ADDRS_JTAG if config.transport == 'jtag' else PCSR_ADDRS_SWD
+            PCSR_ADDRS_JTAG if config.interface == 'jtag' else PCSR_ADDRS_SWD
         )
         # PCSR 주소 자체가 에러 메시지에 노출될 경우 무효 PC로 필터링
         _addr_mask: Set[int] = set()
@@ -1374,7 +1374,7 @@ class OpenOCDPCSampler:
 
     def _send_startup_tcl(self):
         """전원 활성화 + read_all_pcs proc 정의 (connect/reconnect 공통)."""
-        log.warning(f"[Startup] transport={self.config.transport!r}")
+        log.warning(f"[Startup] transport={self.config.interface!r}")
 
         # Step 1: DP CTRL/STAT power-up (catch 없이 실제값 확인)
         r_pwr = self._telnet_cmd('r8.dap dpreg 4 0x50000000')
@@ -1426,7 +1426,7 @@ class OpenOCDPCSampler:
             for i, addr in enumerate(self._pcsr_addrs)
         )
         _ret_vars = ' '.join(f'$pc{i}' for i in range(len(self._pcsr_addrs)))
-        if self.config.transport == 'jtag':
+        if self.config.interface == 'jtag':
             proc_body = (
                 'proc read_all_pcs {} {'
                 ' if {[catch {'
@@ -6866,12 +6866,12 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=f'PC Sampling SSD Fuzzer v{FUZZER_VERSION}')
-    parser.add_argument('--transport', choices=['swd', 'jtag'], default='swd',
+    parser.add_argument('--interface', choices=['swd', 'jtag'], default='swd',
                         help='디버그 transport (swd: r8_pcsr.cfg, jtag: r8_pcsr_jtag.cfg)')
     parser.add_argument('--openocd-binary', default=OPENOCD_BINARY,
                         help=f'OpenOCD 바이너리 경로 (default: {OPENOCD_BINARY})')
     parser.add_argument('--openocd-config', default=None,
-                        help='OpenOCD 설정 파일 경로 (미지정 시 --transport로 자동 선택)')
+                        help='OpenOCD 설정 파일 경로 (미지정 시 --interface로 자동 선택)')
     parser.add_argument('--openocd-host', default=OPENOCD_TELNET_HOST,
                         help=f'OpenOCD telnet 호스트 (default: {OPENOCD_TELNET_HOST})')
     parser.add_argument('--openocd-port', type=int, default=OPENOCD_TELNET_PORT,
@@ -7023,10 +7023,10 @@ if __name__ == "__main__":
     print(f"  - [v4.6] Crash 시 nvme-cli 프로세스 보존 (fd 유지 → SSD 상태 {passthru_days:.1f}일 보존)")
     print()
 
-    # --transport로 cfg 자동 선택 (--openocd-config 명시 시 우선)
+    # --interface로 cfg 자동 선택 (--openocd-config 명시 시 우선)
     if args.openocd_config is not None:
         resolved_cfg = args.openocd_config
-    elif args.transport == 'jtag':
+    elif args.interface == 'jtag':
         resolved_cfg = OPENOCD_CONFIG_JTAG
     else:
         resolved_cfg = OPENOCD_CONFIG
@@ -7034,7 +7034,7 @@ if __name__ == "__main__":
     config = FuzzConfig(
         openocd_binary=args.openocd_binary,
         openocd_config=resolved_cfg,
-        transport=args.transport,
+        interface=args.interface,
         openocd_host=args.openocd_host,
         openocd_port=args.openocd_port,
         openocd_timeout=args.openocd_timeout,
