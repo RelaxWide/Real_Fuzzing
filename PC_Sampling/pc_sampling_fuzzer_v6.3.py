@@ -4541,8 +4541,22 @@ class NVMeFuzzer:
         """crash 발생 시 JLink 메모리 덤프를 실행한다.
 
         실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./run_smi_mem_dump_JLINK_USB.sh
+        OpenOCD가 J-Link를 점유 중이므로 실행 전 shutdown으로 해제 후 스크립트 실행.
         """
         TIMEOUT = 300   # 5분
+
+        # OpenOCD shutdown — J-Link USB 점유 해제
+        # shutdown 없이 kill하면 libjaylink가 USB를 잠근 채 종료 → JLink 연결 불가
+        log.warning("[JLINK DUMP] OpenOCD shutdown (J-Link 해제)...")
+        if self._sock and self._openocd_alive():
+            try:
+                self._sock.sendall(b'shutdown\n')
+                time.sleep(1.0)
+            except Exception:
+                pass
+        self._close_telnet()
+        self._terminate_proc()
+        log.warning("[JLINK DUMP] OpenOCD 종료 완료")
 
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         sh_path = os.path.join(script_dir, 'run_smi_mem_dump_JLINK_USB.sh')
