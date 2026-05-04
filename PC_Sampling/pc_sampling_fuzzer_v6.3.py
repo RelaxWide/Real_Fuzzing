@@ -272,6 +272,12 @@ PCSR_CORE2      = 0x80034084
 PCSR_POWER_ADDR = 0x30313f30
 PCSR_POWER_MASK = 0x00010101   # Core0=bit0, Core1=bit8, Core2=bit16
 
+# transport별 기본 PCSR 주소 목록
+# SWD 제품: 3코어 (Core0/1/2)
+# JTAG 제품: 2코어 (Core0/1) — ROM table 및 JLink 스크립트(num_of_core=2) 확인
+PCSR_ADDRS_SWD  = [PCSR_CORE0, PCSR_CORE1, PCSR_CORE2]
+PCSR_ADDRS_JTAG = [PCSR_CORE0, PCSR_CORE1]
+
 # NVMe 장치 설정
 NVME_DEVICE    = '/dev/nvme0'
 NVME_NAMESPACE = 1
@@ -919,7 +925,6 @@ class FuzzConfig:
     openocd_port:    int   = OPENOCD_TELNET_PORT
     openocd_timeout: float = OPENOCD_STARTUP_TIMEOUT
     transport:       str   = 'swd'   # 'swd' | 'jtag'
-    pcsr_addrs: Optional[List[int]] = None  # None = 기본값 사용 (PCSR_CORE0/1/2)
 
     nvme_device: str = NVME_DEVICE
     nvme_namespace: int = NVME_NAMESPACE
@@ -1139,10 +1144,9 @@ class OpenOCDPCSampler:
         self.idle_pcs: Set[int]      = set()
         self._sock_buf: bytes        = b''   # 소켓 읽기 잔여 버퍼
 
-        # 유효 PCSR 주소 목록 — CLI --pcsr-addrs 또는 기본값 (CORE0/1/2)
+        # transport별 PCSR 주소 목록 (jtag=2코어, swd=3코어)
         self._pcsr_addrs: List[int] = (
-            config.pcsr_addrs if config.pcsr_addrs
-            else [PCSR_CORE0, PCSR_CORE1, PCSR_CORE2]
+            PCSR_ADDRS_JTAG if config.transport == 'jtag' else PCSR_ADDRS_SWD
         )
         # PCSR 주소 자체가 에러 메시지에 노출될 경우 무효 PC로 필터링
         _addr_mask: Set[int] = set()
@@ -6864,10 +6868,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=f'PC Sampling SSD Fuzzer v{FUZZER_VERSION}')
     parser.add_argument('--transport', choices=['swd', 'jtag'], default='swd',
                         help='디버그 transport (swd: r8_pcsr.cfg, jtag: r8_pcsr_jtag.cfg)')
-    parser.add_argument('--pcsr-addrs', default=None,
-                        help='쉼표로 구분된 PCSR 주소 목록 (hex). '
-                             '미지정 시 기본값 사용 (0x80030084,0x80032084,0x80034084). '
-                             '예: --pcsr-addrs 0x80030084,0x80032084 (2코어 제품)')
     parser.add_argument('--openocd-binary', default=OPENOCD_BINARY,
                         help=f'OpenOCD 바이너리 경로 (default: {OPENOCD_BINARY})')
     parser.add_argument('--openocd-config', default=None,
@@ -7023,14 +7023,6 @@ if __name__ == "__main__":
     print(f"  - [v4.6] Crash 시 nvme-cli 프로세스 보존 (fd 유지 → SSD 상태 {passthru_days:.1f}일 보존)")
     print()
 
-    # --pcsr-addrs 파싱
-    parsed_pcsr_addrs = None
-    if args.pcsr_addrs:
-        parsed_pcsr_addrs = [int(x.strip(), 0) for x in args.pcsr_addrs.split(',') if x.strip()]
-        if not parsed_pcsr_addrs:
-            parser.error('--pcsr-addrs: 유효한 주소가 없습니다.')
-        print(f"PCSR 주소 오버라이드: {[hex(a) for a in parsed_pcsr_addrs]}")
-
     # --transport로 cfg 자동 선택 (--openocd-config 명시 시 우선)
     if args.openocd_config is not None:
         resolved_cfg = args.openocd_config
@@ -7043,7 +7035,6 @@ if __name__ == "__main__":
         openocd_binary=args.openocd_binary,
         openocd_config=resolved_cfg,
         transport=args.transport,
-        pcsr_addrs=parsed_pcsr_addrs,
         openocd_host=args.openocd_host,
         openocd_port=args.openocd_port,
         openocd_timeout=args.openocd_timeout,
