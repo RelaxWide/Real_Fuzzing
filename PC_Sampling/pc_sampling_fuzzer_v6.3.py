@@ -908,6 +908,7 @@ class FuzzConfig:
     openocd_host:    str   = OPENOCD_TELNET_HOST
     openocd_port:    int   = OPENOCD_TELNET_PORT
     openocd_timeout: float = OPENOCD_STARTUP_TIMEOUT
+    transport:       str   = 'swd'   # 'swd' | 'jtag'
 
     nvme_device: str = NVME_DEVICE
     nvme_namespace: int = NVME_NAMESPACE
@@ -1356,20 +1357,19 @@ class OpenOCDPCSampler:
         r_clr = self._telnet_cmd('catch {r8.dap dpreg 0 0x1e}')
         log.debug(f"[OpenOCD] DAP sticky error 클리어 응답: {repr(r_clr)}")
         # Step 3: 칩 고유 debug power enable (AXI AP 경유).
-        # JTAG에서 AXI AP(ap-num 1)가 안 잡히면 실패할 수 있으나,
-        # Step 1에서 DP CTRL/STAT로 이미 power-up 했으므로 PCSR 접근에는 무관.
-        r0 = self._telnet_cmd(
-            f'catch {{set _pwr [lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0]}}'
-        )
-        log.debug(f"[OpenOCD] 전원 읽기 응답: {repr(r0)}")
-        r1 = self._telnet_cmd(
-            f'catch {{r8.axi write_memory {hex(PCSR_POWER_ADDR)} 32 '
-            f'[expr {{$_pwr | {hex(PCSR_POWER_MASK)}}}]}}'
-        )
-        log.debug(f"[OpenOCD] 전원 쓰기 응답: {repr(r1)}")
-        # AXI AP 접근 실패 시 생긴 sticky error를 다시 클리어
-        self._telnet_cmd('catch {r8.dap dpreg 0 0x1e}')
-        log.debug("[OpenOCD] AXI 후 sticky error 클리어")
+        # Step 3: 칩 고유 debug power enable (AXI AP 경유, SWD 전용).
+        # JTAG 모드에서는 이 write가 AXI bus error → sticky error를 일으켜
+        # 이후 PCSR read를 모두 실패시킨다. cfg의 DP CTRL/STAT power-up으로 충분.
+        if self.config.transport != 'jtag':
+            r0 = self._telnet_cmd(
+                f'set _pwr [lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0]'
+            )
+            log.debug(f"[OpenOCD] 전원 읽기 응답: {repr(r0)}")
+            r1 = self._telnet_cmd(
+                f'r8.axi write_memory {hex(PCSR_POWER_ADDR)} 32 '
+                f'[expr {{$_pwr | {hex(PCSR_POWER_MASK)}}}]'
+            )
+            log.debug(f"[OpenOCD] 전원 쓰기 응답: {repr(r1)}")
         # 배치 읽기 proc 정의 (1 RTT = 3코어 PC)
         # catch: read_memory 실패(DAP fault, 디버그 도메인 꺼짐) 시 에러 메시지가
         # 텔넷 스트림에 섞이지 않도록 Tcl 레벨에서 잡아 sentinel 0xFFFFFFFF 반환.
@@ -6980,6 +6980,7 @@ if __name__ == "__main__":
     config = FuzzConfig(
         openocd_binary=args.openocd_binary,
         openocd_config=resolved_cfg,
+        transport=args.transport,
         openocd_host=args.openocd_host,
         openocd_port=args.openocd_port,
         openocd_timeout=args.openocd_timeout,
