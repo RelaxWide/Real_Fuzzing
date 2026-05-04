@@ -4537,6 +4537,84 @@ class NVMeFuzzer:
         log.warning("[UFAS] PCIe bus 번호 자동 탐지 실패 — UFAS 덤프 건너뜀")
         return None
 
+    def _run_jlink_dump(self) -> None:
+        """crash 발생 시 JLink 메모리 덤프를 실행한다.
+
+        실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./run_smi_mem_dump_JLINK_USB.sh
+        """
+        TIMEOUT = 300   # 5분
+
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        sh_path = os.path.join(script_dir, 'run_smi_mem_dump_JLINK_USB.sh')
+
+        if not os.path.isfile(sh_path):
+            log.warning("[JLINK DUMP] 스크립트 없음 — 건너뜀")
+            return
+        if not os.access(sh_path, os.X_OK):
+            log.warning("[JLINK DUMP] 실행 권한 없음 (chmod +x 필요) — 건너뜀")
+            return
+
+        cmd = ['bash', sh_path]
+        log.warning(f"[JLINK DUMP] 실행: {sh_path}")
+
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=script_dir,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            log.warning(f"[JLINK DUMP] Popen 실패: {e}")
+            return
+
+        log.warning(f"[JLINK DUMP] PID={proc.pid} — 최대 {TIMEOUT}초 대기")
+
+        import threading
+        _result: dict = {}
+
+        def _communicate():
+            try:
+                out, err = proc.communicate()
+                _result['stdout'] = out
+                _result['stderr'] = err
+                _result['rc'] = proc.returncode
+            except Exception as ex:
+                _result['error'] = ex
+
+        t = threading.Thread(target=_communicate, daemon=True)
+        t.start()
+
+        POLL_INTERVAL = 30
+        waited = 0
+        while waited < TIMEOUT:
+            t.join(timeout=POLL_INTERVAL)
+            if not t.is_alive():
+                break
+            waited += POLL_INTERVAL
+            log.warning(f"[JLINK DUMP] 진행 중... {waited}s 경과")
+
+        if t.is_alive():
+            log.warning(f"[JLINK DUMP] {TIMEOUT}초 timeout — SIGKILL (PID={proc.pid})")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            t.join(timeout=5)
+            return
+
+        if 'error' in _result:
+            log.warning(f"[JLINK DUMP] 오류: {_result['error']}")
+            return
+
+        rc = _result.get('rc', -1)
+        out = _result.get('stdout', b'').decode(errors='replace').strip()
+        err = _result.get('stderr', b'').decode(errors='replace').strip()
+        if out:
+            log.warning(f"[JLINK DUMP] stdout:\n{out}")
+        if err:
+            log.warning(f"[JLINK DUMP] stderr:\n{err}")
+        log.warning(f"[JLINK DUMP] 완료 (rc={rc})")
+
     def _run_ufas_dump(self) -> None:
         """crash 발생 시 UFAS 펌웨어 덤프를 실행한다.
 
@@ -5101,7 +5179,14 @@ class NVMeFuzzer:
         except Exception as _replay_exc:
             log.warning(f"[REPLAY] replay .sh 생성 실패: {_replay_exc}")
 
-        # 3.6) UFAS 펌웨어 덤프
+        # 3.6) JLink 메모리 덤프 (UFAS 이전)
+        log.warning("[TIMEOUT] JLink 메모리 덤프를 실행합니다...")
+        try:
+            self._run_jlink_dump()
+        except Exception as _jlink_exc:
+            log.warning(f"[JLINK DUMP] 예기치 않은 예외: {_jlink_exc}")
+
+        # 3.7) UFAS 펌웨어 덤프
         if self.config.enable_ufas:
             log.warning("[TIMEOUT] UFAS 펌웨어 덤프를 실행합니다...")
             try:
