@@ -1345,35 +1345,42 @@ class OpenOCDPCSampler:
 
     def _send_startup_tcl(self):
         """전원 활성화 + read_all_pcs proc 정의 (connect/reconnect 공통)."""
-        # Step 1: DP CTRL/STAT로 debug/system power domain 직접 요청.
-        # SWD: J-Link가 연결 시 자동으로 처리하므로 이미 켜져 있음 (무해).
-        # JTAG+mem_ap: OpenOCD가 CDBGPWRUPREQ를 자동 설정하지 않으므로 명시적으로 해야 함.
-        # CTRL/STAT(DP 주소 0x4): bit30=CSYSPWRUPREQ, bit28=CDBGPWRUPREQ → 0x50000000
+        log.warning(f"[Startup] transport={self.config.transport!r}")
+
+        # Step 1: DP CTRL/STAT power-up
         r_pwr = self._telnet_cmd('catch {r8.dap dpreg 4 0x50000000}')
-        log.debug(f"[OpenOCD] DP CTRL/STAT power-up 응답: {repr(r_pwr)}")
-        time.sleep(0.05)  # power ACK 대기
-        # Step 2: ABORT 레지스터(DP 주소 0x0)로 sticky error 클리어.
-        # power-up 이전 AP 접근 실패로 STICKY ERROR가 set되어 있을 수 있음.
+        log.warning(f"[Startup] dpreg4 power-up: {repr(r_pwr)}")
+        time.sleep(0.05)
+
+        # Step 2: ABORT 레지스터로 sticky error 클리어
         r_clr = self._telnet_cmd('catch {r8.dap dpreg 0 0x1e}')
-        log.debug(f"[OpenOCD] DAP sticky error 클리어 응답: {repr(r_clr)}")
-        # Step 3: 칩 고유 debug power enable (AXI AP 경유).
-        # Step 3: 칩 고유 debug power enable (AXI AP 경유, SWD 전용).
-        # JTAG 모드에서는 이 write가 AXI bus error → sticky error를 일으켜
-        # 이후 PCSR read를 모두 실패시킨다. cfg의 DP CTRL/STAT power-up으로 충분.
+        log.warning(f"[Startup] dpreg0 abort-clr: {repr(r_clr)}")
+
+        # CTRL/STAT 읽기로 power ACK 확인
+        r_stat = self._telnet_cmd('catch {r8.dap dpreg 4}')
+        log.warning(f"[Startup] dpreg4 read (CTRL/STAT): {repr(r_stat)}")
+
+        # Step 3: AXI AP power enable (SWD 전용)
         if self.config.transport != 'jtag':
             r0 = self._telnet_cmd(
                 f'set _pwr [lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0]'
             )
-            log.debug(f"[OpenOCD] 전원 읽기 응답: {repr(r0)}")
+            log.warning(f"[Startup] AXI read power: {repr(r0)}")
             r1 = self._telnet_cmd(
                 f'r8.axi write_memory {hex(PCSR_POWER_ADDR)} 32 '
                 f'[expr {{$_pwr | {hex(PCSR_POWER_MASK)}}}]'
             )
-            log.debug(f"[OpenOCD] 전원 쓰기 응답: {repr(r1)}")
-        # 배치 읽기 proc 정의 (1 RTT = 3코어 PC)
-        # catch: read_memory 실패(DAP fault, 디버그 도메인 꺼짐) 시 에러 메시지가
-        # 텔넷 스트림에 섞이지 않도록 Tcl 레벨에서 잡아 sentinel 0xFFFFFFFF 반환.
-        # r8.dap dpreg 0 0x1e: 각 read 직전 sticky error 클리어 (JTAG 연속 오류 방지)
+            log.warning(f"[Startup] AXI write power: {repr(r1)}")
+        else:
+            log.warning("[Startup] JTAG 모드 — AXI power write 스킵")
+
+        # Step 4: PCSR 직접 read 테스트 (proc 정의 전 원시 확인)
+        r_test = self._telnet_cmd(
+            f'catch {{r8.abp read_memory {hex(PCSR_CORE0)} 32 1}}'
+        )
+        log.warning(f"[Startup] PCSR Core0 raw read: {repr(r_test)}")
+
+        # Step 5: read_all_pcs proc 정의
         r2 = self._telnet_cmd(
             'proc read_all_pcs {} {'
             ' catch {r8.dap dpreg 0 0x1e};'
@@ -1385,7 +1392,11 @@ class OpenOCDPCSampler:
             ' return "$pc0 $pc1 $pc2"'
             ' }'
         )
-        log.debug(f"[OpenOCD] proc 정의 응답: {repr(r2)}")
+        log.warning(f"[Startup] proc 정의: {repr(r2)}")
+
+        # Step 6: proc 호출 테스트
+        r3 = self._telnet_cmd('read_all_pcs')
+        log.warning(f"[Startup] read_all_pcs 첫 호출: {repr(r3)}")
 
     def _verify_pcsr(self) -> bool:
         result = self._read_all_pcs()
