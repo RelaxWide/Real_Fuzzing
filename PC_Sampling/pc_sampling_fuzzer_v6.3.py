@@ -1385,18 +1385,34 @@ class OpenOCDPCSampler:
         )
         log.warning(f"[Startup] lindex 추출 테스트: {repr(r_lindex)}")
 
-        # Step 7: read_all_pcs proc 정의 — 에러 시 메시지 반환
-        r2 = self._telnet_cmd(
-            'proc read_all_pcs {} {'
-            ' catch {r8.dap dpreg 0 0x1e};'
-            ' if {[catch {'
-            f'  set pc0 [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0];'
-            f'  set pc1 [lindex [r8.abp read_memory {hex(PCSR_CORE1)} 32 1] 0];'
-            f'  set pc2 [lindex [r8.abp read_memory {hex(PCSR_CORE2)} 32 1] 0];'
-            ' } _err]} { return "ERR:$_err" };'
-            ' return "$pc0 $pc1 $pc2"'
-            ' }'
-        )
+        # Step 7: read_all_pcs proc 정의
+        # JTAG: dpreg 0 0x1e(ABORT write)가 JTAG 상태머신을 건드려 이후 read 실패시킴
+        #       → proc 내 dpreg 제거, read만 수행
+        # SWD: dpreg 0 0x1e로 sticky error 사전 클리어 유지
+        if self.config.transport == 'jtag':
+            proc_body = (
+                'proc read_all_pcs {} {'
+                ' if {[catch {'
+                f'  set pc0 [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0];'
+                f'  set pc1 [lindex [r8.abp read_memory {hex(PCSR_CORE1)} 32 1] 0];'
+                f'  set pc2 [lindex [r8.abp read_memory {hex(PCSR_CORE2)} 32 1] 0];'
+                ' } _err]} { return "ERR:$_err" };'
+                ' return "$pc0 $pc1 $pc2"'
+                ' }'
+            )
+        else:
+            proc_body = (
+                'proc read_all_pcs {} {'
+                ' catch {r8.dap dpreg 0 0x1e};'
+                ' if {[catch {'
+                f'  set pc0 [lindex [r8.abp read_memory {hex(PCSR_CORE0)} 32 1] 0];'
+                f'  set pc1 [lindex [r8.abp read_memory {hex(PCSR_CORE1)} 32 1] 0];'
+                f'  set pc2 [lindex [r8.abp read_memory {hex(PCSR_CORE2)} 32 1] 0];'
+                ' } _err]} { return "ERR:$_err" };'
+                ' return "$pc0 $pc1 $pc2"'
+                ' }'
+            )
+        r2 = self._telnet_cmd(proc_body)
         log.warning(f"[Startup] proc 정의: {repr(r2)}")
 
         # Step 8: proc 첫 호출 — ERR: 로 시작하면 에러 메시지 그대로 출력
