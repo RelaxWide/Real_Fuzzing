@@ -69,7 +69,7 @@ v6.0 변경사항:
     이유: 이전 실행의 디버그 도메인 파워가 SSD PM 상태에 영향을 줄 수 있음.
 - [Feature] timeout crash 분석 강화:
     인프라 실패(OpenOCD) vs 펌웨어 hang 자동 구분.
-    _reinit_target() 성공 시: read_stuck_pcs(count=100) PCSR 샘플링.
+    _reinit_target() 성공 시: read_stuck_pcs(count=1000) PCSR 샘플링.
     코어별 Counter 분석: top_ratio≥70% → HANG, 40~70% → busy-wait,
       <40% → 분산(복구 중). idle_pcs 교차 확인으로 정상 idle 구분.
     인프라 실패 시: 수동 확인 절차(nvme id-ctrl, J-Link) 로그 출력.
@@ -5013,7 +5013,7 @@ class NVMeFuzzer:
             stuck_pcs = []
         else:
             log.warning("[TIMEOUT] 인프라 정상 — SSD 펌웨어 hang 지점 확인을 위해 PC를 읽습니다...")
-            stuck_pcs = self.sampler.read_stuck_pcs(count=100)
+            stuck_pcs = self.sampler.read_stuck_pcs(count=1000)
 
         if stuck_pcs:
             idle_pcs    = self.sampler.idle_pcs
