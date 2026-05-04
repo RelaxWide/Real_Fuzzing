@@ -1380,52 +1380,29 @@ class OpenOCDPCSampler:
 
     def _send_startup_tcl(self):
         """전원 활성화 + read_all_pcs proc 정의 (connect/reconnect 공통)."""
-        log.warning(f"[Startup] transport={self.config.interface!r}")
+        log.info(f"[Startup] interface={self.config.interface!r}, "
+                 f"cores={[hex(a) for a in self._pcsr_addrs]}")
 
-        # Step 1: DP CTRL/STAT power-up (catch 없이 실제값 확인)
-        r_pwr = self._telnet_cmd('r8.dap dpreg 4 0x50000000')
-        log.warning(f"[Startup] dpreg4 power-up write: {repr(r_pwr)}")
+        # DP CTRL/STAT power-up (CDBGPWRUPREQ | CSYSPWRUPREQ)
+        self._telnet_cmd('r8.dap dpreg 4 0x50000000')
         time.sleep(0.05)
 
-        # Step 2: CTRL/STAT 읽기 — CDBGPWRUPACK(bit29) 확인
-        r_stat = self._telnet_cmd('r8.dap dpreg 4')
-        log.warning(f"[Startup] dpreg4 CTRL/STAT read: {repr(r_stat)}")
+        # sticky error 클리어
+        self._telnet_cmd('r8.dap dpreg 0 0x1e')
 
-        # Step 3: ABORT으로 sticky error 클리어
-        r_clr = self._telnet_cmd('r8.dap dpreg 0 0x1e')
-        log.warning(f"[Startup] dpreg0 abort-clr: {repr(r_clr)}")
-
-        # Step 4: 칩 고유 per-core debug power enable (AXI AP 경유, SWD/JTAG 공통)
-        # PCSR_POWER_MASK=0x00010101: bit0=Core0, bit8=Core1, bit16=Core2
-        # JTAG에서도 Core2 전원은 이 레지스터로 켜야 함 (global dpreg만으로는 Core2 미작동)
+        # 칩 고유 per-core debug power enable (AXI AP 경유)
         # AXI write 후 sticky error가 생길 수 있으므로 즉시 클리어
-        r0 = self._telnet_cmd(
+        self._telnet_cmd(
             f'catch {{set _pwr [lindex [r8.axi read_memory {hex(PCSR_POWER_ADDR)} 32 1] 0]}}'
         )
-        log.warning(f"[Startup] AXI read power: {repr(r0)}")
-        r1 = self._telnet_cmd(
+        self._telnet_cmd(
             f'catch {{r8.axi write_memory {hex(PCSR_POWER_ADDR)} 32 '
             f'[expr {{$_pwr | {hex(PCSR_POWER_MASK)}}}]}}'
         )
-        log.warning(f"[Startup] AXI write power: {repr(r1)}")
-        # AXI write로 인한 sticky error 즉시 클리어 (proc 정의 전에 처리)
         self._telnet_cmd('r8.dap dpreg 0 0x1e')
-        log.warning("[Startup] AXI 후 sticky error 클리어")
 
-        # Step 5: PCSR raw read (catch 없이 실제 반환값 확인)
-        r_test = self._telnet_cmd(f'r8.abp read_memory {hex(self._pcsr_addrs[0])} 32 1')
-        log.warning(f"[Startup] PCSR Core0 raw read: {repr(r_test)}")
-
-        # Step 6: lindex 테스트 — proc과 동일한 방식으로 값 추출
-        r_lindex = self._telnet_cmd(
-            f'catch {{set _t [lindex [r8.abp read_memory {hex(self._pcsr_addrs[0])} 32 1] 0]}} _e; '
-            f'list $_t $_e'
-        )
-        log.warning(f"[Startup] lindex 추출 테스트: {repr(r_lindex)}")
-
-        # Step 7: read_all_pcs proc 정의 — self._pcsr_addrs 기반으로 코어 수 유연하게 구성
-        # JTAG: dpreg 0 0x1e(ABORT write)가 JTAG 상태머신을 건드려 이후 read 실패시킴
-        #       → proc 내 dpreg 제거, read만 수행
+        # read_all_pcs proc 정의 — self._pcsr_addrs 기반으로 코어 수 유연하게 구성
+        # JTAG: proc 내 dpreg 제거 (JTAG 상태머신 간섭 방지)
         # SWD: dpreg 0 0x1e로 sticky error 사전 클리어 유지
         _read_stmts = ''.join(
             f'  set pc{i} [lindex [r8.abp read_memory {hex(addr)} 32 1] 0];'
@@ -1451,12 +1428,8 @@ class OpenOCDPCSampler:
                 f' return "{_ret_vars}"'
                 ' }'
             )
-        r2 = self._telnet_cmd(proc_body)
-        log.warning(f"[Startup] proc 정의: {repr(r2)}")
-
-        # Step 8: proc 첫 호출 — ERR: 로 시작하면 에러 메시지 그대로 출력
-        r3 = self._telnet_cmd('read_all_pcs')
-        log.warning(f"[Startup] read_all_pcs 첫 호출: {repr(r3)}")
+        self._telnet_cmd(proc_body)
+        log.info("[Startup] read_all_pcs proc 정의 완료")
 
     def _verify_pcsr(self) -> bool:
         result = self._read_all_pcs()
