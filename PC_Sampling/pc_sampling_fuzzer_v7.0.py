@@ -7237,7 +7237,8 @@ class NVMeFuzzer:
                                     sequence = list(self._cmd_history),
                                     delta    = _delta,
                                     score    = _delta.score,
-                                    causes   = _delta.state_buckets(),
+                                    causes   = [b for b in _delta.state_buckets()
+                                                if not b.endswith(':=init')],
                                     found_at = self.executions,
                                 )
                                 self.state_corpus.append(_entry)
