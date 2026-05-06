@@ -2449,6 +2449,85 @@ class NVMeFuzzer:
             log.warning(f"[SMART] smart-log 실패 (rc={proc.returncode}): "
                         f"{stderr_data.decode(errors='replace').strip()}")
 
+    def _log_state_snapshot(self):
+        """state_fields.py에 정의된 모든 필드를 읽어 human-readable 형태로 로그에 기록.
+        퍼징 시작 시 1회 + 이후 10000회마다 호출."""
+        log.info("[State-Snap] ══════════════ State Fields Snapshot ══════════════")
+        log.info(f"[State-Snap] exec={self.executions:,}  "
+                 f"state-cov={len(self.state_cov_map)}  "
+                 f"state-corpus={len(self.state_corpus)}")
+
+        # ── SMART (LID 02h) ───────────────────────────────────────────
+        smart_fields = [f for f in STATE_FIELDS if f['source'] == 'smart']
+        if smart_fields:
+            try:
+                proc = subprocess.run(
+                    ['nvme', 'smart-log', self.config.nvme_device],
+                    capture_output=True, timeout=10,
+                )
+                raw_out = proc.stdout or proc.stderr
+                smart_text: Dict[str, int] = {}
+                for line in raw_out.decode(errors='replace').splitlines():
+                    if ':' not in line:
+                        continue
+                    k, _, v = line.partition(':')
+                    k = k.strip().lower().replace(' ', '_')
+                    v = v.strip().split()[0].rstrip('%').replace(',', '') if v.strip() else ''
+                    try:
+                        smart_text[k] = int(v, 0)
+                    except ValueError:
+                        pass
+                _SMART_TEXT_KEY_MAP = {
+                    'percent_used': 'percentage_used',
+                    'avail_spare': 'available_spare',
+                    'spare_thresh': 'available_spare_threshold',
+                    'warning_temp_time': 'warning_temperature_time',
+                    'critical_comp_time': 'critical_composite_temperature_time',
+                }
+                log.info("[State-Snap] ── LID 02h SMART / Health ──────────────────")
+                for f in smart_fields:
+                    text_key = _SMART_TEXT_KEY_MAP.get(f['key'], f['key'])
+                    val = smart_text.get(text_key)
+                    if val is not None:
+                        log.info(f"[State-Snap]   {f['name']:<30s} = {val:>12,}   ({f['desc']})")
+                    else:
+                        log.info(f"[State-Snap]   {f['name']:<30s} = {'N/A':>12}   ({f['desc']})")
+            except Exception as e:
+                log.warning(f"[State-Snap] SMART 읽기 실패: {e}")
+
+        # ── Vendor log (LID별 1회) ────────────────────────────────────
+        vendor_lids: Dict[int, int] = {}
+        for f in STATE_FIELDS:
+            if f['source'] == 'vendor':
+                vendor_lids[f['lid']] = f['log_len']
+
+        for lid, log_len in sorted(vendor_lids.items()):
+            try:
+                proc = subprocess.run(
+                    ['nvme', 'get-log', self.config.nvme_device,
+                     f'--log-id={lid:#x}', f'--log-len={log_len}', '--raw-binary'],
+                    capture_output=True, timeout=10,
+                )
+                if proc.returncode != 0:
+                    log.warning(f"[State-Snap] LID={lid:#x} 실패: "
+                                f"{proc.stderr.decode(errors='replace').strip()}")
+                    continue
+                raw = proc.stdout
+                log.info(f"[State-Snap] ── LID {lid:#04x} ({log_len}B) ──────────────────")
+                for f in STATE_FIELDS:
+                    if f['source'] != 'vendor' or f.get('lid') != lid:
+                        continue
+                    start, end = f['offset'], f['offset'] + f['length']
+                    if end > len(raw):
+                        log.info(f"[State-Snap]   {f['name']:<30s} = {'SHORT':>12}   ({f['desc']})")
+                        continue
+                    val = int.from_bytes(raw[start:end], f.get('endian', 'little'))
+                    log.info(f"[State-Snap]   {f['name']:<30s} = {val:>12,}   ({f['desc']})")
+            except Exception as e:
+                log.warning(f"[State-Snap] LID={lid:#x} 읽기 실패: {e}")
+
+        log.info("[State-Snap] ════════════════════════════════════════════════════")
+
     def _prefill_drive(self) -> bool:
         """POR 전 드라이브 전체 영역에 랜덤 데이터 쓰기 (GC/Wear Leveling 트리거용).
 
@@ -6770,6 +6849,11 @@ class NVMeFuzzer:
         # calibration 실행 횟수를 제외하고 main loop 기준으로 카운트 재시작
         self.executions = 0
 
+        # 퍼징 시작 직전 초기 상태 스냅샷
+        self._log_smart()
+        if self.config.state_enabled:
+            self._log_state_snapshot()
+
         # 메인 퍼징 루프 진입 — 터미널 출력을 [Stats]/[PM]/[+]/CRASH 로만 제한
         for _h in log.handlers:
             if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
@@ -7102,6 +7186,8 @@ class NVMeFuzzer:
 
                 if self.executions % 10000 == 0 and self.executions > 0:
                     self._log_smart()
+                    if self.config.state_enabled:
+                        self._log_state_snapshot()
 
                 # v7.0: state monitoring — 100회마다 nvme smart-log / get-log 실행
                 if (self.config.state_enabled
