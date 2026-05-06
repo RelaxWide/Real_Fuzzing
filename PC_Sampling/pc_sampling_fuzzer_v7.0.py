@@ -1153,8 +1153,10 @@ log = logging.getLogger('pcfuzz')
 @dataclass
 class NVMeStateDelta:
     """100회 명령 window 전후의 state 필드 차분."""
-    changes: Dict[str, int]     # field_name → after - before (0이면 변화 없음)
-    weights: Dict[str, float]   # field_name → STATE_FIELDS weight
+    changes:     Dict[str, int]   # field_name → after - before (0이면 변화 없음)
+    weights:     Dict[str, float] # field_name → STATE_FIELDS weight
+    buckets:     List[str]        # CSFuzz §III-B 적응형 버킷 (pre-computed)
+    init_deltas: Dict[str, int]   # field_name → current - init_value
 
     @property
     def is_interesting(self) -> bool:
@@ -1162,24 +1164,16 @@ class NVMeStateDelta:
 
     @property
     def score(self) -> float:
-        return sum(abs(v) * self.weights.get(k, 1.0)
-                   for k, v in self.changes.items())
+        # CSFuzz §III-B 정신: raw delta 대신 log2(1 + |init_delta|) × weight
+        # → I/O 볼륨 같은 대량 누적 필드가 score 독식하는 현상 방지
+        return sum(
+            math.log2(1 + abs(self.init_deltas.get(k, 0))) * self.weights.get(k, 1.0)
+            for k in self.changes
+        )
 
     def state_buckets(self) -> List[str]:
-        """커버리지 맵 키 목록.
-        bucket 기준: ±small(1-5) / ±large(6+) / nonzero(비트필드)."""
-        keys = []
-        for name, delta in self.changes.items():
-            if delta == 0:
-                continue
-            # critical_warning은 비트마스크 → nonzero 단일 버킷
-            if 'warning' in name or 'critical' in name:
-                keys.append(f"{name}:nonzero")
-            elif delta > 0:
-                keys.append(f"{name}:+{'small' if delta <= 5 else 'large'}")
-            else:
-                keys.append(f"{name}:-{'small' if abs(delta) <= 5 else 'large'}")
-        return keys
+        """CSFuzz §III-B 적응형 버킷 목록 반환 (pre-computed)."""
+        return self.buckets
 
 
 @dataclass
@@ -1209,6 +1203,8 @@ class NVMeStateMonitor:
         # weight 테이블
         self._weights: Dict[str, float] = {f['name']: f.get('weight', 1.0)
                                             for f in fields}
+        # CSFuzz §III-B: 최초 관측값 (adaptive partitioning 기준점)
+        self._init_values: Dict[str, int] = {}
 
     def capture(self) -> Optional[Dict[str, int]]:
         """활성 필드 기준으로 필요한 nvme 명령만 실행.
@@ -1305,8 +1301,24 @@ class NVMeStateMonitor:
                 log.warning(f"[State] get-log LID={lid:#x} 예외: {e}")
                 continue
 
+        # CSFuzz §III-B: 최초 관측 시 init_value 등록
+        for name, val in result.items():
+            if name not in self._init_values:
+                self._init_values[name] = val
+                log.info(f"[State] init_value 등록: {name}={val:,}")
         log.info(f"[State] capture 완료: 총 {len(result)}개 필드 수집")
         return result
+
+    @staticmethod
+    def _adaptive_bucket(field: str, init: int, current: int) -> str:
+        """CSFuzz §III-B Fig.3(b): 초기값 기준 power-of-2 구간 버킷.
+        d=0 → '=init', d=1 → '+2^0', d=2..3 → '+2^1', d=4..7 → '+2^2', ..."""
+        d = current - init
+        if d == 0:
+            return f'{field}:=init'
+        sign = '+' if d > 0 else '-'
+        n = (abs(d)).bit_length() - 1   # floor(log2(|d|))
+        return f'{field}:{sign}2^{n}'
 
     def delta(self,
               before: Dict[str, int],
@@ -1315,14 +1327,33 @@ class NVMeStateMonitor:
             name: after.get(name, 0) - before.get(name, 0)
             for name in self._weights
         }
-        return NVMeStateDelta(changes=changes, weights=dict(self._weights))
+        # CSFuzz §III-B: 각 필드를 초기값 기준 power-of-2 구간으로 버킷화
+        buckets: List[str] = []
+        init_deltas: Dict[str, int] = {}
+        for name in self._weights:
+            if name not in self._init_values:
+                continue
+            current = after.get(name, 0)
+            init    = self._init_values[name]
+            d = current - init
+            init_deltas[name] = d
+            buckets.append(self._adaptive_bucket(name, init, current))
+        return NVMeStateDelta(
+            changes=changes,
+            weights=dict(self._weights),
+            buckets=buckets,
+            init_deltas=init_deltas,
+        )
 
     def update_cov_map(self,
                        delta: NVMeStateDelta,
                        cov_map: Dict[str, int]) -> bool:
-        """새 (field, bucket) 조합이면 cov_map 갱신 후 True 반환."""
+        """새 (field, bucket) 조합이면 cov_map 갱신 후 True 반환.
+        '=init' 버킷은 기준점이므로 새 state로 취급하지 않음."""
         is_new = False
         for bucket in delta.state_buckets():
+            if bucket.endswith(':=init'):
+                continue
             if bucket not in cov_map:
                 cov_map[bucket] = 0
                 is_new = True
@@ -7219,6 +7250,13 @@ class NVMeFuzzer:
                                     f"score={_entry.score:.1f}  "
                                     f"seq={len(_entry.sequence)}  "
                                     f"state-corpus={len(self.state_corpus)}")
+                                for _fname, _fdelta in _delta.changes.items():
+                                    if _fdelta != 0:
+                                        _before = self._state_snap_prev.get(_fname, 0)
+                                        _after  = _snap.get(_fname, 0)
+                                        log.warning(
+                                            f"[+][State-Cov]   {_fname}: "
+                                            f"{_before:,} → {_after:,} (Δ{_fdelta:+,})")
                         self._state_snap_prev = _snap
 
                 if self.executions % 1000 == 0 and self.executions > 0:
