@@ -7093,8 +7093,26 @@ class NVMeFuzzer:
                 # v4.5+: PC 기반 커버리지 평가 (primary signal)
                 is_interesting, new_pcs = self.sampler.evaluate_coverage()
 
-                if self._sa_loaded and self.sampler._last_new_pcs:
-                    self._update_static_coverage(self.sampler._last_new_pcs)
+                # v7.0+: basic_blocks.txt 로드 시 BB 단위로 is_interesting override
+                # raw PC 샘플링 노이즈 제거 — 같은 경로면 같은 BB → favored 중복 방지
+                if self._sa_loaded and self._sa_bb_starts:
+                    _mask = self._sa_thumb_mask
+                    _cur_bbs: set = set()
+                    for _pc in self.sampler.current_trace:
+                        _pk = (_pc & ~1) if _mask else _pc
+                        _idx = bisect.bisect_right(self._sa_bb_starts, _pk) - 1
+                        if _idx >= 0 and _pk < self._sa_bb_ends[_idx]:
+                            _cur_bbs.add(self._sa_bb_starts[_idx])
+                    _new_bbs = _cur_bbs - self._sa_covered_bbs
+                    is_interesting = len(_new_bbs) > 0
+                    new_pcs = len(_new_bbs)          # stats 출력 재사용 (실제론 new BBs)
+                    _seed_covered = _cur_bbs          # culling: BB starts 기반 favored 판정
+                    if self.sampler._last_new_pcs:
+                        self._update_static_coverage(self.sampler._last_new_pcs)
+                else:
+                    _seed_covered = set(self.sampler.current_trace)
+                    if self._sa_loaded and self.sampler._last_new_pcs:
+                        self._update_static_coverage(self.sampler._last_new_pcs)
 
                 self.cmd_pcs[track_key].update(self.sampler.current_trace)
                 # raw PC trace 저장 (deque maxlen=200 자동 관리)
@@ -7149,9 +7167,9 @@ class NVMeFuzzer:
                         data_len_override=mutated_seed.data_len_override,
                         found_at=self.executions,
                         new_pcs=new_pcs,
-                        # 이 실행에서 방문한 PC 주소 집합 — culling의 favored 판정 기준
-                        # PC 주소는 결정론적이므로 별도 필터링 불필요
-                        covered_pcs=set(self.sampler.current_trace),
+                        # BB 로드 시: BB start 주소 집합 (노이즈 없는 favored 판정)
+                        # BB 미로드 시: raw PC 주소 집합
+                        covered_pcs=_seed_covered,
                     )
                     self.corpus.append(new_seed)
                     # CSFuzz C1 reward 기록
