@@ -1238,8 +1238,12 @@ class NVMeStateMonitor:
                     return None
                 # 텍스트 파싱: "key_name   : value" 형식
                 # 키 정규화: 소문자 + 공백→밑줄, 값: 첫 토큰에서 % / 쉼표 제거
+                # 구버전 nvme-cli는 stdout 대신 stderr로 출력하는 경우가 있음
+                _raw_out = proc.stdout or proc.stderr
+                log.info(f"[State] smart-log stdout={len(proc.stdout)}B "
+                         f"stderr={len(proc.stderr)}B")
                 smart_text: Dict[str, int] = {}
-                for line in proc.stdout.decode(errors='replace').splitlines():
+                for line in _raw_out.decode(errors='replace').splitlines():
                     if ':' not in line:
                         continue
                     k, _, v = line.partition(':')
