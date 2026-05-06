@@ -2483,10 +2483,10 @@ class NVMeFuzzer:
     def _log_state_snapshot(self):
         """state_fields.py에 정의된 모든 필드를 읽어 human-readable 형태로 로그에 기록.
         퍼징 시작 시 1회 + 이후 10000회마다 호출."""
-        log.info("[State-Snap] ══════════════ State Fields Snapshot ══════════════")
-        log.info(f"[State-Snap] exec={self.executions:,}  "
-                 f"state-cov={len(self.state_cov_map)}  "
-                 f"state-corpus={len(self.state_corpus)}")
+        log.warning("[State-Snap] ══════════════ State Fields Snapshot ══════════════")
+        log.warning(f"[State-Snap] exec={self.executions:,}  "
+                    f"state-cov={len(self.state_cov_map)}  "
+                    f"state-corpus={len(self.state_corpus)}")
 
         # ── SMART (LID 02h) ───────────────────────────────────────────
         smart_fields = [f for f in STATE_FIELDS if f['source'] == 'smart']
@@ -2515,14 +2515,14 @@ class NVMeFuzzer:
                     'warning_temp_time': 'warning_temperature_time',
                     'critical_comp_time': 'critical_composite_temperature_time',
                 }
-                log.info("[State-Snap] ── LID 02h SMART / Health ──────────────────")
+                log.warning("[State-Snap] ── LID 02h SMART / Health ──────────────────")
                 for f in smart_fields:
                     text_key = _SMART_TEXT_KEY_MAP.get(f['key'], f['key'])
                     val = smart_text.get(text_key)
                     if val is not None:
-                        log.info(f"[State-Snap]   {f['name']:<30s} = {val:>12,}   ({f['desc']})")
+                        log.warning(f"[State-Snap]   {f['name']:<30s} = {val:>12,}   ({f['desc']})")
                     else:
-                        log.info(f"[State-Snap]   {f['name']:<30s} = {'N/A':>12}   ({f['desc']})")
+                        log.warning(f"[State-Snap]   {f['name']:<30s} = {'N/A':>12}   ({f['desc']})")
             except Exception as e:
                 log.warning(f"[State-Snap] SMART 읽기 실패: {e}")
 
@@ -2544,20 +2544,20 @@ class NVMeFuzzer:
                                 f"{proc.stderr.decode(errors='replace').strip()}")
                     continue
                 raw = proc.stdout
-                log.info(f"[State-Snap] ── LID {lid:#04x} ({log_len}B) ──────────────────")
+                log.warning(f"[State-Snap] ── LID {lid:#04x} ({log_len}B) ──────────────────")
                 for f in STATE_FIELDS:
                     if f['source'] != 'vendor' or f.get('lid') != lid:
                         continue
                     start, end = f['offset'], f['offset'] + f['length']
                     if end > len(raw):
-                        log.info(f"[State-Snap]   {f['name']:<30s} = {'SHORT':>12}   ({f['desc']})")
+                        log.warning(f"[State-Snap]   {f['name']:<30s} = {'SHORT':>12}   ({f['desc']})")
                         continue
                     val = int.from_bytes(raw[start:end], f.get('endian', 'little'))
-                    log.info(f"[State-Snap]   {f['name']:<30s} = {val:>12,}   ({f['desc']})")
+                    log.warning(f"[State-Snap]   {f['name']:<30s} = {val:>12,}   ({f['desc']})")
             except Exception as e:
                 log.warning(f"[State-Snap] LID={lid:#x} 읽기 실패: {e}")
 
-        log.info("[State-Snap] ════════════════════════════════════════════════════")
+        log.warning("[State-Snap] ════════════════════════════════════════════════════")
 
     def _prefill_drive(self) -> bool:
         """POR 전 드라이브 전체 영역에 랜덤 데이터 쓰기 (GC/Wear Leveling 트리거용).
