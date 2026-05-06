@@ -1246,7 +1246,7 @@ class NVMeStateMonitor:
                     k = k.strip().lower().replace(' ', '_')
                     v = v.strip().split()[0].rstrip('%').replace(',', '') if v.strip() else ''
                     try:
-                        smart_text[k] = int(v)
+                        smart_text[k] = int(v, 0)  # base=0: 0x.. hex / 0o.. octal / decimal 자동 판별
                     except ValueError:
                         pass
                 hit = 0
