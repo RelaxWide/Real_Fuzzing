@@ -162,17 +162,138 @@ STATE_FIELDS = [
     # ══════════════════════════════════════════════════════════════════
     # LID DFh — Lenovo Drive Identification Page (512B, NSID 무시)
     # 확인: sudo nvme get-log /dev/nvme0 --log-id=0xDF --log-len=512 | xxd
-    # offset 정보 수신 후 아래 주석 해제 및 수정
+    #
+    # Offset  Size  Field
+    # 0x00     3    "LEN" ASCII (고정값, 모니터링 제외)
+    # 0x03     1    Spec Version (35h = v1.44+, 고정값, 모니터링 제외)
+    # 0x04   220    Reserved
+    # 0xE0    16    Main NAND 기록량 (512B×1000 단위, 128-bit LE) → 하위 8B 사용
+    # 0xF0     4    LCRC/ECRC 에러 누적 수
+    # 0xF4    16    SLC Buffer 기록량 (512B×1000 단위, 128-bit LE) → 하위 8B 사용
+    # 0x104    1    SLC Buffer Percentage Used
+    # 0x105   10    FRU Number (ASCII, 고정값, 모니터링 제외)
+    # 0x10F    8    Patrol Read에 의한 Relocated Block 수
+    # 0x117    2    Average PE Cycles
+    # 0x119    2    Max PE Cycles
+    # 0x11B    2    Grown Bad Block 수
+    # 0x11D    2    DRAM Parity 에러 수
+    # 0x11F    2    SRAM Parity 에러 수
+    # 0x121  223    Reserved
     # ══════════════════════════════════════════════════════════════════
-    # {
-    #     'name':    'lenovo_df_0x??',
-    #     'source':  'vendor',
-    #     'lid':     0xDF,
-    #     'log_len': 512,
-    #     'offset':  0x??,
-    #     'length':  4,
-    #     'endian':  'little',
-    #     'weight':  3.0,
-    #     'desc':    '[DFh 0x??] Lenovo Drive ID — offset 확인 필요',
-    # },
+
+    # ── 에러 지표 ─────────────────────────────────────────────────────
+    {
+        'name':    'df_dram_parity_errors',
+        'source':  'vendor',
+        'lid':     0xDF,
+        'log_len': 512,
+        'offset':  0x11D,
+        'length':  2,
+        'endian':  'little',
+        'weight':  10.0,
+        'desc':    '[DFh 0x11D] DRAM Parity 에러 누적 — 메모리 무결성 이상',
+    },
+    {
+        'name':    'df_sram_parity_errors',
+        'source':  'vendor',
+        'lid':     0xDF,
+        'log_len': 512,
+        'offset':  0x11F,
+        'length':  2,
+        'endian':  'little',
+        'weight':  10.0,
+        'desc':    '[DFh 0x11F] SRAM Parity 에러 누적 — 캐시/버퍼 무결성 이상',
+    },
+    {
+        'name':    'df_crc_errors',
+        'source':  'vendor',
+        'lid':     0xDF,
+        'log_len': 512,
+        'offset':  0xF0,
+        'length':  4,
+        'endian':  'little',
+        'weight':  8.0,
+        'desc':    '[DFh 0xF0] LCRC/ECRC 에러 누적 — 인터페이스 에러',
+    },
+    {
+        'name':    'df_grown_bad_blocks',
+        'source':  'vendor',
+        'lid':     0xDF,
+        'log_len': 512,
+        'offset':  0x11B,
+        'length':  2,
+        'endian':  'little',
+        'weight':  8.0,
+        'desc':    '[DFh 0x11B] Grown Bad Block 수 — NAND 열화 지표',
+    },
+
+    # ── NAND 마모 지표 ─────────────────────────────────────────────────
+    {
+        'name':    'df_patrol_relocated',
+        'source':  'vendor',
+        'lid':     0xDF,
+        'log_len': 512,
+        'offset':  0x10F,
+        'length':  8,
+        'endian':  'little',
+        'weight':  4.0,
+        'desc':    '[DFh 0x10F] Patrol Read Relocated Block 수',
+    },
+    {
+        'name':    'df_max_pe_cycles',
+        'source':  'vendor',
+        'lid':     0xDF,
+        'log_len': 512,
+        'offset':  0x119,
+        'length':  2,
+        'endian':  'little',
+        'weight':  3.0,
+        'desc':    '[DFh 0x119] Max PE Cycles — 최대 소거 횟수',
+    },
+    {
+        'name':    'df_slc_percent_used',
+        'source':  'vendor',
+        'lid':     0xDF,
+        'log_len': 512,
+        'offset':  0x104,
+        'length':  1,
+        'endian':  'little',
+        'weight':  3.0,
+        'desc':    '[DFh 0x104] SLC Buffer Percentage Used',
+    },
+    {
+        'name':    'df_avg_pe_cycles',
+        'source':  'vendor',
+        'lid':     0xDF,
+        'log_len': 512,
+        'offset':  0x117,
+        'length':  2,
+        'endian':  'little',
+        'weight':  2.0,
+        'desc':    '[DFh 0x117] Average PE Cycles — 평균 소거 횟수',
+    },
+
+    # ── I/O 볼륨 ──────────────────────────────────────────────────────
+    {
+        'name':    'df_nand_written',
+        'source':  'vendor',
+        'lid':     0xDF,
+        'log_len': 512,
+        'offset':  0xE0,
+        'length':  8,
+        'endian':  'little',
+        'weight':  1.5,
+        'desc':    '[DFh 0xE0] Main NAND 기록량 (512B×1000 단위, 하위 64-bit)',
+    },
+    {
+        'name':    'df_slc_written',
+        'source':  'vendor',
+        'lid':     0xDF,
+        'log_len': 512,
+        'offset':  0xF4,
+        'length':  8,
+        'endian':  'little',
+        'weight':  1.0,
+        'desc':    '[DFh 0xF4] SLC Buffer 기록량 (512B×1000 단위, 하위 64-bit)',
+    },
 ]
