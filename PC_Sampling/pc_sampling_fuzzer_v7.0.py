@@ -1216,10 +1216,19 @@ class NVMeStateMonitor:
         result: Dict[str, int] = {}
 
         # ── SMART-log ──────────────────────────────────────────────
+        # JSON 옵션 없는 구버전 nvme-cli 대응: 텍스트 출력 파싱
+        # state_fields.py의 'key'는 JSON 키 기준 — 텍스트 키와 다른 경우 아래 매핑 사용
+        _SMART_TEXT_KEY_MAP = {
+            'percent_used':       'percentage_used',
+            'avail_spare':        'available_spare',
+            'spare_thresh':       'available_spare_threshold',
+            'warning_temp_time':  'warning_temperature_time',
+            'critical_comp_time': 'critical_composite_temperature_time',
+        }
         if self._smart_needed:
             try:
                 proc = subprocess.run(
-                    ['nvme', 'smart-log', self._device, '-o', 'json'],
+                    ['nvme', 'smart-log', self._device],
                     capture_output=True, timeout=5,
                 )
                 if proc.returncode != 0:
@@ -1227,16 +1236,31 @@ class NVMeStateMonitor:
                                 f"(rc={proc.returncode}): "
                                 f"{proc.stderr.decode(errors='replace').strip()}")
                     return None
-                smart = json.loads(proc.stdout)
+                # 텍스트 파싱: "key_name   : value" 형식
+                # 키 정규화: 소문자 + 공백→밑줄, 값: 첫 토큰에서 % / 쉼표 제거
+                smart_text: Dict[str, int] = {}
+                for line in proc.stdout.decode(errors='replace').splitlines():
+                    if ':' not in line:
+                        continue
+                    k, _, v = line.partition(':')
+                    k = k.strip().lower().replace(' ', '_')
+                    v = v.strip().split()[0].rstrip('%').replace(',', '') if v.strip() else ''
+                    try:
+                        smart_text[k] = int(v)
+                    except ValueError:
+                        pass
+                hit = 0
                 for f in self._fields:
-                    if f['source'] == 'smart':
-                        raw_val = smart.get(f['key'], 0)
-                        # 일부 구현에서 {"lo": N, "hi": 0} dict로 반환하는 경우 처리
-                        if isinstance(raw_val, dict):
-                            raw_val = raw_val.get('lo', 0)
-                        result[f['name']] = int(raw_val)
-                log.info(f"[State] smart-log OK: "
-                         f"{len([f for f in self._fields if f['source']=='smart'])}개 필드")
+                    if f['source'] != 'smart':
+                        continue
+                    text_key = _SMART_TEXT_KEY_MAP.get(f['key'], f['key'])
+                    if text_key in smart_text:
+                        result[f['name']] = smart_text[text_key]
+                        hit += 1
+                    else:
+                        log.warning(f"[State] smart-log 키 없음: "
+                                    f"field={f['name']} text_key={text_key}")
+                log.info(f"[State] smart-log OK: {hit}개 필드 수집")
             except Exception as e:
                 log.warning(f"[State] smart-log 예외: {e}")
                 return None
