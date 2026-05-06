@@ -1222,6 +1222,11 @@ class NVMeStateMonitor:
                     ['nvme', 'smart-log', self._device, '-o', 'json'],
                     capture_output=True, timeout=5,
                 )
+                if proc.returncode != 0:
+                    log.warning(f"[State] smart-log 실패 "
+                                f"(rc={proc.returncode}): "
+                                f"{proc.stderr.decode(errors='replace').strip()}")
+                    return None
                 smart = json.loads(proc.stdout)
                 for f in self._fields:
                     if f['source'] == 'smart':
@@ -1230,8 +1235,10 @@ class NVMeStateMonitor:
                         if isinstance(raw_val, dict):
                             raw_val = raw_val.get('lo', 0)
                         result[f['name']] = int(raw_val)
+                log.info(f"[State] smart-log OK: "
+                         f"{len([f for f in self._fields if f['source']=='smart'])}개 필드")
             except Exception as e:
-                log.debug(f"[State] smart-log 실패: {e}")
+                log.warning(f"[State] smart-log 예외: {e}")
                 return None
 
         # ── Vendor log (LID별 1회) ─────────────────────────────────
@@ -1246,25 +1253,31 @@ class NVMeStateMonitor:
                     capture_output=True, timeout=5,
                 )
                 if proc.returncode != 0:
-                    log.debug(f"[State] get-log LID={lid:#x} 실패 "
-                              f"(rc={proc.returncode}): {proc.stderr.decode(errors='replace').strip()}")
+                    log.warning(f"[State] get-log LID={lid:#x} 실패 "
+                                f"(rc={proc.returncode}): "
+                                f"{proc.stderr.decode(errors='replace').strip()}")
                     continue
                 raw = proc.stdout
+                ok_fields = 0
                 for f in self._fields:
                     if f['source'] == 'vendor' and f.get('lid') == lid:
                         start = f['offset']
                         end   = start + f['length']
                         if end > len(raw):
-                            log.debug(f"[State] vendor log 짧음: "
-                                      f"lid={lid:#x} got={len(raw)} need={end}")
+                            log.warning(f"[State] LID={lid:#x} 응답 짧음: "
+                                        f"got={len(raw)}B need={end}B "
+                                        f"field={f['name']}")
                             continue
                         val = int.from_bytes(raw[start:end],
                                              f.get('endian', 'little'))
                         result[f['name']] = val
+                        ok_fields += 1
+                log.info(f"[State] get-log LID={lid:#x} OK: {ok_fields}개 필드")
             except Exception as e:
-                log.debug(f"[State] get-log LID={lid:#x} 예외: {e}")
+                log.warning(f"[State] get-log LID={lid:#x} 예외: {e}")
                 continue
 
+        log.info(f"[State] capture 완료: 총 {len(result)}개 필드 수집")
         return result
 
     def delta(self,
