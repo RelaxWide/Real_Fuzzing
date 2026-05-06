@@ -1219,7 +1219,7 @@ class NVMeStateMonitor:
         if self._smart_needed:
             try:
                 proc = subprocess.run(
-                    ['nvme', 'smart-log', self._device, '--output-format=json'],
+                    ['nvme', 'smart-log', self._device, '-o', 'json'],
                     capture_output=True, timeout=5,
                 )
                 smart = json.loads(proc.stdout)
@@ -1235,6 +1235,7 @@ class NVMeStateMonitor:
                 return None
 
         # ── Vendor log (LID별 1회) ─────────────────────────────────
+        # LID 실패 시 해당 LID 필드만 skip — 다른 LID/SMART 결과는 유지
         for (lid, log_len) in self._vendor_lids:
             try:
                 proc = subprocess.run(
@@ -1244,6 +1245,10 @@ class NVMeStateMonitor:
                      '--raw-binary'],
                     capture_output=True, timeout=5,
                 )
+                if proc.returncode != 0:
+                    log.debug(f"[State] get-log LID={lid:#x} 실패 "
+                              f"(rc={proc.returncode}): {proc.stderr.decode(errors='replace').strip()}")
+                    continue
                 raw = proc.stdout
                 for f in self._fields:
                     if f['source'] == 'vendor' and f.get('lid') == lid:
@@ -1252,13 +1257,13 @@ class NVMeStateMonitor:
                         if end > len(raw):
                             log.debug(f"[State] vendor log 짧음: "
                                       f"lid={lid:#x} got={len(raw)} need={end}")
-                            return None
+                            continue
                         val = int.from_bytes(raw[start:end],
                                              f.get('endian', 'little'))
                         result[f['name']] = val
             except Exception as e:
-                log.debug(f"[State] get-log LID={lid:#x} 실패: {e}")
-                return None
+                log.debug(f"[State] get-log LID={lid:#x} 예외: {e}")
+                continue
 
         return result
 
