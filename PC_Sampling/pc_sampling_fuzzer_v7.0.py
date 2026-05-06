@@ -2780,14 +2780,7 @@ class NVMeFuzzer:
         return factor
 
     def _select_seed(self) -> Optional[Seed]:
-        """v4: 에너지 기반 가중치 랜덤 선택.
-        v7.0: 30% 확률로 state corpus에서 시퀀스 replay 선택."""
-        # v7.0: state corpus 선택 — 30% 확률
-        if (self.config.state_enabled
-                and self.state_corpus
-                and random.random() < 0.30):
-            return self._select_state_entry()
-
+        """v4: 에너지 기반 가중치 랜덤 선택."""
         if not self.corpus:
             return None
 
@@ -2812,72 +2805,6 @@ class NVMeFuzzer:
         self.corpus[-1].exec_count += 1
         return self.corpus[-1]
 
-    def _select_state_entry(self) -> Optional[Seed]:
-        """state corpus에서 energy-weighted로 StateCorpusEntry를 선택,
-        시퀀스를 replay한 뒤 마지막 seed를 반환한다 (suffix mutation 대상).
-        replay 실행 중 timeout 발생 시 None 반환."""
-        # energy-weighted 선택
-        total = sum(e.energy for e in self.state_corpus)
-        r = random.uniform(0, total) if total > 0 else 0
-        cumulative = 0.0
-        entry = self.state_corpus[-1]
-        for e in self.state_corpus:
-            cumulative += e.energy
-            if r <= cumulative:
-                entry = e
-                break
-        entry.exec_count += 1
-        # AFLfast energy 감쇠
-        ratio = self.executions / max(entry.exec_count, 1)
-        entry.energy = min(16.0, max(1.0, 2 ** int(math.log2(ratio + 1))))
-
-        if not entry.sequence:
-            return None
-
-        # 시퀀스 replay (prefix) — 마지막 명령 제외
-        prefix = entry.sequence[:-1]
-        last   = entry.sequence[-1]
-
-        log.debug(f"[State-Replay] {entry.causes}  "
-                  f"seq={len(entry.sequence)}  score={entry.score:.1f}")
-
-        for hist_item in prefix:
-            if hist_item.get('kind') != 'nvme':
-                continue
-            # hist_item은 _cmd_history 포맷: opcode, cdw10-15, data 등
-            _replay_seed = Seed(
-                data=hist_item.get('data') or b'\x00' * 4,
-                cmd=next((c for c in self.commands
-                          if c.opcode == hist_item.get('opcode', 0)), None)
-                    or self.commands[0],
-                cdw10=hist_item.get('cdw10', 0),
-                cdw11=hist_item.get('cdw11', 0),
-                cdw12=hist_item.get('cdw12', 0),
-                cdw13=hist_item.get('cdw13', 0),
-                cdw14=hist_item.get('cdw14', 0),
-                cdw15=hist_item.get('cdw15', 0),
-            )
-            rc = self._send_nvme_command(_replay_seed.data, _replay_seed)
-            self.sampler.stop_sampling()
-            if rc == self.RC_TIMEOUT:
-                self._handle_timeout_crash(_replay_seed, _replay_seed.data)
-                return None
-
-        # 마지막 명령을 일반 Seed로 변환해 반환 → main loop에서 mutation 적용
-        last_seed = Seed(
-            data=last.get('data') or b'\x00' * 4,
-            cmd=next((c for c in self.commands
-                      if c.opcode == last.get('opcode', 0)), None)
-                or self.commands[0],
-            cdw10=last.get('cdw10', 0),
-            cdw11=last.get('cdw11', 0),
-            cdw12=last.get('cdw12', 0),
-            cdw13=last.get('cdw13', 0),
-            cdw14=last.get('cdw14', 0),
-            cdw15=last.get('cdw15', 0),
-        )
-        return last_seed
-
     def _epoch_reset_corpus(self):
         """v6.1: Epoch 경계에서 corpus를 favored+초기 시드만 유지하고 energy 감쇠.
 
@@ -2895,6 +2822,29 @@ class NVMeFuzzer:
         after = len(self.corpus)
         log.info(f"[Epoch] corpus reset: {before} → {after} "
                  f"(favored+initial 유지, energy 리셋, epoch={self.executions:,})")
+
+    def _cull_state_corpus(self):
+        """state corpus 관리: 크기 제한 + 동일 bucket 중복 제거."""
+        MAX_STATE_CORPUS = 50
+
+        # 1) 동일 causes(bucket) → score 높은 것만 유지
+        seen: dict[str, StateCorpusEntry] = {}
+        for entry in self.state_corpus:
+            key = '|'.join(sorted(entry.causes))
+            if key not in seen or entry.score > seen[key].score:
+                seen[key] = entry
+        deduped = list(seen.values())
+
+        # 2) 크기 초과 시 score 낮은 것 제거
+        if len(deduped) > MAX_STATE_CORPUS:
+            deduped.sort(key=lambda e: e.score, reverse=True)
+            deduped = deduped[:MAX_STATE_CORPUS]
+
+        before = len(self.state_corpus)
+        self.state_corpus = deduped
+        after = len(self.state_corpus)
+        if before != after:
+            log.debug(f"[State-Cull] {before} → {after} entries")
 
     def _cull_corpus(self):
         """v4.3: AFL++ 방식 corpus culling (v4.5+: PC 주소 기반).
@@ -7020,6 +6970,8 @@ class NVMeFuzzer:
 
                 if self.executions % 1000 == 0 and self.executions > 0:
                     self._cull_corpus()
+                    if self.config.state_enabled:
+                        self._cull_state_corpus()
                     self._mopt_update_phase()
 
                 if (CORPUS_EPOCH_SIZE > 0
