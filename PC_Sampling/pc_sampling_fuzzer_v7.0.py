@@ -2193,6 +2193,18 @@ class NVMeFuzzer:
         self._state_snap_prev: Optional[Dict[str, int]] = None
         self.state_corpus_dir: Path = self.output_dir / 'state_corpus'
 
+        # CSFuzz §III-C/D: dynamic corpus selection
+        self._csfuzz_p: float = 0.5            # P(C1 선택), [0.1, 0.9]
+        self._csfuzz_a: float = 1.0            # reward 파라미터
+        self._csfuzz_b: float = 1.0
+        self._csfuzz_c1_rewards: List[int] = [] # C1 선택 후 C1 growth 기록
+        self._csfuzz_c2_rewards: List[int] = [] # C2 선택 후 C2 growth 기록
+        self._csfuzz_last_from: str = 'c1'     # 마지막 선택 corpus
+        self._csfuzz_pre_c1_size: int = 0
+        self._csfuzz_pre_c2_size: int = 0
+        # §III-D: bucket별 fuzz count
+        self._state_bucket_fuzz_count: Dict[str, int] = {}
+
     @staticmethod
     def _tracking_label(cmd: 'NVMeCommand', seed: 'Seed') -> str:
         """v4.4: 실제 실행 내용 기준 추적 키 생성.
@@ -2891,6 +2903,94 @@ class NVMeFuzzer:
         after = len(self.state_corpus)
         if before != after:
             log.debug(f"[State-Cull] {before} → {after} entries")
+
+    # ------------------------------------------------------------------ #
+    # CSFuzz §III-C/D: corpus selection + seed prioritization             #
+    # ------------------------------------------------------------------ #
+
+    def _select_state_entry_csfuzz(self) -> 'Optional[StateCorpusEntry]':
+        """CSFuzz §III-D 수식 (6): state corpus에서 entry를 확률적으로 선택."""
+        if not self.state_corpus:
+            return None
+        _a = 0.5
+        t_sum = sum(e.found_at for e in self.state_corpus)
+        weights = []
+        for entry in self.state_corpus:
+            causes = entry.causes
+            if not causes:
+                weights.append(1.0)
+                continue
+            fuzz_cnts = [self._state_bucket_fuzz_count.get(b, 0) for b in causes]
+            min_fuzz  = min(fuzz_cnts)
+            sum_inv_n = sum(1.0 / max(n, 1) for n in fuzz_cnts)
+            # term1: min_fuzz=0이면 never selected → max priority
+            if min_fuzz == 0:
+                term1 = 1.0 - _a
+            else:
+                denom = min_fuzz * sum_inv_n
+                term1 = (1 - _a) / max(denom, 1e-9)
+            # term2: recently added → prefer large found_at
+            term2 = _a * entry.found_at / max(t_sum, 1)
+            weights.append(term1 + term2)
+        total = sum(weights)
+        if total <= 0:
+            return random.choice(self.state_corpus)
+        r = random.uniform(0, total)
+        cumul = 0.0
+        for entry, w in zip(self.state_corpus, weights):
+            cumul += w
+            if r <= cumul:
+                return entry
+        return self.state_corpus[-1]
+
+    def _replay_state_sequence(self, entry: 'StateCorpusEntry') -> bool:
+        """StateCorpusEntry의 명령 시퀀스를 SSD에 재실행해 상태 재현.
+        _cmd_history / executions 는 수정하지 않음 (context 설정 전용).
+        타임아웃 발생 시 False를 반환."""
+        log.info(f"[State-Replay] causes={entry.causes} "
+                 f"seq={len(entry.sequence)} score={entry.score:.1f}")
+        # bucket fuzz count 갱신
+        for b in entry.causes:
+            self._state_bucket_fuzz_count[b] = \
+                self._state_bucket_fuzz_count.get(b, 0) + 1
+        entry.exec_count += 1
+
+        for hist_item in entry.sequence:
+            if hist_item.get('kind') != 'nvme':
+                continue
+            _data = hist_item.get('data') or b'\x00' * 4
+            _cmd  = next((c for c in self.commands
+                          if c.opcode == hist_item.get('opcode', 0)), None) \
+                    or self.commands[0]
+            _seed = Seed(
+                data=_data, cmd=_cmd,
+                cdw2=hist_item.get('cdw2', 0),  cdw3=hist_item.get('cdw3', 0),
+                cdw10=hist_item.get('cdw10', 0), cdw11=hist_item.get('cdw11', 0),
+                cdw12=hist_item.get('cdw12', 0), cdw13=hist_item.get('cdw13', 0),
+                cdw14=hist_item.get('cdw14', 0), cdw15=hist_item.get('cdw15', 0),
+            )
+            rc = self._send_nvme_command(_data, _seed)
+            self.sampler.stop_sampling()
+            if rc == self.RC_TIMEOUT:
+                self._handle_timeout_crash(_seed, _data)
+                return False
+        return True
+
+    def _update_csfuzz_p(self):
+        """CSFuzz §III-C 수식 (4)/(5): 1000회 interval마다 corpus selection 확률 p 갱신."""
+        NC1 = max(len(self.corpus), 1)
+        NC2 = max(len(self.state_corpus), 1)
+        m1  = (sum(self._csfuzz_c1_rewards) / len(self._csfuzz_c1_rewards)
+               if self._csfuzz_c1_rewards else 0.0)
+        m2  = (sum(self._csfuzz_c2_rewards) / len(self._csfuzz_c2_rewards)
+               if self._csfuzz_c2_rewards else 0.0)
+        delta = (self._csfuzz_a * m1 / NC1
+                 - self._csfuzz_b * m2 / NC2) * (NC1 + NC2)
+        self._csfuzz_p = max(0.1, min(0.9, self._csfuzz_p + delta))
+        log.info(f"[CSFuzz-p] p={self._csfuzz_p:.3f} δ={delta:.4f} "
+                 f"m1={m1:.4f} m2={m2:.4f} NC1={NC1} NC2={NC2}")
+        self._csfuzz_c1_rewards.clear()
+        self._csfuzz_c2_rewards.clear()
 
     def _cull_corpus(self):
         """v4.3: AFL++ 방식 corpus culling (v4.5+: PC 주소 기반).
@@ -6698,6 +6798,21 @@ class NVMeFuzzer:
                         is_det_stage = False
 
                 if not is_det_stage:
+                    # CSFuzz §III-C: corpus selection probability
+                    self._csfuzz_pre_c1_size = len(self.corpus)
+                    self._csfuzz_pre_c2_size = len(self.state_corpus)
+                    if (self.config.state_enabled
+                            and self.state_corpus
+                            and random.random() >= self._csfuzz_p):
+                        # C2(state corpus) 선택 → 시퀀스 replay 후 정상 seed 선택
+                        self._csfuzz_last_from = 'c2'
+                        _sc_entry = self._select_state_entry_csfuzz()
+                        if _sc_entry is not None:
+                            if not self._replay_state_sequence(_sc_entry):
+                                continue  # replay 중 timeout
+                    else:
+                        self._csfuzz_last_from = 'c1'
+
                     # v4: Power Schedule 기반 시드 선택 + CDW 변형
                     if self.corpus and random.random() >= self.config.random_gen_ratio:
                         base_seed = self._select_seed()
@@ -6923,6 +7038,9 @@ class NVMeFuzzer:
                         covered_pcs=set(self.sampler.current_trace),
                     )
                     self.corpus.append(new_seed)
+                    # CSFuzz C1 reward 기록
+                    if self.config.state_enabled and self._csfuzz_last_from == 'c1':
+                        self._csfuzz_c1_rewards.append(1)
 
                     # corpus 파일 저장 (CDW 메타데이터 포함)
                     input_hash = hashlib.md5(fuzz_data).hexdigest()[:12]
@@ -7006,6 +7124,9 @@ class NVMeFuzzer:
                                     found_at = self.executions,
                                 )
                                 self.state_corpus.append(_entry)
+                                # CSFuzz C2 reward 기록
+                                if self._csfuzz_last_from == 'c2':
+                                    self._csfuzz_c2_rewards.append(1)
                                 self._generate_state_replay_sh(_entry)
                                 log.warning(
                                     f"[+][State-Cov] {_entry.causes}  "
@@ -7018,6 +7139,8 @@ class NVMeFuzzer:
                     self._cull_corpus()
                     if self.config.state_enabled:
                         self._cull_state_corpus()
+                        if self.state_corpus:
+                            self._update_csfuzz_p()
                     self._mopt_update_phase()
 
                 if (CORPUS_EPOCH_SIZE > 0
