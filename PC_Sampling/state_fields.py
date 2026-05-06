@@ -63,14 +63,7 @@ STATE_FIELDS = [
         'weight': 5.0,
         'desc':   '[02h 9Ch] 에러 로그 엔트리 수 (단조증가)',
     },
-    {
-        'name':   'unsafe_shutdowns',
-        'source': 'smart',
-        'key':    'unsafe_shutdowns',
-        'weight': 8.0,
-        'desc':   '[02h 72h] 비정상 종료(power-fail) 횟수',
-    },
-
+    
     # ── 수명 지표 ─────────────────────────────────────────────────────
     {
         'name':   'percent_used',
@@ -85,38 +78,6 @@ STATE_FIELDS = [
         'key':    'avail_spare',
         'weight': 2.0,
         'desc':   '[02h 03h] 여유 스페어 블록 비율 (%) — 감소 방향 주목',
-    },
-
-    # ── 온도 지표 ─────────────────────────────────────────────────────
-    {
-        'name':   'warning_temp_time',
-        'source': 'smart',
-        'key':    'warning_temp_time',
-        'weight': 3.0,
-        'desc':   '[02h A0h] Warning Composite Temperature 초과 누적 시간(분)',
-    },
-    {
-        'name':   'critical_comp_time',
-        'source': 'smart',
-        'key':    'critical_comp_time',
-        'weight': 5.0,
-        'desc':   '[02h A4h] Critical Composite Temperature 초과 누적 시간(분)',
-    },
-
-    # ── I/O 볼륨 (퍼저 I/O 패턴 다양성 반영) ─────────────────────────
-    {
-        'name':   'data_units_written',
-        'source': 'smart',
-        'key':    'data_units_written',
-        'weight': 1.0,
-        'desc':   '[02h 48h] 호스트 기록량 (512B×1000 단위, 128-bit)',
-    },
-    {
-        'name':   'data_units_read',
-        'source': 'smart',
-        'key':    'data_units_read',
-        'weight': 1.0,
-        'desc':   '[02h 32h] 호스트 읽기량 (512B×1000 단위, 128-bit)',
     },
 
     # ══════════════════════════════════════════════════════════════════
