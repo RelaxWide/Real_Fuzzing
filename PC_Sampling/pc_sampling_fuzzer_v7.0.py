@@ -4562,6 +4562,8 @@ class NVMeFuzzer:
         #    NOPS(PS3/PS4): 커맨드 수신 시 컨트롤러 wake-up 후 설정된 PS값 반환.
         if combo.pcie_d == PCIeDState.D3:
             res['nvme_ps'] = 'skipped (D3hot: NVMe BAR inaccessible)'
+        elif combo.pcie_l == PCIeLState.L1_2:
+            res['nvme_ps'] = 'skipped (L1.2: link-down, clock off)'
         else:
             try:
                 r = subprocess.run(
@@ -4592,26 +4594,33 @@ class NVMeFuzzer:
                 res['nvme_ps'] = f"ERR({e})"
 
         # 2. PMCSR readback — D-state bits[1:0]
+        #    L1.2+D0: 클락 off로 config space = 0xFFFF → bits[1:0]=3 = 오독 가능.
+        #    0xFFFF는 링크 단절로 판정, D0으로 간주.
         if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
-            v = self._setpci_read(self._pcie_bdf, self._pcie_pm_cap_offset + 0x04, 'w')
-            if v is not None:
-                dval  = v & 0x3
-                dname = {0: 'D0', 1: 'D1', 2: 'D2', 3: 'D3hot'}.get(dval, 'D?')
-                exp   = 3 if combo.pcie_d == PCIeDState.D3 else 0
-                chk   = 'OK' if dval == exp else f'MISMATCH(exp={exp})'
-                res['d_state'] = f"{dname}(raw={dval:#04x}) {chk}"
+            if combo.pcie_l == PCIeLState.L1_2 and combo.pcie_d == PCIeDState.D0:
+                res['d_state'] = 'D0(L1.2 link-down: unreadable)'
             else:
-                res['d_state'] = 'read_fail'
+                v = self._setpci_read(self._pcie_bdf, self._pcie_pm_cap_offset + 0x04, 'w')
+                if v is not None and v != 0xFFFF:
+                    dval  = v & 0x3
+                    dname = {0: 'D0', 1: 'D1', 2: 'D2', 3: 'D3hot'}.get(dval, 'D?')
+                    exp   = 3 if combo.pcie_d == PCIeDState.D3 else 0
+                    chk   = 'OK' if dval == exp else f'MISMATCH(exp={exp})'
+                    res['d_state'] = f"{dname}(raw={v:#06x}) {chk}"
+                else:
+                    res['d_state'] = 'read_fail'
 
         # 3. LNKCTL readback — EP ASPM bits[1:0]
         if self._pcie_bdf and self._pcie_cap_offset is not None:
             v = self._setpci_read(self._pcie_bdf, self._pcie_cap_offset + 0x10, 'w')
-            if v is not None:
+            if v is not None and v != 0xFFFF:
                 aspm  = v & 0x3
                 aname = {0: 'L0/disabled', 1: 'L0s', 2: 'L1', 3: 'L0s+L1'}.get(aspm, '?')
                 exp   = 0 if combo.pcie_l == PCIeLState.L0 else 2
                 chk   = 'OK' if aspm == exp else f'MISMATCH(exp={exp})'
                 res['l_state_ep'] = f"EP ASPM={aname}(raw={aspm:#04x}) {chk}"
+            elif combo.pcie_l == PCIeLState.L1_2:
+                res['l_state_ep'] = 'EP L1.2(link-down: unreadable)'
             else:
                 res['l_state_ep'] = 'read_fail'
 
