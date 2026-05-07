@@ -4555,12 +4555,25 @@ class NVMeFuzzer:
         except Exception as e:
             res['pmu'] = f"ERR({e})"
 
-        # 1. nvme get-feature FID=0x02 — PS 진입 확인 (PMU 측정 후 수행)
-        #    D3hot: NVMe BAR 접근 불가 → 커널 NVMe 드라이버가 ioctl을 blocking하여
-        #           SIGKILL도 D-sleep 중엔 무시됨 → 드라이버 자체 타임아웃(30~60s)까지 대기.
-        #           D-state는 setpci PMCSR readback으로 이미 검증하므로 skip.
-        #    NOPS(PS3/PS4): 커맨드 수신 시 컨트롤러 wake-up 후 설정된 PS값 반환.
-        _link_down = (res.get('d_state', '').find('link-down') >= 0)
+        # 1. PMCSR readback — D-state bits[1:0] (NVMe 명령 전 먼저 실행해 link-down 판정)
+        #    L1.2+PSx: 클락 off 시 config space = 0xFFFF → link-down으로 판정.
+        if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
+            v = self._setpci_read(self._pcie_bdf, self._pcie_pm_cap_offset + 0x04, 'w')
+            if v is not None and v != 0xFFFF:
+                dval  = v & 0x3
+                dname = {0: 'D0', 1: 'D1', 2: 'D2', 3: 'D3hot'}.get(dval, 'D?')
+                exp   = 3 if combo.pcie_d == PCIeDState.D3 else 0
+                chk   = 'OK' if dval == exp else f'MISMATCH(exp={exp})'
+                res['d_state'] = f"{dname}(raw={v:#06x}) {chk}"
+            elif v == 0xFFFF:
+                exp_d = 'D3hot' if combo.pcie_d == PCIeDState.D3 else 'D0'
+                res['d_state'] = f'{exp_d}(link-down: clock off)'
+            else:
+                res['d_state'] = 'read_fail'
+
+        # 2. nvme get-feature FID=0x02 — PS 진입 확인
+        #    D3hot / link-down: NVMe BAR 접근 불가 → 커널 드라이버 blocking(30~60s) 방지.
+        _link_down = 'link-down' in res.get('d_state', '')
         if combo.pcie_d == PCIeDState.D3:
             res['nvme_ps'] = 'skipped (D3hot: NVMe BAR inaccessible)'
         elif _link_down:
@@ -4594,23 +4607,6 @@ class NVMeFuzzer:
             except Exception as e:
                 res['nvme_ps'] = f"ERR({e})"
 
-        # 2. PMCSR readback — D-state bits[1:0]
-        #    L1.2+D0: 클락 off로 config space = 0xFFFF → bits[1:0]=3 = 오독 가능.
-        #    0xFFFF는 링크 단절로 판정, D0으로 간주.
-        if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
-            v = self._setpci_read(self._pcie_bdf, self._pcie_pm_cap_offset + 0x04, 'w')
-            if v is not None and v != 0xFFFF:
-                dval  = v & 0x3
-                dname = {0: 'D0', 1: 'D1', 2: 'D2', 3: 'D3hot'}.get(dval, 'D?')
-                exp   = 3 if combo.pcie_d == PCIeDState.D3 else 0
-                chk   = 'OK' if dval == exp else f'MISMATCH(exp={exp})'
-                res['d_state'] = f"{dname}(raw={v:#06x}) {chk}"
-            elif v == 0xFFFF:
-                # L1.2+PSx: 디바이스가 CLKREQ# deassert → 클락 off → config space 불가
-                exp_d = 'D3hot' if combo.pcie_d == PCIeDState.D3 else 'D0'
-                res['d_state'] = f'{exp_d}(link-down: clock off)'
-            else:
-                res['d_state'] = 'read_fail'
 
         # 3. LNKCTL readback — EP ASPM bits[1:0]
         if self._pcie_bdf and self._pcie_cap_offset is not None:
