@@ -4797,20 +4797,26 @@ class NVMeFuzzer:
                     time.sleep(D3_RESTORE_SETTLE)
                 elif combo.pcie_l == PCIeLState.L1_2:
                     # L1.2 복귀: L0 경로(pin16 assert→poll→레지스터) → NVMe 재등록 대기 → PS0
-                    # L1.2에서는 클락이 꺼져있어 L1 경로의 첫 setpci들이 silently 실패.
-                    # L0 경로만 pin16 assert를 가장 먼저 수행하므로 L1.2 복귀에 적합.
                     self._set_pcie_l_state(PCIeLState.L0)
+                    # config space 복귀 확인
+                    _lnkctl = self._setpci_read(self._pcie_bdf, self._pcie_cap_offset + 0x10, 'w') if self._pcie_bdf and self._pcie_cap_offset else None
+                    log.warning(f"[PM] L1.2→L0 후 LNKCTL={_lnkctl:#06x if _lnkctl is not None and _lnkctl != 0xFFFF else repr(_lnkctl)}")
                     _dev = self.config.nvme_device
                     _deadline = time.monotonic() + 10.0
+                    _nvme_ok = False
                     while time.monotonic() < _deadline:
                         time.sleep(0.2)
                         if os.path.exists(_dev):
                             _r = subprocess.run(
                                 ['nvme', 'id-ctrl', _dev],
                                 capture_output=True, timeout=3)
+                            log.warning(f"[PM] id-ctrl rc={_r.returncode}")
                             if _r.returncode == 0:
+                                _nvme_ok = True
                                 break
-                    else:
+                        else:
+                            log.warning(f"[PM] {_dev} 아직 없음")
+                    if not _nvme_ok:
                         log.warning(f"[PM] L1.2 복귀 후 {_dev} 응답 없음 (10s timeout)")
                         ok_restore = False
                     if ok_restore:
