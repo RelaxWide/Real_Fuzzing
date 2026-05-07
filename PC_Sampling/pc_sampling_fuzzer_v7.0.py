@@ -1200,9 +1200,11 @@ class NVMeStateMonitor:
             (f['lid'], f['log_len'])
             for f in fields if f['source'] == 'vendor'
         }
-        # weight 테이블
+        # 정적 weight (state_fields.py 정의값 — 초기 힌트)
         self._weights: Dict[str, float] = {f['name']: f.get('weight', 1.0)
                                             for f in fields}
+        # 동적 weight 보정: 변화 횟수 누적 → 자주 바뀌는 필드일수록 weight 감소
+        self._change_counts: Dict[str, int] = {f['name']: 0 for f in fields}
         # security_recv: (secp, spsp, nsid) → max_size
         self._sec_groups: Dict[tuple, int] = {}
         for f in fields:
@@ -1423,6 +1425,18 @@ class NVMeStateMonitor:
             name: after.get(name, 0) - before.get(name, 0)
             for name in self._weights
         }
+        # 변화 횟수 누적 (delta 호출마다 — before/after 비교 시점)
+        for name, diff in changes.items():
+            if diff != 0:
+                self._change_counts[name] = self._change_counts.get(name, 0) + 1
+
+        # 동적 effective weight: static_weight / log2(2 + change_count)
+        # 자주 바뀌는 필드일수록 weight 자동 감소
+        effective_weights = {
+            name: self._weights[name] / math.log2(2 + self._change_counts.get(name, 0))
+            for name in self._weights
+        }
+
         # CSFuzz §III-B: 각 필드를 초기값 기준 power-of-2 구간으로 버킷화
         buckets: List[str] = []
         init_deltas: Dict[str, int] = {}
@@ -1436,7 +1450,7 @@ class NVMeStateMonitor:
             buckets.append(self._adaptive_bucket(name, init, current))
         return NVMeStateDelta(
             changes=changes,
-            weights=dict(self._weights),
+            weights=effective_weights,
             buckets=buckets,
             init_deltas=init_deltas,
         )
@@ -3226,8 +3240,8 @@ class NVMeFuzzer:
         """StateCorpusEntry의 명령 시퀀스를 SSD에 재실행해 상태 재현.
         _cmd_history / executions 는 수정하지 않음 (context 설정 전용).
         타임아웃 발생 시 False를 반환."""
-        log.info(f"[State-Replay] causes={entry.causes} "
-                 f"seq={len(entry.sequence)} score={entry.score:.1f}")
+        log.warning(f"[State-Replay] found_at={entry.found_at:,}  "
+                    f"seq={len(entry.sequence)}  score={entry.score:.1f}")
         # bucket fuzz count 갱신
         for b in entry.causes:
             self._state_bucket_fuzz_count[b] = \
@@ -6167,7 +6181,7 @@ class NVMeFuzzer:
 
             ax.set_xlabel('Executions')
             ax.set_ylabel('Coverage (%)')
-            ax.set_title('Coverage Growth — PC Sampling Fuzzer v5.6')
+            ax.set_title('Coverage Growth')
             ax.legend(loc='lower right')
             ax.set_ylim(0, max(max(c_pcts, default=0), max(f_pcts, default=0)) * 1.15 + 1)
             ax.grid(True, alpha=0.3)
@@ -6219,7 +6233,7 @@ class NVMeFuzzer:
             ax2.set_xticklabels(tick_labels, fontsize=8)
             ax2.set_xlabel(f'Elapsed time ({_unit})', fontsize=9)
 
-            plt.tight_layout()
+            fig.subplots_adjust(top=0.85, bottom=0.12, left=0.08, right=0.97)
             growth_file = graph_dir / 'coverage_growth.png'
             plt.savefig(growth_file, dpi=150, bbox_inches='tight')
             plt.close()
@@ -6618,7 +6632,7 @@ class NVMeFuzzer:
         total_execs = self.executions or 1
 
         fig, axes = plt.subplots(1, 3, figsize=(18, max(4, len(active_ops) * 0.32 + 2.0)))
-        fig.suptitle('Mutation Effectiveness — PC Sampling Fuzzer v5.6',
+        fig.suptitle('Mutation Effectiveness',
                      fontsize=13, fontweight='bold')
 
         # ---- subplot 1: MOpt operator efficiency (finds / uses ratio) ----
@@ -7341,6 +7355,12 @@ class NVMeFuzzer:
                         covered_pcs=_seed_covered,
                     )
                     self.corpus.append(new_seed)
+                    _cov_label = "BB" if (self._sa_loaded and self._sa_bb_starts) else "PC"
+                    log.warning(
+                        f"[+][Edge-Cov] cmd={cmd.name}  "
+                        f"new_{_cov_label}={new_pcs}  "
+                        f"total_{_cov_label}={len(self._sa_covered_bbs) if (self._sa_loaded and self._sa_bb_starts) else len(self.sampler.global_coverage)}  "
+                        f"corpus={len(self.corpus)}  exec={self.executions:,}")
                     # CSFuzz C1 reward 기록
                     if self.config.state_enabled and self._csfuzz_last_from == 'c1':
                         self._csfuzz_c1_rewards.append(1)
