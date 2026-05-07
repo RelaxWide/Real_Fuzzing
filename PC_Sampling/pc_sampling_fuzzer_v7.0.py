@@ -4796,17 +4796,26 @@ class NVMeFuzzer:
                     ok_restore = self._pm_d3_safe_restore()
                     time.sleep(D3_RESTORE_SETTLE)
                 elif combo.pcie_l == PCIeLState.L1_2:
-                    # L1.2 복귀 순서: CLKREQ# assert → L1(클락 on) → PS0 → L0
-                    # CLKREQ# assert 후 링크는 L1으로 전환(클락 on, NVMe 접근 가능).
-                    # L0 레지스터 쓰기(링크 재협상) 전에 PS0 먼저 전송해야 안정적.
+                    # L1.2 복귀: CLKREQ# assert → 커널 NVMe 드라이버 재등록 대기 → PS0 → L0
+                    # PMU GPIO로 클락을 직접 끊으면 커널 드라이버가 컨트롤러 리셋을 트리거.
+                    # /dev/nvme0 재등록 후 안정화까지 대기 필요.
                     self._set_pcie_l_state(PCIeLState.L1)   # CLKREQ# assert + L1 안착
-                    for _attempt in range(5):
-                        time.sleep(0.1)
-                        if self._pm_set_state(0):
-                            ok_restore = True
-                            break
+                    _dev = self.config.nvme_device
+                    _deadline = time.monotonic() + 10.0
+                    while time.monotonic() < _deadline:
+                        time.sleep(0.2)
+                        if os.path.exists(_dev):
+                            # 디바이스 존재 확인 후 id-ctrl로 응답 여부 검증
+                            _r = subprocess.run(
+                                ['nvme', 'id-ctrl', _dev],
+                                capture_output=True, timeout=3)
+                            if _r.returncode == 0:
+                                break
                     else:
+                        log.warning(f"[PM] L1.2 복귀 후 {_dev} 응답 없음 (10s timeout)")
                         ok_restore = False
+                    if ok_restore:
+                        ok_restore = self._pm_set_state(0)
                     self._set_pcie_l_state(PCIeLState.L0)   # L1 → L0
                     time.sleep(RESTORE_SETTLE)
                 else:
