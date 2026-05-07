@@ -34,6 +34,11 @@ write_reg() {
     sudo setpci -s "$bdf" "${off}.${width}=${val}:${mask}" 2>/dev/null
 }
 
+nvme_ctrl_state() {
+    # NVMe 컨트롤러 커널 내부 상태: live / resetting / connecting / deleting / dead
+    cat /sys/class/nvme/nvme0/state 2>/dev/null || echo "unknown"
+}
+
 check_state() {
     local label=$1
     echo ""
@@ -57,6 +62,7 @@ check_state() {
     else
         echo "  $NVME_DEV    : MISSING"
     fi
+    echo "  NVMe state   : $(nvme_ctrl_state)"
 }
 
 pmu_clkreq_deassert() {
@@ -91,21 +97,26 @@ poll_nvme() {
     local deadline=$(( $(date +%s) + timeout_s ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
         if [ ! -e "$NVME_DEV" ]; then
-            log "[nvme-poll] $NVME_DEV 없음"
-            # sysfs 상태도 확인
+            log "[nvme-poll] $NVME_DEV 없음  state=$(nvme_ctrl_state)"
             if [ ! -e "/sys/bus/pci/devices/$BDF" ]; then
                 log "[nvme-poll] $BDF sysfs도 없음 — surprise removal 상태"
             fi
             sleep 1
             continue
         fi
-        local rc=0
+        local st rc=0
+        st=$(nvme_ctrl_state)
         sudo nvme id-ctrl "$NVME_DEV" >/dev/null 2>&1 || rc=$?
-        log "[nvme-poll] id-ctrl rc=$rc"
-        [ "$rc" -eq 0 ] && return 0
+        log "[nvme-poll] id-ctrl rc=$rc  state=$st"
+        # id-ctrl 성공 AND state=live 둘 다 확인
+        if [ "$rc" -eq 0 ] && [ "$st" = "live" ]; then
+            log "[nvme-poll] 완전 복귀 확인 (id-ctrl OK + state=live)"
+            return 0
+        fi
+        [ "$st" = "dead" ] && { log "[nvme-poll] state=dead — 드라이버 포기 상태"; return 1; }
         sleep 1
     done
-    log "[nvme-poll] ${timeout_s}s 안에 $NVME_DEV 미복귀"
+    log "[nvme-poll] ${timeout_s}s 안에 $NVME_DEV 미복귀  최종 state=$(nvme_ctrl_state)"
     return 1
 }
 
@@ -246,19 +257,46 @@ run_test() {
     check_state "복귀 완료 (PS${ps})"
 }
 
+# state=live 될 때까지 대기 (다음 사이클 진입 전 안전 확인)
+wait_nvme_live() {
+    local timeout_s=${1:-60}
+    local deadline=$(( $(date +%s) + timeout_s ))
+    log "[stabilize] NVMe state=live 대기 (최대 ${timeout_s}s)..."
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        local st
+        st=$(nvme_ctrl_state)
+        log "[stabilize] state=$st"
+        [ "$st" = "live" ] && { log "[stabilize] OK"; return 0; }
+        [ "$st" = "dead" ] && { log "[stabilize] state=dead — 복구 불가"; return 1; }
+        sleep 2
+    done
+    log "[stabilize] timeout — 최종 state=$(nvme_ctrl_state)"
+    return 1
+}
+
 case "$MODE" in
     ps0) run_test 0 ;;
     ps1) run_test 1 ;;
+    # ps0 두 번: 복귀 후 state=live 확인 후 재진입 — 두 번째 실패 여부 재현
+    twice)
+        log "=== PS0 첫 번째 ==="
+        run_test 0
+        log ""
+        wait_nvme_live 60
+        log ""
+        log "=== PS0 두 번째 (state=live 확인 후 재진입) ==="
+        run_test 0
+        ;;
     all)
         log "=== PS0 테스트 ==="
         run_test 0
-        sleep 2
+        wait_nvme_live 60
         log ""
         log "=== PS1 테스트 ==="
         run_test 1
         ;;
     *)
-        echo "Usage: $0 [ps0|ps1|all]"
+        echo "Usage: $0 [ps0|ps1|all|twice]"
         exit 1
         ;;
 esac
