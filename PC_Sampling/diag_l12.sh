@@ -14,6 +14,10 @@ PMU_PY="${PMU_PY:-$(dirname "$0")/pmu_4_1.py}"
 
 MODE="${1:-ps0}"
 
+BASELINE_STABLE_CHECKS="${BASELINE_STABLE_CHECKS:-5}"
+BASELINE_STABLE_INTERVAL="${BASELINE_STABLE_INTERVAL:-1}"
+BASELINE_SETTLE_S="${BASELINE_SETTLE_S:-5}"
+
 ts() { date '+%H:%M:%S.%3N'; }
 log() { echo "[$(ts)] $*"; }
 
@@ -29,6 +33,21 @@ write_reg() {
 
 nvme_ctrl_state() {
     cat /sys/class/nvme/nvme0/state 2>/dev/null || echo "unknown"
+}
+
+is_hex() {
+    [[ "$1" =~ ^[0-9a-fA-F]+$ ]]
+}
+
+reg_has_value() {
+    local v=$1 width=${2:-w}
+    [ "$v" != "FAIL" ] || return 1
+    is_hex "$v" || return 1
+    if [ "$width" = "l" ]; then
+        [ "$v" != "ffffffff" ] && [ "$v" != "FFFFFFFF" ]
+    else
+        [ "$v" != "ffff" ] && [ "$v" != "FFFF" ]
+    fi
 }
 
 pmu_clkreq_deassert() {
@@ -79,6 +98,68 @@ poll_nvme() {
     done
     log "[nvme-poll] timeout; final state=$(nvme_ctrl_state)"
     return 1
+}
+
+verify_baseline_regs_once() {
+    local ep_lnk rp_lnk ep_l1ss rp_l1ss pmcsr
+
+    ep_lnk=$(read_reg "$BDF" "$LNKCTL_OFF" w)
+    rp_lnk=$(read_reg "$RP_BDF" "$RP_LNKCTL_OFF" w)
+    ep_l1ss=$(read_reg "$BDF" "$EP_L1SS_CTL1_OFF")
+    rp_l1ss=$(read_reg "$RP_BDF" "$RP_L1SS_CTL1_OFF")
+    pmcsr=$(read_reg "$BDF" "$PMCSR_OFF" w)
+
+    log "    regs: EP_LNKCTL=0x$ep_lnk RP_LNKCTL=0x$rp_lnk EP_L1SS=0x$ep_l1ss RP_L1SS=0x$rp_l1ss PMCSR=0x$pmcsr"
+
+    reg_has_value "$ep_lnk" w || return 1
+    reg_has_value "$rp_lnk" w || return 1
+    reg_has_value "$ep_l1ss" l || return 1
+    reg_has_value "$rp_l1ss" l || return 1
+    reg_has_value "$pmcsr" w || return 1
+
+    [ $((16#$ep_lnk & 0x3)) -eq 0 ] || return 1
+    [ $((16#$rp_lnk & 0x3)) -eq 0 ] || return 1
+    [ $((16#$ep_l1ss & 0xf)) -eq 0 ] || return 1
+    [ $((16#$rp_l1ss & 0xf)) -eq 0 ] || return 1
+    [ $((16#$pmcsr & 0x3)) -eq 0 ] || return 1
+}
+
+verify_nvme_cmd_once() {
+    local st rc=0
+
+    [ -e "$NVME_DEV" ] || {
+        log "    nvme: $NVME_DEV missing state=$(nvme_ctrl_state)"
+        return 1
+    }
+
+    st=$(nvme_ctrl_state)
+    sudo nvme id-ctrl "$NVME_DEV" >/dev/null 2>&1 || rc=$?
+    log "    nvme: id-ctrl rc=$rc state=$st"
+
+    [ "$rc" -eq 0 ] && [ "$st" = "live" ]
+}
+
+verify_baseline_stable() {
+    local label=${1:-baseline-stable}
+    local checks=${2:-$BASELINE_STABLE_CHECKS}
+    local interval=${3:-$BASELINE_STABLE_INTERVAL}
+    local i
+
+    log "[$label] baseline stability check (${checks} consecutive samples, ${interval}s interval)"
+    for ((i = 1; i <= checks; i++)); do
+        log "[$label] sample $i/$checks"
+        verify_baseline_regs_once || {
+            log "[$label] failed: baseline registers are not stable"
+            return 1
+        }
+        verify_nvme_cmd_once || {
+            log "[$label] failed: NVMe command path is not stable"
+            return 1
+        }
+        sleep "$interval"
+    done
+
+    log "[$label] stable"
 }
 
 cap_offsets() {
@@ -198,37 +279,16 @@ stabilize_baseline() {
     log "[G] NVMe command path poll"
     poll_nvme 60 || return 1
 
-    local ep_lnk rp_lnk ep_l1ss rp_l1ss pmcsr
-    ep_lnk=$(read_reg "$BDF" "$LNKCTL_OFF" w)
-    rp_lnk=$(read_reg "$RP_BDF" "$RP_LNKCTL_OFF" w)
-    ep_l1ss=$(read_reg "$BDF" "$EP_L1SS_CTL1_OFF")
-    rp_l1ss=$(read_reg "$RP_BDF" "$RP_L1SS_CTL1_OFF")
-    pmcsr=$(read_reg "$BDF" "$PMCSR_OFF" w)
-
     log "[H] baseline readback"
-    log "    EP LNKCTL=0x$ep_lnk RP LNKCTL=0x$rp_lnk"
-    log "    EP L1SS=0x$ep_l1ss RP L1SS=0x$rp_l1ss PMCSR=0x$pmcsr"
-
-    if [ "$ep_lnk" = "FAIL" ] || [ "$rp_lnk" = "FAIL" ] ||
-        [ "$ep_l1ss" = "FAIL" ] || [ "$rp_l1ss" = "FAIL" ] ||
-        [ "$pmcsr" = "FAIL" ]; then
-        log "baseline restore failed: config read failure"
-        return 1
-    fi
-    if [ $((16#$ep_lnk & 0x3)) -ne 0 ] || [ $((16#$rp_lnk & 0x3)) -ne 0 ]; then
-        log "baseline restore failed: ASPM still enabled"
-        return 1
-    fi
-    if [ $((16#$ep_l1ss & 0xf)) -ne 0 ] || [ $((16#$rp_l1ss & 0xf)) -ne 0 ]; then
-        log "baseline restore failed: L1SS still enabled"
-        return 1
-    fi
-    if [ $((16#$pmcsr & 0x3)) -ne 0 ]; then
-        log "baseline restore failed: PMCSR is not D0"
+    if ! verify_baseline_regs_once; then
+        log "baseline restore failed: registers are not PS0+L0+D0 baseline"
         return 1
     fi
 
-    sleep 1
+    verify_baseline_stable "baseline-post-restore" || return 1
+
+    log "[I] final settle before next operation (${BASELINE_SETTLE_S}s)"
+    sleep "$BASELINE_SETTLE_S"
     log "baseline restore OK"
 }
 
@@ -258,10 +318,12 @@ case "$MODE" in
     twice)
         log "=== PS0 first pass ==="
         run_test 0
-        stabilize_baseline || {
-            log "baseline restore failed; skip second entry"
+        verify_baseline_stable "twice-pre-second" || {
+            log "baseline stability check failed; skip second entry"
             exit 1
         }
+        log "[twice] extra settle before second entry (${BASELINE_SETTLE_S}s)"
+        sleep "$BASELINE_SETTLE_S"
         log ""
         log "=== PS0 second pass after verified baseline ==="
         run_test 0
