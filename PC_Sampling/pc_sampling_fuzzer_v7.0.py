@@ -4281,18 +4281,31 @@ class NVMeFuzzer:
         val    = 3 if state == PCIeDState.D3 else 0
         exp    = val & 0x3
         offset = self._pcie_pm_cap_offset + 0x04
-        retry_delay = 0.1 if state == PCIeDState.D0 else 0.05
+
+        # D0 복귀 시: L1.2에서 링크 복구까지 config space가 0xFFFF를 반환할 수 있음.
+        # PMCSR이 유효한 값(≠0xFFFF)을 반환할 때까지 최대 3초 polling 후 write.
+        if state == PCIeDState.D0:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                rb = self._setpci_read(self._pcie_bdf, offset, 'w')
+                if rb is not None and rb != 0xFFFF:
+                    break
+                time.sleep(0.1)
+            else:
+                log.warning("[PCIe] D0 복귀 대기 timeout — config space 응답 없음")
+                return False
+
         for attempt in range(3):
             ok = self._setpci_write(self._pcie_bdf, offset, val, 0x0003, 'w')
             if not ok:
-                time.sleep(retry_delay)
+                time.sleep(0.05)
                 continue
             rb = self._setpci_read(self._pcie_bdf, offset, 'w')
             if rb is not None and (rb & 0x3) == exp:
                 if attempt > 0:
                     log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 확인 (attempt {attempt+1})")
                 return True
-            time.sleep(retry_delay)
+            time.sleep(0.05)
         log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 진입 실패")
         return False
 
