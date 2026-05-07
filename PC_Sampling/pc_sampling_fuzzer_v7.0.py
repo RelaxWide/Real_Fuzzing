@@ -4125,7 +4125,14 @@ class NVMeFuzzer:
             #   클록 안정화(T_COMMON_MODE) 대기 후 레지스터 조작.
             subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
                            timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(0.001)
+
+            # L1.2에서 복귀 시 config space가 0xFFFF일 수 있음 — 응답할 때까지 대기
+            _deadline = time.monotonic() + 2.0
+            while time.monotonic() < _deadline:
+                _rb = self._setpci_read(ep, ec + 0x10, 'w')
+                if _rb is not None and _rb != 0xFFFF:
+                    break
+                time.sleep(0.05)
 
             # 1. LNKCTL ASPMC = 0b00 (spec: ASPM disable 먼저)
             ok = self._setpci_write(ep, ec + 0x10, 0x0000, 0x0003, 'w')
