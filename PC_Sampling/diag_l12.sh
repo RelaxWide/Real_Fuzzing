@@ -16,6 +16,7 @@ MODE="${1:-ps0}"
 BASELINE_STABLE_CHECKS="${BASELINE_STABLE_CHECKS:-5}"
 BASELINE_STABLE_INTERVAL="${BASELINE_STABLE_INTERVAL:-1}"
 BASELINE_SETTLE_S="${BASELINE_SETTLE_S:-5}"
+NVME_DEBUG="${NVME_DEBUG:-0}"
 
 ts() { date '+%H:%M:%S.%3N'; }
 log() { echo "[$(ts)] $*"; }
@@ -24,19 +25,31 @@ log() { echo "[$(ts)] $*"; }
 # /dev/nvme0 는 char device(c), namespace /dev/nvme0n1 은 block(b)이므로
 # [ -b ] 검사는 controller를 찾지 못하는 버그가 있음 — 이 함수는 sysfs 심링크만 사용.
 find_nvme_dev() {
-    local ctrl_dir ctrl bdf
+    local ctrl_dir ctrl path bdf
     for ctrl_dir in /sys/class/nvme/nvme[0-9]*; do
         [ -d "$ctrl_dir" ] || continue
         ctrl=$(basename "$ctrl_dir")
         # 컨트롤러만 선택 (nvme0, nvme1 … — nvme0n1 같은 namespace 제외)
         [[ "$ctrl" =~ ^nvme[0-9]+$ ]] || continue
         # 심링크 실제 경로에서 마지막 BDF 추출 (EP BDF = 경로 중 마지막 XX:XX.X)
-        bdf=$(readlink -f "$ctrl_dir" 2>/dev/null \
+        path=$(readlink -f "$ctrl_dir" 2>/dev/null || true)
+        bdf=$(printf '%s\n' "$path" \
             | grep -oP '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f](?=/)' \
             | tail -1) || true
+        [ "$NVME_DEBUG" = "1" ] && log "[nvme-find] ctrl=$ctrl path=$path bdf=${bdf:-none} target=$BDF" >&2
         [ "$bdf" = "$BDF" ] && echo "/dev/$ctrl" && return 0
     done
     return 1
+}
+
+refresh_nvme_dev() {
+    local cur_dev
+    cur_dev=$(find_nvme_dev 2>/dev/null || echo "")
+    [ -n "$cur_dev" ] || return 1
+    if [ "$cur_dev" != "$NVME_DEV" ]; then
+        log "★ 컨트롤러 번호 변경: $NVME_DEV → $cur_dev"
+        NVME_DEV="$cur_dev"
+    fi
 }
 
 nvme_ctrl_state() {
@@ -57,10 +70,6 @@ read_reg() {
 write_reg() {
     local bdf=$1 off=$2 val=$3 mask=$4 width=${5:-l}
     sudo setpci -s "$bdf" "${off}.${width}=${val}:${mask}" 2>/dev/null
-}
-
-nvme_ctrl_state() {
-    cat /sys/class/nvme/nvme0/state 2>/dev/null || echo "unknown"
 }
 
 is_hex() {
@@ -109,20 +118,16 @@ poll_nvme() {
     local timeout_s=${1:-90}
     local deadline=$(( $(date +%s) + timeout_s ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        # 1) 현재 NVME_DEV를 직접 시도
-        # 2) 실패하면 find_nvme_dev()로 BDF에서 현재 컨트롤러 재탐색 (번호 변경 감지)
         local cur_dev st rc=0
 
-        if [ -c "$NVME_DEV" ]; then
-            cur_dev="$NVME_DEV"
-        else
-            cur_dev=$(find_nvme_dev 2>/dev/null || echo "")
-        fi
+        # BDF 기준 재탐색을 항상 우선한다. /dev/nvme0가 남아 있어도
+        # 다른 컨트롤러일 수 있으므로 char device 존재만 믿지 않는다.
+        cur_dev=$(find_nvme_dev 2>/dev/null || echo "")
 
         if [ -z "$cur_dev" ]; then
             local sysfs_exists="no"
             [ -e "/sys/bus/pci/devices/$BDF" ] && sysfs_exists="yes"
-            log "[nvme-poll] nvme 없음  sysfs=$sysfs_exists  (probe 진행 중 or 실패)"
+            log "[nvme-poll] BDF=$BDF 에 nvme 없음  sysfs=$sysfs_exists  (probe 진행 중 or 실패)"
             sleep 1
             continue
         fi
@@ -174,7 +179,7 @@ verify_baseline_regs_once() {
 verify_nvme_cmd_once() {
     local cur_dev st rc=0
     cur_dev=$(find_nvme_dev 2>/dev/null || echo "")
-    if [ -z "$cur_dev" ] || [ ! -b "$cur_dev" ]; then
+    if [ -z "$cur_dev" ] || [ ! -c "$cur_dev" ]; then
         log "    nvme: BDF=$BDF 에 nvme 없음  state=$(nvme_ctrl_state)"
         return 1
     fi
@@ -270,6 +275,7 @@ do_l12_entry() {
     log "=== L1.2 entry: PS${nvme_ps}+L1.2+D0 ==="
 
     log "[1] NVMe PS${nvme_ps}"
+    refresh_nvme_dev || log "    NVMe controller not found by BDF; using $NVME_DEV"
     sudo nvme set-feature "$NVME_DEV" -f 2 -v "$nvme_ps" 2>&1 | head -1 || true
     sleep 0.1
 
@@ -323,6 +329,7 @@ stabilize_baseline() {
     sleep 0.1
 
     log "[F] NVMe PS0"
+    refresh_nvme_dev || log "    NVMe controller not found by BDF before PS0 restore; using $NVME_DEV"
     sudo nvme set-feature "$NVME_DEV" -f 2 -v 0 2>&1 | head -1 || true
 
     log "[G] NVMe command path poll"
