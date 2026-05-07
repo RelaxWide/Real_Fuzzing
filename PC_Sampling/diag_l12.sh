@@ -17,6 +17,8 @@ BASELINE_STABLE_CHECKS="${BASELINE_STABLE_CHECKS:-5}"
 BASELINE_STABLE_INTERVAL="${BASELINE_STABLE_INTERVAL:-1}"
 BASELINE_SETTLE_S="${BASELINE_SETTLE_S:-5}"
 NVME_DEBUG="${NVME_DEBUG:-0}"
+RESTORE_NVME_PS0="${RESTORE_NVME_PS0:-0}"
+FORCE_PS0_ENTRY_SET="${FORCE_PS0_ENTRY_SET:-0}"
 
 ts() { date '+%H:%M:%S.%3N'; }
 log() { echo "[$(ts)] $*"; }
@@ -276,7 +278,11 @@ do_l12_entry() {
 
     log "[1] NVMe PS${nvme_ps}"
     refresh_nvme_dev || log "    NVMe controller not found by BDF; using $NVME_DEV"
-    sudo nvme set-feature "$NVME_DEV" -f 2 -v "$nvme_ps" 2>&1 | head -1 || true
+    if [ "$nvme_ps" -eq 0 ] && [ "$FORCE_PS0_ENTRY_SET" != "1" ]; then
+        log "    PS0 entry set-feature skip (already target PS0; FORCE_PS0_ENTRY_SET=1 to force)"
+    else
+        sudo nvme set-feature "$NVME_DEV" -f 2 -v "$nvme_ps" 2>&1 | head -1 || true
+    fi
     sleep 0.1
 
     log "[2] L1SS enable bits clear"
@@ -328,12 +334,17 @@ stabilize_baseline() {
     write_reg "$BDF" "$PMCSR_OFF" 0x0000 0x0003 w || true
     sleep 0.1
 
-    log "[F] NVMe PS0"
-    refresh_nvme_dev || log "    NVMe controller not found by BDF before PS0 restore; using $NVME_DEV"
-    sudo nvme set-feature "$NVME_DEV" -f 2 -v 0 2>&1 | head -1 || true
-
-    log "[G] NVMe command path poll"
+    log "[F] NVMe command path poll"
     poll_nvme 60 || return 1
+
+    if [ "$RESTORE_NVME_PS0" = "1" ]; then
+        log "[G] optional NVMe PS0 restore"
+        refresh_nvme_dev || log "    NVMe controller not found by BDF before optional PS0 restore; using $NVME_DEV"
+        sudo nvme set-feature "$NVME_DEV" -f 2 -v 0 2>&1 | head -1 || true
+        poll_nvme 30 || return 1
+    else
+        log "[G] optional NVMe PS0 restore skipped (RESTORE_NVME_PS0=1 to enable)"
+    fi
 
     log "[H] baseline readback"
     if ! verify_baseline_regs_once; then
