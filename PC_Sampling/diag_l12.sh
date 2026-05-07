@@ -20,33 +20,23 @@ BASELINE_SETTLE_S="${BASELINE_SETTLE_S:-5}"
 ts() { date '+%H:%M:%S.%3N'; }
 log() { echo "[$(ts)] $*"; }
 
-# BDF에 연결된 현재 nvme 컨트롤러를 sysfs에서 동적으로 탐색.
-# 링크 down/up 시 nvme0→nvme1→nvme2로 번호가 바뀌므로 하드코딩 금지.
+# BDF sysfs 하위에서 nvme 컨트롤러 디렉터리를 탐색.
+# /dev/nvme0 는 char device, /dev/nvme0n1 은 block device 이므로
+# [ -b ] 검사는 controller가 아닌 namespace만 찾는 버그가 있음 → sysfs 직접 탐색.
 find_nvme_dev() {
-    local sysfs_nvme="/sys/bus/pci/devices/${BDF}/nvme"
-    if [ -d "$sysfs_nvme" ]; then
-        local ctrl
-        ctrl=$(ls "$sysfs_nvme" 2>/dev/null | head -1)
-        [ -n "$ctrl" ] && echo "/dev/$ctrl" && return 0
-    fi
-    # fallback: /dev/nvme* → BDF로 역추적
-    for dev in /dev/nvme[0-9]*; do
-        [ -b "$dev" ] || continue
-        local ctrl_name dev_bdf
-        ctrl_name=$(basename "$dev")
-        dev_bdf=$(readlink -f "/sys/class/nvme/${ctrl_name}" 2>/dev/null \
-            | grep -oP '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]' \
-            | tail -1) || true
-        [ "$dev_bdf" = "$BDF" ] && echo "$dev" && return 0
-    done
-    return 1
+    local pci_sysfs="/sys/bus/pci/devices/$BDF"
+    [ -d "$pci_sysfs" ] || return 1
+    # BDF 하위 디렉터리 중 "nvme숫자" 이름만 (namespace "nvme0n1" 제외)
+    local ctrl_name
+    ctrl_name=$(find "$pci_sysfs" -maxdepth 3 -type d 2>/dev/null \
+        | grep -oP 'nvme\d+$' | head -1)
+    [ -n "$ctrl_name" ] || return 1
+    echo "/dev/$ctrl_name"
 }
 
-# 현재 BDF에 바인드된 nvme 컨트롤러 state 조회
 nvme_ctrl_state() {
-    local cur_dev
+    local cur_dev ctrl_name
     cur_dev=$(find_nvme_dev 2>/dev/null) || { echo "unknown"; return; }
-    local ctrl_name
     ctrl_name=$(basename "$cur_dev")
     cat "/sys/class/nvme/${ctrl_name}/state" 2>/dev/null || echo "unknown"
 }
