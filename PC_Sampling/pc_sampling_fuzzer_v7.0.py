@@ -4781,13 +4781,18 @@ class NVMeFuzzer:
                     log.warning(f"    [verify] L1SS       : {verify['l1ss']}")
 
             # 4. PS0+L0+D0 복귀
-            #    D3 포함 combo: D0 먼저(setpci) → Trst → L0 → PS0 순서 필수.
-            #    D3hot 상태에서 NVMe 커맨드를 먼저 보내면 hang 발생.
+            #    복귀 순서: L0(CLKREQ# assert) → D0 → PS0
+            #    L1.2 상태에서 NVMe 커맨드(PS0)를 먼저 보내면 링크가 없어 hang/fail.
             ok_restore = True
             try:
                 if combo.pcie_d == PCIeDState.D3:
                     ok_restore = self._pm_d3_safe_restore()
                     time.sleep(D3_RESTORE_SETTLE)
+                elif combo.pcie_l == PCIeLState.L1_2:
+                    # L1.2+D0: L0 먼저(CLKREQ# assert, 링크 복원) → PS0
+                    self._set_pcie_l_state(PCIeLState.L0)
+                    ok_restore = self._pm_set_state(0)
+                    time.sleep(RESTORE_SETTLE)
                 else:
                     self._set_power_combo(baseline)
                     time.sleep(RESTORE_SETTLE)
