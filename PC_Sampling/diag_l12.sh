@@ -270,6 +270,50 @@ check_state() {
     echo "  NVMe state: $(nvme_ctrl_state)"
 }
 
+require_l12_armed() {
+    local ep_lnk rp_lnk ep_l1ss rp_l1ss
+
+    ep_lnk=$(read_reg "$BDF" "$LNKCTL_OFF" w)
+    rp_lnk=$(read_reg "$RP_BDF" "$RP_LNKCTL_OFF" w)
+    ep_l1ss=$(read_reg "$BDF" "$EP_L1SS_CTL1_OFF")
+    rp_l1ss=$(read_reg "$RP_BDF" "$RP_L1SS_CTL1_OFF")
+
+    log "    EP LNKCTL=0x$ep_lnk RP LNKCTL=0x$rp_lnk"
+    log "    EP L1SS=0x$ep_l1ss RP L1SS=0x$rp_l1ss"
+
+    reg_has_value "$ep_lnk" w || {
+        log "    L1.2 arm failed: EP LNKCTL config read failed"
+        return 1
+    }
+    reg_has_value "$rp_lnk" w || {
+        log "    L1.2 arm failed: RP LNKCTL config read failed"
+        return 1
+    }
+    reg_has_value "$ep_l1ss" l || {
+        log "    L1.2 arm failed: EP L1SS config read failed"
+        return 1
+    }
+    reg_has_value "$rp_l1ss" l || {
+        log "    L1.2 arm failed: RP L1SS config read failed"
+        return 1
+    }
+
+    if [ $((16#$ep_lnk & 0x3)) -ne 2 ] || [ $((16#$rp_lnk & 0x3)) -ne 2 ]; then
+        log "    L1.2 arm failed: ASPM L1 is not enabled on both EP/RP"
+        log "    expected: EP/RP LNKCTL bits[1:0] == 0x2"
+        return 1
+    fi
+
+    if [ $((16#$ep_l1ss & 0xf)) -eq 0 ] || [ $((16#$rp_l1ss & 0xf)) -eq 0 ]; then
+        log "    L1.2 arm failed: L1SS is not enabled on both EP/RP"
+        log "    current state is L1-only or asymmetric; skip CLKREQ# deassert"
+        log "    offsets: EP_L1SS_CTL1=$EP_L1SS_CTL1_OFF RP_L1SS_CTL1=$RP_L1SS_CTL1_OFF"
+        return 1
+    fi
+
+    log "    L1.2 armed: EP/RP ASPM L1 and L1SS enable bits are set"
+}
+
 do_l12_entry() {
     local nvme_ps=$1
 
@@ -298,10 +342,7 @@ do_l12_entry() {
     write_reg "$BDF" "$LNKCTL_OFF" 0x0002 0x0003 w
 
     log "[5] verify before CLKREQ# deassert"
-    log "    EP LNKCTL=$(read_reg "$BDF" "$LNKCTL_OFF" w)"
-    log "    RP LNKCTL=$(read_reg "$RP_BDF" "$RP_LNKCTL_OFF" w)"
-    log "    EP L1SS=$(read_reg "$BDF" "$EP_L1SS_CTL1_OFF")"
-    log "    RP L1SS=$(read_reg "$RP_BDF" "$RP_L1SS_CTL1_OFF")"
+    require_l12_armed || return 1
 
     log "[6] CLKREQ# deassert"
     pmu_clkreq_deassert
