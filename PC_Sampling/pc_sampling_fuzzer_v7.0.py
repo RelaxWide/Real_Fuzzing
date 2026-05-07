@@ -4281,17 +4281,18 @@ class NVMeFuzzer:
         val    = 3 if state == PCIeDState.D3 else 0
         exp    = val & 0x3
         offset = self._pcie_pm_cap_offset + 0x04
+        retry_delay = 0.1 if state == PCIeDState.D0 else 0.05
         for attempt in range(3):
             ok = self._setpci_write(self._pcie_bdf, offset, val, 0x0003, 'w')
             if not ok:
-                time.sleep(0.05)
+                time.sleep(retry_delay)
                 continue
             rb = self._setpci_read(self._pcie_bdf, offset, 'w')
             if rb is not None and (rb & 0x3) == exp:
                 if attempt > 0:
                     log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 확인 (attempt {attempt+1})")
                 return True
-            time.sleep(0.05)
+            time.sleep(retry_delay)
         log.warning(f"[PCIe] PMCSR D{'3hot' if val else '0'} 진입 실패")
         return False
 
@@ -4475,6 +4476,8 @@ class NVMeFuzzer:
         # Step 1: L0 먼저 — L1.2이면 CLKREQ# assert로 clock 복원 (TLP 전 필수)
         if self._pcie_bdf and self._pcie_cap_offset is not None:
             self._set_pcie_l_state(PCIeLState.L0)
+            # PCIe 링크 재확립 대기 — config space 접근 전 clock 안정화 필요
+            time.sleep(0.1)
         # Step 2: D3 → D0 (clock 복원 후 config space 접근)
         if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
             ok &= self._set_pcie_d_state(PCIeDState.D0)
