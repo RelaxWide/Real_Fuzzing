@@ -4799,25 +4799,31 @@ class NVMeFuzzer:
                     # L1.2 복귀: L0 경로(pin16 assert→poll→레지스터) → NVMe 재등록 대기 → PS0
                     self._set_pcie_l_state(PCIeLState.L0)
                     # config space 복귀 확인
-                    _lnkctl = self._setpci_read(self._pcie_bdf, self._pcie_cap_offset + 0x10, 'w') if self._pcie_bdf and self._pcie_cap_offset else None
-                    log.warning(f"[PM] L1.2→L0 후 LNKCTL={_lnkctl:#06x if _lnkctl is not None and _lnkctl != 0xFFFF else repr(_lnkctl)}")
+                    _lnkctl = self._setpci_read(self._pcie_bdf, self._pcie_cap_offset + 0x10, 'w') \
+                        if (self._pcie_bdf and self._pcie_cap_offset) else None
+                    _lnkctl_str = f"{_lnkctl:#06x}" if (_lnkctl is not None and _lnkctl != 0xFFFF) else repr(_lnkctl)
+                    log.warning(f"[PM] L1.2→L0 후 LNKCTL={_lnkctl_str}")
+                    # 커널 NVMe 드라이버 리셋 후 재등록까지 대기 (최대 30s)
                     _dev = self.config.nvme_device
-                    _deadline = time.monotonic() + 10.0
+                    _deadline = time.monotonic() + 30.0
                     _nvme_ok = False
                     while time.monotonic() < _deadline:
-                        time.sleep(0.2)
-                        if os.path.exists(_dev):
+                        time.sleep(0.5)
+                        if not os.path.exists(_dev):
+                            log.warning(f"[PM] {_dev} 아직 없음")
+                            continue
+                        try:
                             _r = subprocess.run(
                                 ['nvme', 'id-ctrl', _dev],
-                                capture_output=True, timeout=3)
+                                capture_output=True, timeout=5)
                             log.warning(f"[PM] id-ctrl rc={_r.returncode}")
                             if _r.returncode == 0:
                                 _nvme_ok = True
                                 break
-                        else:
-                            log.warning(f"[PM] {_dev} 아직 없음")
+                        except subprocess.TimeoutExpired:
+                            log.warning(f"[PM] id-ctrl timeout — 드라이버 리셋 중")
                     if not _nvme_ok:
-                        log.warning(f"[PM] L1.2 복귀 후 {_dev} 응답 없음 (10s timeout)")
+                        log.warning(f"[PM] L1.2 복귀 후 {_dev} 응답 없음 (30s timeout)")
                         ok_restore = False
                     if ok_restore:
                         ok_restore = self._pm_set_state(0)
