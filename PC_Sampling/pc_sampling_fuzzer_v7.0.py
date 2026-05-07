@@ -4123,8 +4123,11 @@ class NVMeFuzzer:
             # [PMU] CLKREQ# Assert — 클록 복원 먼저, 링크 L0 재진입 후 레지스터 해제
             #   L1.2 상태에서는 클록이 없으므로 setpci(config space write) 전에 반드시 수행.
             #   클록 안정화(T_COMMON_MODE) 대기 후 레지스터 조작.
-            subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
-                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _r = subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
+                                timeout=3, capture_output=True, text=True)
+            log.warning(f"[PMU] CLKREQ# Assert (pin16) rc={_r.returncode}"
+                        + (f" out={_r.stdout.strip()}" if _r.stdout.strip() else "")
+                        + (f" err={_r.stderr.strip()}" if _r.stderr.strip() else ""))
 
             # L1.2에서 복귀 시 config space가 0xFFFF일 수 있음 — 응답할 때까지 대기
             _deadline = time.monotonic() + 2.0
@@ -4179,8 +4182,11 @@ class NVMeFuzzer:
             # 3. PMU CLKREQ# Assert — NOPS device의 자연적 deassert 차단
             #    CLKREQ#가 deassert되면 RP가 ref clock을 제거해 L1.2로 진입.
             #    L1 조합에서는 clock을 유지해야 하므로 pin16으로 강제 assert.
-            subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
-                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _r = subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
+                                timeout=3, capture_output=True, text=True)
+            log.warning(f"[PMU] CLKREQ# Assert (pin16) rc={_r.returncode}"
+                        + (f" out={_r.stdout.strip()}" if _r.stdout.strip() else "")
+                        + (f" err={_r.stderr.strip()}" if _r.stderr.strip() else ""))
             # 4. 전역 ASPM 정책 → powersave (커널 override 방지)
             try:
                 Path('/sys/module/pcie_aspm/parameters/policy').write_text('powersave')
@@ -4269,8 +4275,11 @@ class NVMeFuzzer:
 
             # [PMU] CLKREQ# Deassert — 레지스터 설정·검증 완료 후 마지막 수행
             #   루트 포트가 CLKREQ# 비활성 감지 → 레퍼런스 클록 제거 → 실제 L1.2 진입.
-            subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
-                           timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _r = subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
+                                timeout=3, capture_output=True, text=True)
+            log.warning(f"[PMU] CLKREQ# Deassert (pin15) rc={_r.returncode}"
+                        + (f" out={_r.stdout.strip()}" if _r.stdout.strip() else "")
+                        + (f" err={_r.stderr.strip()}" if _r.stderr.strip() else ""))
 
             # idle window — L1 idle timer + L1.2 clock off 완료 대기
             time.sleep(L1_SETTLE + L1_2_SETTLE)
