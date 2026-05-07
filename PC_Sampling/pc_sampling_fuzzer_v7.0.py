@@ -4796,17 +4796,18 @@ class NVMeFuzzer:
                     ok_restore = self._pm_d3_safe_restore()
                     time.sleep(D3_RESTORE_SETTLE)
                 elif combo.pcie_l == PCIeLState.L1_2:
-                    # L1.2+D0: L0 먼저(CLKREQ# assert, 링크 복원) → NVMe 컨트롤러 wake-up 대기 → PS0
-                    self._set_pcie_l_state(PCIeLState.L0)
-                    # PCIe 링크 복원 후 NVMe 컨트롤러가 L1.2에서 완전히 깨어날 때까지 대기
-                    # config space 접근 가능 ≠ NVMe 큐 ready
+                    # L1.2 복귀 순서: CLKREQ# assert → L1(클락 on) → PS0 → L0
+                    # CLKREQ# assert 후 링크는 L1으로 전환(클락 on, NVMe 접근 가능).
+                    # L0 레지스터 쓰기(링크 재협상) 전에 PS0 먼저 전송해야 안정적.
+                    self._set_pcie_l_state(PCIeLState.L1)   # CLKREQ# assert + L1 안착
                     for _attempt in range(5):
-                        time.sleep(0.2)
+                        time.sleep(0.1)
                         if self._pm_set_state(0):
                             ok_restore = True
                             break
                     else:
                         ok_restore = False
+                    self._set_pcie_l_state(PCIeLState.L0)   # L1 → L0
                     time.sleep(RESTORE_SETTLE)
                 else:
                     self._set_power_combo(baseline)
