@@ -1203,6 +1203,13 @@ class NVMeStateMonitor:
         # weight 테이블
         self._weights: Dict[str, float] = {f['name']: f.get('weight', 1.0)
                                             for f in fields}
+        # security_recv: (secp, spsp, nsid) → max_size
+        self._sec_groups: Dict[tuple, int] = {}
+        for f in fields:
+            if f['source'] == 'security_recv':
+                key = (f['secp'], f['spsp'], f.get('nsid', 0))
+                self._sec_groups[key] = max(
+                    self._sec_groups.get(key, 0), f['size'])
         # CSFuzz §III-B: 최초 관측값 (adaptive partitioning 기준점)
         self._init_values: Dict[str, int] = {}
 
@@ -1301,6 +1308,83 @@ class NVMeStateMonitor:
                 log.warning(f"[State] get-log LID={lid:#x} 예외: {e}")
                 continue
 
+        # ── Security Send → Receive (secp/spsp 그룹별 1회) ───────────
+        _DUMMY_PATH = '/tmp/nvme_sec_dummy.bin'
+        if self._sec_groups and not os.path.exists(_DUMMY_PATH):
+            try:
+                with open(_DUMMY_PATH, 'wb') as _df:
+                    _df.write(b'\x00' * 4)
+            except Exception as e:
+                log.warning(f"[State] dummy 파일 생성 실패: {e}")
+
+        for (secp, spsp, nsid), size in self._sec_groups.items():
+            try:
+                # Security Send (query submission)
+                send_cmd = [
+                    'nvme', 'security-send', self._device,
+                    f'-p', f'{secp:#x}',
+                    f'-s', f'{spsp:#x}',
+                    f'-t', '4',
+                    f'-f', _DUMMY_PATH,
+                ]
+                if nsid:
+                    send_cmd += ['-n', str(nsid)]
+                proc_s = subprocess.run(send_cmd, capture_output=True, timeout=5)
+                if proc_s.returncode not in (0, 1):
+                    log.debug(f"[State] security-send secp={secp:#x} spsp={spsp:#x} "
+                              f"rc={proc_s.returncode}: "
+                              f"{proc_s.stderr.decode(errors='replace').strip()}")
+                    continue
+                # Security Receive (텍스트 출력 파싱 — --raw-binary 미사용)
+                recv_cmd = [
+                    'nvme', 'security-recv', self._device,
+                    f'-p', f'{secp:#x}',
+                    f'-s', f'{spsp:#x}',
+                    f'-x', str(size),
+                    f'-t', str(size),
+                ]
+                if nsid:
+                    recv_cmd += ['-n', str(nsid)]
+                proc_r = subprocess.run(recv_cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, timeout=5)
+                if proc_r.returncode != 0:
+                    log.debug(f"[State] security-recv secp={secp:#x} spsp={spsp:#x} "
+                              f"rc={proc_r.returncode}: "
+                              f"{proc_r.stdout.decode(errors='replace').strip()}")
+                    continue
+                # 텍스트 hex dump → bytes 변환
+                raw = self._parse_sec_hex(proc_r.stdout.decode(errors='replace'))
+                if not raw:
+                    log.debug(f"[State] sec-recv hex 파싱 실패: "
+                              f"{proc_r.stdout.decode(errors='replace')[:80]}")
+                    continue
+                # magic byte 검증 (raw[0] == SPSP)
+                if raw[0] != (spsp & 0xFF):
+                    log.warning(f"[State] sec-recv magic 불일치: "
+                                f"raw[0]={raw[0]:#04x} expected={spsp & 0xFF:#04x}")
+                    continue
+                ok_fields = 0
+                for f in self._fields:
+                    if (f['source'] != 'security_recv'
+                            or f['secp'] != secp
+                            or f['spsp'] != spsp
+                            or f.get('nsid', 0) != nsid):
+                        continue
+                    start = f['offset']
+                    end   = start + f['length']
+                    if end > len(raw):
+                        log.debug(f"[State] sec-recv short: "
+                                  f"got={len(raw)}B need={end}B field={f['name']}")
+                        continue
+                    result[f['name']] = int.from_bytes(
+                        raw[start:end], f.get('endian', 'little'))
+                    ok_fields += 1
+                log.info(f"[State] security-recv secp={secp:#x} spsp={spsp:#x} "
+                         f"OK: {ok_fields}개 필드")
+            except Exception as e:
+                log.warning(f"[State] security-recv secp={secp:#x} spsp={spsp:#x} 예외: {e}")
+                continue
+
         # CSFuzz §III-B: 최초 관측 시 init_value 등록
         for name, val in result.items():
             if name not in self._init_values:
@@ -1308,6 +1392,18 @@ class NVMeStateMonitor:
                 log.info(f"[State] init_value 등록: {name}={val:,}")
         log.info(f"[State] capture 완료: 총 {len(result)}개 필드 수집")
         return result
+
+    @staticmethod
+    def _parse_sec_hex(text: str) -> Optional[bytes]:
+        """nvme security-recv 텍스트 출력에서 hex 바이트 시퀀스를 추출해 bytes로 반환."""
+        buf = bytearray()
+        for token in text.split():
+            if len(token) == 2:
+                try:
+                    buf.append(int(token, 16))
+                except ValueError:
+                    pass
+        return bytes(buf) if buf else None
 
     @staticmethod
     def _adaptive_bucket(field: str, init: int, current: int) -> str:
@@ -2556,6 +2652,79 @@ class NVMeFuzzer:
                     log.warning(f"[State-Snap]   {f['name']:<30s} = {val:>12,}   ({f['desc']})")
             except Exception as e:
                 log.warning(f"[State-Snap] LID={lid:#x} 읽기 실패: {e}")
+
+        # ── Security Receive (secp/spsp 그룹별 Send→Recv) ────────────────
+        sec_groups: Dict[tuple, int] = {}
+        for f in STATE_FIELDS:
+            if f['source'] == 'security_recv':
+                key = (f['secp'], f['spsp'], f.get('nsid', 0))
+                sec_groups[key] = max(sec_groups.get(key, 0), f['size'])
+
+        _DUMMY_PATH = '/tmp/nvme_sec_dummy.bin'
+        if sec_groups and not os.path.exists(_DUMMY_PATH):
+            try:
+                with open(_DUMMY_PATH, 'wb') as _df:
+                    _df.write(b'\x00' * 4)
+            except Exception as e:
+                log.warning(f"[State-Snap] dummy 파일 생성 실패: {e}")
+
+        for (secp, spsp, nsid), size in sorted(sec_groups.items()):
+            try:
+                send_cmd = [
+                    'nvme', 'security-send', self.config.nvme_device,
+                    '-p', f'{secp:#x}', '-s', f'{spsp:#x}', '-t', '4',
+                    '-f', _DUMMY_PATH,
+                ]
+                if nsid:
+                    send_cmd += ['-n', str(nsid)]
+                proc_s = subprocess.run(send_cmd, capture_output=True, timeout=10)
+                if proc_s.returncode not in (0, 1):
+                    log.warning(f"[State-Snap] security-send secp={secp:#x} spsp={spsp:#x} "
+                                f"실패 rc={proc_s.returncode}: "
+                                f"{proc_s.stderr.decode(errors='replace').strip()}")
+                    continue
+
+                recv_cmd = [
+                    'nvme', 'security-recv', self.config.nvme_device,
+                    '-p', f'{secp:#x}', '-s', f'{spsp:#x}',
+                    '-x', str(size), '-t', str(size),
+                ]
+                if nsid:
+                    recv_cmd += ['-n', str(nsid)]
+                proc_r = subprocess.run(recv_cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, timeout=10)
+                if proc_r.returncode != 0:
+                    log.warning(f"[State-Snap] security-recv secp={secp:#x} spsp={spsp:#x} "
+                                f"실패 rc={proc_r.returncode}: "
+                                f"{proc_r.stdout.decode(errors='replace').strip()}")
+                    continue
+
+                raw = NVMeStateMonitor._parse_sec_hex(
+                    proc_r.stdout.decode(errors='replace'))
+                if not raw:
+                    log.warning(f"[State-Snap] sec-recv hex 파싱 실패")
+                    continue
+                if raw[0] != (spsp & 0xFF):
+                    log.warning(f"[State-Snap] sec-recv magic 불일치: "
+                                f"raw[0]={raw[0]:#04x} expected={spsp & 0xFF:#04x}")
+                    continue
+                log.warning(f"[State-Snap] ── Security Recv secp={secp:#x} spsp={spsp:#x} "
+                            f"({size}B) ──────────")
+                for f in STATE_FIELDS:
+                    if (f['source'] != 'security_recv'
+                            or f['secp'] != secp
+                            or f['spsp'] != spsp
+                            or f.get('nsid', 0) != nsid):
+                        continue
+                    start, end = f['offset'], f['offset'] + f['length']
+                    if end > len(raw):
+                        log.warning(f"[State-Snap]   {f['name']:<30s} = {'SHORT':>12}   ({f['desc']})")
+                        continue
+                    val = int.from_bytes(raw[start:end], f.get('endian', 'little'))
+                    log.warning(f"[State-Snap]   {f['name']:<30s} = {val:>12,}   ({f['desc']})")
+            except Exception as e:
+                log.warning(f"[State-Snap] security-recv secp={secp:#x} spsp={spsp:#x} "
+                            f"예외: {e}")
 
         log.warning("[State-Snap] ════════════════════════════════════════════════════")
 
