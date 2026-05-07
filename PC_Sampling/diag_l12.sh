@@ -1,27 +1,20 @@
-#!/bin/bash
-# L1.2 진입·복귀 단계별 진단 스크립트
-# 목적: PS0/PS1 각각에서 L1.2 진입 시 /dev/nvme0과 PCIe sysfs가 어떻게 변하는지 추적
-#
-# 사용법:
-#   sudo bash diag_l12.sh          # PS0+L1.2 테스트
-#   sudo bash diag_l12.sh ps1      # PS1+L1.2 테스트 (true L1.2 — 클록 off)
-#   sudo bash diag_l12.sh ps1 exit # PS1+L1.2 진입 후 복귀 테스트
-#   sudo bash diag_l12.sh all      # PS0/PS1 모두 순차 테스트
-
-BDF="0000:02:00.0"
-RP_BDF="0000:00:01.1"
-L1SS_OFF=0x240
-NVME_DEV="/dev/nvme0"
-PMU_PY="$(dirname "$0")/pmu_4_1.py"
-
-MODE="${1:-ps0}"
-DO_EXIT="${2:-exit}"
+#!/usr/bin/env bash
+# L1.2 entry/exit diagnostic script.
+# The important invariant for repeated tests is:
+#   "NVMe state=live" is not enough; RP/EP ASPM, L1SS, PMCSR, CLKREQ#,
+#   config space, and an NVMe command must all be back at baseline.
 
 set -euo pipefail
 
-# ── 유틸 함수 ──────────────────────────────────────────────────────────────────
-ts() { date '+%H:%M:%S.%3N'; }
+BDF="${BDF:-0000:02:00.0}"
+RP_BDF="${RP_BDF:-0000:00:01.1}"
+L1SS_OFF="${L1SS_OFF:-0x240}"
+NVME_DEV="${NVME_DEV:-/dev/nvme0}"
+PMU_PY="${PMU_PY:-$(dirname "$0")/pmu_4_1.py}"
 
+MODE="${1:-ps0}"
+
+ts() { date '+%H:%M:%S.%3N'; }
 log() { echo "[$(ts)] $*"; }
 
 read_reg() {
@@ -35,273 +28,250 @@ write_reg() {
 }
 
 nvme_ctrl_state() {
-    # NVMe 컨트롤러 커널 내부 상태: live / resetting / connecting / deleting / dead
     cat /sys/class/nvme/nvme0/state 2>/dev/null || echo "unknown"
 }
 
-check_state() {
-    local label=$1
-    echo ""
-    echo "── $label ──────────────────────────────────────"
-    echo "  LNKCTL    EP : $(read_reg $BDF    $LNKCTL_OFF w)"
-    echo "  LNKCTL    RP : $(read_reg $RP_BDF $RP_LNKCTL_OFF w)"
-    echo "  L1SS CTL1 EP : $(read_reg $BDF    $L1SS_CTL1_OFF)"
-    echo "  L1SS CTL1 RP : $(read_reg $RP_BDF $L1SS_CTL1_OFF)"
-    echo "  PMCSR     EP : $(read_reg $BDF    $PMCSR_OFF w)"
-    local pci_sysfs="/sys/bus/pci/devices/$BDF"
-    if [ -e "$pci_sysfs" ]; then
-        echo "  PCI sysfs    : EXISTS"
-        local drv
-        drv=$(readlink "$pci_sysfs/driver" 2>/dev/null | xargs basename 2>/dev/null || echo "none")
-        echo "  PCI driver   : $drv"
-    else
-        echo "  PCI sysfs    : MISSING ← surprise removal"
-    fi
-    if [ -e "$NVME_DEV" ]; then
-        echo "  $NVME_DEV    : EXISTS"
-    else
-        echo "  $NVME_DEV    : MISSING"
-    fi
-    echo "  NVMe state   : $(nvme_ctrl_state)"
-}
-
 pmu_clkreq_deassert() {
-    log "[PMU] CLKREQ# Deassert → pin15 (SetGpioHigh)"
-    python3 "$PMU_PY" 15 1 1 3300 && log "[PMU] pin15 rc=0" || log "[PMU] pin15 rc=$?"
+    log "[PMU] CLKREQ# deassert"
+    python3 "$PMU_PY" 15 1 1 3300 && log "[PMU] deassert rc=0" || log "[PMU] deassert rc=$?"
 }
 
 pmu_clkreq_assert() {
-    log "[PMU] CLKREQ# Assert → pin16 (SetGpioLow)"
-    python3 "$PMU_PY" 16 1 1 3300 && log "[PMU] pin16 rc=0" || log "[PMU] pin16 rc=$?"
+    log "[PMU] CLKREQ# assert"
+    python3 "$PMU_PY" 16 1 1 3300 && log "[PMU] assert rc=0" || log "[PMU] assert rc=$?"
 }
 
 poll_config() {
-    local label=$1 timeout_s=${2:-5}
+    local label=$1 timeout_s=${2:-10}
     local deadline=$(( $(date +%s) + timeout_s ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
         local v
-        v=$(read_reg $BDF $LNKCTL_OFF w)
+        v=$(read_reg "$BDF" "$LNKCTL_OFF" w)
         if [ "$v" != "FAIL" ] && [ "$v" != "ffff" ] && [ "$v" != "FFFF" ]; then
-            log "[$label] config space 복귀: LNKCTL=0x$v"
+            log "[$label] EP config space restored: LNKCTL=0x$v"
             return 0
         fi
-        log "[$label] config space=0x$v (클록 없음) — 대기"
+        log "[$label] EP config space=0x$v; waiting"
         sleep 0.2
     done
-    log "[$label] config space 복귀 실패 (${timeout_s}s timeout)"
+    log "[$label] EP config space restore timeout (${timeout_s}s)"
     return 1
 }
 
 poll_nvme() {
-    local timeout_s=${1:-40}
+    local timeout_s=${1:-60}
     local deadline=$(( $(date +%s) + timeout_s ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        if [ ! -e "$NVME_DEV" ]; then
-            log "[nvme-poll] $NVME_DEV 없음  state=$(nvme_ctrl_state)"
-            if [ ! -e "/sys/bus/pci/devices/$BDF" ]; then
-                log "[nvme-poll] $BDF sysfs도 없음 — surprise removal 상태"
-            fi
-            sleep 1
-            continue
-        fi
         local st rc=0
         st=$(nvme_ctrl_state)
-        sudo nvme id-ctrl "$NVME_DEV" >/dev/null 2>&1 || rc=$?
-        log "[nvme-poll] id-ctrl rc=$rc  state=$st"
-        if [ "$rc" -eq 0 ] && [ "$st" = "live" ]; then
-            log "[nvme-poll] 완전 복귀 확인 (id-ctrl OK + state=live)"
-            return 0
+        if [ -e "$NVME_DEV" ]; then
+            sudo nvme id-ctrl "$NVME_DEV" >/dev/null 2>&1 || rc=$?
+            log "[nvme-poll] id-ctrl rc=$rc state=$st"
+            if [ "$rc" -eq 0 ] && [ "$st" = "live" ]; then
+                log "[nvme-poll] NVMe command path restored"
+                return 0
+            fi
+        else
+            log "[nvme-poll] $NVME_DEV missing state=$st"
         fi
-        [ "$st" = "dead" ] && { log "[nvme-poll] state=dead — 드라이버 포기"; return 1; }
+        [ "$st" = "dead" ] && return 1
         sleep 1
     done
-    log "[nvme-poll] ${timeout_s}s 안에 $NVME_DEV 미복귀  최종 state=$(nvme_ctrl_state)"
+    log "[nvme-poll] timeout; final state=$(nvme_ctrl_state)"
     return 1
 }
 
-# ── Cap offset 탐지 ─────────────────────────────────────────────────────────────
-log "=== L1.2 단계별 진단 시작 ==="
+cap_offsets() {
+    local pm_cap pcie_cap rp_pcie_cap ep_l1ss_cap rp_l1ss_cap
 
-PM_CAP=$(sudo lspci -vvv -s "$BDF" 2>/dev/null \
-    | grep -i "Power Management" | grep -oP '\[\K[0-9a-fA-F]+' | head -1)
-[ -z "$PM_CAP" ] && { log "PM cap 탐지 실패"; exit 1; }
-PMCSR_OFF=$(printf "0x%x" $((16#$PM_CAP + 4)))
+    pm_cap=$(sudo lspci -vvv -s "$BDF" 2>/dev/null |
+        grep -i "Power Management" | grep -oP '\[\K[0-9a-fA-F]+' | head -1 || true)
+    [ -z "$pm_cap" ] && { log "PM capability not found"; exit 1; }
+    PMCSR_OFF=$(printf "0x%x" $((16#$pm_cap + 4)))
 
-PCIE_CAP=$(sudo lspci -vvv -s "$BDF" 2>/dev/null \
-    | grep -iP "PCI Express.*Endpoint|Express.*Endpoint" \
-    | grep -oP '\[\K[0-9a-fA-F]+' | head -1)
-[ -z "$PCIE_CAP" ] && { log "PCIe cap 탐지 실패"; exit 1; }
-LNKCTL_OFF=$(printf "0x%x" $((16#$PCIE_CAP + 0x10)))
+    pcie_cap=$(sudo lspci -vvv -s "$BDF" 2>/dev/null |
+        grep -iP "PCI Express.*Endpoint|Express.*Endpoint" |
+        grep -oP '\[\K[0-9a-fA-F]+' | head -1 || true)
+    [ -z "$pcie_cap" ] && { log "EP PCIe capability not found"; exit 1; }
+    LNKCTL_OFF=$(printf "0x%x" $((16#$pcie_cap + 0x10)))
 
-RP_PCIE_CAP=$(sudo lspci -vvv -s "$RP_BDF" 2>/dev/null \
-    | grep -iP "PCI Express" | grep -oP '\[\K[0-9a-fA-F]+' | head -1)
-RP_LNKCTL_OFF=$(printf "0x%x" $((16#${RP_PCIE_CAP:-80} + 0x10)))
+    rp_pcie_cap=$(sudo lspci -vvv -s "$RP_BDF" 2>/dev/null |
+        grep -iP "PCI Express" | grep -oP '\[\K[0-9a-fA-F]+' | head -1 || true)
+    [ -z "$rp_pcie_cap" ] && { log "RP PCIe capability not found"; exit 1; }
+    RP_LNKCTL_OFF=$(printf "0x%x" $((16#$rp_pcie_cap + 0x10)))
 
-L1SS_CTL1_OFF=$(printf "0x%x" $((L1SS_OFF + 0x08)))
+    ep_l1ss_cap=$(sudo lspci -vvv -s "$BDF" 2>/dev/null |
+        grep -i "L1 PM Substates" | grep -oP '\[\K[0-9a-fA-F]+' | head -1 || true)
+    rp_l1ss_cap=$(sudo lspci -vvv -s "$RP_BDF" 2>/dev/null |
+        grep -i "L1 PM Substates" | grep -oP '\[\K[0-9a-fA-F]+' | head -1 || true)
 
-log "PMCSR=$PMCSR_OFF  LNKCTL=$LNKCTL_OFF  RP_LNKCTL=$RP_LNKCTL_OFF  L1SS_CTL1=$L1SS_CTL1_OFF"
+    EP_L1SS_CTL1_OFF=$(printf "0x%x" $((16#${ep_l1ss_cap:-${L1SS_OFF#0x}} + 0x08)))
+    RP_L1SS_CTL1_OFF=$(printf "0x%x" $((16#${rp_l1ss_cap:-${L1SS_OFF#0x}} + 0x08)))
 
-# ── 공통 L1.2 진입 함수 ─────────────────────────────────────────────────────────
+    log "PMCSR=$PMCSR_OFF EP_LNKCTL=$LNKCTL_OFF RP_LNKCTL=$RP_LNKCTL_OFF EP_L1SS_CTL1=$EP_L1SS_CTL1_OFF RP_L1SS_CTL1=$RP_L1SS_CTL1_OFF"
+}
+
+check_state() {
+    local label=$1
+    echo
+    echo "-- $label ----------------------------------------"
+    echo "  EP LNKCTL : $(read_reg "$BDF" "$LNKCTL_OFF" w)"
+    echo "  RP LNKCTL : $(read_reg "$RP_BDF" "$RP_LNKCTL_OFF" w)"
+    echo "  EP L1SS   : $(read_reg "$BDF" "$EP_L1SS_CTL1_OFF")"
+    echo "  RP L1SS   : $(read_reg "$RP_BDF" "$RP_L1SS_CTL1_OFF")"
+    echo "  EP PMCSR  : $(read_reg "$BDF" "$PMCSR_OFF" w)"
+    if [ -e "/sys/bus/pci/devices/$BDF" ]; then
+        echo "  PCI sysfs : EXISTS"
+    else
+        echo "  PCI sysfs : MISSING"
+    fi
+    if [ -e "$NVME_DEV" ]; then
+        echo "  $NVME_DEV : EXISTS"
+    else
+        echo "  $NVME_DEV : MISSING"
+    fi
+    echo "  NVMe state: $(nvme_ctrl_state)"
+}
+
 do_l12_entry() {
-    local nvme_ps=$1   # 0 or 1
+    local nvme_ps=$1
 
     log ""
-    log "━━━ L1.2 진입 (NVMe PS${nvme_ps}) ━━━"
+    log "=== L1.2 entry: PS${nvme_ps}+L1.2+D0 ==="
 
-    # NVMe PS 설정
-    log "[1] NVMe PS${nvme_ps} 설정"
+    log "[1] NVMe PS${nvme_ps}"
     sudo nvme set-feature "$NVME_DEV" -f 2 -v "$nvme_ps" 2>&1 | head -1 || true
     sleep 0.1
 
-    # L1SS CTL1 enable (bit3:ASPM L1.1, bit2:ASPM L1.2, bit1:PM L1.1, bit0:PM L1.2)
-    log "[2] L1SS CTL1 enable (RP→EP 순)"
-    write_reg "$RP_BDF" "$L1SS_CTL1_OFF" 0x0000000f 0x0000000f
-    write_reg "$BDF"    "$L1SS_CTL1_OFF" 0x0000000f 0x0000000f
+    log "[2] L1SS enable bits clear"
+    write_reg "$RP_BDF" "$RP_L1SS_CTL1_OFF" 0x00000000 0x0000000f || true
+    write_reg "$BDF" "$EP_L1SS_CTL1_OFF" 0x00000000 0x0000000f || true
 
-    # ASPM L1 enable (LNKCTL bits[1:0]=0x02)
-    log "[3] LNKCTL ASPM L1 enable (RP→EP 순)"
-    write_reg "$RP_BDF" "$LNKCTL_OFF" 0x0002 0x0003 w
-    write_reg "$BDF"    "$LNKCTL_OFF" 0x0002 0x0003 w
+    log "[3] L1SS enable (RP then EP)"
+    write_reg "$RP_BDF" "$RP_L1SS_CTL1_OFF" 0x0000000f 0x0000000f
+    write_reg "$BDF" "$EP_L1SS_CTL1_OFF" 0x0000000f 0x0000000f
 
-    # 레지스터 검증 (CLKREQ# deassert 이전)
-    log "[4] 레지스터 검증 (deassert 이전)"
-    echo "    LNKCTL EP : $(read_reg $BDF    $LNKCTL_OFF w)"
-    echo "    L1SS CTL1 : $(read_reg $BDF    $L1SS_CTL1_OFF)"
+    log "[4] ASPM L1 enable (RP then EP)"
+    write_reg "$RP_BDF" "$RP_LNKCTL_OFF" 0x0002 0x0003 w
+    write_reg "$BDF" "$LNKCTL_OFF" 0x0002 0x0003 w
 
-    # CLKREQ# deassert → 실제 L1.2 진입 트리거
-    log "[5] CLKREQ# deassert"
+    log "[5] verify before CLKREQ# deassert"
+    log "    EP LNKCTL=$(read_reg "$BDF" "$LNKCTL_OFF" w)"
+    log "    RP LNKCTL=$(read_reg "$RP_BDF" "$RP_LNKCTL_OFF" w)"
+    log "    EP L1SS=$(read_reg "$BDF" "$EP_L1SS_CTL1_OFF")"
+    log "    RP L1SS=$(read_reg "$RP_BDF" "$RP_L1SS_CTL1_OFF")"
+
+    log "[6] CLKREQ# deassert"
     pmu_clkreq_deassert
-    sleep 0.3  # L1 idle timer + clock off 대기
+    sleep 0.3
 
-    # 진입 후 상태
-    log "[6] 진입 후 상태"
-    local v
-    v=$(read_reg $BDF $LNKCTL_OFF w)
-    log "    LNKCTL = 0x$v  (0xffff → clock off, 진입 성공)"
-    if [ -e "$NVME_DEV" ]; then
-        log "    $NVME_DEV : 존재 (PS0이면 정상 — device-side CLKREQ# 유지)"
-    else
-        log "    $NVME_DEV : 없음 (커널 드라이버 reset 시작)"
-    fi
-    if [ ! -e "/sys/bus/pci/devices/$BDF" ]; then
-        log "    $BDF sysfs : MISSING"
-    else
-        local drv
-        drv=$(readlink "/sys/bus/pci/devices/$BDF/driver" 2>/dev/null | xargs basename 2>/dev/null || echo "none")
-        log "    $BDF sysfs : 존재, driver=$drv"
-    fi
+    log "[7] after entry: EP LNKCTL=$(read_reg "$BDF" "$LNKCTL_OFF" w)"
 }
 
-# ── 공통 L1.2 복귀 함수 ─────────────────────────────────────────────────────────
-do_l12_exit() {
+stabilize_baseline() {
     log ""
-    log "━━━ L1.2 복귀 ━━━"
+    log "=== Baseline restore: PS0+L0+D0 ==="
 
-    # [A] RP 레지스터 먼저 비활성화 — 클록 off 상태에서도 RP(CPU측)는 접근 가능
-    #     pin16(클록 복원) 이전에 RP ASPM을 disable 안 하면,
-    #     클록이 돌아오는 순간 RP가 즉시 L1 재진입을 시도해 EP 링크 트레이닝 방해
-    log "[A] RP L1SS + ASPM disable (클록 off 상태에서, pin16 이전)"
-    write_reg "$RP_BDF" "$L1SS_CTL1_OFF" 0x00000000 0x0000000f 2>/dev/null || true
-    write_reg "$RP_BDF" "$LNKCTL_OFF"    0x0000      0x0003     w 2>/dev/null || true
-    local rp_lnk_verify
-    rp_lnk_verify=$(read_reg "$RP_BDF" "$LNKCTL_OFF" w)
-    log "[A] RP LNKCTL 확인 = 0x${rp_lnk_verify}  (bits[1:0] 이 00이어야 함)"
+    log "[A] RP L1SS + ASPM disable before refclk restore"
+    write_reg "$RP_BDF" "$RP_L1SS_CTL1_OFF" 0x00000000 0x0000000f || true
+    write_reg "$RP_BDF" "$RP_LNKCTL_OFF" 0x0000 0x0003 w || true
+    log "    RP LNKCTL=$(read_reg "$RP_BDF" "$RP_LNKCTL_OFF" w)"
 
-    # [B] CLKREQ# assert → 클록 복원
-    log "[B] CLKREQ# assert (pin16)"
+    log "[B] CLKREQ# assert"
     pmu_clkreq_assert
+    sleep 0.1
 
-    # [C] EP config space 응답 폴링
-    log "[C] EP config space 복귀 폴링 (5s)"
-    if ! poll_config "config-poll" 5; then
-        log "    !!! config space 복귀 실패"
-    fi
+    log "[C] EP config space poll"
+    poll_config "baseline-config" 10 || return 1
 
-    # [D] EP 레지스터 비활성화 + PCIe Command 레지스터 확인
     log "[D] EP L1SS + ASPM disable"
-    write_reg "$BDF" "$LNKCTL_OFF"    0x0000      0x0003     w 2>/dev/null || true
-    write_reg "$BDF" "$L1SS_CTL1_OFF" 0x00000000  0x0000000f 2>/dev/null || true
-    local cmd_reg
-    cmd_reg=$(read_reg "$BDF" 0x04 w)
-    log "[D] EP PCI Command=0x${cmd_reg}  (bit1=MemSpaceEnable, bit2=BusMaster)"
+    write_reg "$BDF" "$LNKCTL_OFF" 0x0000 0x0003 w || true
+    write_reg "$BDF" "$EP_L1SS_CTL1_OFF" 0x00000000 0x0000000f || true
 
-    # [E] sysfs + driver 상태
-    log "[E] PCIe sysfs 상태"
-    if [ -e "/sys/bus/pci/devices/$BDF" ]; then
-        local drv
-        drv=$(readlink "/sys/bus/pci/devices/$BDF/driver" 2>/dev/null | xargs basename 2>/dev/null || echo "none")
-        log "    $BDF sysfs=EXISTS  driver=$drv"
-    else
-        log "    $BDF sysfs=MISSING"
+    log "[E] PMCSR D0"
+    write_reg "$BDF" "$PMCSR_OFF" 0x0000 0x0003 w || true
+    sleep 0.1
+
+    log "[F] NVMe PS0"
+    sudo nvme set-feature "$NVME_DEV" -f 2 -v 0 2>&1 | head -1 || true
+
+    log "[G] NVMe command path poll"
+    poll_nvme 60 || return 1
+
+    local ep_lnk rp_lnk ep_l1ss rp_l1ss pmcsr
+    ep_lnk=$(read_reg "$BDF" "$LNKCTL_OFF" w)
+    rp_lnk=$(read_reg "$RP_BDF" "$RP_LNKCTL_OFF" w)
+    ep_l1ss=$(read_reg "$BDF" "$EP_L1SS_CTL1_OFF")
+    rp_l1ss=$(read_reg "$RP_BDF" "$RP_L1SS_CTL1_OFF")
+    pmcsr=$(read_reg "$BDF" "$PMCSR_OFF" w)
+
+    log "[H] baseline readback"
+    log "    EP LNKCTL=0x$ep_lnk RP LNKCTL=0x$rp_lnk"
+    log "    EP L1SS=0x$ep_l1ss RP L1SS=0x$rp_l1ss PMCSR=0x$pmcsr"
+
+    if [ "$ep_lnk" = "FAIL" ] || [ "$rp_lnk" = "FAIL" ] ||
+        [ "$ep_l1ss" = "FAIL" ] || [ "$rp_l1ss" = "FAIL" ] ||
+        [ "$pmcsr" = "FAIL" ]; then
+        log "baseline restore failed: config read failure"
+        return 1
+    fi
+    if [ $((16#$ep_lnk & 0x3)) -ne 0 ] || [ $((16#$rp_lnk & 0x3)) -ne 0 ]; then
+        log "baseline restore failed: ASPM still enabled"
+        return 1
+    fi
+    if [ $((16#$ep_l1ss & 0xf)) -ne 0 ] || [ $((16#$rp_l1ss & 0xf)) -ne 0 ]; then
+        log "baseline restore failed: L1SS still enabled"
+        return 1
+    fi
+    if [ $((16#$pmcsr & 0x3)) -ne 0 ]; then
+        log "baseline restore failed: PMCSR is not D0"
+        return 1
     fi
 
-    # [F] NVMe 재등록 대기
-    log "[F] $NVME_DEV 재등록 대기 (최대 40s)"
-    local t0
-    t0=$(date +%s)
-    poll_nvme 40 && \
-        log "    복귀 성공 ($(( $(date +%s) - t0 ))s)" || \
-        log "    복귀 실패 (40s timeout)"
-
-    check_state "최종 상태"
+    sleep 1
+    log "baseline restore OK"
 }
 
-# ── 테스트 실행 ─────────────────────────────────────────────────────────────────
+do_l12_exit() {
+    stabilize_baseline
+    check_state "exit complete"
+}
+
 run_test() {
     local ps=$1
-
-    check_state "진입 전 초기 상태 (PS${ps})"
+    check_state "before entry (PS${ps})"
     do_l12_entry "$ps"
     sleep 0.5
-    check_state "L1.2 진입 직후 (PS${ps})"
-
+    check_state "after L1.2 entry (PS${ps})"
     do_l12_exit
-
-    # NVMe PS0 복귀
-    log ""
-    log "[F] NVMe PS0 복귀 시도"
-    sudo nvme set-feature "$NVME_DEV" -f 2 -v 0 2>&1 | head -1 || \
-        log "    PS0 set-feature 실패 (드라이버 reset 중일 수 있음)"
-
-    check_state "복귀 완료 (PS${ps})"
 }
 
-# state=live 될 때까지 대기 (다음 사이클 진입 전 안전 확인)
-wait_nvme_live() {
-    local timeout_s=${1:-60}
-    local deadline=$(( $(date +%s) + timeout_s ))
-    log "[stabilize] NVMe state=live 대기 (최대 ${timeout_s}s)..."
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-        local st
-        st=$(nvme_ctrl_state)
-        log "[stabilize] state=$st"
-        [ "$st" = "live" ] && { log "[stabilize] OK"; return 0; }
-        [ "$st" = "dead" ] && { log "[stabilize] state=dead — 복구 불가"; return 1; }
-        sleep 2
-    done
-    log "[stabilize] timeout — 최종 state=$(nvme_ctrl_state)"
-    return 1
-}
+cap_offsets
 
 case "$MODE" in
-    ps0) run_test 0 ;;
-    ps1) run_test 1 ;;
-    # ps0 두 번: 복귀 후 state=live 확인 후 재진입 — 두 번째 실패 여부 재현
-    twice)
-        log "=== PS0 첫 번째 ==="
+    ps0)
         run_test 0
+        ;;
+    ps1)
+        run_test 1
+        ;;
+    twice)
+        log "=== PS0 first pass ==="
+        run_test 0
+        stabilize_baseline || {
+            log "baseline restore failed; skip second entry"
+            exit 1
+        }
         log ""
-        wait_nvme_live 60
-        log ""
-        log "=== PS0 두 번째 (state=live 확인 후 재진입) ==="
+        log "=== PS0 second pass after verified baseline ==="
         run_test 0
         ;;
     all)
-        log "=== PS0 테스트 ==="
+        log "=== PS0 test ==="
         run_test 0
-        wait_nvme_live 60
+        stabilize_baseline || exit 1
         log ""
-        log "=== PS1 테스트 ==="
+        log "=== PS1 test ==="
         run_test 1
         ;;
     *)
@@ -311,4 +281,4 @@ case "$MODE" in
 esac
 
 log ""
-log "=== 진단 완료 ==="
+log "=== diagnostic complete ==="
