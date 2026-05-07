@@ -4560,10 +4560,11 @@ class NVMeFuzzer:
         #           SIGKILL도 D-sleep 중엔 무시됨 → 드라이버 자체 타임아웃(30~60s)까지 대기.
         #           D-state는 setpci PMCSR readback으로 이미 검증하므로 skip.
         #    NOPS(PS3/PS4): 커맨드 수신 시 컨트롤러 wake-up 후 설정된 PS값 반환.
+        _link_down = (res.get('d_state', '').find('link-down') >= 0)
         if combo.pcie_d == PCIeDState.D3:
             res['nvme_ps'] = 'skipped (D3hot: NVMe BAR inaccessible)'
-        elif combo.pcie_l == PCIeLState.L1_2:
-            res['nvme_ps'] = 'skipped (L1.2: link-down, clock off)'
+        elif _link_down:
+            res['nvme_ps'] = 'skipped (link-down: clock off)'
         else:
             try:
                 r = subprocess.run(
@@ -4597,18 +4598,19 @@ class NVMeFuzzer:
         #    L1.2+D0: 클락 off로 config space = 0xFFFF → bits[1:0]=3 = 오독 가능.
         #    0xFFFF는 링크 단절로 판정, D0으로 간주.
         if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
-            if combo.pcie_l == PCIeLState.L1_2 and combo.pcie_d == PCIeDState.D0:
-                res['d_state'] = 'D0(L1.2 link-down: unreadable)'
+            v = self._setpci_read(self._pcie_bdf, self._pcie_pm_cap_offset + 0x04, 'w')
+            if v is not None and v != 0xFFFF:
+                dval  = v & 0x3
+                dname = {0: 'D0', 1: 'D1', 2: 'D2', 3: 'D3hot'}.get(dval, 'D?')
+                exp   = 3 if combo.pcie_d == PCIeDState.D3 else 0
+                chk   = 'OK' if dval == exp else f'MISMATCH(exp={exp})'
+                res['d_state'] = f"{dname}(raw={v:#06x}) {chk}"
+            elif v == 0xFFFF:
+                # L1.2+PSx: 디바이스가 CLKREQ# deassert → 클락 off → config space 불가
+                exp_d = 'D3hot' if combo.pcie_d == PCIeDState.D3 else 'D0'
+                res['d_state'] = f'{exp_d}(link-down: clock off)'
             else:
-                v = self._setpci_read(self._pcie_bdf, self._pcie_pm_cap_offset + 0x04, 'w')
-                if v is not None and v != 0xFFFF:
-                    dval  = v & 0x3
-                    dname = {0: 'D0', 1: 'D1', 2: 'D2', 3: 'D3hot'}.get(dval, 'D?')
-                    exp   = 3 if combo.pcie_d == PCIeDState.D3 else 0
-                    chk   = 'OK' if dval == exp else f'MISMATCH(exp={exp})'
-                    res['d_state'] = f"{dname}(raw={v:#06x}) {chk}"
-                else:
-                    res['d_state'] = 'read_fail'
+                res['d_state'] = 'read_fail'
 
         # 3. LNKCTL readback — EP ASPM bits[1:0]
         if self._pcie_bdf and self._pcie_cap_offset is not None:
@@ -4619,8 +4621,8 @@ class NVMeFuzzer:
                 exp   = 0 if combo.pcie_l == PCIeLState.L0 else 2
                 chk   = 'OK' if aspm == exp else f'MISMATCH(exp={exp})'
                 res['l_state_ep'] = f"EP ASPM={aname}(raw={aspm:#04x}) {chk}"
-            elif combo.pcie_l == PCIeLState.L1_2:
-                res['l_state_ep'] = 'EP L1.2(link-down: unreadable)'
+            elif _link_down:
+                res['l_state_ep'] = 'EP(link-down: clock off)'
             else:
                 res['l_state_ep'] = 'read_fail'
 
