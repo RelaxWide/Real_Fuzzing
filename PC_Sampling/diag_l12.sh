@@ -20,18 +20,23 @@ BASELINE_SETTLE_S="${BASELINE_SETTLE_S:-5}"
 ts() { date '+%H:%M:%S.%3N'; }
 log() { echo "[$(ts)] $*"; }
 
-# BDF sysfs 하위에서 nvme 컨트롤러 디렉터리를 탐색.
-# /dev/nvme0 는 char device, /dev/nvme0n1 은 block device 이므로
-# [ -b ] 검사는 controller가 아닌 namespace만 찾는 버그가 있음 → sysfs 직접 탐색.
+# /sys/class/nvme/nvmeN 심링크의 실제 경로에서 BDF를 추출해 매칭.
+# /dev/nvme0 는 char device(c), namespace /dev/nvme0n1 은 block(b)이므로
+# [ -b ] 검사는 controller를 찾지 못하는 버그가 있음 — 이 함수는 sysfs 심링크만 사용.
 find_nvme_dev() {
-    local pci_sysfs="/sys/bus/pci/devices/$BDF"
-    [ -d "$pci_sysfs" ] || return 1
-    # BDF 하위 디렉터리 중 "nvme숫자" 이름만 (namespace "nvme0n1" 제외)
-    local ctrl_name
-    ctrl_name=$(find "$pci_sysfs" -maxdepth 3 -type d 2>/dev/null \
-        | grep -oP 'nvme\d+$' | head -1)
-    [ -n "$ctrl_name" ] || return 1
-    echo "/dev/$ctrl_name"
+    local ctrl_dir ctrl bdf
+    for ctrl_dir in /sys/class/nvme/nvme[0-9]*; do
+        [ -d "$ctrl_dir" ] || continue
+        ctrl=$(basename "$ctrl_dir")
+        # 컨트롤러만 선택 (nvme0, nvme1 … — nvme0n1 같은 namespace 제외)
+        [[ "$ctrl" =~ ^nvme[0-9]+$ ]] || continue
+        # 심링크 실제 경로에서 마지막 BDF 추출 (EP BDF = 경로 중 마지막 XX:XX.X)
+        bdf=$(readlink -f "$ctrl_dir" 2>/dev/null \
+            | grep -oP '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f](?=/)' \
+            | tail -1) || true
+        [ "$bdf" = "$BDF" ] && echo "/dev/$ctrl" && return 0
+    done
+    return 1
 }
 
 nvme_ctrl_state() {
@@ -42,6 +47,7 @@ nvme_ctrl_state() {
 }
 
 NVME_DEV=$(find_nvme_dev 2>/dev/null || echo "/dev/nvme0")
+log "초기 NVMe 디바이스: $NVME_DEV"
 
 read_reg() {
     local bdf=$1 off=$2 width=${3:-l}
@@ -100,26 +106,36 @@ poll_config() {
 }
 
 poll_nvme() {
-    local timeout_s=${1:-60}
+    local timeout_s=${1:-90}
     local deadline=$(( $(date +%s) + timeout_s ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        # 매 iteration 마다 BDF에서 현재 nvme 디바이스 재탐색 (번호 변경 감지)
+        # 1) 현재 NVME_DEV를 직접 시도
+        # 2) 실패하면 find_nvme_dev()로 BDF에서 현재 컨트롤러 재탐색 (번호 변경 감지)
         local cur_dev st rc=0
-        cur_dev=$(find_nvme_dev 2>/dev/null || echo "")
-        if [ -z "$cur_dev" ] || [ ! -b "$cur_dev" ]; then
+
+        if [ -c "$NVME_DEV" ]; then
+            cur_dev="$NVME_DEV"
+        else
+            cur_dev=$(find_nvme_dev 2>/dev/null || echo "")
+        fi
+
+        if [ -z "$cur_dev" ]; then
             local sysfs_exists="no"
             [ -e "/sys/bus/pci/devices/$BDF" ] && sysfs_exists="yes"
-            log "[nvme-poll] BDF=$BDF nvme 없음  sysfs=$sysfs_exists  (dmesg probe 실패 확인)"
+            log "[nvme-poll] nvme 없음  sysfs=$sysfs_exists  (probe 진행 중 or 실패)"
             sleep 1
             continue
         fi
+
         if [ "$cur_dev" != "$NVME_DEV" ]; then
             log "[nvme-poll] ★ 컨트롤러 번호 변경: $NVME_DEV → $cur_dev"
             NVME_DEV="$cur_dev"
         fi
+
         st=$(cat "/sys/class/nvme/$(basename "$cur_dev")/state" 2>/dev/null || echo "unknown")
         sudo nvme id-ctrl "$cur_dev" >/dev/null 2>&1 || rc=$?
         log "[nvme-poll] dev=$cur_dev  id-ctrl rc=$rc  state=$st"
+
         if [ "$rc" -eq 0 ] && [ "$st" = "live" ]; then
             log "[nvme-poll] NVMe command path restored"
             return 0
