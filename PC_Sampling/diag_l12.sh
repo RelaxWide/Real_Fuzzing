@@ -9,7 +9,6 @@ set -euo pipefail
 BDF="${BDF:-0000:02:00.0}"
 RP_BDF="${RP_BDF:-0000:00:01.1}"
 L1SS_OFF="${L1SS_OFF:-0x240}"
-NVME_DEV="${NVME_DEV:-/dev/nvme0}"
 PMU_PY="${PMU_PY:-$(dirname "$0")/pmu_4_1.py}"
 
 MODE="${1:-ps0}"
@@ -20,6 +19,39 @@ BASELINE_SETTLE_S="${BASELINE_SETTLE_S:-5}"
 
 ts() { date '+%H:%M:%S.%3N'; }
 log() { echo "[$(ts)] $*"; }
+
+# BDF에 연결된 현재 nvme 컨트롤러를 sysfs에서 동적으로 탐색.
+# 링크 down/up 시 nvme0→nvme1→nvme2로 번호가 바뀌므로 하드코딩 금지.
+find_nvme_dev() {
+    local sysfs_nvme="/sys/bus/pci/devices/${BDF}/nvme"
+    if [ -d "$sysfs_nvme" ]; then
+        local ctrl
+        ctrl=$(ls "$sysfs_nvme" 2>/dev/null | head -1)
+        [ -n "$ctrl" ] && echo "/dev/$ctrl" && return 0
+    fi
+    # fallback: /dev/nvme* → BDF로 역추적
+    for dev in /dev/nvme[0-9]*; do
+        [ -b "$dev" ] || continue
+        local ctrl_name dev_bdf
+        ctrl_name=$(basename "$dev")
+        dev_bdf=$(readlink -f "/sys/class/nvme/${ctrl_name}" 2>/dev/null \
+            | grep -oP '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]' \
+            | tail -1) || true
+        [ "$dev_bdf" = "$BDF" ] && echo "$dev" && return 0
+    done
+    return 1
+}
+
+# 현재 BDF에 바인드된 nvme 컨트롤러 state 조회
+nvme_ctrl_state() {
+    local cur_dev
+    cur_dev=$(find_nvme_dev 2>/dev/null) || { echo "unknown"; return; }
+    local ctrl_name
+    ctrl_name=$(basename "$cur_dev")
+    cat "/sys/class/nvme/${ctrl_name}/state" 2>/dev/null || echo "unknown"
+}
+
+NVME_DEV=$(find_nvme_dev 2>/dev/null || echo "/dev/nvme0")
 
 read_reg() {
     local bdf=$1 off=$2 width=${3:-l}
@@ -81,22 +113,31 @@ poll_nvme() {
     local timeout_s=${1:-60}
     local deadline=$(( $(date +%s) + timeout_s ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        local st rc=0
-        st=$(nvme_ctrl_state)
-        if [ -e "$NVME_DEV" ]; then
-            sudo nvme id-ctrl "$NVME_DEV" >/dev/null 2>&1 || rc=$?
-            log "[nvme-poll] id-ctrl rc=$rc state=$st"
-            if [ "$rc" -eq 0 ] && [ "$st" = "live" ]; then
-                log "[nvme-poll] NVMe command path restored"
-                return 0
-            fi
-        else
-            log "[nvme-poll] $NVME_DEV missing state=$st"
+        # 매 iteration 마다 BDF에서 현재 nvme 디바이스 재탐색 (번호 변경 감지)
+        local cur_dev st rc=0
+        cur_dev=$(find_nvme_dev 2>/dev/null || echo "")
+        if [ -z "$cur_dev" ] || [ ! -b "$cur_dev" ]; then
+            local sysfs_exists="no"
+            [ -e "/sys/bus/pci/devices/$BDF" ] && sysfs_exists="yes"
+            log "[nvme-poll] BDF=$BDF nvme 없음  sysfs=$sysfs_exists  (dmesg probe 실패 확인)"
+            sleep 1
+            continue
         fi
-        [ "$st" = "dead" ] && return 1
+        if [ "$cur_dev" != "$NVME_DEV" ]; then
+            log "[nvme-poll] ★ 컨트롤러 번호 변경: $NVME_DEV → $cur_dev"
+            NVME_DEV="$cur_dev"
+        fi
+        st=$(cat "/sys/class/nvme/$(basename "$cur_dev")/state" 2>/dev/null || echo "unknown")
+        sudo nvme id-ctrl "$cur_dev" >/dev/null 2>&1 || rc=$?
+        log "[nvme-poll] dev=$cur_dev  id-ctrl rc=$rc  state=$st"
+        if [ "$rc" -eq 0 ] && [ "$st" = "live" ]; then
+            log "[nvme-poll] NVMe command path restored"
+            return 0
+        fi
+        [ "$st" = "dead" ] && { log "[nvme-poll] state=dead"; return 1; }
         sleep 1
     done
-    log "[nvme-poll] timeout; final state=$(nvme_ctrl_state)"
+    log "[nvme-poll] timeout; final dev=$(find_nvme_dev 2>/dev/null || echo none)  state=$(nvme_ctrl_state)"
     return 1
 }
 
@@ -125,17 +166,19 @@ verify_baseline_regs_once() {
 }
 
 verify_nvme_cmd_once() {
-    local st rc=0
-
-    [ -e "$NVME_DEV" ] || {
-        log "    nvme: $NVME_DEV missing state=$(nvme_ctrl_state)"
+    local cur_dev st rc=0
+    cur_dev=$(find_nvme_dev 2>/dev/null || echo "")
+    if [ -z "$cur_dev" ] || [ ! -b "$cur_dev" ]; then
+        log "    nvme: BDF=$BDF 에 nvme 없음  state=$(nvme_ctrl_state)"
         return 1
-    }
-
-    st=$(nvme_ctrl_state)
-    sudo nvme id-ctrl "$NVME_DEV" >/dev/null 2>&1 || rc=$?
-    log "    nvme: id-ctrl rc=$rc state=$st"
-
+    fi
+    if [ "$cur_dev" != "$NVME_DEV" ]; then
+        log "    nvme: ★ 컨트롤러 번호 변경 $NVME_DEV → $cur_dev"
+        NVME_DEV="$cur_dev"
+    fi
+    st=$(cat "/sys/class/nvme/$(basename "$cur_dev")/state" 2>/dev/null || echo "unknown")
+    sudo nvme id-ctrl "$cur_dev" >/dev/null 2>&1 || rc=$?
+    log "    nvme: dev=$cur_dev  id-ctrl rc=$rc  state=$st"
     [ "$rc" -eq 0 ] && [ "$st" = "live" ]
 }
 
