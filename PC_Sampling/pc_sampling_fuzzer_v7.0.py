@@ -6922,6 +6922,12 @@ class NVMeFuzzer:
         # firmware 부팅이 완료됐을 것으로 기대하므로 대부분 즉시 성공.
         if self.config.enable_por:
             self._por_pcie_rescan()
+            # rescan 후 PCIe capability offset 재탐지 — 커널이 장치를 재초기화하면서
+            # L1SS 레지스터가 리셋될 수 있으므로 재탐지 후 L0으로 명시 초기화.
+            if self.config.pm_inject_prob > 0:
+                self._detect_pcie_info()
+                self._set_pcie_l_state(PCIeLState.L0)
+                log.warning("[POR] PCIe rescan 후 L0 초기화 완료")
 
         # APST / Keep-Alive 비활성화 — NVMe 접근 가능 상태에서 실행
         # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
