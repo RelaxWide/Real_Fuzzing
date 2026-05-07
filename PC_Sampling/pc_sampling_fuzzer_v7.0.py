@@ -4321,7 +4321,12 @@ class NVMeFuzzer:
         if ps_settle > 0.05:
             time.sleep(ps_settle)
         ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — ASPM 협상 완료
-        ok_d  = self._set_pcie_d_state(combo.pcie_d)  # D3 나중 — 링크 idle 후 자동 재진입
+        # D0는 기본 상태이므로 PMCSR write 불필요 (L1.2 후 config space 접근 불가 방지)
+        # D3hot만 명시적으로 PMCSR write
+        if combo.pcie_d == PCIeDState.D3:
+            ok_d = self._set_pcie_d_state(combo.pcie_d)
+        else:
+            ok_d = True
         # D3+L1/L1.2: D3 config TLP가 링크를 순간 깨움 → 재진입 대기
         if combo.pcie_d == PCIeDState.D3:
             if combo.pcie_l == PCIeLState.L1_2:
