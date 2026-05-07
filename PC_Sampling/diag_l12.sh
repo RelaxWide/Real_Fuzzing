@@ -93,7 +93,7 @@ poll_config() {
 }
 
 poll_nvme() {
-    local timeout_s=${1:-30}
+    local timeout_s=${1:-40}
     local deadline=$(( $(date +%s) + timeout_s ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
         if [ ! -e "$NVME_DEV" ]; then
@@ -108,12 +108,11 @@ poll_nvme() {
         st=$(nvme_ctrl_state)
         sudo nvme id-ctrl "$NVME_DEV" >/dev/null 2>&1 || rc=$?
         log "[nvme-poll] id-ctrl rc=$rc  state=$st"
-        # id-ctrl 성공 AND state=live 둘 다 확인
         if [ "$rc" -eq 0 ] && [ "$st" = "live" ]; then
             log "[nvme-poll] 완전 복귀 확인 (id-ctrl OK + state=live)"
             return 0
         fi
-        [ "$st" = "dead" ] && { log "[nvme-poll] state=dead — 드라이버 포기 상태"; return 1; }
+        [ "$st" = "dead" ] && { log "[nvme-poll] state=dead — 드라이버 포기"; return 1; }
         sleep 1
     done
     log "[nvme-poll] ${timeout_s}s 안에 $NVME_DEV 미복귀  최종 state=$(nvme_ctrl_state)"
@@ -196,43 +195,53 @@ do_l12_entry() {
 # ── 공통 L1.2 복귀 함수 ─────────────────────────────────────────────────────────
 do_l12_exit() {
     log ""
-    log "━━━ L1.2 복귀 (pin16 assert → 폴링) ━━━"
+    log "━━━ L1.2 복귀 ━━━"
 
-    # CLKREQ# assert → 클록 복원
-    log "[A] CLKREQ# assert"
+    # [A] RP 레지스터 먼저 비활성화 — 클록 off 상태에서도 RP(CPU측)는 접근 가능
+    #     pin16(클록 복원) 이전에 RP ASPM을 disable 안 하면,
+    #     클록이 돌아오는 순간 RP가 즉시 L1 재진입을 시도해 EP 링크 트레이닝 방해
+    log "[A] RP L1SS + ASPM disable (클록 off 상태에서, pin16 이전)"
+    write_reg "$RP_BDF" "$L1SS_CTL1_OFF" 0x00000000 0x0000000f 2>/dev/null || true
+    write_reg "$RP_BDF" "$LNKCTL_OFF"    0x0000      0x0003     w 2>/dev/null || true
+    local rp_lnk_verify
+    rp_lnk_verify=$(read_reg "$RP_BDF" "$LNKCTL_OFF" w)
+    log "[A] RP LNKCTL 확인 = 0x${rp_lnk_verify}  (bits[1:0] 이 00이어야 함)"
+
+    # [B] CLKREQ# assert → 클록 복원
+    log "[B] CLKREQ# assert (pin16)"
     pmu_clkreq_assert
 
-    # config space 응답 폴링
-    log "[B] config space 복귀 폴링 (5s)"
+    # [C] EP config space 응답 폴링
+    log "[C] EP config space 복귀 폴링 (5s)"
     if ! poll_config "config-poll" 5; then
-        log "    !!! config space 복귀 실패 — 링크 문제 가능성"
+        log "    !!! config space 복귀 실패"
     fi
 
-    # sysfs + driver 상태 즉시 확인
-    log "[C] PCIe sysfs 상태"
+    # [D] EP 레지스터 비활성화 + PCIe Command 레지스터 확인
+    log "[D] EP L1SS + ASPM disable"
+    write_reg "$BDF" "$LNKCTL_OFF"    0x0000      0x0003     w 2>/dev/null || true
+    write_reg "$BDF" "$L1SS_CTL1_OFF" 0x00000000  0x0000000f 2>/dev/null || true
+    local cmd_reg
+    cmd_reg=$(read_reg "$BDF" 0x04 w)
+    log "[D] EP PCI Command=0x${cmd_reg}  (bit1=MemSpaceEnable, bit2=BusMaster)"
+
+    # [E] sysfs + driver 상태
+    log "[E] PCIe sysfs 상태"
     if [ -e "/sys/bus/pci/devices/$BDF" ]; then
         local drv
         drv=$(readlink "/sys/bus/pci/devices/$BDF/driver" 2>/dev/null | xargs basename 2>/dev/null || echo "none")
         log "    $BDF sysfs=EXISTS  driver=$drv"
     else
-        log "    $BDF sysfs=MISSING ← surprise removal 확정"
+        log "    $BDF sysfs=MISSING"
     fi
 
-    # LNKCTL disable
-    log "[D] LNKCTL ASPM disable (L0 복귀)"
-    write_reg "$BDF"    "$LNKCTL_OFF" 0x0000 0x0003 w 2>/dev/null || true
-    write_reg "$RP_BDF" "$LNKCTL_OFF" 0x0000 0x0003 w 2>/dev/null || true
-    # L1SS disable
-    write_reg "$BDF"    "$L1SS_CTL1_OFF" 0x00000000 0x0000000f 2>/dev/null || true
-    write_reg "$RP_BDF" "$L1SS_CTL1_OFF" 0x00000000 0x0000000f 2>/dev/null || true
-
-    # NVMe 재등록 대기
-    log "[E] $NVME_DEV 재등록 대기 (최대 30s)"
+    # [F] NVMe 재등록 대기
+    log "[F] $NVME_DEV 재등록 대기 (최대 40s)"
     local t0
     t0=$(date +%s)
-    poll_nvme 30 && \
+    poll_nvme 40 && \
         log "    복귀 성공 ($(( $(date +%s) - t0 ))s)" || \
-        log "    복귀 실패 (30s timeout)"
+        log "    복귀 실패 (40s timeout)"
 
     check_state "최종 상태"
 }
