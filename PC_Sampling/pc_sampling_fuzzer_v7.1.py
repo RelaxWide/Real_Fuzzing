@@ -4809,12 +4809,18 @@ class NVMeFuzzer:
 
             # 4. PS0+L0+D0 복귀
             #    D3 포함 combo: D0 먼저(setpci) → Trst → L0 → PS0 순서 필수.
-            #    D3hot 상태에서 NVMe 커맨드를 먼저 보내면 hang 발생.
+            #    L1.2+D0 combo: CLKREQ# assert(L0) 먼저 → PS0 나중.
+            #      clock 없는 상태에서 NVMe SetFeature 먼저 보내면 hang 발생.
             ok_restore = True
             try:
                 if combo.pcie_d == PCIeDState.D3:
                     ok_restore = self._pm_d3_safe_restore()
                     time.sleep(D3_RESTORE_SETTLE)
+                elif combo.pcie_l == PCIeLState.L1_2:
+                    self._set_pcie_l_state(PCIeLState.L0)  # CLKREQ# assert → clock 복원
+                    time.sleep(0.01)
+                    self._pm_set_state(0)                  # clock 복원 후 PS0
+                    time.sleep(RESTORE_SETTLE)
                 else:
                     self._set_power_combo(baseline)
                     time.sleep(RESTORE_SETTLE)
