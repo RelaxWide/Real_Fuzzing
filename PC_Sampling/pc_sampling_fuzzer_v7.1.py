@@ -4567,6 +4567,25 @@ class NVMeFuzzer:
         ok &= self._pm_set_state(0)
         return ok
 
+    def _pm_l12_safe_restore(self, restore_ps0: bool = True) -> bool:
+        """L1.2 → L0+D0 복귀.
+
+        순서: CLKREQ# assert/L0 cleanup → Trst(10ms) → 선택적 PS0.
+        L1.2 상태에서는 NVMe SetFeature보다 clock/link 복구가 먼저다.
+        """
+        ok = True
+
+        if self._pcie_bdf and self._pcie_cap_offset is not None:
+            ok &= self._set_pcie_l_state(PCIeLState.L0)
+        else:
+            self._pmu_clkreq_assert()
+
+        time.sleep(0.01)
+
+        if restore_ps0:
+            ok &= self._pm_set_state(0)
+        return ok
+
     @staticmethod
     def _is_nonop_combo(combo: PowerCombo) -> bool:
         """D3hot 또는 L1.2 상태 여부 — NVMe 커맨드 전 복귀 필요."""
@@ -4581,7 +4600,7 @@ class NVMeFuzzer:
             return POWER_COMBOS[0]  # PS0+L0+D0
 
         log.warning(f"[PM] NonOp restore: {combo.label} → L0")
-        self._set_pcie_l_state(PCIeLState.L0)
+        self._pm_l12_safe_restore(restore_ps0=False)
         return PowerCombo(combo.nvme_ps, PCIeLState.L0, PCIeDState.D0)
 
     def _pm_verify_combo(self, combo: PowerCombo) -> dict:
@@ -4834,13 +4853,17 @@ class NVMeFuzzer:
                     log.warning(f"    [verify] L1SS       : {verify['l1ss']}")
 
             # 4. PS0+L0+D0 복귀
-            #    D3 포함 combo: D0 먼저(setpci) → Trst → L0 → PS0 순서 필수.
-            #    D3hot 상태에서 NVMe 커맨드를 먼저 보내면 hang 발생.
+            #    D3 포함 combo: CLKREQ# assert → D0 → L0 → PS0.
+            #    L1.2 단독 combo: CLKREQ# assert/L0 → PS0.
+            #    clock/link 복구 전에 NVMe 커맨드를 먼저 보내면 hang 발생.
             ok_restore = True
             try:
                 if combo.pcie_d == PCIeDState.D3:
                     ok_restore = self._pm_d3_safe_restore()
                     time.sleep(D3_RESTORE_SETTLE)
+                elif combo.pcie_l == PCIeLState.L1_2:
+                    ok_restore = self._pm_l12_safe_restore(restore_ps0=True)
+                    time.sleep(RESTORE_SETTLE)
                 else:
                     self._set_power_combo(baseline)
                     time.sleep(RESTORE_SETTLE)
