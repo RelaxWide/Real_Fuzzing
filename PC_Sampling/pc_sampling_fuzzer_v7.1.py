@@ -4113,12 +4113,12 @@ class NVMeFuzzer:
         try:
             r = subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '1', '3300'],
                                timeout=3, capture_output=True, text=True)
-            log.warning(f"[PMU] CLKREQ# Assert (pin16) rc={r.returncode}"
+            log.warning(f"[PMU] CLKREQ# Assert rc={r.returncode}"
                         + (f" out={r.stdout.strip()}" if r.stdout.strip() else "")
                         + (f" err={r.stderr.strip()}" if r.stderr.strip() else ""))
             return r.returncode == 0
         except Exception as e:
-            log.warning(f"[PMU] CLKREQ# Assert (pin16) exception: {e}")
+            log.warning(f"[PMU] CLKREQ# Assert exception: {e}")
             return False
 
     def _pmu_clkreq_deassert(self) -> bool:
@@ -4126,12 +4126,12 @@ class NVMeFuzzer:
         try:
             r = subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '1', '3300'],
                                timeout=3, capture_output=True, text=True)
-            log.warning(f"[PMU] CLKREQ# Deassert (pin15) rc={r.returncode}"
+            log.warning(f"[PMU] CLKREQ# Deassert rc={r.returncode}"
                         + (f" out={r.stdout.strip()}" if r.stdout.strip() else "")
                         + (f" err={r.stderr.strip()}" if r.stderr.strip() else ""))
             return r.returncode == 0
         except Exception as e:
-            log.warning(f"[PMU] CLKREQ# Deassert (pin15) exception: {e}")
+            log.warning(f"[PMU] CLKREQ# Deassert exception: {e}")
             return False
 
     def _set_pcie_l_state(self, state: PCIeLState, deassert_l12: bool = True) -> bool:
