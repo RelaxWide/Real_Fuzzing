@@ -4111,7 +4111,7 @@ class NVMeFuzzer:
     def _pmu_clkreq_assert(self) -> bool:
         """CLKREQ# assert only. PCIe config cleanup is intentionally separate."""
         try:
-            r = subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
+            r = subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '1', '3300'],
                                timeout=3, capture_output=True, text=True)
             log.warning(f"[PMU] CLKREQ# Assert (pin16) rc={r.returncode}"
                         + (f" out={r.stdout.strip()}" if r.stdout.strip() else "")
@@ -4124,7 +4124,7 @@ class NVMeFuzzer:
     def _pmu_clkreq_deassert(self) -> bool:
         """CLKREQ# deassert only. Use after L1SS/LNKCTL/D-state are armed."""
         try:
-            r = subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
+            r = subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '1', '3300'],
                                timeout=3, capture_output=True, text=True)
             log.warning(f"[PMU] CLKREQ# Deassert (pin15) rc={r.returncode}"
                         + (f" out={r.stdout.strip()}" if r.stdout.strip() else "")
