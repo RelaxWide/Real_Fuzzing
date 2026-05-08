@@ -4108,7 +4108,33 @@ class NVMeFuzzer:
         else:
             log.warning("[PCIe] L1 진입 조건 충족 (EP/RP 양측 L1 지원 확인)")
 
-    def _set_pcie_l_state(self, state: PCIeLState) -> bool:
+    def _pmu_clkreq_assert(self) -> bool:
+        """CLKREQ# assert only. PCIe config cleanup is intentionally separate."""
+        try:
+            r = subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
+                               timeout=3, capture_output=True, text=True)
+            log.warning(f"[PMU] CLKREQ# Assert (pin16) rc={r.returncode}"
+                        + (f" out={r.stdout.strip()}" if r.stdout.strip() else "")
+                        + (f" err={r.stderr.strip()}" if r.stderr.strip() else ""))
+            return r.returncode == 0
+        except Exception as e:
+            log.warning(f"[PMU] CLKREQ# Assert (pin16) exception: {e}")
+            return False
+
+    def _pmu_clkreq_deassert(self) -> bool:
+        """CLKREQ# deassert only. Use after L1SS/LNKCTL/D-state are armed."""
+        try:
+            r = subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
+                               timeout=3, capture_output=True, text=True)
+            log.warning(f"[PMU] CLKREQ# Deassert (pin15) rc={r.returncode}"
+                        + (f" out={r.stdout.strip()}" if r.stdout.strip() else "")
+                        + (f" err={r.stderr.strip()}" if r.stderr.strip() else ""))
+            return r.returncode == 0
+        except Exception as e:
+            log.warning(f"[PMU] CLKREQ# Deassert (pin15) exception: {e}")
+            return False
+
+    def _set_pcie_l_state(self, state: PCIeLState, deassert_l12: bool = True) -> bool:
         """PCIe L-state 설정 (spec r5.0 §5.5.4.1).
         L0=ASPM disable, L1=ASPM L1, L1.2=L1+L1SS. BDF 미탐지 시 False.
         """
@@ -4131,11 +4157,7 @@ class NVMeFuzzer:
             # [PMU] CLKREQ# Assert — 클록 복원 먼저, 링크 L0 재진입 후 레지스터 해제
             #   L1.2 상태에서는 클록이 없으므로 setpci(config space write) 전에 반드시 수행.
             #   클록 안정화(T_COMMON_MODE) 대기 후 레지스터 조작.
-            _r = subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
-                                timeout=3, capture_output=True, text=True)
-            log.warning(f"[PMU] CLKREQ# Assert (pin16) rc={_r.returncode}"
-                        + (f" out={_r.stdout.strip()}" if _r.stdout.strip() else "")
-                        + (f" err={_r.stderr.strip()}" if _r.stderr.strip() else ""))
+            self._pmu_clkreq_assert()
 
             # L1.2에서 복귀 시 config space가 0xFFFF일 수 있음 — 응답할 때까지 대기
             _deadline = time.monotonic() + 2.0
@@ -4190,11 +4212,7 @@ class NVMeFuzzer:
             # 3. PMU CLKREQ# Assert — NOPS device의 자연적 deassert 차단
             #    CLKREQ#가 deassert되면 RP가 ref clock을 제거해 L1.2로 진입.
             #    L1 조합에서는 clock을 유지해야 하므로 pin16으로 강제 assert.
-            _r = subprocess.run(['python3', _PMU_SCRIPT, '16', '1', '3300'],
-                                timeout=3, capture_output=True, text=True)
-            log.warning(f"[PMU] CLKREQ# Assert (pin16) rc={_r.returncode}"
-                        + (f" out={_r.stdout.strip()}" if _r.stdout.strip() else "")
-                        + (f" err={_r.stderr.strip()}" if _r.stderr.strip() else ""))
+            self._pmu_clkreq_assert()
             # 4. 전역 ASPM 정책 → powersave (커널 override 방지)
             try:
                 Path('/sys/module/pcie_aspm/parameters/policy').write_text('powersave')
@@ -4283,14 +4301,14 @@ class NVMeFuzzer:
 
             # [PMU] CLKREQ# Deassert — 레지스터 설정·검증 완료 후 마지막 수행
             #   루트 포트가 CLKREQ# 비활성 감지 → 레퍼런스 클록 제거 → 실제 L1.2 진입.
-            _r = subprocess.run(['python3', _PMU_SCRIPT, '15', '1', '3300'],
-                                timeout=3, capture_output=True, text=True)
-            log.warning(f"[PMU] CLKREQ# Deassert (pin15) rc={_r.returncode}"
-                        + (f" out={_r.stdout.strip()}" if _r.stdout.strip() else "")
-                        + (f" err={_r.stderr.strip()}" if _r.stderr.strip() else ""))
+            if deassert_l12:
+                ok &= self._pmu_clkreq_deassert()
+            else:
+                log.warning("[PCIe] L1.2 armed; CLKREQ# deassert deferred")
 
             # idle window — L1 idle timer + L1.2 clock off 완료 대기
-            time.sleep(L1_SETTLE + L1_2_SETTLE)
+            if deassert_l12:
+                time.sleep(L1_SETTLE + L1_2_SETTLE)
             return ok
 
     def _set_pcie_d_state(self, state: PCIeDState) -> bool:
@@ -4336,6 +4354,8 @@ class NVMeFuzzer:
     def _set_power_combo(self, combo: PowerCombo) -> None:
         """NVMe PS + PCIe L/D-state 동시 설정 + cmd_history 기록.
         순서: NVMe PS → PS settle → L-state → D3(마지막).
+        단, L1.2+D3hot은 config path가 살아있는 상태에서 D3hot을 먼저
+        확정한 뒤 CLKREQ#를 deassert해야 하므로 별도 순서를 사용한다.
         """
         t0    = time.monotonic()
         ok_ps = self._pm_set_state(combo.nvme_ps)
@@ -4344,19 +4364,26 @@ class NVMeFuzzer:
         ps_settle = self._ps_settle.get(combo.nvme_ps, 0.05)
         if ps_settle > 0.05:
             time.sleep(ps_settle)
-        ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — ASPM 협상 완료
-        # D0는 기본 상태이므로 PMCSR write 불필요 (L1.2 후 config space 접근 불가 방지)
-        # D3hot만 명시적으로 PMCSR write
-        if combo.pcie_d == PCIeDState.D3:
+
+        if combo.pcie_l == PCIeLState.L1_2 and combo.pcie_d == PCIeDState.D3:
+            # D3+L1.2: L1SS/LNKCTL arm까지만 먼저 수행하고 clock은 유지.
+            # PMCSR D3hot write/readback을 끝낸 뒤 마지막에 CLKREQ# deassert.
+            ok_l = self._set_pcie_l_state(combo.pcie_l, deassert_l12=False)
             ok_d = self._set_pcie_d_state(combo.pcie_d)
+            ok_l = self._pmu_clkreq_deassert() and ok_l
+            time.sleep(L1_SETTLE + L1_2_SETTLE)
         else:
-            ok_d = True
-        # D3+L1/L1.2: D3 config TLP가 링크를 순간 깨움 → 재진입 대기
-        if combo.pcie_d == PCIeDState.D3:
-            if combo.pcie_l == PCIeLState.L1_2:
-                time.sleep(L1_SETTLE + L1_2_SETTLE)
-            elif combo.pcie_l == PCIeLState.L1:
+            ok_l  = self._set_pcie_l_state(combo.pcie_l)  # L-state 먼저 — ASPM 협상 완료
+            # D0는 기본 상태이므로 PMCSR write 불필요 (L1.2 후 config space 접근 불가 방지)
+            # D3hot만 명시적으로 PMCSR write
+            if combo.pcie_d == PCIeDState.D3:
+                ok_d = self._set_pcie_d_state(combo.pcie_d)
+            else:
+                ok_d = True
+            # D3+L1: D3 config TLP가 링크를 순간 깨움 → 재진입 대기
+            if combo.pcie_d == PCIeDState.D3 and combo.pcie_l == PCIeLState.L1:
                 time.sleep(L1_SETTLE)
+
         elapsed = time.monotonic() - t0
         status  = (f"PS={'OK' if ok_ps else 'FAIL'} "
                    f"L={'OK' if ok_l else 'FAIL'} "
@@ -4513,19 +4540,30 @@ class NVMeFuzzer:
             log.warning(f"[KeepAlive] 복원 실패: {e}")
 
     def _pm_d3_safe_restore(self) -> bool:
-        """D3hot/L1.2+D3 → PS0+L0+D0 복귀. 순서: L0 → D0 → Trst(10ms) → PS0."""
+        """D3hot/L1.2+D3 → PS0+L0+D0 복귀.
+
+        순서: CLKREQ# assert → D0 → L0 cleanup → Trst(10ms) → PS0.
+        D3hot 상태에서는 링크 레지스터 정리보다 PMCSR D0 복귀가 먼저 안정적이다.
+        """
         ok = True
-        # Step 1: L0 먼저 — L1.2이면 CLKREQ# assert로 clock 복원 (TLP 전 필수)
-        if self._pcie_bdf and self._pcie_cap_offset is not None:
-            self._set_pcie_l_state(PCIeLState.L0)
-            # PCIe 링크 재확립 대기 — config space 접근 전 clock 안정화 필요
-            time.sleep(0.1)
-        # Step 2: D3 → D0 (clock 복원 후 config space 접근)
+
+        # Step 1: L1.2이면 config access 전에 clock을 먼저 복원.
+        self._pmu_clkreq_assert()
+        time.sleep(0.1)
+
+        # Step 2: D3hot → D0. _set_pcie_d_state(D0)가 config 응답을 polling한다.
         if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
             ok &= self._set_pcie_d_state(PCIeDState.D0)
-        # Step 3: Trst
+            time.sleep(0.1)
+
+        # Step 3: D0 복귀 후 L1SS/LNKCTL/LTR/ECPM cleanup.
+        if self._pcie_bdf and self._pcie_cap_offset is not None:
+            ok &= self._set_pcie_l_state(PCIeLState.L0)
+
+        # Step 4: Trst
         time.sleep(0.01)
-        # Step 4: NVMe PS0
+
+        # Step 5: NVMe PS0
         ok &= self._pm_set_state(0)
         return ok
 
