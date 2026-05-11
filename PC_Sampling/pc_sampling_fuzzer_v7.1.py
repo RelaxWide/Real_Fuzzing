@@ -435,7 +435,8 @@ POWER_COMBOS: list = [
 
 # PCIe L1 / L1.2 진입 settle 시간 기본값 (FuzzConfig.l1_settle_s / l1_2_settle_s)
 # --l1-settle / --l1-2-settle CLI로 런타임 조정 가능.
-L1_SETTLE     = 1.0    # L1: idle timer + PM_Request_Ack DLLP handshake 대기 (초)
+L1_SETTLE     = 0.050  # L1: idle timer + PM_Request_Ack DLLP handshake 대기 (초)
+                       # settle sweep 실측 최솟값 5ms × I/O 부하 여유 10x
 L1_2_SETTLE   = 2.0    # L1.2 추가 대기: CLKREQ# deassert → Tclkoff 완료 (초)
 
 # preflight + 메인 퍼징 공통 settle 상수 (CLI로 동시 조정 가능)
