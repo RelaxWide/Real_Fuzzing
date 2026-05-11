@@ -238,7 +238,8 @@ FW_ADDR_END   = 0x003B7FFF
 
 # OpenOCD 설정
 OPENOCD_BINARY          = 'openocd'
-OPENOCD_CONFIG          = 'r8_pcsr.cfg'        # 퍼저 스크립트 디렉토리 기준 경로
+OPENOCD_CONFIG          = 'r8_pcsr.cfg'        # SWD용 cfg (퍼저 스크립트 디렉토리 기준 경로)
+OPENOCD_CONFIG_JTAG     = 'r8_pcsr_jtag.cfg'  # JTAG용 cfg (--transport jtag 시 자동 선택)
 OPENOCD_TELNET_HOST     = '127.0.0.1'
 OPENOCD_TELNET_PORT     = 4444
 OPENOCD_STARTUP_TIMEOUT = 10.0                 # 초
@@ -1339,10 +1340,12 @@ class OpenOCDPCSampler:
     # ------------------------------------------------------------------
 
     # PCSR 유효 PC 판별에서 제외할 알려진 비-PC 값
-    # 0x6ba02477: SWD DPIDR — OpenOCD 에러 메시지에 포함되는 DAP 식별자
+    # 0x6ba02477: SWD DPIDR, 0x6ba00477: JTAG IDCODE/DPIDR
+    # OpenOCD 에러 메시지에 DAP 식별자가 섞여 들어오는 경우 방어
     # PCSR_CORE*: 읽기 대상 주소 자체가 에러 메시지에 노출되는 경우
     _INVALID_PC_MASK = frozenset({
-        0x6ba02476, 0x6ba02477,          # DPIDR (Thumb-bit 마스킹 전·후)
+        0x6ba02476, 0x6ba02477,          # SWD DPIDR (Thumb-bit 마스킹 전·후)
+        0x6ba00476, 0x6ba00477,          # JTAG IDCODE/DPIDR (Cortex-R8)
         PCSR_CORE0, PCSR_CORE0 & ~1,     # 0x80030084
         PCSR_CORE1, PCSR_CORE1 & ~1,     # 0x80032084
         PCSR_CORE2, PCSR_CORE2 & ~1,     # 0x80034084
@@ -6588,10 +6591,12 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=f'PC Sampling SSD Fuzzer v{FUZZER_VERSION}')
+    parser.add_argument('--transport', choices=['swd', 'jtag'], default='swd',
+                        help='디버그 transport (swd: r8_pcsr.cfg, jtag: r8_pcsr_jtag.cfg)')
     parser.add_argument('--openocd-binary', default=OPENOCD_BINARY,
                         help=f'OpenOCD 바이너리 경로 (default: {OPENOCD_BINARY})')
-    parser.add_argument('--openocd-config', default=OPENOCD_CONFIG,
-                        help=f'OpenOCD 설정 파일 경로 (default: {OPENOCD_CONFIG})')
+    parser.add_argument('--openocd-config', default=None,
+                        help='OpenOCD 설정 파일 경로 (미지정 시 --transport로 자동 선택)')
     parser.add_argument('--openocd-host', default=OPENOCD_TELNET_HOST,
                         help=f'OpenOCD telnet 호스트 (default: {OPENOCD_TELNET_HOST})')
     parser.add_argument('--openocd-port', type=int, default=OPENOCD_TELNET_PORT,
@@ -6738,9 +6743,17 @@ if __name__ == "__main__":
     print(f"  - [v4.6] Crash 시 nvme-cli 프로세스 보존 (fd 유지 → SSD 상태 {passthru_days:.1f}일 보존)")
     print()
 
+    # --transport로 cfg 자동 선택 (--openocd-config 명시 시 우선)
+    if args.openocd_config is not None:
+        resolved_cfg = args.openocd_config
+    elif args.transport == 'jtag':
+        resolved_cfg = OPENOCD_CONFIG_JTAG
+    else:
+        resolved_cfg = OPENOCD_CONFIG
+
     config = FuzzConfig(
         openocd_binary=args.openocd_binary,
-        openocd_config=args.openocd_config,
+        openocd_config=resolved_cfg,
         openocd_host=args.openocd_host,
         openocd_port=args.openocd_port,
         openocd_timeout=args.openocd_timeout,
