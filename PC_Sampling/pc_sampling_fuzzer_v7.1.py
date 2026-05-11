@@ -281,7 +281,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from nvme_seeds import SEED_TEMPLATES as _DEFAULT_SEED_TEMPLATES
 
 # 버전
-FUZZER_VERSION = "7.1"
+FUZZER_VERSION = "7.1.1"
 
 # USER CONFIGURATION - 여기만 수정하세요
 
