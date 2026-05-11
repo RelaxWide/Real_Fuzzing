@@ -3990,8 +3990,20 @@ class NVMeFuzzer:
     def _detect_pcie_info(self) -> None:
         """NVMe PCIe BDF + Express/PM/L1SS cap offsets + 루트 포트 탐지.
         실패해도 _pcie_bdf=None → L/D-state 제어 비활성화.
+        POR/rescan 후 재탐지 시 stale 캐시 방지: 탐지 전 전체 초기화.
         """
         import re as _re
+
+        # 재탐지 전 캐시 초기화 — 이전 스캔 값이 잔류하면 cap 오판 가능
+        self._pcie_bdf              = None
+        self._pcie_cap_offset       = None
+        self._pcie_pm_cap_offset    = None
+        self._pcie_l1ss_cap         = None
+        self._pcie_l1ss_offset      = None
+        self._pcie_root_bdf         = None
+        self._pcie_root_cap_offset  = None
+        self._pcie_root_l1ss_offset = None
+        self._pcie_root_l1ss_cap    = None
 
         dev = os.path.basename(self.config.nvme_device)
         m = _re.match(r'(nvme\d+)', dev)
@@ -4485,7 +4497,10 @@ class NVMeFuzzer:
                 if ok_l and ok_d:
                     ok_l = self._pmu_clkreq_deassert() and ok_l
                 else:
-                    log.warning("[PCIe] D3+L1.2: arm 또는 D3hot 실패 — CLKREQ# deassert 생략")
+                    log.warning("[PCIe] D3+L1.2: arm 또는 D3hot 실패 — CLKREQ# deassert 생략, LNKCTL 롤백")
+                    # ok_l=True(arm 성공)인데 ok_d 실패면 LNKCTL ASPMC 비트가 남음 → 명시 롤백
+                    if ok_l and self._pcie_bdf and self._pcie_cap_offset is not None:
+                        self._set_pcie_l_state(PCIeLState.L0)
                 time.sleep(self.config.l1_settle_s + self.config.l1_2_settle_s)
         else:
             ok_l = self._set_pcie_l_state(combo.pcie_l)
@@ -4681,14 +4696,20 @@ class NVMeFuzzer:
                 or combo.pcie_l == PCIeLState.L1_2)
 
     def _nonop_restore(self, combo: PowerCombo) -> PowerCombo:
-        """D3hot/L1.2 → NVMe 커맨드 가능 상태 복귀. 복귀 후 PowerCombo 반환."""
+        """D3hot/L1.2 → NVMe 커맨드 가능 상태 복귀. 복귀 후 PowerCombo 반환.
+        복귀 실패 시 경고를 남기고 baseline combo를 반환 (호출부가 NVMe 응답으로 최종 확인).
+        """
         if combo.pcie_d == PCIeDState.D3:
             log.warning(f"[PM] NonOp restore: {combo.label} → D0+L0+PS0")
-            self._pm_d3_safe_restore()
+            ok = self._pm_d3_safe_restore()
+            if not ok:
+                log.warning("[PM] NonOp restore: D3 복귀 실패 — 장치 응답 불가 상태일 수 있음")
             return POWER_COMBOS[0]  # PS0+L0+D0
 
         log.warning(f"[PM] NonOp restore: {combo.label} → L0")
-        self._set_pcie_l_state(PCIeLState.L0)
+        ok = self._set_pcie_l_state(PCIeLState.L0)
+        if not ok:
+            log.warning("[PM] NonOp restore: L0 복귀 실패 — clock 복원 안 됨")
         return PowerCombo(combo.nvme_ps, PCIeLState.L0, PCIeDState.D0)
 
     def _pm_verify_combo(self, combo: PowerCombo) -> dict:
@@ -4954,9 +4975,13 @@ class NVMeFuzzer:
                     ok_restore = self._pm_d3_safe_restore()
                     time.sleep(D3_RESTORE_SETTLE)
                 elif combo.pcie_l == PCIeLState.L1_2:
-                    self._set_pcie_l_state(PCIeLState.L0)  # CLKREQ# assert → clock 복원
+                    if not self._set_pcie_l_state(PCIeLState.L0):  # CLKREQ# assert → clock 복원
+                        log.warning("    → L0 복귀 실패 (CLKREQ# assert 실패)")
+                        ok_restore = False
                     time.sleep(0.2)
-                    self._pm_set_state(0)                  # clock 복원 후 PS0
+                    if not self._pm_set_state(0):                  # clock 복원 후 PS0
+                        log.warning("    → PS0 복귀 실패")
+                        ok_restore = False
                     time.sleep(RESTORE_SETTLE)
                 else:
                     if not self._set_power_combo(baseline):
@@ -7131,15 +7156,17 @@ class NVMeFuzzer:
 
                 # 진입 직후 verify
                 verify = self._pm_verify_combo(combo)
-                pmu_ok = 'DEASSERT' in verify.get('pmu', '')
+                pmu_raw = verify.get('pmu', '')
+                # PMU getcurrent는 전류값(mA 숫자)을 반환 — FAIL/ERR 없으면 device alive
+                pmu_ok = bool(pmu_raw) and 'FAIL' not in pmu_raw and 'ERR' not in pmu_raw
                 l_ok   = 'OK' in verify.get('l_state_ep', '')
                 log.warning(
-                    f"  verify: pmu={verify.get('pmu','?')}  "
+                    f"  verify: pmu={pmu_raw!r}  "
                     f"l_ep={verify.get('l_state_ep','?')}  "
                     f"l_rp={verify.get('l_state_rp','?')}")
 
                 if not pmu_ok or not l_ok:
-                    log.warning(f"  [FAIL] verify 불일치")
+                    log.warning(f"  [FAIL] verify 불일치 (pmu_ok={pmu_ok}, l_ok={l_ok})")
                     fail_cnt += 1
                 else:
                     log.warning(f"  [PASS]")
@@ -7210,8 +7237,8 @@ class NVMeFuzzer:
                     f"max={self.config.diagnose_max}, "
                     f"sleep={self.config.diagnose_sample_ms}ms, "
                     f"worst={_diag_worst:.0f}s")
-        log.warning(f"PCIe settle : L1={L1_SETTLE*1000:.0f}ms, "
-                    f"L1.2+={L1_2_SETTLE*1000:.0f}ms")
+        log.warning(f"PCIe settle : L1={self.config.l1_settle_s*1000:.0f}ms, "
+                    f"L1.2+={self.config.l1_2_settle_s*1000:.0f}ms")
         log.warning(f"PM settle   : restore={RESTORE_SETTLE_S}s, "
                     f"d3_restore={D3_RESTORE_SETTLE_S}s, "
                     f"d3_extra={D3_EXTRA_S}s")
