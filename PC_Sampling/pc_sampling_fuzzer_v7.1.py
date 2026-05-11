@@ -4303,9 +4303,13 @@ class NVMeFuzzer:
             if rp is None:
                 log.warning("[PCIe] L1.2: RP 미탐지 — L1.2 진입 불가")
                 return False
+            _skip_l1ss_arm = False
             if rl is None:
-                log.warning("[PCIe] L1.2: RP L1SS cap 없음 — L1.2 진입 불가")
-                return False
+                # RP L1SS cap 없으면 EP L1SSCTL1 ASPM L1.2 enable bit(bit2) 쓰면 안 됨.
+                # EP 컨트롤러가 L1 idle 시 CLKREQ#를 auto-deassert → RP 미설정 → link error → device drop.
+                # GPIO deassert는 유지: LNKCTL ASPMC=L1 + GPIO 토글로 수동 테스트와 동일 경로 사용.
+                log.warning("[PCIe] L1.2: RP L1SS cap 미탐지 — L1SS arm 스킵, GPIO CLKREQ# 제어만 사용")
+                _skip_l1ss_arm = True
 
             # Step 1: L1SS enable bits 비활성화 (양측) — spec §5.5.4.1 step 2
             if el:
@@ -4327,11 +4331,14 @@ class NVMeFuzzer:
             # EP와 RP 양측이 지원하는 substate 교집합만 arm — 미지원 bit 기록 방지
             rp_l1ss_cap = self._pcie_root_l1ss_cap if self._pcie_root_l1ss_cap is not None else 0xF
             l1ss_en = self._pcie_l1ss_cap & rp_l1ss_cap & 0xF
-            if rp and rl:
-                self._setpci_write(rp, rl + 0x08, l1ss_en, 0x0000000F)
             ok = True
-            if el:
-                ok = self._setpci_write(ep, el + 0x08, l1ss_en, 0x0000000F)
+            if not _skip_l1ss_arm:
+                if rp and rl:
+                    self._setpci_write(rp, rl + 0x08, l1ss_en, 0x0000000F)
+                if el:
+                    ok = self._setpci_write(ep, el + 0x08, l1ss_en, 0x0000000F)
+            else:
+                l1ss_en = 0  # arm 안 했으므로 검증 기준도 0으로
 
             # Step 6: LNKCTL ASPMC — upstream(RP) 먼저, endpoint 이후 — spec step 6
             aspm_val = aspms & 0x2
@@ -7025,11 +7032,10 @@ class NVMeFuzzer:
             log.warning(f"[PM-Test] cycle {idx + 1}/{self.config.pm_test_cycles}: {combo.label}")
             try:
                 if not self._set_power_combo(combo):
-                    log.warning(f"[PM-Test] {combo.label} 진입 실패 — 복구 후 스킵")
-                    if self._is_nonop_combo(combo):
-                        self._nonop_restore(combo)
-                    else:
-                        self._set_power_combo(POWER_COMBOS[0])
+                    log.warning(f"[PM-Test] {combo.label} 진입 실패 — 스킵 (rollback 자동 수행)")
+                    # 진입 실패 시 _set_pcie_l_state 내 rollback이 이미 수행됨.
+                    # _nonop_restore 호출 금지 — CLKREQ# deassert가 된 적 없는데
+                    # assert를 시도하게 되는 부작용 발생.
                     continue
                 settle = self._ps_settle.get(combo.nvme_ps, 0.05)
                 if combo.pcie_d == PCIeDState.D3:
