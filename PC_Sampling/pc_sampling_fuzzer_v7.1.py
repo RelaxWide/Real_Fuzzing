@@ -7199,18 +7199,16 @@ class NVMeFuzzer:
 
         best_100 = min(full_pass)   # 100% 중 최솟값
         lo       = best_100
-        hi       = max(not_full) if not_full else None  # 100% 미만 중 최댓값
+        # Phase 2 상한: best_100 바로 아래의 실패값 (best_100보다 작은 not_full 중 최댓값)
+        # max(not_full) 전체 사용 시 더 큰 값의 transient failure가 상한으로 잡혀 탐색 방향 오류 가능
+        below_failures = [sv for sv in not_full if sv < best_100]
+        hi = max(below_failures) if below_failures else None
 
-        # Phase 2: lo ↔ hi 이진 탐색
+        # Phase 2: hi ↔ lo 이진 탐색 (hi < lo)
         p2_results: list[tuple[float, int, int, float]] = []
-        if hi is not None and hi < lo:
-            # hi < lo: not_full 중 lo보다 작은 값이 있음 (정상 케이스)
-            lo_p2 = hi
-            hi_p2 = lo
-        elif hi is not None and hi > lo:
-            # 예외: 큰 값에서 실패 (드문 경우)
-            lo_p2 = lo
-            hi_p2 = hi
+        if hi is not None:
+            lo_p2 = hi   # 실패 하한
+            hi_p2 = lo   # 100% 상한
         else:
             lo_p2 = None
 
@@ -8358,8 +8356,8 @@ if __name__ == "__main__":
                         help=f'L1.2 추가 settle 시간 초 (기본: {L1_2_SETTLE})')
     parser.add_argument('--settle-sweep', action='store_true', default=False,
                         help='L1.2 settle 최솟값 탐색 모드 (OpenOCD 불필요, --pm 생략 가능)')
-    parser.add_argument('--settle-sweep-reps', type=int, default=5,
-                        help='settle sweep: 각 값당 반복 횟수 (기본: 5)')
+    parser.add_argument('--settle-sweep-reps', type=int, default=20,
+                        help='settle sweep: 각 값당 반복 횟수 (기본: 20)')
     parser.add_argument('--settle-sweep-values', type=str,
                         default='10.0,5.0,2.0,1.0,0.5,0.2,0.1,0.05',
                         help='settle sweep: 쉼표 구분 내림차순 값 목록 (기본: 10.0,5.0,...,0.05)')
