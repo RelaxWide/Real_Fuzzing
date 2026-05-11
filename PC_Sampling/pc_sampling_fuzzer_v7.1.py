@@ -1049,6 +1049,10 @@ class FuzzConfig:
     l1_settle_s:         float = L1_SETTLE    # L1 진입 idle window settle (초)
     l1_2_settle_s:       float = L1_2_SETTLE  # L1.2 추가 settle (초)
 
+    settle_sweep:        bool  = False        # --settle-sweep 모드
+    settle_sweep_reps:   int   = 5            # 각 settle 값당 반복 횟수
+    settle_sweep_values: list  = field(default_factory=lambda: [10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1, 0.05])
+
     # v7.0: State monitoring
     state_enabled: bool = True             # --no-state 시 False
 
@@ -7061,12 +7065,128 @@ class NVMeFuzzer:
 
         log.warning("[PM-Test] 완료")
 
+    def _run_settle_sweep(self):
+        """L1.2 settle 최솟값 탐색.
+
+        l1_settle_s를 내림차순으로 줄이면서 L1.2 combo를 settle_sweep_reps 회 반복.
+        전체 pass 시 해당 값을 기록, 첫 fail 발생 시 직전 값이 최솟값.
+        결과 테이블을 로그로 출력.
+        """
+        cfg = self.config
+
+        self._detect_pcie_info()
+        if self._pcie_bdf and self._pcie_cap_offset is not None:
+            self._set_pcie_l_state(PCIeLState.L0)
+        self._apst_disable()
+        self._keepalive_disable()
+
+        # L1.2 combo만 대상 (D0 먼저, D3 포함 여부는 reps 안에서 순환)
+        l12_combos = [c for c in POWER_COMBOS if c.pcie_l == PCIeLState.L1_2]
+        if not l12_combos:
+            log.error("[SettleSweep] L1.2 combo 없음 — 종료")
+            return
+
+        baseline = POWER_COMBOS[0]
+        sweep_values: list = cfg.settle_sweep_values
+        reps: int = cfg.settle_sweep_reps
+
+        log.warning("=" * 70)
+        log.warning(f"[SettleSweep] L1.2 settle 최솟값 탐색 시작")
+        log.warning(f"  대상 combo : {[c.label for c in l12_combos]}")
+        log.warning(f"  sweep 값   : {sweep_values}")
+        log.warning(f"  반복 횟수  : {reps}회/값")
+        log.warning(f"  l1_2_settle: {cfg.l1_2_settle_s}s (고정)")
+        log.warning("=" * 70)
+
+        results: list[tuple[float, int, int]] = []  # (settle, pass, total)
+        best_settle: float = sweep_values[0]
+
+        for settle_val in sweep_values:
+            self.config.l1_settle_s = settle_val
+            pass_cnt = 0
+            fail_cnt = 0
+
+            log.warning(f"\n[SettleSweep] ── l1_settle={settle_val:.3f}s ──")
+            for rep in range(reps):
+                combo = l12_combos[rep % len(l12_combos)]
+                log.warning(f"  rep {rep+1}/{reps}: {combo.label}")
+
+                # 베이스라인에서 시작
+                if not self._set_power_combo(baseline):
+                    log.warning("  [!] baseline 진입 실패 — combo 스킵")
+                    fail_cnt += 1
+                    continue
+                time.sleep(RESTORE_SETTLE_S)
+
+                # L1.2 진입
+                ok = self._set_power_combo(combo)
+                if not ok:
+                    log.warning(f"  [FAIL] L1.2 진입 실패")
+                    fail_cnt += 1
+                    # 복귀
+                    self._nonop_restore(combo)
+                    self._current_combo = baseline
+                    time.sleep(RESTORE_SETTLE_S)
+                    continue
+
+                # 진입 직후 verify
+                verify = self._pm_verify_combo(combo)
+                pmu_ok = 'DEASSERT' in verify.get('pmu', '')
+                l_ok   = 'OK' in verify.get('l_state_ep', '')
+                log.warning(
+                    f"  verify: pmu={verify.get('pmu','?')}  "
+                    f"l_ep={verify.get('l_state_ep','?')}  "
+                    f"l_rp={verify.get('l_state_rp','?')}")
+
+                if not pmu_ok or not l_ok:
+                    log.warning(f"  [FAIL] verify 불일치")
+                    fail_cnt += 1
+                else:
+                    log.warning(f"  [PASS]")
+                    pass_cnt += 1
+
+                # 복귀
+                self._nonop_restore(combo)
+                self._current_combo = baseline
+                self._current_ps    = baseline.nvme_ps
+                time.sleep(RESTORE_SETTLE_S)
+
+            total = pass_cnt + fail_cnt
+            results.append((settle_val, pass_cnt, total))
+            log.warning(
+                f"[SettleSweep] settle={settle_val:.3f}s → "
+                f"{pass_cnt}/{total} pass "
+                f"({'OK' if fail_cnt == 0 else 'FAIL'})")
+
+            if fail_cnt == 0:
+                best_settle = settle_val
+            else:
+                log.warning(f"[SettleSweep] settle={settle_val:.3f}s에서 첫 실패 — 탐색 중단")
+                break
+
+        # 결과 요약
+        log.warning("\n" + "=" * 70)
+        log.warning("[SettleSweep] ── 결과 요약 ──")
+        log.warning(f"  {'settle(s)':>10}  {'pass':>6}  {'total':>6}  {'판정':>6}")
+        for sv, pc, tc in results:
+            verdict = 'PASS' if pc == tc else 'FAIL'
+            log.warning(f"  {sv:>10.3f}  {pc:>6}  {tc:>6}  {verdict:>6}")
+        log.warning(f"\n  ★ 권장 l1_settle : {best_settle:.3f}s  "
+                    f"(pre-deassert 대기; l1_2_settle={cfg.l1_2_settle_s}s 별도 유지)")
+        log.warning(f"  사용법: --l1-settle {best_settle}")
+        log.warning("=" * 70)
+
     def run(self):
         global log
 
         self._setup_directories()
         log, log_file = setup_logging(self.config.output_dir)
         log.warning(f"Log file: {log_file}")
+
+        # --settle-sweep: OpenOCD/fuzzing loop 없이 settle 최솟값만 탐색
+        if self.config.settle_sweep:
+            self._run_settle_sweep()
+            return
 
         log.warning("=" * 60)
         log.warning(f" PC Sampling SSD Fuzzer v{self.VERSION}")
@@ -8163,6 +8283,13 @@ if __name__ == "__main__":
                         help=f'L1 idle window settle 시간 초 (기본: {L1_SETTLE})')
     parser.add_argument('--l1-2-settle', type=float, default=L1_2_SETTLE,
                         help=f'L1.2 추가 settle 시간 초 (기본: {L1_2_SETTLE})')
+    parser.add_argument('--settle-sweep', action='store_true', default=False,
+                        help='L1.2 settle 최솟값 탐색 모드 (OpenOCD 불필요, --pm 생략 가능)')
+    parser.add_argument('--settle-sweep-reps', type=int, default=5,
+                        help='settle sweep: 각 값당 반복 횟수 (기본: 5)')
+    parser.add_argument('--settle-sweep-values', type=str,
+                        default='10.0,5.0,2.0,1.0,0.5,0.2,0.1,0.05',
+                        help='settle sweep: 쉼표 구분 내림차순 값 목록 (기본: 10.0,5.0,...,0.05)')
     parser.add_argument('--no-por', action='store_true', default=False,
                         help='시작 시 SSD POR(전원 사이클) 건너뜀 (기본: POR 수행)')
     parser.add_argument('--no-ufas', action='store_true', default=False,
@@ -8317,6 +8444,9 @@ if __name__ == "__main__":
         clkreq_voltage_mv=args.clkreq_voltage,
         l1_settle_s=args.l1_settle,
         l1_2_settle_s=args.l1_2_settle,
+        settle_sweep=args.settle_sweep,
+        settle_sweep_reps=args.settle_sweep_reps,
+        settle_sweep_values=[float(v) for v in args.settle_sweep_values.split(',')],
     )
 
     fuzzer = NVMeFuzzer(config)
