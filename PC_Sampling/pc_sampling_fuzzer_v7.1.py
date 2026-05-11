@@ -4838,9 +4838,15 @@ class NVMeFuzzer:
             v = self._setpci_read(self._pcie_bdf, self._pcie_l1ss_offset + 0x08, 'l')
             if v is not None and v != 0xFFFFFFFF:
                 l1ss_en = v & 0xF
-                _ep_cap = self._pcie_l1ss_cap if self._pcie_l1ss_cap is not None else 0xF
-                _rp_cap = self._pcie_root_l1ss_cap if self._pcie_root_l1ss_cap is not None else 0xF
-                exp_en  = (_ep_cap & _rp_cap & 0xF) if combo.pcie_l == PCIeLState.L1_2 else 0x0
+                # RP L1SS offset 없으면 _skip_l1ss_arm=True로 arm 자체를 스킵했으므로
+                # 기댓값도 0x0. _rp_cap 기본값을 0xF로 두면 잘못된 MISMATCH 발생.
+                _skip_l1ss_arm = (self._pcie_root_l1ss_offset is None)
+                if combo.pcie_l != PCIeLState.L1_2 or _skip_l1ss_arm:
+                    exp_en = 0x0
+                else:
+                    _ep_cap = self._pcie_l1ss_cap if self._pcie_l1ss_cap is not None else 0xF
+                    _rp_cap = self._pcie_root_l1ss_cap if self._pcie_root_l1ss_cap is not None else 0xF
+                    exp_en  = _ep_cap & _rp_cap & 0xF
                 chk     = 'OK' if l1ss_en == exp_en else f'MISMATCH(exp={exp_en:#03x})'
                 res['l1ss'] = f"L1SS_EN={l1ss_en:#03x} {chk}"
             elif combo.pcie_l == PCIeLState.L1_2:
