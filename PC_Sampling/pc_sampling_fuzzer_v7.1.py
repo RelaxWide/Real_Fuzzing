@@ -4004,6 +4004,7 @@ class NVMeFuzzer:
         self._pcie_root_cap_offset  = None
         self._pcie_root_l1ss_offset = None
         self._pcie_root_l1ss_cap    = None
+        self._pcie_lnkcap           = None
 
         dev = os.path.basename(self.config.nvme_device)
         m = _re.match(r'(nvme\d+)', dev)
