@@ -1050,7 +1050,7 @@ class FuzzConfig:
     l1_2_settle_s:       float = L1_2_SETTLE  # L1.2 추가 settle (초)
 
     settle_sweep:        bool  = False        # --settle-sweep 모드
-    settle_sweep_reps:   int   = 5            # 각 settle 값당 반복 횟수
+    settle_sweep_reps:   int   = 20           # 각 settle 값당 반복 횟수 (Phase1)
     settle_sweep_values: list  = field(default_factory=lambda: [10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1, 0.05])
 
     # v7.0: State monitoring
@@ -7091,12 +7091,57 @@ class NVMeFuzzer:
 
         log.warning("[PM-Test] 완료")
 
-    def _run_settle_sweep(self):
-        """L1.2 settle 최솟값 탐색.
+    def _settle_sweep_run_reps(self, combo_list, baseline, reps: int) -> tuple[int, int]:
+        """settle_val이 config에 세팅된 상태로 reps회 L1.2 진입/verify/복귀 반복.
+        반환: (pass_cnt, total_cnt)
+        """
+        pass_cnt = 0
+        total    = 0
+        for rep in range(reps):
+            combo = combo_list[rep % len(combo_list)]
+            total += 1
 
-        l1_settle_s를 내림차순으로 줄이면서 L1.2 combo를 settle_sweep_reps 회 반복.
-        전체 pass 시 해당 값을 기록, 첫 fail 발생 시 직전 값이 최솟값.
-        결과 테이블을 로그로 출력.
+            if not self._set_power_combo(baseline):
+                log.warning(f"  rep{rep+1}: [FAIL] baseline 진입 실패")
+                self._nonop_restore(baseline)
+                time.sleep(RESTORE_SETTLE_S)
+                continue
+            time.sleep(RESTORE_SETTLE_S)
+
+            ok = self._set_power_combo(combo)
+            if not ok:
+                log.warning(f"  rep{rep+1}: [FAIL] L1.2 진입 실패")
+                self._nonop_restore(combo)
+                self._current_combo = baseline
+                time.sleep(RESTORE_SETTLE_S)
+                continue
+
+            verify  = self._pm_verify_combo(combo)
+            pmu_raw = verify.get('pmu', '')
+            pmu_ok  = bool(pmu_raw) and 'FAIL' not in pmu_raw and 'ERR' not in pmu_raw
+            l_ok    = 'OK' in verify.get('l_state_ep', '')
+            result  = 'PASS' if (pmu_ok and l_ok) else f'FAIL(pmu={pmu_ok},l={l_ok})'
+            log.warning(
+                f"  rep{rep+1}: [{result}]  "
+                f"pmu={pmu_raw!r}  l_ep={verify.get('l_state_ep','?')}")
+            if pmu_ok and l_ok:
+                pass_cnt += 1
+
+            self._nonop_restore(combo)
+            self._current_combo = baseline
+            self._current_ps    = baseline.nvme_ps
+            time.sleep(RESTORE_SETTLE_S)
+
+        return pass_cnt, total
+
+    def _run_settle_sweep(self):
+        """L1.2 pre-deassert settle 최솟값 통계 탐색.
+
+        Phase 1: sweep_values 전체를 reps회씩 완주 — 성공률(%) 테이블 출력.
+                 첫 실패에서 중단하지 않고 모든 값을 측정해 전체 분포를 파악.
+        Phase 2: 100% 구간의 마지막 값(lo)과 첫 실패 값(hi) 사이를
+                 이진 탐색(최대 6회, reps*2 샘플)으로 정밀 탐색.
+        최종: 100% 신뢰 최솟값 권장.
         """
         cfg = self.config
 
@@ -7106,102 +7151,102 @@ class NVMeFuzzer:
         self._apst_disable()
         self._keepalive_disable()
 
-        # L1.2 combo만 대상 (D0 먼저, D3 포함 여부는 reps 안에서 순환)
         l12_combos = [c for c in POWER_COMBOS if c.pcie_l == PCIeLState.L1_2]
         if not l12_combos:
             log.error("[SettleSweep] L1.2 combo 없음 — 종료")
             return
 
-        baseline = POWER_COMBOS[0]
-        sweep_values: list = cfg.settle_sweep_values
-        reps: int = cfg.settle_sweep_reps
+        baseline     = POWER_COMBOS[0]
+        sweep_values = cfg.settle_sweep_values
+        reps         = cfg.settle_sweep_reps
 
         log.warning("=" * 70)
-        log.warning(f"[SettleSweep] L1.2 settle 최솟값 탐색 시작")
-        log.warning(f"  대상 combo : {[c.label for c in l12_combos]}")
-        log.warning(f"  sweep 값   : {sweep_values}")
-        log.warning(f"  반복 횟수  : {reps}회/값")
+        log.warning("[SettleSweep] ══ Phase 1: 전체 sweep (성공률 측정) ══")
+        log.warning(f"  sweep 값  : {sweep_values}")
+        log.warning(f"  반복 횟수 : {reps}회/값")
         log.warning(f"  l1_2_settle: {cfg.l1_2_settle_s}s (고정)")
         log.warning("=" * 70)
 
-        results: list[tuple[float, int, int]] = []  # (settle, pass, total)
-        best_settle: float = sweep_values[0]
+        # (settle_val, pass, total, rate_pct)
+        p1_results: list[tuple[float, int, int, float]] = []
 
         for settle_val in sweep_values:
             self.config.l1_settle_s = settle_val
-            pass_cnt = 0
-            fail_cnt = 0
+            log.warning(f"\n[SettleSweep] ── l1_settle={settle_val:.3f}s ({reps}회) ──")
+            pc, tc = self._settle_sweep_run_reps(l12_combos, baseline, reps)
+            rate   = pc / tc * 100 if tc else 0.0
+            p1_results.append((settle_val, pc, tc, rate))
+            log.warning(f"  → {pc}/{tc} pass  ({rate:.1f}%)")
 
-            log.warning(f"\n[SettleSweep] ── l1_settle={settle_val:.3f}s ──")
-            for rep in range(reps):
-                combo = l12_combos[rep % len(l12_combos)]
-                log.warning(f"  rep {rep+1}/{reps}: {combo.label}")
-
-                # 베이스라인에서 시작
-                if not self._set_power_combo(baseline):
-                    log.warning("  [!] baseline 진입 실패 — combo 스킵")
-                    fail_cnt += 1
-                    continue
-                time.sleep(RESTORE_SETTLE_S)
-
-                # L1.2 진입
-                ok = self._set_power_combo(combo)
-                if not ok:
-                    log.warning(f"  [FAIL] L1.2 진입 실패")
-                    fail_cnt += 1
-                    # 복귀
-                    self._nonop_restore(combo)
-                    self._current_combo = baseline
-                    time.sleep(RESTORE_SETTLE_S)
-                    continue
-
-                # 진입 직후 verify
-                verify = self._pm_verify_combo(combo)
-                pmu_raw = verify.get('pmu', '')
-                # PMU getcurrent는 전류값(mA 숫자)을 반환 — FAIL/ERR 없으면 device alive
-                pmu_ok = bool(pmu_raw) and 'FAIL' not in pmu_raw and 'ERR' not in pmu_raw
-                l_ok   = 'OK' in verify.get('l_state_ep', '')
-                log.warning(
-                    f"  verify: pmu={pmu_raw!r}  "
-                    f"l_ep={verify.get('l_state_ep','?')}  "
-                    f"l_rp={verify.get('l_state_rp','?')}")
-
-                if not pmu_ok or not l_ok:
-                    log.warning(f"  [FAIL] verify 불일치 (pmu_ok={pmu_ok}, l_ok={l_ok})")
-                    fail_cnt += 1
-                else:
-                    log.warning(f"  [PASS]")
-                    pass_cnt += 1
-
-                # 복귀
-                self._nonop_restore(combo)
-                self._current_combo = baseline
-                self._current_ps    = baseline.nvme_ps
-                time.sleep(RESTORE_SETTLE_S)
-
-            total = pass_cnt + fail_cnt
-            results.append((settle_val, pass_cnt, total))
-            log.warning(
-                f"[SettleSweep] settle={settle_val:.3f}s → "
-                f"{pass_cnt}/{total} pass "
-                f"({'OK' if fail_cnt == 0 else 'FAIL'})")
-
-            if fail_cnt == 0:
-                best_settle = settle_val
-            else:
-                log.warning(f"[SettleSweep] settle={settle_val:.3f}s에서 첫 실패 — 탐색 중단")
-                break
-
-        # 결과 요약
+        # Phase 1 요약 테이블
         log.warning("\n" + "=" * 70)
-        log.warning("[SettleSweep] ── 결과 요약 ──")
-        log.warning(f"  {'settle(s)':>10}  {'pass':>6}  {'total':>6}  {'판정':>6}")
-        for sv, pc, tc in results:
-            verdict = 'PASS' if pc == tc else 'FAIL'
-            log.warning(f"  {sv:>10.3f}  {pc:>6}  {tc:>6}  {verdict:>6}")
-        log.warning(f"\n  ★ 권장 l1_settle : {best_settle:.3f}s  "
-                    f"(pre-deassert 대기; l1_2_settle={cfg.l1_2_settle_s}s 별도 유지)")
-        log.warning(f"  사용법: --l1-settle {best_settle}")
+        log.warning("[SettleSweep] ── Phase 1 결과 ──")
+        log.warning(f"  {'settle(s)':>10}  {'pass':>5}  {'total':>5}  {'성공률':>7}  {'판정':>6}")
+        log.warning("  " + "-" * 42)
+        for sv, pc, tc, rate in p1_results:
+            verdict = '100%' if rate == 100.0 else (f'{rate:.0f}%' if rate > 0 else 'FAIL')
+            flag    = ' ◀' if rate == 100.0 else ''
+            log.warning(f"  {sv:>10.3f}  {pc:>5}  {tc:>5}  {rate:>6.1f}%  {verdict:>6}{flag}")
+
+        # 100% 구간 경계 파악
+        full_pass = [sv for sv, pc, tc, rate in p1_results if rate == 100.0]
+        not_full  = [sv for sv, pc, tc, rate in p1_results if rate < 100.0]
+
+        if not full_pass:
+            log.warning("\n[SettleSweep] 100% 성공 값 없음 — sweep 범위 확장 필요")
+            self.config.l1_settle_s = sweep_values[0]
+            return
+
+        best_100 = min(full_pass)   # 100% 중 최솟값
+        lo       = best_100
+        hi       = max(not_full) if not_full else None  # 100% 미만 중 최댓값
+
+        # Phase 2: lo ↔ hi 이진 탐색
+        p2_results: list[tuple[float, int, int, float]] = []
+        if hi is not None and hi < lo:
+            # hi < lo: not_full 중 lo보다 작은 값이 있음 (정상 케이스)
+            lo_p2 = hi
+            hi_p2 = lo
+        elif hi is not None and hi > lo:
+            # 예외: 큰 값에서 실패 (드문 경우)
+            lo_p2 = lo
+            hi_p2 = hi
+        else:
+            lo_p2 = None
+
+        if lo_p2 is not None:
+            log.warning(f"\n[SettleSweep] ══ Phase 2: 정밀 이진 탐색 [{lo_p2:.3f}s ~ {hi_p2:.3f}s] ══")
+            log.warning(f"  샘플 수: {reps * 2}회/값  최대 6회 탐색")
+            bsearch_lo = lo_p2
+            bsearch_hi = hi_p2
+            for biter in range(6):
+                mid = round((bsearch_lo + bsearch_hi) / 2, 3)
+                if abs(bsearch_hi - bsearch_lo) < 0.020:
+                    log.warning(f"  [이진탐색] 수렴 ({bsearch_lo:.3f}~{bsearch_hi:.3f}s < 20ms) — 종료")
+                    break
+                self.config.l1_settle_s = mid
+                log.warning(f"  [이진탐색 {biter+1}] mid={mid:.3f}s ({reps*2}회)")
+                pc, tc = self._settle_sweep_run_reps(l12_combos, baseline, reps * 2)
+                rate   = pc / tc * 100 if tc else 0.0
+                p2_results.append((mid, pc, tc, rate))
+                log.warning(f"  → {pc}/{tc} ({rate:.1f}%) {'✓ 100%' if rate == 100.0 else '✗'}")
+                if rate == 100.0:
+                    best_100    = mid
+                    bsearch_hi  = mid
+                else:
+                    bsearch_lo  = mid
+
+        # 최종 권장값
+        self.config.l1_settle_s = sweep_values[0]  # 원복
+        log.warning("\n" + "=" * 70)
+        log.warning("[SettleSweep] ── 최종 결과 ──")
+        if p2_results:
+            log.warning(f"  Phase 2 탐색 결과:")
+            for sv, pc, tc, rate in p2_results:
+                log.warning(f"    {sv:.3f}s → {pc}/{tc} ({rate:.1f}%)")
+        log.warning(f"\n  ★ 권장 l1_settle : {best_100:.3f}s  "
+                    f"(100% 신뢰 최솟값; l1_2_settle={cfg.l1_2_settle_s}s 고정)")
+        log.warning(f"  사용법: --l1-settle {best_100}")
         log.warning("=" * 70)
 
     def run(self):
