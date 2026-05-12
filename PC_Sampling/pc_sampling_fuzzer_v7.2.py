@@ -5580,6 +5580,13 @@ class NVMeFuzzer:
             except Exception:
                 pass
             t.join(timeout=5)
+            # bash를 SIGKILL로 종료하면 자식 JLinkExe가 고아로 남아 USB를 점유할 수 있음.
+            # 여기서만 pkill — rc!=0 정상 종료 경로는 JLinkExe가 이미 종료된 상태.
+            try:
+                subprocess.run(['pkill', '-9', '-x', JLINK_BINARY],
+                               capture_output=True, timeout=5)
+            except Exception:
+                pass
             return
 
         if 'error' in _result:
@@ -5594,17 +5601,6 @@ class NVMeFuzzer:
         if err:
             log.warning(f"[JLINK DUMP] stderr:\n{err}")
         log.warning(f"[JLINK DUMP] 완료 (rc={rc})")
-
-        # rc!=0이면 스크립트가 비정상 종료 → 잔여 JLinkExe가 USB를 점유할 수 있음.
-        # pkill로 정리한 뒤 USB 해제까지 잠시 대기.
-        if rc != 0:
-            log.warning("[JLINK DUMP] rc!=0 — 잔여 JLinkExe 프로세스 정리")
-            try:
-                subprocess.run(['pkill', '-9', '-x', JLINK_BINARY],
-                               capture_output=True, timeout=5)
-            except Exception:
-                pass
-            time.sleep(2.0)
 
     def _run_ufas_dump(self) -> None:
         """crash 발생 시 UFAS 펌웨어 덤프를 실행한다.
@@ -8371,15 +8367,6 @@ class NVMeFuzzer:
             # timeout crash: JLink 기반 PC 모니터링 루프 (30초 간격, Ctrl+C로 종료)
             # OpenOCD는 JLink dump 전에 이미 종료됨 → JLink 직접 연결로 PC 읽기
             if self._timeout_crash:
-                # dump 스크립트가 비정상 종료됐을 경우 잔여 JLinkExe가 남아있을 수 있으므로
-                # 모니터링 시작 전 한번 더 정리한다 (정상 종료 경로에선 실행 안 함).
-                try:
-                    subprocess.run(['pkill', '-9', '-x', JLINK_BINARY],
-                                   capture_output=True, timeout=5)
-                    time.sleep(1.5)
-                except Exception:
-                    pass
-
                 import threading as _threading
                 import re as _re
 
@@ -8390,8 +8377,8 @@ class NVMeFuzzer:
 
                 def _read_pc_via_jlink() -> Optional[List[int]]:
                     # JTAG 멀티코어: 'core N'이 JLinkExe에서 지원 안 될 수 있음.
-                    # 1차 시도: core N + h + r + go (전코어)
-                    # 2차 시도(JTAG fallback): h + r + go만 (Core0만 읽기)
+                    # 1차 시도: core N + h + go (전코어) — h가 halt와 동시에 레지스터 덤프 출력
+                    # 2차 시도(JTAG fallback): h + go만 (Core0만 읽기)
                     def _run(cmd_list):
                         cmd_input = ('\n'.join(cmd_list) + '\nexit\n').encode()
                         proc = subprocess.run(
@@ -8409,7 +8396,6 @@ class NVMeFuzzer:
                             if _n_cores > 1:
                                 cmds.append(f'core {i}')
                             cmds.append('h')
-                            cmds.append('r')
                             cmds.append('go')
                         output = _run(cmds)
                         pcs = [int(p, 16) & ~1
@@ -8423,7 +8409,7 @@ class NVMeFuzzer:
                                     + output[:400])
                         if _n_cores > 1:
                             # fallback: core N 없이 Core0만
-                            output2 = _run(['h', 'r', 'go'])
+                            output2 = _run(['h', 'go'])
                             pcs2 = [int(p, 16) & ~1
                                     for p in _re.findall(r'\bPC\s*=\s*([0-9A-Fa-f]+)', output2)]
                             if pcs2:
