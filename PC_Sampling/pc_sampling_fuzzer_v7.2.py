@@ -5594,6 +5594,17 @@ class NVMeFuzzer:
             log.warning(f"[JLINK DUMP] stderr:\n{err}")
         log.warning(f"[JLINK DUMP] 완료 (rc={rc})")
 
+        # rc!=0이면 스크립트가 비정상 종료 → 잔여 JLinkExe가 USB를 점유할 수 있음.
+        # pkill로 정리한 뒤 USB 해제까지 잠시 대기.
+        if rc != 0:
+            log.warning("[JLINK DUMP] rc!=0 — 잔여 JLinkExe 프로세스 정리")
+            try:
+                subprocess.run(['pkill', '-9', '-x', JLINK_BINARY],
+                               capture_output=True, timeout=5)
+            except Exception:
+                pass
+            time.sleep(2.0)
+
     def _run_ufas_dump(self) -> None:
         """crash 발생 시 UFAS 펌웨어 덤프를 실행한다.
 
@@ -8273,6 +8284,15 @@ class NVMeFuzzer:
             # timeout crash: JLink 기반 PC 모니터링 루프 (30초 간격, Ctrl+C로 종료)
             # OpenOCD는 JLink dump 전에 이미 종료됨 → JLink 직접 연결로 PC 읽기
             if self._timeout_crash:
+                # dump 스크립트가 비정상 종료됐을 경우 잔여 JLinkExe가 남아있을 수 있으므로
+                # 모니터링 시작 전 한번 더 정리한다 (정상 종료 경로에선 실행 안 함).
+                try:
+                    subprocess.run(['pkill', '-9', '-x', JLINK_BINARY],
+                                   capture_output=True, timeout=5)
+                    time.sleep(1.5)
+                except Exception:
+                    pass
+
                 import threading as _threading
                 import re as _re
 
