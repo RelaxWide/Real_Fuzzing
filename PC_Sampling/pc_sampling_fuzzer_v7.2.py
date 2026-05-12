@@ -1202,7 +1202,7 @@ class _FuzzingTerminalFilter(logging.Filter):
     import re as _re
     _ALLOW = _re.compile(
         r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
-        r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]'
+        r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]|\[State-Replay\]'
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -3378,18 +3378,23 @@ class NVMeFuzzer:
         return True
 
     def _update_csfuzz_p(self):
-        """CSFuzz §III-C 수식 (4)/(5): 1000회 interval마다 corpus selection 확률 p 갱신."""
+        """CSFuzz §III-C 수식 (4)/(5): 10000회 interval마다 corpus selection 확률 p 갱신.
+        m2는 avg_seq_len으로 나눠 NVMe 명령 1개당 finds로 정규화 후 m1과 비교."""
         NC1 = max(len(self.corpus), 1)
         NC2 = max(len(self.state_corpus), 1)
+        avg_seq = (sum(len(e.sequence) for e in self.state_corpus)
+                   / len(self.state_corpus)) if self.state_corpus else 1.0
         m1  = (sum(self._csfuzz_c1_rewards) / len(self._csfuzz_c1_rewards)
                if self._csfuzz_c1_rewards else 0.0)
-        m2  = (sum(self._csfuzz_c2_rewards) / len(self._csfuzz_c2_rewards)
-               if self._csfuzz_c2_rewards else 0.0)
+        m2_raw = (sum(self._csfuzz_c2_rewards) / len(self._csfuzz_c2_rewards)
+                  if self._csfuzz_c2_rewards else 0.0)
+        m2  = m2_raw / max(avg_seq, 1.0)   # per-NVMe-command 기준으로 정규화
         delta = (self._csfuzz_a * m1 / NC1
                  - self._csfuzz_b * m2 / NC2) * (NC1 + NC2)
         self._csfuzz_p = max(0.1, min(0.9, self._csfuzz_p + delta))
         log.info(f"[CSFuzz-p] p={self._csfuzz_p:.3f} δ={delta:.4f} "
-                 f"m1={m1:.4f} m2={m2:.4f} NC1={NC1} NC2={NC2}")
+                 f"m1={m1:.4f} m2_raw={m2_raw:.4f} m2_norm={m2:.6f} "
+                 f"avg_seq={avg_seq:.1f} NC1={NC1} NC2={NC2}")
         self._csfuzz_c1_rewards.clear()
         self._csfuzz_c2_rewards.clear()
 
@@ -7793,10 +7798,12 @@ class NVMeFuzzer:
                     # CSFuzz §III-C: corpus selection probability
                     self._csfuzz_pre_c1_size = len(self.corpus)
                     self._csfuzz_pre_c2_size = len(self.state_corpus)
+                    _avg_seq = (sum(len(e.sequence) for e in self.state_corpus)
+                                / len(self.state_corpus)) if self.state_corpus else 1.0
+                    _p_c2 = (1.0 - self._csfuzz_p) / max(_avg_seq, 1.0)
                     if (self.config.state_enabled
                             and self.state_corpus
-                            and self.executions % 100 == 99
-                            and random.random() >= self._csfuzz_p):
+                            and random.random() < _p_c2):
                         # C2(state corpus) 선택 → 시퀀스 replay 후 정상 seed 선택
                         self._csfuzz_last_from = 'c2'
                         _sc_entry = self._select_state_entry_csfuzz()
