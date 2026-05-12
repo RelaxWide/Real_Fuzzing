@@ -8397,6 +8397,7 @@ class NVMeFuzzer:
                             if _n_cores > 1:
                                 cmds.append(f'core {i}')
                             cmds.append('h')
+                            cmds.append('regs')
                             cmds.append('go')
                         output = _run(cmds)
                         pcs = [int(p, 16) & ~1
@@ -8410,7 +8411,7 @@ class NVMeFuzzer:
                                     + output[:400])
                         if _n_cores > 1:
                             # fallback: core N 없이 Core0만
-                            output2 = _run(['h', 'go'])
+                            output2 = _run(['h', 'regs', 'go'])
                             pcs2 = [int(p, 16) & ~1
                                     for p in _re.findall(r'\bPC\s*=\s*([0-9A-Fa-f]+)', output2)]
                             if pcs2:
