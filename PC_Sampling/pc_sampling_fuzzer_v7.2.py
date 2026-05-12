@@ -7795,6 +7795,7 @@ class NVMeFuzzer:
                     self._csfuzz_pre_c2_size = len(self.state_corpus)
                     if (self.config.state_enabled
                             and self.state_corpus
+                            and self.executions % 100 == 99
                             and random.random() >= self._csfuzz_p):
                         # C2(state corpus) 선택 → 시퀀스 replay 후 정상 seed 선택
                         self._csfuzz_last_from = 'c2'
@@ -8167,9 +8168,11 @@ class NVMeFuzzer:
                     self._cull_corpus()
                     if self.config.state_enabled:
                         self._cull_state_corpus()
-                        if self.state_corpus:
-                            self._update_csfuzz_p()
                     self._mopt_update_phase()
+
+                if self.executions % 10000 == 0 and self.executions > 0:
+                    if self.config.state_enabled and self.state_corpus:
+                        self._update_csfuzz_p()
 
                 if (CORPUS_EPOCH_SIZE > 0
                         and self.executions % CORPUS_EPOCH_SIZE == 0
