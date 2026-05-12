@@ -8407,8 +8407,10 @@ class NVMeFuzzer:
                             cmds.append('regs')
                             cmds.append('go')
                         output = _run(cmds)
+                        # PC = 0x... / PC: (R15) = 0x... 형식 허용 (R15 별도 매칭 제외 — 중복 방지)
+                        _pc_re = r'\bPC\s*(?::\s*\([^)]*\)\s*)?=\s*(?:0x)?([0-9A-Fa-f]+)'
                         pcs = [int(p, 16) & ~1
-                               for p in _re.findall(r'\bPC\s*=\s*([0-9A-Fa-f]+)', output)]
+                               for p in _re.findall(_pc_re, output)]
                         if len(pcs) >= _n_cores:
                             return pcs[:_n_cores]
 
@@ -8418,7 +8420,7 @@ class NVMeFuzzer:
                             # fallback: core N 없이 Core0만
                             output2 = _run(['h', 'regs', 'go'])
                             pcs2 = [int(p, 16) & ~1
-                                    for p in _re.findall(r'\bPC\s*=\s*([0-9A-Fa-f]+)', output2)]
+                                    for p in _re.findall(_pc_re, output2)]
                             if pcs2:
                                 log.warning("[MONITOR] fallback: Core0만 읽음 (core N 미지원 가능성)")
                                 return pcs2[:1]
