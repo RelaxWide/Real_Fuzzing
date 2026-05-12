@@ -8374,60 +8374,30 @@ class NVMeFuzzer:
                 import threading as _threading
                 import re as _re
 
-                _n_cores = len(self.sampler._pcsr_addrs)
                 _jlink_if = 'JTAG' if self.config.interface == 'jtag' else 'SWD'
                 _jlink_dev = self.config.jlink_device
                 idle_pcs = self.sampler.idle_pcs
 
                 def _read_pc_via_jlink() -> Optional[List[int]]:
-                    # JTAG 멀티코어: 'core N'이 JLinkExe에서 지원 안 될 수 있음.
-                    # 1차 시도: core N + h + go (전코어) — h가 halt와 동시에 레지스터 덤프 출력
-                    # 2차 시도(JTAG fallback): h + go만 (Core0만 읽기)
-                    def _run(cmd_list):
-                        argv = [JLINK_BINARY, '-if', _jlink_if, '-speed', '4000',
-                                '-device', _jlink_dev, '-autoconnect', '1']
-                        cmd_input = ('\n'.join(cmd_list) + '\nexit\n').encode()
-                        log.debug(f"[MONITOR] JLink cmd: {' '.join(argv)}")
-                        log.debug(f"[MONITOR] JLink stdin: {cmd_input.decode()!r}")
+                    # OpenOCD 미사용 환경 — JLinkExe로 Core0만 읽기
+                    argv = [JLINK_BINARY, '-if', _jlink_if, '-speed', '4000',
+                            '-device', _jlink_dev, '-autoconnect', '1']
+                    cmd_input = b'h\nregs\ngo\nexit\n'
+                    log.debug(f"[MONITOR] JLink cmd: {' '.join(argv)}")
+                    try:
                         proc = subprocess.run(
                             argv,
                             input=cmd_input,
                             capture_output=True, timeout=15
                         )
                         out = proc.stdout.decode(errors='replace')
-                        err = proc.stderr.decode(errors='replace')
-                        log.debug(f"[MONITOR] JLink stdout:\n{out}")
-                        if err.strip():
-                            log.debug(f"[MONITOR] JLink stderr:\n{err}")
-                        return out
-
-                    try:
-                        cmds = []
-                        for i in range(_n_cores):
-                            if _n_cores > 1:
-                                cmds.append(f'core {i}')
-                            cmds.append('h')
-                            cmds.append('regs')
-                            cmds.append('go')
-                        output = _run(cmds)
-                        # PC = 0x... / PC: (R15) = 0x... 형식 허용 (R15 별도 매칭 제외 — 중복 방지)
+                        if proc.stderr.strip():
+                            log.debug(f"[MONITOR] JLink stderr:\n{proc.stderr.decode(errors='replace')}")
                         _pc_re = r'\bPC\s*(?::\s*\([^)]*\)\s*)?=\s*(?:0x)?([0-9A-Fa-f]+)'
-                        pcs = [int(p, 16) & ~1
-                               for p in _re.findall(_pc_re, output)]
-                        if len(pcs) >= _n_cores:
-                            return pcs[:_n_cores]
-
-                        # PC가 부족하면 warning으로 전체 출력을 남기고 fallback 시도
-                        log.warning(f"[MONITOR] JLink PC={len(pcs)}개 (기대={_n_cores}). 전체 출력:\n{output}")
-                        if _n_cores > 1:
-                            # fallback: core N 없이 Core0만
-                            output2 = _run(['h', 'regs', 'go'])
-                            pcs2 = [int(p, 16) & ~1
-                                    for p in _re.findall(_pc_re, output2)]
-                            if pcs2:
-                                log.warning("[MONITOR] fallback: Core0만 읽음 (core N 미지원 가능성)")
-                                return pcs2[:1]
-                            log.warning(f"[MONITOR] fallback 출력:\n{output2}")
+                        pcs = [int(p, 16) & ~1 for p in _re.findall(_pc_re, out)]
+                        if pcs:
+                            return pcs[:1]
+                        log.warning(f"[MONITOR] JLink PC 미검출. 전체 출력:\n{out}")
                         return None
                     except Exception as e:
                         log.warning(f"[MONITOR] JLink 예외: {e}")
@@ -8449,10 +8419,9 @@ class NVMeFuzzer:
                 while not _monitor_stop.is_set():
                     pcs = _read_pc_via_jlink()
                     if pcs:
-                        tags = [f"Core{i}={hex(pc)}"
-                                + (" [IDLE]" if pc in idle_pcs else " [NON-IDLE]")
-                                for i, pc in enumerate(pcs)]
-                        log.warning("[MONITOR] " + "  ".join(tags))
+                        pc = pcs[0]
+                        tag = "[IDLE]" if pc in idle_pcs else "[NON-IDLE]"
+                        log.warning(f"[MONITOR] Core0={hex(pc)} {tag}")
                     else:
                         log.warning("[MONITOR] JLink PC 읽기 실패")
                     _monitor_stop.wait(30.0)
