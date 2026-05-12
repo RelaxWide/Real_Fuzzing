@@ -2408,6 +2408,7 @@ class NVMeFuzzer:
         # _handle_timeout_crash()에서 log.error() 전에 복원하기 위해 사용.
         self._cal_saved_stderr_fd: Optional[int] = None
         self._crash_nvme_pid: Optional[int] = None
+        self._log_file: Optional[str] = None   # run()에서 설정, artifact 복사에 사용
         # nvme_core 모듈 파라미터 원래 값 (종료 시 복원용)
         self._nvme_timeout_originals: dict = {}
 
@@ -5715,6 +5716,75 @@ class NVMeFuzzer:
         else:
             log.warning(f"[UFAS] 덤프 실패 (rc={rc})")
 
+    def _collect_crash_artifacts(self, crash_time: datetime) -> None:
+        """JLink/UFAS dump 완료 후 관련 파일을 날짜 폴더에 모아 복사한다.
+
+        수집 대상:
+          - crashes_dir/ 내 crash_{name} 바이너리·JSON·dmesg 파일 (crash_time 이후 생성)
+          - script_dir/ 내 *.bin 및 *dump* 파일 (dump 시작 시각 기준 60초 여유)
+          - fuzzer 로그 파일 (self._log_file)
+          - 현재 dmesg 스냅샷
+        """
+        import shutil
+
+        ts = crash_time.strftime('%Y%m%d_%H%M%S')
+        dest = self.crashes_dir / f"crash_{ts}"
+        dest.mkdir(parents=True, exist_ok=True)
+        log.warning(f"[ARTIFACT] 수집 폴더: {dest}")
+
+        crash_epoch = crash_time.timestamp()
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+        # 1) crashes_dir 내 crash 파일 (crash_time 5초 전부터)
+        try:
+            for p in sorted(self.crashes_dir.iterdir()):
+                if p.is_dir():
+                    continue
+                if p.stat().st_mtime >= crash_epoch - 5:
+                    shutil.copy2(p, dest / p.name)
+                    log.warning(f"[ARTIFACT] 복사: {p.name}")
+        except Exception as e:
+            log.warning(f"[ARTIFACT] crashes_dir 복사 오류: {e}")
+
+        # 2) script_dir 내 dump 파일 (crash_time 60초 전부터 — dump에 시간 소요)
+        try:
+            for entry in sorted(os.scandir(script_dir), key=lambda e: e.name):
+                if not entry.is_file():
+                    continue
+                name_lower = entry.name.lower()
+                if not (name_lower.endswith('.bin') or 'dump' in name_lower):
+                    continue
+                if entry.stat().st_mtime >= crash_epoch - 60:
+                    dst = dest / entry.name
+                    shutil.copy2(entry.path, dst)
+                    log.warning(f"[ARTIFACT] dump 복사: {entry.name} "
+                                f"({entry.stat().st_size:,} bytes)")
+        except Exception as e:
+            log.warning(f"[ARTIFACT] script_dir 복사 오류: {e}")
+
+        # 3) 로그 파일 (flush 후 복사)
+        if self._log_file and os.path.isfile(self._log_file):
+            for h in log.handlers:
+                try:
+                    h.flush()
+                except Exception:
+                    pass
+            try:
+                shutil.copy2(self._log_file, dest / os.path.basename(self._log_file))
+                log.warning(f"[ARTIFACT] 로그 복사: {os.path.basename(self._log_file)}")
+            except Exception as e:
+                log.warning(f"[ARTIFACT] 로그 복사 실패: {e}")
+
+        # 4) dmesg 최신본 저장
+        try:
+            dmesg = self._capture_dmesg(lines=200)
+            (dest / f"dmesg_{ts}.txt").write_text(dmesg)
+            log.warning(f"[ARTIFACT] dmesg 저장: dmesg_{ts}.txt")
+        except Exception as e:
+            log.warning(f"[ARTIFACT] dmesg 저장 실패: {e}")
+
+        log.warning(f"[ARTIFACT] 수집 완료 → {dest}/")
+
     def _generate_state_replay_sh(self, entry: 'StateCorpusEntry') -> None:
         """state corpus entry의 100개 명령 시퀀스를 replay .sh로 저장.
         기존 _generate_replay_sh를 재사용 — _cmd_history를 임시 교체."""
@@ -5993,7 +6063,7 @@ class NVMeFuzzer:
             return f"(dmesg capture failed: {e})"
 
     def _save_crash(self, data: bytes, seed: Seed, reason: str = "timeout",
-                    stuck_pcs: Optional[List[int]] = None,
+                    stuck_pcs: Optional[List[Tuple[int, ...]]] = None,
                     dmesg_snapshot: Optional[str] = None):
         input_hash = hashlib.md5(data).hexdigest()[:12]
         filename = f"crash_{seed.cmd.name}_{hex(seed.cmd.opcode)}_{input_hash}"
@@ -6007,17 +6077,21 @@ class NVMeFuzzer:
         meta["timestamp"] = datetime.now().isoformat()
 
         if stuck_pcs:
-            meta["stuck_pcs"] = [hex(pc) for pc in stuck_pcs]
-            meta["stuck_pcs_unique"] = [hex(pc) for pc in sorted(set(stuck_pcs))]
-            meta["stuck_pcs_count"] = len(stuck_pcs)
-            # 가장 빈도 높은 PC = 가장 유력한 hang 지점
             from collections import Counter
-            pc_counts = Counter(stuck_pcs)
-            most_common = pc_counts.most_common(5)
-            meta["stuck_pc_top5"] = [
-                {"pc": hex(pc), "count": cnt, "ratio": f"{cnt/len(stuck_pcs):.0%}"}
-                for pc, cnt in most_common
-            ]
+            n_cores = len(stuck_pcs[0]) if stuck_pcs else 0
+            meta["stuck_pcs_count"] = len(stuck_pcs)
+            # 샘플별 코어 PC 목록: [[core0, core1, ...], ...]
+            meta["stuck_pcs"] = [[hex(pc) for pc in sample] for sample in stuck_pcs]
+            # 코어별 top-5 빈도 PC
+            per_core_top = []
+            for i in range(n_cores):
+                cc = Counter(t[i] for t in stuck_pcs)
+                per_core_top.append([
+                    {"pc": hex(pc), "count": cnt,
+                     "ratio": f"{cnt/len(stuck_pcs):.0%}"}
+                    for pc, cnt in cc.most_common(5)
+                ])
+            meta["stuck_pc_top5_per_core"] = per_core_top
 
         if dmesg_snapshot:
             meta["dmesg_snapshot"] = dmesg_snapshot
@@ -6039,6 +6113,8 @@ class NVMeFuzzer:
         호출 후 caller는 break로 현재 루프를 탈출해야 한다.
         """
         from collections import Counter
+
+        _crash_time = datetime.now()   # artifact 폴더 타임스탬프 기준
 
         # calibration 구간은 J-Link DLL 노이즈 억제를 위해 fd 2(stderr)를
         # /dev/null로 리다이렉트한다. 이 상태에서 log.error()를 호출하면
@@ -6203,6 +6279,13 @@ class NVMeFuzzer:
             log.warning("[UFAS] _run_ufas_dump 반환")
         else:
             log.warning("[TIMEOUT] UFAS 덤프 건너뜀 (--no-ufas)")
+
+        # 3.8) 모든 dump 완료 후 artifact 수집 (crash 폴더에 날짜 폴더 생성)
+        log.warning("[TIMEOUT] Crash artifact 수집을 시작합니다...")
+        try:
+            self._collect_crash_artifacts(_crash_time)
+        except Exception as _art_exc:
+            log.warning(f"[ARTIFACT] 수집 중 예외: {_art_exc}")
 
         # 4) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
         log.error(
@@ -7372,6 +7455,7 @@ class NVMeFuzzer:
 
         self._setup_directories()
         log, log_file = setup_logging(self.config.output_dir)
+        self._log_file = log_file
         log.warning(f"Log file: {log_file}")
 
         # --settle-sweep: OpenOCD/fuzzing loop 없이 settle 최솟값만 탐색
@@ -7676,6 +7760,9 @@ class NVMeFuzzer:
 
         try:
             while True:
+                if self._timeout_crash:
+                    break
+
                 elapsed = (datetime.now() - self.start_time).total_seconds()
                 if elapsed >= self.config.total_runtime_sec:
                     log.info("Runtime limit reached")
@@ -7717,7 +7804,7 @@ class NVMeFuzzer:
                         _sc_entry = self._select_state_entry_csfuzz()
                         if _sc_entry is not None:
                             if not self._replay_state_sequence(_sc_entry):
-                                continue  # replay 중 timeout
+                                break  # replay 중 timeout → _timeout_crash=True, 루프 탈출
                     else:
                         self._csfuzz_last_from = 'c1'
 
