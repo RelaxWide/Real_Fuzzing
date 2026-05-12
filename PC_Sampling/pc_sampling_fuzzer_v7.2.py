@@ -7513,8 +7513,9 @@ class NVMeFuzzer:
         log.warning(f"Output      : {self.config.output_dir}")
         log.warning("=" * 60)
 
-        # 이전 실행의 corpus/graphs 폴더 비우기
-        for subdir in ('corpus', 'graphs'):
+        # 이전 실행의 corpus/graphs/state_corpus 폴더 비우기
+        # crashes/는 분석 증거이므로 보존한다.
+        for subdir in ('corpus', 'graphs', 'state_corpus'):
             target = self.output_dir / subdir
             if target.exists():
                 shutil.rmtree(target)
