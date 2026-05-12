@@ -8381,14 +8381,21 @@ class NVMeFuzzer:
                     # 1차 시도: core N + h + go (전코어) — h가 halt와 동시에 레지스터 덤프 출력
                     # 2차 시도(JTAG fallback): h + go만 (Core0만 읽기)
                     def _run(cmd_list):
+                        argv = [JLINK_BINARY, '-if', _jlink_if, '-speed', '4000',
+                                '-device', _jlink_dev, '-autoconnect', '1']
                         cmd_input = ('\n'.join(cmd_list) + '\nexit\n').encode()
+                        log.debug(f"[MONITOR] JLink cmd: {' '.join(argv)}")
+                        log.debug(f"[MONITOR] JLink stdin: {cmd_input.decode()!r}")
                         proc = subprocess.run(
-                            [JLINK_BINARY, '-if', _jlink_if, '-speed', '4000',
-                             '-device', _jlink_dev, '-autoconnect', '1'],
+                            argv,
                             input=cmd_input,
                             capture_output=True, timeout=15
                         )
                         out = proc.stdout.decode(errors='replace')
+                        err = proc.stderr.decode(errors='replace')
+                        log.debug(f"[MONITOR] JLink stdout:\n{out}")
+                        if err.strip():
+                            log.debug(f"[MONITOR] JLink stderr:\n{err}")
                         return out
 
                     try:
@@ -8405,10 +8412,8 @@ class NVMeFuzzer:
                         if len(pcs) >= _n_cores:
                             return pcs[:_n_cores]
 
-                        # PC가 부족하면 출력 일부를 로그로 남기고 fallback 시도
-                        log.warning(f"[MONITOR] JLink 출력 PC={len(pcs)}개 "
-                                    f"(기대={_n_cores}). 출력 앞부분:\n"
-                                    + output[:400])
+                        # PC가 부족하면 warning으로 전체 출력을 남기고 fallback 시도
+                        log.warning(f"[MONITOR] JLink PC={len(pcs)}개 (기대={_n_cores}). 전체 출력:\n{output}")
                         if _n_cores > 1:
                             # fallback: core N 없이 Core0만
                             output2 = _run(['h', 'regs', 'go'])
@@ -8417,6 +8422,7 @@ class NVMeFuzzer:
                             if pcs2:
                                 log.warning("[MONITOR] fallback: Core0만 읽음 (core N 미지원 가능성)")
                                 return pcs2[:1]
+                            log.warning(f"[MONITOR] fallback 출력:\n{output2}")
                         return None
                     except Exception as e:
                         log.warning(f"[MONITOR] JLink 예외: {e}")
