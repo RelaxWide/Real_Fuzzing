@@ -503,7 +503,8 @@ IO_ADMIN_RATIO         = 3      # I/O 커맨드 선택 비율 (Admin 대비)
 CORPUS_EPOCH_SIZE      = 0      # Epoch 기반 corpus 리셋 주기 (0=비활성, N=N exec마다 리셋)
 
 # Phase 3: builtin sequence 패턴 (명령 이름 리스트)
-# SetFeatures FID=0x06 (Volatile Write Cache) 만 기본 허용 — Power/APST/queue는 --pm-sequences 옵션
+# 비활성 명령이 포함된 시퀀스는 _valid_seqs 필터로 자동 제외됨
+# FWDownload→FWCommit: --all-commands 없이는 실행되지 않음
 BUILTIN_SEQUENCES: List[List[str]] = [
     ["Write", "Compare"],
     ["FWDownload", "FWCommit"],   # 잘못된 이미지에 대한 FW 에러 핸들링 경로 탐색
