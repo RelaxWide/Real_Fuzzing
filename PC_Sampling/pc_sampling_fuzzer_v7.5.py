@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v7.4
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v7.5
 
 OpenOCD PCSR(PC Sampling Register) 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
+
+=============================================================================
+v7.5 변경사항:
+- [Corpus] SequenceSeed 도입: builtin sequence(Write→Compare 등)를 N개 명령어 단위로
+    corpus에 저장. energy = base / N 패널티로 단일 Seed와 per-exec 공정 경쟁.
+    corpus에서 SequenceSeed 선택 시 stored Seeds를 순서대로 mutation+replay.
+    개별 Seed 저장(중복) 제거 — sequence 실행 중 _seq_sink에 누적 후 완료 시 저장.
 
 =============================================================================
 v7.4 변경사항:
@@ -383,7 +390,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from nvme_seeds import SEED_TEMPLATES as _DEFAULT_SEED_TEMPLATES
 
 # 버전
-FUZZER_VERSION = "7.4.0"
+FUZZER_VERSION = "7.5.0"
 
 # USER CONFIGURATION - 여기만 수정하세요
 
@@ -1078,6 +1085,18 @@ class Seed:
     stability: float = 1.0      # 0.0~1.0, PC 안정성 비율
     stable_pcs: Optional[set] = None    # calibration에서 과반수 실행에 등장한 PC 주소
     det_done: bool = False       # deterministic stage 완료 여부
+
+@dataclass
+class SequenceSeed:
+    """v7.5: N개 명령어 시퀀스를 단일 corpus 단위로 저장.
+    energy = base_energy / len(commands) 패널티로 단일 Seed와 per-exec 공정 경쟁."""
+    commands: List['Seed']           # 시퀀스 내 명령어 목록 (실행 순서)
+    new_pcs: int = 0                 # 시퀀스 전체에서 발견한 새 PC 수
+    energy: float = 1.0              # _calculate_energy() 갱신 시 base / len(commands)
+    found_at: int = 0
+    exec_count: int = 0
+    is_favored: bool = False
+    covered_pcs: Optional[set] = None
 
 @dataclass
 class FuzzConfig:
@@ -2445,7 +2464,10 @@ class NVMeFuzzer:
         # Phase 3: sequence 상태
         self._pending_sequence: Optional[List[str]] = None
         self._pending_seq_ctx: Optional[dict] = None   # 공유 SLBA/NLB/data (Write→Compare 등)
+        self._pending_seq_seeds: Optional[List['Seed']] = None  # corpus SequenceSeed replay용
         self._seq_cmds_in_window: int = 0
+        # sequence 실행 중 개별 저장 대신 누적 — 완료 시 SequenceSeed로 저장
+        self._seq_sink: Optional[dict] = None  # {'commands', 'new_pcs', 'covered_pcs', 'interesting'}
         # 실제 전송된 opcode 분포 (원본과 다른 경우만)
         self.actual_opcode_dist: dict[int, int] = defaultdict(int)
         # 실제 전송된 passthru 타입 분포
@@ -3267,24 +3289,25 @@ class NVMeFuzzer:
         log.info(f"[Fuzzer] Added {len(default_seeds)} default NVMe spec seeds"
                  f" (total corpus: {len(self.corpus)})")
 
-    def _calculate_energy(self, seed: Seed) -> float:
-        """v4: AFLfast 'explore' 스케줄 - 적게 실행된 시드에 높은 에너지"""
-        if seed.exec_count == 0:
-            return MAX_ENERGY  # 새 시드는 최대 에너지
+    def _calculate_energy(self, seed: 'Union[Seed, SequenceSeed]') -> float:
+        """v4: AFLfast 'explore' 스케줄 - 적게 실행된 시드에 높은 에너지.
+        v7.5: SequenceSeed는 base / len(commands) 패널티 적용."""
+        n = len(seed.commands) if isinstance(seed, SequenceSeed) else 1
 
-        # factor = min(MAX_ENERGY, 2^(log2(total_execs / exec_count)))
+        if seed.exec_count == 0:
+            return MAX_ENERGY / n
+
         ratio = self.executions / seed.exec_count
         if ratio <= 1:
-            return 1.0
+            return 1.0 / n
 
-        # bit_length()는 정수에만 사용 가능하므로 math.log2 사용
         try:
             power = int(math.log2(ratio))
             factor = min(MAX_ENERGY, 2 ** power)
         except (ValueError, OverflowError):
             factor = 1.0
 
-        return factor
+        return factor / n
 
     def _select_seed(self) -> Optional[Seed]:
         """v4: 에너지 기반 가중치 랜덤 선택."""
@@ -3617,34 +3640,47 @@ class NVMeFuzzer:
                 new_pcs=new_pcs,
                 covered_pcs=_seed_covered,
             )
-            self.corpus.append(new_seed)
-            _cov_label = "BB" if (self._sa_loaded and self._sa_bb_starts) else "PC"
-            log.warning(
-                f"[+][Edge-Cov] cmd={cmd.name}  "
-                f"new_{_cov_label}={new_pcs}  "
-                f"total_{_cov_label}={len(self._sa_covered_bbs) if (self._sa_loaded and self._sa_bb_starts) else len(self.sampler.global_coverage)}  "
-                f"corpus={len(self.corpus)}  exec={self.executions:,}")
-            if self.config.state_enabled and source == 'c1':
-                self._csfuzz_c1_rewards.append(1)
-            # C2 reward는 replay 완료 후 state 변화 재현 성공 여부로 기록 (per-replay)
 
-            input_hash = hashlib.md5(fuzz_data).hexdigest()[:12]
-            corpus_file = self.output_dir / 'corpus' / f"input_{cmd.name}_{hex(cmd.opcode)}_{input_hash}"
-            corpus_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(corpus_file, 'wb') as f:
-                f.write(fuzz_data)
-            with open(str(corpus_file) + '.json', 'w') as f:
-                json.dump(self._seed_meta(new_seed), f)
+            if self._seq_sink is not None:
+                # 시퀀스 모드: 개별 저장 없이 _seq_sink에 누적
+                # 완료 후 SequenceSeed 단위로 한 번에 저장
+                self._seq_sink['interesting'] = True
+                self._seq_sink['new_pcs'] += new_pcs
+                self._seq_sink['covered_pcs'].update(_seed_covered)
+                self._seq_sink['commands'].append(new_seed)
+                if self.config.state_enabled and source == 'c1':
+                    self._csfuzz_c1_rewards.append(1)
+                log.info(f"[+][Seq-Acc] cmd={cmd.name} +{new_pcs} PCs "
+                         f"(seq_acc={self._seq_sink['new_pcs']})")
+            else:
+                # 단일 명령 모드: 기존 경로
+                self.corpus.append(new_seed)
+                _cov_label = "BB" if (self._sa_loaded and self._sa_bb_starts) else "PC"
+                log.warning(
+                    f"[+][Edge-Cov] cmd={cmd.name}  "
+                    f"new_{_cov_label}={new_pcs}  "
+                    f"total_{_cov_label}={len(self._sa_covered_bbs) if (self._sa_loaded and self._sa_bb_starts) else len(self.sampler.global_coverage)}  "
+                    f"corpus={len(self.corpus)}  exec={self.executions:,}")
+                if self.config.state_enabled and source == 'c1':
+                    self._csfuzz_c1_rewards.append(1)
 
-            log.info(f"[+] New coverage! cmd={cmd.name} "
-                     f"CDW10=0x{seed.cdw10:08x} "
-                     f"+{new_pcs} PCs (total: {len(self.sampler.global_coverage)} pcs)")
+                input_hash = hashlib.md5(fuzz_data).hexdigest()[:12]
+                corpus_file = self.output_dir / 'corpus' / f"input_{cmd.name}_{hex(cmd.opcode)}_{input_hash}"
+                corpus_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(corpus_file, 'wb') as f:
+                    f.write(fuzz_data)
+                with open(str(corpus_file) + '.json', 'w') as f:
+                    json.dump(self._seed_meta(new_seed), f)
 
-            if not new_seed.det_done:
-                gen = self._deterministic_stage(new_seed)
-                self._det_queue.append((new_seed, gen))
-                log.info(f"[Det] Queued {new_seed.cmd.name} "
-                         f"(queue size: {len(self._det_queue)})")
+                log.info(f"[+] New coverage! cmd={cmd.name} "
+                         f"CDW10=0x{seed.cdw10:08x} "
+                         f"+{new_pcs} PCs (total: {len(self.sampler.global_coverage)} pcs)")
+
+                if not new_seed.det_done:
+                    gen = self._deterministic_stage(new_seed)
+                    self._det_queue.append((new_seed, gen))
+                    log.info(f"[Det] Queued {new_seed.cmd.name} "
+                             f"(queue size: {len(self._det_queue)})")
         else:
             # C1: non-interesting도 0으로 기록 (분모 정확성)
             if self.config.state_enabled and source == 'c1':
@@ -8458,7 +8494,19 @@ class NVMeFuzzer:
 
                     # Phase 3: pending sequence 또는 신규 sequence 시작
                     _used_seq = False
-                    if self._pending_sequence:
+
+                    # [3a] corpus SequenceSeed replay continuation
+                    if self._pending_seq_seeds:
+                        _next_seed = self._pending_seq_seeds.pop(0)
+                        mutated_seed = self._mutate(_next_seed)
+                        fuzz_data = mutated_seed.data
+                        cmd = mutated_seed.cmd
+                        self._seq_cmds_in_window += 1
+                        self.mutation_stats["seq_builtin"] += 1
+                        _used_seq = True
+
+                    # [3b] builtin sequence continuation
+                    elif self._pending_sequence:
                         _seq_cmd = self._pending_sequence.pop(0)
                         mutated_seed = self._pick_seq_seed(_seq_cmd, self._pending_seq_ctx)
                         fuzz_data = mutated_seed.data
@@ -8466,14 +8514,14 @@ class NVMeFuzzer:
                         self._seq_cmds_in_window += 1
                         self.mutation_stats["seq_builtin"] += 1
                         if not self._pending_sequence:
-                            self._pending_seq_ctx = None  # 시퀀스 종료 시 ctx 클리어
+                            self._pending_seq_ctx = None
                         _used_seq = True
+
+                    # [3c] 신규 builtin sequence 시작
                     elif (SEQ_PROB > 0
                           and BUILTIN_SEQUENCES
                           and self._seq_cmds_in_window < SEQ_MAX_PER_100
                           and random.random() < SEQ_PROB):
-                        # 현재 활성화된 명령어로만 구성된 시퀀스만 선택
-                        # (비활성 명령 포함 시퀀스는 FWDownload→FWCommit 등 자동 게이팅)
                         _enabled_names = {c.name for c in self.commands}
                         _valid_seqs = [s for s in BUILTIN_SEQUENCES
                                        if all(n in _enabled_names for n in s)]
@@ -8481,7 +8529,6 @@ class NVMeFuzzer:
                             _seq = list(random.choice(_valid_seqs))
                             _seq_cmd = _seq.pop(0)
                             self._pending_sequence = _seq if _seq else None
-                            # 공유 컨텍스트가 필요한 시퀀스면 ctx 생성
                             _full_seq = tuple([_seq_cmd] + (_seq or []))
                             if _full_seq in self._CTX_SEQUENCES:
                                 _nsze = self._get_nsze()
@@ -8500,6 +8547,11 @@ class NVMeFuzzer:
                                 }
                             else:
                                 self._pending_seq_ctx = None
+                            # 새 시퀀스 시작 시 _seq_sink 초기화
+                            self._seq_sink = {
+                                'commands': [], 'new_pcs': 0,
+                                'covered_pcs': set(), 'interesting': False,
+                            }
                             mutated_seed = self._pick_seq_seed(_seq_cmd, self._pending_seq_ctx)
                             fuzz_data = mutated_seed.data
                             cmd = mutated_seed.cmd
@@ -8516,6 +8568,20 @@ class NVMeFuzzer:
                                 fuzz_data = os.urandom(random.randint(64, 512))
                                 mutated_seed = Seed(data=fuzz_data, cmd=cmd)
                                 self.mutation_stats["random_gen"] += 1
+                            elif isinstance(base_seed, SequenceSeed):
+                                # corpus SequenceSeed → 시퀀스 replay 시작
+                                _cs_cmds = list(base_seed.commands)
+                                _first = self._mutate(_cs_cmds.pop(0))
+                                self._pending_seq_seeds = _cs_cmds if _cs_cmds else None
+                                self._seq_sink = {
+                                    'commands': [], 'new_pcs': 0,
+                                    'covered_pcs': set(), 'interesting': False,
+                                }
+                                mutated_seed = _first
+                                fuzz_data = mutated_seed.data
+                                cmd = mutated_seed.cmd
+                                self._seq_cmds_in_window += 1
+                                self.mutation_stats["seq_builtin"] += 1
                             else:
                                 mutated_seed = self._mutate(base_seed)
                                 fuzz_data = mutated_seed.data
@@ -8589,9 +8655,33 @@ class NVMeFuzzer:
                     is_det_stage=is_det_stage,
                 )
                 if _action == 'break':
+                    self._seq_sink = None       # timeout 시 sink 클리어
+                    self._pending_seq_seeds = None
                     break
                 if _action == 'continue':
                     continue
+
+                # 시퀀스 완료 시 SequenceSeed 저장
+                _seq_done = (self._seq_sink is not None
+                             and not self._pending_sequence
+                             and not self._pending_seq_seeds)
+                if _seq_done:
+                    if self._seq_sink['interesting']:
+                        _n = max(len(self._seq_sink['commands']), 1)
+                        _seq_seed = SequenceSeed(
+                            commands=self._seq_sink['commands'],
+                            new_pcs=self._seq_sink['new_pcs'],
+                            energy=MAX_ENERGY / _n,
+                            found_at=self.executions,
+                            covered_pcs=self._seq_sink['covered_pcs'],
+                        )
+                        self.corpus.append(_seq_seed)
+                        _cov_label = "BB" if (self._sa_loaded and self._sa_bb_starts) else "PC"
+                        log.warning(
+                            f"[+][SeqSeed] cmds={_n}  "
+                            f"new_{_cov_label}={_seq_seed.new_pcs}  "
+                            f"corpus={len(self.corpus)}  exec={self.executions:,}")
+                    self._seq_sink = None
 
 
         except KeyboardInterrupt:
