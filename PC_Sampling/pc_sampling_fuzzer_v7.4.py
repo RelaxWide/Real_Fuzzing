@@ -1,9 +1,32 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v7.3
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v7.4
 
 OpenOCD PCSR(PC Sampling Register) 방식으로 커버리지를 수집하고,
 subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
+
+=============================================================================
+v7.4 변경사항:
+- [Mutation/Phase1] NLB-relative + MDTS boundary data_len 지능화:
+    Write/Read/Compare 대상으로 CDW12 NLB 값 기반 경계 후보 생성.
+    expected-1 / exact / +1 / +page_size 4개 후보를 clamp+중복 제거 후 사용.
+    MDTS boundary 후보(max-1/max/max+1)도 추가. MDTS=0 skip 처리.
+    기존 static 후보군과 합산 후 선택.
+    mutation_stats["datalen_nlb"] / ["datalen_mdts"] 분리 집계.
+- [Mutation/Phase2] 64-bit LBA pair mutation:
+    Read/Write/Compare/Verify/Copy 대상으로 cdw10+cdw11 쌍 변이.
+    후보: 0, 1, nsze-2, nsze-1, nsze, nsze+1, 0xFFFFFFFF, 0x100000000, random.
+    LBA_PAIR_MUT_PROB=0.15 독립 확률. mutation_stats["lba_pair_64bit"] 집계.
+- [Mutation/Phase2] DSM/Copy structured payload mutation:
+    DatasetManagement/Copy: NR+payload를 경계 케이스로 재구성.
+    (1 entry / 256 entries / 선언-실제 불일치 / 빈 payload)
+    STRUCT_PAYLOAD_MUT_PROB=0.10. mutation_stats["dsm_structured"/"copy_structured"] 집계.
+- [Mutation/Phase3] Builtin sequence mini-set:
+    BUILTIN_SEQUENCES 2개 패턴 내장. SEQ_PROB=0.05.
+    SEQ_MAX_PER_100=10 (100-exec window당 최대 10개 sequence 명령).
+    mutation_stats["seq_builtin"] 집계.
+- [Cache] _get_mdts(): nvme id-ctrl에서 MDTS 캐싱 (MDTS_CACHE_TTL=5000 exec).
+- [Mutation] _mutate_field_by_type LBA 후보에 nsze-2, nsze-1 추가.
 
 =============================================================================
 v7.2 로드맵 (작업 예정)
@@ -360,7 +383,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from nvme_seeds import SEED_TEMPLATES as _DEFAULT_SEED_TEMPLATES
 
 # 버전
-FUZZER_VERSION = "7.3.0"
+FUZZER_VERSION = "7.4.0"
 
 # USER CONFIGURATION - 여기만 수정하세요
 
@@ -471,8 +494,20 @@ NSID_MUT_PROB          = 0.10   # namespace ID override 확률 (기본 10%)
 ADMIN_SWAP_PROB        = 0.05   # Admin↔IO 교차 전송 확률 (기본 5%)
 DATALEN_MUT_PROB       = 0.08   # data_len 불일치 확률 (기본 8%)
 SCHEMA_MUT_PROB        = 0.30   # 스키마 기반 CDW 필드 변형 확률 (기본 30%)
+_PAGE_SIZE             = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+LBA_PAIR_MUT_PROB      = 0.15   # 64-bit LBA pair (cdw10+cdw11) 쌍 변이 확률
+STRUCT_PAYLOAD_MUT_PROB= 0.10   # DSM/Copy structured payload 재구성 확률
+SEQ_PROB               = 0.05   # builtin sequence 시작 확률
+SEQ_MAX_PER_100        = 10     # 100-exec window당 sequence 명령 최대 개수
 IO_ADMIN_RATIO         = 3      # I/O 커맨드 선택 비율 (Admin 대비)
 CORPUS_EPOCH_SIZE      = 0      # Epoch 기반 corpus 리셋 주기 (0=비활성, N=N exec마다 리셋)
+
+# Phase 3: builtin sequence 패턴 (명령 이름 리스트)
+# SetFeatures FID=0x06 (Volatile Write Cache) 만 기본 허용 — Power/APST/queue는 --pm-sequences 옵션
+BUILTIN_SEQUENCES: List[List[str]] = [
+    ["Write", "Compare"],
+    ["FWDownload", "FWCommit"],   # 잘못된 이미지에 대한 FW 에러 핸들링 경로 탐색
+]
 
 PM_ROTATE_INTERVAL = 100   # 이 횟수마다 PS 상태 전환 (PS0→PS1→PS2→PS3→PS4→PS0...)
 
@@ -2392,12 +2427,24 @@ class NVMeFuzzer:
             "nsid_override": 0,       # nsid가 변형된 횟수
             "force_admin_swap": 0,    # Admin↔IO 교차 전송 횟수
             "data_len_override": 0,   # data_len 불일치 횟수
+            "datalen_nlb": 0,         # NLB-relative data_len 경계값 사용 횟수
+            "datalen_mdts": 0,        # MDTS boundary data_len 사용 횟수
+            "lba_pair_64bit": 0,      # 64-bit LBA pair 쌍 변이 횟수
+            "dsm_structured": 0,      # DSM structured payload 재구성 횟수
+            "copy_structured": 0,     # Copy structured payload 재구성 횟수
+            "seq_builtin": 0,         # builtin sequence에서 발행된 명령 횟수
             "schema_field": 0,        # 스키마 기반 CDW 필드 변형 횟수
             "random_gen": 0,          # 완전 랜덤 생성 횟수
             "corpus_mutated": 0,      # corpus 기반 mutation 횟수
         }
         self._nsze_cache: Optional[int] = None
         self._nsze_cache_at: int = 0
+        self._mdts_cache: Optional[int] = None
+        self._mdts_cache_at: int = 0
+        # Phase 3: sequence 상태
+        self._pending_sequence: Optional[List[str]] = None
+        self._pending_seq_ctx: Optional[dict] = None   # 공유 SLBA/NLB/data (Write→Compare 등)
+        self._seq_cmds_in_window: int = 0
         # 실제 전송된 opcode 분포 (원본과 다른 경우만)
         self.actual_opcode_dist: dict[int, int] = defaultdict(int)
         # 실제 전송된 passthru 타입 분포
@@ -3613,6 +3660,7 @@ class NVMeFuzzer:
 
         # 100회 주기
         if self.executions % 100 == 0:
+            self._seq_cmds_in_window = 0   # Phase 3: sequence 명령 window 초기화
             _now = datetime.now()
             _wdt = (_now - self._window_t0).total_seconds()
             _wexec = self.executions - self._window_exec0
@@ -3955,7 +4003,8 @@ class NVMeFuzzer:
                 self.executions - self._nsze_cache_at > self.NSZE_CACHE_TTL):
             try:
                 out = subprocess.check_output(
-                    ["nvme", "id-ns", self.config.nvme_device, "-n", "1", "-o", "json"],
+                    ["nvme", "id-ns", self.config.nvme_device,
+                     "-n", str(self.config.nvme_namespace or 1), "-o", "json"],
                     timeout=3, stderr=subprocess.DEVNULL)
                 ns_info = json.loads(out)
                 self._nsze_cache = int(ns_info.get("nsze", 0x100000))
@@ -3963,6 +4012,89 @@ class NVMeFuzzer:
                 self._nsze_cache = 0x100000   # 1M blocks fallback
             self._nsze_cache_at = self.executions
         return self._nsze_cache
+
+    MDTS_CACHE_TTL = 5000
+
+    def _get_mdts(self) -> int:
+        """MDTS (Maximum Data Transfer Size) 조회 및 캐싱 (5000 exec마다 갱신).
+        반환값: MDTS 값 (0 = no limit). nvme id-ctrl의 mdts 필드."""
+        if (self._mdts_cache is None or
+                self.executions - self._mdts_cache_at > self.MDTS_CACHE_TTL):
+            try:
+                out = subprocess.check_output(
+                    ["nvme", "id-ctrl", self.config.nvme_device, "-o", "json"],
+                    timeout=3, stderr=subprocess.DEVNULL)
+                ctrl_info = json.loads(out)
+                self._mdts_cache = int(ctrl_info.get("mdts", 0))
+            except Exception:
+                self._mdts_cache = 0
+            self._mdts_cache_at = self.executions
+        return self._mdts_cache
+
+    # 공유 컨텍스트가 필요한 시퀀스 (첫 번째 명령 기준)
+    _CTX_SEQUENCES: frozenset = frozenset([("Write", "Compare")])
+
+    def _pick_seq_seed(self, cmd_name: str,
+                       ctx: Optional[dict] = None) -> 'Seed':
+        """builtin sequence용 seed 선택: corpus에서 cmd_name 일치 seed 반환, 없으면 기본 생성.
+        ctx가 주어지면 SLBA/NLB/data를 고정."""
+        candidates = [s for s in self.corpus if s.cmd.name == cmd_name]
+        if candidates:
+            seed = self._mutate(random.choice(candidates))
+        else:
+            cmd_obj = next((c for c in self.commands if c.name == cmd_name), None)
+            if cmd_obj is None:
+                raise RuntimeError(
+                    f"_pick_seq_seed: {cmd_name!r} not in enabled commands — "
+                    "sequence prefilter should have prevented this"
+                )
+            seed = Seed(data=b'\x00' * 512, cmd=cmd_obj)
+        if ctx:
+            seed = self._apply_seq_ctx(seed, ctx)
+        return seed
+
+    def _apply_seq_ctx(self, seed: 'Seed', ctx: dict) -> 'Seed':
+        """시퀀스 공유 컨텍스트(SLBA/NLB/data)를 seed에 적용."""
+        slba = ctx['slba']
+        nlb  = ctx['nlb']
+        seed.cdw10 = slba & 0xFFFFFFFF
+        seed.cdw11 = (slba >> 32) & 0xFFFFFFFF
+        seed.cdw12 = (seed.cdw12 & ~0xFFFF) | (nlb & 0xFFFF)
+        seed.data  = ctx['data']
+        seed.data_len_override = len(ctx['data'])
+        # 시퀀스 명령은 정상 opcode/queue/nsid로 실행 — 변이 필드 초기화
+        seed.opcode_override = None
+        seed.force_admin     = None
+        seed.nsid_override   = None
+        return seed
+
+    def _make_dsm_payload(self, entry_count: int, nsze: int) -> bytes:
+        """DSM range payload 생성. 각 entry = 16B (Context Attrs 4B + LBA Count 4B + SLBA 8B)."""
+        payload = b''
+        for _ in range(entry_count):
+            ctx = random.randint(0, 0xFFFFFFFF)
+            lba_count = random.choice([0, 1, max(0, nsze - 1), nsze, 0xFFFFFFFF,
+                                       random.randint(0, max(1, nsze))])
+            slba = random.choice([0, 1, max(0, nsze - 2), max(0, nsze - 1),
+                                  nsze, nsze + 1, 0xFFFFFFFF, 0x100000000,
+                                  random.randint(0, max(1, nsze))])
+            payload += struct.pack('<IIQ', ctx, lba_count & 0xFFFFFFFF,
+                                   slba & 0xFFFFFFFFFFFFFFFF)
+        return payload
+
+    def _make_copy_payload(self, entry_count: int, nsze: int) -> bytes:
+        """Copy source range payload 생성. Format 0h: 32B per entry."""
+        payload = b''
+        for _ in range(entry_count):
+            slba = random.choice([0, 1, max(0, nsze - 2), max(0, nsze - 1),
+                                  nsze, nsze + 1, 0xFFFFFFFF, 0x100000000,
+                                  random.randint(0, max(1, nsze))])
+            nlb = random.choice([0, 1, 0xFF, 0xFFFF, random.randint(0, 0xFFFF)])
+            # SLBA(8) + NLB(2) + RSVD(2) + EILBRT(4) + ELBATM(2) + ELBAT(2) + RSVD(12) = 32B
+            payload += struct.pack('<QHHIHH',
+                                   slba & 0xFFFFFFFFFFFFFFFF, nlb, 0, 0, 0, 0)
+            payload += b'\x00' * 12
+        return payload
 
     def _mutate_field_by_type(self, f: CDWField, nsze: int) -> int:
         """CDWField 타입별 변형 값 생성."""
@@ -3976,7 +4108,7 @@ class NVMeFuzzer:
             return random.choice(pool) if pool else 0
         elif ft == FieldType.LBA:
             return random.choice([
-                0, 1, max(0, nsze - 1), nsze, nsze + 1,
+                0, 1, max(0, nsze - 2), max(0, nsze - 1), nsze, nsze + 1,
                 0xFFFF, 0xFFFFFFFF, random.randint(0, max(1, nsze)),
             ])
         elif ft == FieldType.LBA_CNT:
@@ -4149,18 +4281,50 @@ class NVMeFuzzer:
             # 원래 admin이면 IO로, IO면 admin으로
             new_seed.force_admin = (seed.cmd.cmd_type != NVMeCommandType.ADMIN)
 
-        # [4] data_len 의도적 불일치 — 커널은 통과, SSD DMA 엔진에 혼란
+        # [4] data_len mutation — Phase 1: NLB-relative + MDTS boundary + static fallback
         if DATALEN_MUT_PROB > 0 and random.random() < DATALEN_MUT_PROB:
-            new_seed.data_len_override = random.choice([
-                0,                 # 빈 버퍼
-                4,                 # 극소
-                64,
-                512,
-                4096,
-                8192,
-                65536,             # 64KB
-                random.randint(1, 2 * 1024 * 1024),  # 랜덤 (max 2MB)
-            ])
+            _MAX_BUF = 2 * 1024 * 1024
+            _lba_sz = self.config.nvme_lba_size or 512
+            _data_transfer_cmds = {"Write", "Read", "Compare"}
+            _candidates: List[int] = []
+            _nlb_set: set = set()
+            _mdts_set: set = set()
+
+            if new_seed.cmd.name in _data_transfer_cmds:
+                # NLB-relative 후보 (CDW12[15:0] = NLB, 0-based)
+                _nlb = new_seed.cdw12 & 0xFFFF
+                _expected = (_nlb + 1) * _lba_sz
+                _page_sz = _PAGE_SIZE
+                _nlb_cands = [c for c in [
+                    _expected - 1, _expected, _expected + 1, _expected + _page_sz,
+                ] if 0 <= c <= _MAX_BUF]
+                _candidates += _nlb_cands
+                _nlb_set.update(_nlb_cands)
+
+                # MDTS boundary 후보
+                _mdts = self._get_mdts()
+                if _mdts > 0:
+                    _page_sz = _PAGE_SIZE
+                    _max_bytes = (1 << _mdts) * _page_sz
+                    _mdts_cands = [c for c in [
+                        _max_bytes - 1, _max_bytes, _max_bytes + 1,
+                    ] if 0 <= c <= _MAX_BUF]
+                    _candidates += _mdts_cands
+                    _mdts_set.update(_mdts_cands)
+
+            # static fallback 후보 (항상 포함)
+            _candidates += [0, 4, 64, 512, 4096, 8192, 65536,
+                            random.randint(1, _MAX_BUF)]
+
+            # 중복 제거 후 선택 → 선택된 값의 출처로 통계 집계
+            _candidates = list(dict.fromkeys(_candidates))
+            _chosen_dl = random.choice(_candidates)
+            new_seed.data_len_override = _chosen_dl
+
+            if _chosen_dl in _nlb_set:
+                self.mutation_stats["datalen_nlb"] += 1
+            if _chosen_dl in _mdts_set:
+                self.mutation_stats["datalen_mdts"] += 1
 
         # [5] Schema-guided field mutation
         if SCHEMA_MUT_PROB > 0 and random.random() < SCHEMA_MUT_PROB:
@@ -4175,6 +4339,84 @@ class NVMeFuzzer:
                 mask = ((1 << width) - 1) << f.lo
                 setattr(new_seed, cdw_attr, (old & ~mask) | ((new_val << f.lo) & mask))
                 self.mutation_stats["schema_field"] += 1
+
+        # [6] Phase 2: 64-bit LBA pair mutation (cdw10 + cdw11)
+        # 대상: Read/Write/Compare/Verify/Copy — SLBA_LO(cdw10) + SLBA_HI(cdw11) 쌍 변이
+        _LBA_PAIR_CMDS = {"Read", "Write", "Compare", "Verify", "Copy"}
+        if (LBA_PAIR_MUT_PROB > 0
+                and new_seed.cmd.name in _LBA_PAIR_CMDS
+                and random.random() < LBA_PAIR_MUT_PROB):
+            _nsze = self._get_nsze()
+            _slba = random.choice([
+                0,
+                1,
+                max(0, _nsze - 2),
+                max(0, _nsze - 1),
+                _nsze,
+                _nsze + 1,
+                0xFFFFFFFF,
+                0x100000000,          # cdw10=0, cdw11=1 — high dword 처리 경로
+                random.randint(0, max(1, _nsze)),
+            ])
+            new_seed.cdw10 = _slba & 0xFFFFFFFF
+            new_seed.cdw11 = (_slba >> 32) & 0xFFFFFFFF
+            self.mutation_stats["lba_pair_64bit"] += 1
+
+        # [7] Phase 2: DSM/Copy structured payload 재구성
+        if STRUCT_PAYLOAD_MUT_PROB > 0 and random.random() < STRUCT_PAYLOAD_MUT_PROB:
+            _nsze = self._get_nsze()
+            _MAX_BUF = 2 * 1024 * 1024
+
+            if new_seed.cmd.name == "DatasetManagement":
+                # CDW10[7:0] = NR (0-based, 실제 range 수 = NR+1)
+                # mut_type: 0=1 entry, 1=256 entries(max), 2=선언256+payload0(불일치), 3=NR0+payload0
+                _mut_type = random.randint(0, 3)
+                if _mut_type == 0:
+                    _nr, _count = 0x00, 1
+                    new_seed.data = self._make_dsm_payload(_count, _nsze)
+                    new_seed.cdw10 = (new_seed.cdw10 & ~0xFF) | _nr
+                elif _mut_type == 1:
+                    _nr, _count = 0xFF, 256
+                    new_seed.data = self._make_dsm_payload(_count, _nsze)
+                    new_seed.cdw10 = (new_seed.cdw10 & ~0xFF) | _nr
+                elif _mut_type == 2:
+                    # dsm_payload_257_decl256: NR=0xFF 선언, payload=257 entries
+                    new_seed.data = self._make_dsm_payload(257, _nsze)
+                    new_seed.cdw10 = (new_seed.cdw10 & ~0xFF) | 0xFF
+                else:
+                    # dsm_nr0_payload0: NR=0, payload 0B
+                    new_seed.data = b''
+                    new_seed.cdw10 = new_seed.cdw10 & ~0xFF
+                self.mutation_stats["dsm_structured"] += 1
+
+            elif new_seed.cmd.name == "Copy":
+                # CDW12[11:8] = NR (0-based), CDW10/11 = destination SLBA
+                # mut_type: 0=1 entry, 1=256 entries, 2=선언256+payload0, 3=NR0+payload0
+                _mut_type = random.randint(0, 3)
+                _dst_slba = random.choice([
+                    0, 1, max(0, _nsze - 2), max(0, _nsze - 1),
+                    _nsze, _nsze + 1, 0xFFFFFFFF, 0x100000000,
+                ])
+                new_seed.cdw10 = _dst_slba & 0xFFFFFFFF
+                new_seed.cdw11 = (_dst_slba >> 32) & 0xFFFFFFFF
+                _nr_mask = 0xFF << 8
+                if _mut_type == 0:
+                    _nr_val = 0x00
+                    new_seed.data = self._make_copy_payload(1, _nsze)
+                    new_seed.cdw12 = (new_seed.cdw12 & ~_nr_mask) | (_nr_val << 8)
+                elif _mut_type == 1:
+                    _nr_val = 0xFF
+                    new_seed.data = self._make_copy_payload(256, _nsze)
+                    new_seed.cdw12 = (new_seed.cdw12 & ~_nr_mask) | (_nr_val << 8)
+                elif _mut_type == 2:
+                    # copy_nr_decl256_payload0
+                    new_seed.data = b''
+                    new_seed.cdw12 = (new_seed.cdw12 & ~_nr_mask) | (0xFF << 8)
+                else:
+                    # copy_nr0_payload0
+                    new_seed.data = b''
+                    new_seed.cdw12 = new_seed.cdw12 & ~_nr_mask
+                self.mutation_stats["copy_structured"] += 1
 
         return new_seed
 
@@ -7444,15 +7686,24 @@ class NVMeFuzzer:
         src_values = [ms.get('corpus_mutated', 0), ms.get('random_gen', 0)]
 
         # mutation 유형 (소스 외 필드)
-        mut_labels = ['opcode\noverride', 'nsid\noverride', 'admin↔io\nswap', 'datalen\noverride', 'schema\nfield']
+        mut_labels = ['opcode\noverride', 'nsid\noverride', 'admin↔io\nswap',
+                      'datalen\noverride', 'schema\nfield',
+                      'datalen\nnlb', 'datalen\nmdts',
+                      'lba_pair\n64bit', 'dsm\nstructured', 'copy\nstructured',
+                      'seq\nbuiltin']
         mut_values = [ms.get('opcode_override', 0), ms.get('nsid_override', 0),
                       ms.get('force_admin_swap', 0), ms.get('data_len_override', 0),
-                      ms.get('schema_field', 0)]
+                      ms.get('schema_field', 0),
+                      ms.get('datalen_nlb', 0), ms.get('datalen_mdts', 0),
+                      ms.get('lba_pair_64bit', 0), ms.get('dsm_structured', 0),
+                      ms.get('copy_structured', 0), ms.get('seq_builtin', 0)]
 
         all_labels = src_labels + mut_labels
         all_values = src_values + mut_values
         all_colors = ['#4e9af1', '#a8d8ea',  # 소스 (파란 계열)
-                      '#f4a261', '#e76f51', '#e9c46a', '#2a9d8f', '#8ecae6']  # mutation 유형
+                      '#f4a261', '#e76f51', '#e9c46a', '#2a9d8f', '#8ecae6',  # 기존 mutation
+                      '#b5e48c', '#95d5b2', '#74c69d', '#52b788',             # v7.4 신규
+                      '#1a936f']
 
         bars3 = ax3.barh(range(len(all_labels)), all_values,
                          color=all_colors, edgecolor='none', height=0.65)
@@ -8097,75 +8348,8 @@ class NVMeFuzzer:
                 # 항상 빈 리스트가 전달되어 mopt_finds/mopt_uses가 누적되지 않는 버그가 있었음.
                 self._current_mutations = []
 
-                is_det_stage = False
-                # v7.2: DET_BUDGET 비율만큼만 det stage 소비.
-                # 기존 구조는 _det_queue가 있으면 무조건 소비해서
-                # Write seed가 coverage를 내면 ~400회 Write 전용 실행이 연속으로 발생,
-                # havoc/random/admin 경로가 완전히 차단되는 다양성 편향 문제가 있었음.
-                if self._det_queue and random.random() < DET_BUDGET:
-                    det_seed, det_gen = self._det_queue[0]
-                    try:
-                        mutated_seed = next(det_gen)
-                        fuzz_data = mutated_seed.data
-                        cmd = mutated_seed.cmd
-                        is_det_stage = True
-                    except StopIteration:
-                        self._det_queue.popleft()
-                        det_seed.det_done = True
-                        log.info(f"[Det] Completed deterministic stage for {det_seed.cmd.name}")
-                        # 이번 iteration은 havoc으로 fallthrough
-                        is_det_stage = False
-
-                if not is_det_stage:
-                    # CSFuzz §III-C: corpus selection probability
-                    self._csfuzz_pre_c1_size = len(self.corpus)
-                    self._csfuzz_pre_c2_size = len(self.state_corpus)
-                    _avg_seq = (sum(len(e.sequence) for e in self.state_corpus)
-                                / len(self.state_corpus)) if self.state_corpus else 1.0
-                    _p_c2 = (1.0 - self._csfuzz_p) / max(_avg_seq, 1.0)
-                    if (self.config.state_enabled
-                            and self.state_corpus
-                            and random.random() < _p_c2):
-                        # C2(state corpus) 선택 → 시퀀스 replay 후 정상 seed 선택
-                        self._csfuzz_last_from = 'c2'
-                        _sc_entry = self._select_state_entry_csfuzz()
-                        if _sc_entry is not None:
-                            if not self._replay_state_sequence(_sc_entry):
-                                break  # replay 중 timeout → _timeout_crash=True, 루프 탈출
-                    else:
-                        self._csfuzz_last_from = 'c1'
-
-                    # v4: Power Schedule 기반 시드 선택 + CDW 변형
-                    if self.corpus and random.random() >= self.config.random_gen_ratio:
-                        base_seed = self._select_seed()
-                        if base_seed is None:
-                            cmd = random.choice(self.commands)
-                            fuzz_data = os.urandom(random.randint(64, 512))
-                            mutated_seed = Seed(data=fuzz_data, cmd=cmd)
-                            self.mutation_stats["random_gen"] += 1
-                        else:
-                            mutated_seed = self._mutate(base_seed)
-                            fuzz_data = mutated_seed.data
-                            cmd = mutated_seed.cmd
-                            self.mutation_stats["corpus_mutated"] += 1
-                    else:
-                        cmd = random.choice(self.commands)
-                        fuzz_data = os.urandom(random.randint(64, 512))
-                        mutated_seed = Seed(data=fuzz_data, cmd=cmd)
-                        self.mutation_stats["random_gen"] += 1
-
-                if mutated_seed.opcode_override is not None:
-                    self.mutation_stats["opcode_override"] += 1
-                    self.actual_opcode_dist[mutated_seed.opcode_override] += 1
-                if mutated_seed.nsid_override is not None:
-                    self.mutation_stats["nsid_override"] += 1
-                if mutated_seed.force_admin is not None:
-                    self.mutation_stats["force_admin_swap"] += 1
-                if mutated_seed.data_len_override is not None:
-                    self.mutation_stats["data_len_override"] += 1
-
-                # PM combo 로테이션 — NVMe 명령 직전, PM_ROTATE_INTERVAL마다 새 combo 진입
-                # preflight와 동일 패턴: enter combo → restore if nonop → NVMe command
+                # PM combo 로테이션 — seed 선택 전, PM_ROTATE_INTERVAL마다 새 combo 진입
+                # PM 구간과 명령어 블록을 분리: PM 전이 완료 후 seed 선택 → 실행
                 if (self.config.pm_inject_prob > 0
                         and self.executions % PM_ROTATE_INTERVAL == 0):
                     # 1/6 확률로 PS3/PS4 강제 idle 진입 슬롯 실행
@@ -8232,6 +8416,125 @@ class NVMeFuzzer:
                             self._current_ps    = _next_combo.nvme_ps
                         self.ps_enter_counts[_next_combo.nvme_ps] += 1
                         self.combo_enter_counts[_next_combo] += 1
+
+                is_det_stage = False
+                # v7.2: DET_BUDGET 비율만큼만 det stage 소비.
+                # 기존 구조는 _det_queue가 있으면 무조건 소비해서
+                # Write seed가 coverage를 내면 ~400회 Write 전용 실행이 연속으로 발생,
+                # havoc/random/admin 경로가 완전히 차단되는 다양성 편향 문제가 있었음.
+                if self._det_queue and random.random() < DET_BUDGET:
+                    det_seed, det_gen = self._det_queue[0]
+                    try:
+                        mutated_seed = next(det_gen)
+                        fuzz_data = mutated_seed.data
+                        cmd = mutated_seed.cmd
+                        is_det_stage = True
+                    except StopIteration:
+                        self._det_queue.popleft()
+                        det_seed.det_done = True
+                        log.info(f"[Det] Completed deterministic stage for {det_seed.cmd.name}")
+                        # 이번 iteration은 havoc으로 fallthrough
+                        is_det_stage = False
+
+                if not is_det_stage:
+                    # CSFuzz §III-C: corpus selection probability
+                    self._csfuzz_pre_c1_size = len(self.corpus)
+                    self._csfuzz_pre_c2_size = len(self.state_corpus)
+                    _avg_seq = (sum(len(e.sequence) for e in self.state_corpus)
+                                / len(self.state_corpus)) if self.state_corpus else 1.0
+                    _p_c2 = (1.0 - self._csfuzz_p) / max(_avg_seq, 1.0)
+                    if (self.config.state_enabled
+                            and self.state_corpus
+                            and random.random() < _p_c2):
+                        # C2(state corpus) 선택 → 시퀀스 replay 후 정상 seed 선택
+                        self._csfuzz_last_from = 'c2'
+                        _sc_entry = self._select_state_entry_csfuzz()
+                        if _sc_entry is not None:
+                            if not self._replay_state_sequence(_sc_entry):
+                                break  # replay 중 timeout → _timeout_crash=True, 루프 탈출
+                    else:
+                        self._csfuzz_last_from = 'c1'
+
+                    # Phase 3: pending sequence 또는 신규 sequence 시작
+                    _used_seq = False
+                    if self._pending_sequence:
+                        _seq_cmd = self._pending_sequence.pop(0)
+                        mutated_seed = self._pick_seq_seed(_seq_cmd, self._pending_seq_ctx)
+                        fuzz_data = mutated_seed.data
+                        cmd = mutated_seed.cmd
+                        self._seq_cmds_in_window += 1
+                        self.mutation_stats["seq_builtin"] += 1
+                        if not self._pending_sequence:
+                            self._pending_seq_ctx = None  # 시퀀스 종료 시 ctx 클리어
+                        _used_seq = True
+                    elif (SEQ_PROB > 0
+                          and BUILTIN_SEQUENCES
+                          and self._seq_cmds_in_window < SEQ_MAX_PER_100
+                          and random.random() < SEQ_PROB):
+                        # 현재 활성화된 명령어로만 구성된 시퀀스만 선택
+                        # (비활성 명령 포함 시퀀스는 FWDownload→FWCommit 등 자동 게이팅)
+                        _enabled_names = {c.name for c in self.commands}
+                        _valid_seqs = [s for s in BUILTIN_SEQUENCES
+                                       if all(n in _enabled_names for n in s)]
+                        if _valid_seqs:
+                            _seq = list(random.choice(_valid_seqs))
+                            _seq_cmd = _seq.pop(0)
+                            self._pending_sequence = _seq if _seq else None
+                            # 공유 컨텍스트가 필요한 시퀀스면 ctx 생성
+                            _full_seq = tuple([_seq_cmd] + (_seq or []))
+                            if _full_seq in self._CTX_SEQUENCES:
+                                _nsze = self._get_nsze()
+                                _lba_sz = self.config.nvme_lba_size or 512
+                                _nlb = random.choice([0, 1, 3, 7, 15,
+                                                      random.randint(0, 255)])
+                                _slba = random.choice([
+                                    0, 1, max(0, _nsze - 2), max(0, _nsze - 1),
+                                    _nsze, _nsze + 1,
+                                    random.randint(0, max(1, _nsze)),
+                                ])
+                                self._pending_seq_ctx = {
+                                    'slba': _slba,
+                                    'nlb':  _nlb,
+                                    'data': os.urandom((_nlb + 1) * _lba_sz),
+                                }
+                            else:
+                                self._pending_seq_ctx = None
+                            mutated_seed = self._pick_seq_seed(_seq_cmd, self._pending_seq_ctx)
+                            fuzz_data = mutated_seed.data
+                            cmd = mutated_seed.cmd
+                            self._seq_cmds_in_window += 1
+                            self.mutation_stats["seq_builtin"] += 1
+                            _used_seq = True
+
+                    if not _used_seq:
+                        # v4: Power Schedule 기반 시드 선택 + CDW 변형
+                        if self.corpus and random.random() >= self.config.random_gen_ratio:
+                            base_seed = self._select_seed()
+                            if base_seed is None:
+                                cmd = random.choice(self.commands)
+                                fuzz_data = os.urandom(random.randint(64, 512))
+                                mutated_seed = Seed(data=fuzz_data, cmd=cmd)
+                                self.mutation_stats["random_gen"] += 1
+                            else:
+                                mutated_seed = self._mutate(base_seed)
+                                fuzz_data = mutated_seed.data
+                                cmd = mutated_seed.cmd
+                                self.mutation_stats["corpus_mutated"] += 1
+                        else:
+                            cmd = random.choice(self.commands)
+                            fuzz_data = os.urandom(random.randint(64, 512))
+                            mutated_seed = Seed(data=fuzz_data, cmd=cmd)
+                            self.mutation_stats["random_gen"] += 1
+
+                if mutated_seed.opcode_override is not None:
+                    self.mutation_stats["opcode_override"] += 1
+                    self.actual_opcode_dist[mutated_seed.opcode_override] += 1
+                if mutated_seed.nsid_override is not None:
+                    self.mutation_stats["nsid_override"] += 1
+                if mutated_seed.force_admin is not None:
+                    self.mutation_stats["force_admin_swap"] += 1
+                if mutated_seed.data_len_override is not None:
+                    self.mutation_stats["data_len_override"] += 1
 
                 # Non-Operational PM 상태 복귀 — NVMe 커맨드 전 mandatory
                 # D3hot / L1.2(CLKREQ# deasserted): 커맨드 전 반드시 복귀 필요.
@@ -8356,6 +8659,19 @@ class NVMeFuzzer:
                 summary_lines.append(
                     f"  data_len_override: {ms['data_len_override']} "
                     f"({100*ms['data_len_override']/total:.1f}%)")
+                summary_lines.append(
+                    f"  datalen_nlb      : {ms['datalen_nlb']} "
+                    f"({100*ms['datalen_nlb']/total:.1f}%)"
+                    f"  datalen_mdts: {ms['datalen_mdts']} "
+                    f"({100*ms['datalen_mdts']/total:.1f}%)")
+                summary_lines.append(
+                    f"  lba_pair_64bit   : {ms['lba_pair_64bit']} "
+                    f"({100*ms['lba_pair_64bit']/total:.1f}%)")
+                summary_lines.append(
+                    f"  dsm_structured   : {ms['dsm_structured']} "
+                    f"  copy_structured: {ms['copy_structured']}"
+                    f"  seq_builtin: {ms['seq_builtin']} "
+                    f"({100*ms['seq_builtin']/total:.1f}%)")
 
                 # 실제 전송된 opcode 분포 (변형된 것만)
                 if stats['actual_opcode_dist']:
