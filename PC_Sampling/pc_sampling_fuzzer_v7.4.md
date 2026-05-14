@@ -169,8 +169,8 @@ sudo python3 pc_sampling_fuzzer_v7.4.py \
 sudo python3 pc_sampling_fuzzer_v7.4.py \
   --product BM9H1 \
   --nvme /dev/nvme0 \
-  --addr-start 0x28000 \
-  --addr-end 0x1FFFF \
+  --addr-start 0x00000 \
+  --addr-end 0x27FFF \
   --output ./output/run_bm9h1
 ```
 
