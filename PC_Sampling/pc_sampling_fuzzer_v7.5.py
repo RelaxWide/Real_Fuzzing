@@ -6543,6 +6543,7 @@ class NVMeFuzzer:
         self._cmd_history = deque(history, maxlen=len(history))
         try:
             self._generate_replay_sh(self.seq_corpus_dir, tag)
+            log.info(f"[SeqSeed] replay .sh 저장: {self.seq_corpus_dir / ('replay_' + tag + '.sh')}")
         except Exception as e:
             log.debug(f"[SeqSeed] replay .sh 생성 실패: {e}")
         finally:
@@ -7967,13 +7968,13 @@ class NVMeFuzzer:
         state_tag = (f" | state-cov: {len(self.state_cov_map)} "
                      f"state-corpus: {len(self.state_corpus)}"
                      if self.config.state_enabled else "")
+        _seq_cnt = sum(1 for s in self.corpus if isinstance(s, SequenceSeed))
+        _seq_run = self.mutation_stats.get('seq_builtin', 0)
         log.warning(f"[Stats] exec: {stats['executions']:,} | "
-                 f"corpus: {stats['corpus_size']} | "
+                 f"corpus: {stats['corpus_size']}(seq:{_seq_cnt}) | "
                  f"pcs: {stats['coverage_unique_pcs']:,} | "
-                 f"samples: {stats['total_samples']:,} | "
-                 f"last_run: {last_samples} | "
-                 f"exec/s(avg): {stats['exec_per_sec']:.1f} | "
-                 f"exec/s(win): {window_eps:.1f}"
+                 f"exec/s: {window_eps:.1f} | "
+                 f"seq_run: {_seq_run}"
                  f"{ps_tag}{state_tag}")
         if self._sa_loaded:
             sa_parts = []
@@ -8680,6 +8681,8 @@ class NVMeFuzzer:
                     # [3a] corpus SequenceSeed replay continuation
                     if self._pending_seq_seeds:
                         _next_seed = self._pending_seq_seeds.pop(0)
+                        log.debug(f"[Seq/Corp] continuation: cmd={_next_seed.cmd.name} "
+                                  f"remaining={len(self._pending_seq_seeds)}")
                         mutated_seed = self._mutate(_next_seed)
                         if self._pending_seq_ctx:
                             mutated_seed = self._apply_seq_ctx(mutated_seed, self._pending_seq_ctx)
@@ -8721,6 +8724,7 @@ class NVMeFuzzer:
                                 'commands': [], 'new_pcs': 0,
                                 'covered_pcs': set(), 'interesting': False,
                             }
+                            log.debug(f"[Seq/Builtin] 시작: {_full_seq}")
                             mutated_seed = self._pick_seq_seed(_seq_cmd, ctx=None)
                             if _full_seq in self._CTX_SEQUENCES:
                                 # Write mutation 결과에서 ctx 파생 → Compare가 따라감
@@ -8751,6 +8755,8 @@ class NVMeFuzzer:
                                     # corpus SequenceSeed → 시퀀스 replay 시작
                                     _cs_cmds = list(base_seed.commands)
                                     _cs_names = tuple(s.cmd.name for s in base_seed.commands)
+                                    log.debug(f"[Seq/Corp] replay 시작: cmds={_cs_names} "
+                                              f"new_pcs={base_seed.new_pcs}")
                                     _first = self._mutate(_cs_cmds.pop(0))
                                     if _cs_names in self._CTX_SEQUENCES:
                                         # Write mutation 결과에서 ctx 파생 → Compare가 따라감
@@ -8776,6 +8782,8 @@ class NVMeFuzzer:
                                     _used_seq = True
                                 else:
                                     # window 초과: 첫 명령만 단독 실행 (시퀀스 미시작)
+                                    log.debug(f"[Seq/Corp] window 초과 → 단독 실행: "
+                                              f"cmd={base_seed.commands[0].cmd.name}")
                                     mutated_seed = self._mutate(base_seed.commands[0])
                                     fuzz_data = mutated_seed.data
                                     cmd = mutated_seed.cmd
