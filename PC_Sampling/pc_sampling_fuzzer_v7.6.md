@@ -61,13 +61,13 @@ Python 3.8+, openocd 0.12.0+, nvme-cli, setpci, JLinkExe, J-Link V9/EDU, pmu_4_1
 
 ```bash
 # PM9M1 (SWD, 3코어)
-sudo python3 pc_sampling_fuzzer_v7.5.py --product PM9M1 --nvme /dev/nvme0
+sudo python3 pc_sampling_fuzzer_v7.6.py --product PM9M1 --nvme /dev/nvme0
 
 # BM9H1 (JTAG, 2코어)
-sudo python3 pc_sampling_fuzzer_v7.5.py --product BM9H1 --nvme /dev/nvme0
+sudo python3 pc_sampling_fuzzer_v7.6.py --product BM9H1 --nvme /dev/nvme0
 
 # 위험 명령 포함 (FWDownload→FWCommit 시퀀스 활성)
-sudo python3 pc_sampling_fuzzer_v7.5.py --product PM9M1 --nvme /dev/nvme0 --all-commands
+sudo python3 pc_sampling_fuzzer_v7.6.py --product PM9M1 --nvme /dev/nvme0 --all-commands
 ```
 
 주소 범위·출력 폴더 등 자주 변경하지 않는 값은 코드 상단 상수 또는 `FuzzConfig` 필드로 직접 수정.

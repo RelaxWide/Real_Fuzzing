@@ -2195,6 +2195,9 @@ class NVMeFuzzer:
         self.passthru_stats = {"admin-passthru": 0, "io-passthru": 0}
 
         self._timeout_crash = False
+        # v7.6: _shutdown_openocd_for_jlink() 멱등 보장용 플래그.
+        # timeout crash 시 dump 실행 여부와 무관하게 1회만 shutdown 실행.
+        self._openocd_shutdown_done = False
         # calibration 구간 stderr 억제(fd 2 → /dev/null) 중 저장된 원본 fd.
         # _handle_timeout_crash()에서 log.error() 전에 복원하기 위해 사용.
         self._cal_saved_stderr_fd: Optional[int] = None
@@ -5951,17 +5954,17 @@ class NVMeFuzzer:
         log.warning("[UFAS] PCIe bus 번호 자동 탐지 실패 — UFAS 덤프 건너뜀")
         return None
 
-    def _run_jlink_dump(self) -> None:
-        """crash 발생 시 JLink 메모리 덤프를 실행한다.
+    def _shutdown_openocd_for_jlink(self) -> None:
+        """OpenOCD를 정상 shutdown 하여 J-Link USB 점유를 해제한다.
 
-        실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./run_smi_mem_dump_JLINK_USB.sh
-        OpenOCD가 J-Link를 점유 중이므로 실행 전 shutdown으로 해제 후 스크립트 실행.
+        shutdown 없이 process kill만 하면 libjaylink가 USB를 잠근 채 종료되어
+        후속 JLinkExe 호출(메모리 덤프, PC 모니터링)이 실패한다.
+
+        멱등 동작: 이미 종료된 상태에서 재호출되어도 안전.
         """
-        TIMEOUT = 300   # 5분
-
-        # OpenOCD shutdown — J-Link USB 점유 해제
-        # shutdown 없이 kill하면 libjaylink가 USB를 잠근 채 종료 → JLink 연결 불가
-        log.warning("[JLINK DUMP] OpenOCD shutdown (J-Link 해제)...")
+        if getattr(self, '_openocd_shutdown_done', False):
+            return
+        log.warning("[JLINK] OpenOCD shutdown (J-Link USB 해제)...")
         sampler = self.sampler
         if sampler._sock and sampler._openocd_alive():
             try:
@@ -5971,7 +5974,20 @@ class NVMeFuzzer:
                 pass
         sampler._close_telnet()
         sampler._terminate_proc()
-        log.warning("[JLINK DUMP] OpenOCD 종료 완료")
+        self._openocd_shutdown_done = True
+        log.warning("[JLINK] OpenOCD 종료 완료")
+
+    def _run_jlink_dump(self) -> None:
+        """crash 발생 시 JLink 메모리 덤프를 실행한다.
+
+        실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./run_smi_mem_dump_JLINK_USB.sh
+        호출 전에 _shutdown_openocd_for_jlink() 로 J-Link 점유가 해제되어 있어야 한다
+        (timeout crash 핸들러가 항상 먼저 호출함).
+        """
+        TIMEOUT = 300   # 5분
+
+        # 방어적 — caller가 누락한 경우 대비.
+        self._shutdown_openocd_for_jlink()
 
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         sh_path = os.path.join(script_dir, 'run_smi_mem_dump_JLINK_USB.sh')
@@ -6813,7 +6829,15 @@ class NVMeFuzzer:
         except Exception as _replay_exc:
             log.warning(f"[REPLAY] replay .sh 생성 실패: {_replay_exc}")
 
-        # 3.6) JLink 메모리 덤프 (UFAS 이전)
+        # 3.6) JLink 사용 전 OpenOCD를 항상 종료 — J-Link USB 점유 해제.
+        # dump를 스킵하더라도 후속 JLink PC 모니터링 루프가 J-Link에 접근하므로
+        # 여기서 shutdown이 누락되면 "Cannot connect to J-Link" 오류 발생.
+        try:
+            self._shutdown_openocd_for_jlink()
+        except Exception as _sd_exc:
+            log.warning(f"[JLINK] OpenOCD shutdown 예외: {_sd_exc}")
+
+        # 3.7) JLink 메모리 덤프 (UFAS 이전)
         if self.config.enable_jlink_dump:
             log.warning("[TIMEOUT] JLink 메모리 덤프를 실행합니다...")
             try:
@@ -7223,25 +7247,37 @@ class NVMeFuzzer:
             # --- 함수별 BB 커버율 계산 ---
             # 0.0 = not entered  /  0.0~1.0 = partial  /  1.0 = full
             # BB 파일 없으면 진입 여부만으로 0/1 fallback
+            # 동시에 BB-weighted 평균을 위한 함수 내 total/covered BB 수도 누적.
             func_cov_pct: list = []
+            _total_bbs_in_funcs = 0
+            _cov_bbs_in_funcs   = 0
+            _has_bb = self._sa_bb_starts is not None and self._sa_total_bbs > 0
             for i in range(len(entries)):
                 entry = entries[i]
                 end   = ends[i]
-                if entry not in entered:
+                _is_entered = entry in entered
+
+                if _has_bb:
+                    lo = _bisect_fm.bisect_left(self._sa_bb_starts, entry)
+                    hi = _bisect_fm.bisect_left(self._sa_bb_starts, end)
+                    _n_total = hi - lo
+                    _n_cov = sum(1 for bb in self._sa_bb_starts[lo:hi]
+                                 if bb in self._sa_covered_bbs)
+                else:
+                    _n_total = 0
+                    _n_cov = 0
+
+                _total_bbs_in_funcs += _n_total
+                _cov_bbs_in_funcs   += _n_cov
+
+                if not _is_entered:
                     func_cov_pct.append(0.0)
-                    continue
-                if self._sa_bb_starts is None or self._sa_total_bbs == 0:
-                    func_cov_pct.append(1.0)   # 진입했으면 full로 간주
-                    continue
-                lo = _bisect_fm.bisect_left(self._sa_bb_starts, entry)
-                hi = _bisect_fm.bisect_left(self._sa_bb_starts, end)
-                if hi == lo:
-                    func_cov_pct.append(1.0)
-                    continue
-                _n_total = hi - lo
-                _n_cov = sum(1 for bb in self._sa_bb_starts[lo:hi]
-                             if bb in self._sa_covered_bbs)
-                func_cov_pct.append(_n_cov / _n_total)
+                elif not _has_bb:
+                    func_cov_pct.append(1.0)            # BB 정보 없음 → 진입=full
+                elif _n_total == 0:
+                    func_cov_pct.append(1.0)            # BB 0개 함수 → 진입=full
+                else:
+                    func_cov_pct.append(_n_cov / _n_total)
 
             n_funcs = len(entries)
 
@@ -7305,7 +7341,7 @@ class NVMeFuzzer:
                 y   = rows - 1 - row
                 _short_name = names[func_i][:18]
                 ax.annotate(
-                    f'⬛ {_short_name}\n({sz}B)',
+                    f'{_short_name}\n({sz}B)',
                     xy=(col + 0.5, y + 0.5),
                     xytext=(min(cols + 1, col + 1.2),
                             max(0, min(rows - 1, y - 0.8 - rank * 0.4))),
@@ -7324,7 +7360,7 @@ class NVMeFuzzer:
                 y   = rows - 1 - row
                 _short_name = names[func_i][:18]
                 ax.annotate(
-                    f'⬜ {_short_name}\n({sz}B, {int(pct*100)}%)',
+                    f'{_short_name}\n({sz}B, {int(pct*100)}%)',
                     xy=(col + 0.5, y + 0.5),
                     xytext=(max(-2, col - 4.2),
                             max(0, min(rows - 1, y + 0.8 + rank * 0.4))),
@@ -7335,8 +7371,10 @@ class NVMeFuzzer:
             n_cov   = len(entered)
             n_uncov = n_funcs - n_cov
             cov_pct = 100.0 * n_cov / n_funcs
-            # BB 기반 가중 평균 커버율 (시각 효과 검증용)
-            _avg_bb_pct = sum(func_cov_pct) / max(n_funcs, 1) * 100.0
+            # 함수 내 전체 BB 대비 커버된 BB 비율 — 진짜 BB-weighted.
+            # (함수별 % 단순 평균이 아닌 Σ covered / Σ total 가중 평균)
+            _avg_bb_pct = (100.0 * _cov_bbs_in_funcs / _total_bbs_in_funcs
+                           if _total_bbs_in_funcs > 0 else 0.0)
 
             # 그라데이션 범례
             _sm = _cm_fm.ScalarMappable(cmap=cmap_fm,
