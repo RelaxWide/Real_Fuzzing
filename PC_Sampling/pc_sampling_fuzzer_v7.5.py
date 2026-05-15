@@ -2,373 +2,58 @@
 """
 PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v7.5
 
-OpenOCD PCSR(PC Sampling Register) 방식으로 커버리지를 수집하고,
-subprocess(nvme-cli)를 통해 SSD에 퍼징 입력을 전달합니다.
+OpenOCD PCSR(PC Sampling Register) 비침습 샘플링 + nvme-cli passthru 기반
+Coverage-Guided + State-Aware Fuzzer. 3코어(PM9M1) / 2코어(BM9H1) 지원.
 
-=============================================================================
-v7.5 변경사항:
-- [Corpus] SequenceSeed 도입: builtin sequence(Write→Compare 등)를 N개 명령어 단위로
-    corpus에 저장. energy = base / N 패널티로 단일 Seed와 per-exec 공정 경쟁.
-    corpus에서 SequenceSeed 선택 시 stored Seeds를 순서대로 mutation+replay.
-    개별 Seed 저장(중복) 제거 — sequence 실행 중 _seq_sink에 누적 후 완료 시 저장.
-- [Sequence/Ctx] Write→Compare ctx 파생 방식 개선:
-    기존: fresh random SLBA/NLB/data 생성 후 Write·Compare 양쪽에 강제 적용.
-    변경: Write를 먼저 mutation 후 그 결과 CDW10/11/12/data에서 ctx 파생 → Compare에만 적용.
-    builtin sequence와 corpus SequenceSeed replay 양쪽 동일하게 적용.
-    Write mutation 결과가 완전히 보존되고 Compare만 Write를 따라감.
-- [Replay] seq_corpus/ 폴더에 SequenceSeed replay .sh 저장:
-    _generate_seq_replay_sh(): passthru_type(admin-passthru/io-passthru), device 경로
-    (admin=controller, IO=namespace), force_admin 3단계 로직, data_len NLB 기반 계산.
-    _finalize_seq_sink(): 중복 저장 로직 통합 헬퍼.
-- [Mutation/Fix] DSM NR=0xFF 불일치: payload=1 entry(언더플로) 케이스 수정.
-    Copy _nr_mask 0xFF→0xF (CDW12[11:8] = 4비트). data_len_override 잔존 리셋.
-- [SEQ_MAX] corpus SequenceSeed 선택 시 window 체크 적용.
+핵심 구성
+- Coverage: OpenOCD telnet → AP mem_ap → PCSR(CoreBase+0x84) 비침습 PC 샘플링.
+            Ghidra basic_blocks.txt 있으면 BB 기준 interesting 판정.
+- State:    NVMeStateMonitor (smart-log / get-log delta) → state corpus C2.
+            CSFuzz §III-B/C/D 적응형 p 갱신 (m1=edge, m2=state, P_MIN=0.05, P_MAX=0.60).
+- Mutation: AFL++ Havoc/Splice + Deterministic (DET_BUDGET=20%) + MOpt + Schema
+            (CDW field 타입별 변이) + Phase 1/2/3 (NLB/MDTS/64-bit LBA/structured/sequence).
+- Power:    NVMe PS0~4 × PCIe L0/L1/L1.2 × D0/D3 = 30 combo + PS3/PS4 강제 idle 슬롯.
+- POR:      pmu_4_1.py 전원 사이클 → PCIe rescan → OpenOCD 재연결.
+- Defect:   timeout/hang 감지 시 PCSR stuck 분석 → JLink mem dump → UFAS dump
+            → JLink PC 모니터링 루프 (옵션: --no-jlink-dump / --no-ufas).
 
-=============================================================================
-v7.4 변경사항:
-- [Mutation/Phase1] NLB-relative + MDTS boundary data_len 지능화:
-    Write/Read/Compare 대상으로 CDW12 NLB 값 기반 경계 후보 생성.
-    expected-1 / exact / +1 / +page_size 4개 후보를 clamp+중복 제거 후 사용.
-    MDTS boundary 후보(max-1/max/max+1)도 추가. MDTS=0 skip 처리.
-    기존 static 후보군과 합산 후 선택.
-    mutation_stats["datalen_nlb"] / ["datalen_mdts"] 분리 집계.
-- [Mutation/Phase2] 64-bit LBA pair mutation:
-    Read/Write/Compare/Verify/Copy 대상으로 cdw10+cdw11 쌍 변이.
-    후보: 0, 1, nsze-2, nsze-1, nsze, nsze+1, 0xFFFFFFFF, 0x100000000, random.
-    LBA_PAIR_MUT_PROB=0.15 독립 확률. mutation_stats["lba_pair_64bit"] 집계.
-- [Mutation/Phase2] DSM/Copy structured payload mutation:
-    DatasetManagement/Copy: NR+payload를 경계 케이스로 재구성.
-    (1 entry / 256 entries / 선언-실제 불일치 / 빈 payload)
-    STRUCT_PAYLOAD_MUT_PROB=0.10. mutation_stats["dsm_structured"/"copy_structured"] 집계.
-- [Mutation/Phase3] Builtin sequence mini-set:
-    BUILTIN_SEQUENCES 2개 패턴 내장. SEQ_PROB=0.05.
-    SEQ_MAX_PER_100=10 (100-exec window당 최대 10개 sequence 명령).
-    mutation_stats["seq_builtin"] 집계.
-- [Cache] _get_mdts(): nvme id-ctrl에서 MDTS 캐싱 (MDTS_CACHE_TTL=5000 exec).
-- [Mutation] _mutate_field_by_type LBA 후보에 nsze-2, nsze-1 추가.
+v7.5 주요 변경
+- SequenceSeed corpus 도입 — builtin sequence(Write→Compare 등)를 N개 명령 단위로 저장.
+  energy = MAX_ENERGY / N 패널티로 단일 Seed와 per-exec 공정 경쟁.
+- Sequence ctx 파생 — Write를 먼저 mutation 후 그 결과 CDW10/11/12/data에서 ctx 파생,
+  Compare/Read에만 적용. Write mutation 결과가 완전히 보존됨.
+- _cull_corpus 2-pass favored 마킹 — Pass1: 단일 Seed로 PC → best 매핑,
+  Pass2: 미커버 PC만 SequenceSeed가 채움. SequenceSeed도 동일 cull/epoch 규칙 적용.
+- MAX_SEQUENCE_CORPUS=50 cap을 (is_favored, new_pcs) 정렬로 변경.
+- seq_corpus/ 폴더에 SequenceSeed replay .sh 자동 저장. cull 시 고아 파일 청소.
+- BUILTIN_SEQUENCES 확장: Write→Read, Write→Write, SetFeatures→GetFeatures
+  (기본 모드 명령만으로도 시퀀스 작동). SEQ_PROB=0.05, SEQ_MAX_PER_100=10.
+- --no-jlink-dump 옵션 추가. CLI 옵션 51→19개로 정리 (나머지는 코드 상수로 유지).
+- DSM NR=0xFF payload 불일치 / Copy NR 마스크 0xFF→0xF / data_len_override 잔존 리셋 수정.
 
-=============================================================================
-v7.2 로드맵 (작업 예정)
-=============================================================================
+버전 이력 요약
+- v7.4 — Phase 1 (NLB/MDTS data_len), Phase 2 (64-bit LBA pair, DSM/Copy structured),
+         Phase 3 (Builtin sequence mini-set), PM 로테이션을 seed 선택 전으로 이동.
+- v7.3 — _account_command() 헬퍼, State-Replay cmd 복원 정확도, m2 정규화.
+- v7.2 — DET_BUDGET(20%) 도입, MOpt operator reward 누적 버그 수정.
+- v7.1 — --allow-no-openocd --pm 조합으로 PM 독립 검증 경로 추가.
+- v7.0 — State-Aware Fuzzer: NVMeStateMonitor / StateCorpusEntry / dual interesting.
+- v6.4 — PS3/PS4 강제 idle 슬롯 (NOPS 커버리지 확보).
+- v6.3 — JTAG 지원 (BM9H1, 2코어), PCSR 주소 CLI 설정.
+- v6.2 — Rule-Based Schema Mutation (42cmd / ~150field / 8type), IO_ADMIN_RATIO=3.
+- v6.0 — OpenOCD PCSR 비침습 샘플링 (J-Link halt-sample-resume 대체), 3코어 동시 수집,
+         POR, 2단계 복구, hang 보존 분석.
+- v5.x — J-Link halt-sample-resume, MOpt, Power Combo, BB coverage, 시각화 그래프,
+         시드 템플릿 nvme_seeds.py 분리.
 
-배경:
-  ITCM 0x20000 이내 PC coverage는 hot path 위주라 포화가 빠름.
-  다음 단계는 "PC 숫자 올리기"에서 벗어나 상태·시퀀스·환경 교란 기반
-  fuzzing으로 전환하는 것.
+상세 변경 이력은 git log 참조.
 
-Phase 1 — 관측 기반 점검 (선행 조건)
-  [ ] 1-1. PC 필터 범위 진단
-        _in_range() 와 addr_start/end 가 ITCM 외부 영역
-        (ROM/DRAM mapped code, veneer, exception vector, overlay)을
-        잘못 버리는지 확인. 필요 시 multi-range 필터로 교체.
-  [ ] 1-2. Basic Block coverage 활성화 검증
-        basic_blocks.txt Ghidra export 정확도 확인 (Thumb bit, ITCM alias).
-        raw PC 대신 BB 기준 interesting 판정이 제대로 동작하는지 측정.
-
-Phase 2 — FTL Dirty State 사전 준비
-  [ ] 2-1. --prefill 루틴 강화
-        실행 전 sequential write → random write → trim/DSM 혼합으로
-        GC/WL이 활성화된 상태를 의도적으로 만들기.
-        깨끗한 FTL 상태에서는 얕은 fast path만 밟으므로 사전 부하 필수.
-  [ ] 2-2. FTL 상태 지표 추가 (state_fields.py)
-        thermal throttle, GC/WL counter, SLC cache state,
-        bad block count, retry count, media scan, error log,
-        queue/resource pressure 등 vendor log 필드 추가.
-
-Phase 3 — PM 시나리오 퍼징 고도화
-  [ ] 3-1. PM 시나리오 테이블 도입
-        현재 "가끔 PM 전이"에서 의도적 시나리오로 전환:
-          - PS3/PS4 진입 직후 admin command burst
-          - L1.2 복귀 직후 Write sequence
-          - D3hot restore 직후 GetLog + SMART 연속 읽기
-          - APST on/off 반복 중 command injection
-          - KeepAlive disable/restore 구간 fuzzing
-        각 시나리오를 ScenarioSeed 타입으로 정의, corpus에 편입.
-  [ ] 3-2. POR 직후 boot_sweep 구간 command injection
-        재시작 직후 초기화 경로를 노리는 시나리오.
-
-Phase 4 — Command Sequence Mutation
-  [ ] 4-1. TransactionSeed 타입 도입
-        현재 StateCorpusEntry의 100개 명령 시퀀스를 seed 단위로 승격.
-        기존 단일 mutated_seed 실행 비중 조정:
-          - 단일 seed 실행 50% / 시퀀스 replay+suffix mutation 50%.
-  [ ] 4-2. 시퀀스 자체 mutation 구현
-        삽입(insert), 삭제(delete), 교환(swap), 파라미터 변이를
-        시퀀스 레벨에서 적용하는 mutate_sequence() 추가.
-  [ ] 4-3. 유용한 시퀀스 패턴 seed 화
-        SetFeatures → Write burst → Flush → GetLog → Read/Verify → PM transition
-        같은 상태 전이 패턴을 초기 seed로 내장.
-
-Phase 5 — 명령 종류 확장 (선택적)
-  [ ] 5-1. 안전한 추가 명령 활성화
-        Verify, DatasetManagement(Trim), WriteZeroes, Compare.
-        기기가 실험용임을 확인 후 활성화.
-  [ ] 5-2. 위험 명령 격리 정책
-        FormatNVM, Sanitize, FWCommit, Lockdown은
-        별도 --unsafe-cmds 플래그 뒤에 격리.
-
-=============================================================================
-
-v7.2 변경사항:
-- [Fix] DET_BUDGET(20%) 도입 — det_queue 무조건 우선 소비 문제 수정
-    배경: _det_queue가 있으면 random.random() 체크 없이 항상 det stage를 소비해서
-          Write seed가 new coverage를 내면 ~400회 Write 전용 실행이 연속 발생,
-          havoc/random/admin/state 경로가 완전히 차단되는 다양성 편향이 있었음.
-    수정: `if self._det_queue and random.random() < DET_BUDGET` 조건 추가.
-          DET_BUDGET=0.20 → 전체 실행의 20%만 det stage 소비,
-          나머지 80%는 기존 havoc/random_gen/state corpus 경로 유지.
-    상수: DET_BUDGET = 0.20 (--det-budget CLI 미추가, 상수 직접 조정)
-
-- [Fix] MOpt operator reward 누적 버그 수정
-    배경: `self._current_mutations = []` 가 _mutate() 호출 이후에 위치해서
-          MOpt reward(mopt_finds/mopt_uses) 계산 시점에 항상 빈 리스트가 전달됨.
-          결과적으로 MOpt weight가 전혀 갱신되지 않고 uniform 분포 유지.
-    수정: `self._current_mutations = []` 를 루프 iteration 시작(is_det_stage 설정 전)으로
-          이동. _mutate()가 append한 operator 목록이 reward까지 온전히 전달됨.
-
-v7.1 변경사항:
-- [PM-Test] OpenOCD 연결 실패 시에도 --allow-no-openocd --pm 조합이면
-  PM preflight와 선택적 PM cycle 테스트를 수행하고 종료.
-  목적: JTAG/OpenOCD 없이 PCIe/NVMe PM 조합 진입·복귀만 독립 검증.
-  OpenOCD 없는 경로에서는 coverage/diagnose/fuzzing loop를 실행하지 않음.
-
-v7.0 변경사항:
-- [State] State (Telemetry)-Aware Fuzzer 도입:
-    배경: PC sampling은 코드 경로를 추적하지만, SSD 내부 상태 변화
-          (ECC 에러, 헬스 비트, 벤더 내부 카운터 등)를 일으키는
-          입력을 우선 탐색하지 못함.
-    구현:
-      state_fields.py — 관측 필드 정의 파일 (퍼저 수정 없이 필드 추가/삭제).
-      NVMeStateMonitor — 100회마다 nvme smart-log / nvme get-log 실행,
-          before/after delta 계산, 새 state 버킷 감지.
-      StateCorpusEntry — state 변화를 일으킨 최근 100개 명령 시퀀스 저장.
-          _cmd_history 스냅샷 재사용, replay .sh 자동 생성.
-      dual interesting: new PC OR new state 버킷 → 각각 corpus 추가.
-      seed 선택: 30% 확률로 state corpus 선택 (시퀀스 replay + suffix mutation).
-    CLI: --no-state 로 비활성화 (기본: 활성화).
-
-v6.4 변경사항:
-- [PM] PS3/PS4 강제 idle 진입 슬롯 추가 (NOPS 커버리지 확보):
-    배경: POST_CMD_DELAY_MS=0 + APST 비활성화 환경에서는 명령 사이 idle이 없어
-          PS3/PS4(Non-Operational Power State)에 자동 진입하지 않음.
-    구현: PM 로테이션(매 100회 실행) 시 1/6 확률로 일반 combo 전환 대신 NOPS 슬롯 실행.
-          PS3 또는 PS4 중 랜덤 선택 → enlat 기반 최소 진입 시간(_ps_settle) × 2 idle 대기.
-          이후 PS0 복귀. 커버리지 갱신(global_coverage.update) 및 ps_enter_counts 기록.
-    조건: L0+D0 조합의 POWER_COMBOS에서 해당 PS 항목 검색 — 없으면 슬롯 건너뜀.
-    확률: randint(0, 5) == 0 → 약 16.7% 확률 (6회 중 1회).
-
-v6.3 변경사항:
-- [Transport] JTAG 지원 추가:
-    --interface swd|jtag CLI 옵션으로 디버그 transport 선택.
-    swd(기본): r8_pcsr.cfg 사용 (기존 동작 유지).
-    jtag: r8_pcsr_jtag.cfg 자동 선택 (ARM Cortex-R8, IDCODE=0x6BA00477, irlen=4).
-    --openocd-config 명시 시 --interface 무시하고 지정 cfg 우선 사용.
-    OPENOCD_CONFIG_JTAG = 'r8_pcsr_jtag.cfg' 상수 추가.
-- [Fix] JTAG-DP STICKY ERROR 수정:
-    r8_pcsr_jtag.cfg: transport select jtag을 adapter driver보다 앞에 배치.
-    init 직후 DP CTRL/STAT(0x4)=0x50000000으로 debug power-up, ABORT(0x0)=0x1e로 sticky 클리어.
-    read_all_pcs proc 내부에서 dpreg 0 0x1e 제거 (JTAG 상태머신 간섭 방지).
-    AXI write 후 즉시 sticky error 클리어.
-- [Config] PCSR 주소 CLI 설정 추가:
-    --pcsr-addrs 0xADDR0,0xADDR1[,0xADDR2] 옵션으로 코어별 PCSR 주소 오버라이드.
-    미지정 시 기본값(0x80030084, 0x80032084, 0x80034084) 사용.
-    코어 수가 다른 제품(2코어 등)도 지원. proc, 파싱, 마스크 모두 코어 수에 자동 적응.
-    FuzzConfig.pcsr_addrs 필드 추가.
-- [Fix] _INVALID_PC_MASK에 JTAG DPIDR 추가 및 인스턴스 기반으로 전환:
-    0x6ba00476 / 0x6ba00477 (ARM Cortex-R8 JTAG IDCODE, Thumb-bit 전·후).
-    클래스 변수에서 인스턴스 변수(_invalid_pc_mask)로 변경 — pcsr_addrs 반영.
-
-v6.2 변경사항:
-- [Mutation] 규칙 기반 스키마 뮤테이터 도입 (libFuzzer 스타일):
-    각 NVMe 커맨드의 CDW 필드를 FieldType(ENUM/LBA/FLAGS/SIZE_DW 등)으로 정의.
-    SCHEMA_MUT_PROB=0.30 확률로 CMD_SCHEMAS에서 필드를 무작위 선택, 타입별 전략 적용.
-    기존 슬롯 [5]LBA경계값/[6]FID/[7]CNS/[8]NUMDL → 단일 schema_mutate 슬롯으로 통합.
-    총 39개 커맨드 스키마 정의 (Admin 21 + I/O 18).
-- [Command] 신규 커맨드 10개 추가 (거절 경로 탐색):
-    Abort, AER, Copy, Reservation×4, Cancel, NamespaceAttachment(SEL=0),
-    KeepAlive, DirectiveSend/Receive, VirtMgmt, CapacityMgmt, Lockdown(PRHBT=0),
-    MigrationSend/Receive, ControllerDataQueue, IOMgmtSend/Receive.
-- [Seed] 최소 앵커 시드 방식 + IO_ADMIN_RATIO=3 (75% I/O, 25% Admin):
-    I/O 풀과 Admin 풀을 분리하여 I/O 커맨드 발행 빈도 증가.
-- [Corpus] Epoch 기반 주기적 리셋 (CORPUS_EPOCH_SIZE, 기본 0=비활성):
-    CORPUS_EPOCH_SIZE>0 이면 해당 exec마다 _epoch_reset_corpus() 호출.
-    favored 시드 + found_at==0(초기 시드)만 유지, exec_count를 1/4로 감쇠.
-    목적: 오래된 중복 시드가 선택 확률을 희석하는 현상 방지.
-    주의: 0으로 두면 기존 v6.0과 동일 동작.
-
-v6.0 변경사항:
-- [Arch] J-Link halt-sample-resume → OpenOCD PCSR 비침습 샘플링:
-    펌웨어 실행을 중단하지 않으므로 NVMe DMA 타이밍 간섭 없음.
-    PCSR: CoreBase+0x084 (APB-AP ap-num 0).
-    Core0=0x80030084, Core1=0x80032084, Core2=0x80034084.
-- [Arch] 3코어 동시 수집 (기존 Core0만 → Core0/1/2 모두):
-    1 RTT = 3코어 PC. _read_all_pcs() → Optional[Tuple[int,int,int]].
-    _sampling_worker() 튜플 단위 처리: 3코어 모두 idle일 때만 idle 카운트.
-- [Arch] pylink/libjlinkarm 제거 → OpenOCD+libjaylink 사용:
-    import pylink 제거. J-Link USB 동글은 여전히 필요 (SWD 물리 연결).
-    OpenOCD telnet(4444) raw socket 통신.
-    subprocess로 OpenOCD 프로세스 라이프사이클 관리.
-- [Config] J-Link 관련 설정 제거, OpenOCD 설정 추가:
-    제거: device_name, interface, jtag_speed, pc_reg_index, go_settle_ms
-    추가: openocd_binary, openocd_config, openocd_host, openocd_port, openocd_timeout
-- [Reliability] OpenOCD 2단계 복구:
-    _reinit_target(): OpenOCD 유지, _send_startup_tcl() 재전송 (빠른 복구).
-    _reconnect(): OpenOCD 재시작 (느린 복구). 두 단계 순차 시도.
-    openocd_error 이벤트로 샘플링 스레드→메인 루프 즉시 감지.
-- [Feature] POR (Power-On Reset): run() 시작 시 PMU 보드 전원 사이클.
-    _power_cycle_ssd(): PMU OFF(opcode 7) → 방전 대기 → ON(opcode 4) → PCIe rescan.
-    CLI: --no-por / --por-poweroff-wait / --por-boot-wait.
-    이유: 이전 실행의 디버그 도메인 파워가 SSD PM 상태에 영향을 줄 수 있음.
-- [Feature] timeout crash 분석 강화:
-    인프라 실패(OpenOCD) vs 펌웨어 hang 자동 구분.
-    _reinit_target() 성공 시: read_stuck_pcs(count=1000) PCSR 샘플링.
-    코어별 Counter 분석: top_ratio≥70% → HANG, 40~70% → busy-wait,
-      <40% → 분산(복구 중). idle_pcs 교차 확인으로 정상 idle 구분.
-    인프라 실패 시: 수동 확인 절차(nvme id-ctrl, J-Link) 로그 출력.
-- [Feature] timeout crash 후 PC 모니터링 루프:
-    시각화 완료 후 10초 간격으로 Core0/1/2 PC + [IDLE]/[NON-IDLE] 태그 출력.
-    Ctrl+C → 루프만 종료, telnet 닫기. OpenOCD는 유지(hang 상태 보존).
-    이유: OpenOCD kill 시 J-Link가 nSRST assert → 펌웨어 상태 변경.
-    다음 실행 시 connect()의 _kill_stale_openocd()가 자동 정리.
-- [Feature] timeout crash 시 J-Link USB 정상 해제:
-    정상 종료 경로: close()에서 OpenOCD shutdown 명령 전송 후 종료.
-    crash 경로: OpenOCD 유지 (nSRST 방지), telnet만 닫음.
-- [Fix] idle_pcs 수집 신뢰도 개선:
-    DIAGNOSE_MAX: 5000 → 10000 (최대 100초).
-    수렴 조건에 min_samples = max(stability×3, 500) 최소 보장.
-    주기가 긴 IRQ 핸들러가 stability 간격보다 늦게 등장해도 누락 방지.
-- [Fix] 시드 순서: Write → Read 명시적 정렬 (set 순서 비결정성 제거).
-    FormatNVM / Sanitize 시드에서 제외 (파괴적 동작 방지).
-
-v5.6 변경사항:
-- [Viz] coverage_growth.png: X축에 wall-clock time 이중 축 추가
-- [Viz] command_comparison.png: RC 오류율 subplot(4번째) 추가
-- [Viz] uncovered_funcs.png: 부분 커버 함수(진입 O, BB 미달) 구분 표시
-- [Viz] coverage_heatmap_1d.png: 컬러바 + bin 단위 명시
-- [Viz] mutation_chart.png: MOpt operator 효율 + 입력 소스 분포 신규 차트
-- [Viz] 주기적 그래프 갱신 (GRAPH_REFRESH_INTERVAL마다 자동 갱신)
-
-v5.5 변경사항:
-- [Refactor] 시드 템플릿 분리:
-    SEED_TEMPLATES 딕셔너리(~500줄)를 nvme_seeds.py 모듈로 추출.
-    _generate_default_seeds()가 nvme_seeds.py를 import하여 사용.
-    시드 수정/추가 시 nvme_seeds.py만 편집하면 됨.
-- [Refactor] CLI 인자 제거 — 하드코딩 상수로 대체:
-    --saturation-limit         → SATURATION_LIMIT
-    --global-saturation-limit  → GLOBAL_SATURATION_LIMIT
-    --l1-settle                → L1_SETTLE
-    --l1-2-settle              → L1_2_SETTLE
-    --idle-window-size         → IDLE_WINDOW_SIZE
-    --idle-ratio-thresh        → IDLE_RATIO_THRESH
-    --ps-settle-cap            → PS_SETTLE_CAP_S
-    --mut-prob                 → MOpt 내부 가중치 (MUT_WEIGHTS)
-    --max-energy               → MAX_ENERGY 상수
-    --no-det                   제거 (deterministic stage 상시 활성화)
-    --no-mopt                  제거 (MOpt scheduling 상시 활성화)
-    --bb-addrs / --func-addrs  제거 (자동 탐지 유지)
-- [Fix] FWDownload 기본 청크 크기 1KB → 32KB:
-    더미 시드: data=b'\x00' * 32768, cdw10(NUMD)=0x1FFF (-x 32768 기본값과 일치)
-    nvme_seeds.py FWDownload 항목도 동일하게 적용.
-
-v5.4 변경사항:
-- [Fix] [Stats] 로그에서 crashes 항목 제거:
-    crash 발생 시 퍼저가 즉시 중단되므로 [Stats]에 표시되는 crash 카운트는
-    항상 0이며 의미 없음. 종료 summary에는 계속 출력됨.
-
-v5.3 변경사항:
-- [Opt] PCIe L-state settle time 대폭 단축 (throughput 개선):
-    L1_SETTLE  : 5.0s → 0.05s (50ms)
-    L1_2_SETTLE: 2.0s → 0.05s (50ms)
-    근거: PCIe ASPM L1 idle timer 수 μs + PM_Request_Ack DLLP 수 μs~ms = 실측 <1ms.
-          CLKREQ# deassert → Tclkoff <10ms. 5s/2s는 극도로 conservative → 50ms로 단축.
-    효과: L1.2+D3 combo 전환 시 14초 대기 → 0.2초 이하 (98% 단축).
-    _set_pcie_l_state() 내 time.sleep(L1_SETTLE / L1_SETTLE+L1_2_SETTLE) 모두 적용.
-    _set_power_combo() 내 D3+L1.x 재진입 settle도 동일하게 단축.
-- [Opt] preflight settle 단축:
-    _pm_preflight_check() 지역 상수:
-      RESTORE_SETTLE   : 0.5 → 0.1s
-      D3_RESTORE_SETTLE: 1.5 → 0.5s
-      D3_EXTRA         : 1.0 → 0.2s
-    30개 combo preflight 총 시간: ~255초 → ~21초 (92% 단축).
-- [Opt] diagnose() 샘플 간격 단축:
-    DIAGNOSE_SAMPLE_MS = 10 (ms) 상수 추가 — 기존 하드코딩 50ms.
-    time.sleep(0.05) → time.sleep(self.config.diagnose_sample_ms / 1000.0).
-    --diagnose-sleep-ms MS CLI 옵션 추가.
-    DIAGNOSE_STABILITY: 100 → 50 기본값 변경.
-    DIAGNOSE_MAX: 5000 → 2000 기본값 변경.
-    효과: worst case 2000×10ms = 20s (기존 5000×50ms = 250s 대비 92% 단축).
-    SWD+레벨시프터 등 불안정 환경은 --diagnose-sleep-ms 50 으로 복원 가능.
-- [Opt] idle saturation window-ratio 기반 조기 감지:
-    IDLE_WINDOW_SIZE = 30 (마지막 N개 PC 윈도우) 상수 추가.
-    IDLE_RATIO_THRESH = 0.80 (idle_pcs 비율 임계값) 상수 추가.
-    _sampling_worker() 내 _recent_pcs deque(maxlen=IDLE_WINDOW_SIZE) 추가.
-    윈도우 가득 차고 idle_pcs 비율 ≥ IDLE_RATIO_THRESH → idle_saturated 조기 종료.
-    기존 consecutive 방식과 OR 결합: 둘 중 하나 충족 시 즉시 조기 종료.
-    효과: NVMe 명령 완료 후 idle 복귀 감지 가속 → 다음 명령 대기 시간 단축.
-- [Opt] PS settle 상한(cap) 적용:
-    PS_SETTLE_CAP_S = 1.0 상수 추가.
-    _init_ps_settle() 계산값을 PS_SETTLE_CAP_S로 clamp.
-    기존 PS4 fallback 2.0s → max 1.0s 적용.
-    FuzzConfig.ps_settle_cap 필드 추가 (--ps-settle-cap 옵션).
-
-v5.2 변경사항:
-- [Feature] Power Combo — NVMe PS + PCIe L-state(L0/L1/L1.2) + D-state(D0/D3) 동시 제어:
-    PowerCombo(nvme_ps, pcie_l, pcie_d) 전체 30개 조합(5×3×2) 랜덤 전환.
-    _detect_pcie_info(): BDF + PCIe Express / PCI PM / L1SS capability offset 탐지.
-    _set_pcie_l_state(): setpci LNKCTL bits[1:0] + L1SS cap L1.2 enable.
-    _set_pcie_d_state(): setpci PMCSR bits[1:0] (D0=0x0000, D3hot=0x0003).
-    _set_power_combo(): 3개 setter 통합, cmd_history에 pcie_state 항목 기록.
-    D3 timeout: PS_ENTRY_EXIT_MARGIN_MS(105ms) 고정 마진으로 통합.
-    Stats 태그: "PS3+L1.2+D3(×4TO)" 형태로 현재 combo 표시.
-    Summary: Power Combo Stats 섹션 추가.
-    Replay .sh: pcie_state → setpci 커맨드 포함.
-- [BugFix] --pm 없을 때 combo 관련 코드 완전 비활성화 유지.
-
-v5.1 변경사항:
-- [Feature] PM Rotation: --pm 플래그로 매 PM_ROTATE_INTERVAL(기본 100)회 명령마다
-    random.randint(0,4)로 PS0~PS4 중 랜덤 전환 (같은 PS 재진입 허용).
-    _pm_set_state() → bool: SetFeatures(FID=0x02, CDW11=ps) 전송, rc·소요시간 로그 출력.
-    [Stats] 출력과 동일 경계(executions % 100)에서 PS 전환.
-    PS별 실행 횟수 / 진입 횟수 통계 — 종료 summary에 출력.
-    PS3/PS4: 명령 타입 필터 없음(IO 포함 모든 명령 허용).
-             timeout: PS_ENTRY_EXIT_MARGIN_MS(105ms) 고정 가산 (entry/exit latency 흡수).
-- [Feature] 정적 분석 커버리지 연동 (Basic Block 기준):
-    퍼저 동일 디렉토리에 basic_blocks.txt / functions.txt(Ghidra ghidra_export.py 생성) 두면
-    자동 탐지 · 로드 (CLI 인자 불필요). 파일 없으면 기존 동작 유지.
-    BB 커버리지: bisect O(log N)으로 샘플된 PC → BB(start/end) 탐색.
-    BB 내 어느 instruction이든 1회 샘플 = 해당 BB 전체 실행으로 판단
-    (instruction 단위 집계보다 샘플링 노이즈에 강인).
-    [Stats] 출력 시 [StatCov] BB: X.X% | funcs: N/M (Y.Y%) 행 추가.
-    종료 summary에 BB Coverage / Func Coverage 섹션 추가.
-- [Feature] 정적 분석 시각화 그래프 3종 (graphs/ 에 자동 생성):
-    coverage_growth.png  : BB_cov% / funcs_cov% 성장 곡선 (100회마다 스냅샷)
-    firmware_map.png     : 펌웨어 함수 공간 전체 맵 (커버=초록 / 미커버=회색)
-    uncovered_funcs.png  : 미커버 함수 Top-30 크기 내림차순 막대 차트
-- [Tune] DIAGNOSE_STABILITY: 50 → 100, DIAGNOSE_MAX: 1000 → 5000
-    idle PC 100개+ 환경(복잡한 RTOS, 주기 인터럽트)에서 최대 샘플 도달로
-    idle 유니버스 수렴 미완료 발생 → 상한 확장으로 완전 수렴 보장.
-    최대 소요 시간: 5000 × 50ms ≈ 4분 (퍼저 시작 시 1회).
-- [BugFix] idle_pcs addr_range 필터 제거:
-    RTOS/IRQ 핸들러(0x10000000+) 등 범위 밖 PC가 idle_pcs에서 빠지면
-    consecutive_idle 카운터가 리셋되어 idle saturation이 동작하지 않는 문제 수정.
-    idle_pcs는 전체 idle 유니버스를 포함, addr_range 필터는 coverage 추적에만 적용.
-- [Feature] Crash 시 FAIL CMD 상세 출력:
-    timeout crash 발생 시 dmesg 캡처 직후, 실패한 NVMe 명령의
-    cmd/opcode/device/nsid/cdw2~15/data_len/data hex/mutations 전체를
-    "!! FAIL CMD !!" 블록으로 강조 출력.
-- [Feature] Crash 시 UFAS 펌웨어 덤프 자동 실행:
-    fuzzer 동일 디렉토리의 ./ufas 파일이 있으면 crash 저장 직후 자동 실행.
-    PCIe bus 번호는 /sys/class/nvme/<ctrl>/address sysfs 우선 탐지,
-    실패 시 lspci fallback. 덤프 파일명: <YYYYMMDD>_UFAS_Dump.bin.
-- [Feature] Crash 재현 TC replay .sh 자동 생성:
-    _cmd_history(deque maxlen=100)에 NVMe 명령 + PM 동작을 순서대로 기록.
-    crash 발생 시 crashes/replay_<tag>.sh 생성 — sudo bash replay_<tag>.sh 로 바로 실행.
-    마지막 항목(CRASH CMD) 주석 표기, write 데이터는 replay_data_<tag>/data_NNN.bin 저장.
-    --input-file 절대경로 저장 (실행 위치 무관), stdout > /dev/null 으로 response buffer 억제,
-    명령어 CLI 전체 + rc=$? echo 출력, set +e 로 중간 실패 시에도 전체 시퀀스 실행.
-    nvme-cli --timeout=3600000(1시간): crash 발생 명령에서 blocking 유지 → crash state 보존.
-    스크립트 헤더에서 nvme_core.admin_timeout/io_timeout을 30일로 설정 → 커널 abort/reset 방지.
-
+미완성 로드맵 (TODO)
+- Phase 1: PC 필터 범위 진단 (multi-range), BB coverage 정확도 검증.
+- Phase 2: --prefill 강화, FTL 상태 지표 추가 (state_fields.py).
+- Phase 3: PM 시나리오 테이블 (ScenarioSeed), POR 직후 boot_sweep injection.
+- Phase 4: TransactionSeed 도입, 시퀀스 자체 mutation (insert/delete/swap).
+- Phase 5: 안전한 추가 명령 활성화, 위험 명령 격리 정책.
 """
 
 from __future__ import annotations
