@@ -2256,7 +2256,9 @@ class NVMeFuzzer:
         """v4.4: 실제 실행 내용 기준 추적 키 생성.
         opcode_override가 있으면:
           - NVMe 스펙에 일치하는 명령어가 있으면 해당 이름 사용
-          - 없으면 원래 명령어명 없이 unknown_op0x{XX} 형태"""
+          - 없으면 unknown_{admin|io}_op0x{XX} 형태 (v7.6: passthru 타입 임베드 —
+            command_comparison 차트에서 admin/io 두 버킷으로 합치기 위함)
+        """
         if seed.opcode_override is not None:
             # 실제 전송되는 passthru 타입 결정
             if seed.force_admin is not None:
@@ -2266,7 +2268,7 @@ class NVMeFuzzer:
             spec_name = _OPCODE_TO_NAME.get((seed.opcode_override, actual_type))
             if spec_name is not None:
                 return spec_name
-            return f"unknown_op0x{seed.opcode_override:02X}"
+            return f"unknown_{actual_type}_op0x{seed.opcode_override:02X}"
         return cmd.name
 
     def _clone_seed(self, seed: Seed) -> Seed:
@@ -6962,7 +6964,12 @@ class NVMeFuzzer:
         self._generate_comparison_chart(graph_dir)
 
     def _generate_comparison_chart(self, graph_dir: Path):
-        """명령어별 PC 수 / 실행 횟수 / global coverage 기여율 / RC 오류율 비교 차트 생성"""
+        """명령어별 PC 수 / 실행 횟수 / global coverage 기여율 / RC 오류율 비교 차트 생성.
+
+        v7.6: unknown_{admin|io}_op0x.. 라벨이 opcode마다 따로 잡혀 차트가 노이즈로
+        가득 차는 문제를 해결하기 위해 unknown(admin)/unknown(io) 두 버킷으로 합산.
+        개별 unknown opcode hit 통계는 _format_unknown_opcode_summary()에서 텍스트로 별도 보고.
+        """
         try:
             import matplotlib
             matplotlib.use('Agg')
@@ -6972,6 +6979,36 @@ class NVMeFuzzer:
                         "'pip install matplotlib' 로 설치 가능")
             return
 
+        # --- v7.6: unknown 라벨 버킷팅 ---
+        # 입력: cmd_pcs/cmd_stats/rc_stats 의 키 (track_key 단위)
+        # 출력: known 키는 그대로 + unknown(admin)/unknown(io) 두 통합 키
+        def _bucket(track_key: str) -> str:
+            if track_key.startswith('unknown_admin_op0x'):
+                return 'unknown(admin)'
+            if track_key.startswith('unknown_io_op0x'):
+                return 'unknown(io)'
+            return track_key
+
+        from collections import defaultdict as _dd
+        bucket_pcs:   dict = _dd(set)      # bucket → unique PC set
+        bucket_exec:  dict = _dd(int)      # bucket → 실행 횟수 합
+        bucket_rc:    dict = _dd(lambda: _dd(int))   # bucket → {rc: count}
+        bucket_has_trace: dict = _dd(bool) # bucket → has any traces
+
+        for _k, _pcs in self.cmd_pcs.items():
+            _b = _bucket(_k)
+            if _pcs:
+                bucket_pcs[_b] |= _pcs
+        for _k in self.cmd_traces:
+            if self.cmd_traces[_k]:
+                bucket_has_trace[_bucket(_k)] = True
+        for _k, _st in self.cmd_stats.items():
+            bucket_exec[_bucket(_k)] += _st.get("exec", 0)
+        for _k, _rd in self.rc_stats.items():
+            _b = _bucket(_k)
+            for _rc, _c in _rd.items():
+                bucket_rc[_b][_rc] += _c
+
         cmd_names = []
         pc_counts = []
         trace_counts = []
@@ -6980,16 +7017,21 @@ class NVMeFuzzer:
 
         global_total = len(self.sampler.global_coverage) or 1
 
-        for cmd_name in sorted(self.cmd_pcs.keys()):
-            if self.cmd_pcs[cmd_name] or self.cmd_traces[cmd_name]:
+        # known 키 알파벳 정렬, unknown 두 버킷은 끝으로 고정
+        _all_buckets = set(bucket_pcs) | set(bucket_has_trace)
+        _known = sorted(b for b in _all_buckets
+                        if not b.startswith('unknown('))
+        _unknown = sorted(b for b in _all_buckets
+                          if b.startswith('unknown('))
+        for cmd_name in _known + _unknown:
+            if bucket_pcs.get(cmd_name) or bucket_has_trace.get(cmd_name):
                 cmd_names.append(cmd_name)
-                n_pcs = len(self.cmd_pcs[cmd_name])
+                n_pcs = len(bucket_pcs.get(cmd_name, set()))
                 pc_counts.append(n_pcs)
-                # cmd_stats["exec"] = 실제 실행 횟수 (RC_TIMEOUT/RC_ERROR 포함)
-                trace_counts.append(self.cmd_stats.get(cmd_name, {}).get("exec", 0))
+                trace_counts.append(bucket_exec.get(cmd_name, 0))
                 pc_pcts.append(100.0 * n_pcs / global_total)
-                # RC 오류율 계산 (rc_stats는 RC_TIMEOUT/RC_ERROR 제외한 nvme-cli rc만 포함)
-                rc_dist = self.rc_stats.get(cmd_name, {})
+                # RC 오류율
+                rc_dist = bucket_rc.get(cmd_name, {})
                 total_rc = sum(rc_dist.values())
                 error_rc = sum(v for k, v in rc_dist.items() if k != 0)
                 error_rates.append(100.0 * error_rc / total_rc if total_rc > 0 else 0.0)
@@ -7162,20 +7204,25 @@ class NVMeFuzzer:
                                 xytext=(8, -12), textcoords='offset points',
                                 color='coral', fontsize=9, fontweight='bold')
 
-            # --- 하단: BB velocity (window당 신규 % 증가) bar chart ---
+            # --- 하단: Coverage velocity (window별 새로 발견한 BB%) ---
+            # 의미: 직전 snapshot 이후 추가된 BB 커버율 (BB% increment per window).
+            # 막대 높이가 클수록 그 시간 동안 진행이 빨랐다는 뜻.
+            # 0에 가까우면 포화 — 위 plateau 음영과 같은 정보를 다른 형태로 보여줌.
             if self._sa_total_bbs > 0 and len(execs) >= 2:
-                # 각 구간의 신규 BB 비율 (cumulative diff)
                 _bar_x = execs[1:]
                 _bar_w_arr = [execs[i] - execs[i-1] for i in range(1, len(execs))]
                 _vel = [(c_pcts[i] - c_pcts[i-1]) for i in range(1, len(execs))]
-                # bar 너비 = 구간 길이의 90% (centered on right edge)
                 ax_bot.bar(
                     [_bar_x[i] - _bar_w_arr[i] / 2 for i in range(len(_bar_x))],
                     _vel,
                     width=[max(w, 1) * 0.9 for w in _bar_w_arr],
                     color='steelblue', alpha=0.55, edgecolor='none',
                 )
-                ax_bot.set_ylabel('BB ΔΔ%/window', fontsize=8)
+                ax_bot.set_ylabel('New BB %\nper window', fontsize=8)
+                ax_bot.set_title(
+                    'Coverage velocity — window별 새로 발견한 BB 비율 '
+                    '(0 ≈ 포화)',
+                    fontsize=9, loc='left', pad=2)
                 ax_bot.axhline(0, color='gray', linewidth=0.6)
                 ax_bot.grid(True, alpha=0.25)
                 ax_bot.tick_params(labelsize=8)
@@ -7399,108 +7446,47 @@ class NVMeFuzzer:
             log.info(f"[StatGraph] 펌웨어 맵 → {map_file} "
                      f"({n_funcs} funcs / {cols}×{rows} grid)")
 
-        # ------------------------------------------------------------------ #
-        # 3. Top uncovered / partially-covered functions (by size)
-        # ------------------------------------------------------------------ #
-        if self._sa_func_entries and self._sa_total_funcs > 0:
-            import bisect as _bisect_sc
-            entered = self._sa_entered_funcs
+        # v7.6: uncovered_funcs.png 제거. firmware_map의 Top-N 라벨 + 그라데이션이
+        # 같은 정보를 더 효율적으로 보여주고, 우선순위 분석은 텍스트 로그가 더 효과적.
+        # 종료 summary에서 _collect_uncov_funcs()로 동일한 데이터를 텍스트로 출력함.
 
-            # 각 함수를 "완전 미진입(not_entered)" vs "부분 커버(partial)" 로 분류.
-            # BB 데이터 없으면 모든 진입된 함수를 'partial' 취급.
-            not_entered_list = []  # (name, size, entry)
-            partial_list = []      # (name, size, entry, bb_cov_pct)
+    def _collect_uncov_funcs(self):
+        """미진입(not_entered) + 부분커버(partial) 함수 목록을 크기 내림차순으로 수집.
+        return: (not_entered_list, partial_list)
+          not_entered_list: [(name, size, entry), ...]
+          partial_list:     [(name, size, entry, bb_cov_pct), ...]   (pct는 0~100)
 
-            for i in range(len(self._sa_func_entries)):
-                entry = self._sa_func_entries[i]
-                end   = self._sa_func_ends[i]
-                name  = self._sa_func_names[i]
-                size  = end - entry
-
-                if entry not in entered:
-                    not_entered_list.append((name, size, entry))
-                    continue
-
-                # 진입된 함수 → BB 데이터가 있으면 BB 커버율 계산
-                if self._sa_bb_starts is not None and self._sa_total_bbs > 0:
-                    lo = _bisect_sc.bisect_left(self._sa_bb_starts, entry)
-                    hi = _bisect_sc.bisect_left(self._sa_bb_starts, end)
-                    func_bbs = self._sa_bb_starts[lo:hi]
-                    if func_bbs:
-                        n_cov_bb = sum(1 for bb in func_bbs if bb in self._sa_covered_bbs)
-                        bb_pct = 100.0 * n_cov_bb / len(func_bbs)
-                        if bb_pct < 100.0:
-                            partial_list.append((name, size, entry, bb_pct))
-                    # 100% 커버 함수는 둘 다 추가 안 함 (완전 커버)
-                # BB 데이터 없으면 partial 취급 (진입됐지만 BB 정보 불명)
-                elif self._sa_total_bbs == 0:
-                    partial_list.append((name, size, entry, float('nan')))
-
-            # 크기 내림차순 정렬
-            not_entered_list.sort(key=lambda x: x[1], reverse=True)
-            partial_list.sort(key=lambda x: x[1], reverse=True)
-
-            TOP_N = 25
-            top_ne = not_entered_list[:TOP_N]
-            top_pt = partial_list[:TOP_N]
-
-            if top_ne or top_pt:
-                # 두 카테고리를 하나의 차트에 — 미진입 아래, 부분커버 위
-                combined = []
-                combined_colors = []
-                combined_labels = []
-
-                for n, sz, addr in top_ne:
-                    combined.append(sz)
-                    combined_colors.append('#e05a5a')   # 빨강 — 완전 미진입
-                    combined_labels.append(f"{n}  (0x{addr:08x})")
-
-                for n, sz, addr, pct in top_pt:
-                    combined.append(sz)
-                    combined_colors.append('#e09a30')   # 주황 — 부분 커버
-                    pct_tag = f' [{pct:.0f}% BB]' if pct == pct else ' [BB?]'  # nan 체크
-                    combined_labels.append(f"{n}  (0x{addr:08x}){pct_tag}")
-
-                total_shown = len(combined)
-                fig, ax = plt.subplots(figsize=(11, max(4, total_shown * 0.32)))
-                bars = ax.barh(range(total_shown), combined,
-                               color=combined_colors, edgecolor='none', height=0.72)
-                ax.set_yticks(range(total_shown))
-                ax.set_yticklabels(combined_labels, fontsize=8)
-                ax.invert_yaxis()
-                ax.set_xlabel('Function size (bytes)')
-                ax.set_title(
-                    f'Uncovered / Partially Covered Functions (by size)\n'
-                    f'Not entered: {len(not_entered_list):,}  |  '
-                    f'Partial: {len(partial_list):,}  |  '
-                    f'Total funcs: {self._sa_total_funcs:,}',
-                    fontsize=11)
-                ax.grid(True, axis='x', alpha=0.3)
-
-                _max_sz = max(combined) if combined else 1
-                for bar, sz in zip(bars, combined):
-                    ax.text(bar.get_width() + _max_sz * 0.01,
-                            bar.get_y() + bar.get_height() / 2,
-                            str(sz), va='center', fontsize=7, color='#555')
-
-                # 범례
-                legend_patches = [
-                    mpatches.Patch(color='#e05a5a', label=f'Not entered (top {len(top_ne)})'),
-                    mpatches.Patch(color='#e09a30', label=f'Partial BB cov (top {len(top_pt)})'),
-                ]
-                ax.legend(handles=legend_patches, loc='lower right', fontsize=9)
-
-                # 섹션 구분선
-                if top_ne and top_pt:
-                    ax.axhline(len(top_ne) - 0.5, color='gray', linestyle='--',
-                               linewidth=0.8, alpha=0.6)
-
-                plt.tight_layout()
-                uncov_file = graph_dir / 'uncovered_funcs.png'
-                plt.savefig(uncov_file, dpi=150, bbox_inches='tight')
-                plt.close()
-                log.info(f"[StatGraph] 미커버/부분커버 함수 → {uncov_file} "
-                         f"(not_entered={len(not_entered_list)}, partial={len(partial_list)})")
+        v7.6: 기존 uncovered_funcs.png 생성용 로직을 헬퍼로 추출 — 종료 summary
+        텍스트 출력에서 재사용.
+        """
+        if not (self._sa_func_entries and self._sa_total_funcs > 0):
+            return [], []
+        import bisect as _bisect_sc
+        entered = self._sa_entered_funcs
+        not_entered_list = []
+        partial_list = []
+        for i in range(len(self._sa_func_entries)):
+            entry = self._sa_func_entries[i]
+            end   = self._sa_func_ends[i]
+            name  = self._sa_func_names[i]
+            size  = end - entry
+            if entry not in entered:
+                not_entered_list.append((name, size, entry))
+                continue
+            if self._sa_bb_starts is not None and self._sa_total_bbs > 0:
+                lo = _bisect_sc.bisect_left(self._sa_bb_starts, entry)
+                hi = _bisect_sc.bisect_left(self._sa_bb_starts, end)
+                func_bbs = self._sa_bb_starts[lo:hi]
+                if func_bbs:
+                    n_cov_bb = sum(1 for bb in func_bbs if bb in self._sa_covered_bbs)
+                    bb_pct = 100.0 * n_cov_bb / len(func_bbs)
+                    if bb_pct < 100.0:
+                        partial_list.append((name, size, entry, bb_pct))
+            elif self._sa_total_bbs == 0:
+                partial_list.append((name, size, entry, float('nan')))
+        not_entered_list.sort(key=lambda x: x[1], reverse=True)
+        partial_list.sort(key=lambda x: x[1], reverse=True)
+        return not_entered_list, partial_list
 
     def _generate_heatmaps(self):
         """1D 주소 커버리지 히트맵 + 2D edge 히트맵 생성"""
@@ -7521,36 +7507,19 @@ class NVMeFuzzer:
         addr_end = self.config.addr_range_end if self.config.addr_range_end is not None else 0x147FFF
         addr_range = addr_end - addr_start + 1
 
-        # 데이터가 있는 명령어만 수집
-        active_cmds = [name for name in sorted(self.cmd_pcs.keys())
-                       if self.cmd_pcs[name] or self.cmd_traces[name]]
-        if not active_cmds:
+        if not self.sampler.global_coverage:
             log.warning("[Heatmap] No coverage data to visualize")
             return
 
-        MAX_HEATMAP_CMDS = 40
-        if len(active_cmds) > MAX_HEATMAP_CMDS:
-            log.info(f"[Heatmap] {len(active_cmds)} commands detected, "
-                     f"limiting to top {MAX_HEATMAP_CMDS} by PC count")
-            active_cmds.sort(key=lambda n: len(self.cmd_pcs.get(n, set())),
-                             reverse=True)
-            active_cmds = sorted(active_cmds[:MAX_HEATMAP_CMDS])
-
-        # Bin 크기 결정: 1D는 세밀하게, 2D는 조금 크게
+        # Bin 크기 결정 — 1D heatmap만 (v7.6: per-cmd / 2D edge 제거)
         bin_size_1d = max(256, addr_range // 512)
-        bin_size_2d = max(1024, addr_range // 256)
         n_bins_1d = (addr_range + bin_size_1d - 1) // bin_size_1d
-        n_bins_2d = (addr_range + bin_size_2d - 1) // bin_size_2d
 
-        # 1D Address Coverage Heatmap
-        # 각 row: strip(높이 0.4인치) + title + colorbar 공간
-        ROW_H = 1.4   # inches per strip row
-        n_rows_1d = len(active_cmds) + 1  # +1 for global
-        fig, axes = plt.subplots(n_rows_1d, 1,
-                                 figsize=(18, ROW_H * n_rows_1d + 1.0),
-                                 gridspec_kw={'hspace': 0.9})
-        if n_rows_1d == 1:
-            axes = [axes]
+        # 1D Global Address Coverage Heatmap
+        # v7.6: per-command strip과 2D edge heatmap은 제거.
+        # - per-command: command_comparison/firmware_map에서 더 명확하게 보여줌
+        # - 2D edge: PC 샘플링은 sequential trace가 아니라 "샘플 인접" 이라 진짜 edge가 아님 — 노이즈
+        fig, ax = plt.subplots(figsize=(18, 3.2))
 
         fig.suptitle(
             f'Firmware Coverage Heatmap  '
@@ -7570,14 +7539,14 @@ class NVMeFuzzer:
                     global_bins[idx] += 1
 
         covered_bins = int(np.count_nonzero(global_bins))
-        ax = axes[0]
         im = ax.imshow(global_bins.reshape(1, -1), aspect='auto', cmap='YlOrRd',
                        extent=[addr_start, addr_end, 0, 1], interpolation='nearest')
         ax.set_yticks([])
-        ax.set_title(f'ALL  —  {len(self.sampler.global_coverage)} PCs, '
-                     f'{covered_bins}/{n_bins_1d} bins covered '
-                     f'({100*covered_bins/n_bins_1d:.1f}%)',
-                     fontsize=9, loc='left')
+        ax.set_title(
+            f'ALL  —  {len(self.sampler.global_coverage)} PCs, '
+            f'{covered_bins}/{n_bins_1d} bins covered '
+            f'({100 * covered_bins / n_bins_1d:.1f}%)',
+            fontsize=9, loc='left')
         ax.xaxis.set_major_formatter(plt.FuncFormatter(_hex_formatter))
         ax.tick_params(axis='x', labelsize=7)
         cb = fig.colorbar(im, ax=ax, orientation='vertical',
@@ -7585,111 +7554,31 @@ class NVMeFuzzer:
         cb.set_label('PC hits/bin', fontsize=7)
         cb.ax.tick_params(labelsize=6)
 
-        # Per-command
-        for i, cmd_name in enumerate(active_cmds):
-            cmd_bins = np.zeros(n_bins_1d)
-            for pc in self.cmd_pcs[cmd_name]:
-                if addr_start <= pc <= addr_end:
-                    idx = (pc - addr_start) // bin_size_1d
-                    if 0 <= idx < n_bins_1d:
-                        cmd_bins[idx] += 1
-
-            cmd_covered = int(np.count_nonzero(cmd_bins))
-            ax = axes[i + 1]
-            im_c = ax.imshow(cmd_bins.reshape(1, -1), aspect='auto', cmap='YlOrRd',
-                             extent=[addr_start, addr_end, 0, 1], interpolation='nearest')
-            ax.set_yticks([])
-            ax.set_title(f'{cmd_name}  —  {len(self.cmd_pcs[cmd_name])} PCs, '
-                         f'{cmd_covered}/{n_bins_1d} bins ({100*cmd_covered/n_bins_1d:.1f}%)',
-                         fontsize=9, loc='left')
-            ax.xaxis.set_major_formatter(plt.FuncFormatter(_hex_formatter))
-            ax.tick_params(axis='x', labelsize=7)
-            cb_c = fig.colorbar(im_c, ax=ax, orientation='vertical',
-                                fraction=0.012, pad=0.008, shrink=0.85)
-            cb_c.set_label('PC hits/bin', fontsize=7)
-            cb_c.ax.tick_params(labelsize=6)
+        # --- v7.6: Hot spot 라벨 — 가장 활발한 top-3 bin 주소 표시 ---
+        # 가독성을 위해 strip 위에 점선 + 화살표로 주소 annotation
+        _ymax_val = float(global_bins.max()) if global_bins.size > 0 else 0
+        if _ymax_val > 0:
+            _top3_idx = sorted(np.argsort(global_bins)[-3:][::-1])  # 주소 순 정렬
+            for _rank, _bi in enumerate(_top3_idx):
+                if global_bins[_bi] == 0:
+                    continue
+                _bin_addr = addr_start + int(_bi) * bin_size_1d
+                # strip 안에서의 x 위치 (extent 기반)
+                ax.annotate(
+                    f'hot #{_rank + 1}: 0x{_bin_addr:X}\n({int(global_bins[_bi])} PCs)',
+                    xy=(_bin_addr + bin_size_1d / 2, 1.0),
+                    xytext=(_bin_addr + bin_size_1d / 2, 1.4 + 0.25 * _rank),
+                    fontsize=7, color='#5a2d0c',
+                    ha='center',
+                    arrowprops=dict(arrowstyle='->', color='#a04020',
+                                    lw=0.6, alpha=0.7),
+                    annotation_clip=False)
 
         heatmap_file = graph_dir / 'coverage_heatmap_1d.png'
-        dpi_1d = min(150, int(65000 / max(fig.get_size_inches()[1], 1)))
-        dpi_1d = max(dpi_1d, 50)  # 최소 DPI
-        plt.savefig(heatmap_file, dpi=dpi_1d, bbox_inches='tight')
+        plt.savefig(heatmap_file, dpi=150, bbox_inches='tight')
         plt.close()
-        log.info(f"[Heatmap] 1D coverage heatmap → {heatmap_file} "
-                 f"(bin={bin_size_1d}B, dpi={dpi_1d})")
-
-        # 2D Edge Heatmap (prev_pc × cur_pc 인접 행렬)
-        n_cols = min(3, len(active_cmds))
-        n_rows_2d = (len(active_cmds) + n_cols - 1) // n_cols
-
-        fig, axes_2d = plt.subplots(n_rows_2d, n_cols,
-                                    figsize=(6.5 * n_cols, 5.5 * n_rows_2d),
-                                    squeeze=False)
-        fig.suptitle(f'Edge Heatmap  prev_pc → cur_pc  (bin={bin_size_2d}B)',
-                     fontsize=13, fontweight='bold')
-
-        # 축 눈금 위치 (5개)
-        tick_positions = np.linspace(0, n_bins_2d - 1, 6)
-        tick_labels = [f'0x{int(addr_start + p * bin_size_2d):X}' for p in tick_positions]
-
-        for idx, cmd_name in enumerate(active_cmds):
-            row, col = divmod(idx, n_cols)
-            ax = axes_2d[row][col]
-
-            # Edge 빈도 행렬 구성 — traces에서 도출
-            edge_matrix = np.zeros((n_bins_2d, n_bins_2d))
-            unique_edges: Set[Tuple[int, int]] = set()
-
-            for trace in self.cmd_traces[cmd_name]:
-                for ti in range(len(trace) - 1):
-                    p, c = trace[ti], trace[ti + 1]
-                    unique_edges.add((p, c))
-                    if addr_start <= p <= addr_end and addr_start <= c <= addr_end:
-                        bx = (p - addr_start) // bin_size_2d
-                        by = (c - addr_start) // bin_size_2d
-                        if 0 <= bx < n_bins_2d and 0 <= by < n_bins_2d:
-                            edge_matrix[by][bx] += 1
-
-            if not unique_edges:
-                ax.set_visible(False)
-                continue
-
-            # log 스케일로 표시 (빈도 차이가 큼)
-            edge_display = np.log1p(edge_matrix)
-
-            im = ax.imshow(edge_display, aspect='equal', cmap='inferno',
-                           origin='lower', interpolation='nearest')
-
-            ax.set_xticks(tick_positions)
-            ax.set_xticklabels(tick_labels, rotation=45, fontsize=6, ha='right')
-            ax.set_yticks(tick_positions)
-            ax.set_yticklabels(tick_labels, fontsize=6)
-            ax.set_xlabel('prev_pc (from)', fontsize=8)
-            ax.set_ylabel('cur_pc (to)', fontsize=8)
-
-            # 대각선 참조선 (순차 실행 영역)
-            ax.plot([0, n_bins_2d - 1], [0, n_bins_2d - 1],
-                    'w--', alpha=0.3, linewidth=0.5)
-
-            active_bins = int(np.count_nonzero(edge_matrix))
-            ax.set_title(f'{cmd_name}  —  {len(unique_edges)} edges, '
-                         f'{active_bins} active bins',
-                         fontsize=9)
-            plt.colorbar(im, ax=ax, shrink=0.75, label='log(count+1)',
-                         pad=0.02)
-
-        # 빈 subplot 숨기기
-        for idx in range(len(active_cmds), n_rows_2d * n_cols):
-            row, col = divmod(idx, n_cols)
-            axes_2d[row][col].set_visible(False)
-
-        plt.tight_layout()
-        edge_heatmap_file = graph_dir / 'edge_heatmap_2d.png'
-        max_dim = max(fig.get_size_inches())
-        dpi_2d = min(150, int(65000 / max(max_dim, 1)))
-        dpi_2d = max(dpi_2d, 50)
-        plt.savefig(edge_heatmap_file, dpi=dpi_2d, bbox_inches='tight')
-        plt.close()
-        log.info(f"[Heatmap] 2D edge heatmap → {edge_heatmap_file} (dpi={dpi_2d})")
+        log.info(f"[Heatmap] 1D global coverage heatmap → {heatmap_file} "
+                 f"(bin={bin_size_1d}B)")
 
     def _generate_mutation_chart(self):
         """MOpt operator 효율 + 입력 소스 분포 차트 생성 → graphs/mutation_chart.png"""
@@ -8920,13 +8809,59 @@ class NVMeFuzzer:
                     f"Coverage (PCs)   : {stats['coverage_unique_pcs']:,}",
                     "Per-command stats:",
                 ]
-                for cmd_name, cmd_stat in stats['command_stats'].items():
-                    summary_lines.append(f"  {cmd_name}: exec={cmd_stat['exec']}, "
-                                         f"interesting={cmd_stat['interesting']}")
+                # v7.6: unknown_{admin|io}_op0x.. 라벨을 unknown(admin)/unknown(io) 두
+                # 버킷으로 합산. 개별 unknown opcode 통계는 아래 별도 섹션에 출력.
+                def _bucket_track(_k: str) -> str:
+                    if _k.startswith('unknown_admin_op0x'):
+                        return 'unknown(admin)'
+                    if _k.startswith('unknown_io_op0x'):
+                        return 'unknown(io)'
+                    return _k
+
+                from collections import defaultdict as _dd_sum
+                _cs_bucket = _dd_sum(lambda: {'exec': 0, 'interesting': 0})
+                for _k, _st in stats['command_stats'].items():
+                    _b = _bucket_track(_k)
+                    _cs_bucket[_b]['exec']        += _st.get('exec', 0)
+                    _cs_bucket[_b]['interesting'] += _st.get('interesting', 0)
+                _known   = sorted(b for b in _cs_bucket if not b.startswith('unknown('))
+                _unknown_b = sorted(b for b in _cs_bucket if b.startswith('unknown('))
+                for _b in _known + _unknown_b:
+                    _agg = _cs_bucket[_b]
+                    summary_lines.append(
+                        f"  {_b}: exec={_agg['exec']}, "
+                        f"interesting={_agg['interesting']}")
+
+                # Top unknown opcodes — 개별 hit이 큰 unknown opcode top-5 (별도 신호)
+                _unknown_entries = []
+                for _k, _st in stats['command_stats'].items():
+                    if _k.startswith('unknown_admin_op0x') or _k.startswith('unknown_io_op0x'):
+                        _unknown_entries.append((_k, _st.get('exec', 0),
+                                                 _st.get('interesting', 0)))
+                if _unknown_entries:
+                    _unknown_entries.sort(key=lambda x: x[1], reverse=True)
+                    summary_lines.append(
+                        f"Top unknown opcodes (unique={len(_unknown_entries)}, exec 내림차순):")
+                    for _k, _ex, _int in _unknown_entries[:5]:
+                        _typ = 'admin' if _k.startswith('unknown_admin') else 'io'
+                        _opc = _k.rsplit('op0x', 1)[-1]
+                        summary_lines.append(
+                            f"  unknown({_typ}) op=0x{_opc}: exec={_ex}, "
+                            f"interesting={_int}")
+
                 summary_lines.append("Return code distribution:")
-                for cmd_name, rc_dist in self.rc_stats.items():
-                    rc_summary = ", ".join(f"rc={rc}:{cnt}" for rc, cnt in sorted(rc_dist.items()))
-                    summary_lines.append(f"  {cmd_name}: {rc_summary}")
+                _rc_bucket = _dd_sum(lambda: _dd_sum(int))
+                for _k, _rd in self.rc_stats.items():
+                    _b = _bucket_track(_k)
+                    for _rc, _c in _rd.items():
+                        _rc_bucket[_b][_rc] += _c
+                _known_rc   = sorted(b for b in _rc_bucket if not b.startswith('unknown('))
+                _unknown_rc = sorted(b for b in _rc_bucket if b.startswith('unknown('))
+                for _b in _known_rc + _unknown_rc:
+                    rc_dist = _rc_bucket[_b]
+                    rc_summary = ", ".join(f"rc={rc}:{cnt}"
+                                           for rc, cnt in sorted(rc_dist.items()))
+                    summary_lines.append(f"  {_b}: {rc_summary}")
 
                 ms = stats['mutation_stats']
                 total = stats['executions'] or 1
@@ -9010,6 +8945,25 @@ class NVMeFuzzer:
                         summary_lines.append(
                             f"Func Coverage    : {fpct:.2f}%"
                             f" ({n_f} / {self._sa_total_funcs} functions)")
+
+                    # v7.6: Top 미진입/부분커버 함수 텍스트 출력 (uncovered_funcs.png 대체)
+                    _ne_list, _pt_list = self._collect_uncov_funcs()
+                    _TOP_N_TXT = 20
+                    if _ne_list:
+                        summary_lines.append(
+                            f"Top {min(_TOP_N_TXT, len(_ne_list))} not-entered functions "
+                            f"(total {len(_ne_list)}, by size):")
+                        for _name, _sz, _addr in _ne_list[:_TOP_N_TXT]:
+                            summary_lines.append(
+                                f"  0x{_addr:08x}  size={_sz:>6}  {_name}")
+                    if _pt_list:
+                        summary_lines.append(
+                            f"Top {min(_TOP_N_TXT, len(_pt_list))} partially-covered functions "
+                            f"(total {len(_pt_list)}, by size):")
+                        for _name, _sz, _addr, _pct in _pt_list[:_TOP_N_TXT]:
+                            _pct_str = f"{_pct:5.1f}% BB" if _pct == _pct else "  BB?  "
+                            summary_lines.append(
+                                f"  0x{_addr:08x}  size={_sz:>6}  [{_pct_str}]  {_name}")
 
                 op_names = ['bitflip1', 'int8', 'int16', 'int32',
                             'arith8', 'arith16', 'arith32', 'randbyte',

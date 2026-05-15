@@ -110,7 +110,17 @@ Panel 3: m1 vs m2 reward (per-command 정규화 후 비교)
 
 ### per-command CFG 제거
 
-`{cmd}_cfg.dot/.png` 생성 코드 제거. edge 수가 늘어나면 sfdp 레이아웃으로 떨어져도 가독성 떨어지고, 대체 시각화(heatmap, edge_heatmap_2d)가 이미 존재해서 가치 낮음.
+`{cmd}_cfg.dot/.png` 생성 코드 제거. edge 수가 늘어나면 sfdp 레이아웃으로 떨어져도 가독성 떨어지고, 대체 시각화(heatmap)가 이미 존재해서 가치 낮음.
+
+### v7.6 후속 정리
+
+- **command_comparison.png** — opcode mutation으로 생성된 `unknown_op0x..` 라벨이 차트를 노이즈로 채우는 문제 해결. `_tracking_label` 형식을 `unknown_{admin|io}_op0x{XX}` 로 변경 후 차트에서 `unknown(admin)` / `unknown(io)` 두 버킷으로 합산. 종료 summary 텍스트에 **Top-5 unknown opcode** 별도 출력 (hit count 내림차순) — 차트는 깔끔하고 디테일은 텍스트로 보존.
+- **coverage_growth.png** — 하단 panel y축 라벨을 모호한 `BB ΔΔ%/window` 에서 `New BB % per window` 로 변경, subtitle "Coverage velocity — window별 새로 발견한 BB 비율 (0 ≈ 포화)" 추가.
+- **heatmap 정리** — `edge_heatmap_2d.png` 제거 (PC 샘플링에서는 진짜 edge가 아니라 sample 인접이라 노이즈). per-command 1D heatmap strip도 제거. **`coverage_heatmap_1d.png`는 global 1개 strip만 유지**하되 가장 hit이 많은 top-3 bin 주소를 hot spot 라벨로 표시.
+- **uncovered_funcs.png 제거** — firmware_map의 Top-N 라벨 + BB-coverage 그라데이션이 같은 정보를 더 효율적으로 보여줌. 우선순위 분석은 종료 summary 텍스트에 **Top-20 not-entered + Top-20 partially-covered** 함수 목록(주소·크기·BB% 포함)으로 출력.
+- **firmware_map BB-weighted 평균 정확화** — 함수별 % 단순 평균이 아니라 `Σ covered_bbs / Σ total_bbs` 가중 평균.
+- **JLink shutdown 분리** — `_shutdown_openocd_for_jlink()` 헬퍼 + `_handle_timeout_crash`에서 항상 호출. `--no-jlink-dump` 사용 시에도 후속 JLink PC 모니터링이 J-Link USB에 정상 접근 가능.
+- firmware_map Top-N 라벨에서 ⬛/⬜ unicode 제거 (matplotlib 기본 폰트에 없어 Glyph missing 경고).
 
 ---
 
@@ -379,17 +389,18 @@ output/pc_sampling_v7.6.0/
 │   ├── replay_<tag>.sh
 │   └── replay_data_<tag>/
 └── graphs/
-    ├── command_comparison.png
+    ├── command_comparison.png           (v7.6 unknown 버킷팅)
     ├── mutation_chart.png
-    ├── coverage_heatmap_1d.png
-    ├── edge_heatmap_2d.png
+    ├── coverage_heatmap_1d.png          (v7.6 global only + hot-spot 라벨)
     ├── coverage_growth.png              (* Ghidra 연동, v7.6 velocity+plateau+milestone)
     ├── firmware_map.png                 (* Ghidra 연동, v7.6 BB-gradient+전체 함수+Top-N)
-    ├── uncovered_funcs.png              (* Ghidra 연동)
     └── csfuzz_dynamics.png              (v7.6 신규, state 활성 시)
 ```
 
-`{cmd}_cfg.dot/.png`는 v7.6에서 제거됨 (가독성 낮아 의미 없음).
+v7.6에서 제거된 산출물:
+- `{cmd}_cfg.dot/.png` — edge 많아지면 가독성 낮음
+- `edge_heatmap_2d.png` — PC 샘플링에서는 진짜 edge가 아니라 노이즈
+- `uncovered_funcs.png` — firmware_map + 종료 summary 텍스트로 대체
 
 ---
 
