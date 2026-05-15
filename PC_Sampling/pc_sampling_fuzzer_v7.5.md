@@ -93,14 +93,19 @@ SequenceSeed의 각 명령을 nvme-cli 커맨드로 변환, `replay_seq_{found_a
 ```python
 BUILTIN_SEQUENCES = [
     ["Write", "Read"],              # 데이터 일관성 (기본 모드)
-    ["Write", "Write"],             # overwrite 경로 (기본 모드)
-    ["SetFeatures", "GetFeatures"], # feature config 회귀 (기본 모드)
+    ["Write", "Write"],             # 동일 LBA overwrite (기본 모드, 데이터 분리)
     ["Write", "Compare"],           # --commands Compare 필요
     ["FWDownload", "FWCommit"],     # --all-commands 필요
 ]
 ```
 
-`_CTX_SEQUENCES = {("Write","Compare"), ("Write","Read"), ("Write","Write")}` — ctx 공유 필요한 시퀀스.
+`_CTX_SEQUENCES` (dict — 모드 매핑):
+
+| 시퀀스 | 모드 | 동작 |
+|--------|------|------|
+| `("Write","Compare")` | `full` | SLBA + NLB + **data** 모두 공유 — Compare가 Write 결과 검증 |
+| `("Write","Read")` | `full` | SLBA + NLB + **data** 모두 공유 — Read가 동일 LBA 회수 |
+| `("Write","Write")` | `lba_nlb` | SLBA + NLB만 공유, data는 독립 mutation — overwrite 경로 탐색 |
 
 ### CLI 옵션 정리 (51 → 19개)
 자주 변경하지 않는 옵션 32개를 CLI에서 제거하고 `FuzzConfig` 필드/상수로 유지. 필요 시 코드 직접 수정.
@@ -187,8 +192,10 @@ _valid_seqs = [s for s in BUILTIN_SEQUENCES
 seed.cdw10 = slba & 0xFFFFFFFF
 seed.cdw11 = (slba >> 32) & 0xFFFFFFFF
 seed.cdw12 = (seed.cdw12 & ~0xFFFF) | (nlb & 0xFFFF)   # NLB만 덮어씀
-seed.data  = ctx['data']
-seed.data_len_override = len(ctx['data'])
+if ctx.get('data') is not None:        # full 모드
+    seed.data = ctx['data']
+    seed.data_len_override = len(ctx['data'])
+# lba_nlb 모드: seed.data 와 data_len_override 는 mutation 결과 그대로 유지
 # 시퀀스 명령은 정상 경로 — 변이 필드 초기화
 seed.opcode_override = None
 seed.force_admin     = None
@@ -196,6 +203,8 @@ seed.nsid_override   = None
 ```
 
 CDW12 상위 비트(FUA, PRINFO 등)와 CDW13~15 mutation은 살아있음.
+
+`lba_nlb` 모드에서 두 번째 명령의 `data_len_override` mutation이 ctx의 NLB와 불일치하면 declared/actual size mismatch가 발생 — **의도된 경계 fuzzing** (FTL의 size 검증 경로 탐색).
 
 ---
 
@@ -341,7 +350,7 @@ output/pc_sampling_v7.5.0/
 
 | 버전 | 주요 변경 |
 |------|-----------|
-| **v7.5** | SequenceSeed corpus + 2-pass favored cull 일관성. Sequence ctx를 Write mutation 결과에서 파생. seq_corpus/ replay .sh 자동 저장 + 고아 청소. BUILTIN_SEQUENCES에 기본 모드 시퀀스(Write→Read 등) 추가. `--no-jlink-dump` 추가. CLI 옵션 51→19. DSM/Copy NR 마스크 수정. |
+| **v7.5** | SequenceSeed corpus + 2-pass favored cull 일관성. Sequence ctx를 Write mutation 결과에서 파생 + `full`/`lba_nlb` 두 모드 지원 (Write→Write는 data 분리). seq_corpus/ replay .sh 자동 저장 + 고아 청소. BUILTIN_SEQUENCES에 기본 모드 시퀀스(Write→Read, Write→Write) 추가. SequenceSeed window 초과 fallback에서 exec_count 보정. `--no-jlink-dump` 추가. CLI 옵션 51→19. DSM/Copy NR 마스크 수정. |
 | v7.4 | Phase 1 (NLB/MDTS data_len), Phase 2 (64-bit LBA, DSM/Copy structured), Phase 3 (builtin sequence). PM 로테이션을 seed 선택 전으로 이동. |
 | v7.3 | `_account_command()` 헬퍼, State-Replay 복원 정확도, m2 정규화. |
 | v7.2 | DET_BUDGET(20%), MOpt reward 누적 버그 수정. |

@@ -20,14 +20,18 @@ Coverage-Guided + State-Aware Fuzzer. 3코어(PM9M1) / 2코어(BM9H1) 지원.
 v7.5 주요 변경
 - SequenceSeed corpus 도입 — builtin sequence(Write→Compare 등)를 N개 명령 단위로 저장.
   energy = MAX_ENERGY / N 패널티로 단일 Seed와 per-exec 공정 경쟁.
-- Sequence ctx 파생 — Write를 먼저 mutation 후 그 결과 CDW10/11/12/data에서 ctx 파생,
-  Compare/Read에만 적용. Write mutation 결과가 완전히 보존됨.
+- Sequence ctx 파생 — Write를 먼저 mutation 후 그 결과 CDW10/11/12/[data]에서 ctx 파생,
+  후속 명령에만 적용. `_CTX_SEQUENCES`는 모드 매핑 dict:
+    full     — SLBA+NLB+data 공유 (Write→Compare, Write→Read)
+    lba_nlb  — SLBA+NLB만 공유, data는 독립 mutation (Write→Write — overwrite 경로)
 - _cull_corpus 2-pass favored 마킹 — Pass1: 단일 Seed로 PC → best 매핑,
   Pass2: 미커버 PC만 SequenceSeed가 채움. SequenceSeed도 동일 cull/epoch 규칙 적용.
 - MAX_SEQUENCE_CORPUS=50 cap을 (is_favored, new_pcs) 정렬로 변경.
 - seq_corpus/ 폴더에 SequenceSeed replay .sh 자동 저장. cull 시 고아 파일 청소.
-- BUILTIN_SEQUENCES 확장: Write→Read, Write→Write, SetFeatures→GetFeatures
-  (기본 모드 명령만으로도 시퀀스 작동). SEQ_PROB=0.05, SEQ_MAX_PER_100=10.
+- BUILTIN_SEQUENCES 확장: Write→Read, Write→Write (기본 모드 명령만으로도 시퀀스 작동).
+  SEQ_PROB=0.05, SEQ_MAX_PER_100=10.
+- corpus SequenceSeed 선택 시 window 초과 fallback에서 exec_count 보정 — 단발 실행으로
+  소비된 카운트를 되돌려 다음 window에서 재선택 기회를 보존.
 - --no-jlink-dump 옵션 추가. CLI 옵션 51→19개로 정리 (나머지는 코드 상수로 유지).
 - DSM NR=0xFF payload 불일치 / Copy NR 마스크 0xFF→0xF / data_len_override 잔존 리셋 수정.
 
@@ -73,7 +77,7 @@ import logging
 import math
 import re
 from collections import defaultdict, deque
-from typing import Set, List, Optional, Tuple, Dict
+from typing import Set, List, Optional, Tuple, Dict, Union
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -214,8 +218,7 @@ CORPUS_EPOCH_SIZE      = 0      # Epoch 기반 corpus 리셋 주기 (0=비활성
 BUILTIN_SEQUENCES: List[List[str]] = [
     # 기본 모드 (Identify/GetLogPage/GetFeatures/SetFeatures/Read/Write)
     ["Write", "Read"],                       # Write 후 동일 LBA Read — 데이터 일관성 경로
-    ["Write", "Write"],                      # 동일 LBA overwrite — 매핑/캐시 경로
-    ["SetFeatures", "GetFeatures"],          # feature config 회귀 경로
+    ["Write", "Write"],                      # 동일 LBA overwrite — FTL 매핑/캐시 경로 (data 분리)
     # Extended (Compare/FW*는 --commands 또는 --all-commands 필요)
     ["Write", "Compare"],
     ["FWDownload", "FWCommit"],              # 잘못된 이미지에 대한 FW 에러 핸들링 경로 탐색
@@ -3016,8 +3019,9 @@ class NVMeFuzzer:
 
         return factor / n
 
-    def _select_seed(self) -> Optional[Seed]:
-        """v4: 에너지 기반 가중치 랜덤 선택."""
+    def _select_seed(self) -> 'Optional[Union[Seed, SequenceSeed]]':
+        """v4: 에너지 기반 가중치 랜덤 선택.
+        v7.5+: corpus에 Seed와 SequenceSeed가 혼재하므로 두 타입 모두 반환 가능."""
         if not self.corpus:
             return None
 
@@ -3028,7 +3032,9 @@ class NVMeFuzzer:
         # 가중치 랜덤 선택
         total_energy = sum(s.energy for s in self.corpus)
         if total_energy <= 0:
-            return random.choice(self.corpus)
+            seed = random.choice(self.corpus)
+            seed.exec_count += 1
+            return seed
 
         r = random.uniform(0, total_energy)
         cumulative = 0
@@ -3869,13 +3875,16 @@ class NVMeFuzzer:
             self._mdts_cache_at = self.executions
         return self._mdts_cache
 
-    # 공유 컨텍스트가 필요한 시퀀스 — 첫 명령 mutation 결과의 SLBA/NLB/data를 후속 명령에 적용.
-    # _apply_seq_ctx 는 LBA/NLB/data만 다루므로 Read/Write/Compare 계열에 한정.
-    _CTX_SEQUENCES: frozenset = frozenset([
-        ("Write", "Compare"),
-        ("Write", "Read"),
-        ("Write", "Write"),
-    ])
+    # 공유 컨텍스트가 필요한 시퀀스 — 첫 명령 mutation 결과의 SLBA/NLB/[data]를 후속 명령에 적용.
+    # 모드:
+    #   'full'    — SLBA + NLB + data 공유. Compare/Read가 Write의 정확한 결과를 따라감.
+    #   'lba_nlb' — SLBA + NLB만 공유, data는 각 명령이 독립 mutation.
+    #               (Write→Write: 같은 LBA 범위에 다른 데이터로 overwrite 경로 탐색)
+    _CTX_SEQUENCES: dict = {
+        ("Write", "Compare"): 'full',
+        ("Write", "Read"):    'full',
+        ("Write", "Write"):   'lba_nlb',
+    }
 
     def _pick_seq_seed(self, cmd_name: str,
                        ctx: Optional[dict] = None) -> 'Seed':
@@ -3897,14 +3906,20 @@ class NVMeFuzzer:
         return seed
 
     def _apply_seq_ctx(self, seed: 'Seed', ctx: dict) -> 'Seed':
-        """시퀀스 공유 컨텍스트(SLBA/NLB/data)를 seed에 적용."""
+        """시퀀스 공유 컨텍스트를 seed에 적용.
+
+        ctx['data']가 있으면 data와 data_len_override까지 덮어씀 (full 모드).
+        없으면 SLBA/NLB만 공유하고 seed의 mutation 결과 data는 보존 (lba_nlb 모드).
+        """
         slba = ctx['slba']
         nlb  = ctx['nlb']
         seed.cdw10 = slba & 0xFFFFFFFF
         seed.cdw11 = (slba >> 32) & 0xFFFFFFFF
         seed.cdw12 = (seed.cdw12 & ~0xFFFF) | (nlb & 0xFFFF)
-        seed.data  = ctx['data']
-        seed.data_len_override = len(ctx['data'])
+        if ctx.get('data') is not None:
+            seed.data = ctx['data']
+            seed.data_len_override = len(ctx['data'])
+        # lba_nlb 모드: seed.data / seed.data_len_override 는 mutation 결과 유지
         # 시퀀스 명령은 정상 opcode/queue/nsid로 실행 — 변이 필드 초기화
         seed.opcode_override = None
         seed.force_admin     = None
@@ -8411,6 +8426,11 @@ class NVMeFuzzer:
                             and self.state_corpus
                             and random.random() < _p_c2):
                         # C2(state corpus) 선택 → 시퀀스 replay 후 정상 seed 선택
+                        # 주의: _replay_state_sequence는 entry.sequence(최대 100개)의 모든 명령을
+                        # 순차 실행하므로 이 iteration에서 100+개의 NVMe 명령이 발행될 수 있다.
+                        # 각 명령은 _account_command로 executions/coverage가 정상 회계되며,
+                        # replay 종료 후 본 iteration의 단일 seed 실행이 추가로 진행된다.
+                        # _seq_in_progress=True일 때는 진입하지 않으므로 sequence atomicity 보장.
                         self._csfuzz_last_from = 'c2'
                         _sc_entry = self._select_state_entry_csfuzz()
                         if _sc_entry is not None:
@@ -8470,12 +8490,13 @@ class NVMeFuzzer:
                             }
                             log.debug(f"[Seq/Builtin] 시작: {_full_seq}")
                             mutated_seed = self._pick_seq_seed(_seq_cmd, ctx=None)
-                            if _full_seq in self._CTX_SEQUENCES:
-                                # Write mutation 결과에서 ctx 파생 → Compare가 따라감
+                            _ctx_mode = self._CTX_SEQUENCES.get(_full_seq)
+                            if _ctx_mode is not None:
+                                # 첫 명령 mutation 결과에서 ctx 파생
                                 self._pending_seq_ctx = {
                                     'slba': (mutated_seed.cdw11 << 32) | mutated_seed.cdw10,
                                     'nlb':  mutated_seed.cdw12 & 0xFFFF,
-                                    'data': mutated_seed.data,
+                                    'data': mutated_seed.data if _ctx_mode == 'full' else None,
                                 }
                             else:
                                 self._pending_seq_ctx = None
@@ -8502,12 +8523,13 @@ class NVMeFuzzer:
                                     log.debug(f"[Seq/Corp] replay 시작: cmds={_cs_names} "
                                               f"new_pcs={base_seed.new_pcs}")
                                     _first = self._mutate(_cs_cmds.pop(0))
-                                    if _cs_names in self._CTX_SEQUENCES:
-                                        # Write mutation 결과에서 ctx 파생 → Compare가 따라감
+                                    _ctx_mode = self._CTX_SEQUENCES.get(_cs_names)
+                                    if _ctx_mode is not None:
+                                        # 첫 명령 mutation 결과에서 ctx 파생
                                         self._pending_seq_ctx = {
                                             'slba': (_first.cdw11 << 32) | _first.cdw10,
                                             'nlb': _first.cdw12 & 0xFFFF,
-                                            'data': _first.data,
+                                            'data': _first.data if _ctx_mode == 'full' else None,
                                         }
                                     else:
                                         self._pending_seq_ctx = None
@@ -8526,6 +8548,10 @@ class NVMeFuzzer:
                                     _used_seq = True
                                 else:
                                     # window 초과: 첫 명령만 단독 실행 (시퀀스 미시작)
+                                    # _select_seed가 SequenceSeed의 exec_count를 이미 증가시켰지만
+                                    # 실제 시퀀스 replay가 일어나지 않으므로 보정 — 다음 window에서
+                                    # 동일 SequenceSeed가 다시 선택될 기회를 보존.
+                                    base_seed.exec_count = max(0, base_seed.exec_count - 1)
                                     log.debug(f"[Seq/Corp] window 초과 → 단독 실행: "
                                               f"cmd={base_seed.commands[0].cmd.name}")
                                     mutated_seed = self._mutate(base_seed.commands[0])
