@@ -1191,6 +1191,7 @@ class FuzzConfig:
     fw_slot: int = 1                    # FWCommit 슬롯 번호
 
     enable_ufas: bool = True            # crash 시 UFAS 펌웨어 덤프 실행 여부 (--no-ufas로 비활성화)
+    enable_jlink_dump: bool = True      # crash 시 JLink 메모리 덤프 실행 여부 (--no-jlink-dump로 비활성화)
 
     prefill: bool = False               # POR 전 드라이브 전체 쓰기 (GC/WL 트리거용, --prefill)
     prefill_bs: int = 4 * 1024 * 1024  # prefill dd 블록 크기 (기본 4MB)
@@ -7092,11 +7093,14 @@ class NVMeFuzzer:
             log.warning(f"[REPLAY] replay .sh 생성 실패: {_replay_exc}")
 
         # 3.6) JLink 메모리 덤프 (UFAS 이전)
-        log.warning("[TIMEOUT] JLink 메모리 덤프를 실행합니다...")
-        try:
-            self._run_jlink_dump()
-        except Exception as _jlink_exc:
-            log.warning(f"[JLINK DUMP] 예기치 않은 예외: {_jlink_exc}")
+        if self.config.enable_jlink_dump:
+            log.warning("[TIMEOUT] JLink 메모리 덤프를 실행합니다...")
+            try:
+                self._run_jlink_dump()
+            except Exception as _jlink_exc:
+                log.warning(f"[JLINK DUMP] 예기치 않은 예외: {_jlink_exc}")
+        else:
+            log.warning("[TIMEOUT] JLink 덤프 건너뜀 (--no-jlink-dump)")
 
         # 3.7) UFAS 펌웨어 덤프
         if self.config.enable_ufas:
@@ -9197,6 +9201,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=f'PC Sampling SSD Fuzzer v{FUZZER_VERSION}')
+    # 제품/타겟
     parser.add_argument('--product', choices=list(PRODUCT_CONFIGS.keys()), default=None,
                         help=f'제품 선택 (interface/cfg 자동 설정). '
                              f'선택지: {", ".join(PRODUCT_CONFIGS.keys())}. '
@@ -9204,119 +9209,52 @@ if __name__ == "__main__":
     parser.add_argument('--interface', choices=['swd', 'jtag'], default='swd',
                         help='디버그 transport (swd: r8_pcsr.cfg, jtag: r8_pcsr_jtag.cfg). '
                              '--product 지정 시 무시됨')
-    parser.add_argument('--openocd-binary', default=OPENOCD_BINARY,
-                        help=f'OpenOCD 바이너리 경로 (default: {OPENOCD_BINARY})')
-    parser.add_argument('--openocd-config', default=None,
-                        help='OpenOCD 설정 파일 경로 (미지정 시 --interface로 자동 선택)')
-    parser.add_argument('--openocd-host', default=OPENOCD_TELNET_HOST,
-                        help=f'OpenOCD telnet 호스트 (default: {OPENOCD_TELNET_HOST})')
-    parser.add_argument('--openocd-port', type=int, default=OPENOCD_TELNET_PORT,
-                        help=f'OpenOCD telnet 포트 (default: {OPENOCD_TELNET_PORT})')
-    parser.add_argument('--openocd-timeout', type=float, default=OPENOCD_STARTUP_TIMEOUT,
-                        help=f'OpenOCD 시작 대기 타임아웃 (초, default: {OPENOCD_STARTUP_TIMEOUT})')
     parser.add_argument('--nvme', default=NVME_DEVICE, help='NVMe device')
     parser.add_argument('--namespace', type=int, default=NVME_NAMESPACE)
-    parser.add_argument('--lba-size', type=int, default=0,
-                        help='NVMe LBA 크기(바이트). 0=자동 감지 (blockdev --getss)')
+
+    # 명령어 선택
     parser.add_argument('--commands', nargs='+', default=[],
                         help='Commands to use (e.g., Read Write GetFeatures FormatNVM)')
     parser.add_argument('--all-commands', action='store_true', default=False,
                         help='Enable ALL commands including destructive ones '
                              '(FormatNVM, Sanitize, FWCommit, etc.)')
-    parser.add_argument('--runtime', type=int, default=TOTAL_RUNTIME_SEC)
-    parser.add_argument('--output', default=OUTPUT_DIR, help='Output dir')
-    parser.add_argument('--seed-dir', default=SEED_DIR,
-                        help='Seed directory path (load previous corpus as seeds)')
+    parser.add_argument('--exclude-opcodes', type=str, default='',
+                        help='Comma-separated hex opcodes to exclude from fuzzing, '
+                             'e.g. "0xC1,0xC0" or "C1,C0"')
+
+    # 커버리지 resume
+    parser.add_argument('--resume-coverage', default=RESUME_COVERAGE,
+                        help='Path to previous coverage.txt')
+
+    # FW Download/Commit
     parser.add_argument('--fw-bin', default=_FW_BIN_PATH,
                         help='[v4.7] 펌웨어 바이너리 경로 (FWDownload 실제 시드 생성, '
                              '없으면 더미 1KB 시드). 기본값: FW_BIN_FILENAME 설정')
     parser.add_argument('--fw-xfer', type=int, default=32768,
-                        help='[v4.7] FWDownload 청크 크기(바이트), nvme fw-download -x 와 동일 '
-                             '(default: 32768)')
+                        help='[v4.7] FWDownload 청크 크기(바이트) (default: 32768)')
     parser.add_argument('--fw-slot', type=int, default=1,
                         help='[v4.7] FWCommit 슬롯 번호 (default: 1)')
-    parser.add_argument('--samples', type=int, default=MAX_SAMPLES_PER_RUN)
-    parser.add_argument('--interval', type=int, default=SAMPLE_INTERVAL_US,
-                        help='Sample interval (us). 0 = max density (기본값)')
-    parser.add_argument('--post-cmd-delay', type=int, default=POST_CMD_DELAY_MS,
-                        help='Post-command sampling delay (ms)')
-    parser.add_argument('--passthru-timeout', type=int, default=NVME_PASSTHRU_TIMEOUT_MS,
-                        help='nvme-cli --timeout (ms). '
-                             f'(default: {NVME_PASSTHRU_TIMEOUT_MS}ms = 30일)')
-    parser.add_argument('--kernel-timeout', type=int, default=NVME_KERNEL_TIMEOUT_SEC,
-                        help='nvme_core admin/io_timeout (초). crash 후 커널 reset 유예 시간. '
-                             f'(default: {NVME_KERNEL_TIMEOUT_SEC}s = 24시간)')
-    parser.add_argument('--addr-start', type=lambda x: int(x, 0), default=FW_ADDR_START,
-                        help='Firmware .text start (hex)')
-    parser.add_argument('--addr-end', type=lambda x: int(x, 0), default=FW_ADDR_END,
-                        help='Firmware .text end (hex)')
-    parser.add_argument('--resume-coverage', default=RESUME_COVERAGE,
-                        help='Path to previous coverage.txt')
-    parser.add_argument('--random-gen-ratio', type=float, default=RANDOM_GEN_RATIO,
-                        help='Ratio of fully random inputs (0.0~1.0, default 0.2)')
-    parser.add_argument('--exclude-opcodes', type=str, default='',
-                        help='Comma-separated hex opcodes to exclude from fuzzing, '
-                             'e.g. "0xC1,0xC0" or "C1,C0"')
-    parser.add_argument('--admin-swap-prob', type=float, default=ADMIN_SWAP_PROB,
-                        help='Admin/IO swap probability (0.0=disable, default 0.05)')
-    parser.add_argument('--timeout', nargs=2, action='append', metavar=('GROUP', 'MS'),
-                        help='Set timeout per group, e.g. --timeout command 8000 '
-                             '--timeout format 600000. '
-                             f'Groups: {", ".join(NVME_TIMEOUTS.keys())}')
 
-    parser.add_argument('--diagnose-stability', type=int, default=DIAGNOSE_STABILITY,
-                        help=f'idle 유니버스 수렴 조건: 새 PC 없이 연속 N회 (default: {DIAGNOSE_STABILITY}). '
-                             'SWD에서 주기적 인터럽트를 모두 포함하려면 크게 설정')
-    parser.add_argument('--diagnose-max', type=int, default=DIAGNOSE_MAX,
-                        help=f'idle 유니버스 수집 최대 샘플 수 (default: {DIAGNOSE_MAX})')
-    parser.add_argument('--diagnose-sleep-ms', type=int, default=DIAGNOSE_SAMPLE_MS,
-                        help=f'diagnose() 샘플 간격 (ms). (default: {DIAGNOSE_SAMPLE_MS})')
-
-    parser.add_argument('--calibration-runs', type=int, default=CALIBRATION_RUNS,
-                        help='Calibration runs per initial seed (0=disable, default 3)')
-
+    # PM
     parser.add_argument('--pm', action='store_true', default=False,
                         help=f'PM 로테이션 활성화: {PM_ROTATE_INTERVAL}명령마다 PS0→PS1→PS2→PS3→PS4 순환. '
                              f'timeout +{PS_ENTRY_EXIT_MARGIN_MS}ms 고정 마진 적용')
     parser.add_argument('--allow-no-openocd', action='store_true', default=False,
                         help='OpenOCD 연결 실패 시 --pm 전용 PM preflight/cycle 테스트만 수행하고 종료')
-    parser.add_argument('--pm-test-cycles', type=int, default=0,
-                        help='--allow-no-openocd --pm 모드에서 preflight 후 추가 랜덤 PM cycle 수 (default: 0)')
-    parser.add_argument('--pmu-script', default=_PMU_SCRIPT,
-                        help=f'PMU 제어 스크립트 경로 (기본: {_PMU_SCRIPT})')
-    parser.add_argument('--clkreq-assert-pin', type=int, default=16,
-                        help='CLKREQ# assert GPIO pin 번호 (기본: 16)')
-    parser.add_argument('--clkreq-deassert-pin', type=int, default=15,
-                        help='CLKREQ# deassert GPIO pin 번호 (기본: 15)')
-    parser.add_argument('--clkreq-voltage', type=int, default=3300,
-                        help='CLKREQ# 핀 전압 mV (기본: 3300)')
-    parser.add_argument('--l1-settle', type=float, default=L1_SETTLE,
-                        help=f'L1 idle window settle 시간 초 (기본: {L1_SETTLE})')
-    parser.add_argument('--l1-2-settle', type=float, default=L1_2_SETTLE,
-                        help=f'L1.2 추가 settle 시간 초 (기본: {L1_2_SETTLE})')
-    parser.add_argument('--settle-sweep', action='store_true', default=False,
-                        help='L1.2 settle 최솟값 탐색 모드 (OpenOCD 불필요, --pm 생략 가능)')
-    parser.add_argument('--settle-sweep-reps', type=int, default=20,
-                        help='settle sweep: 각 값당 반복 횟수 (기본: 20)')
-    parser.add_argument('--settle-sweep-values', type=str,
-                        default='1.0,0.5,0.2,0.1,0.05,0.02,0.01,0.005',
-                        help='settle sweep: 쉼표 구분 내림차순 값 목록 (기본: 1.0,0.5,...,0.005)')
+
+    # 토글
     parser.add_argument('--no-por', action='store_true', default=False,
                         help='시작 시 SSD POR(전원 사이클) 건너뜀 (기본: POR 수행)')
     parser.add_argument('--no-ufas', action='store_true', default=False,
                         help='crash 시 UFAS 펌웨어 덤프 건너뜀 (기본: ./ufas 파일이 있으면 자동 실행)')
+    parser.add_argument('--no-jlink-dump', action='store_true', default=False,
+                        help='crash 시 JLink 메모리 덤프 건너뜀 (기본: run_smi_mem_dump_JLINK_USB.sh가 있으면 자동 실행)')
     parser.add_argument('--no-state', action='store_true', default=False,
                         help='State monitoring 비활성화 (기본: 100회마다 nvme smart-log / get-log 실행)')
     parser.add_argument('--prefill', action='store_true', default=False,
                         help='POR 전 드라이브 전체 랜덤 쓰기 수행 (GC/Wear Leveling 트리거, 수 분 소요)')
     parser.add_argument('--prefill-bs', type=int, default=4 * 1024 * 1024,
                         help='prefill dd 블록 크기 (바이트, 기본: 4194304 = 4MB)')
-    parser.add_argument('--por-boot-wait', type=float, default=POR_BOOT_WAIT,
-                        help=f'PCIe rescan 후 NVMe 응답 최대 대기 시간 (초, 기본={POR_BOOT_WAIT})')
-    parser.add_argument('--boot-sweep-s', type=float, default=10.0,
-                        help='connect() 직후 boot-phase PC 수집 창 (초, 기본=10.0, 0=비활성화)')
-    parser.add_argument('--por-poweroff-wait', type=float, default=POR_POWEROFF_WAIT,
-                        help=f'POR 전원 OFF 후 방전 대기 시간 (초, 기본={POR_POWEROFF_WAIT})')
 
     args = parser.parse_args()
 
@@ -9330,14 +9268,8 @@ if __name__ == "__main__":
                 if val not in excluded_opcodes:
                     excluded_opcodes.append(val)
 
-    # CLI에서 지정한 타임아웃으로 오버라이드
+    # NVMe 타임아웃 — 그룹별 조정은 코드 상단 NVME_TIMEOUTS 상수에서 직접 수정
     nvme_timeouts = NVME_TIMEOUTS.copy()
-    if args.timeout:
-        for group, ms in args.timeout:
-            if group not in nvme_timeouts:
-                parser.error(f"Unknown timeout group '{group}'. "
-                             f"Valid: {', '.join(nvme_timeouts.keys())}")
-            nvme_timeouts[group] = int(ms)
 
     # 활성화될 명령어 결정
     if args.commands:
@@ -9369,95 +9301,44 @@ if __name__ == "__main__":
     print("  - subprocess (nvme-cli) NVMe passthru")
     print("  - Global PC saturation (configurable) + idle PC detection")
     print("  - Per-execution prev_pc reset (no cross-execution false edges)")
-    print("  - Post-command delay sampling")
-    print("  - AFL++ havoc/splice mutation engine")
+    print("  - AFL++ havoc/splice mutation engine + MOpt scheduling")
     print("  - Per-opcode NVMe spec seed templates")
-    print("  - Per-command CFG graph generation")
-    print(f"  - [v4.5] Hit count bucketing (AFL++ log buckets)")
-    print(f"  - [v4.5] Calibration (runs={args.calibration_runs})")
-    print(f"  - [v4.5] Deterministic stage (arith_max={DETERMINISTIC_ARITH_MAX})")
-    print(f"  - [v4.5] MOpt mutation scheduling (pilot={MOPT_PILOT_PERIOD}, core={MOPT_CORE_PERIOD})")
-    print(f"  - [v4.6] io-passthru → namespace device (/dev/nvme0n1, deprecated ioctl 제거)")
-    passthru_days = args.passthru_timeout / 86_400_000
-    print(f"  - [v4.6] Passthru timeout={args.passthru_timeout}ms ({passthru_days:.1f}일, "
-          f"커널 reset 방지, subprocess 감지={NVME_TIMEOUTS.get('command', 8000)}ms)")
-    print(f"  - [v4.6] Crash 시 nvme-cli 프로세스 보존 (fd 유지 → SSD 상태 {passthru_days:.1f}일 보존)")
     print()
 
-    # --product → interface/cfg 자동 결정 (--openocd-config 명시 시 cfg만 우선)
+    # --product → interface/cfg 자동 결정
     if args.product is not None:
         _pcfg = PRODUCT_CONFIGS[args.product]
         resolved_interface = _pcfg['interface']
-        resolved_cfg = args.openocd_config if args.openocd_config else _pcfg['openocd_config']
+        resolved_cfg = _pcfg['openocd_config']
         print(f"Product={args.product}: interface={resolved_interface}, cfg={resolved_cfg}")
     else:
         resolved_interface = args.interface
-        if args.openocd_config is not None:
-            resolved_cfg = args.openocd_config
-        elif args.interface == 'jtag':
-            resolved_cfg = OPENOCD_CONFIG_JTAG
-        else:
-            resolved_cfg = OPENOCD_CONFIG
+        resolved_cfg = OPENOCD_CONFIG_JTAG if args.interface == 'jtag' else OPENOCD_CONFIG
 
     config = FuzzConfig(
-        openocd_binary=args.openocd_binary,
         openocd_config=resolved_cfg,
         interface=resolved_interface,
-        openocd_host=args.openocd_host,
-        openocd_port=args.openocd_port,
-        openocd_timeout=args.openocd_timeout,
         nvme_device=args.nvme,
         nvme_namespace=args.namespace,
-        nvme_lba_size=args.lba_size,
         nvme_timeouts=nvme_timeouts,
         enabled_commands=args.commands,
         all_commands=args.all_commands,
-        total_runtime_sec=args.runtime,
-        output_dir=args.output,
-        seed_dir=args.seed_dir,
-        max_samples_per_run=args.samples,
-        sample_interval_us=args.interval,
-        post_cmd_delay_ms=args.post_cmd_delay,
-        nvme_passthru_timeout_ms=args.passthru_timeout,
-        nvme_kernel_timeout_sec=args.kernel_timeout,
-        addr_range_start=args.addr_start,
-        addr_range_end=args.addr_end,
         resume_coverage=args.resume_coverage,
-        random_gen_ratio=args.random_gen_ratio,
         excluded_opcodes=excluded_opcodes,
-        admin_swap_prob=args.admin_swap_prob,
-        # v4.7
-        diagnose_stability=args.diagnose_stability,
-        diagnose_max=args.diagnose_max,
-        # v4.5
-        calibration_runs=args.calibration_runs,
-        # v4.7
+        # FW
         fw_bin=args.fw_bin,
         fw_xfer_size=args.fw_xfer,
         fw_slot=args.fw_slot,
-        # v5.1
+        # PM
         pm_inject_prob=1.0 if args.pm else 0.0,
         allow_no_openocd=args.allow_no_openocd,
-        pm_test_cycles=args.pm_test_cycles,
-        diagnose_sample_ms=args.diagnose_sleep_ms,
-        # v6.0 POR
+        # 토글
         enable_por=not args.no_por,
-        por_poweroff_wait=args.por_poweroff_wait,
-        por_boot_wait=args.por_boot_wait,
-        boot_sweep_s=args.boot_sweep_s,
         enable_ufas=not args.no_ufas,
+        enable_jlink_dump=not args.no_jlink_dump,
         state_enabled=not args.no_state,
         prefill=args.prefill,
         prefill_bs=args.prefill_bs,
-        pmu_script=args.pmu_script,
-        clkreq_assert_pin=args.clkreq_assert_pin,
-        clkreq_deassert_pin=args.clkreq_deassert_pin,
-        clkreq_voltage_mv=args.clkreq_voltage,
-        l1_settle_s=args.l1_settle,
-        l1_2_settle_s=args.l1_2_settle,
-        settle_sweep=args.settle_sweep,
-        settle_sweep_reps=args.settle_sweep_reps,
-        settle_sweep_values=[float(v) for v in args.settle_sweep_values.split(',')],
     )
 
     fuzzer = NVMeFuzzer(config)
