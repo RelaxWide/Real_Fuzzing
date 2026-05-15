@@ -525,9 +525,15 @@ CORPUS_EPOCH_SIZE      = 0      # Epoch 기반 corpus 리셋 주기 (0=비활성
 # Phase 3: builtin sequence 패턴 (명령 이름 리스트)
 # 비활성 명령이 포함된 시퀀스는 _valid_seqs 필터로 자동 제외됨
 # FWDownload→FWCommit: --all-commands 없이는 실행되지 않음
+# v7.5+: 기본 모드(NVME_COMMANDS_DEFAULT) 활성 시퀀스 추가 — 기본 명령어만으로 시퀀스 작동.
 BUILTIN_SEQUENCES: List[List[str]] = [
+    # 기본 모드 (Identify/GetLogPage/GetFeatures/SetFeatures/Read/Write)
+    ["Write", "Read"],                       # Write 후 동일 LBA Read — 데이터 일관성 경로
+    ["Write", "Write"],                      # 동일 LBA overwrite — 매핑/캐시 경로
+    ["SetFeatures", "GetFeatures"],          # feature config 회귀 경로
+    # Extended (Compare/FW*는 --commands 또는 --all-commands 필요)
     ["Write", "Compare"],
-    ["FWDownload", "FWCommit"],   # 잘못된 이미지에 대한 FW 에러 핸들링 경로 탐색
+    ["FWDownload", "FWCommit"],              # 잘못된 이미지에 대한 FW 에러 핸들링 경로 탐색
 ]
 
 PM_ROTATE_INTERVAL = 100   # 이 횟수마다 PS 상태 전환 (PS0→PS1→PS2→PS3→PS4→PS0...)
@@ -3356,18 +3362,25 @@ class NVMeFuzzer:
         CORPUS_EPOCH_SIZE > 0 일 때 매 epoch마다 호출됨.
         목적: 오래된 중복 시드가 selection 확률을 희석하는 현상 방지.
               에너지를 1/4로 감쇠시켜 완전 초기화 없이 fresh 스케줄링 유도.
+        v7.5+: SequenceSeed도 동일 규칙 적용 — favored가 아니면 epoch에서 제거.
         """
         if CORPUS_EPOCH_SIZE <= 0:
             return
         before = len(self.corpus)
+        # 제거 대상 추적 — SequenceSeed면 replay .sh 청소 필요
+        _removed_seqs = [s for s in self.corpus
+                         if isinstance(s, SequenceSeed)
+                         and not (s.is_favored or s.found_at == 0)]
         self.corpus = [s for s in self.corpus
-                       if s.is_favored or s.found_at == 0 or isinstance(s, SequenceSeed)]
+                       if s.is_favored or s.found_at == 0]
         for s in self.corpus:
             s.exec_count = max(1, s.exec_count // 4)
             s.energy = 1.0
         after = len(self.corpus)
         log.info(f"[Epoch] corpus reset: {before} → {after} "
                  f"(favored+initial 유지, energy 리셋, epoch={self.executions:,})")
+        for s in _removed_seqs:
+            self._remove_seq_replay_artifacts(s)
 
     def _cull_state_corpus(self):
         """state corpus 관리: 크기 제한 + 동일 bucket 중복 제거."""
@@ -3865,69 +3878,93 @@ class NVMeFuzzer:
     def _cull_corpus(self):
         """v4.3: AFL++ 방식 corpus culling (v4.5+: PC 주소 기반).
         각 PC에 대해 가장 작은 seed를 favored로 마킹하고,
-        favored가 아닌 seed 중 기여도 없는 것을 제거한다."""
+        favored가 아닌 seed 중 기여도 없는 것을 제거한다.
+        v7.5+: 2-pass favored 마킹.
+          Pass 1 — 단일 Seed만으로 PC → best(data 크기 기준) 매핑.
+          Pass 2 — 단일 Seed가 커버하지 못한 PC에 한해 SequenceSeed가 채움.
+        단일 Seed와 SequenceSeed가 동일 PC를 커버하면 항상 단일 Seed가 우선."""
         if len(self.corpus) <= 10:
             return
 
-        # 1) PC → best seed 매핑 (가장 작은 data 우선, Seed만 참여)
-        pc_best: dict[int, Seed] = {}
+        # Pass 1: 단일 Seed만으로 PC → best 매핑 (data 크기 기준)
+        pc_best: dict[int, object] = {}
         for seed in self.corpus:
-            if not isinstance(seed, Seed):
-                continue
-            if not seed.covered_pcs:
+            if not isinstance(seed, Seed) or not seed.covered_pcs:
                 continue
             for pc in seed.covered_pcs:
-                current = pc_best.get(pc)
-                if current is None or len(seed.data) < len(current.data):
+                cur = pc_best.get(pc)
+                if cur is None or len(seed.data) < len(cur.data):
                     pc_best[pc] = seed
 
-        # 2) favored 마킹
-        favored_seeds = set()
-        for seed in pc_best.values():
-            favored_seeds.add(id(seed))
+        # Pass 2: 단일 Seed가 없는 PC만 SequenceSeed가 채움
+        for seed in self.corpus:
+            if not isinstance(seed, SequenceSeed) or not seed.covered_pcs:
+                continue
+            for pc in seed.covered_pcs:
+                if pc not in pc_best:
+                    pc_best[pc] = seed
+
+        # favored 마킹
+        favored_seeds = {id(s) for s in pc_best.values()}
         for seed in self.corpus:
             seed.is_favored = id(seed) in favored_seeds
 
-        # 3) 제거 대상: favored 아님 + exec_count >= 2 + 기본 시드 아님 (found_at > 0)
-        # v4.5+: 임계값을 5→2로 낮춤. PC 샘플링 corpus는 false positive로 인해
-        # 매우 빠르게 팽창하므로 unfavored seed를 더 공격적으로 제거한다.
+        # 제거 대상: favored 아님 + exec_count >= 2 + 기본 시드 아님 (found_at > 0)
+        # SequenceSeed도 단일 Seed와 동일한 선택 압력 적용.
         before = len(self.corpus)
-        self.corpus = [
-            s for s in self.corpus
-            if s.is_favored or s.exec_count < 2 or s.found_at == 0
-            or isinstance(s, SequenceSeed)
-        ]
+        _to_remove = [s for s in self.corpus
+                      if not (s.is_favored or s.exec_count < 2 or s.found_at == 0)]
+        _removed_seq_set = {id(s) for s in _to_remove if isinstance(s, SequenceSeed)}
+        self.corpus = [s for s in self.corpus
+                       if s.is_favored or s.exec_count < 2 or s.found_at == 0]
         removed = before - len(self.corpus)
         if removed > 0:
             log.info(f"[Cull] corpus {before} → {len(self.corpus)} "
                      f"(-{removed}, favored={sum(1 for s in self.corpus if s.is_favored)})")
+        for s in _to_remove:
+            if isinstance(s, SequenceSeed):
+                self._remove_seq_replay_artifacts(s)
 
         # 4) 하드 상한: 상한 초과 시 exec_count가 높은 비선호 seed부터 강제 제거
+        # SequenceSeed도 일반 cull과 동일 규칙(favored/found_at) 보호.
+        # 그 외 SeqSeed는 단일 Seed와 동일하게 exec_count 내림차순으로 evict.
         hard_limit = self.config.max_corpus_hard_limit
         if hard_limit > 0 and len(self.corpus) > hard_limit:
             before_hard = len(self.corpus)
-            # 기본 시드(found_at==0)와 선호 시드는 보호, 나머지를 exec_count 내림차순 정렬 후 삭제
-            # SequenceSeed는 별도 MAX_SEQUENCE_CORPUS cap으로 관리하므로 여기서는 일반 취급
             protected = [s for s in self.corpus if s.found_at == 0 or s.is_favored]
             evictable = sorted(
                 [s for s in self.corpus if s.found_at > 0 and not s.is_favored],
                 key=lambda s: s.exec_count, reverse=True
             )
             keep = max(0, hard_limit - len(protected))
+            kept_ids = {id(s) for s in protected + evictable[:keep]}
+            _evicted = [s for s in self.corpus if id(s) not in kept_ids]
             self.corpus = protected + evictable[:keep]
             log.info(f"[Cull] Hard limit {hard_limit}: corpus {before_hard} → {len(self.corpus)}")
+            for s in _evicted:
+                if isinstance(s, SequenceSeed):
+                    self._remove_seq_replay_artifacts(s)
 
-        # 5) SequenceSeed 별도 상한: new_pcs 낮은 것부터 제거
+        # 5) SequenceSeed 별도 상한: (favored, new_pcs) 내림차순으로 상위 N개 보존
+        # favored인 SeqSeed는 단일 Seed가 도달 못한 PC를 가진 것 — 우선 보존.
+        # 동일 favored 등급 내에서는 new_pcs가 큰 것 우선.
         _seq_seeds = [s for s in self.corpus if isinstance(s, SequenceSeed)]
         if len(_seq_seeds) > MAX_SEQUENCE_CORPUS:
-            _keep_seqs = set(id(s) for s in sorted(
-                _seq_seeds, key=lambda s: s.new_pcs, reverse=True
-            )[:MAX_SEQUENCE_CORPUS])
+            _keep_list = sorted(
+                _seq_seeds,
+                key=lambda s: (s.is_favored, s.new_pcs),
+                reverse=True
+            )[:MAX_SEQUENCE_CORPUS]
+            _keep_ids = {id(s) for s in _keep_list}
+            _seq_evicted = [s for s in _seq_seeds if id(s) not in _keep_ids]
             before_seq = len(self.corpus)
             self.corpus = [s for s in self.corpus
-                           if not isinstance(s, SequenceSeed) or id(s) in _keep_seqs]
+                           if not isinstance(s, SequenceSeed) or id(s) in _keep_ids]
             log.info(f"[Cull] SeqSeed cap {MAX_SEQUENCE_CORPUS}: "
-                     f"corpus {before_seq} → {len(self.corpus)}")
+                     f"corpus {before_seq} → {len(self.corpus)} "
+                     f"(favored 우선)")
+            for s in _seq_evicted:
+                self._remove_seq_replay_artifacts(s)
 
     # AFL++ Mutation Engine
 
@@ -4146,8 +4183,13 @@ class NVMeFuzzer:
             self._mdts_cache_at = self.executions
         return self._mdts_cache
 
-    # 공유 컨텍스트가 필요한 시퀀스 (첫 번째 명령 기준)
-    _CTX_SEQUENCES: frozenset = frozenset([("Write", "Compare")])
+    # 공유 컨텍스트가 필요한 시퀀스 — 첫 명령 mutation 결과의 SLBA/NLB/data를 후속 명령에 적용.
+    # _apply_seq_ctx 는 LBA/NLB/data만 다루므로 Read/Write/Compare 계열에 한정.
+    _CTX_SEQUENCES: frozenset = frozenset([
+        ("Write", "Compare"),
+        ("Write", "Read"),
+        ("Write", "Write"),
+    ])
 
     def _pick_seq_seed(self, cmd_name: str,
                        ctx: Optional[dict] = None) -> 'Seed':
@@ -6548,6 +6590,19 @@ class NVMeFuzzer:
             log.debug(f"[SeqSeed] replay .sh 생성 실패: {e}")
         finally:
             self._cmd_history = orig
+
+    def _remove_seq_replay_artifacts(self, seq_seed: 'SequenceSeed') -> None:
+        """cull로 제거되는 SequenceSeed의 replay .sh 와 data 폴더 제거 (디스크 누수 방지)."""
+        tag = f"seq_{seq_seed.found_at}"
+        sh_path  = self.seq_corpus_dir / f"replay_{tag}.sh"
+        data_dir = self.seq_corpus_dir / f"replay_data_{tag}"
+        try:
+            if sh_path.exists():
+                sh_path.unlink()
+            if data_dir.exists():
+                shutil.rmtree(data_dir, ignore_errors=True)
+        except Exception as e:
+            log.debug(f"[SeqCull] artifact 제거 실패 {tag}: {e}")
 
     def _finalize_seq_sink(self) -> None:
         """_seq_sink에 누적된 시퀀스를 SequenceSeed로 corpus에 추가하고 replay .sh 저장.
