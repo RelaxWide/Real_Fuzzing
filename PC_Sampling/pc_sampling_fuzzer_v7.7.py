@@ -4981,14 +4981,23 @@ class NVMeFuzzer:
             return False
         return True
 
-    def _pm_perturb_clkreq(self) -> bool:
+    def _pm_perturb_clkreq(self, mode: Optional[str] = None) -> bool:
         """CLKREQ# timing perturbation (S2).
-        4개 mode (missed_wake / extended_wait / short_pulse / rapid_toggle) 중 1개 random.
+        4개 mode (missed_wake / extended_wait / short_pulse / rapid_toggle) 중 선택.
+        mode=None: 4 mode 중 1개 random (PM rotation 기본 호출).
+        mode='<name>': 명시된 mode 강제 (preflight 등 결정적 호출).
         일회성 timing 이벤트 — 다음 rotation 까지 별도 상태 유지 없음.
         """
         if not CLKREQ_FUZZ_MODES:
             return False
-        mode_name, params = random.choice(CLKREQ_FUZZ_MODES)
+        if mode is None:
+            mode_name, params = random.choice(CLKREQ_FUZZ_MODES)
+        else:
+            _entry = next(((m, p) for m, p in CLKREQ_FUZZ_MODES if m == mode), None)
+            if _entry is None:
+                log.warning(f"[PM] CLKREQ# mode {mode!r} 미정의 — 스킵")
+                return False
+            mode_name, params = _entry
 
         # replay .sh 재현 시 필요한 PMU 정보 (entry 마다 동일)
         pmu_ctx = {
@@ -5971,6 +5980,120 @@ class NVMeFuzzer:
 
         # 실패 조합이 있어도 fuzzing 계속 (abort하지 않음)
         return True
+
+    def _pm_preflight_s1_s2(self) -> bool:
+        """v7.7 S1/S2 preflight — 모든 PCIE_PM_FUZZ_TARGETS 비트 + CLKREQ_FUZZ_MODES
+        를 1회씩 결정적으로 적용하여 NVMe 응답성 검증.
+        POWER_COMBOS preflight 직후 호출. 실패해도 fuzzing 계속.
+        """
+        if not self._pcie_bdf or self._pcie_cap_offset is None:
+            log.warning("[PM-Preflight S1/S2] PCIe BDF/cap 미탐지 — 스킵")
+            return True
+
+        log.warning("=" * 60)
+        log.warning(f"[PM-Preflight S1/S2] PCIe bit {len(PCIE_PM_FUZZ_TARGETS)}개 + "
+                    f"CLKREQ# {len(CLKREQ_FUZZ_MODES)}개 검증 시작")
+        log.warning("=" * 60)
+
+        results: list = []   # (label, status, elapsed) — status ∈ {'OK','FAIL','SKIP'}
+        PROBE_TIMEOUT = 5.0
+
+        def _nvme_alive() -> bool:
+            """NVMe id-ctrl 로 controller 응답성 확인."""
+            try:
+                r = subprocess.run(
+                    ['nvme', 'id-ctrl', self.config.nvme_device],
+                    timeout=PROBE_TIMEOUT,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return r.returncode == 0
+            except Exception:
+                return False
+
+        # ── S1: PCIe config bit 13개 ──────────────────────────────────────
+        for i, target in enumerate(PCIE_PM_FUZZ_TARGETS):
+            cap_name, off_in_cap, bit_lo, bit_w, name, constraint = target
+            label = f"{cap_name}.{name}"
+            log.warning(f"  S1 [{i+1:2d}/{len(PCIE_PM_FUZZ_TARGETS)}] {label}")
+            t0 = time.monotonic()
+            status = 'FAIL'
+
+            try:
+                if constraint == 'forced_one_shot':
+                    # PMCSR D1/D2 forced slot — 진입 + 50ms + D0 복귀 자체 검증.
+                    ok_p = self._pm_perturb_pmcsr_forced()
+                    status = 'OK' if (ok_p and _nvme_alive()) else 'FAIL'
+                else:
+                    cap_base = self._pm_perturb_target_cap_offset(cap_name)
+                    if cap_base is None:
+                        status = 'SKIP'
+                        log.warning(f"    → cap {cap_name!r} 미탐지, 스킵")
+                    else:
+                        abs_offset = cap_base + off_in_cap
+                        width = 'l' if cap_name == 'l1ss' else 'w'
+                        max_val = (1 << bit_w) - 1
+                        # constraint 가 range dict 이면 max 적용, 아니면 전체 비트
+                        if isinstance(constraint, dict):
+                            hi = constraint.get('max', max_val)
+                            test_val = hi & max_val
+                        else:
+                            test_val = max_val   # stress: 해당 필드 전체 1
+                        mask = max_val << bit_lo
+                        orig = self._setpci_read(self._pcie_bdf, abs_offset, width)
+                        if orig is None:
+                            status = 'SKIP'
+                            log.warning("    → setpci_read 실패, 스킵")
+                        else:
+                            ok_w = self._setpci_write(
+                                self._pcie_bdf, abs_offset,
+                                (test_val << bit_lo) & mask, mask, width)
+                            ok_alive = _nvme_alive() if ok_w else False
+                            # 원복 — perturb 후 baseline 영향 없게.
+                            self._setpci_write(
+                                self._pcie_bdf, abs_offset,
+                                orig & mask, mask, width)
+                            status = 'OK' if (ok_w and ok_alive) else 'FAIL'
+            except Exception as e:
+                log.warning(f"    → 예외: {e}")
+
+            elapsed = time.monotonic() - t0
+            results.append(('S1', label, status, elapsed))
+            log.warning(f"    → {status}  ({elapsed:.2f}s)")
+
+        # ── S2: CLKREQ# timing 4 mode ─────────────────────────────────────
+        for i, (mode_name, _params) in enumerate(CLKREQ_FUZZ_MODES):
+            log.warning(f"  S2 [{i+1}/{len(CLKREQ_FUZZ_MODES)}] CLKREQ# {mode_name}")
+            t0 = time.monotonic()
+            status = 'FAIL'
+            try:
+                ok_p = self._pm_perturb_clkreq(mode=mode_name)
+                status = 'OK' if (ok_p and _nvme_alive()) else 'FAIL'
+            except Exception as e:
+                log.warning(f"    → 예외: {e}")
+            elapsed = time.monotonic() - t0
+            results.append(('S2', f'clkreq.{mode_name}', status, elapsed))
+            log.warning(f"    → {status}  ({elapsed:.2f}s)")
+
+        # 결과 요약
+        log.warning("=" * 60)
+        log.warning("[PM-Preflight S1/S2] 결과 요약")
+        log.warning(f"  {'Kind':<4} {'Target':<28} {'Status':>6} {'Time':>7}")
+        log.warning("  " + "-" * 60)
+        n_ok = n_fail = n_skip = 0
+        for kind, label, status, elapsed in results:
+            mark = {'OK':'✓', 'FAIL':'✗', 'SKIP':'-'}.get(status, '?')
+            log.warning(f"  {kind:<4} {label:<28} {status:>6} {elapsed:>6.2f}s  {mark}")
+            if status == 'OK':   n_ok   += 1
+            elif status == 'FAIL': n_fail += 1
+            else:                  n_skip += 1
+        log.warning("  " + "-" * 60)
+        log.warning(f"[PM-Preflight S1/S2] OK={n_ok}  FAIL={n_fail}  SKIP={n_skip}  "
+                    f"(total {len(results)})")
+        if n_fail > 0:
+            log.warning("[PM-Preflight S1/S2] 실패 항목은 퍼징 중 attribution 어려울 수 있음 — 확인 권장")
+        else:
+            log.warning("[PM-Preflight S1/S2] 모든 perturbation 정상 — S1/S2 준비 완료")
+        log.warning("=" * 60)
+        return n_fail == 0
 
     def _send_nvme_command(self, data: bytes, seed: Seed,
                            record_history: bool = True) -> int:
@@ -8328,6 +8451,9 @@ class NVMeFuzzer:
         if not preflight_ok:
             log.warning("[PM-Test] PM preflight에서 실패 조합이 감지되었습니다.")
 
+        # v7.7: S1/S2 perturbation preflight — POWER_COMBOS 검증 직후 실행
+        self._pm_preflight_s1_s2()
+
         if self.config.pm_test_cycles <= 0:
             log.warning("[PM-Test] 추가 cycle 없음 (--pm-test-cycles N 으로 활성화)")
             return
@@ -8713,6 +8839,10 @@ class NVMeFuzzer:
         # PM preflight: idle 유니버스 수집 전에 전체 PowerCombo 검증.
         # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
         self._pm_preflight_check()
+
+        # v7.7: S1/S2 perturbation preflight — PCIe bit + CLKREQ# 1회씩 검증.
+        if self.config.pm_inject_prob > 0:
+            self._pm_preflight_s1_s2()
 
         # J-Link PC 읽기 진단 + idle PC 감지
         if not self.sampler.diagnose():
