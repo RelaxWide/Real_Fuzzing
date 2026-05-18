@@ -6480,12 +6480,18 @@ class NVMeFuzzer:
             log.warning("[JLINK DUMP] 실행 권한 없음 (chmod +x 필요) — 건너뜀")
             return
 
-        cmd = ['bash', sh_path]
-        log.warning(f"[JLINK DUMP] 실행: {sh_path}")
+        # 시분초까지 포함된 timestamp 를 env var + argv 양쪽으로 전달.
+        # shell script 측에서 ${DUMP_TIMESTAMP} 또는 "$1" 으로 받아 dump 파일명에 반영하면
+        # 동일 일자 다중 crash 시 파일 덮어쓰기 방지.
+        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        cmd = ['bash', sh_path, ts_str]
+        env = os.environ.copy()
+        env['DUMP_TIMESTAMP'] = ts_str
+        log.warning(f"[JLINK DUMP] 실행: {sh_path} (DUMP_TIMESTAMP={ts_str})")
 
         try:
             proc = subprocess.Popen(
-                cmd, cwd=script_dir,
+                cmd, cwd=script_dir, env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
             )
@@ -6573,8 +6579,9 @@ class NVMeFuzzer:
         if pcie_bus is None:
             return
 
-        date_str = datetime.now().strftime('%Y%m%d')
-        dump_filename = f"{date_str}_UFAS_Dump.bin"
+        # 시분초까지 포함 — 동일 일자 다중 crash 시 파일 덮어쓰기 방지
+        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        dump_filename = f"{ts_str}_UFAS_Dump.bin"
         dump_path = os.path.join(script_dir, dump_filename)
 
         cmd = ['sudo', ufas_path, pcie_bus, '1', dump_path, '--ini=PM9M1_A815.ini']
