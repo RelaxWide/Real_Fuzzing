@@ -16,14 +16,15 @@ v7.5에서 도입된 SequenceSeed corpus / ctx 모드(full / lba_nlb) / 2-pass f
 4. [v7.5 변경사항](#v75-변경사항)
 5. [SequenceSeed corpus](#sequenceseed-corpus)
 6. [Builtin sequence](#builtin-sequence)
-7. [CSFuzz / State-Aware Fuzzer](#csfuzz--state-aware-fuzzer)
-8. [Power Management](#power-management)
-9. [JTAG 지원 (BM9H1)](#jtag-지원-bm9h1)
-10. [Defect 처리](#defect-처리)
-11. [주요 상수](#주요-상수)
-12. [CLI 옵션 (19개)](#cli-옵션-19개)
-13. [출력 디렉터리](#출력-디렉터리)
-14. [버전 이력](#버전-이력)
+7. [Mutation 전략](#mutation-전략)
+8. [CSFuzz / State-Aware Fuzzer](#csfuzz--state-aware-fuzzer)
+9. [Power Management](#power-management)
+10. [JTAG 지원 (BM9H1)](#jtag-지원-bm9h1)
+11. [Defect 처리](#defect-처리)
+12. [주요 상수](#주요-상수)
+13. [CLI 옵션 (19개)](#cli-옵션-19개)
+14. [출력 디렉터리](#출력-디렉터리)
+15. [버전 이력](#버전-이력)
 
 ---
 
@@ -260,6 +261,206 @@ seed.nsid_override   = None
 CDW12 상위 비트(FUA, PRINFO 등)와 CDW13~15 mutation은 살아있음.
 
 `lba_nlb` 모드에서 두 번째 명령의 `data_len_override` mutation이 ctx의 NLB와 불일치하면 declared/actual size mismatch가 발생 — **의도된 경계 fuzzing** (FTL의 size 검증 경로 탐색).
+
+---
+
+## Mutation 전략
+
+v7.6에서 사용되는 모든 mutation 대상·방법·확률 정리.
+
+### Mutation 대상 (Seed 필드별)
+
+| 필드 | 타입 | 의미 | 변형 방법 |
+|------|------|------|----------|
+| `seed.data` | `bytes` | host buffer / payload | havoc 16 op (`_mutate_bytes`) + splice |
+| `seed.cdw2`, `cdw3` | `uint32` | metadata pointer 등 | CDW mutation (random op 6종) |
+| `seed.cdw10` ~ `cdw15` | `uint32 × 6` | 명령별 파라미터 (SLBA/NLB/FID/CNS 등) | CDW + schema (필드 단위) + Phase 1/2 |
+| `seed.opcode_override` | `uint8 \| None` | opcode 강제 (디스패치 테이블 탐색) | `_mutate` `[1]` |
+| `seed.nsid_override` | `uint32 \| None` | NSID 강제 (오류 핸들링 경로) | `_mutate` `[2]` |
+| `seed.force_admin` | `bool \| None` | passthru 타입 강제 (admin↔io 교차) | `_mutate` `[3]` |
+| `seed.data_len_override` | `int \| None` | 전송 크기 declared 강제 (NLB/cmd 추론 무시) | `_mutate` `[4]`, Phase 1 NLB/MDTS |
+
+### Pipeline (`_mutate(seed)` 적용 순서)
+
+```
+1. Splice (15%)              — 다른 corpus Seed와 임의 split 지점 합성
+2. Havoc (_mutate_bytes)     — 2^(1~7) = 2~128회 스택 mutation, MOpt 16 op
+3. CDW 필드 변형 (30%)        — 1~3개 cdw 필드 무작위 선택, _mutate_cdw 적용
+4. 확장 mutation 7개 (각 독립 확률, 누적 적용 가능):
+   [1] opcode_override        OPCODE_MUT_PROB        = 10%
+   [2] nsid_override          NSID_MUT_PROB          = 10%
+   [3] admin↔io swap          ADMIN_SWAP_PROB        =  5%
+   [4] data_len_override      DATALEN_MUT_PROB       =  8%   (NLB/MDTS boundary 우선)
+   [5] schema-guided CDW      SCHEMA_MUT_PROB        = 30%
+   [6] 64-bit LBA pair        LBA_PAIR_MUT_PROB      = 15%   (Read/Write/Compare/Verify/Copy)
+   [7] DSM/Copy structured    STRUCT_PAYLOAD_MUT_PROB= 10%   (DSM/Copy 한정)
+```
+
+### Havoc operators (16개, MOpt 선택)
+
+| # | Operator | 동작 | 제약 |
+|---|----------|------|------|
+| 0 | `bitflip1` | 1 byte의 1 bit XOR | — |
+| 1 | `int8` | 1 byte에 interesting_8 대입 | — |
+| 2 | `int16` | 2 byte에 interesting_8/16 대입 (LE/BE 50:50) | len≥2 |
+| 3 | `int32` | 4 byte에 interesting_8/16/32 대입 (LE/BE) | len≥4 |
+| 4 | `arith8` | 1 byte ± `random(1, 35)` | — |
+| 5 | `arith16` | 2 byte ± delta (LE/BE) | len≥2 |
+| 6 | `arith32` | 4 byte ± delta (LE/BE) | len≥4 |
+| 7 | `randbyte` | 1 byte 완전 랜덤 | — |
+| 8 | `byteswap` | 2 byte 위치 교환 | len≥2 |
+| 9 | `delete` | 1~len/4 byte 삭제 | len>1 |
+| 10 | `insert` | 1~min(128, len/4) byte 삽입 (clone/random 50:50) | — |
+| 11 | `overwrite` | 1~min(128, len/4) byte 덮어쓰기 (clone/random) | len≥2 |
+| 12 | `splice` | 다른 corpus Seed와 chunk 교차 | corpus≥2, len≥4 |
+| 13 | `shuffle` | 2~16 byte 범위 in-place 셔플 | len≥2 |
+| 14 | `blockfill` | 1~32 byte를 `0x00`/`0xFF`/`0x41`/`0x20`/random 으로 채움 | — |
+| 15 | `asciiint` | 8 byte에 ASCII 숫자 (`-1`, `0x7FFFFFFF` 등) 삽입 | len≥8 |
+
+**AFL++ Interesting 상수**:
+- `INT_8`  = `[-128, -1, 0, 1, 16, 32, 64, 100, 127]`
+- `INT_16` = `[-32768, -129, 128, 255, 256, 512, 1000, 1024, 4096, 32767]`
+- `INT_32` = `[-2147483648, -100663046, -32769, 32768, 65535, 65536, 100663045, 2147483647]`
+- `ARITH_MAX` = `35`
+
+### MOpt (Mutation Operator Pilot)
+
+- **Pilot 단계** (5000 iter): 16 operator 균등 확률
+- **Core 단계** (50000 iter): `finds[i]/uses[i]` 비율로 정규화된 가중치 적용
+- 사이클: `pilot → core → 통계 리셋 → pilot ...`
+- 최소 확률 `0.01 / 16` 보장 (operator 완전 0 방지)
+
+### `_mutate_cdw(value)` — CDW 32-bit 변형 (6종 중 1개)
+
+- bitflip 1~4 bits
+- arith ±1~35
+- random interesting (`INT_8` ∪ `INT_16` ∪ `INT_32`)
+- 완전 random 32-bit
+- byte-level (32비트 중 랜덤 1 byte만 교체)
+- endian swap (32-bit 또는 16-bit halves)
+
+### Deterministic stage (`DET_BUDGET = 20%`)
+
+새 coverage 발견 시드만 `_det_queue`에 등록. iteration의 20%에서 generator 1개씩 소비.
+
+| Phase | 동작 | 대상 | 발화 수 (per seed) |
+|-------|------|------|------------------|
+| 1 | Walking bitflip | cdw10~cdw15 (cdw13~15는 0이면 skip) | 최대 32 × 6 = 192 |
+| 2 | Arith ±1~10 | 동일 | 20 × 6 = 120 |
+| 3 | Interesting 32-bit (8개 값) | 동일 | 8 × 6 = 48 |
+| 4 | Byte-position interesting 8-bit | 4 byte × `INT_8` 9개 | 36 × 6 = 216 |
+
+DET_BUDGET 도입 전엔 det queue 우선 소비로 단일 명령 ~400회 전용 실행이 연속 발생하던 다양성 편향 문제를 해결.
+
+### Schema-guided CDW mutation (`SCHEMA_MUT_PROB = 30%`)
+
+각 명령의 `CMD_SCHEMAS` 사전에서 CDW 필드 무작위 선택. 8가지 FieldType별 generation:
+
+| FieldType | 후보 |
+|-----------|------|
+| `ENUM` | valid list ∪ (옵션) reserved 범위 random ∪ vendor 범위 random |
+| `LBA` | `0, 1, nsze-2, nsze-1, nsze, nsze+1, 0xFFFF, 0xFFFFFFFF, random(0, nsze)` |
+| `LBA_CNT` | `0, 1, 7, 0xFF, 0xFFFF, 0xFFFFFFFF, random(0, 0xFFFF)` |
+| `FLAGS` | valid list 또는 비트 너비 mask 안에서 random |
+| `SIZE_DW` | `0, 1, 0x7F, 0xFF, 0x3FF, 0x7FF, 0xFFFF, random` |
+| `OFFSET_DW` | `0, 1, 0x100, 0x1000, 0xFFFF, 0xFFFFFFFF, random(0, 0xFFFFFF)` |
+| `SLOT` | `0, 1, max_val, max_val+1, random` |
+| `OPAQUE` | 비트 너비 mask 안에서 `_mutate_cdw(0)` |
+
+42 commands × ~150 fields 정의 (`CMD_SCHEMAS`).
+
+### Phase 1 — `data_len_override` (NLB/MDTS boundary, 8%)
+
+Write/Read/Compare 한정. 다음 후보 풀에서 random.choice 후 `mutation_stats["datalen_nlb"]` / `datalen_mdts` 출처별 집계:
+
+| 출처 | 후보 |
+|------|------|
+| **NLB-relative** | `expected = (NLB+1) × LBA_size`, `[expected-1, expected, expected+1, expected+PAGE_SIZE]` |
+| **MDTS boundary** | `max_bytes = (1 << mdts) × PAGE_SIZE`, `[max-1, max, max+1]` (mdts > 0 시) |
+| **Static fallback** | `[0, 4, 64, 512, 4096, 8192, 65536, random(1, 2MB)]` |
+
+캐시: `_get_mdts()`는 `nvme id-ctrl`에서 5000 exec마다 갱신.
+
+### Phase 2 — 64-bit LBA pair (15%)
+
+대상: Read / Write / Compare / Verify / Copy. cdw10+cdw11을 64-bit SLBA 단일 단위로 변이.
+
+```
+SLBA 후보: 0, 1, nsze-2, nsze-1, nsze, nsze+1,
+           0xFFFFFFFF, 0x100000000 (cdw10=0, cdw11=1 — high dword 경로),
+           random(0, nsze)
+
+cdw10 = slba & 0xFFFFFFFF
+cdw11 = (slba >> 32) & 0xFFFFFFFF
+```
+
+캐시: `_get_nsze()`는 `nvme id-ns`에서 5000 exec마다 갱신.
+
+### Phase 2 — DSM / Copy structured payload (10%)
+
+`CDW` 선언과 payload 크기가 연동되는 두 명령에 한해, 4가지 경계 케이스로 재구성. `data_len_override`는 이때 None으로 리셋되어 mutation 잔존 mismatch 제거.
+
+#### DatasetManagement (`CDW10[7:0] = NR`, payload = `(NR+1) × 16B` range entry)
+
+| mut_type | NR (declared) | payload | 의도 |
+|---|---|---|---|
+| 0 | 0 | 1 entry (16B) | 정상 단일 |
+| 1 | 255 | 256 entries (4096B) | 최대 정상 |
+| 2 | 255 (declared) | 1 entry (16B) | declared/actual mismatch (underflow) |
+| 3 | 0 | empty (`b''`) | NR=0 + zero payload |
+
+각 entry: `Context Attrs(4B) + LBA Count(4B) + SLBA(8B)`, LBA Count/SLBA는 nsze 경계 후보.
+
+#### Copy (`CDW12[11:8] = NR` 4-bit, `CDW10/11 = dest SLBA`, payload = `(NR+1) × 32B` source range)
+
+| mut_type | NR | payload | dest SLBA |
+|---|---|---|---|
+| 0 | 0 | 1 entry (32B) | 경계값 |
+| 1 | 3 | 4 entries (128B) | 경계값 |
+| 2 | 3 (declared) | 1 entry (32B) | declared mismatch |
+| 3 | 0 | empty | 경계값 |
+
+각 entry: `SLBA(8) + NLB(2) + RSVD(2) + EILBRT(4) + ELBATM(2) + ELBAT(2) + RSVD(12) = 32B`.
+
+### Phase 3 — Sequence (5%, max 10/100-window)
+
+상세는 [Builtin sequence](#builtin-sequence) 참조. 요약:
+
+| 시퀀스 | ctx 모드 | 의미 |
+|--------|---------|------|
+| `Write → Read` | `full` | Read가 Write 결과 LBA/data 회수 |
+| `Write → Write` | `lba_nlb` | 동일 LBA 다른 data overwrite (FTL 매핑) |
+| `Write → Compare` | `full` | data 일관성 검증 (Compare 필요) |
+| `FWDownload → FWCommit` | — | FW 에러 핸들링 (`--all-commands` 필요) |
+
+### 입력 소스 (mutation 발화 전 단계, 시드 선택 순위)
+
+| 소스 | 빈도 | 설명 |
+|------|------|------|
+| `[3a]` corpus SequenceSeed continuation | 시퀀스 진행 중 | 이전 iteration 시작된 시퀀스 다음 명령 |
+| `[3b]` builtin sequence continuation | 시퀀스 진행 중 | 이전 iteration 시작된 builtin 다음 명령 |
+| `[3c]` 신규 builtin sequence | `SEQ_PROB = 5%` | 새 시퀀스 시작 |
+| CSFuzz C2 state replay | `p` 확률 | `state_corpus`의 100-명령 시퀀스 전체 replay |
+| 일반 corpus mutation | `1 - random_gen_ratio = 80%` | `_select_seed()` 가중치 + `_mutate()` |
+| 완전 랜덤 생성 | `random_gen_ratio = 20%` | `os.urandom(64~512)` + 랜덤 명령 |
+
+### 통계 키 (`mutation_stats`)
+
+| 키 | 의미 |
+|----|------|
+| `corpus_mutated` | corpus seed mutation 횟수 |
+| `random_gen` | 완전 랜덤 생성 횟수 |
+| `opcode_override` | opcode mutation 적용 |
+| `nsid_override` | NSID mutation 적용 |
+| `force_admin_swap` | admin↔io swap |
+| `data_len_override` | data_len mutation |
+| `datalen_nlb` / `datalen_mdts` | data_len 출처별 |
+| `schema_field` | schema-guided field |
+| `lba_pair_64bit` | 64-bit LBA pair |
+| `dsm_structured` / `copy_structured` | structured payload |
+| `seq_builtin` | sequence 모드로 발행된 명령 누적 |
+
+종료 summary 텍스트 + `mutation_chart.png` (3 subplot: MOpt efficiency / uses+finds / source 분포) 에서 시각화.
 
 ---
 
