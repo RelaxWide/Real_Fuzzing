@@ -989,6 +989,25 @@ class _FuzzingTerminalFilter(logging.Filter):
             return True
         return bool(self._ALLOW.search(record.getMessage()))
 
+def _setup_matplotlib_chart_env():
+    """차트 생성용 matplotlib 환경 — ASCII 폰트 고정 + glyph missing 경고 억제.
+
+    한글 폰트가 시스템에 없거나 matplotlib 기본 폰트(DejaVu Sans)에 없을 때 발생하는
+    'Glyph N missing from current font' UserWarning과 깨진 글자 출력을 방지한다.
+
+    rcParams는 process-global이라 호출 1회만으로 충분하지만, 차트 함수가 각자 lazy
+    import 패턴이라 모든 사이트에서 호출하여 idempotent 안전성 확보.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    matplotlib.rcParams['font.family']        = 'DejaVu Sans'
+    matplotlib.rcParams['font.sans-serif']    = ['DejaVu Sans']
+    matplotlib.rcParams['axes.unicode_minus'] = False
+    import warnings
+    warnings.filterwarnings(
+        'ignore', message=r'.*missing from (current )?font.*')
+
+
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     """파일 + 콘솔 동시 로깅 설정 (실행마다 날짜시간 로그 파일 생성)"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -6974,8 +6993,7 @@ class NVMeFuzzer:
         개별 unknown opcode hit 통계는 _format_unknown_opcode_summary()에서 텍스트로 별도 보고.
         """
         try:
-            import matplotlib
-            matplotlib.use('Agg')
+            _setup_matplotlib_chart_env()
             import matplotlib.pyplot as plt
         except ImportError:
             log.warning("[Graph] matplotlib 미설치 — 비교 차트 생략. "
@@ -7107,8 +7125,7 @@ class NVMeFuzzer:
             return
 
         try:
-            import matplotlib
-            matplotlib.use('Agg')
+            _setup_matplotlib_chart_env()
             import matplotlib.pyplot as plt
             import matplotlib.patches as mpatches
         except ImportError:
@@ -7223,8 +7240,8 @@ class NVMeFuzzer:
                 )
                 ax_bot.set_ylabel('New BB %\nper window', fontsize=8)
                 ax_bot.set_title(
-                    'Coverage velocity — window별 새로 발견한 BB 비율 '
-                    '(0 ≈ 포화)',
+                    'Coverage velocity — new BB % discovered per window '
+                    '(0 = saturated)',
                     fontsize=9, loc='left', pad=2)
                 ax_bot.axhline(0, color='gray', linewidth=0.6)
                 ax_bot.grid(True, alpha=0.25)
@@ -7494,8 +7511,7 @@ class NVMeFuzzer:
     def _generate_heatmaps(self):
         """1D 주소 커버리지 히트맵 + 2D edge 히트맵 생성"""
         try:
-            import matplotlib
-            matplotlib.use('Agg')
+            _setup_matplotlib_chart_env()
             import matplotlib.pyplot as plt
             import numpy as np
         except ImportError:
@@ -7586,8 +7602,7 @@ class NVMeFuzzer:
     def _generate_mutation_chart(self):
         """MOpt operator 효율 + 입력 소스 분포 차트 생성 → graphs/mutation_chart.png"""
         try:
-            import matplotlib
-            matplotlib.use('Agg')
+            _setup_matplotlib_chart_env()
             import matplotlib.pyplot as plt
             import numpy as np
         except ImportError:
@@ -7745,8 +7760,7 @@ class NVMeFuzzer:
             return
 
         try:
-            import matplotlib
-            matplotlib.use('Agg')
+            _setup_matplotlib_chart_env()
             import matplotlib.pyplot as plt
         except ImportError:
             log.warning("[CSFuzzViz] matplotlib 미설치 — csfuzz 동역학 그래프 생략")
