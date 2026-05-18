@@ -14,17 +14,18 @@ v7.5에서 도입된 SequenceSeed corpus / ctx 모드(full / lba_nlb) / 2-pass f
 2. [요구사항 / 빠른 시작](#요구사항--빠른-시작)
 3. [v7.6 변경사항](#v76-변경사항)
 4. [v7.5 변경사항](#v75-변경사항)
-5. [SequenceSeed corpus](#sequenceseed-corpus)
-6. [Builtin sequence](#builtin-sequence)
-7. [Mutation 전략](#mutation-전략)
-8. [CSFuzz / State-Aware Fuzzer](#csfuzz--state-aware-fuzzer)
-9. [Power Management](#power-management)
-10. [JTAG 지원 (BM9H1)](#jtag-지원-bm9h1)
-11. [Defect 처리](#defect-처리)
-12. [주요 상수](#주요-상수)
-13. [CLI 옵션 (19개)](#cli-옵션-19개)
-14. [출력 디렉터리](#출력-디렉터리)
-15. [버전 이력](#버전-이력)
+5. [시드 (Seed)](#시드-seed)
+6. [SequenceSeed corpus](#sequenceseed-corpus)
+7. [Builtin sequence](#builtin-sequence)
+8. [Mutation 전략](#mutation-전략)
+9. [CSFuzz / State-Aware Fuzzer](#csfuzz--state-aware-fuzzer)
+10. [Power Management](#power-management)
+11. [JTAG 지원 (BM9H1)](#jtag-지원-bm9h1)
+12. [Defect 처리](#defect-처리)
+13. [주요 상수](#주요-상수)
+14. [CLI 옵션 (19개)](#cli-옵션-19개)
+15. [출력 디렉터리](#출력-디렉터리)
+16. [버전 이력](#버전-이력)
 
 ---
 
@@ -176,6 +177,120 @@ BUILTIN_SEQUENCES = [
 
 ---
 
+## 시드 (Seed)
+
+### Seed dataclass (단일 명령)
+
+```python
+@dataclass
+class Seed:
+    data: bytes                          # host buffer / payload
+    cmd: NVMeCommand                     # name, opcode, type(Admin/IO), needs_data, weight
+    cdw2: int = 0;  cdw3: int = 0        # NVMe CDW2/3 (metadata pointer 등)
+    cdw10..cdw15: int = 0                # 명령별 파라미터 6×32-bit
+    # override 필드 — None이면 명령어 기본 동작
+    opcode_override:   Optional[int]  = None   # opcode 강제
+    nsid_override:     Optional[int]  = None   # NSID 강제
+    force_admin:       Optional[bool] = None   # True=admin-passthru, False=io-passthru
+    data_len_override: Optional[int]  = None   # 전송 크기 declared 강제
+    # corpus 운영 metadata
+    exec_count: int = 0;  found_at: int = 0;  new_pcs: int = 0
+    energy: float = 1.0;  is_favored: bool = False
+    covered_pcs: Optional[set] = None    # 이 시드 실행 시 방문한 PC/BB 집합
+    is_calibrated: bool = False;  stability: float = 1.0
+    stable_pcs: Optional[set] = None     # calibration 과반 PC
+    det_done: bool = False               # deterministic stage 소비 완료
+```
+
+각 필드의 mutation 처리는 [Mutation 전략](#mutation-전략) 참조.
+
+### 초기 시드 소스: `nvme_seeds.py`
+
+명령어별 정상 CDW 조합 목록이 정의된 사전 (`SEED_TEMPLATES: Dict[cmd_name, List[dict]]`).
+시드 추가/수정은 이 파일만 편집하면 됨 — 퍼저 코드 수정 불필요.
+
+**예시** (`Identify`):
+
+```python
+"Identify": [
+    # CNS=0x01 (Controller): NSID는 Reserved → nsid_override=0
+    dict(cdw10=0x0001, nsid_override=0),
+    dict(cdw10=0x0000),
+    dict(cdw10=0x0002, nsid_override=0),
+    ...
+    # CNTID 필드 포함 (CNS=0x06/0x07에서 특정 컨트롤러 조회)
+    dict(cdw10=(0x0001 << 16) | 0x0006, nsid_override=0),
+    # 미지원 CNS — 에러 경로 탐색
+    dict(cdw10=0x00FF, nsid_override=0),
+],
+```
+
+각 dict는 그대로 `Seed(**)` 키워드 인자로 사용 (`data`, `cdw2/3/10~15`, `nsid_override` 등).
+
+| 명령 | 시드 수 | 비고 |
+|------|--------|------|
+| Identify | ~14 | CNS 값별 + CNTID + 미지원 CNS |
+| GetLogPage | ~26 | LID 0x01~0x13 + vendor 0x70~0xFF + LPOL offset |
+| GetFeatures / SetFeatures | 각 ~20 | FID별 + SEL (current/default/saved/supported) |
+| Read / Write | ~10 | NLB·FUA·PRINFO·PRCHK 조합 |
+| Compare / Verify / WriteZeroes / Flush / DSM / Copy | 각 다수 | NVMe spec 기반 정상 조합 |
+| FWDownload | 1 (또는 청크별) | `--fw-bin` 명시 시 실제 바이너리 청크화 |
+| FWCommit | 4 | slot × action (CA=0/1/2/3) |
+
+총 **42 commands × 평균 10 시드 ≈ 400+ 초기 시드** (활성 명령 수에 비례).
+
+### 시드 생성 흐름 (`_generate_default_seeds`)
+
+```
+for cmd in self.commands:            # 활성 명령어만
+    if cmd in {"FormatNVM","Sanitize"}: skip            # 파괴 명령 제외
+    if cmd == "FWDownload":
+        if --fw-bin 지정 + 파일 존재:
+            바이너리를 fw_xfer(32KB) 청크로 분할
+            chunk_seed = Seed(data=chunk, cdw10=NUMD, cdw11=OFST)
+            self._fw_chunks 에 모든 청크 보관
+            corpus 에는 첫 청크만 (대표 시드)
+        else:
+            32KB zero 더미 시드 1개
+    if cmd == "FWCommit":
+        cdw10 = (slot << 3) | CA  (CA=1: replace+activate-on-reset)
+    else:
+        for tmpl in SEED_TEMPLATES[cmd.name]:
+            seed = Seed(data=tmpl['data'], cdw2..15=tmpl[...],
+                        nsid_override=tmpl.get('nsid_override'),
+                        found_at=0)
+            seeds.append(seed)
+
+# I/O 우선 정렬: Write → Read → 나머지
+return write_seeds + read_seeds + others
+```
+
+`found_at=0` 인 초기 시드는 cull / epoch reset에서 **무조건 보호**됨 (favored 여부 무관).
+
+### Calibration (`_calibrate_seed`)
+
+각 초기 시드를 `--calibration-runs` (기본 3회) 만큼 미리 실행하여:
+- PC 안정성 측정 — 과반수 실행에 등장한 PC를 `stable_pcs`로 분류
+- `covered_pcs = all_seen_pcs` 설정 → 2-pass favored 마킹 즉시 참여 가능
+- `global_coverage` 에 합산 → 첫 mutation부터 새 PC 판정 정확
+
+Calibration 중 timeout/error 발생 시 즉시 중단 + crash 처리.
+
+### 시드 vs SequenceSeed
+
+| 구분 | Seed | SequenceSeed |
+|------|------|--------------|
+| 단위 | 단일 NVMe 명령 1회 | N개 명령 시퀀스 (Write→Read 등) |
+| 저장 시점 | new PC 발견 시 즉시 | 시퀀스 완료 + 누적 interesting 시 |
+| 위치 | `corpus/input_<cmd>_<opcode>_<md5>` | `seq_corpus/replay_seq_<found_at>.sh` |
+| Energy | `MAX_ENERGY` 기반 | `MAX_ENERGY / N` (per-exec 공정 경쟁) |
+| Cull | `unfavored + exec≥2 + found_at>0` → 제거 | 동일 규칙 + 50개 hard cap (favored 우선) |
+| 변형 단위 | `_mutate(seed)` 단일 명령 변형 | 각 commands[i] 를 개별 `_mutate` + ctx 공유 |
+
+상세 SequenceSeed 운영은 [SequenceSeed corpus](#sequenceseed-corpus) 참조.
+
+---
+
 ## SequenceSeed corpus
 
 ### 데이터 구조
@@ -267,6 +382,96 @@ CDW12 상위 비트(FUA, PRINFO 등)와 CDW13~15 mutation은 살아있음.
 ## Mutation 전략
 
 v7.6에서 사용되는 모든 mutation 대상·방법·확률 정리.
+
+### NVMe CLI 명령 매핑 (어디를 변형하는가)
+
+각 Seed는 최종적으로 `nvme {admin|io}-passthru` CLI로 변환되어 SSD에 전송됨. Seed 필드 ↔ CLI 플래그 매핑:
+
+```bash
+nvme {admin-passthru | io-passthru} {device}        # ← seed.force_admin / cmd.cmd_type
+  --opcode={hex}                                    # ← seed.opcode_override or cmd.opcode
+  --namespace-id={hex}                              # ← seed.nsid_override or default(1)
+  --cdw2={hex}  --cdw3={hex}                        # ← seed.cdw2 / cdw3
+  --cdw10={hex} --cdw11={hex} --cdw12={hex}         # ← seed.cdw10 / 11 / 12
+  --cdw13={hex} --cdw14={hex} --cdw15={hex}         # ← seed.cdw13 / 14 / 15
+  --data-len={bytes}                                # ← seed.data_len_override or NLB-derived
+  --input-file={path}  -w                           # ← seed.data (write 명령)
+  --read                                            # ← read 명령
+  --timeout={ms}                                    # ← config 기반
+```
+
+#### 매핑 표 — 어떤 mutation이 어떤 플래그를 바꾸는가
+
+| CLI 플래그 | Seed 필드 | 변형 단계 (적용 확률) |
+|-----------|----------|--------------------|
+| `admin-passthru` ↔ `io-passthru` | `force_admin` | `[3] admin↔io swap` (5%) — passthru type 강제 교차 |
+| device path (`/dev/nvme0` vs `/dev/nvme0n1`) | `force_admin` 파생 | admin → controller char dev / IO → namespace block dev |
+| `--opcode` | `opcode_override` (없으면 `cmd.opcode`) | `[1] opcode_override` (10%) — vendor 0xC0~0xFF / 완전 random / bit flip / 타 명령 opcode |
+| `--namespace-id` | `nsid_override` (없으면 `config.nvme_namespace`) | `[2] nsid_override` (10%) — 0x00 / 0xFFFFFFFF / 0xFFFFFFFE / 비존재 NS / random |
+| `--cdw2`, `--cdw3` | `cdw2`, `cdw3` | havoc CDW (30%) + schema (30%) |
+| `--cdw10` | `cdw10` | 동일 + Phase 2 LBA pair (cdw10 lower) + Phase 2 DSM NR (cdw10[7:0]) + Phase 2 Copy dest SLBA |
+| `--cdw11` | `cdw11` | 동일 + LBA pair (cdw11 upper) |
+| `--cdw12` | `cdw12` | 동일 + Phase 1 NLB-relative (cdw12[15:0]) + Phase 2 Copy NR (cdw12[11:8]) |
+| `--cdw13`, `--cdw14`, `--cdw15` | `cdw13/14/15` | 동일 (대부분 reserved=0) |
+| `--data-len` | `data_len_override` (없으면 NLB·cmd 추론) | `[4] data_len_override` (8%) — NLB-relative / MDTS boundary / static |
+| `--input-file` 내용 | `data` (bytes) | Havoc 16 op (`_mutate_bytes`) + Splice + Phase 2 DSM/Copy payload 재구성 |
+| `--timeout` | (config) | timeout group별 고정 + PS_ENTRY_EXIT_MARGIN_MS=105ms 가산 |
+
+#### 예시 — `Identify` (CNS=0x01) seed가 어떻게 변형되는가
+
+**초기 시드** (`nvme_seeds.py`):
+```python
+dict(cdw10=0x0001, nsid_override=0)
+```
+→ Seed 객체: `cmd=Identify`, `cdw10=0x0001`, `nsid_override=0`, `data=b''`
+
+**`_mutate()` 후 (예시 변형)**:
+- `cdw10 = 0x00010003` (schema mutation으로 CNTID=0x0001 추가)
+- `nsid_override = 0xFFFFFFFF` (`[2]` nsid mutation, broadcast)
+- `opcode_override = 0xC3` (`[1]` opcode mutation, vendor-specific)
+- `force_admin = False` (`[3]` admin→io swap)
+
+**최종 CLI**:
+```bash
+nvme io-passthru /dev/nvme0n1 \
+  --opcode=0xc3 \              # opcode_override
+  --namespace-id=0xffffffff \  # nsid_override
+  --cdw2=0x0 --cdw3=0x0 \
+  --cdw10=0x10003 \            # CNS + CNTID
+  --cdw11=0x0 --cdw12=0x0 --cdw13=0x0 --cdw14=0x0 --cdw15=0x0 \
+  --timeout=8000
+```
+
+→ Admin 명령 Identify가 IO passthru로 vendor opcode를 달고 전송됨 → dispatch table / nsid validation / opcode validation 경로 동시 탐색.
+
+#### 예시 — `Write` (4KB) seed가 어떻게 변형되는가
+
+**초기 시드**:
+```python
+dict(data=os.urandom(4096), cdw10=0, cdw11=0, cdw12=7)   # SLBA=0, NLB=7 (8 LBA = 4096B)
+```
+
+**`_mutate()` 후 (예시)**:
+- `data` ← `_mutate_bytes(data)` (havoc 2~128 ops 적용 후)
+- `cdw10=0xFFFFFFFF`, `cdw11=0x1` (`[6]` LBA pair → `slba=0x100000000`)
+- `cdw12 = (cdw12 & ~0xFFFF) | 0x0F` (havoc CDW 또는 schema에서 NLB=15 = 16 LBA = 8KB)
+- `data_len_override = 4097` (`[4]` NLB-relative → expected+1 boundary)
+
+**최종 CLI**:
+```bash
+nvme io-passthru /dev/nvme0n1 \
+  --opcode=0x01 \
+  --namespace-id=0x1 \
+  --cdw10=0xffffffff --cdw11=0x1 \   # SLBA = 0x100000000
+  --cdw12=0xf \                       # NLB = 15 (8KB transfer 선언)
+  --data-len=4097 \                   # 실제는 4097B 만 전송 (mismatch)
+  --input-file=/tmp/.nvme_input.bin -w \
+  --timeout=8000
+```
+
+→ NLB(8KB)와 data-len(4097B)의 declared/actual size mismatch + LBA 64-bit 경계 + 이상한 PRINFO 플래그 등이 한 번에 적용된 fuzz 명령.
+
+---
 
 ### Mutation 대상 (Seed 필드별)
 
