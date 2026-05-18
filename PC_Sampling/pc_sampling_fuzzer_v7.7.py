@@ -8836,15 +8836,10 @@ class NVMeFuzzer:
         self._apst_disable()
         self._keepalive_disable()
 
-        # PM preflight: idle 유니버스 수집 전에 전체 PowerCombo 검증.
-        # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
-        self._pm_preflight_check()
-
-        # v7.7: S1/S2 perturbation preflight — PCIe bit + CLKREQ# 1회씩 검증.
-        if self.config.pm_inject_prob > 0:
-            self._pm_preflight_s1_s2()
-
-        # J-Link PC 읽기 진단 + idle PC 감지
+        # J-Link PC 읽기 진단 + idle PC 감지 — POR + APST/Keep-Alive disable 직후의
+        # 가장 깨끗한 idle 상태에서 수집. PM preflight (30 PowerCombo + 17 S1/S2
+        # perturb) 직후엔 firmware cleanup/recovery PC 가 idle universe 에 오염
+        # 들어갈 수 있으므로 이 시점이 적절.
         if not self.sampler.diagnose():
             log.error("J-Link PC read diagnosis failed, aborting")
             return
@@ -8856,6 +8851,14 @@ class NVMeFuzzer:
             log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
         else:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
+
+        # PM preflight: idle 유니버스 수집 직후 전체 PowerCombo 검증.
+        # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
+        self._pm_preflight_check()
+
+        # v7.7: S1/S2 perturbation preflight — PCIe bit + CLKREQ# 1회씩 검증.
+        if self.config.pm_inject_prob > 0:
+            self._pm_preflight_s1_s2()
 
         # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
         # _log_smart() 이후에 설정: 이전에 실행하면 admin_timeout=30일 상태에서
