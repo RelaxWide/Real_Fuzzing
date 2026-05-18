@@ -35,7 +35,10 @@ v7.6 시각화 / v7.5 SequenceSeed corpus / ctx 모드(full / lba_nlb) / 2-pass 
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Startup: PMU POR → OpenOCD → diagnose() → Calibration       │
+│  Startup: PMU POR → OpenOCD → APST/KA disable                │
+│         → diagnose() (idle universe)                         │
+│         → PM Preflight (PowerCombo 30 + S1/S2 17, --pm 시)   │
+│         → Calibration                                        │
 └──────────────────────────────────────────────────────────────┘
 ┌── Main Loop ────────────────────────────────────────────────┐
 │  ① PM 로테이션 (100회마다, seed 선택 전)                      │
@@ -134,8 +137,8 @@ sudo python3 pc_sampling_fuzzer_v7.6.py --product PM9M1 --nvme /dev/nvme0 --all-
 - PCIe config bit 변경 후 **복원 안 함** — 다음 rotation 까지 유지
 - 다음 rotation 에서 새 perturbation 또는 POWER_COMBO 가 덮어씀
 - POWER_COMBO 가 명시 설정하는 영역(PS/L-state/D-state)은 자동 reset, 그 외 비트는 잔류 (realistic — 실제 OS 도 일부만 변경)
-- D1/D2 forced 는 일회성 (50ms 후 D0 자동 복귀)
-- CLKREQ# perturb 는 일회성 timing 이벤트
+- D1/D2 forced 는 일회성: D1/D2 진입 → 50ms → D0 복귀 시 **`setpci_write` 반환값 + readback 검증**. restore 실패 시 warning 로그 + False 반환 (host-side restore 실패가 firmware 결함으로 attribution 되는 오염 차단)
+- CLKREQ# perturb 는 일회성 timing 이벤트 (모든 mode 가 assert state 로 종료)
 
 #### 결함 판정
 
@@ -147,7 +150,22 @@ sudo python3 pc_sampling_fuzzer_v7.6.py --product PM9M1 --nvme /dev/nvme0 --all-
 | state telemetry 4a/4c 그룹 비정상 변동 | PM event 부수 효과 |
 | 일관된 latency 증가 | 약한 PM 결함 신호 |
 
-`_cmd_history` 가 PM event (`kind: pcie_pm_bit` / `kind: clkreq`) 자동 기록 → crash 시 replay.sh 에 `setpci` / PMU 호출 포함 → **완전 재현 가능**.
+`_cmd_history` 가 PM event (`kind: pcie_pm_bit` / `kind: clkreq`) 자동 기록 → crash 시 `_generate_replay_sh()` 가 setpci write-with-mask / PMU GPIO 토글 시퀀스 (4 mode 별 정확 reproduction) 으로 변환 → **완전 재현 가능**. state corpus / seq corpus replay 도 동일 경로 사용.
+
+#### Preflight 검증
+
+`--pm` 활성 시 fuzzing 시작 전 두 단계 PM preflight 수행:
+
+| 단계 | 검증 항목 | 메서드 |
+|------|----------|--------|
+| 1단계 | POWER_COMBO 30종 (PS × L × D) | `_pm_preflight_check()` — 기존 |
+| 2단계 (v7.7) | S1 PCIe bit 13개 + S2 CLKREQ# 4 mode = **17 perturbation** | `_pm_preflight_s1_s2()` — 신규 |
+
+각 항목 1회씩 결정적으로 적용 → `nvme id-ctrl` 5초 응답 확인 → 원복 (S1 normal 12개는 `(orig & mask, mask)` 으로 perturbed bit 만 복원, 다른 비트 보존). 실패해도 fuzzing 계속 (식별만, abort X).
+
+**OK 의미**: setpci write 성공 + controller hang 안 됨. Data corruption / latency 증가 / 내부 state 정합성은 검증 안 함 (본격 fuzz 의 state telemetry + crash detection 영역).
+
+**Init 순서 보정**: idle PC universe 수집(`sampler.diagnose()`)은 PM preflight **앞**에서 수행. PM preflight ~50회 전환 직후엔 firmware cleanup/wake handler PC 가 idle universe 에 오염될 위험 → POR + APST/Keep-Alive disable 직후의 가장 깨끗한 baseline 사용.
 
 #### CLI
 
@@ -904,7 +922,7 @@ v7.6에서 제거된 산출물:
 
 | 버전 | 주요 변경 |
 |------|-----------|
-| **v7.7** | S1+S2 PM Robustness Perturbation 도입. 기존 PM rotation slot 에 PCIe config 13 비트 perturb (LNKCTL/DEVCTL2/PMCSR/L1SS, 변경 유지) + CLKREQ# 4 mode (missed_wake / extended_wait / short_pulse / rapid_toggle) 통합. PMCSR D1/D2 일회성 forced (50ms→D0). **`--pm` 옵션 활성 시 자동 동작** (별도 옵션 없음). Completion Timeout / Common Mode Restore 등 host timeout 로직 영향 비트 제외 — vendor 클레임 가능 영역만. |
+| **v7.7** | S1+S2 PM Robustness Perturbation 도입. 기존 PM rotation slot 에 PCIe config 13 비트 perturb (LNKCTL/DEVCTL2/PMCSR/L1SS, 변경 유지) + CLKREQ# 4 mode (missed_wake / extended_wait / short_pulse / rapid_toggle) 통합. PMCSR D1/D2 일회성 forced (50ms→D0 + readback 검증). **`--pm` 옵션 활성 시 자동 동작** (별도 옵션 없음). Completion Timeout / Common Mode Restore 등 host timeout 로직 영향 비트 제외 — vendor 클레임 가능 영역만. S1/S2 preflight 추가 (PowerCombo preflight 직후 17개 perturbation 결정적 검증). `_generate_replay_sh()` 가 `pcie_pm_bit` / `clkreq` event 도 setpci/PMU 시퀀스로 변환 → PM crash 완전 재현. Init 순서 보정: idle universe 수집을 PM preflight 앞으로 이동 (PM 전환 잔여 효과로 idle PC 오염 차단). |
 | v7.6 | 시각화 개선: coverage_growth(velocity bar + plateau + milestone), firmware_map(BB gradient + 전체 함수 treemap + Top-N 라벨), csfuzz_dynamics 신규(3-panel p/corpus/m1m2). per-command CFG 생성 제거. |
 | v7.5 | SequenceSeed corpus + 2-pass favored cull 일관성. Sequence ctx를 Write mutation 결과에서 파생 + `full`/`lba_nlb` 두 모드 지원 (Write→Write는 data 분리). seq_corpus/ replay .sh 자동 저장 + 고아 청소. BUILTIN_SEQUENCES에 기본 모드 시퀀스(Write→Read, Write→Write) 추가. SequenceSeed window 초과 fallback에서 exec_count 보정. `--no-jlink-dump` 추가. CLI 옵션 51→19. DSM/Copy NR 마스크 수정. |
 | v7.4 | Phase 1 (NLB/MDTS data_len), Phase 2 (64-bit LBA, DSM/Copy structured), Phase 3 (builtin sequence). PM 로테이션을 seed 선택 전으로 이동. |
