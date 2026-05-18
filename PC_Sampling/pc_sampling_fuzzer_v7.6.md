@@ -115,11 +115,13 @@ Panel 3: m1 vs m2 reward (per-command 정규화 후 비교)
 ### v7.6 후속 정리
 
 - **command_comparison.png** — opcode mutation으로 생성된 `unknown_op0x..` 라벨이 차트를 노이즈로 채우는 문제 해결. `_tracking_label` 형식을 `unknown_{admin|io}_op0x{XX}` 로 변경 후 차트에서 `unknown(admin)` / `unknown(io)` 두 버킷으로 합산. 종료 summary 텍스트에 **Top-5 unknown opcode** 별도 출력 (hit count 내림차순) — 차트는 깔끔하고 디테일은 텍스트로 보존.
-- **coverage_growth.png** — 하단 panel y축 라벨을 모호한 `BB ΔΔ%/window` 에서 `New BB % per window` 로 변경, subtitle "Coverage velocity — window별 새로 발견한 BB 비율 (0 ≈ 포화)" 추가.
+- **coverage_growth.png** — 하단 panel y축 라벨을 모호한 `BB ΔΔ%/window` 에서 `New BB % per window` 로 변경, subtitle `Coverage velocity — new BB % discovered per window (0 = saturated)` 추가 (영어, 폰트 호환성).
 - **heatmap 정리** — `edge_heatmap_2d.png` 제거 (PC 샘플링에서는 진짜 edge가 아니라 sample 인접이라 노이즈). per-command 1D heatmap strip도 제거. **`coverage_heatmap_1d.png`는 global 1개 strip만 유지**하되 가장 hit이 많은 top-3 bin 주소를 hot spot 라벨로 표시.
 - **uncovered_funcs.png 제거** — firmware_map의 Top-N 라벨 + BB-coverage 그라데이션이 같은 정보를 더 효율적으로 보여줌. 우선순위 분석은 종료 summary 텍스트에 **Top-20 not-entered + Top-20 partially-covered** 함수 목록(주소·크기·BB% 포함)으로 출력.
 - **firmware_map BB-weighted 평균 정확화** — 함수별 % 단순 평균이 아니라 `Σ covered_bbs / Σ total_bbs` 가중 평균.
 - **JLink shutdown 분리** — `_shutdown_openocd_for_jlink()` 헬퍼 + `_handle_timeout_crash`에서 항상 호출. `--no-jlink-dump` 사용 시에도 후속 JLink PC 모니터링이 J-Link USB에 정상 접근 가능.
+- **JLink/MONITOR 터미널 로그 표시** — `_FuzzingTerminalFilter._ALLOW` 정규식에 `[JLINK]`, `[JLINK DUMP]`, `[MONITOR]` prefix 추가. 이전엔 파일 로그에만 기록돼 dump 진행 상황이나 PC 모니터링 출력이 터미널에 안 찍히던 문제 수정.
+- **차트 한글 텍스트 제거 + 폰트 fallback 안전화** — matplotlib 기본 폰트(`DejaVu Sans`)에 한글 글리프가 없어 `Glyph N missing from current font` 경고와 글자 깨짐 발생. 모든 차트 렌더링 텍스트를 ASCII로 통일. 추가로 `_setup_matplotlib_chart_env()` 헬퍼 신설 — `font.family = DejaVu Sans` 고정 + `Glyph missing` 경고 패턴 ignore. 5개 차트 생성 사이트가 모두 이 헬퍼를 호출. 우발적 한글 텍스트가 들어가도 fallback 폰트 시도 없이 안전한 ASCII 렌더링.
 - firmware_map Top-N 라벨에서 ⬛/⬜ unicode 제거 (matplotlib 기본 폰트에 없어 Glyph missing 경고).
 
 ---

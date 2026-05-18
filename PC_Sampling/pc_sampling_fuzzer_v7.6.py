@@ -19,14 +19,36 @@ Coverage-Guided + State-Aware Fuzzer. 3코어(PM9M1) / 2코어(BM9H1) 지원.
 
 v7.6 주요 변경 — 시각화 개선
 - coverage_growth.png 발전 — 누적 % 곡선 위에 plateau 음영 + 25/50/75/90% 마일스톤
-  vertical line + 하단 panel에 window별 BB ΔΔ%/window bar 추가. 한 그래프로 진행 속도,
-  포화 시점, 단계별 도달 시간을 동시 확인.
+  vertical line + 하단 panel에 window별 New BB %/window velocity bar 추가. 한 그래프로
+  진행 속도, 포화 시점, 단계별 도달 시간을 동시 확인.
 - firmware_map.png 발전 — 함수당 BB 커버율 0~100% 그라데이션 cell, MAX_FUNCS cap 제거 후
-  전체 함수 격자(treemap-like), Top-N 미진입/부분 커버 함수 라벨, BB-weighted 평균 표시.
+  전체 함수 격자(treemap-like), Top-N 미진입/부분 커버 함수 라벨, BB-weighted 평균
+  ( Σ covered_bbs / Σ total_bbs ) 표시.
 - csfuzz_dynamics.png 신규 — 3-panel (p 추이 + NC1/NC2 corpus 성장 + m1 vs m2 reward).
   CSFuzz §III-C/D 동역학을 시각적으로 검증 가능. _csfuzz_history는 _update_csfuzz_p마다
   (exec, p, m1, m2_norm, NC1, NC2) 누적.
 - 명령별 CFG ({cmd}_cfg.dot/.png) 제거 — edge 수가 늘면 가독성이 사라져 가치 낮음.
+
+v7.6 후속 정리 (codex review + 사용성 개선)
+- command_comparison.png — opcode mutation으로 생긴 unknown_op0x.. 라벨이 차트를 노이즈로
+  채우는 문제 해결. _tracking_label 형식을 unknown_{admin|io}_op0x{XX} 로 변경 후 차트에서
+  unknown(admin)/unknown(io) 두 버킷으로 합산. 종료 summary에 Top-5 unknown opcode 별도
+  텍스트 출력. Per-command stats / Return code distribution 도 동일 버킷팅.
+- heatmap 정리 — edge_heatmap_2d.png 제거 (PC 샘플링은 진짜 edge가 아니라 노이즈).
+  per-command 1D heatmap strip 제거. coverage_heatmap_1d.png는 global 1 strip만 유지하되
+  top-3 hot bin 주소를 라벨로 표시.
+- uncovered_funcs.png 제거 — firmware_map의 Top-N 라벨 + 그라데이션으로 대체. 우선순위
+  분석은 종료 summary 텍스트에 Top-20 not-entered + Top-20 partially-covered 목록
+  (주소·크기·BB%) 출력.
+- JLink shutdown 분리 — _shutdown_openocd_for_jlink() 헬퍼 + _handle_timeout_crash에서
+  항상 호출. --no-jlink-dump 사용 시에도 후속 JLink PC 모니터링이 J-Link USB에 정상 접근.
+- JLink/MONITOR 터미널 로그 표시 — _FuzzingTerminalFilter._ALLOW 정규식에 [JLINK],
+  [JLINK DUMP], [MONITOR] prefix 추가. dump 진행/완료, PC 모니터링 출력이 터미널에 표시됨.
+- 차트 한글 텍스트 제거 + 폰트 fallback 안전화 — matplotlib 기본 폰트(DejaVu Sans)에 한글
+  글리프가 없어 'Glyph N missing from current font' 경고와 글자 깨짐 발생. 모든 차트
+  렌더링 텍스트를 ASCII로 통일. _setup_matplotlib_chart_env() 헬퍼 신설 — font.family를
+  DejaVu Sans로 고정 + Glyph missing 경고 패턴 ignore. 5개 차트 사이트가 헬퍼 호출.
+- firmware_map Top-N 라벨에서 ⬛/⬜ unicode 제거 (matplotlib 기본 폰트 미지원).
 
 v7.5 주요 변경
 - SequenceSeed corpus 도입 — builtin sequence(Write→Compare 등)를 N개 명령 단위로 저장.
