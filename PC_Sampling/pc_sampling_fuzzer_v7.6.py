@@ -971,6 +971,8 @@ class _FuzzingTerminalFilter(logging.Filter):
       [TIMEOUT]            — timeout 후속 처리 (_handle_timeout_crash)
       [REPLAY]             — replay .sh 생성 완료
       [UFAS]               — UFAS 펌웨어 덤프 진행/완료
+      [JLINK] / [JLINK DUMP] — OpenOCD shutdown / JLink 메모리 덤프 진행·완료
+      [MONITOR]            — timeout crash 후 JLink PC 모니터링 출력
       ERROR / CRITICAL     — 예외 없이 항상 출력
 
     나머지는 파일 로그에만 기록됨.
@@ -979,6 +981,7 @@ class _FuzzingTerminalFilter(logging.Filter):
     _ALLOW = _re.compile(
         r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
         r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]|\[State-Replay\]'
+        r'|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]'
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
