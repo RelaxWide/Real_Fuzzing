@@ -5645,21 +5645,27 @@ class NVMeFuzzer:
         APST 활성화 상태에서는 NVMe 컨트롤러가 자율적으로 PS 전환을 하면서
         PCIe 트래픽을 발생시켜 L1/L1.2 idle window를 깨뜨림.
         퍼징 시작 전 비활성화하여 PM 상태가 fuzzer 제어 하에만 전환되도록 함.
+
+        반복 호출 안전: _orig_apst_cdw11 은 None 일 때만 저장 (이미 캡처된
+        '원본' 값을 forced_idle slot 에서 enable→disable 한 후 덮어쓰면 안 됨).
         """
         dev = self.config.nvme_device
-        try:
-            r = subprocess.run(
-                ['nvme', 'get-feature', dev, '-f', '0x0C'],
-                capture_output=True, text=True, timeout=5)
-            for line in r.stdout.splitlines():
-                if 'value:' in line.lower() or 'Current value' in line:
-                    import re as _re
-                    m = _re.search(r'0x([0-9a-fA-F]+)', line)
-                    if m:
-                        self._orig_apst_cdw11 = int(m.group(1), 16)
-                        break
-        except Exception as e:
-            log.warning(f"[APST] get-feature 실패: {e}")
+        # 원본 cdw11 캡처는 첫 호출 1회만 — 이후엔 (이미 disable 또는 enable→disable
+        # 가 한 _orig 가 의미 있는) 상태를 건드리지 않음.
+        if self._orig_apst_cdw11 is None:
+            try:
+                r = subprocess.run(
+                    ['nvme', 'get-feature', dev, '-f', '0x0C'],
+                    capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    if 'value:' in line.lower() or 'Current value' in line:
+                        import re as _re
+                        m = _re.search(r'0x([0-9a-fA-F]+)', line)
+                        if m:
+                            self._orig_apst_cdw11 = int(m.group(1), 16)
+                            break
+            except Exception as e:
+                log.warning(f"[APST] get-feature 실패: {e}")
 
         if self._orig_apst_cdw11 == 0:
             log.warning("[APST] 이미 비활성화 상태 — skip")
@@ -5695,6 +5701,58 @@ class NVMeFuzzer:
 
         if not _ok_apst:
             log.warning("[APST] 비활성화 실패 — APST 자율 PS 전환이 MISMATCH 유발할 수 있음")
+
+    def _apst_enable_short_itpt(self, ps3_ms: int = 500, ps4_ms: int = 2000) -> bool:
+        """APST 를 짧은 ITPT 로 활성화 — PM rotation forced_idle slot 전용.
+
+        NVMe spec §5.21.1.7 APST table (256B, 32 entries × 8B):
+          Entry[N] 은 "현재 PS=N 일 때, ITPT ms idle 이면 ITPS 로 자율 전환".
+          bits[7:3] = ITPS (target PS), bits[31:8] = ITPT (ms), 나머지 reserved.
+
+        설정:
+          Entry[0]: PS0 idle ps3_ms 후 → PS3
+          Entry[3]: PS3 idle ps4_ms 후 → PS4
+        결과: 활성화 후 디바이스 가 idle 이면 ps3_ms → PS3 → 추가 ps4_ms → PS4
+        로 자율 전환. SetFeatures PS=4 강제 진입보다 실제 OS 동작에 가까움.
+
+        호출 후 슬롯 종료 시 _apst_disable() 로 다시 끄기 — 다른 PM rotation 슬롯
+        (POWER_COMBO 등) 의 manual PM 제어가 APST 와 충돌하지 않게.
+        """
+        dev = self.config.nvme_device
+        table = bytearray(256)
+        # Entry[0] — PS0 → PS3
+        _entry0 = (ps3_ms << 8) | (3 << 3)
+        table[0:8] = _entry0.to_bytes(8, 'little')
+        # Entry[3] — PS3 → PS4
+        _entry3 = (ps4_ms << 8) | (4 << 3)
+        table[24:32] = _entry3.to_bytes(8, 'little')
+
+        import tempfile as _tf
+        _fname: Optional[str] = None
+        try:
+            with _tf.NamedTemporaryFile(suffix='.apst', delete=False) as _f:
+                _f.write(bytes(table))
+                _fname = _f.name
+            # CDW11 bit0=1 (APSTE) — '-v 1'
+            r = subprocess.run(
+                ['nvme', 'set-feature', dev, '-f', '0x0C', '-v', '1',
+                 '--data-len=256', f'--data={_fname}'],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                log.warning(f"[APST] enable: ITPT PS0→PS3={ps3_ms}ms, "
+                            f"PS3→PS4={ps4_ms}ms")
+                return True
+            log.warning(f"[APST] enable 실패 (rc={r.returncode}): {r.stderr.strip()}")
+            return False
+        except Exception as e:
+            log.warning(f"[APST] enable 예외: {e}")
+            return False
+        finally:
+            if _fname is not None:
+                try:
+                    os.unlink(_fname)
+                except OSError:
+                    pass
 
     def _apst_restore(self) -> None:
         """퍼징 종료 시 원본 APST 상태 복원."""
@@ -9364,23 +9422,21 @@ class NVMeFuzzer:
                     else:
                         _pm_slot = 'clkreq'
 
-                    # ── forced_idle slot ─────────────────────────────────
+                    # ── forced_idle slot — APST autonomous PS3→PS4 ───────
+                    # 강제 SetFeatures PS=4 대신 APST 짧은 ITPT 활성 → 자율 전환.
+                    # 슬롯 종료 시 APST 다시 disable → 다른 PM rotation 슬롯
+                    # (POWER_COMBO/pcie_bit/clkreq) 의 manual PM 제어와 충돌 X.
                     if _pm_slot == 'forced_idle':
-                        _nops_ps = random.choice([3, 4])
-                        _nops_settle = self._ps_settle.get(_nops_ps, 0.5)
-                        _nops_combo = next(
-                            (c for c in POWER_COMBOS
-                             if c.nvme_ps == _nops_ps and c.pcie_l == PCIeLState.L0
-                             and c.pcie_d == PCIeDState.D0),
-                            None
-                        )
-                        if _nops_combo:
-                            log.warning(f"[PM] PS{_nops_ps} 강제 idle 진입 "
-                                        f"(settle={_nops_settle:.2f}s + idle {_nops_settle:.2f}s)")
+                        _ps3_ms = 500       # PS0 → PS3 ITPT (0.5초)
+                        _ps4_ms = 2000      # PS3 → PS4 ITPT (2.0초)
+                        _idle_total_s = (_ps3_ms + _ps4_ms) / 1000.0 + 1.0  # 여유 1초
+                        log.warning(f"[PM] APST 자율 idle 진입 "
+                                    f"(PS0→PS3 {_ps3_ms}ms, PS3→PS4 {_ps4_ms}ms, "
+                                    f"total {_idle_total_s:.1f}s)")
+                        _apst_ok = self._apst_enable_short_itpt(_ps3_ms, _ps4_ms)
+                        if _apst_ok:
                             self.sampler.start_sampling()
-                            self._pm_set_state(_nops_ps)
-                            time.sleep(_nops_settle)        # NOPS 진입 대기
-                            time.sleep(_nops_settle)        # 추가 idle — 실제 NOPS 진입 보장
+                            time.sleep(_idle_total_s)     # 자율 PS3 → PS4 진입 대기
                             self.sampler.stop_sampling()
                             _pm_new_set = self.sampler.current_trace - self.sampler.global_coverage
                             _pm_new_cnt = len(_pm_new_set)
@@ -9388,12 +9444,17 @@ class NVMeFuzzer:
                             if _pm_new_cnt > 0:
                                 if self._sa_loaded:
                                     self._update_static_coverage(_pm_new_set)
-                                log.info(f"[+][PM-Cov] PS{_nops_ps}-idle +{_pm_new_cnt} new PCs")
-                            # 복귀 — PS0로 되돌려야 다음 커맨드 전송 가능
-                            self._pm_set_state(0)
-                            self._current_combo = POWER_COMBOS[0]
-                            self._current_ps    = 0
-                            self.ps_enter_counts[_nops_ps] += 1
+                                log.info(f"[+][PM-Cov] APST-idle (PS3→PS4) +{_pm_new_cnt} new PCs")
+                            # APST 다시 disable — 다음 PM rotation 슬롯이 manual 제어
+                            # 가능하도록. 다음 NVMe 명령이 디바이스를 자연 wake.
+                            self._apst_disable()
+                            self.ps_enter_counts[3] += 1
+                            self.ps_enter_counts[4] += 1
+                        else:
+                            log.warning("[PM] APST enable 실패 — forced_idle slot skip")
+                        # current_combo 는 다음 명령 송신 직전 _nonop_restore 가 정리
+                        self._current_combo = POWER_COMBOS[0]
+                        self._current_ps    = 0
 
                     # ── PCIe config bit perturb slot (v7.7 S1) ──────────
                     elif _pm_slot == 'pcie_bit':
