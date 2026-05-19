@@ -4038,20 +4038,91 @@ class NVMeFuzzer:
     NSZE_CACHE_TTL = 5000
 
     def _get_nsze(self) -> int:
-        """Namespace Size (NSZE) 조회 및 캐싱 (5000 exec 마다 갱신)."""
+        """Namespace Size (NSZE) 조회 및 캐싱 (5000 exec 마다 갱신).
+        구버전 nvme-cli 호환 — JSON 미지원 시 text 출력 파싱 fallback."""
         if (self._nsze_cache is None or
                 self.executions - self._nsze_cache_at > self.NSZE_CACHE_TTL):
+            _ns = self.config.nvme_namespace or 1
+            ns_info, _, _ = self._nvme_id_dict(
+                ['nvme', 'id-ns', self.config.nvme_device, '-n', str(_ns)])
             try:
-                out = subprocess.check_output(
-                    ["nvme", "id-ns", self.config.nvme_device,
-                     "-n", str(self.config.nvme_namespace or 1), "--output-format=json"],
-                    timeout=3, stderr=subprocess.DEVNULL)
-                ns_info = json.loads(out)
                 self._nsze_cache = int(ns_info.get("nsze", 0x100000))
-            except Exception:
+            except (ValueError, TypeError):
                 self._nsze_cache = 0x100000   # 1M blocks fallback
             self._nsze_cache_at = self.executions
         return self._nsze_cache
+
+    @staticmethod
+    def _parse_nvme_text(text: str) -> dict:
+        """nvme id-ctrl / id-ns 의 text 출력 파싱 → dict.
+        JSON 미지원 구버전 nvme-cli fallback. 가능한 한 JSON 출력 스키마와
+        호환되는 키 이름 / 타입을 사용 (vid/ssvid/mn/sn/fr/ver/mdts/nn,
+        nsze/ncap/nuse/flbas/lbafs).
+        """
+        result: dict = {}
+        lbafs: list = []
+        for line in text.splitlines():
+            # 'lbaf  0 : ms:0   lbads:9  rp:0x2 (in use)' 같은 LBA format 라인
+            m = re.match(r'\s*lbaf\s+(\d+)\s*:\s*ms:(\d+)\s+lbads:(\d+)', line)
+            if m:
+                lbafs.append({
+                    'ms': int(m.group(2)),
+                    'ds': int(m.group(3)),
+                    'in_use': '(in use)' in line,
+                })
+                continue
+            # 'key : value' 일반 라인
+            m = re.match(r'\s*([A-Za-z_][\w\-]*)\s*:\s*(.+?)\s*$', line)
+            if not m:
+                continue
+            key, val = m.group(1), m.group(2).strip()
+            # 텍스트 포맷은 필드마다 표기 다름:
+            #   - '0x...' prefix      → hex int (vid/ssvid 등)
+            #   - 일반 십진수 (1자리 또는 leading 0 없음)  → dec int (mdts/nn 등)
+            #   - leading-zero 또는 hex digit 포함  → 문자열 유지 (ieee/eui64/nguid 등)
+            #     JSON 출력 schema 와 정확히 일치하진 않지만 표시 / 키 lookup 에는 충분.
+            try:
+                if val.startswith('0x') or val.startswith('0X'):
+                    result[key] = int(val, 16)
+                elif val.isdigit() and (len(val) == 1 or val[0] != '0'):
+                    result[key] = int(val)
+                else:
+                    result[key] = val
+            except ValueError:
+                result[key] = val
+        if lbafs:
+            result['lbafs'] = lbafs
+        return result
+
+    def _nvme_id_dict(self, cmd_args: list) -> Tuple[dict, str, int]:
+        """nvme id-* 호출 → dict 반환. JSON 우선, 실패 시 text 파싱 fallback.
+        반환: (parsed_dict, stderr_str, returncode).
+        성공 시 parsed_dict 채워짐, 실패 시 빈 dict 와 진단 정보.
+        """
+        # 1) JSON 시도
+        _json_cmd = cmd_args + ['--output-format=json']
+        try:
+            _r = subprocess.run(_json_cmd, timeout=5,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if _r.returncode == 0:
+                try:
+                    return json.loads(_r.stdout), '', 0
+                except json.JSONDecodeError:
+                    pass   # text fallback 으로
+            # 옵션 인식 실패 / JSON 미지원 → text fallback
+        except Exception:
+            pass
+        # 2) text fallback (JSON 옵션 빼고)
+        try:
+            _r = subprocess.run(cmd_args, timeout=5,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _err = _r.stderr.decode(errors='replace').strip()
+            if _r.returncode != 0:
+                return {}, _err, _r.returncode
+            _text = _r.stdout.decode(errors='replace')
+            return self._parse_nvme_text(_text), _err, 0
+        except Exception as e:
+            return {}, str(e), -1
 
     def _log_device_info(self) -> None:
         """nvme id-ctrl / id-ns 결과 + PCIe 정보를 정리해서 한 번에 터미널 출력.
@@ -4062,25 +4133,14 @@ class NVMeFuzzer:
         log.warning(" Device Information")
         log.warning("=" * 60)
 
-        # id-ctrl — stderr 캡처하여 실패 시 실제 메시지 표시
-        ctrl: dict = {}
-        _cmd = ['nvme', 'id-ctrl', self.config.nvme_device, '--output-format=json']
-        try:
-            _r = subprocess.run(_cmd, timeout=5,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if _r.returncode == 0:
-                ctrl = json.loads(_r.stdout)
-            else:
-                _err = _r.stderr.decode(errors='replace').strip()
-                _out = _r.stdout.decode(errors='replace').strip()
-                log.warning(f"  id-ctrl rc={_r.returncode}")
-                log.warning(f"    cmd    : {' '.join(_cmd)}")
-                if _err:
-                    log.warning(f"    stderr : {_err}")
-                if _out:
-                    log.warning(f"    stdout : {_out[:200]}")
-        except Exception as e:
-            log.warning(f"  id-ctrl 예외: {e}  (cmd={' '.join(_cmd)})")
+        # id-ctrl — JSON 우선, 실패 시 text 파싱 fallback (_nvme_id_dict)
+        _cmd = ['nvme', 'id-ctrl', self.config.nvme_device]
+        ctrl, _err, _rc = self._nvme_id_dict(_cmd)
+        if not ctrl:
+            log.warning(f"  id-ctrl rc={_rc}")
+            log.warning(f"    cmd    : {' '.join(_cmd)}")
+            if _err:
+                log.warning(f"    stderr : {_err}")
 
         if ctrl:
             _model  = str(ctrl.get('mn', '')).strip()
@@ -4088,7 +4148,12 @@ class NVMeFuzzer:
             _fw     = str(ctrl.get('fr', '')).strip()
             _vid    = ctrl.get('vid', 0)
             _ssvid  = ctrl.get('ssvid', 0)
-            _ieee   = ctrl.get('ieee', 'N/A')
+            # ieee 는 JSON 에선 int, text 파싱에선 leading-zero 문자열 → 양쪽 통일.
+            _ieee_raw = ctrl.get('ieee', 'N/A')
+            if isinstance(_ieee_raw, int):
+                _ieee = f"{_ieee_raw:06x}"
+            else:
+                _ieee = str(_ieee_raw)
             _ver    = ctrl.get('ver', 0)
             _nn     = ctrl.get('nn', '?')
             _mdts   = ctrl.get('mdts', 0)
@@ -4107,30 +4172,15 @@ class NVMeFuzzer:
             if _subnqn:
                 log.warning(f"  SubNQN      : {_subnqn}")
 
-        # id-ns — stderr 캡처
-        ns_info: dict = {}
+        # id-ns — JSON 우선, 실패 시 text 파싱 fallback
         _ns = self.config.nvme_namespace or 1
-        _ns_cmd = ['nvme', 'id-ns', self.config.nvme_device,
-                   '-n', str(_ns), '--output-format=json']
-        try:
-            _r = subprocess.run(_ns_cmd, timeout=5,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if _r.returncode == 0:
-                ns_info = json.loads(_r.stdout)
-            else:
-                _err = _r.stderr.decode(errors='replace').strip()
-                _out = _r.stdout.decode(errors='replace').strip()
-                log.warning(f"  id-ns rc={_r.returncode}")
-                log.warning(f"    cmd    : {' '.join(_ns_cmd)}")
-                if _err:
-                    log.warning(f"    stderr : {_err}")
-                if _out:
-                    log.warning(f"    stdout : {_out[:200]}")
-                # 명확한 실패 시 아래 파싱 분기로 가지 못하도록 early return
-                log.warning("=" * 60)
-                return
-        except Exception as e:
-            log.warning(f"  id-ns 예외: {e}  (cmd={' '.join(_ns_cmd)})")
+        _ns_cmd = ['nvme', 'id-ns', self.config.nvme_device, '-n', str(_ns)]
+        ns_info, _err, _rc = self._nvme_id_dict(_ns_cmd)
+        if not ns_info:
+            log.warning(f"  id-ns rc={_rc}")
+            log.warning(f"    cmd    : {' '.join(_ns_cmd)}")
+            if _err:
+                log.warning(f"    stderr : {_err}")
             log.warning("=" * 60)
             return
         try:
@@ -4172,16 +4222,15 @@ class NVMeFuzzer:
 
     def _get_mdts(self) -> int:
         """MDTS (Maximum Data Transfer Size) 조회 및 캐싱 (5000 exec마다 갱신).
-        반환값: MDTS 값 (0 = no limit). nvme id-ctrl의 mdts 필드."""
+        반환값: MDTS 값 (0 = no limit). nvme id-ctrl의 mdts 필드.
+        구버전 nvme-cli 호환 — JSON 미지원 시 text 출력 파싱 fallback."""
         if (self._mdts_cache is None or
                 self.executions - self._mdts_cache_at > self.MDTS_CACHE_TTL):
+            ctrl_info, _, _ = self._nvme_id_dict(
+                ['nvme', 'id-ctrl', self.config.nvme_device])
             try:
-                out = subprocess.check_output(
-                    ["nvme", "id-ctrl", self.config.nvme_device, "--output-format=json"],
-                    timeout=3, stderr=subprocess.DEVNULL)
-                ctrl_info = json.loads(out)
                 self._mdts_cache = int(ctrl_info.get("mdts", 0))
-            except Exception:
+            except (ValueError, TypeError):
                 self._mdts_cache = 0
             self._mdts_cache_at = self.executions
         return self._mdts_cache
