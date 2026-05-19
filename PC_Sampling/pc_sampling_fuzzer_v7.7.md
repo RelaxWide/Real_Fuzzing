@@ -180,6 +180,52 @@ sudo python3 pc_sampling_fuzzer_v7.6.py --product PM9M1 --nvme /dev/nvme0 --all-
 - server/datacenter (SMI, hypervisor, VM passthrough)
 - embedded/자동차 (hardware glitch level)
 
+### v7.7 후속 정리
+
+#### forced_idle slot — APST 자율 진입으로 변경
+
+기존: `SetFeatures FID=0x02 cdw11=4` 강제 PS=4 → settle 2초 × 2회 = 4초 대기. 일부 SSD 가 강제 PS=4 만으로는 NAND deep sleep 까지 도달하지 못함 + 실제 OS 동작과 다른 경로.
+
+신규: PM rotation 의 forced_idle slot 동안만 APST 짧은 ITPT 로 활성화 → 디바이스 자율 PS0 → PS3 → PS4 전환. 슬롯 종료 시 다시 disable → 다른 슬롯 (POWER_COMBO/pcie_bit/clkreq) 의 manual PM 제어와 충돌 X.
+
+| 단계 | 시간 | 동작 |
+|------|------|------|
+| 1 | t=0 | `_apst_enable_short_itpt(500, 2000)` — APST table 설정 |
+| 2 | t=0.5s | device 자율 PS0 → PS3 진입 |
+| 3 | t=2.5s | device 자율 PS3 → PS4 진입 |
+| 4 | t=3.5s | sampling stop + `_apst_disable()` |
+
+APST table (256B): Entry[0]=(ITPS=3, ITPT=500ms), Entry[3]=(ITPS=4, ITPT=2000ms). 나머지 entry/upper 32-bit reserved=0.
+
+#### Replay 산출물 self-contained
+
+| 항목 | 변경 |
+|------|------|
+| crash_<ts>/ 폴더 통합 | `_handle_timeout_crash` 시작 시 미리 생성하여 replay_<tag>.sh + replay_data_<tag>/ + dump + log + dmesg 모두 동일 폴더에. 통째로 다른 머신에 옮겨도 동작. |
+| `--input-file` 상대경로 | `cd "${SCRIPT_DIR}"` 헤더 + `./replay_data_<tag>/data_NNN.bin` — 어디서 실행해도 동작 |
+| dump 파일명 시분초 | `%Y%m%d_%H%M%S` — 동일 일자 다중 crash 시 덮어쓰기 방지. JLink dump 는 `DUMP_TIMESTAMP` env var + argv `$1` 로 shell 에 전달. |
+| crash JSON 정리 | raw fuzz_data binary + .dmesg.txt 제거. `.json` 만 유지 (seed CDW + stuck PC top5 + dmesg 필드). 명령 데이터는 `replay_data_<tag>/data_NNN.bin` 에 이미 포함. |
+| PM 복구 replay 순서 | `_pm_d3_safe_restore` 가 `_pm_set_state(0)` 호출 직전에 `pcie_state(L0+D0)` entry 를 `_cmd_history` 에 기록 → replay 가 setpci L0+D0 → SetFeatures PS0 순서로 정확히 재생 (이전엔 D3hot 상태에서 PS0 시도 → hang) |
+| device path 정규화 | replay 출력 직전 `/dev/nvme0n1n1` 같은 중복 `nN` 접미사 제거 (`_normalize_nvme_path`) |
+| replay 분기 확장 | `_generate_replay_sh` 에 `pcie_pm_bit` (setpci) / `clkreq` (PMU 4 mode 시퀀스) 분기 추가 — PM perturbation 발생 시점도 완전 재현 가능 |
+
+#### Device 호환성
+
+| 항목 | 변경 |
+|------|------|
+| WSL2 / namespace-only 환경 | `/dev/nvme0` controller char device 없으면 `/dev/nvme0n*` glob 으로 namespace block device 검색 → 최저 ns id 사용. `_io_device()` 헬퍼가 admin/io 모두 동일 경로 사용. |
+| `--nvme /dev/nvme0nN` 명시 | path 에서 namespace 번호 추출 → `config.nvme_namespace` 자동 보정 (mismatch 시 `EINVAL` 방지) |
+| nvme-cli 구버전 | `-o json` → `--output-format=json` 으로 변경. JSON 자체 미지원 환경에선 text 출력 파싱 fallback (`_parse_nvme_text`) — 모든 `id-ctrl`/`id-ns` 호출이 `_nvme_id_dict()` 헬퍼 통과 |
+
+#### Logging / 진단
+
+| 항목 | 변경 |
+|------|------|
+| FileHandler encoding | 명시적 `encoding='utf-8'` — sudo / C locale 환경에서 μ/✓/→/한글 깨짐 방지 |
+| stderr 인코딩 | `sys.stderr.reconfigure(encoding='utf-8', errors='replace')` (Python 3.7+; 실패 시 silent skip) |
+| Device Information 출력 | idle universe 수집 완료 직후 `_log_device_info()` 호출 — Model/Serial/Firmware/Vendor ID/IEEE OUI/NVMe spec/Namespaces/MDTS + Namespace size/LBA size/사용량 + PCIe BDF/Root Port/ASPM cap 한 박스에 표시 |
+| nvme-cli 실패 진단 | id-ctrl/id-ns 실패 시 stderr 메시지 + 실제 cmd 전체 + stdout 일부 출력 — 권한/구버전/옵션 인식 실패 원인 즉시 판별 |
+
 ---
 
 ## v7.6 변경사항
@@ -922,7 +968,7 @@ v7.6에서 제거된 산출물:
 
 | 버전 | 주요 변경 |
 |------|-----------|
-| **v7.7** | S1+S2 PM Robustness Perturbation 도입. 기존 PM rotation slot 에 PCIe config 13 비트 perturb (LNKCTL/DEVCTL2/PMCSR/L1SS, 변경 유지) + CLKREQ# 4 mode (missed_wake / extended_wait / short_pulse / rapid_toggle) 통합. PMCSR D1/D2 일회성 forced (50ms→D0 + readback 검증). **`--pm` 옵션 활성 시 자동 동작** (별도 옵션 없음). Completion Timeout / Common Mode Restore 등 host timeout 로직 영향 비트 제외 — vendor 클레임 가능 영역만. S1/S2 preflight 추가 (PowerCombo preflight 직후 17개 perturbation 결정적 검증). `_generate_replay_sh()` 가 `pcie_pm_bit` / `clkreq` event 도 setpci/PMU 시퀀스로 변환 → PM crash 완전 재현. Init 순서 보정: idle universe 수집을 PM preflight 앞으로 이동 (PM 전환 잔여 효과로 idle PC 오염 차단). |
+| **v7.7** | S1+S2 PM Robustness Perturbation 도입. 기존 PM rotation slot 에 PCIe config 13 비트 perturb (LNKCTL/DEVCTL2/PMCSR/L1SS, 변경 유지) + CLKREQ# 4 mode (missed_wake / extended_wait / short_pulse / rapid_toggle) 통합. PMCSR D1/D2 일회성 forced (50ms→D0 + readback 검증). **`--pm` 옵션 활성 시 자동 동작** (별도 옵션 없음). Completion Timeout / Common Mode Restore 등 host timeout 로직 영향 비트 제외 — vendor 클레임 가능 영역만. S1/S2 preflight 추가. forced_idle slot 을 APST 자율 PS3→PS4 진입 방식으로 전환 (짧은 ITPT로 OS 동작 모사 + 다른 슬롯과 충돌 X). `_generate_replay_sh()` 가 `pcie_pm_bit`/`clkreq`/`pcie_state(restore)` event 까지 setpci+PMU+SetFeatures 시퀀스로 정확히 재생. D3 복구 시 L0+D0 setpci 가 PS0 SetFeatures 보다 먼저 기록되도록 순서 보정. Init: idle universe 수집을 PM preflight 앞으로 이동. Crash artifact: replay/dump/log/dmesg 모두 `crash_<ts>/` 단일 폴더, 상대경로 `--input-file` 로 통째로 옮기기 가능, 시분초 timestamp. Device 호환: WSL2/namespace-only 환경 자동 fallback + `nvme_namespace` path 기반 보정, nvme-cli 구버전 text 출력 파싱 fallback, idle 직후 Device Information 박스 (Model/Serial/FW/PCIe BDF/ASPM/Namespace size) 출력, UTF-8 logging encoding 명시. |
 | v7.6 | 시각화 개선: coverage_growth(velocity bar + plateau + milestone), firmware_map(BB gradient + 전체 함수 treemap + Top-N 라벨), csfuzz_dynamics 신규(3-panel p/corpus/m1m2). per-command CFG 생성 제거. |
 | v7.5 | SequenceSeed corpus + 2-pass favored cull 일관성. Sequence ctx를 Write mutation 결과에서 파생 + `full`/`lba_nlb` 두 모드 지원 (Write→Write는 data 분리). seq_corpus/ replay .sh 자동 저장 + 고아 청소. BUILTIN_SEQUENCES에 기본 모드 시퀀스(Write→Read, Write→Write) 추가. SequenceSeed window 초과 fallback에서 exec_count 보정. `--no-jlink-dump` 추가. CLI 옵션 51→19. DSM/Copy NR 마스크 수정. |
 | v7.4 | Phase 1 (NLB/MDTS data_len), Phase 2 (64-bit LBA, DSM/Copy structured), Phase 3 (builtin sequence). PM 로테이션을 seed 선택 전으로 이동. |
