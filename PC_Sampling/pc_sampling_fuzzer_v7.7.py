@@ -1142,13 +1142,20 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     )
 
     # 파일: 매 실행마다 새 파일 생성 (INFO 이상 전체 기록)
-    fh = logging.FileHandler(log_file)
+    # encoding='utf-8' 명시 — sudo / C locale 환경에서 μ/✓/→/한글 깨짐 방지.
+    # errors='replace' — 인코딩 불가 문자는 '?' 로 치환하여 logging 자체 실패 차단.
+    fh = logging.FileHandler(log_file, encoding='utf-8', errors='replace')
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
     # 콘솔: 초기화 단계에서는 WARNING 이상 전부 출력
     # 메인 퍼징 루프 진입 시 _FuzzingTerminalFilter 추가로 제한됨
+    # stderr 도 UTF-8 로 reconfigure (Python 3.7+) — TTY 인코딩이 C/POSIX 일 때 보호.
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
     ch = logging.StreamHandler()
     ch.setLevel(logging.WARNING)
     # TTY이면 컬러 포매터, 파이프/리다이렉트이면 일반 포매터
@@ -8855,6 +8862,17 @@ class NVMeFuzzer:
         self._load_seeds()
 
         nvme_dev = self.config.nvme_device
+        # 사용자가 --nvme /dev/nvmeXnY 처럼 namespace 경로를 직접 명시했을 때,
+        # path 의 ns id 와 config.nvme_namespace 가 불일치하면 path 기준으로 보정.
+        # 그렇지 않으면 nvme-cli 가 ns mismatch 로 EINVAL("Invalid argument") 반환.
+        _m_path_ns = re.search(r'n(\d+)$', nvme_dev)
+        if _m_path_ns:
+            _path_ns = int(_m_path_ns.group(1))
+            if _path_ns != self.config.nvme_namespace:
+                log.warning(f"[Pre-flight] --nvme path '{nvme_dev}' 의 ns={_path_ns} 가 "
+                            f"--namespace {self.config.nvme_namespace} 와 불일치 → "
+                            f"path 기준으로 보정 (namespace := {_path_ns})")
+                self.config.nvme_namespace = _path_ns
         if not os.path.exists(nvme_dev):
             # WSL2 / 일부 인클로저 환경: controller char device(/dev/nvme0)는 없고
             # namespace block device(/dev/nvme0nN)만 노출됨. namespace 번호는
