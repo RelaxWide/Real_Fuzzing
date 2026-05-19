@@ -5622,22 +5622,64 @@ class NVMeFuzzer:
         return (combo.pcie_d  == PCIeDState.D3
                 or combo.pcie_l == PCIeLState.L1_2)
 
+    def _record_pcie_state_history(self, combo: PowerCombo, ok: bool, label: str) -> None:
+        """_cmd_history 에 pcie_state entry 추가 — replay .sh 가 setpci 재현 가능하게.
+        _set_power_combo 의 인라인 기록과 동일 포맷.
+        """
+        if not self._pcie_bdf:
+            return
+        self._cmd_history.append({
+            'kind':                  'pcie_state',
+            'label':                 label,
+            'ok':                    ok,
+            'pcie_l':                int(combo.pcie_l),
+            'pcie_d':                int(combo.pcie_d),
+            'pcie_bdf':              self._pcie_bdf,
+            'pcie_cap_offset':       self._pcie_cap_offset,
+            'pcie_pm_cap_offset':    self._pcie_pm_cap_offset,
+            'pcie_l1ss_offset':      self._pcie_l1ss_offset,
+            'pcie_lnkcap':           self._pcie_lnkcap,
+            'pcie_l1ss_cap':         self._pcie_l1ss_cap,
+            'pcie_root_bdf':         self._pcie_root_bdf,
+            'pcie_root_cap_offset':  self._pcie_root_cap_offset,
+            'pcie_root_l1ss_offset': self._pcie_root_l1ss_offset,
+            'pmu_script':            self.config.pmu_script,
+            'clkreq_assert_pin':     self.config.clkreq_assert_pin,
+            'clkreq_deassert_pin':   self.config.clkreq_deassert_pin,
+            'clkreq_voltage_mv':     self.config.clkreq_voltage_mv,
+        })
+
     def _nonop_restore(self, combo: PowerCombo) -> PowerCombo:
         """D3hot/L1.2 → NVMe 커맨드 가능 상태 복귀. 복귀 후 PowerCombo 반환.
         복귀 실패 시 경고를 남기고 baseline combo를 반환 (호출부가 NVMe 응답으로 최종 확인).
+
+        Replay 호환: 복귀 후 baseline(PS0+L0+D0) 또는 (cur_ps+L0+D0) 를 pcie_state
+        entry 로 _cmd_history 에 기록 → replay .sh 가 L0/D0 setpci 를 재생산하여
+        후속 NVMe SetFeatures PS0 가 D3hot 상태에서 hang 하는 문제 차단.
         """
         if combo.pcie_d == PCIeDState.D3:
             log.warning(f"[PM] NonOp restore: {combo.label} → D0+L0+PS0")
             ok = self._pm_d3_safe_restore()
             if not ok:
                 log.warning("[PM] NonOp restore: D3 복귀 실패 — 장치 응답 불가 상태일 수 있음")
+            # _pm_d3_safe_restore 의 setpci L0/D0 writes 는 history 미기록 — 보정.
+            # (_pm_set_state(0) 의 'pm' entry 는 별도로 이미 기록됨.)
+            self._record_pcie_state_history(
+                POWER_COMBOS[0], ok,
+                f'NonOp restore L0+D0 (from {combo.label})')
             return POWER_COMBOS[0]  # PS0+L0+D0
 
         log.warning(f"[PM] NonOp restore: {combo.label} → L0")
         ok = self._set_pcie_l_state(PCIeLState.L0)
         if not ok:
             log.warning("[PM] NonOp restore: L0 복귀 실패 — clock 복원 안 됨")
-        return PowerCombo(combo.nvme_ps, PCIeLState.L0, PCIeDState.D0)
+        # _set_pcie_l_state 의 setpci 변경 ('L1.2→L0' CLKREQ# assert + LNKCTL/L1SS clear)
+        # 는 history 미기록 — 보정.
+        _restored = PowerCombo(combo.nvme_ps, PCIeLState.L0, PCIeDState.D0)
+        self._record_pcie_state_history(
+            _restored, ok,
+            f'NonOp restore L0 (from {combo.label})')
+        return _restored
 
     def _pm_verify_combo(self, combo: PowerCombo) -> dict:
         """PM 상태 다중 검증 (PMU/PMCSR/LNKCTL/L1SS/sysfs) → dict 반환."""
