@@ -7262,6 +7262,10 @@ class NVMeFuzzer:
         from collections import Counter
 
         _crash_time = datetime.now()   # artifact 폴더 타임스탬프 기준
+        # crash 산출물 통합 폴더 — replay.sh, replay_data/, dump, log, dmesg 모두 여기로.
+        # _collect_crash_artifacts 도 동일 경로를 재계산해서 사용 (mkdir exist_ok).
+        _crash_dir = self.crashes_dir / f"crash_{_crash_time.strftime('%Y%m%d_%H%M%S')}"
+        _crash_dir.mkdir(parents=True, exist_ok=True)
 
         # calibration 구간은 J-Link DLL 노이즈 억제를 위해 fd 2(stderr)를
         # /dev/null로 리다이렉트한다. 이 상태에서 log.error()를 호출하면
@@ -7401,11 +7405,12 @@ class NVMeFuzzer:
         except Exception as _save_exc:
             log.error(f"  Crash 데이터 저장 실패: {_save_exc}")
 
-        # 3.5) 재현 TC replay 스크립트 생성
+        # 3.5) 재현 TC replay 스크립트 생성 — crash_<ts>/ 안에 직접 생성하여
+        # replay_<tag>.sh + replay_data_<tag>/ 가 함께 self-contained.
         _replay_tag = hashlib.md5(fuzz_data).hexdigest()[:8]
-        log.warning("[TIMEOUT] 재현 TC 스크립트를 생성합니다...")
+        log.warning(f"[TIMEOUT] 재현 TC 스크립트를 생성합니다 → {_crash_dir}/")
         try:
-            self._generate_replay_sh(self.crashes_dir, _replay_tag)
+            self._generate_replay_sh(_crash_dir, _replay_tag)
         except Exception as _replay_exc:
             log.warning(f"[REPLAY] replay .sh 생성 실패: {_replay_exc}")
 
