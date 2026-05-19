@@ -4044,7 +4044,7 @@ class NVMeFuzzer:
             try:
                 out = subprocess.check_output(
                     ["nvme", "id-ns", self.config.nvme_device,
-                     "-n", str(self.config.nvme_namespace or 1), "-o", "json"],
+                     "-n", str(self.config.nvme_namespace or 1), "--output-format=json"],
                     timeout=3, stderr=subprocess.DEVNULL)
                 ns_info = json.loads(out)
                 self._nsze_cache = int(ns_info.get("nsze", 0x100000))
@@ -4064,7 +4064,7 @@ class NVMeFuzzer:
 
         # id-ctrl — stderr 캡처하여 실패 시 실제 메시지 표시
         ctrl: dict = {}
-        _cmd = ['nvme', 'id-ctrl', self.config.nvme_device, '-o', 'json']
+        _cmd = ['nvme', 'id-ctrl', self.config.nvme_device, '--output-format=json']
         try:
             _r = subprocess.run(_cmd, timeout=5,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -4111,7 +4111,7 @@ class NVMeFuzzer:
         ns_info: dict = {}
         _ns = self.config.nvme_namespace or 1
         _ns_cmd = ['nvme', 'id-ns', self.config.nvme_device,
-                   '-n', str(_ns), '-o', 'json']
+                   '-n', str(_ns), '--output-format=json']
         try:
             _r = subprocess.run(_ns_cmd, timeout=5,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -4177,7 +4177,7 @@ class NVMeFuzzer:
                 self.executions - self._mdts_cache_at > self.MDTS_CACHE_TTL):
             try:
                 out = subprocess.check_output(
-                    ["nvme", "id-ctrl", self.config.nvme_device, "-o", "json"],
+                    ["nvme", "id-ctrl", self.config.nvme_device, "--output-format=json"],
                     timeout=3, stderr=subprocess.DEVNULL)
                 ctrl_info = json.loads(out)
                 self._mdts_cache = int(ctrl_info.get("mdts", 0))
