@@ -8857,22 +8857,51 @@ class NVMeFuzzer:
         nvme_dev = self.config.nvme_device
         if not os.path.exists(nvme_dev):
             # WSL2 / 일부 인클로저 환경: controller char device(/dev/nvme0)는 없고
-            # namespace block device(/dev/nvme0n1)만 노출됨. nvme-cli 는 namespace
-            # device 로도 admin/io 모두 동작 가능 → 자동 fallback.
+            # namespace block device(/dev/nvme0nN)만 노출됨. namespace 번호는
+            # 1 일 수도 있고 (대부분) 2/3/... 일 수도 있음 (vendor format 후 등).
+            # nvme-cli 는 namespace device 로 admin/io 모두 동작 가능 → 자동 fallback.
+            _ns_dev = None
+            _ns_id  = None
             if _NVME_NS_SUFFIX_RE.search(nvme_dev):
-                _ns_dev = nvme_dev   # 이미 namespace 경로
+                # 이미 namespace 경로 — 그대로 사용, namespace id 도 path 에서 추출
+                _ns_dev = nvme_dev
+                _m = re.search(r'n(\d+)$', nvme_dev)
+                if _m:
+                    _ns_id = int(_m.group(1))
             else:
-                _ns = self.config.nvme_namespace or 1
-                _ns_dev = f"{nvme_dev}n{_ns}"
-            if os.path.exists(_ns_dev):
+                # 우선 configured namespace 시도, 없으면 동일 controller 의 다른 namespace glob.
+                _ctrl = os.path.basename(nvme_dev)   # e.g. "nvme0"
+                _ns   = self.config.nvme_namespace or 1
+                _cand = f"{nvme_dev}n{_ns}"
+                if os.path.exists(_cand):
+                    _ns_dev, _ns_id = _cand, _ns
+                else:
+                    # glob 으로 동일 controller 의 노출된 namespace 검색
+                    import glob as _glob
+                    _hits = sorted(_glob.glob(f"{nvme_dev}n*"))
+                    # nvme0n1, nvme0n2 ... 형태만 — 다른 device(예: nvme0_1) 배제
+                    _hits = [p for p in _hits
+                             if re.match(rf"^{re.escape(nvme_dev)}n\d+$", p)]
+                    if _hits:
+                        # 숫자 가장 작은 것 우선
+                        _hits.sort(key=lambda p: int(re.search(r'n(\d+)$', p).group(1)))
+                        _ns_dev = _hits[0]
+                        _ns_id  = int(re.search(r'n(\d+)$', _ns_dev).group(1))
+            if _ns_dev and os.path.exists(_ns_dev):
                 log.warning(f"[Pre-flight] controller {nvme_dev} 없음 → "
                             f"namespace device {_ns_dev} 로 fallback "
                             "(admin/io 모두 동일 경로 사용)")
                 self.config.nvme_device = _ns_dev
+                if _ns_id is not None and _ns_id != self.config.nvme_namespace:
+                    log.warning(f"[Pre-flight] nvme_namespace 자동 보정: "
+                                f"{self.config.nvme_namespace} → {_ns_id} "
+                                "(검출된 device 의 namespace id 와 일치)")
+                    self.config.nvme_namespace = _ns_id
                 nvme_dev = _ns_dev
             else:
                 log.error(f"[Pre-flight] NVMe 디바이스 {nvme_dev} 가 존재하지 않습니다.")
-                log.error(f"  fallback {_ns_dev} 도 없음. nvme list / ls /dev/nvme* 로 확인.")
+                log.error(f"  같은 controller 의 namespace device 도 못 찾음. "
+                          f"nvme list / ls /dev/nvme* 로 확인.")
                 return
         if not os.access(nvme_dev, os.R_OK | os.W_OK):
             log.error(f"[Pre-flight] NVMe 디바이스 {nvme_dev} 에 대한 읽기/쓰기 권한이 없습니다.")
