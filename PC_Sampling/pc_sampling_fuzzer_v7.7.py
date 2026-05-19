@@ -5599,20 +5599,35 @@ class NVMeFuzzer:
             log.warning(f"[KeepAlive] 복원 실패: {e}")
 
     def _pm_d3_safe_restore(self) -> bool:
-        """D3hot/L1.2+D3 → PS0+L0+D0 복귀. 순서: L0 → D0 → Trst(10ms) → PS0."""
+        """D3hot/L1.2+D3 → PS0+L0+D0 복귀. 순서: L0 → D0 → Trst(10ms) → PS0.
+
+        Replay 호환: PS0 SetFeatures 전에 baseline(PS0+L0+D0) pcie_state entry
+        를 _cmd_history 에 명시 기록 → replay .sh 가 L0+D0 setpci 시퀀스를
+        PS0 SetFeatures 보다 먼저 출력. 그렇지 않으면 _pm_set_state(0) 가
+        먼저 'pm' entry 를 추가해버려 replay 가 D3hot 상태에서 PS0 시도 → hang.
+        """
         ok = True
         # Step 1: L0 먼저 — L1.2이면 CLKREQ# assert로 clock 복원 (TLP 전 필수)
         if self._pcie_bdf and self._pcie_cap_offset is not None:
             ok &= self._set_pcie_l_state(PCIeLState.L0)
             if not ok:
                 log.warning("[PM] D3 restore: L0 복귀 실패 — clock 없음, D0/PS0 중단")
+                # 실패해도 부분 복귀 기록 — replay 에서 동일 시도 후 일관된 실패 가능.
+                self._record_pcie_state_history(
+                    POWER_COMBOS[0], False,
+                    'D3 restore L0+D0 (L0 진입 실패)')
                 return False
         # Step 2: D3 → D0 (clock 복원 후 config space 접근)
         if self._pcie_bdf and self._pcie_pm_cap_offset is not None:
             ok &= self._set_pcie_d_state(PCIeDState.D0)
         # Step 3: Trst
         time.sleep(0.1)
-        # Step 4: NVMe PS0
+        # Step 3.5: pcie_state 기록 — PS0 SetFeatures 직전에 추가하여
+        # replay 순서가 "setpci L0+D0 → SetFeatures PS0" 가 되게 한다.
+        self._record_pcie_state_history(
+            POWER_COMBOS[0], ok,
+            'D3 restore L0+D0 (pre-PS0)')
+        # Step 4: NVMe PS0 — 위 entry 이후에 'pm' entry 추가됨.
         ok &= self._pm_set_state(0)
         return ok
 
@@ -5659,14 +5674,11 @@ class NVMeFuzzer:
         """
         if combo.pcie_d == PCIeDState.D3:
             log.warning(f"[PM] NonOp restore: {combo.label} → D0+L0+PS0")
+            # _pm_d3_safe_restore 내부에서 pcie_state(baseline) entry 를
+            # PS0 SetFeatures 직전에 기록 — replay 순서 보장.
             ok = self._pm_d3_safe_restore()
             if not ok:
                 log.warning("[PM] NonOp restore: D3 복귀 실패 — 장치 응답 불가 상태일 수 있음")
-            # _pm_d3_safe_restore 의 setpci L0/D0 writes 는 history 미기록 — 보정.
-            # (_pm_set_state(0) 의 'pm' entry 는 별도로 이미 기록됨.)
-            self._record_pcie_state_history(
-                POWER_COMBOS[0], ok,
-                f'NonOp restore L0+D0 (from {combo.label})')
             return POWER_COMBOS[0]  # PS0+L0+D0
 
         log.warning(f"[PM] NonOp restore: {combo.label} → L0")
