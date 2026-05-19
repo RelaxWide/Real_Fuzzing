@@ -4053,6 +4053,92 @@ class NVMeFuzzer:
             self._nsze_cache_at = self.executions
         return self._nsze_cache
 
+    def _log_device_info(self) -> None:
+        """nvme id-ctrl / id-ns 결과 + PCIe 정보를 정리해서 한 번에 터미널 출력.
+        idle universe 수집 직후 호출 → 어떤 device 에서 fuzz 돌렸는지 명확히 기록.
+        실패해도 fuzz 진행에 영향 없음 (best-effort).
+        """
+        log.warning("=" * 60)
+        log.warning(" Device Information")
+        log.warning("=" * 60)
+
+        # id-ctrl
+        ctrl: dict = {}
+        try:
+            out = subprocess.check_output(
+                ['nvme', 'id-ctrl', self.config.nvme_device, '-o', 'json'],
+                timeout=5, stderr=subprocess.DEVNULL)
+            ctrl = json.loads(out)
+        except Exception as e:
+            log.warning(f"  id-ctrl 조회 실패: {e}")
+
+        if ctrl:
+            _model  = str(ctrl.get('mn', '')).strip()
+            _serial = str(ctrl.get('sn', '')).strip()
+            _fw     = str(ctrl.get('fr', '')).strip()
+            _vid    = ctrl.get('vid', 0)
+            _ssvid  = ctrl.get('ssvid', 0)
+            _ieee   = ctrl.get('ieee', 'N/A')
+            _ver    = ctrl.get('ver', 0)
+            _nn     = ctrl.get('nn', '?')
+            _mdts   = ctrl.get('mdts', 0)
+            _subnqn = str(ctrl.get('subnqn', '')).strip()
+            _major  = (_ver >> 16) & 0xFFFF
+            _minor  = (_ver >> 8) & 0xFF
+            _tert   = _ver & 0xFF
+            log.warning(f"  Model       : {_model}")
+            log.warning(f"  Serial      : {_serial}")
+            log.warning(f"  Firmware    : {_fw}")
+            log.warning(f"  Vendor ID   : 0x{_vid:04x}  /  Subsys 0x{_ssvid:04x}")
+            log.warning(f"  IEEE OUI    : {_ieee}")
+            log.warning(f"  NVMe spec   : {_major}.{_minor}.{_tert}  (raw 0x{_ver:08x})")
+            log.warning(f"  Namespaces  : {_nn}")
+            log.warning(f"  MDTS        : {_mdts}  (0 = unlimited)")
+            if _subnqn:
+                log.warning(f"  SubNQN      : {_subnqn}")
+
+        # id-ns
+        try:
+            _ns = self.config.nvme_namespace or 1
+            out = subprocess.check_output(
+                ['nvme', 'id-ns', self.config.nvme_device,
+                 '-n', str(_ns), '-o', 'json'],
+                timeout=5, stderr=subprocess.DEVNULL)
+            ns_info = json.loads(out)
+            nsze = ns_info.get('nsze', 0)
+            ncap = ns_info.get('ncap', 0)
+            nuse = ns_info.get('nuse', 0)
+            # 현재 활성 LBA format 의 data size
+            lbafs    = ns_info.get('lbafs', [])
+            flbas    = ns_info.get('flbas', 0)
+            cur_idx  = flbas & 0xF
+            lba_size = 512
+            if 0 <= cur_idx < len(lbafs):
+                _ds = lbafs[cur_idx].get('ds', 9)   # log2(LBA size)
+                lba_size = 1 << _ds
+            _size_gb = nsze * lba_size / 1e9
+            _use_pct = (100 * nuse / ncap) if ncap else 0.0
+            log.warning(f"  Namespace {_ns}")
+            log.warning(f"    LBA size  : {lba_size} B  (lbaf={cur_idx})")
+            log.warning(f"    NSZE      : {nsze:,} LBAs  ({_size_gb:,.2f} GB)")
+            log.warning(f"    NCAP      : {ncap:,} LBAs")
+            log.warning(f"    NUSE      : {nuse:,} LBAs  ({_use_pct:.1f}% used)")
+        except Exception as e:
+            log.warning(f"  id-ns 조회 실패: {e}")
+
+        # PCIe 정보 (이미 _detect_pcie_info 가 호출되었으면 출력)
+        if self._pcie_bdf:
+            log.warning(f"  PCIe BDF    : {self._pcie_bdf}")
+            if self._pcie_root_bdf:
+                log.warning(f"  Root Port   : {self._pcie_root_bdf}")
+            if self._pcie_lnkcap is not None:
+                _aspms = (self._pcie_lnkcap >> 10) & 0x3
+                _cpm   = (self._pcie_lnkcap >> 18) & 0x1
+                _aspm_str = {0:'none',1:'L0s',2:'L1',3:'L0s+L1'}.get(_aspms, f'?{_aspms}')
+                log.warning(f"  ASPM cap    : {_aspm_str}  /  ClockPM={_cpm}")
+
+        log.warning("=" * 60)
+
     MDTS_CACHE_TTL = 5000
 
     def _get_mdts(self) -> int:
@@ -9018,6 +9104,9 @@ class NVMeFuzzer:
             log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
         else:
             log.warning("Idle PCs    : not detected (saturation = global PC only)")
+
+        # idle 유니버스 수집 완료 → 디바이스 정보 한 번에 출력
+        self._log_device_info()
 
         # PM preflight: idle 유니버스 수집 직후 전체 PowerCombo 검증.
         # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
