@@ -6867,8 +6867,11 @@ class NVMeFuzzer:
         sh_path  = crash_dir / f"replay_{tag}.sh"
         data_dir = crash_dir / f"replay_data_{tag}"
         data_dir.mkdir(exist_ok=True)
-        # 절대경로로 변환 — 스크립트를 어느 디렉토리에서 실행해도 경로가 깨지지 않음
+        # data 파일 write 는 절대경로 사용 (file I/O 안전).
+        # .sh 안에서는 스크립트 자신의 디렉토리로 cd → 상대경로 ${SCRIPT_DIR}/<...> 로 접근.
+        # → crashes/ 폴더만 통째로 다른 곳에 옮겨도 replay 동작.
         data_dir_abs = data_dir.resolve()
+        data_dir_rel = data_dir.name   # 'replay_data_<tag>' — sh_path 와 같은 디렉토리
 
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         # nvme_core 모듈 타임아웃 — 퍼저와 동일한 값
@@ -6885,6 +6888,10 @@ class NVMeFuzzer:
             "#",
             # set -e 대신 set +e — rc를 직접 캡처하기 위해 오류 즉시 종료 비활성화
             "set +e",
+            "",
+            "# 스크립트 자신의 디렉토리로 cd — replay_data_<tag>/ 를 상대경로로 접근 가능",
+            'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+            'cd "${SCRIPT_DIR}"',
             "",
             "# ── nvme_core 커널 timeout 설정 ─────────────────────────────────────",
             "# crash 발생 후 커널이 abort/reset_controller 를 수행하지 않도록",
@@ -7154,11 +7161,14 @@ class NVMeFuzzer:
             ]
 
             if entry['is_write'] and entry['data']:
-                # 절대경로로 data bin 파일 저장 — 스크립트 실행 위치 무관
-                data_file_abs = data_dir_abs / f"data_{i:03d}.bin"
+                # data bin 파일은 절대경로로 write (file I/O), .sh 안에선 상대경로로 참조.
+                # 스크립트 시작 시 SCRIPT_DIR 로 cd 했으므로 ./replay_data_<tag>/data_NNN.bin 으로 접근.
+                _data_filename = f"data_{i:03d}.bin"
+                data_file_abs = data_dir_abs / _data_filename
                 data_file_abs.write_bytes(entry['data'])
+                _data_rel = f"./{data_dir_rel}/{_data_filename}"
                 cmd_parts += [f"--data-len={entry['data_len']}",
-                               f"--input-file={data_file_abs}", "-w"]
+                               f"--input-file={_data_rel}", "-w"]
             elif entry['data_len'] > 0:
                 cmd_parts += [f"--data-len={entry['data_len']}", "-r"]
 
