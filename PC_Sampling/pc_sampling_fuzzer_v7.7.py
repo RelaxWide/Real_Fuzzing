@@ -2997,13 +2997,26 @@ class NVMeFuzzer:
         self.state_corpus_dir.mkdir(parents=True, exist_ok=True)
         self.seq_corpus_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _normalize_nvme_path(path: str) -> str:
+        """터미널의 중복된 nN 접미사 정리. /dev/nvme0n1n1 → /dev/nvme0n1.
+        과거 버전에서 nvme_device=/dev/nvme0n1 인 상태로 f"{dev}n{ns}" 가
+        실행되어 corpus / cmd_history 에 잘못 들어간 device path 가 있을 수
+        있으므로 replay 직전 정규화."""
+        # 끝의 연속된 nN+ 패턴을 찾아 첫 번째 nN 만 남김
+        m = re.search(r'(n\d+){2,}$', path)
+        if m:
+            first = re.match(r'n\d+', m.group()).group()
+            return path[:m.start()] + first
+        return path
+
     def _io_device(self) -> str:
         """io-passthru / 블록 디바이스 작업용 namespace 경로 반환.
         nvme_device 가 이미 namespace 경로(/dev/nvme0n1)면 그대로,
         controller 경로(/dev/nvme0)면 n{namespace} 를 붙임.
         WSL2 등 controller char device 가 없는 환경 호환을 위한 헬퍼.
         """
-        dev = self.config.nvme_device
+        dev = self._normalize_nvme_path(self.config.nvme_device)
         if _NVME_NS_SUFFIX_RE.search(dev):
             return dev
         return f"{dev}n{self.config.nvme_namespace or 1}"
@@ -7161,8 +7174,11 @@ class NVMeFuzzer:
                 lines.append("")
                 continue
 
+            # device path 방어 정규화 — 과거 corpus / cmd_history 에 잘못 저장된
+            # /dev/nvme0n1n1 같은 중복 nN 접미사를 replay 시점에 한 번 더 정리.
+            _entry_dev = self._normalize_nvme_path(entry['device'])
             cmd_parts = [
-                "nvme", entry['passthru_type'], entry['device'],
+                "nvme", entry['passthru_type'], _entry_dev,
                 f"--opcode={entry['opcode']:#x}",
                 f"--namespace-id={entry['nsid']}",
                 f"--cdw2={entry['cdw2']:#x}",
