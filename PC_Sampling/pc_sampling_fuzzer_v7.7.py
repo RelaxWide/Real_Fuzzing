@@ -7212,12 +7212,15 @@ class NVMeFuzzer:
     def _save_crash(self, data: bytes, seed: Seed, reason: str = "timeout",
                     stuck_pcs: Optional[List[Tuple[int, ...]]] = None,
                     dmesg_snapshot: Optional[str] = None):
+        """crash 메타데이터를 .json 1개만 저장.
+
+        raw fuzz_data binary 와 별도 .dmesg.txt 는 더 이상 저장하지 않음:
+          - 명령 데이터: replay_data_<tag>/data_NNN.bin 에 이미 포함됨
+          - dmesg: .json 의 dmesg_snapshot 필드 + dmesg_<ts>.txt (수집 시점) 으로 충분
+        """
         input_hash = hashlib.md5(data).hexdigest()[:12]
         filename = f"crash_{seed.cmd.name}_{hex(seed.cmd.opcode)}_{input_hash}"
         filepath = self.crashes_dir / filename
-
-        with open(filepath, 'wb') as f:
-            f.write(data)
 
         meta = self._seed_meta(seed)
         meta["crash_reason"] = reason
@@ -7242,13 +7245,6 @@ class NVMeFuzzer:
 
         if dmesg_snapshot:
             meta["dmesg_snapshot"] = dmesg_snapshot
-            # 별도 텍스트 파일로도 저장 (JSON에 넣기엔 길 수 있으므로)
-            dmesg_file = str(filepath) + '.dmesg.txt'
-            try:
-                with open(dmesg_file, 'w') as f:
-                    f.write(dmesg_snapshot)
-            except Exception:
-                pass
 
         with open(str(filepath) + '.json', 'w') as f:
             json.dump(meta, f, indent=2)
