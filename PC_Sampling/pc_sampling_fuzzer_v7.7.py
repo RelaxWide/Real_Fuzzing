@@ -191,6 +191,11 @@ PRODUCT_CONFIGS = {
 NVME_DEVICE    = '/dev/nvme0'
 NVME_NAMESPACE = 1
 
+# nvme_device 경로가 이미 namespace 형태(/dev/nvme0n1)인지 판단.
+# WSL2 등 일부 환경에선 controller char device(/dev/nvme0)가 없고
+# namespace block device 만 노출됨 → fallback 처리에 사용.
+_NVME_NS_SUFFIX_RE = re.compile(r'n\d+$')
+
 # NVMe 명령어 그룹별 타임아웃 (ms)
 # 그룹에 속하지 않는 명령어는 모두 'command'에 해당
 NVME_TIMEOUTS = {
@@ -2790,7 +2795,7 @@ class NVMeFuzzer:
         수단: dd if=/dev/urandom of=<ns_dev> bs=<prefill_bs> — 블록 디바이스 전체 덮어쓰기.
         주의: 드라이브 용량에 따라 수 분~수십 분 소요. 완료 후 POR로 FTL 상태 리셋됨.
         """
-        ns_dev = f"{self.config.nvme_device}n{self.config.nvme_namespace}"
+        ns_dev = self._io_device()
         bs = self.config.prefill_bs
 
         if not os.path.exists(ns_dev):
@@ -2992,9 +2997,20 @@ class NVMeFuzzer:
         self.state_corpus_dir.mkdir(parents=True, exist_ok=True)
         self.seq_corpus_dir.mkdir(parents=True, exist_ok=True)
 
+    def _io_device(self) -> str:
+        """io-passthru / 블록 디바이스 작업용 namespace 경로 반환.
+        nvme_device 가 이미 namespace 경로(/dev/nvme0n1)면 그대로,
+        controller 경로(/dev/nvme0)면 n{namespace} 를 붙임.
+        WSL2 등 controller char device 가 없는 환경 호환을 위한 헬퍼.
+        """
+        dev = self.config.nvme_device
+        if _NVME_NS_SUFFIX_RE.search(dev):
+            return dev
+        return f"{dev}n{self.config.nvme_namespace or 1}"
+
     def _detect_lba_size(self) -> int:
         """blockdev --getss로 LBA 크기 자동 감지. 실패 시 512 반환."""
-        ns_dev = f"{self.config.nvme_device}n{self.config.nvme_namespace}"
+        ns_dev = self._io_device()
         r = self._run_cmd(['blockdev', '--getss', ns_dev])
         if r:
             try:
@@ -6202,7 +6218,7 @@ class NVMeFuzzer:
         # IO 명령은 namespace block device(/dev/nvme0n1)를 사용해야 한다.
         # Admin 명령은 char device 그대로 사용.
         if passthru_type == "io-passthru":
-            target_device = f"{self.config.nvme_device}n{self.config.nvme_namespace}"
+            target_device = self._io_device()
         else:
             target_device = self.config.nvme_device
 
@@ -6763,7 +6779,7 @@ class NVMeFuzzer:
                 passthru_type = ('admin-passthru' if cmd.cmd_type == NVMeCommandType.ADMIN
                                  else 'io-passthru')
             device = (self.config.nvme_device if passthru_type == 'admin-passthru'
-                      else f"{self.config.nvme_device}n{self.config.nvme_namespace or 1}")
+                      else self._io_device())
             data = seed.data
             _lba_sz = self.config.nvme_lba_size or 512
             _IO_NO_NLB = ("Flush", "DatasetManagement",
@@ -8770,9 +8786,24 @@ class NVMeFuzzer:
 
         nvme_dev = self.config.nvme_device
         if not os.path.exists(nvme_dev):
-            log.error(f"[Pre-flight] NVMe 디바이스 {nvme_dev} 가 존재하지 않습니다.")
-            log.error("  nvme list / ls /dev/nvme* 로 확인하세요.")
-            return
+            # WSL2 / 일부 인클로저 환경: controller char device(/dev/nvme0)는 없고
+            # namespace block device(/dev/nvme0n1)만 노출됨. nvme-cli 는 namespace
+            # device 로도 admin/io 모두 동작 가능 → 자동 fallback.
+            if _NVME_NS_SUFFIX_RE.search(nvme_dev):
+                _ns_dev = nvme_dev   # 이미 namespace 경로
+            else:
+                _ns = self.config.nvme_namespace or 1
+                _ns_dev = f"{nvme_dev}n{_ns}"
+            if os.path.exists(_ns_dev):
+                log.warning(f"[Pre-flight] controller {nvme_dev} 없음 → "
+                            f"namespace device {_ns_dev} 로 fallback "
+                            "(admin/io 모두 동일 경로 사용)")
+                self.config.nvme_device = _ns_dev
+                nvme_dev = _ns_dev
+            else:
+                log.error(f"[Pre-flight] NVMe 디바이스 {nvme_dev} 가 존재하지 않습니다.")
+                log.error(f"  fallback {_ns_dev} 도 없음. nvme list / ls /dev/nvme* 로 확인.")
+                return
         if not os.access(nvme_dev, os.R_OK | os.W_OK):
             log.error(f"[Pre-flight] NVMe 디바이스 {nvme_dev} 에 대한 읽기/쓰기 권한이 없습니다.")
             log.error("  sudo로 실행하거나 권한을 확인하세요.")
