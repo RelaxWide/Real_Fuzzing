@@ -1143,8 +1143,9 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
 
     # 파일: 매 실행마다 새 파일 생성 (INFO 이상 전체 기록)
     # encoding='utf-8' 명시 — sudo / C locale 환경에서 μ/✓/→/한글 깨짐 방지.
-    # errors='replace' — 인코딩 불가 문자는 '?' 로 치환하여 logging 자체 실패 차단.
-    fh = logging.FileHandler(log_file, encoding='utf-8', errors='replace')
+    # 주의: errors='replace' 는 Python 3.9+ 만 지원 → 호환성 위해 사용 안 함.
+    # UTF-8 은 모든 Unicode 표현 가능하므로 encode 실패 가능성 없음.
+    fh = logging.FileHandler(log_file, encoding='utf-8')
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
