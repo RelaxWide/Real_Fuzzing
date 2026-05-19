@@ -4062,15 +4062,25 @@ class NVMeFuzzer:
         log.warning(" Device Information")
         log.warning("=" * 60)
 
-        # id-ctrl
+        # id-ctrl — stderr 캡처하여 실패 시 실제 메시지 표시
         ctrl: dict = {}
+        _cmd = ['nvme', 'id-ctrl', self.config.nvme_device, '-o', 'json']
         try:
-            out = subprocess.check_output(
-                ['nvme', 'id-ctrl', self.config.nvme_device, '-o', 'json'],
-                timeout=5, stderr=subprocess.DEVNULL)
-            ctrl = json.loads(out)
+            _r = subprocess.run(_cmd, timeout=5,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if _r.returncode == 0:
+                ctrl = json.loads(_r.stdout)
+            else:
+                _err = _r.stderr.decode(errors='replace').strip()
+                _out = _r.stdout.decode(errors='replace').strip()
+                log.warning(f"  id-ctrl rc={_r.returncode}")
+                log.warning(f"    cmd    : {' '.join(_cmd)}")
+                if _err:
+                    log.warning(f"    stderr : {_err}")
+                if _out:
+                    log.warning(f"    stdout : {_out[:200]}")
         except Exception as e:
-            log.warning(f"  id-ctrl 조회 실패: {e}")
+            log.warning(f"  id-ctrl 예외: {e}  (cmd={' '.join(_cmd)})")
 
         if ctrl:
             _model  = str(ctrl.get('mn', '')).strip()
@@ -4097,14 +4107,33 @@ class NVMeFuzzer:
             if _subnqn:
                 log.warning(f"  SubNQN      : {_subnqn}")
 
-        # id-ns
+        # id-ns — stderr 캡처
+        ns_info: dict = {}
+        _ns = self.config.nvme_namespace or 1
+        _ns_cmd = ['nvme', 'id-ns', self.config.nvme_device,
+                   '-n', str(_ns), '-o', 'json']
         try:
-            _ns = self.config.nvme_namespace or 1
-            out = subprocess.check_output(
-                ['nvme', 'id-ns', self.config.nvme_device,
-                 '-n', str(_ns), '-o', 'json'],
-                timeout=5, stderr=subprocess.DEVNULL)
-            ns_info = json.loads(out)
+            _r = subprocess.run(_ns_cmd, timeout=5,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if _r.returncode == 0:
+                ns_info = json.loads(_r.stdout)
+            else:
+                _err = _r.stderr.decode(errors='replace').strip()
+                _out = _r.stdout.decode(errors='replace').strip()
+                log.warning(f"  id-ns rc={_r.returncode}")
+                log.warning(f"    cmd    : {' '.join(_ns_cmd)}")
+                if _err:
+                    log.warning(f"    stderr : {_err}")
+                if _out:
+                    log.warning(f"    stdout : {_out[:200]}")
+                # 명확한 실패 시 아래 파싱 분기로 가지 못하도록 early return
+                log.warning("=" * 60)
+                return
+        except Exception as e:
+            log.warning(f"  id-ns 예외: {e}  (cmd={' '.join(_ns_cmd)})")
+            log.warning("=" * 60)
+            return
+        try:
             nsze = ns_info.get('nsze', 0)
             ncap = ns_info.get('ncap', 0)
             nuse = ns_info.get('nuse', 0)
