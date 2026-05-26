@@ -6994,7 +6994,8 @@ class NVMeFuzzer:
         """J-Link dump 직후 호출 — customer_parsing_dump.py 실행 후
         <dump>_customer_analysis/g16arEventLog*.txt 에서 EngineErrInt 검색.
 
-        Parser 경로: PC_Sampling/DebugPackage/smi_mem_parsing/customer_parsing_dump.py
+        Parser 경로: <fuzzer 가 있는 폴더>/DebugPackage/smi_mem_parsing/customer_parsing_dump.py
+                     (sys.argv[0] 기준 상대 — 폴더명 PC_Sampling / pc_sample 등 무관)
         cwd : parser 가 있는 smi_mem_parsing/ 폴더 (.bat 의 'cd /d %~dp0' 동치)
         분석 폴더 위치: parser 가 dump 파일 옆 / parser 폴더 / cwd 중 어디든 가능
                        → 3개 후보 검색 후 첫 매칭 사용.
@@ -10455,8 +10456,8 @@ if __name__ == "__main__":
     parser.add_argument('--unsupported-skip', action='store_true', default=False,
                         help='timeout 후 J-Link dump 의 event log 에서 EngineErrInt 검출 시 '
                              '미지원 명령으로 간주, power cycle 후 메인 루프 계속. '
-                             'customer_parsing_dump.py 는 '
-                             'PC_Sampling/DebugPackage/smi_mem_parsing/ 에 있어야 함.')
+                             'customer_parsing_dump.py 는 fuzzer 와 같은 위치의 '
+                             'DebugPackage/smi_mem_parsing/ 에 있어야 함.')
 
     # 토글
     parser.add_argument('--no-por', action='store_true', default=False,
