@@ -945,6 +945,7 @@ class FuzzConfig:
     interface:       str   = 'swd'   # 'swd' | 'jtag'
     jlink_device:    str   = JLINK_DEVICE
     allow_no_openocd: bool = False    # OpenOCD 실패 시 --pm 전용 테스트 경로 허용
+    no_jlink:         bool = False    # J-Link 자체 없이 NVMe fuzz 만 수행 (coverage 0)
     pm_test_cycles:   int  = 0        # OpenOCD 없이 preflight 후 추가 랜덤 PM cycle 수
 
     nvme_device: str = NVME_DEVICE
@@ -1496,6 +1497,83 @@ class NVMeStateMonitor:
                 is_new = True
             cov_map[bucket] += 1
         return is_new
+
+
+class NullSampler:
+    """J-Link 없이 NVMe fuzz 만 수행할 때 쓰는 no-op sampler.
+
+    `--no-jlink` 활성 시 `OpenOCDPCSampler` 대신 사용. 모든 PC 수집/커버리지
+    관련 메서드는 안전한 빈 값/True 를 반환하여 main loop 가 그대로 동작.
+    NVMe 명령 전송, state telemetry, PM rotation, crash detection (timeout
+    기준) 은 모두 그대로 작동 — coverage 측면만 0 으로 표시.
+    """
+
+    def __init__(self, config: 'FuzzConfig') -> None:
+        self.config = config
+        # 빈 coverage 자료구조 — fuzzer 곳곳에서 참조하므로 None 대신 빈 컨테이너
+        self.global_coverage: Set[int] = set()
+        self.current_trace:   Set[int] = set()
+        self.idle_pcs:        Set[int] = set()
+        self.idle_pc:         Optional[int] = None
+        self._last_raw_pcs:   List[int] = []
+        self._last_new_pcs:   Set[int]  = set()
+        self._last_new_at:    int = 0
+        self._unique_at_intervals: dict = {}
+        self._out_of_range_count: int = 0
+        self._stopped_reason: str = ''
+        self.total_samples: int = 0
+        self.interesting_inputs: int = 0
+        # main loop 가 참조할 수 있는 threading 객체 — set 되지 않은 상태로 유지
+        self.stop_event    = threading.Event()
+        self.openocd_error = threading.Event()
+        self.sample_thread = None
+
+    # ── 라이프사이클 / 인프라 (모두 성공으로 가장) ─────────────────
+    def connect(self) -> bool:
+        log.warning("[NullSampler] J-Link 비활성 모드 — coverage 수집 안 함")
+        return True
+    def _terminate_proc(self) -> None: pass
+    def _close_telnet(self) -> None: pass
+    def close(self) -> None: pass
+    def _openocd_alive(self) -> bool: return False
+    def _reinit_target(self) -> bool: return False
+    def _reconnect(self) -> bool: return True
+
+    # ── PC 읽기 (항상 빈 결과) ─────────────────────────────────
+    def _read_all_pcs(self) -> Optional[Tuple[int, ...]]:
+        return None
+    def _in_range(self, pc: int) -> bool:
+        return False
+    def diagnose(self, count: int = 20) -> bool:
+        log.warning("[NullSampler] diagnose 건너뜀 (idle_pcs 비어 있음)")
+        return True
+    def read_stuck_pcs(self, count: int = 10) -> List[Tuple[int, ...]]:
+        return []
+
+    # ── 샘플링 / 커버리지 (no-op) ─────────────────────────────
+    def start_sampling(self) -> None:
+        self.current_trace = set()
+        self._last_raw_pcs = []
+    def stop_sampling(self) -> int:
+        return 0
+    def evaluate_coverage(self) -> Tuple[bool, int]:
+        # 항상 (interesting=False, new_pcs=0). coverage 신호 없이 fuzz 진행.
+        self._last_new_pcs = set()
+        return False, 0
+
+    # ── 영속성 (no-op) ─────────────────────────────────────
+    def load_coverage(self, filepath: str) -> int:
+        log.info(f"[NullSampler] load_coverage 건너뜀: {filepath}")
+        return 0
+    def save_coverage(self, output_dir: str) -> None:
+        # 빈 coverage.txt 라도 작성하여 후처리 스크립트 호환
+        pc_path = os.path.join(output_dir, 'coverage.txt')
+        try:
+            with open(pc_path, 'w') as f:
+                pass
+            log.info(f"[NullSampler] empty coverage.txt 작성 → {pc_path}")
+        except OSError:
+            pass
 
 
 class OpenOCDPCSampler:
@@ -2229,7 +2307,11 @@ class NVMeFuzzer:
 
     def __init__(self, config: FuzzConfig):
         self.config = config
-        self.sampler = OpenOCDPCSampler(config)
+        # --no-jlink 활성 시 NullSampler 사용 — coverage 수집 없이 NVMe fuzz 만.
+        # J-Link/OpenOCD 가 없어도 fuzz / state telemetry / PM rotation / crash
+        # detection (timeout 기준) 은 모두 동작.
+        self.sampler = (NullSampler(config) if config.no_jlink
+                        else OpenOCDPCSampler(config))
 
         if config.enabled_commands:
             # --commands 지정 시: NVME_COMMANDS 전체에서 이름 매칭
@@ -3741,7 +3823,7 @@ class NVMeFuzzer:
                 and self.executions % CORPUS_EPOCH_SIZE == 0
                 and self.executions > 0):
             self._epoch_reset_corpus()
-            if not self.sampler._openocd_alive():
+            if not self.config.no_jlink and not self.sampler._openocd_alive():
                 log.error("[OpenOCD] heartbeat 실패 — OpenOCD 프로세스가 종료됐습니다.")
                 if not self.sampler._reconnect():
                     log.error("  재시작 실패. USB 케이블/J-Link 상태를 확인하세요.")
@@ -9020,12 +9102,17 @@ class NVMeFuzzer:
             return
 
         log.warning("=" * 60)
-        log.warning(f" PC Sampling SSD Fuzzer v{self.VERSION}")
+        log.warning(f" PC Sampling SSD Fuzzer v{self.VERSION}"
+                    + (" [NO-JLINK MODE]" if self.config.no_jlink else ""))
         log.warning("=" * 60)
         log.warning(f"NVMe device : {self.config.nvme_device}")
         log.warning(f"Commands    : {[c.name for c in self.commands]}")
-        log.warning(f"OpenOCD     : {self.config.openocd_binary} / {self.config.openocd_config} "
-                    f"(telnet {self.config.openocd_host}:{self.config.openocd_port})")
+        if self.config.no_jlink:
+            log.warning("OpenOCD     : DISABLED (--no-jlink) — coverage 수집 안 함, "
+                        "NVMe fuzz + state + PM 만 동작")
+        else:
+            log.warning(f"OpenOCD     : {self.config.openocd_binary} / {self.config.openocd_config} "
+                        f"(telnet {self.config.openocd_host}:{self.config.openocd_port})")
         if self.config.addr_range_start is not None:
             log.warning(f"Addr filter : {hex(self.config.addr_range_start)}"
                      f" - {hex(self.config.addr_range_end)}")
@@ -9205,8 +9292,10 @@ class NVMeFuzzer:
         # Boot-phase PC 수집: connect() 성공 시점부터 남은 boot_sweep_s 창 동안 수집.
         # firmware 부팅 중 초기화 경로(FTL 테이블 로드 등) PC를 global_coverage에 반영.
         # 이 시점은 PCIe rescan 전이므로 NVMe 명령 없이 순수 PCSR 폴링만 수행.
-        _sweep_remaining = max(0.0, _swd_deadline - time.monotonic())
-        self._collect_boot_coverage(_sweep_remaining)
+        # --no-jlink 모드면 J-Link 없이 PCSR 못 읽으므로 boot sweep 건너뜀.
+        if not self.config.no_jlink:
+            _sweep_remaining = max(0.0, _swd_deadline - time.monotonic())
+            self._collect_boot_coverage(_sweep_remaining)
 
         # POR Phase 2: boot sweep 완료 후 PCIe rescan + NVMe 응답 확인
         # firmware 부팅이 완료됐을 것으로 기대하므로 대부분 즉시 성공.
@@ -10145,6 +10234,9 @@ if __name__ == "__main__":
                              f'timeout +{PS_ENTRY_EXIT_MARGIN_MS}ms 고정 마진 적용')
     parser.add_argument('--allow-no-openocd', action='store_true', default=False,
                         help='OpenOCD 연결 실패 시 --pm 전용 PM preflight/cycle 테스트만 수행하고 종료')
+    parser.add_argument('--no-jlink', action='store_true', default=False,
+                        help='J-Link 없이 NVMe fuzz 만 수행 (coverage 수집 안 함). '
+                             'PM rotation / state telemetry / mutation / crash detection(timeout) 은 모두 동작.')
 
     # 토글
     parser.add_argument('--no-por', action='store_true', default=False,
@@ -10236,6 +10328,7 @@ if __name__ == "__main__":
         # PM
         pm_inject_prob=1.0 if args.pm else 0.0,
         allow_no_openocd=args.allow_no_openocd,
+        no_jlink=args.no_jlink,
         # 토글
         enable_por=not args.no_por,
         enable_ufas=not args.no_ufas,
