@@ -7063,6 +7063,17 @@ class NVMeFuzzer:
         """미지원 명령 skip 직후 SSD 정상 복귀. 실패 시 False (호출자가 break 결정)."""
         log.warning("[UnsupChk] === Power Off → On + PCIe rescan ===")
 
+        # 0) 정지 중인 nvme-cli child 명시 종료 — PCIe remove 가 자연 종료시키지만
+        # explicit SIGKILL 로 D-state 잔류 / 좀비 방지. PID 가 이미 죽었으면 무시.
+        if self._crash_nvme_pid is not None:
+            import signal as _signal
+            try:
+                os.kill(self._crash_nvme_pid, _signal.SIGKILL)
+                log.warning(f"[UnsupChk] nvme-cli PID={self._crash_nvme_pid} SIGKILL")
+            except (OSError, ProcessLookupError):
+                pass   # 이미 종료된 경우
+            self._crash_nvme_pid = None
+
         # 1) 전원 사이클 — PCIe remove 단계에서 정지 중인 nvme-cli child 자동 종료
         if not self._power_cycle_ssd():
             log.warning("[UnsupChk] Power cycle 실패 — fuzz 중단 권고")
