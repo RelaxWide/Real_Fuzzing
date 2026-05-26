@@ -124,8 +124,8 @@ _shutdown_openocd_for_jlink → _run_jlink_dump (기존)
 
 | 항목 | 설명 |
 |------|------|
-| `customer_parsing_dump.py` | fuzzer 와 같은 폴더 (`os.path.dirname(sys.argv[0])`) 에 위치. `argv[1]` 으로 dump 파일 경로 받음 |
-| `<dump>_customer_analysis/` | parser 가 dump 와 같은 디렉토리에 생성 (dump 파일명 + `_customer_analysis` suffix, 확장자 포함) |
+| `customer_parsing_dump.py` | `PC_Sampling/DebugPackage/smi_mem_parsing/customer_parsing_dump.py` 위치. `argv[1]` 으로 dump 파일 경로 받음. fuzzer 가 호출 시 `cwd = smi_mem_parsing/` 으로 설정 (`.bat` 의 `cd /d %~dp0` 동치) |
+| `<dump>_customer_analysis/` | parser 가 생성하는 분석 결과 폴더 (dump 파일명 + `_customer_analysis` suffix, 확장자 포함). 위치는 환경마다 다를 수 있어 3개 후보 (dump 옆 / parser 폴더 / fuzzer 폴더) 자동 검색 |
 | `g16arEventLog.txt` / `g16arEventLog2.txt` | 그 폴더 안에 존재. 둘 중 하나에 `EngineErrInt` 포함 시 skip 판정 |
 
 #### SKIPPED.marker 형식

@@ -6994,6 +6994,11 @@ class NVMeFuzzer:
         """J-Link dump 직후 호출 — customer_parsing_dump.py 실행 후
         <dump>_customer_analysis/g16arEventLog*.txt 에서 EngineErrInt 검색.
 
+        Parser 경로: PC_Sampling/DebugPackage/smi_mem_parsing/customer_parsing_dump.py
+        cwd : parser 가 있는 smi_mem_parsing/ 폴더 (.bat 의 'cd /d %~dp0' 동치)
+        분석 폴더 위치: parser 가 dump 파일 옆 / parser 폴더 / cwd 중 어디든 가능
+                       → 3개 후보 검색 후 첫 매칭 사용.
+
         True : 미지원 명령 처리로 판정 (skip + power cycle)
         False: 검사 불가 / 미검출 (기존 timeout crash 흐름)
         """
@@ -7001,23 +7006,26 @@ class NVMeFuzzer:
             return False
 
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-        parser_py  = os.path.join(script_dir, 'customer_parsing_dump.py')
+        parser_dir = os.path.join(script_dir, 'DebugPackage', 'smi_mem_parsing')
+        parser_py  = os.path.join(parser_dir, 'customer_parsing_dump.py')
         if not os.path.isfile(parser_py):
             log.warning(f"[UnsupChk] {parser_py} 없음 — 검사 건너뜀")
             return False
 
-        # 1) dump 파일 탐색
+        # 1) dump 파일 탐색 (J-Link dump 는 script_dir 에 생성됨)
         dump_path = self._find_latest_jlink_dump(script_dir, dump_start_t)
         if dump_path is None:
             log.warning("[UnsupChk] J-Link dump 파일 미발견 — 검사 건너뜀")
             return False
         log.warning(f"[UnsupChk] 검사 대상 dump: {dump_path}")
 
-        # 2) parsing tool 실행 (timeout 120s)
+        # 2) parsing tool 실행 (timeout 120s).
+        # cwd = parser_dir 로 .bat 의 'cd /d %~dp0' 동작 모사 — parser 의 상대 경로
+        # 의존성 (예: ../python/ 같은 sibling) 해소.
         try:
             r = subprocess.run(
                 ['python3', parser_py, dump_path],
-                cwd=script_dir, timeout=120,
+                cwd=parser_dir, timeout=120,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except subprocess.TimeoutExpired:
             log.warning("[UnsupChk] parsing tool 120초 timeout — 검사 건너뜀")
@@ -7037,10 +7045,19 @@ class NVMeFuzzer:
             log.info(f"[UnsupChk] parser stdout:\n{_out}")
 
         # 3) 분석 폴더 검증 — {dump_filename}_customer_analysis
-        analysis_dir = Path(dump_path).parent / f"{Path(dump_path).name}_customer_analysis"
-        if not analysis_dir.is_dir():
-            log.warning(f"[UnsupChk] 분석 폴더 미생성: {analysis_dir} — 검사 건너뜀")
+        # parser 가 어디에 생성하는지 환경마다 다를 수 있어 3개 후보 검색.
+        _analysis_name = f"{Path(dump_path).name}_customer_analysis"
+        _candidates = [
+            Path(dump_path).parent / _analysis_name,   # dump 파일 옆 (가장 일반적)
+            Path(parser_dir) / _analysis_name,         # parser 폴더 안
+            Path(script_dir) / _analysis_name,         # fuzzer 폴더 (script_dir)
+        ]
+        analysis_dir = next((p for p in _candidates if p.is_dir()), None)
+        if analysis_dir is None:
+            log.warning(f"[UnsupChk] 분석 폴더 미생성. 후보: "
+                        f"{[str(p) for p in _candidates]} — 검사 건너뜀")
             return False
+        log.warning(f"[UnsupChk] 분석 폴더: {analysis_dir}")
 
         # 4) 이벤트 로그 grep
         for log_name in ('g16arEventLog.txt', 'g16arEventLog2.txt'):
@@ -10438,7 +10455,8 @@ if __name__ == "__main__":
     parser.add_argument('--unsupported-skip', action='store_true', default=False,
                         help='timeout 후 J-Link dump 의 event log 에서 EngineErrInt 검출 시 '
                              '미지원 명령으로 간주, power cycle 후 메인 루프 계속. '
-                             'customer_parsing_dump.py 가 fuzzer 와 같은 폴더에 있어야 함.')
+                             'customer_parsing_dump.py 는 '
+                             'PC_Sampling/DebugPackage/smi_mem_parsing/ 에 있어야 함.')
 
     # 토글
     parser.add_argument('--no-por', action='store_true', default=False,
