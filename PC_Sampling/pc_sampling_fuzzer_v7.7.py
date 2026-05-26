@@ -6943,10 +6943,11 @@ class NVMeFuzzer:
         rc = _result.get('rc', -1)
         out = _result.get('stdout', b'').decode(errors='replace').strip()
         err = _result.get('stderr', b'').decode(errors='replace').strip()
+        # 길고 verbose 한 JLinkExe 출력은 파일 로그에만 (INFO) — 터미널은 summary 만.
         if out:
-            log.warning(f"[JLINK DUMP] stdout:\n{out}")
+            log.info(f"[JLINK DUMP] stdout:\n{out}")
         if err:
-            log.warning(f"[JLINK DUMP] stderr:\n{err}")
+            log.info(f"[JLINK DUMP] stderr:\n{err}")
         log.warning(f"[JLINK DUMP] 완료 (rc={rc})")
 
     def _run_ufas_dump(self) -> None:
@@ -7051,10 +7052,11 @@ class NVMeFuzzer:
         rc = _result.get('rc', -1)
         out = _result.get('stdout', b'').decode(errors='replace').strip()
         err = _result.get('stderr', b'').decode(errors='replace').strip()
+        # UFAS 실행 출력도 verbose 하므로 파일 로그에만 (INFO).
         if out:
-            log.warning(f"[UFAS] stdout:\n{out}")
+            log.info(f"[UFAS] stdout:\n{out}")
         if err:
-            log.warning(f"[UFAS] stderr:\n{err}")
+            log.info(f"[UFAS] stderr:\n{err}")
         if rc == 0:
             log.warning(f"[UFAS] 덤프 완료 (rc=0) → {dump_path}")
         else:
@@ -10143,7 +10145,10 @@ class NVMeFuzzer:
                         pcs = [int(p, 16) & ~1 for p in _re.findall(_pc_re, out)]
                         if pcs:
                             return pcs[:1]
-                        log.warning(f"[MONITOR] JLink PC 미검출. 전체 출력:\n{out}")
+                        # JLinkExe 전체 출력은 verbose → 파일 로그에만 (INFO).
+                        # 터미널 에는 짧은 실패 마커 만 표시.
+                        log.info(f"[MONITOR] JLink PC 미검출. 전체 출력:\n{out}")
+                        log.warning("[MONITOR] JLink PC 미검출 (전체 출력은 로그 파일 참조)")
                         return None
                     except Exception as e:
                         log.warning(f"[MONITOR] JLink 예외: {e}")
