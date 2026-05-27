@@ -7034,12 +7034,17 @@ class NVMeFuzzer:
         log.warning(f"[UnsupChk] 검사 대상 dump: {dump_path}")
 
         # 2) parsing tool 실행 (timeout 120s).
-        # cwd = parser_dir 로 .bat 의 'cd /d %~dp0' 동작 모사 — parser 의 상대 경로
-        # 의존성 (예: ../python/ 같은 sibling) 해소.
+        # cwd = parser_dir 로 .bat 의 'cd /d %~dp0' 동작 모사.
+        # PYTHONPATH 에 DebugPackage/ 추가 — parser 가 'from module.share import ...'
+        # 형태로 import 하는데, module/ 패키지가 DebugPackage/ 직속에 있어 시스템
+        # python3 의 sys.path 만으로는 못 찾음. PYTHONPATH 로 명시.
+        _debug_pkg = os.path.dirname(parser_dir)   # DebugPackage/
+        _env = os.environ.copy()
+        _env['PYTHONPATH'] = _debug_pkg + os.pathsep + _env.get('PYTHONPATH', '')
         try:
             r = subprocess.run(
                 ['python3', parser_py, dump_path],
-                cwd=parser_dir, timeout=120,
+                cwd=parser_dir, env=_env, timeout=120,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except subprocess.TimeoutExpired:
             log.warning("[UnsupChk] parsing tool 120초 timeout — 검사 건너뜀")
