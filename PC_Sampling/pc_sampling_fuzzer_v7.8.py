@@ -6968,9 +6968,15 @@ class NVMeFuzzer:
 
     def _find_latest_jlink_dump(self, script_dir: str,
                                  after_t: float) -> Optional[str]:
-        """script_dir 안 mtime ≥ after_t-5 인 .bin 파일 중 가장 최근 반환.
-        JLink dump 가 같은 basename 으로 .bin / .zip / .txt 셋을 생성하지만
-        실제 메모리 dump 는 .bin 한 개 → .bin 만 매칭.
+        """script_dir 안 mtime ≥ (after_t - 5) 인 .bin 파일 중 가장 최근 반환.
+
+        - after_t : J-Link dump 시작 직전의 time.time() 값 (Unix epoch).
+                    st_mtime 도 같은 epoch 라 비교 가능.
+        - 5초 leeway : 파일 시스템 timestamp 분해능 / NTP 미세 보정 흡수.
+        - 동일 폴더에 이전 dump (.bin) 가 여러 개 있어도 이번 dump 시점 이후에
+          생성된 것만 후보 → 그 중 최신 1개 반환. 후보 없으면 None.
+        - JLink dump 는 같은 basename 으로 .bin / .zip / .txt 셋 생성하지만
+          실제 메모리 dump 는 .bin 한 개 → .bin 만 매칭.
         """
         cand: list = []
         try:
@@ -6991,6 +6997,10 @@ class NVMeFuzzer:
         if not cand:
             return None
         cand.sort(reverse=True)
+        if len(cand) > 1:
+            log.warning(f"[UnsupChk] dump .bin 후보 {len(cand)}개 — 최신 mtime 선택: "
+                        f"{os.path.basename(cand[0][1])}  (나머지: "
+                        f"{[os.path.basename(c[1]) for c in cand[1:]]})")
         return cand[0][1]
 
     def _check_unsupported_after_jlink_dump(self, dump_start_t: float) -> bool:
@@ -8019,7 +8029,9 @@ class NVMeFuzzer:
             log.warning(f"[JLINK] OpenOCD shutdown 예외: {_sd_exc}")
 
         # 3.7) JLink 메모리 덤프 (UFAS 이전)
-        _dump_start_t = time.monotonic()
+        # st_mtime (Unix epoch) 과 비교할 거라 time.time() 사용.
+        # time.monotonic() 은 uptime 기준이라 비교 시 항상 통과되어 filter 무력화됨.
+        _dump_start_t = time.time()
         if self.config.enable_jlink_dump:
             log.warning("[TIMEOUT] JLink 메모리 덤프를 실행합니다...")
             try:
