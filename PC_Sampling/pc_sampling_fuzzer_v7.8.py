@@ -7042,9 +7042,16 @@ class NVMeFuzzer:
 
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         parser_dir = os.path.join(script_dir, 'DebugPackage', 'smi_mem_parsing')
+        parser_sh  = os.path.join(parser_dir, 'customer_parsing_dump.sh')
         parser_py  = os.path.join(parser_dir, 'customer_parsing_dump.py')
-        if not os.path.isfile(parser_py):
-            log.warning(f"[UnsupChk] {parser_py} 없음 — 검사 건너뜀")
+        # .sh 우선 — PYTHONPATH / python interpreter 선택을 wrapper 가 처리.
+        # 없으면 .py 직접 호출 + PYTHONPATH env 로 fallback.
+        if os.path.isfile(parser_sh):
+            _cmd_mode = 'sh'
+        elif os.path.isfile(parser_py):
+            _cmd_mode = 'py'
+        else:
+            log.warning(f"[UnsupChk] parser 없음 ({parser_sh} / {parser_py}) — 검사 건너뜀")
             return False
 
         # 1) dump 파일 탐색 (J-Link dump 는 script_dir 에 생성됨)
@@ -7055,17 +7062,21 @@ class NVMeFuzzer:
         log.warning(f"[UnsupChk] 검사 대상 dump: {dump_path}")
 
         # 2) parsing tool 실행 (timeout 120s).
-        # cwd = parser_dir 로 .bat 의 'cd /d %~dp0' 동작 모사.
-        # PYTHONPATH 에 DebugPackage/ 추가 — parser 가 'from module.share import ...'
-        # 형태로 import 하는데, module/ 패키지가 DebugPackage/ 직속에 있어 시스템
-        # python3 의 sys.path 만으로는 못 찾음. PYTHONPATH 로 명시.
-        _debug_pkg = os.path.dirname(parser_dir)   # DebugPackage/
-        _env = os.environ.copy()
-        _env['PYTHONPATH'] = _debug_pkg + os.pathsep + _env.get('PYTHONPATH', '')
+        if _cmd_mode == 'sh':
+            # .sh 가 내부에서 cd + PYTHONPATH + python interpreter 모두 처리.
+            _cmd = ['bash', parser_sh, dump_path]
+            _env = os.environ.copy()    # .sh 가 자체 env 설정하므로 그대로 전달
+            log.info(f"[UnsupChk] parser 실행: bash {parser_sh} {dump_path}")
+        else:
+            # Fallback: .py 직접 + PYTHONPATH 명시.
+            _debug_pkg = os.path.dirname(parser_dir)   # DebugPackage/
+            _env = os.environ.copy()
+            _env['PYTHONPATH'] = _debug_pkg + os.pathsep + _env.get('PYTHONPATH', '')
+            _cmd = ['python3', parser_py, dump_path]
+            log.info(f"[UnsupChk] parser 실행 (fallback): python3 {parser_py} {dump_path}")
         try:
             r = subprocess.run(
-                ['python3', parser_py, dump_path],
-                cwd=parser_dir, env=_env, timeout=120,
+                _cmd, cwd=parser_dir, env=_env, timeout=120,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except subprocess.TimeoutExpired:
             log.warning("[UnsupChk] parsing tool 120초 timeout — 검사 건너뜀")
