@@ -7183,9 +7183,9 @@ class NVMeFuzzer:
                 pass   # 이미 종료된 경우
             self._crash_nvme_pid = None
 
-        # 0.5) 커널 nvme_core admin/io_timeout 을 일시 단축 — pending ioctl 빠르게
-        # abort 되어 PCIe remove 가 D-state 에서 안 풀리는 케이스 방지.
-        # 복구 후 _configure_nvme_timeouts() 로 원복.
+        # 0.5) 커널 nvme_core admin/io_timeout 을 일시 단축. 단, in-flight ioctl 은
+        # 제출 시점 값을 쓰므로 영향 없음 — 이후 신규 ioctl 만 영향. 그래도 power off
+        # 후 kernel cleanup 단계의 후속 명령 (nvme id-ctrl 등) 빠른 abort 에 도움.
         _short_to = 5
         for _p in ['/sys/module/nvme_core/parameters/admin_timeout',
                    '/sys/module/nvme_core/parameters/io_timeout']:
@@ -7194,12 +7194,22 @@ class NVMeFuzzer:
                     f.write(str(_short_to))
             except OSError as e:
                 log.warning(f"[UnsupChk] {_p} 단축 실패: {e}")
-        log.warning(f"[UnsupChk] nvme_core admin/io_timeout 일시 단축 ({_short_to}s) — "
-                    "pending ioctl 빠른 abort")
-        time.sleep(_short_to + 1)   # ioctl abort 대기
+        log.warning(f"[UnsupChk] nvme_core admin/io_timeout 일시 단축 ({_short_to}s)")
 
-        # 1) 전원 사이클 — PCIe remove 단계에서 정지 중인 nvme-cli child 자동 종료
-        if not self._power_cycle_ssd():
+        # 1) 전원 사이클 — PCIe remove 우회 (D-state hang 방지).
+        # 핵심: 직전 timeout 된 nvme-cli 의 ioctl 이 커널에 남아 있어
+        # /sys/bus/pci/devices/<BDF>/remove 의 sysfs write 가 영구 block 됨
+        # (D-state 라 subprocess/SIGKILL 도 안 풀림). PMU 전원 OFF 가 PCIe link
+        # down 을 만들면 커널 AER 가 device 사라짐을 감지 → FD cleanup → 정상 복귀.
+        # → _pcie_bdf 를 일시 None 으로 두고 _power_cycle_ssd() 호출 시 PCIe remove
+        # 분기 건너뛰게 함 (초기 POR 과 동일 경로).
+        _saved_bdf = self._pcie_bdf
+        self._pcie_bdf = None
+        try:
+            _power_ok = self._power_cycle_ssd()
+        finally:
+            self._pcie_bdf = _saved_bdf
+        if not _power_ok:
             log.warning("[UnsupChk] Power cycle 실패 — fuzz 중단 권고")
             return False
 
