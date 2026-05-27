@@ -17,10 +17,18 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-# 2) PYTHONPATH: parser 가 'from module.share import ...' 형태로 import 하는데
-#    module/ 패키지가 SCRIPT_DIR 의 상위 DebugPackage/ 에 있음 → 명시 추가.
+# 2) PYTHONPATH 구성:
+#    - DebugPackage/                            ← parser 의 'from module.share import ...'
+#    - DebugPackage/python/Lib/site-packages    ← bundled Windows Python 의 pure-Python
+#         third-party 패키지 (intelhex 등) 재사용. Linux 의 시스템 python3 도 .py 만
+#         있으면 import 가능 (C 확장 .pyd 는 못 씀 — 그 경우 pip3 로 별도 설치 필요).
 DEBUG_PKG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-export PYTHONPATH="${DEBUG_PKG_DIR}:${PYTHONPATH:-}"
+BUNDLED_SITE_PACKAGES="${DEBUG_PKG_DIR}/python/Lib/site-packages"
+if [ -d "${BUNDLED_SITE_PACKAGES}" ]; then
+    export PYTHONPATH="${DEBUG_PKG_DIR}:${BUNDLED_SITE_PACKAGES}:${PYTHONPATH:-}"
+else
+    export PYTHONPATH="${DEBUG_PKG_DIR}:${PYTHONPATH:-}"
+fi
 
 # 3) 인자 검증
 if [ -z "${1:-}" ]; then
