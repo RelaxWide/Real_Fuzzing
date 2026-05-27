@@ -1276,17 +1276,37 @@ class NVMeStateMonitor:
                 _raw_out = proc.stdout or proc.stderr
                 log.info(f"[State] smart-log stdout={len(proc.stdout)}B "
                          f"stderr={len(proc.stderr)}B")
+                _raw_text = _raw_out.decode(errors='replace')
+                # 진단: 첫 호출 또는 critical_warning != 0 시 raw 출력 전체 file log 에 dump.
+                # 사용자가 nvme-cli 직접 실행 결과와 비교 가능하게.
+                _dump_raw = not hasattr(self, '_smart_raw_logged')
                 smart_text: Dict[str, int] = {}
-                for line in _raw_out.decode(errors='replace').splitlines():
+                _raw_lines_for_key: Dict[str, str] = {}   # diag: 어떤 raw 라인이 어느 key 로 매핑됐는지
+                for line in _raw_text.splitlines():
                     if ':' not in line:
                         continue
                     k, _, v = line.partition(':')
-                    k = k.strip().lower().replace(' ', '_')
-                    v = v.strip().split()[0].rstrip('%').replace(',', '') if v.strip() else ''
+                    k_norm = k.strip().lower().replace(' ', '_')
+                    v_clean = v.strip().split()[0].rstrip('%').replace(',', '') if v.strip() else ''
                     try:
-                        smart_text[k] = int(v, 0)  # base=0: 0x.. hex / 0o.. octal / decimal 자동 판별
+                        smart_text[k_norm] = int(v_clean, 0)  # base=0: 0x.. hex / 0o.. octal / decimal 자동 판별
+                        _raw_lines_for_key[k_norm] = line.rstrip()
                     except ValueError:
                         pass
+                # 진단: critical_warning 처음 비0 검출 시 raw 라인 + raw 출력 전체 dump
+                _cw = smart_text.get('critical_warning')
+                _need_diag = _dump_raw or (_cw is not None and _cw != 0
+                                           and not hasattr(self, '_smart_cw_diag_logged'))
+                if _need_diag:
+                    log.info(f"[State][DIAG] smart-log raw output ({len(_raw_text)}B):\n"
+                             f"--- BEGIN ---\n{_raw_text}\n--- END ---")
+                    log.info(f"[State][DIAG] critical_warning 매칭 line: "
+                             f"{_raw_lines_for_key.get('critical_warning', '(없음)')}")
+                    log.info(f"[State][DIAG] parsed smart_text "
+                             f"keys={sorted(smart_text.keys())}")
+                    self._smart_raw_logged = True
+                    if _cw is not None and _cw != 0:
+                        self._smart_cw_diag_logged = True
                 hit = 0
                 for f in self._fields:
                     if f['source'] != 'smart':
@@ -1298,7 +1318,8 @@ class NVMeStateMonitor:
                     else:
                         log.warning(f"[State] smart-log 키 없음: "
                                     f"field={f['name']} text_key={text_key}")
-                log.info(f"[State] smart-log OK: {hit}개 필드 수집")
+                log.info(f"[State] smart-log OK: {hit}개 필드 수집, "
+                         f"critical_warning={smart_text.get('critical_warning', 'N/A')}")
             except Exception as e:
                 log.warning(f"[State] smart-log 예외: {e}")
                 return None
