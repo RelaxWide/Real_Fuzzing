@@ -7095,14 +7095,20 @@ class NVMeFuzzer:
         if _out:
             log.info(f"[UnsupChk] parser stdout:\n{_out}")
 
-        # 3) 분석 폴더 검증 — {dump_filename}_customer_analysis
-        # parser 가 어디에 생성하는지 환경마다 다를 수 있어 3개 후보 검색.
-        _analysis_name = f"{Path(dump_path).name}_customer_analysis"
-        _candidates = [
-            Path(dump_path).parent / _analysis_name,   # dump 파일 옆 (가장 일반적)
-            Path(parser_dir) / _analysis_name,         # parser 폴더 안
-            Path(script_dir) / _analysis_name,         # fuzzer 폴더 (script_dir)
+        # 3) 분석 폴더 검증 — parser 가 생성하는 폴더 위치/이름이 환경마다 다를 수 있어
+        # 2가지 이름 (확장자 제거 vs 포함) × 3개 위치 = 6개 후보 검색.
+        _dump_p = Path(dump_path)
+        _analysis_name_candidates = [
+            f"{_dump_p.stem}_customer_analysis",   # 'foo' (.bin 제거) — 실제 parser 동작
+            f"{_dump_p.name}_customer_analysis",   # 'foo.bin' (확장자 포함) — 대안
         ]
+        _candidates: list = []
+        for _aname in _analysis_name_candidates:
+            _candidates += [
+                _dump_p.parent / _aname,           # dump 파일 옆 (가장 일반적)
+                Path(parser_dir) / _aname,         # parser 폴더 안
+                Path(script_dir) / _aname,         # fuzzer 폴더 (script_dir)
+            ]
         analysis_dir = next((p for p in _candidates if p.is_dir()), None)
         if analysis_dir is None:
             log.warning(f"[UnsupChk] 분석 폴더 미생성. 후보: "

@@ -125,7 +125,7 @@ _shutdown_openocd_for_jlink → _run_jlink_dump (기존)
 | 항목 | 설명 |
 |------|------|
 | `customer_parsing_dump.py` | `<fuzzer 가 있는 폴더>/DebugPackage/smi_mem_parsing/customer_parsing_dump.py` 위치 (sys.argv[0] 기준 상대 — 폴더명 `PC_Sampling` / `pc_sample` / 기타 무관). `argv[1]` 으로 dump 파일 경로 받음. fuzzer 가 호출 시 `cwd = smi_mem_parsing/` 으로 설정 (`.bat` 의 `cd /d %~dp0` 동치) |
-| `<dump>_customer_analysis/` | parser 가 생성하는 분석 결과 폴더 (dump 파일명 + `_customer_analysis` suffix, 확장자 포함). 위치는 환경마다 다를 수 있어 3개 후보 (dump 옆 / parser 폴더 / fuzzer 폴더) 자동 검색 |
+| `<dump>_customer_analysis/` | parser 가 생성하는 분석 결과 폴더. 이름은 환경마다 다름 (확장자 제거된 `<basename>_customer_analysis` 또는 포함된 `<basename.bin>_customer_analysis`) + 위치도 다름 (dump 옆 / parser 폴더 / fuzzer 폴더). → 두 이름 × 세 위치 = 총 6개 후보 자동 검색 |
 | `g16arEventLog.txt` / `g16arEventLog2.txt` | 그 폴더 안에 존재. 두 파일 합산 `EngineErrInt` count 가 직전 baseline 보다 증가 시 신규 entry 로 간주 → skip 판정. (firmware event log 는 NAND persistent 라 동일 entry 가 다음 dump 에도 남으므로 단순 `in` 매칭 X — count delta 사용. log wrap/clear 시 baseline 자동 reset) |
 
 #### SKIPPED.marker 형식
