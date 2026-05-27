@@ -6968,16 +6968,16 @@ class NVMeFuzzer:
 
     def _find_latest_jlink_dump(self, script_dir: str,
                                  after_t: float) -> Optional[str]:
-        """script_dir 안 mtime ≥ after_t-5 인 *.bin / *dump* 파일 중 가장 최근 반환.
-        J-Link dump 파일 이름이 shell script 측에서 결정되므로 mtime 기반 탐색.
+        """script_dir 안 mtime ≥ after_t-5 인 .bin 파일 중 가장 최근 반환.
+        JLink dump 가 같은 basename 으로 .bin / .zip / .txt 셋을 생성하지만
+        실제 메모리 dump 는 .bin 한 개 → .bin 만 매칭.
         """
         cand: list = []
         try:
             for entry in os.scandir(script_dir):
                 if not entry.is_file():
                     continue
-                name = entry.name.lower()
-                if not (name.endswith('.bin') or 'dump' in name):
+                if not entry.name.lower().endswith('.bin'):
                     continue
                 try:
                     mt = entry.stat().st_mtime
