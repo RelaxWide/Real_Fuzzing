@@ -2338,6 +2338,9 @@ class NVMeFuzzer:
         self.crash_inputs: List[Tuple[bytes, NVMeCommand]] = []
         # v7.8: 종료 시 집계 출력용 카운터 dict
         self.stats: dict = {}
+        # v7.8: EngineErrInt 누적 baseline — firmware event log 가 persistent (NAND)
+        # 이라 동일 entry 가 다음 dump 에도 남음. 마지막 본 count 와 delta 만 평가.
+        self._engineerrint_baseline: int = 0
         # FWDownload: 청크 시드 목록 (corpus에는 1개만, 실제 전송 시 여기서 순서대로 전송)
         self._fw_chunks: List[Seed] = []
 
@@ -7060,7 +7063,12 @@ class NVMeFuzzer:
             return False
         log.warning(f"[UnsupChk] 분석 폴더: {analysis_dir}")
 
-        # 4) 이벤트 로그 grep
+        # 4) 이벤트 로그 — EngineErrInt 누적 count 집계 (두 파일 합산)
+        # firmware event log 는 NAND/NVRAM 기반 persistent. power cycle 후에도
+        # 직전 entry 가 그대로 남으므로 단순 'in' 매칭은 false positive.
+        # → baseline count 와의 delta 로 신규 entry 여부 판정.
+        current_count = 0
+        _found_files: list = []
         for log_name in ('g16arEventLog.txt', 'g16arEventLog2.txt'):
             log_path = analysis_dir / log_name
             if not log_path.is_file():
@@ -7070,11 +7078,30 @@ class NVMeFuzzer:
             except Exception as e:
                 log.warning(f"[UnsupChk] {log_path} 읽기 실패: {e}")
                 continue
-            if 'EngineErrInt' in content:
-                log.warning(f"[UnsupChk] EngineErrInt 검출 → {log_path} "
-                            "— 미지원 명령 처리로 판정, skip + power cycle")
-                return True
-        log.warning("[UnsupChk] EngineErrInt 미검출 — 기존 timeout crash 흐름 진행")
+            _n = content.count('EngineErrInt')
+            current_count += _n
+            _found_files.append((log_path, _n))
+
+        prev = self._engineerrint_baseline
+        # 판정:
+        #   current > prev  → 새 entry 추가됨 (NEW)
+        #   current < prev  → 로그 wrap / clear → current > 0 이면 NEW, 아니면 X
+        #   current == prev → 변화 없음 → 기존 entry (skip 안 함)
+        if current_count > prev:
+            is_new = True
+        elif current_count < prev:
+            is_new = current_count > 0
+        else:
+            is_new = False
+        self._engineerrint_baseline = current_count
+
+        _summary = ", ".join(f"{p.name}={n}" for p, n in _found_files) if _found_files else "(파일 없음)"
+        if is_new:
+            log.warning(f"[UnsupChk] EngineErrInt 신규 검출 — prev={prev}, current={current_count} "
+                        f"[{_summary}] → 미지원 명령 처리로 판정, skip + power cycle")
+            return True
+        log.warning(f"[UnsupChk] EngineErrInt 신규 없음 — prev={prev}, current={current_count} "
+                    f"[{_summary}] → 기존 timeout crash 흐름 진행")
         return False
 
     def _recover_after_unsupported_skip(self) -> bool:
