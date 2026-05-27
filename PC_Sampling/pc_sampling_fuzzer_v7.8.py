@@ -1099,7 +1099,7 @@ class _FuzzingTerminalFilter(logging.Filter):
     _ALLOW = _re.compile(
         r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
         r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]|\[State-Replay\]'
-        r'|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]'
+        r'|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]|\[Probe-'
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -7168,9 +7168,58 @@ class NVMeFuzzer:
                     f"[{_summary}] → 기존 timeout crash 흐름 진행")
         return False
 
+    def _probe_device(self, label: str) -> None:
+        """SSD 상태 진단 — sysfs / nvme id-ctrl. 어느 단계에서 device 가 응답
+        안 하는지 추적용. 안전:
+        - sysfs read 는 hang 위험 없음
+        - nvme id-ctrl 은 daemon thread 로 던져서 D-state 라도 main flow block 안 함
+        """
+        parts: list = []
+        # 1) /dev/nvmeXnY block 존재?
+        parts.append(f"dev={'exist' if os.path.exists(self.config.nvme_device) else 'gone'}")
+        # 2) PCIe BDF sysfs entry 상태 + link
+        bdf = self._pcie_bdf
+        if bdf:
+            bdf_dir = f"/sys/bus/pci/devices/{bdf}"
+            if os.path.isdir(bdf_dir):
+                parts.append("bdf=exist")
+                try:
+                    _spd = Path(f"{bdf_dir}/current_link_speed").read_text().strip()
+                    _wid = Path(f"{bdf_dir}/current_link_width").read_text().strip()
+                    parts.append(f"link={_spd}/{_wid}")
+                except OSError:
+                    pass
+            else:
+                parts.append("bdf=gone")
+        else:
+            parts.append("bdf=N/A")
+        # 3) nvme id-ctrl 빠른 응답 확인 (daemon thread — D-state 안전)
+        import threading as _threading
+        _result: dict = {'rc': None}
+        def _probe():
+            try:
+                r = subprocess.run(
+                    ['nvme', 'id-ctrl', self.config.nvme_device],
+                    capture_output=True, timeout=5)
+                _result['rc'] = r.returncode
+            except subprocess.TimeoutExpired:
+                _result['rc'] = 'subproc_timeout'
+            except Exception as e:
+                _result['rc'] = f'exc:{e}'
+        t = _threading.Thread(target=_probe, daemon=True)
+        t.start()
+        t.join(timeout=4)
+        if t.is_alive():
+            parts.append("id-ctrl=NO_RESPONSE(>4s)")
+        else:
+            _rc = _result.get('rc')
+            parts.append(f"id-ctrl=OK" if _rc == 0 else f"id-ctrl=FAIL({_rc})")
+        log.warning(f"[Probe-{label}] {' '.join(parts)}")
+
     def _recover_after_unsupported_skip(self) -> bool:
         """미지원 명령 skip 직후 SSD 정상 복귀. 실패 시 False (호출자가 break 결정)."""
         log.warning("[UnsupChk] === Power Off → On + PCIe rescan ===")
+        self._probe_device("recovery_start")   # 진입 시점 상태
 
         # 0) 정지 중인 nvme-cli child 명시 종료 — PCIe remove 가 자연 종료시키지만
         # explicit SIGKILL 로 D-state 잔류 / 좀비 방지. PID 가 이미 죽었으면 무시.
@@ -7195,6 +7244,7 @@ class NVMeFuzzer:
             except OSError as e:
                 log.warning(f"[UnsupChk] {_p} 단축 실패: {e}")
         log.warning(f"[UnsupChk] nvme_core admin/io_timeout 일시 단축 ({_short_to}s)")
+        self._probe_device("after_sigkill_timeout_lower")   # 전원 사이클 전 baseline
 
         # 1) 복구 전용 PMU power cycle 시퀀스:
         #    PMU OFF → 방전 → PCIe remove (now device gone, 빠르게 통과) → PMU ON
@@ -7223,6 +7273,7 @@ class NVMeFuzzer:
             return False
         log.warning(f"[POR] 전원 OFF — {self.config.por_poweroff_wait:.1f}초 방전 대기...")
         time.sleep(self.config.por_poweroff_wait)
+        self._probe_device("after_power_off")   # device gone 상태 확인
 
         # 1-b) PCIe 장치 제거 (이제 device gone 상태 — sysfs write 빠르게 통과).
         # subprocess + timeout 으로 안전망 (만에 하나 또 block 되면 무시).
@@ -7254,11 +7305,14 @@ class NVMeFuzzer:
             log.error(f"[POR] PowerOn 실패: {e}")
             return False
         log.warning("[POR] 전원 ON 완료 — PCIe rescan 진행")
+        self._probe_device("after_power_on")   # 부팅 시작 시점
 
         # 2) PCIe rescan + NVMe probe
         if not self._por_pcie_rescan():
             log.warning("[UnsupChk] PCIe rescan / NVMe probe 실패")
+            self._probe_device("rescan_failed")
             return False
+        self._probe_device("after_rescan_ok")
 
         # 3) 상태 재초기화 (run() POR Phase 2 와 동일)
         if self.config.pm_inject_prob > 0:
@@ -8165,6 +8219,8 @@ class NVMeFuzzer:
                 self._run_jlink_dump()
             except Exception as _jlink_exc:
                 log.warning(f"[JLINK DUMP] 예기치 않은 예외: {_jlink_exc}")
+            if self.config.unsupported_skip:
+                self._probe_device("after_jlink_dump")
         else:
             log.warning("[TIMEOUT] JLink 덤프 건너뜀 (--no-jlink-dump)")
 
@@ -8177,6 +8233,7 @@ class NVMeFuzzer:
                 _is_unsupported = self._check_unsupported_after_jlink_dump(_dump_start_t)
             except Exception as _chk_exc:
                 log.warning(f"[UnsupChk] 검사 중 예외: {_chk_exc}")
+            self._probe_device("after_parser")
             if _is_unsupported:
                 # SKIPPED.marker — crashes/crash_<ts>/ 안에 audit 파일
                 try:
