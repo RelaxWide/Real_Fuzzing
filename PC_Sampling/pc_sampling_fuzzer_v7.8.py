@@ -7196,22 +7196,64 @@ class NVMeFuzzer:
                 log.warning(f"[UnsupChk] {_p} 단축 실패: {e}")
         log.warning(f"[UnsupChk] nvme_core admin/io_timeout 일시 단축 ({_short_to}s)")
 
-        # 1) 전원 사이클 — PCIe remove 우회 (D-state hang 방지).
-        # 핵심: 직전 timeout 된 nvme-cli 의 ioctl 이 커널에 남아 있어
-        # /sys/bus/pci/devices/<BDF>/remove 의 sysfs write 가 영구 block 됨
-        # (D-state 라 subprocess/SIGKILL 도 안 풀림). PMU 전원 OFF 가 PCIe link
-        # down 을 만들면 커널 AER 가 device 사라짐을 감지 → FD cleanup → 정상 복귀.
-        # → _pcie_bdf 를 일시 None 으로 두고 _power_cycle_ssd() 호출 시 PCIe remove
-        # 분기 건너뛰게 함 (초기 POR 과 동일 경로).
-        _saved_bdf = self._pcie_bdf
-        self._pcie_bdf = None
-        try:
-            _power_ok = self._power_cycle_ssd()
-        finally:
-            self._pcie_bdf = _saved_bdf
-        if not _power_ok:
-            log.warning("[UnsupChk] Power cycle 실패 — fuzz 중단 권고")
+        # 1) 복구 전용 PMU power cycle 시퀀스:
+        #    PMU OFF → 방전 → PCIe remove (now device gone, 빠르게 통과) → PMU ON
+        #
+        # 이전 시도 두 가지 모두 실패:
+        #  a) PCIe remove 먼저 → device hung 의 ioctl 때문에 sysfs write 가 D-state
+        #     영구 block.
+        #  b) PCIe remove 건너뜀 → device 는 reset 되지만 kernel BDF entry 가 stale
+        #     → rescan 이 새 device 안 잡음 → nvme id-ctrl 미응답.
+        # 해결: power off 후 remove → BDF entry 깨끗 정리 → power on + rescan →
+        #       fresh enumeration → nvme 정상.
+
+        if not os.path.isfile(self.config.pmu_script):
+            log.error(f"[UnsupChk] PMU script 없음: {self.config.pmu_script}")
             return False
+
+        # 1-a) PMU 전원 OFF
+        log.warning("[POR] (recovery) PMU 전원 OFF 시작...")
+        _off_cmd = ['python3', self.config.pmu_script, '7', '1']
+        try:
+            _r = subprocess.run(_off_cmd, capture_output=True, timeout=10)
+            log.warning(f"[POR] PowerOff rc={_r.returncode} "
+                        f"stderr={_r.stderr.decode(errors='replace').strip()!r}")
+        except Exception as e:
+            log.error(f"[POR] PowerOff 실패: {e}")
+            return False
+        log.warning(f"[POR] 전원 OFF — {self.config.por_poweroff_wait:.1f}초 방전 대기...")
+        time.sleep(self.config.por_poweroff_wait)
+
+        # 1-b) PCIe 장치 제거 (이제 device gone 상태 — sysfs write 빠르게 통과).
+        # subprocess + timeout 으로 안전망 (만에 하나 또 block 되면 무시).
+        if self._pcie_bdf:
+            _remove_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/remove"
+            try:
+                _r = subprocess.run(
+                    ['bash', '-c', f'echo 1 > {_remove_path}'],
+                    timeout=10, capture_output=True)
+                if _r.returncode == 0:
+                    log.warning(f"[POR] PCIe 장치 제거 (power off 후): {self._pcie_bdf}")
+                else:
+                    log.warning(f"[POR] PCIe remove rc={_r.returncode}: "
+                                f"{_r.stderr.decode(errors='replace').strip()}")
+            except subprocess.TimeoutExpired:
+                log.warning("[POR] PCIe remove timeout 10s — 무시 진행")
+            except Exception as e:
+                log.warning(f"[POR] PCIe remove 예외: {e}")
+
+        # 1-c) PMU 전원 ON
+        log.warning("[POR] PMU 전원 ON 시작...")
+        _on_cmd = ['python3', self.config.pmu_script, '4', '1',
+                   str(self.config.clkreq_voltage_mv), '0', '12000', '0', '0']
+        try:
+            _r = subprocess.run(_on_cmd, capture_output=True, timeout=15)
+            log.warning(f"[POR] PowerOn rc={_r.returncode} "
+                        f"stderr={_r.stderr.decode(errors='replace').strip()!r}")
+        except Exception as e:
+            log.error(f"[POR] PowerOn 실패: {e}")
+            return False
+        log.warning("[POR] 전원 ON 완료 — PCIe rescan 진행")
 
         # 2) PCIe rescan + NVMe probe
         if not self._por_pcie_rescan():
