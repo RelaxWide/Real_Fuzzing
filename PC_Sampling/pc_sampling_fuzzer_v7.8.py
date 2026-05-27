@@ -1099,7 +1099,7 @@ class _FuzzingTerminalFilter(logging.Filter):
     _ALLOW = _re.compile(
         r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
         r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]|\[State-Replay\]'
-        r'|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]'
+        r'|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]'
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -3004,15 +3004,26 @@ class NVMeFuzzer:
 
         log.warning("[POR] SSD 전원 사이클 시작...")
 
-        # 1. PCIe 장치 제거 (커널이 사라진 장치에 접근하는 것 방지)
+        # 1. PCIe 장치 제거 (커널이 사라진 장치에 접근하는 것 방지).
+        # subprocess + timeout 으로 감싸 무한 hang 차단 — 직전 RC_TIMEOUT 으로
+        # 커널 admin/io_timeout 이 매우 큰 값 (수십일)인 상태라 device 가 응답
+        # 안 하면 sysfs write 가 영구 블록 가능. 10초 timeout 후 강제 진행.
         if self._pcie_bdf:
             remove_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/remove"
             try:
-                with open(remove_path, 'w') as f:
-                    f.write('1')
-                log.warning(f"[POR] PCIe 장치 제거: {self._pcie_bdf}")
+                _r = subprocess.run(
+                    ['bash', '-c', f'echo 1 > {remove_path}'],
+                    timeout=10, capture_output=True)
+                if _r.returncode == 0:
+                    log.warning(f"[POR] PCIe 장치 제거: {self._pcie_bdf}")
+                else:
+                    log.warning(f"[POR] PCIe 장치 제거 rc={_r.returncode}: "
+                                f"{_r.stderr.decode(errors='replace').strip()} — 무시")
+            except subprocess.TimeoutExpired:
+                log.warning(f"[POR] PCIe 장치 제거 10초 timeout — 강제 진행 "
+                            "(전원 사이클이 device 강제 reset)")
             except Exception as e:
-                log.warning(f"[POR] PCIe 장치 제거 실패 (무시): {e}")
+                log.warning(f"[POR] PCIe 장치 제거 예외: {e} — 무시")
 
         # 2. 전원 OFF
         _off_cmd = ['python3', self.config.pmu_script, '7', '1']
@@ -7172,6 +7183,21 @@ class NVMeFuzzer:
                 pass   # 이미 종료된 경우
             self._crash_nvme_pid = None
 
+        # 0.5) 커널 nvme_core admin/io_timeout 을 일시 단축 — pending ioctl 빠르게
+        # abort 되어 PCIe remove 가 D-state 에서 안 풀리는 케이스 방지.
+        # 복구 후 _configure_nvme_timeouts() 로 원복.
+        _short_to = 5
+        for _p in ['/sys/module/nvme_core/parameters/admin_timeout',
+                   '/sys/module/nvme_core/parameters/io_timeout']:
+            try:
+                with open(_p, 'w') as f:
+                    f.write(str(_short_to))
+            except OSError as e:
+                log.warning(f"[UnsupChk] {_p} 단축 실패: {e}")
+        log.warning(f"[UnsupChk] nvme_core admin/io_timeout 일시 단축 ({_short_to}s) — "
+                    "pending ioctl 빠른 abort")
+        time.sleep(_short_to + 1)   # ioctl abort 대기
+
         # 1) 전원 사이클 — PCIe remove 단계에서 정지 중인 nvme-cli child 자동 종료
         if not self._power_cycle_ssd():
             log.warning("[UnsupChk] Power cycle 실패 — fuzz 중단 권고")
@@ -7199,6 +7225,12 @@ class NVMeFuzzer:
                     log.warning("[UnsupChk] OpenOCD 재연결 실패 — coverage 만 영향, fuzz 계속")
             except Exception as e:
                 log.warning(f"[UnsupChk] OpenOCD 재연결 예외: {e}")
+
+        # 5) nvme_core admin/io_timeout 원복 — 다음 진짜 crash 보존용
+        try:
+            self._configure_nvme_timeouts()
+        except Exception as e:
+            log.warning(f"[UnsupChk] nvme_core timeout 원복 실패: {e}")
 
         log.warning("[UnsupChk] 복구 완료 — 메인 루프 재개")
         return True
