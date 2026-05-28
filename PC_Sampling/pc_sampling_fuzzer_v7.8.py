@@ -3068,11 +3068,17 @@ class NVMeFuzzer:
             except Exception as e:
                 log.warning(f"[POR] PCIe rescan 실패 (시도 {attempt}): {e}")
 
-            # 2) sysfs 에 BDF 가 올라왔는지 빠르게 확인 (rescan 효과 검증)
+            # 2) device 가 완전히 올라왔는지 확인 — sysfs BDF + /dev/ char dev +
+            # /dev/ namespace dev 모두 있어야 id-ctrl 호출 가능 (nvme-cli 가 내부에서
+            # controller char device 도 stat() 하므로).
             _bdf_ready = (self._pcie_bdf is not None
                           and os.path.isdir(f"/sys/bus/pci/devices/{self._pcie_bdf}"))
             _dev_ready = os.path.exists(self.config.nvme_device)
-            if _bdf_ready or _dev_ready:
+            # nvme_device 가 '/dev/nvme0n1' 형식이면 controller char '/dev/nvme0' 도 필요
+            _ctrl_path = re.sub(r'n\d+$', '', self.config.nvme_device)
+            _ctrl_ready = (_ctrl_path == self.config.nvme_device
+                           or os.path.exists(_ctrl_path))   # 동일 path 면 그냥 _dev_ready 와 같음
+            if _dev_ready and _ctrl_ready:
                 # 3) NVMe id-ctrl 시도 — kernel 에 device 가 잡힌 후만 의미 있음
                 r = subprocess.run(
                     ['nvme', 'id-ctrl', self.config.nvme_device],
@@ -3083,11 +3089,12 @@ class NVMeFuzzer:
                     return True
                 _err = r.stderr.decode(errors='replace').strip()[:100]
                 log.warning(f"[POR] id-ctrl rc={r.returncode} (시도 {attempt}회): "
-                            f"bdf_ready={_bdf_ready} dev_ready={_dev_ready} err={_err}")
+                            f"bdf_ready={_bdf_ready} ctrl={_ctrl_path}({_ctrl_ready}) "
+                            f"dev={self.config.nvme_device}({_dev_ready}) err={_err}")
             else:
-                log.warning(f"[POR] device 미인식 (시도 {attempt}회): "
-                            f"bdf={self._pcie_bdf or 'N/A'} dev={self.config.nvme_device} — "
-                            "rescan retry 대기")
+                log.warning(f"[POR] device 미생성 대기 (시도 {attempt}회): "
+                            f"bdf={_bdf_ready} ctrl={_ctrl_path}({_ctrl_ready}) "
+                            f"dev={self.config.nvme_device}({_dev_ready}) — rescan retry")
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
