@@ -2,126 +2,27 @@
 """
 PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v7.8
 
-OpenOCD PCSR(PC Sampling Register) 비침습 샘플링 + nvme-cli passthru 기반
-Coverage-Guided + State-Aware Fuzzer. 3코어(PM9M1) / 2코어(BM9H1) 지원.
+OpenOCD PCSR 비침습 샘플링 + nvme-cli passthru 기반 Coverage-Guided + State-Aware
+Fuzzer. 3코어(PM9M1) / 2코어(BM9H1).
 
 핵심 구성
-- Coverage: OpenOCD telnet → AP mem_ap → PCSR(CoreBase+0x84) 비침습 PC 샘플링.
-            Ghidra basic_blocks.txt 있으면 BB 기준 interesting 판정.
-- State:    NVMeStateMonitor (smart-log / get-log delta) → state corpus C2.
-            CSFuzz §III-B/C/D 적응형 p 갱신 (m1=edge, m2=state, P_MIN=0.05, P_MAX=0.60).
-- Mutation: AFL++ Havoc/Splice + Deterministic (DET_BUDGET=20%) + MOpt + Schema
-            (CDW field 타입별 변이) + Phase 1/2/3 (NLB/MDTS/64-bit LBA/structured/sequence).
-- Power:    NVMe PS0~4 × PCIe L0/L1/L1.2 × D0/D3 = 30 combo + PS3/PS4 강제 idle 슬롯.
+- Coverage: OpenOCD telnet → PCSR (CoreBase+0x84). Ghidra BB 정보가 있으면 BB 기준.
+- State:    NVMeStateMonitor delta → state corpus. CSFuzz 적응형 p.
+- Mutation: Havoc/Splice + Deterministic + MOpt + Schema + Phase 1/2/3.
+- Power:    PS0~4 × L0/L1/L1.2 × D0/D3 + S1/S2 perturb (PCIe bit / CLKREQ#).
 - POR:      pmu_4_1.py 전원 사이클 → PCIe rescan → OpenOCD 재연결.
-- Defect:   timeout/hang 감지 시 PCSR stuck 분석 → JLink mem dump → UFAS dump
-            → JLink PC 모니터링 루프 (옵션: --no-jlink-dump / --no-ufas).
+- Defect:   timeout 시 stuck PC 분석 → JLink dump → UFAS dump → PC 모니터링.
 
-v7.8 주요 변경
-- Unsupported-Command 자동 skip & recovery (EngineErrInt) — `--unsupported-skip`.
-  J-Link dump → customer parser → event log 의 EngineErrInt count delta 검출 시
-  power cycle 후 메인 루프 계속 (UFAS / break 안 함). 자세한 사용법은 md 참조.
-- `--no-jlink` — J-Link 없이 NVMe fuzz 만 수행 (NullSampler, coverage 0).
-
-v7.7 주요 변경 — S1/S2 PM Robustness Perturbation
-- 기존 PM rotation slot 에 새 perturbation slot 통합 (--pm 활성 시 자동):
-    60% POWER_COMBO (기존) / 10% forced_idle PS3/PS4 (기존)
-    20% PCIe config bit perturb (S1) — 다음 rotation 까지 변경 상태 유지
-    10% CLKREQ# timing perturb (S2) — 4 mode random
-- S1 대상 13 비트 (12 normal + 1 forced):
-    LNKCTL: rcb, extended_sync, enable_clock_pm, hw_autonomous_width
-    DEVCTL2: ido, ltr_enable, obff_enable (completion_timeout / cto_disable 제외 —
-             host PCIe controller / kernel timeout 로직에 영향 가능)
-    PMCSR: pmcsr_d1_d2_forced (일회성 50ms→D0 복귀), no_soft_reset, pme_en
-    L1SS Control1: l1ss_enable, ltr_l1_2_threshold, ltr_l1_2_scale
-             (common_mode_restore 제외 — 큰 값 시 wake 매우 느려져 timeout 가능)
-- S2 CLKREQ# 4 mode: missed_wake / extended_wait / short_pulse / rapid_toggle
-- 변경된 PCIe config 비트는 다음 rotation 까지 유지 → fuzz 명령들이 그 PM 상태에서
-  발화 → PM × fuzz 상호작용 평가 가능. 모든 입력은 host OS/BIOS 가 정상 발행 가능
-  또는 hardware glitch level 로 실제 발생 가능한 범위 한정 (vendor 클레임 가능).
-- 별도 sanity check 없음 — fuzz NVMe 명령들이 그 PM 상태에서 정상 동작하는지 자체가
-  검증. 기존 timeout/crash 로직 그대로 활용. _cmd_history 에 PM event 자동 기록되어
-  replay.sh 에 setpci/PMU 호출 포함 → 완전 재현 가능.
-
-v7.6 주요 변경 — 시각화 개선
-- coverage_growth.png 발전 — 누적 % 곡선 위에 plateau 음영 + 25/50/75/90% 마일스톤
-  vertical line + 하단 panel에 window별 New BB %/window velocity bar 추가. 한 그래프로
-  진행 속도, 포화 시점, 단계별 도달 시간을 동시 확인.
-- firmware_map.png 발전 — 함수당 BB 커버율 0~100% 그라데이션 cell, MAX_FUNCS cap 제거 후
-  전체 함수 격자(treemap-like), Top-N 미진입/부분 커버 함수 라벨, BB-weighted 평균
-  ( Σ covered_bbs / Σ total_bbs ) 표시.
-- csfuzz_dynamics.png 신규 — 3-panel (p 추이 + NC1/NC2 corpus 성장 + m1 vs m2 reward).
-  CSFuzz §III-C/D 동역학을 시각적으로 검증 가능. _csfuzz_history는 _update_csfuzz_p마다
-  (exec, p, m1, m2_norm, NC1, NC2) 누적.
-- 명령별 CFG ({cmd}_cfg.dot/.png) 제거 — edge 수가 늘면 가독성이 사라져 가치 낮음.
-
-v7.6 후속 정리 (codex review + 사용성 개선)
-- command_comparison.png — opcode mutation으로 생긴 unknown_op0x.. 라벨이 차트를 노이즈로
-  채우는 문제 해결. _tracking_label 형식을 unknown_{admin|io}_op0x{XX} 로 변경 후 차트에서
-  unknown(admin)/unknown(io) 두 버킷으로 합산. 종료 summary에 Top-5 unknown opcode 별도
-  텍스트 출력. Per-command stats / Return code distribution 도 동일 버킷팅.
-- heatmap 정리 — edge_heatmap_2d.png 제거 (PC 샘플링은 진짜 edge가 아니라 노이즈).
-  per-command 1D heatmap strip 제거. coverage_heatmap_1d.png는 global 1 strip만 유지하되
-  top-3 hot bin 주소를 라벨로 표시.
-- uncovered_funcs.png 제거 — firmware_map의 Top-N 라벨 + 그라데이션으로 대체. 우선순위
-  분석은 종료 summary 텍스트에 Top-20 not-entered + Top-20 partially-covered 목록
-  (주소·크기·BB%) 출력.
-- JLink shutdown 분리 — _shutdown_openocd_for_jlink() 헬퍼 + _handle_timeout_crash에서
-  항상 호출. --no-jlink-dump 사용 시에도 후속 JLink PC 모니터링이 J-Link USB에 정상 접근.
-- JLink/MONITOR 터미널 로그 표시 — _FuzzingTerminalFilter._ALLOW 정규식에 [JLINK],
-  [JLINK DUMP], [MONITOR] prefix 추가. dump 진행/완료, PC 모니터링 출력이 터미널에 표시됨.
-- 차트 한글 텍스트 제거 + 폰트 fallback 안전화 — matplotlib 기본 폰트(DejaVu Sans)에 한글
-  글리프가 없어 'Glyph N missing from current font' 경고와 글자 깨짐 발생. 모든 차트
-  렌더링 텍스트를 ASCII로 통일. _setup_matplotlib_chart_env() 헬퍼 신설 — font.family를
-  DejaVu Sans로 고정 + Glyph missing 경고 패턴 ignore. 5개 차트 사이트가 헬퍼 호출.
-- firmware_map Top-N 라벨에서 ⬛/⬜ unicode 제거 (matplotlib 기본 폰트 미지원).
-
-v7.5 주요 변경
-- SequenceSeed corpus 도입 — builtin sequence(Write→Compare 등)를 N개 명령 단위로 저장.
-  energy = MAX_ENERGY / N 패널티로 단일 Seed와 per-exec 공정 경쟁.
-- Sequence ctx 파생 — Write를 먼저 mutation 후 그 결과 CDW10/11/12/[data]에서 ctx 파생,
-  후속 명령에만 적용. `_CTX_SEQUENCES`는 모드 매핑 dict:
-    full     — SLBA+NLB+data 공유 (Write→Compare, Write→Read)
-    lba_nlb  — SLBA+NLB만 공유, data는 독립 mutation (Write→Write — overwrite 경로)
-- _cull_corpus 2-pass favored 마킹 — Pass1: 단일 Seed로 PC → best 매핑,
-  Pass2: 미커버 PC만 SequenceSeed가 채움. SequenceSeed도 동일 cull/epoch 규칙 적용.
-- MAX_SEQUENCE_CORPUS=50 cap을 (is_favored, new_pcs) 정렬로 변경.
-- seq_corpus/ 폴더에 SequenceSeed replay .sh 자동 저장. cull 시 고아 파일 청소.
-- BUILTIN_SEQUENCES 확장: Write→Read, Write→Write (기본 모드 명령만으로도 시퀀스 작동).
-  SEQ_PROB=0.05, SEQ_MAX_PER_100=10.
-- corpus SequenceSeed 선택 시 window 초과 fallback에서 exec_count 보정 — 단발 실행으로
-  소비된 카운트를 되돌려 다음 window에서 재선택 기회를 보존.
-- --no-jlink-dump 옵션 추가. CLI 옵션 51→19개로 정리 (나머지는 코드 상수로 유지).
-- DSM NR=0xFF payload 불일치 / Copy NR 마스크 0xFF→0xF / data_len_override 잔존 리셋 수정.
-
-버전 이력 요약
-- v7.6 — 시각화 개선 (coverage_growth velocity+plateau+milestone, firmware_map BB-gradient+
-         treemap+Top-N, csfuzz_dynamics 신규). CFG 제거, heatmap/uncovered 정리. JLink
-         shutdown 분리. unknown opcode 버킷팅. matplotlib 한글 폰트 fallback 안전화.
-- v7.5 — SequenceSeed corpus + 2-pass favored cull + ctx 모드(full/lba_nlb) + 기본 모드 시퀀스
-         (Write→Read, Write→Write) + CLI 19개로 정리 + --no-jlink-dump.
-- v7.4 — Phase 1 (NLB/MDTS data_len), Phase 2 (64-bit LBA pair, DSM/Copy structured),
-         Phase 3 (Builtin sequence mini-set), PM 로테이션을 seed 선택 전으로 이동.
-- v7.3 — _account_command() 헬퍼, State-Replay cmd 복원 정확도, m2 정규화.
-- v7.2 — DET_BUDGET(20%) 도입, MOpt operator reward 누적 버그 수정.
-- v7.1 — --allow-no-openocd --pm 조합으로 PM 독립 검증 경로 추가.
-- v7.0 — State-Aware Fuzzer: NVMeStateMonitor / StateCorpusEntry / dual interesting.
-- v6.4 — PS3/PS4 강제 idle 슬롯 (NOPS 커버리지 확보).
-- v6.3 — JTAG 지원 (BM9H1, 2코어), PCSR 주소 CLI 설정.
-- v6.2 — Rule-Based Schema Mutation (42cmd / ~150field / 8type), IO_ADMIN_RATIO=3.
-- v6.0 — OpenOCD PCSR 비침습 샘플링 (J-Link halt-sample-resume 대체), 3코어 동시 수집,
-         POR, 2단계 복구, hang 보존 분석.
-- v5.x — J-Link halt-sample-resume, MOpt, Power Combo, BB coverage, 시각화 그래프,
-         시드 템플릿 nvme_seeds.py 분리.
-
-상세 변경 이력은 git log 참조.
-
-미완성 로드맵 (TODO)
-- Phase 1: PC 필터 범위 진단 (multi-range), BB coverage 정확도 검증.
-- Phase 2: --prefill 강화, FTL 상태 지표 추가 (state_fields.py).
-- Phase 3: PM 시나리오 테이블 (ScenarioSeed), POR 직후 boot_sweep injection.
-- Phase 4: TransactionSeed 도입, 시퀀스 자체 mutation (insert/delete/swap).
-- Phase 5: 안전한 추가 명령 활성화, 위험 명령 격리 정책.
+버전 요약 (자세한 내용은 git log / 각 버전 md 참조)
+- v7.8: `--unsupported-skip` (EngineErrInt 자동 감지 → power cycle 후 메인 루프 계속),
+        `--no-jlink` (J-Link 없이 NVMe-only fuzz).
+- v7.7: S1 PCIe config bit perturb + S2 CLKREQ# timing perturb (PM rotation 통합).
+- v7.6: 시각화 (coverage_growth velocity, firmware_map gradient, csfuzz_dynamics).
+- v7.5: SequenceSeed corpus + 2-pass favored cull + ctx 모드.
+- v7.4: Phase 1/2/3 (NLB/MDTS, 64-bit LBA, builtin sequence).
+- v7.3: _account_command 헬퍼, m2 정규화.
+- v7.0: State-Aware (NVMeStateMonitor / dual interesting).
+- v6.x: OpenOCD PCSR, JTAG 지원, Schema Mutation, PS3/PS4 idle slot.
 """
 
 from __future__ import annotations
@@ -211,12 +112,7 @@ NVME_TIMEOUTS = {
     'selftest_short': 120_000,   # Device Self-test Short DST (STC=0x1) — 2분
     'selftest_ext':   900_000,   # Device Self-test Extended DST (STC=0x2) — 15분
     'verify':          20_000,   # Verify — 미디어 ECC 검증, LBA 범위에 따라 지연 가능
-    # 아래는 'command' fallback(8,000ms)으로 처리
-    # 'sanitize':      sanitize는 FuzzConfig 초기화 전용 → 풀에서 제거됨
-    # 'fw_commit':     8,000ms
-    # 'telemetry':     8,000ms
-    # 'dsm':           8,000ms
-    # 'security':      8,000ms
+    # fw_commit/telemetry/dsm/security 는 'command' fallback (8,000ms). sanitize 는 풀 제외.
 }
 
 # PC 샘플링 설정
@@ -228,19 +124,9 @@ SATURATION_LIMIT      = 10    # idle 유니버스 연속 카운터: idle_pcs 내
 GLOBAL_SATURATION_LIMIT = 20  # 연속 N회 새 global PC 없으면 조기 종료 (global_coverage 기준).
 POST_CMD_DELAY_MS     = 0     # 커맨드 완료 후 tail 샘플링 (ms)
 
-# subprocess 감지 timeout(NVME_TIMEOUTS)과 분리.
-# 정상 실행에서는 SSD가 ms~초 단위로 응답하므로 이 값은 무관.
-# crash 시: subprocess 감지 timeout(~10초)이 먼저 발동 → kill → D state.
-#           이 값이 길면 커널이 NVMe 명령을 포기하지 않아 controller reset을 하지 않음.
-#           → SSD 펌웨어 crash 상태 보존 (JTAG 분석 용이).
-NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일 (커널 reset 방지, u32 max ~49.7일)
-
-# 퍼저 시작 시 nvme_core 모듈 파라미터로 설정할 타임아웃 (초)
-# crash 발생 시 이 시간이 지나야 커널이 controller reset을 시작한다.
-# 기본값: admin_timeout=60s, io_timeout=30s → 펌웨어 crash 후 ~60초면 reset됨.
-# 이 값을 크게 설정하면 crash 상태가 장기간 보존되어 JTAG 분석 가능.
-# 적용 대상: 설정 이후 새로 제출되는 NVMe 명령 (기존 in-flight AER 제외)
-NVME_KERNEL_TIMEOUT_SEC = 2_592_000  # 30일 (30 * 24 * 3600)
+# crash 후 커널이 controller reset 하지 않도록 큰 값. 정상 실행에는 영향 없음.
+NVME_PASSTHRU_TIMEOUT_MS = 2_592_000_000  # 30일 (u32 max ~49.7일)
+NVME_KERNEL_TIMEOUT_SEC  = 2_592_000      # 30일 (nvme_core admin/io_timeout)
 
 # 퍼징 설정
 MAX_INPUT_LEN     = 131072    # 최대 입력 바이트 (128KB = 256 blocks, Write 대용량 시드 지원)
@@ -301,30 +187,13 @@ GRAPH_REFRESH_INTERVAL = 5000
 # PS entry/exit latency 마진 — 어떤 PS 상태에서든 entry+exit 합산 최대 105ms를 모든 timeout에 가산
 PS_ENTRY_EXIT_MARGIN_MS = 105
 
-# ──────────────────────────────────────────────────────────────────────
-# v7.7: S1/S2 PM Robustness Perturbation
-# ──────────────────────────────────────────────────────────────────────
-# 기존 PM rotation slot(POWER_COMBO / forced_idle) 위에 새 perturbation
-# slot 을 추가하여 PCIe config bit / CLKREQ# timing 의 PM robustness 검증.
-# --pm 활성 시 자동 사용 (별도 옵션 없음).
-#
-# 모든 입력은 host OS/BIOS 가 정상 발행하거나 hardware glitch level 로
-# 실제 발생 가능한 범위만 — vendor 클레임 가능한 결함 신호 산출이 목적.
-#
-# 분기 비율:
-#    0.00 ~ 0.60  POWER_COMBO 30종 (기존)
-#    0.60 ~ 0.70  forced_idle PS3/PS4 (기존)
-#    0.70 ~ 0.90  PCIe config bit perturb (S1, 변경 유지)
-#    0.90 ~ 1.00  CLKREQ# timing perturb (S2, 4 mode random)
-# ──────────────────────────────────────────────────────────────────────
+# v7.7 PM perturbation 분기 (--pm 시 자동):
+#   0.00~0.60 POWER_COMBO 30종 / 0.60~0.70 forced_idle PS3/PS4
+#   0.70~0.90 S1 PCIe config bit perturb (변경 유지) / 0.90~1.00 S2 CLKREQ# timing
 
-# PCIe config 비트 perturbation 대상 (S1)
-# 각 항목: (cap_name, offset_in_cap, bit_lo, bit_width, name, constraint)
-# cap_name : 'exp' | 'pm' | 'l1ss'
-# constraint:
-#    None              — 전체 범위(0~2^width-1) random
-#    {'min','max'}     — 값 범위 제한
-#    'forced_one_shot' — 일회성 forced slot (D1/D2 진입 → 50ms → D0 자동 복귀)
+# S1 대상: (cap_name, offset_in_cap, bit_lo, bit_width, name, constraint)
+#   cap_name: 'exp' | 'pm' | 'l1ss'
+#   constraint: None / {'min','max'} / 'forced_one_shot' (D1/D2 → 50ms → D0)
 PCIE_PM_FUZZ_TARGETS = [
     # PCIe Express Cap — LNKCTL (offset 0x10), 4 비트
     ('exp', 0x10,  2, 1, 'rcb',                 None),
@@ -3007,10 +2876,8 @@ class NVMeFuzzer:
 
         log.warning("[POR] SSD 전원 사이클 시작...")
 
-        # 1. PCIe 장치 제거 (커널이 사라진 장치에 접근하는 것 방지).
-        # subprocess + timeout 으로 감싸 무한 hang 차단 — 직전 RC_TIMEOUT 으로
-        # 커널 admin/io_timeout 이 매우 큰 값 (수십일)인 상태라 device 가 응답
-        # 안 하면 sysfs write 가 영구 블록 가능. 10초 timeout 후 강제 진행.
+        # 1. PCIe 장치 제거. nvme_kernel_timeout_sec 가 크게 설정된 상태에서 device 가
+        # 응답 안 하면 sysfs write 영구 block 가능 → subprocess timeout 10초 강제 진행.
         if self._pcie_bdf:
             remove_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/remove"
             try:
@@ -7215,29 +7082,14 @@ class NVMeFuzzer:
                 pass   # 이미 종료된 경우
             self._crash_nvme_pid = None
 
-        # NOTE: 이전엔 nvme_core admin/io_timeout 을 5s 로 일시 단축했지만 — 그게
-        # 오히려 recovery 직후 nvme id-ctrl polling 까지 5s 로 제한해서 device boot
-        # 시간 안에 응답 못 받음 → "NVMe 미응답" 으로 recovery 실패하는 원인이었음.
-        # 사용자 수동 (off → on → rescan, timeout 손 안 댐) 은 정상 동작. → 단축 제거.
-        # PMU power off 가 PCIe link down 을 일으키면 kernel AER 가 in-flight ioctl
-        # 자동 abort 하므로 timeout 손댈 필요 없음.
-        self._probe_device("after_sigkill")   # baseline 진단
+        # NOTE: nvme_core timeout 은 손대지 않음 — 단축하면 recovery 후 id-ctrl polling
+        # 까지 그 값에 갇혀 device boot 안에 응답 못 받음. PMU off 가 link down →
+        # AER 가 in-flight ioctl 자동 abort.
+        self._probe_device("after_sigkill")
 
-        # 1) 복구 전용 sequence:
-        #    PMU OFF → 방전 대기 → PCIe remove → PMU ON → boot wait → rescan
-        #
-        # 시행착오:
-        #  a) PCIe remove 먼저 (PMU off 이전): device hung ioctl 의 D-state 때문에
-        #     sysfs write 영구 block.
-        #  b) PCIe remove 건너뜀 (off→on→rescan): kernel BDF entry + nvme driver
-        #     state 가 wedged 인 채로 새 device 잡힘 → rescan 은 성공 / lspci 보이지만
-        #     id-ctrl 단계에서 admin queue wedged → hang.
-        #  c) power off 후 remove + 짧은 wait: device 가 link training 전에 rescan →
-        #     device miss → lspci 안 보임.
-        # → 채택: power off → 방전 → remove (driver unbind) → power on → boot wait →
-        #   rescan (retry). PMU off 가 AER 로 in-flight ioctl 정리, remove 가 driver
-        #   강제 unbind, boot wait 가 link training 시간 확보, rescan retry 가 늦은
-        #   부팅도 흡수.
+        # 복구 sequence: PMU OFF → 방전 → PCIe remove → PMU ON → boot wait → rescan.
+        # remove 가 필수 — 안 하면 wedged driver state 에 새 device 가 붙어 id-ctrl
+        # 단계에서 admin queue hang. 시행착오 상세는 md 참조.
 
         if not os.path.isfile(self.config.pmu_script):
             log.error(f"[UnsupChk] PMU script 없음: {self.config.pmu_script}")
@@ -7257,12 +7109,8 @@ class NVMeFuzzer:
         time.sleep(self.config.por_poweroff_wait)
         self._probe_device("after_power_off")   # device gone 상태 확인
 
-        # 1-b) PCIe 장치 제거 — 이제 device 가 link down (AER 처리 끝남) 이라
-        # 그 BDF 의 in-flight ioctl 없음. sysfs write 빠르게 통과 + nvme driver
-        # 강제 unbind + BDF entry 정리. 다음 PMU on + rescan 에서 fresh bind.
-        #
-        # 안 하면: rescan 이 stale driver state 인 채로 device 새로 잡아 → id-ctrl
-        # 단계에서 admin queue wedged → hang.
+        # 1-b) PCIe 장치 제거 — link down 후라 in-flight ioctl 없음 → sysfs write
+        # 빠르게 통과. driver unbind + BDF entry 정리 → PMU on 시 fresh bind.
         if self._pcie_bdf:
             _remove_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/remove"
             try:
@@ -7295,10 +7143,8 @@ class NVMeFuzzer:
         log.warning("[POR] 전원 ON 완료")
         self._probe_device("after_power_on")   # 부팅 시작 시점
 
-        # 1-d) SSD boot 대기 — 초기 POR 흐름에서는 OpenOCD connect retry +
-        # _collect_boot_coverage 가 자연스러운 ~boot_sweep_s 만큼 wait 을 제공해
-        # rescan 시점엔 SSD 가 완전 부팅됨. recovery 에선 그 단계가 없어 rescan 이
-        # link training 전에 실행 → device miss. 명시 wait 추가.
+        # 1-d) SSD boot 대기 — recovery 에선 초기 POR 의 boot_sweep wait 가 없어 rescan
+        # 이 link training 전에 실행되면 device miss. 명시 대기 필요.
         _boot_wait = max(self.config.boot_sweep_s, 5.0)
         log.warning(f"[POR] SSD boot 대기 {_boot_wait:.1f}초...")
         time.sleep(_boot_wait)
@@ -9912,14 +9758,8 @@ class NVMeFuzzer:
                 # 항상 빈 리스트가 전달되어 mopt_finds/mopt_uses가 누적되지 않는 버그가 있었음.
                 self._current_mutations = []
 
-                # PM combo 로테이션 — seed 선택 전, PM_ROTATE_INTERVAL마다 새 slot 진입
-                # PM 구간과 명령어 블록을 분리: PM 전이 완료 후 seed 선택 → 실행
-                #
-                # v7.7: --pm 활성 시 slot 분기 (S1/S2 PM Robustness Perturbation 포함)
-                #   60%: POWER_COMBO (기존)
-                #   10%: forced_idle PS3/PS4 (기존)
-                #   20%: PCIe config bit perturb (S1, 변경 유지)
-                #   10%: CLKREQ# timing perturb (S2, 4 mode random)
+                # PM rotation (PM_ROTATE_INTERVAL 마다): 60% combo / 10% forced_idle /
+                # 20% S1 pcie_bit / 10% S2 clkreq. PM 전이 후 seed 선택.
                 if (self.config.pm_inject_prob > 0
                         and self.executions % PM_ROTATE_INTERVAL == 0):
                     _next_combo = None
