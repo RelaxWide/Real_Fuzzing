@@ -7301,8 +7301,17 @@ class NVMeFuzzer:
         except Exception as e:
             log.error(f"[POR] PowerOn 실패: {e}")
             return False
-        log.warning("[POR] 전원 ON 완료 — PCIe rescan 진행")
+        log.warning("[POR] 전원 ON 완료")
         self._probe_device("after_power_on")   # 부팅 시작 시점
+
+        # 1-c) SSD boot 대기 — 초기 POR 흐름에서는 OpenOCD connect retry +
+        # _collect_boot_coverage 가 자연스러운 ~boot_sweep_s 만큼 wait 을 제공해
+        # rescan 시점엔 SSD 가 완전 부팅됨. recovery 에선 그 단계가 없어 rescan 이
+        # link training 전에 실행 → device miss. 명시 wait 추가.
+        _boot_wait = max(self.config.boot_sweep_s, 5.0)
+        log.warning(f"[POR] SSD boot 대기 {_boot_wait:.1f}초...")
+        time.sleep(_boot_wait)
+        self._probe_device("after_boot_wait")
 
         # 2) PCIe rescan + NVMe probe
         if not self._por_pcie_rescan():
