@@ -3047,39 +3047,52 @@ class NVMeFuzzer:
         return True
 
     def _por_pcie_rescan(self) -> bool:
-        """POR Phase 2: PCIe rescan + NVMe 장치 응답 확인 (boot sweep 완료 후 호출).
+        """POR Phase 2: PCIe rescan + NVMe 장치 응답 확인.
 
-        boot sweep 동안 firmware가 부팅을 완료했을 것으로 기대.
-        NVMe 응답이 없으면 por_boot_wait 내에서 재시도.
+        Device boot / link training 시간이 변동적이라 단일 rescan 으론 놓치는
+        경우 있음. → por_boot_wait 동안 rescan + id-ctrl 을 retry loop 으로 반복.
+        한 번이라도 device 가 sysfs 에 올라오면 id-ctrl 시도.
         """
-        # PCIe rescan
-        try:
-            with open('/sys/bus/pci/rescan', 'w') as f:
-                f.write('1')
-            log.warning("[POR] PCIe rescan 완료")
-            time.sleep(1.5)
-        except Exception as e:
-            log.warning(f"[POR] PCIe rescan 실패: {e}")
-
-        # NVMe 장치 응답 확인 — por_boot_wait 내에서 재시도
         deadline = time.monotonic() + self.config.por_boot_wait
         attempt = 0
-        while True:
+        _first_rescan = True
+        while time.monotonic() < deadline:
             attempt += 1
-            r = subprocess.run(
-                ['nvme', 'id-ctrl', self.config.nvme_device],
-                capture_output=True, timeout=10,
-            )
-            if r.returncode == 0:
-                log.warning(f"[POR] NVMe 장치 응답 확인: {self.config.nvme_device} ✓ "
-                            f"(시도 {attempt}회)")
-                return True
+            # 1) rescan trigger (매 시도마다 — device 가 늦게 올라와도 잡힘)
+            try:
+                with open('/sys/bus/pci/rescan', 'w') as f:
+                    f.write('1')
+                if _first_rescan:
+                    log.warning("[POR] PCIe rescan 완료 (첫 시도)")
+                    _first_rescan = False
+            except Exception as e:
+                log.warning(f"[POR] PCIe rescan 실패 (시도 {attempt}): {e}")
+
+            # 2) sysfs 에 BDF 가 올라왔는지 빠르게 확인 (rescan 효과 검증)
+            _bdf_ready = (self._pcie_bdf is not None
+                          and os.path.isdir(f"/sys/bus/pci/devices/{self._pcie_bdf}"))
+            _dev_ready = os.path.exists(self.config.nvme_device)
+            if _bdf_ready or _dev_ready:
+                # 3) NVMe id-ctrl 시도 — kernel 에 device 가 잡힌 후만 의미 있음
+                r = subprocess.run(
+                    ['nvme', 'id-ctrl', self.config.nvme_device],
+                    capture_output=True, timeout=10)
+                if r.returncode == 0:
+                    log.warning(f"[POR] NVMe 장치 응답 확인: {self.config.nvme_device} "
+                                f"✓ (시도 {attempt}회)")
+                    return True
+                _err = r.stderr.decode(errors='replace').strip()[:100]
+                log.warning(f"[POR] id-ctrl rc={r.returncode} (시도 {attempt}회): "
+                            f"bdf_ready={_bdf_ready} dev_ready={_dev_ready} err={_err}")
+            else:
+                log.warning(f"[POR] device 미인식 (시도 {attempt}회): "
+                            f"bdf={self._pcie_bdf or 'N/A'} dev={self.config.nvme_device} — "
+                            "rescan retry 대기")
+
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             wait = min(1.0, remaining)
-            log.warning(f"[POR] NVMe 미응답 (시도 {attempt}회) — {wait:.1f}초 후 재시도 "
-                        f"(남은 대기 {remaining:.1f}초)...")
             time.sleep(wait)
 
         log.error(f"[POR] NVMe 장치 미응답 — boot sweep + por_boot_wait({self.config.por_boot_wait:.0f}s) "
@@ -7232,30 +7245,26 @@ class NVMeFuzzer:
                 pass   # 이미 종료된 경우
             self._crash_nvme_pid = None
 
-        # 0.5) 커널 nvme_core admin/io_timeout 을 일시 단축. 단, in-flight ioctl 은
-        # 제출 시점 값을 쓰므로 영향 없음 — 이후 신규 ioctl 만 영향. 그래도 power off
-        # 후 kernel cleanup 단계의 후속 명령 (nvme id-ctrl 등) 빠른 abort 에 도움.
-        _short_to = 5
-        for _p in ['/sys/module/nvme_core/parameters/admin_timeout',
-                   '/sys/module/nvme_core/parameters/io_timeout']:
-            try:
-                with open(_p, 'w') as f:
-                    f.write(str(_short_to))
-            except OSError as e:
-                log.warning(f"[UnsupChk] {_p} 단축 실패: {e}")
-        log.warning(f"[UnsupChk] nvme_core admin/io_timeout 일시 단축 ({_short_to}s)")
-        self._probe_device("after_sigkill_timeout_lower")   # 전원 사이클 전 baseline
+        # NOTE: 이전엔 nvme_core admin/io_timeout 을 5s 로 일시 단축했지만 — 그게
+        # 오히려 recovery 직후 nvme id-ctrl polling 까지 5s 로 제한해서 device boot
+        # 시간 안에 응답 못 받음 → "NVMe 미응답" 으로 recovery 실패하는 원인이었음.
+        # 사용자 수동 (off → on → rescan, timeout 손 안 댐) 은 정상 동작. → 단축 제거.
+        # PMU power off 가 PCIe link down 을 일으키면 kernel AER 가 in-flight ioctl
+        # 자동 abort 하므로 timeout 손댈 필요 없음.
+        self._probe_device("after_sigkill")   # baseline 진단
 
-        # 1) 복구 전용 PMU power cycle 시퀀스:
-        #    PMU OFF → 방전 → PCIe remove (now device gone, 빠르게 통과) → PMU ON
+        # 1) 복구 전용 PMU power cycle 시퀀스 — 사용자 수동 동작과 동일:
+        #      PMU OFF → 방전 대기 → PMU ON → _por_pcie_rescan (retry loop)
         #
-        # 이전 시도 두 가지 모두 실패:
-        #  a) PCIe remove 먼저 → device hung 의 ioctl 때문에 sysfs write 가 D-state
+        # 시행착오:
+        #  a) PCIe remove 먼저: device hung 의 ioctl 때문에 sysfs write 가 D-state
         #     영구 block.
-        #  b) PCIe remove 건너뜀 → device 는 reset 되지만 kernel BDF entry 가 stale
-        #     → rescan 이 새 device 안 잡음 → nvme id-ctrl 미응답.
-        # 해결: power off 후 remove → BDF entry 깨끗 정리 → power on + rescan →
-        #       fresh enumeration → nvme 정상.
+        #  b) PCIe remove 건너뜀 (그냥 off→on→rescan): kernel BDF entry stale 라도
+        #     rescan 이 link 변화 감지하면 driver 재bind → 정상. (사용자 수동 동작)
+        #  c) power off 후 remove: remove 가 BDF entry 정리하지만 hotplug 자동 detect
+        #     가 안 먹어서 rescan 만으론 device 못 잡는 케이스.
+        # → b) 채택. _por_pcie_rescan 이 rescan 을 retry loop 으로 반복하여
+        #    link training 늦은 경우도 흡수.
 
         if not os.path.isfile(self.config.pmu_script):
             log.error(f"[UnsupChk] PMU script 없음: {self.config.pmu_script}")
@@ -7275,25 +7284,13 @@ class NVMeFuzzer:
         time.sleep(self.config.por_poweroff_wait)
         self._probe_device("after_power_off")   # device gone 상태 확인
 
-        # 1-b) PCIe 장치 제거 (이제 device gone 상태 — sysfs write 빠르게 통과).
-        # subprocess + timeout 으로 안전망 (만에 하나 또 block 되면 무시).
-        if self._pcie_bdf:
-            _remove_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/remove"
-            try:
-                _r = subprocess.run(
-                    ['bash', '-c', f'echo 1 > {_remove_path}'],
-                    timeout=10, capture_output=True)
-                if _r.returncode == 0:
-                    log.warning(f"[POR] PCIe 장치 제거 (power off 후): {self._pcie_bdf}")
-                else:
-                    log.warning(f"[POR] PCIe remove rc={_r.returncode}: "
-                                f"{_r.stderr.decode(errors='replace').strip()}")
-            except subprocess.TimeoutExpired:
-                log.warning("[POR] PCIe remove timeout 10s — 무시 진행")
-            except Exception as e:
-                log.warning(f"[POR] PCIe remove 예외: {e}")
+        # NOTE: 이전엔 PMU off → PCIe remove → PMU on 순으로 BDF entry 명시 정리
+        # 했지만, remove 후엔 hotplug 자동 detect 가 안 먹어서 rescan 만으론 device
+        # 못 잡는 케이스 발생. 사용자 수동 (off → on → rescan, remove 안 함) 흐름이
+        # 정상 동작 — 같은 패턴 적용. stale BDF entry 가 있어도 rescan 이 link 변화
+        # 감지하면 driver 재bind.
 
-        # 1-c) PMU 전원 ON
+        # 1-b) PMU 전원 ON
         log.warning("[POR] PMU 전원 ON 시작...")
         _on_cmd = ['python3', self.config.pmu_script, '4', '1',
                    str(self.config.clkreq_voltage_mv), '0', '12000', '0', '0']
@@ -7331,12 +7328,6 @@ class NVMeFuzzer:
                     log.warning("[UnsupChk] OpenOCD 재연결 실패 — coverage 만 영향, fuzz 계속")
             except Exception as e:
                 log.warning(f"[UnsupChk] OpenOCD 재연결 예외: {e}")
-
-        # 5) nvme_core admin/io_timeout 원복 — 다음 진짜 crash 보존용
-        try:
-            self._configure_nvme_timeouts()
-        except Exception as e:
-            log.warning(f"[UnsupChk] nvme_core timeout 원복 실패: {e}")
 
         log.warning("[UnsupChk] 복구 완료 — 메인 루프 재개")
         return True
