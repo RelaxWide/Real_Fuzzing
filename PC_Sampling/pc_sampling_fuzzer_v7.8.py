@@ -7253,18 +7253,21 @@ class NVMeFuzzer:
         # 자동 abort 하므로 timeout 손댈 필요 없음.
         self._probe_device("after_sigkill")   # baseline 진단
 
-        # 1) 복구 전용 PMU power cycle 시퀀스 — 사용자 수동 동작과 동일:
-        #      PMU OFF → 방전 대기 → PMU ON → _por_pcie_rescan (retry loop)
+        # 1) 복구 전용 sequence:
+        #    PMU OFF → 방전 대기 → PCIe remove → PMU ON → boot wait → rescan
         #
         # 시행착오:
-        #  a) PCIe remove 먼저: device hung 의 ioctl 때문에 sysfs write 가 D-state
-        #     영구 block.
-        #  b) PCIe remove 건너뜀 (그냥 off→on→rescan): kernel BDF entry stale 라도
-        #     rescan 이 link 변화 감지하면 driver 재bind → 정상. (사용자 수동 동작)
-        #  c) power off 후 remove: remove 가 BDF entry 정리하지만 hotplug 자동 detect
-        #     가 안 먹어서 rescan 만으론 device 못 잡는 케이스.
-        # → b) 채택. _por_pcie_rescan 이 rescan 을 retry loop 으로 반복하여
-        #    link training 늦은 경우도 흡수.
+        #  a) PCIe remove 먼저 (PMU off 이전): device hung ioctl 의 D-state 때문에
+        #     sysfs write 영구 block.
+        #  b) PCIe remove 건너뜀 (off→on→rescan): kernel BDF entry + nvme driver
+        #     state 가 wedged 인 채로 새 device 잡힘 → rescan 은 성공 / lspci 보이지만
+        #     id-ctrl 단계에서 admin queue wedged → hang.
+        #  c) power off 후 remove + 짧은 wait: device 가 link training 전에 rescan →
+        #     device miss → lspci 안 보임.
+        # → 채택: power off → 방전 → remove (driver unbind) → power on → boot wait →
+        #   rescan (retry). PMU off 가 AER 로 in-flight ioctl 정리, remove 가 driver
+        #   강제 unbind, boot wait 가 link training 시간 확보, rescan retry 가 늦은
+        #   부팅도 흡수.
 
         if not os.path.isfile(self.config.pmu_script):
             log.error(f"[UnsupChk] PMU script 없음: {self.config.pmu_script}")
@@ -7284,13 +7287,31 @@ class NVMeFuzzer:
         time.sleep(self.config.por_poweroff_wait)
         self._probe_device("after_power_off")   # device gone 상태 확인
 
-        # NOTE: 이전엔 PMU off → PCIe remove → PMU on 순으로 BDF entry 명시 정리
-        # 했지만, remove 후엔 hotplug 자동 detect 가 안 먹어서 rescan 만으론 device
-        # 못 잡는 케이스 발생. 사용자 수동 (off → on → rescan, remove 안 함) 흐름이
-        # 정상 동작 — 같은 패턴 적용. stale BDF entry 가 있어도 rescan 이 link 변화
-        # 감지하면 driver 재bind.
+        # 1-b) PCIe 장치 제거 — 이제 device 가 link down (AER 처리 끝남) 이라
+        # 그 BDF 의 in-flight ioctl 없음. sysfs write 빠르게 통과 + nvme driver
+        # 강제 unbind + BDF entry 정리. 다음 PMU on + rescan 에서 fresh bind.
+        #
+        # 안 하면: rescan 이 stale driver state 인 채로 device 새로 잡아 → id-ctrl
+        # 단계에서 admin queue wedged → hang.
+        if self._pcie_bdf:
+            _remove_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/remove"
+            try:
+                _r = subprocess.run(
+                    ['bash', '-c', f'echo 1 > {_remove_path}'],
+                    timeout=10, capture_output=True)
+                if _r.returncode == 0:
+                    log.warning(f"[POR] PCIe 장치 제거 (driver unbind): {self._pcie_bdf}")
+                else:
+                    log.warning(f"[POR] PCIe remove rc={_r.returncode}: "
+                                f"{_r.stderr.decode(errors='replace').strip()} — 무시")
+            except subprocess.TimeoutExpired:
+                log.warning("[POR] PCIe remove timeout 10s — 무시 진행 "
+                            "(power off 가 이미 link down 시킴)")
+            except Exception as e:
+                log.warning(f"[POR] PCIe remove 예외: {e} — 무시")
+        self._probe_device("after_remove")
 
-        # 1-b) PMU 전원 ON
+        # 1-c) PMU 전원 ON
         log.warning("[POR] PMU 전원 ON 시작...")
         _on_cmd = ['python3', self.config.pmu_script, '4', '1',
                    str(self.config.clkreq_voltage_mv), '0', '12000', '0', '0']
@@ -7304,7 +7325,7 @@ class NVMeFuzzer:
         log.warning("[POR] 전원 ON 완료")
         self._probe_device("after_power_on")   # 부팅 시작 시점
 
-        # 1-c) SSD boot 대기 — 초기 POR 흐름에서는 OpenOCD connect retry +
+        # 1-d) SSD boot 대기 — 초기 POR 흐름에서는 OpenOCD connect retry +
         # _collect_boot_coverage 가 자연스러운 ~boot_sweep_s 만큼 wait 을 제공해
         # rescan 시점엔 SSD 가 완전 부팅됨. recovery 에선 그 단계가 없어 rescan 이
         # link training 전에 실행 → device miss. 명시 wait 추가.
