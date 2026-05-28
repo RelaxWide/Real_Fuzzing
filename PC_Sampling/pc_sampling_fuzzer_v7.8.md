@@ -63,22 +63,130 @@ v7.7 의 PM Robustness Perturbation (S1+S2), v7.6 시각화 / v7.5 SequenceSeed 
 
 ## 요구사항 / 빠른 시작
 
+### 환경
+
+- **OS**: Linux (Ubuntu 권장). 모든 설명은 native Linux 기준.
+- **Python**: 3.8+
+- **시스템 패키지**: `openocd 0.12.0+`, `nvme-cli`, `pciutils` (`setpci` / `lspci`)
+- **하드웨어**: J-Link V9 / EDU (SWD 또는 JTAG), PMU GPIO 보드 (`pmu_4_1.py` 로 제어)
+- **타겟**: Samsung PM9M1 (SWD, 3코어) 또는 BM9H1 (JTAG, 2코어)
+- **권한**: `sudo` (nvme-cli, setpci, /sys 접근 필요)
+
+### 디렉토리 구조
+
+`<fuzzer가 있는 폴더>` 안에 다음 모두 있어야 함 (이름은 `PC_Sampling` / `pc_sample` / 기타 무관 — sys.argv[0] 기준 상대):
+
 ```
-Python 3.8+, openocd 0.12.0+, nvme-cli, setpci, JLinkExe, J-Link V9/EDU, pmu_4_1.py
+<fuzzer 폴더>/
+├── pc_sampling_fuzzer_v7.8.py        # 본체
+├── pc_sampling_fuzzer_v7.8.md        # 이 문서
+├── pmu_4_1.py                        # PMU GPIO 제어 스크립트 (사용자 환경)
+├── r8_pcsr.cfg                       # OpenOCD config (PM9M1 SWD)
+├── r8_pcsr_jtag.cfg                  # OpenOCD config (BM9H1 JTAG, 옵션)
+├── run_smi_mem_dump_JLINK_USB.sh     # J-Link 메모리 dump (crash 시)
+├── ufas                              # UFAS firmware dump 바이너리 (옵션)
+├── nvme_seeds.py                     # 초기 NVMe seed 정의
+├── basic_blocks.txt                  # Ghidra 추출 BB 시작 주소 (선택)
+├── functions.txt                     # Ghidra 함수 entry/end (선택)
+│
+├── DebugPackage/                     # ── v7.8 --unsupported-skip 용 ─
+│   ├── module/                       # vendor parser 의 share / utility
+│   │   ├── share.py
+│   │   ├── dumpmem_handle.py
+│   │   └── ... (기타 vendor 모듈)
+│   ├── python/                       # bundled Windows Python (Linux 면 site-packages 만 활용)
+│   │   ├── python.exe                # Linux 에선 실행 불가, 무시
+│   │   └── Lib/site-packages/        # pure-Python 패키지 (intelhex 등) — Linux 도 PYTHONPATH 로 활용
+│   ├── SnapShot/                     # parser 의존 데이터 (vendor 가 제공)
+│   │   └── PM9M1_A815.ini, *.csv ...
+│   └── smi_mem_parsing/              # parser 본체 위치
+│       ├── customer_parsing_dump.py  # vendor 의 dump 분석 도구 (Linux 호환 patch 필요할 수 있음)
+│       └── customer_parsing_dump.sh  # Linux 용 wrapper (이 repo 에 포함)
+│
+└── output/                           # 자동 생성 (실행 시)
+    └── pc_sampling_v7.8.0/
+        ├── corpus/   crashes/   state_corpus/   seq_corpus/   graphs/
+        ├── coverage.txt
+        └── fuzzer_<ts>.log
 ```
+
+### 첫 실행 — 가장 단순한 형태
 
 ```bash
 # PM9M1 (SWD, 3코어)
-sudo python3 pc_sampling_fuzzer_v7.6.py --product PM9M1 --nvme /dev/nvme0
+sudo python3 pc_sampling_fuzzer_v7.8.py --product PM9M1 --nvme /dev/nvme0n1
 
 # BM9H1 (JTAG, 2코어)
-sudo python3 pc_sampling_fuzzer_v7.6.py --product BM9H1 --nvme /dev/nvme0
-
-# 위험 명령 포함 (FWDownload→FWCommit 시퀀스 활성)
-sudo python3 pc_sampling_fuzzer_v7.6.py --product PM9M1 --nvme /dev/nvme0 --all-commands
+sudo python3 pc_sampling_fuzzer_v7.8.py --product BM9H1 --nvme /dev/nvme0n1
 ```
 
-주소 범위·출력 폴더 등 자주 변경하지 않는 값은 코드 상단 상수 또는 `FuzzConfig` 필드로 직접 수정.
+`/dev/nvme0n1` 이 namespace block device. fuzzer 가 자동으로 `/dev/nvme0` (controller char) 없으면 namespace 로 fallback.
+
+### 자주 쓰는 옵션 조합
+
+| 시나리오 | 명령 |
+|---------|------|
+| 기본 fuzz | `--product PM9M1 --nvme /dev/nvme0n1` |
+| PM 추가 | `... --pm` (PowerCombo + S1/S2 perturbation) |
+| 위험 명령 포함 | `... --all-commands` (FW/Format/Sanitize 등) |
+| 미지원 명령 자동 skip + recovery | `... --unsupported-skip` (DebugPackage/ 필요) |
+| J-Link 없이 (coverage 0) | `... --no-jlink` |
+| dump 일부 건너뛰기 | `... --no-ufas` 또는 `... --no-jlink-dump` |
+| POR 비활성 | `... --no-por` |
+| 최대 runtime 제한 | `... --total-runtime-sec 3600` |
+
+### `--unsupported-skip` 사용 절차 (처음 쓰는 사람용)
+
+1. **DebugPackage/ 폴더 준비** — vendor 가 제공하는 customer parsing tool 일체. 위 디렉토리 구조 참고.
+2. **`customer_parsing_dump.sh` 배치** — 이 repo 의 `DebugPackage/smi_mem_parsing/customer_parsing_dump.sh` 를 같은 위치에 복사 (이미 있으면 그대로).
+3. **Linux 호환 patch** (필요 시) — vendor parser 가 Windows backslash path 를 hardcode 한 경우:
+   ```bash
+   # path string 의 \\ 를 / 로 일괄 변환 (regex 패턴은 검토 후)
+   find <fuzzer>/DebugPackage/{smi_mem_parsing,module} \
+        -name "*.py" -exec sed -i.bak 's|\\\\|/|g' {} \;
+   # pathlib glob 의 '**\\*.bin' → '**/*.bin' 같이 수동 확인
+   ```
+4. **실행**:
+   ```bash
+   sudo python3 pc_sampling_fuzzer_v7.8.py --product PM9M1 --nvme /dev/nvme0n1 \
+        --unsupported-skip
+   ```
+5. **EngineErrInt 검출 시 동작 확인** — 로그에 다음 시퀀스 보이면 정상:
+   ```
+   [TIMEOUT] JLink 메모리 덤프를 실행합니다...
+   [JLINK DUMP] 완료 (rc=0)
+   [Probe-after_jlink_dump] dev=exist bdf=exist ...
+   [UnsupChk] EngineErrInt 신규 검출 — prev=N, current=N+1 ...
+   [UnsupChk] SKIPPED.marker 작성 → ...
+   [UnsupChk] === Power Off → On + PCIe rescan ===
+   [POR] PMU 전원 OFF 시작 / 완료 / 방전 대기
+   [POR] PCIe 장치 제거 (driver unbind): 0000:01:00.0
+   [POR] PMU 전원 ON 시작 / 완료
+   [POR] SSD boot 대기 10.0초...
+   [POR] PCIe rescan 완료 (첫 시도)
+   [POR] NVMe 장치 응답 확인: /dev/nvme0n1 ✓ (시도 N회)
+   [UnsupChk] 복구 완료 — 메인 루프 재개
+   ```
+
+### 옵션이 동작하지 않을 때 점검
+
+| 증상 | 원인 / 점검 |
+|------|------------|
+| `parser rc=1` + `ModuleNotFoundError: 'module.share'` | `module/` 가 `DebugPackage/` 직속에 있는지. `.sh` 가 `PYTHONPATH=.../DebugPackage` 를 설정하므로 위치만 맞으면 OK |
+| `ModuleNotFoundError: 'intelhex'` 등 third-party | `DebugPackage/python/Lib/site-packages/` 안에 해당 pure-Python 패키지 있는지. `.sh` 가 자동 추가. 또는 `pip3 install --user <패키지>` |
+| `SanpShot.csv` 같은 path 에러 | vendor parser 가 Windows backslash 하드코딩 — 위 3번 sed patch 적용 |
+| `'**' can only be an entire path component` | `pathlib.Path.glob("**\\*.bin")` 같은 패턴 — `**/*.bin` 으로 수정 |
+| `PCIe rescan 완료` 후 `NVMe 미응답` | `--boot-sweep-s 15` 같이 boot wait 늘리기. 또는 `--por-boot-wait 15` |
+| `lspci` 에 device 안 보임 | recovery 의 PCIe remove 가 안 들어갔거나 PMU 명령 실패. `[POR]` 로그의 `rc=` 확인 |
+| 모든 timeout 이 skip 됨 | `_engineerrint_baseline` 첫 호출 false positive 가능. `--no-unsupported-skip` (또는 옵션 미사용) 으로 baseline 한 번 잡고 다시 활성 |
+
+### 변경 없이 그대로 두면 좋은 것들
+
+자주 안 바뀌는 설정은 코드 상단 상수 또는 `FuzzConfig` 기본값으로 둠. CLI 옵션 19개 (v7.5 이후) 외엔 코드 수정 권장.
+
+- 주소 범위 (PCSR 필터)
+- 출력 폴더 prefix (`OUTPUT_DIR`)
+- mutation 비율 / DET_BUDGET / MOpt 등 알고리즘 상수
 
 ---
 
