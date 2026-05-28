@@ -7169,15 +7169,16 @@ class NVMeFuzzer:
         return False
 
     def _probe_device(self, label: str) -> None:
-        """SSD 상태 진단 — sysfs / nvme id-ctrl. 어느 단계에서 device 가 응답
-        안 하는지 추적용. 안전:
-        - sysfs read 는 hang 위험 없음
-        - nvme id-ctrl 은 daemon thread 로 던져서 D-state 라도 main flow block 안 함
+        """SSD 상태 진단 — sysfs only. 어느 단계에서 device sysfs 가 변하는지 추적.
+
+        IMPORTANT: nvme id-ctrl 같은 ioctl 은 호출 안 함. 이전엔 daemon thread 로
+        시도했지만, device 가 hung 상태일 때 subprocess 도 D-state 로 좀비가 되어
+        kernel FD 를 점유 → 후속 PCIe remove 가 영구 block 되는 부작용.
         """
         parts: list = []
         # 1) /dev/nvmeXnY block 존재?
         parts.append(f"dev={'exist' if os.path.exists(self.config.nvme_device) else 'gone'}")
-        # 2) PCIe BDF sysfs entry 상태 + link
+        # 2) PCIe BDF sysfs entry + link 상태
         bdf = self._pcie_bdf
         if bdf:
             bdf_dir = f"/sys/bus/pci/devices/{bdf}"
@@ -7193,27 +7194,6 @@ class NVMeFuzzer:
                 parts.append("bdf=gone")
         else:
             parts.append("bdf=N/A")
-        # 3) nvme id-ctrl 빠른 응답 확인 (daemon thread — D-state 안전)
-        import threading as _threading
-        _result: dict = {'rc': None}
-        def _probe():
-            try:
-                r = subprocess.run(
-                    ['nvme', 'id-ctrl', self.config.nvme_device],
-                    capture_output=True, timeout=5)
-                _result['rc'] = r.returncode
-            except subprocess.TimeoutExpired:
-                _result['rc'] = 'subproc_timeout'
-            except Exception as e:
-                _result['rc'] = f'exc:{e}'
-        t = _threading.Thread(target=_probe, daemon=True)
-        t.start()
-        t.join(timeout=4)
-        if t.is_alive():
-            parts.append("id-ctrl=NO_RESPONSE(>4s)")
-        else:
-            _rc = _result.get('rc')
-            parts.append(f"id-ctrl=OK" if _rc == 0 else f"id-ctrl=FAIL({_rc})")
         log.warning(f"[Probe-{label}] {' '.join(parts)}")
 
     def _recover_after_unsupported_skip(self) -> bool:
