@@ -97,36 +97,67 @@ RC_TIMEOUT
   ↓
 _handle_timeout_crash (기존 stuck PC / dmesg / FAIL CMD / _save_crash / replay.sh)
   ↓
-_shutdown_openocd_for_jlink → _run_jlink_dump (기존)
+_shutdown_openocd_for_jlink → _run_jlink_dump
   ↓
-[v7.8 NEW] _check_unsupported_after_jlink_dump():
-    1. script_dir 에서 가장 최근 dump.bin 탐색 (mtime 기반)
-    2. python3 customer_parsing_dump.py <dump.bin>  (timeout 120s)
-    3. <dump.bin>_customer_analysis/ 폴더 검증
-    4. g16arEventLog.txt / g16arEventLog2.txt 안 'EngineErrInt' grep
-    └── 검출 ──┐
-               ↓
-        SKIPPED.marker 작성 (crashes/crash_<ts>/ 안)
-               ↓
-        _recover_after_unsupported_skip():
-          • _power_cycle_ssd (PMU GPIO)
-          • _por_pcie_rescan (PCIe 재열거 + NVMe probe)
-          • _detect_pcie_info + _set_pcie_l_state(L0)  (--pm 시)
-          • _apst_disable + _keepalive_disable
-          • sampler._reconnect  (J-Link 사용 중이면)
-               ↓
-        stats['unsupported_skipped'] += 1
-        _timeout_crash 안 set ←  메인 루프 계속
-    └── 미검출 → 기존 흐름 (UFAS dump → artifact → break)
+[Probe-after_jlink_dump]   sysfs + nvme id-ctrl 진단 (daemon thread, hang 안전)
+  ↓
+[v7.8] _check_unsupported_after_jlink_dump():
+    1. _find_latest_jlink_dump() — script_dir 에서 mtime ≥ dump 시작 시점 .bin 최신 1개
+       (time.time() Unix epoch 비교, .zip / .txt 제외)
+    2. parser 실행:
+       - .sh 우선:   bash <fuzzer>/DebugPackage/smi_mem_parsing/customer_parsing_dump.sh <dump>
+       - .py 폴백:   python3 <...>/customer_parsing_dump.py <dump> + PYTHONPATH 명시
+       cwd = smi_mem_parsing/, timeout 120s
+    3. <dump>_customer_analysis/ 폴더 자동 검색 (이름 × 위치 = 2 × 3 = 6 후보)
+    4. g16arEventLog.txt / g16arEventLog2.txt 의 'EngineErrInt' 누적 count vs baseline
+       (current > prev → NEW, current < prev → wrap/clear 후 신규 여부, else 변화 없음)
+  ↓
+[Probe-after_parser]    진단 로그
+  ↓
+  ├── 검출 ──┐
+  │          ↓
+  │   SKIPPED.marker 작성 (crashes/crash_<ts>/ 안)
+  │          ↓
+  │   _recover_after_unsupported_skip():
+  │     [Probe-recovery_start]
+  │     1) SIGKILL nvme-cli 좀비       (D-state ioctl 잔류 정리)
+  │     [Probe-after_sigkill]
+  │     2) PMU power OFF               (PCIe link down → AER → in-flight ioctl 자연 정리)
+  │     3) sleep por_poweroff_wait     (3s 방전)
+  │     [Probe-after_power_off]
+  │     4) PCIe remove                 (driver 강제 unbind, BDF entry 정리)
+  │                                     ※ power off 후라 D-state hang 없음
+  │     [Probe-after_remove]
+  │     5) PMU power ON
+  │     [Probe-after_power_on]
+  │     6) sleep max(boot_sweep_s, 5)  (link training + driver bind 시간 확보)
+  │     [Probe-after_boot_wait]
+  │     7) _por_pcie_rescan()
+  │          매 1초 반복:
+  │            - echo 1 > /sys/bus/pci/rescan
+  │            - nvme id-ctrl <dev>  (v7.7 의 blind hammer 방식 — path 검사 없음)
+  │            - rc==0 면 성공
+  │          por_boot_wait 초 안에 미응답 → False
+  │     [Probe-after_rescan_ok]
+  │     8) (--pm 시) _detect_pcie_info + _set_pcie_l_state(L0)
+  │     9) _apst_disable + _keepalive_disable
+  │     10) (--no-jlink 미사용 시) sampler._reconnect()
+  │          ↓
+  │     stats['unsupported_skipped'] += 1
+  │     _timeout_crash 안 set ←  메인 루프 계속 (다음 mutation)
+  │
+  └── 미검출 → 기존 흐름 (UFAS dump → _collect_crash_artifacts → break)
 ```
 
 #### 사용 조건
 
 | 항목 | 설명 |
 |------|------|
-| `customer_parsing_dump.py` | `<fuzzer 가 있는 폴더>/DebugPackage/smi_mem_parsing/customer_parsing_dump.py` 위치 (sys.argv[0] 기준 상대 — 폴더명 `PC_Sampling` / `pc_sample` / 기타 무관). `argv[1]` 으로 dump 파일 경로 받음. fuzzer 가 호출 시 `cwd = smi_mem_parsing/` 으로 설정 (`.bat` 의 `cd /d %~dp0` 동치) |
-| `<dump>_customer_analysis/` | parser 가 생성하는 분석 결과 폴더. 이름은 환경마다 다름 (확장자 제거된 `<basename>_customer_analysis` 또는 포함된 `<basename.bin>_customer_analysis`) + 위치도 다름 (dump 옆 / parser 폴더 / fuzzer 폴더). → 두 이름 × 세 위치 = 총 6개 후보 자동 검색 |
-| `g16arEventLog.txt` / `g16arEventLog2.txt` | 그 폴더 안에 존재. 두 파일 합산 `EngineErrInt` count 가 직전 baseline 보다 증가 시 신규 entry 로 간주 → skip 판정. (firmware event log 는 NAND persistent 라 동일 entry 가 다음 dump 에도 남으므로 단순 `in` 매칭 X — count delta 사용. log wrap/clear 시 baseline 자동 reset) |
+| `customer_parsing_dump.sh` (권장) | `<fuzzer>/DebugPackage/smi_mem_parsing/customer_parsing_dump.sh`. 내부에서 `cd` + `PYTHONPATH` (DebugPackage + bundled `python/Lib/site-packages`) + python interpreter 자동 선택. Windows `.bat` 의 Linux 등가물. |
+| `customer_parsing_dump.py` (fallback) | 위 위치. `argv[1]` = dump 파일 경로. fuzzer 가 호출 시 `cwd = smi_mem_parsing/`, `PYTHONPATH = .../DebugPackage` 명시. |
+| `<dump>_customer_analysis/` | parser 결과 폴더. 이름 후보 2개 (`<stem>_customer_analysis` / `<name>_customer_analysis`), 위치 후보 3개 (dump 옆 / parser 폴더 / fuzzer 폴더) = 6 자동 검색. |
+| `g16arEventLog.txt` / `g16arEventLog2.txt` | 그 폴더 안. 두 파일 합산 `EngineErrInt` count delta 판정 — firmware event log 가 NAND persistent 라 단순 substring 매칭 X. `self._engineerrint_baseline` 와 비교. log wrap/clear (current < prev) 시 자동 reset. |
+| `--no-jlink-dump` 옵션과 호환 | dump 자체가 disable 되면 검사도 skip → 기존 timeout 흐름 |
 
 #### SKIPPED.marker 형식
 
@@ -146,6 +177,23 @@ fuzz_data_md5: <hex>
 - Power cycle 실패 시 `_timeout_crash = True` set → 메인 루프 안전하게 종료.
 - OpenOCD 재연결 실패는 경고만 — coverage 만 영향, fuzz 계속.
 - 연속 skip 무제한 — `stats` 카운터로 audit. 폭증 시 Ctrl+C 로 수동 종료.
+- First detection 의 false positive 가능성: fuzzer 시작 전 부팅 시 EngineErrInt 가 이미 누적돼 있으면 `baseline=0` 인 채로 비교 → 첫 timeout 한 번 skip 될 수 있음. 이후 detection 부터는 정확.
+
+#### 시행착오 정리 (recovery POR sequence)
+
+여러 iteration 끝에 정착한 순서. 각 단계가 해결한 문제:
+
+| 단계 | 해결한 문제 |
+|------|------------|
+| SIGKILL nvme-cli | timeout 으로 D-state ioctl 잔류 → 좀비 정리 |
+| PMU power OFF (먼저) | PCIe link down → AER 가 in-flight ioctl 자연 정리. 이게 먼저 와야 다음 remove 가 가능 |
+| 방전 대기 | AER cleanup 완료 시간 확보 |
+| PCIe remove (off 이후) | driver 강제 unbind + BDF entry 정리. **이걸 안 하면** 새 device 가 wedged driver state 상속 → id-ctrl hang |
+| PMU power ON | device 부팅 시작 |
+| boot 대기 (`max(boot_sweep_s, 5)`) | 초기 POR 의 OpenOCD connect retry + boot sweep 와 동일한 ~10초 wait 모사. **이걸 안 하면** rescan 이 link training 전에 실행되어 device miss |
+| rescan + id-ctrl hammer | v7.7 의 단순 blind retry 방식 — 매 1초마다 rescan + nvme id-ctrl 무조건 시도. sysfs path 검사 같은 gate 없음 (false positive 우려). por_boot_wait 내 미응답 → fail |
+
+각 단계 사이 `[Probe-<단계>]` 로그 출력 — 어디서 깨지는지 추적 가능. sysfs read + daemon thread nvme id-ctrl 라 hang 위험 없음.
 
 #### CLI
 

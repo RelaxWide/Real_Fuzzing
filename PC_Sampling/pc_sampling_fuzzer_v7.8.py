@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v7.7
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v7.8
 
 OpenOCD PCSR(PC Sampling Register) 비침습 샘플링 + nvme-cli passthru 기반
 Coverage-Guided + State-Aware Fuzzer. 3코어(PM9M1) / 2코어(BM9H1) 지원.
@@ -16,6 +16,39 @@ Coverage-Guided + State-Aware Fuzzer. 3코어(PM9M1) / 2코어(BM9H1) 지원.
 - POR:      pmu_4_1.py 전원 사이클 → PCIe rescan → OpenOCD 재연결.
 - Defect:   timeout/hang 감지 시 PCSR stuck 분석 → JLink mem dump → UFAS dump
             → JLink PC 모니터링 루프 (옵션: --no-jlink-dump / --no-ufas).
+
+v7.8 주요 변경 — Unsupported-Command 자동 Skip & 복구 (EngineErrInt 기반)
+- 펌웨어 업체가 "미지원 명령" 으로 dismiss 하는 timeout 을 자동 분리. J-Link
+  dump → vendor parsing tool → event log 의 `EngineErrInt` 토큰 검출 시
+  미지원 처리로 판정 → UFAS dump / artifact 수집 건너뛰고 power cycle 후
+  메인 루프 계속.
+- `--unsupported-skip` opt-in. customer_parsing_dump.{sh,py} 는
+  <fuzzer>/DebugPackage/smi_mem_parsing/ 에 위치. `.sh` wrapper 가 cwd /
+  PYTHONPATH (DebugPackage/, bundled site-packages 포함) / python interpreter
+  자동 처리. Linux 시스템 python3 로 vendor 의 windows-bundled .py 실행 가능.
+- EngineErrInt count delta 판정 (NAND-persistent log 의 false positive 방지) —
+  `self._engineerrint_baseline` 유지.
+- 분석 결과 폴더 자동 검색 — 이름 (stem/name) × 위치 (dump 옆 / parser 폴더 /
+  fuzzer 폴더) = 6 후보.
+- Recovery sequence — _recover_after_unsupported_skip():
+    1. SIGKILL nvme-cli 좀비
+    2. PMU power OFF (AER → in-flight ioctl 정리)
+    3. 방전 대기 (por_poweroff_wait)
+    4. PCIe remove (driver 강제 unbind, BDF entry 정리)
+    5. PMU power ON
+    6. boot 대기 (max(boot_sweep_s, 5))
+    7. _por_pcie_rescan (rescan retry + id-ctrl hammer)
+    8. _detect_pcie_info + L0 / _apst_disable / _keepalive_disable
+    9. OpenOCD 재연결
+  각 단계 _probe_device("...") 진단 로그.
+- crashes/crash_<ts>/SKIPPED.marker 로 audit.
+- 신규 옵션 / 헬퍼:
+    --unsupported-skip          (CLI)
+    --no-jlink                  (J-Link 없이 NVMe fuzz 만, NullSampler)
+    _check_unsupported_after_jlink_dump / _find_latest_jlink_dump
+    _recover_after_unsupported_skip / _probe_device
+
+v7.7 주요 변경 — S1/S2 PM Robustness Perturbation
 
 v7.7 주요 변경 — S1/S2 PM Robustness Perturbation
 - 기존 PM rotation slot 에 새 perturbation slot 통합 (--pm 활성 시 자동):
@@ -7045,17 +7078,32 @@ class NVMeFuzzer:
         return cand[0][1]
 
     def _check_unsupported_after_jlink_dump(self, dump_start_t: float) -> bool:
-        """J-Link dump 직후 호출 — customer_parsing_dump.py 실행 후
-        <dump>_customer_analysis/g16arEventLog*.txt 에서 EngineErrInt 검색.
+        """J-Link dump 직후 호출 — customer parsing tool 실행 후
+        <dump>_customer_analysis/g16arEventLog*.txt 에서 EngineErrInt count 변화 검출.
 
-        Parser 경로: <fuzzer 가 있는 폴더>/DebugPackage/smi_mem_parsing/customer_parsing_dump.py
-                     (sys.argv[0] 기준 상대 — 폴더명 PC_Sampling / pc_sample 등 무관)
-        cwd : parser 가 있는 smi_mem_parsing/ 폴더 (.bat 의 'cd /d %~dp0' 동치)
-        분석 폴더 위치: parser 가 dump 파일 옆 / parser 폴더 / cwd 중 어디든 가능
-                       → 3개 후보 검색 후 첫 매칭 사용.
+        Parser 호출 우선순위:
+          1) <fuzzer>/DebugPackage/smi_mem_parsing/customer_parsing_dump.sh  ← Linux 권장
+             (.sh 가 cwd, PYTHONPATH, python interpreter 자동 처리)
+          2) <fuzzer>/DebugPackage/smi_mem_parsing/customer_parsing_dump.py  ← fallback
+             (python3 + PYTHONPATH=<fuzzer>/DebugPackage 명시)
+          - sys.argv[0] 기준 상대 경로 — 폴더명 (PC_Sampling / pc_sample 등) 무관.
 
-        True : 미지원 명령 처리로 판정 (skip + power cycle)
-        False: 검사 불가 / 미검출 (기존 timeout crash 흐름)
+        분석 결과 폴더 후보 (이름 × 위치 = 2 × 3 = 6 개 자동 검색):
+          이름: <dump.stem>_customer_analysis (확장자 제거 — 실제 parser 동작)
+                <dump.name>_customer_analysis (확장자 포함 — 환경별 대안)
+          위치: dump 파일 옆 / parser 폴더 / fuzzer 폴더
+
+        검출 판정 — count delta 기반:
+          firmware event log 는 NAND/NVRAM persistent 라 동일 entry 가 다음 dump
+          에도 남음. 단순 'in' 매칭 시 false positive → self._engineerrint_baseline
+          과의 count delta 로 판정:
+              current > prev  → NEW (신규 entry)
+              current < prev  → wrap/clear → current > 0 이면 NEW
+              current == prev → 변화 없음 (기존 entry, skip 안 함)
+
+        반환:
+          True  : 신규 EngineErrInt 감지 (미지원 명령으로 판정 — skip + power cycle)
+          False : 검사 불가 (parser/폴더 부재) / 미검출 (기존 timeout crash 흐름)
         """
         if not self.config.unsupported_skip:
             return False
@@ -7226,7 +7274,30 @@ class NVMeFuzzer:
         log.warning(f"[Probe-{label}] {' '.join(parts)}")
 
     def _recover_after_unsupported_skip(self) -> bool:
-        """미지원 명령 skip 직후 SSD 정상 복귀. 실패 시 False (호출자가 break 결정)."""
+        """미지원 명령 skip 직후 SSD 정상 복귀. 실패 시 False (호출자가 break 결정).
+
+        Recovery sequence (시행착오 끝에 정착한 순서):
+          1. SIGKILL nvme-cli child  (timeout 으로 D-state 잔류, 좀비 제거)
+          2. PMU power OFF           (PCIe link down → AER → in-flight ioctl 정리)
+          3. 방전 대기 (por_poweroff_wait)
+          4. PCIe remove             (driver 강제 unbind + BDF entry 정리)
+                                       — power off 후라 block 할 ioctl 없음
+                                       — wedged driver state 가 새 bind 에 상속 차단
+          5. PMU power ON            (device 부팅 시작)
+          6. boot 대기 (boot_sweep_s)  — 초기 POR 의 boot sweep 단계 대응
+          7. _por_pcie_rescan        (rescan retry + id-ctrl hammer)
+          8. _detect_pcie_info + _set_pcie_l_state(L0)  (--pm 활성 시)
+          9. _apst_disable + _keepalive_disable
+          10. sampler._reconnect()    (--no-jlink 미사용 시)
+
+        각 단계마다 _probe_device 진단 로그 출력.
+
+        초기 POR 과 다른 점 (clean state 가 아니라 timeout 으로 hung 상태에서 진입):
+          - pending nvme ioctl 이 D-state 로 남아 PCIe remove 가 영구 block 가능
+            → PMU off 가 link down 시켜야 AER 로 ioctl 정리 → 그 후 remove 가능
+          - 이전 driver state 가 wedged → PCIe remove 로 강제 unbind 필요
+          - PMU on → rescan 사이에 boot 시간 필요 → 명시적 sleep
+        """
         log.warning("[UnsupChk] === Power Off → On + PCIe rescan ===")
         self._probe_device("recovery_start")   # 진입 시점 상태
 
