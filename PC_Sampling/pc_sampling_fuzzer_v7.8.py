@@ -3049,16 +3049,20 @@ class NVMeFuzzer:
     def _por_pcie_rescan(self) -> bool:
         """POR Phase 2: PCIe rescan + NVMe 장치 응답 확인.
 
-        Device boot / link training 시간이 변동적이라 단일 rescan 으론 놓치는
-        경우 있음. → por_boot_wait 동안 rescan + id-ctrl 을 retry loop 으로 반복.
-        한 번이라도 device 가 sysfs 에 올라오면 id-ctrl 시도.
+        v7.7 의 단순 hammer 방식 유지 — sysfs path 검사 같은 gate 없이 매 iteration
+        id-ctrl 무조건 시도. v7.8 에서 추가했던 strict ctrl_ready 검사는 user 환경
+        에서 false positive (controller char 잠시 missing 시 무한 wait) 가 있어 제거.
+
+        v7.7 대비 유일한 차이: rescan 도 retry loop 으로 반복 (device 가 늦게 올라
+        오는 경우 다중 rescan 으로 다시 잡힘). 단일 rescan 만 했을 때 놓치는 케이스
+        를 보완.
         """
         deadline = time.monotonic() + self.config.por_boot_wait
         attempt = 0
         _first_rescan = True
         while time.monotonic() < deadline:
             attempt += 1
-            # 1) rescan trigger (매 시도마다 — device 가 늦게 올라와도 잡힘)
+            # 1) rescan trigger (매 iteration — device 가 늦게 올라와도 잡힘)
             try:
                 with open('/sys/bus/pci/rescan', 'w') as f:
                     f.write('1')
@@ -3068,38 +3072,23 @@ class NVMeFuzzer:
             except Exception as e:
                 log.warning(f"[POR] PCIe rescan 실패 (시도 {attempt}): {e}")
 
-            # 2) device 가 완전히 올라왔는지 확인 — sysfs BDF + /dev/ char dev +
-            # /dev/ namespace dev 모두 있어야 id-ctrl 호출 가능 (nvme-cli 가 내부에서
-            # controller char device 도 stat() 하므로).
-            _bdf_ready = (self._pcie_bdf is not None
-                          and os.path.isdir(f"/sys/bus/pci/devices/{self._pcie_bdf}"))
-            _dev_ready = os.path.exists(self.config.nvme_device)
-            # nvme_device 가 '/dev/nvme0n1' 형식이면 controller char '/dev/nvme0' 도 필요
-            _ctrl_path = re.sub(r'n\d+$', '', self.config.nvme_device)
-            _ctrl_ready = (_ctrl_path == self.config.nvme_device
-                           or os.path.exists(_ctrl_path))   # 동일 path 면 그냥 _dev_ready 와 같음
-            if _dev_ready and _ctrl_ready:
-                # 3) NVMe id-ctrl 시도 — kernel 에 device 가 잡힌 후만 의미 있음
-                r = subprocess.run(
-                    ['nvme', 'id-ctrl', self.config.nvme_device],
-                    capture_output=True, timeout=10)
-                if r.returncode == 0:
-                    log.warning(f"[POR] NVMe 장치 응답 확인: {self.config.nvme_device} "
-                                f"✓ (시도 {attempt}회)")
-                    return True
-                _err = r.stderr.decode(errors='replace').strip()[:100]
-                log.warning(f"[POR] id-ctrl rc={r.returncode} (시도 {attempt}회): "
-                            f"bdf_ready={_bdf_ready} ctrl={_ctrl_path}({_ctrl_ready}) "
-                            f"dev={self.config.nvme_device}({_dev_ready}) err={_err}")
-            else:
-                log.warning(f"[POR] device 미생성 대기 (시도 {attempt}회): "
-                            f"bdf={_bdf_ready} ctrl={_ctrl_path}({_ctrl_ready}) "
-                            f"dev={self.config.nvme_device}({_dev_ready}) — rescan retry")
-
+            # 2) id-ctrl 무조건 시도 — kernel 측 path 가 일시적으로 안 보여도
+            # 다음 iteration 에서 다시 시도. v7.7 의 단순 hammer 방식.
+            r = subprocess.run(
+                ['nvme', 'id-ctrl', self.config.nvme_device],
+                capture_output=True, timeout=10)
+            if r.returncode == 0:
+                log.warning(f"[POR] NVMe 장치 응답 확인: {self.config.nvme_device} "
+                            f"✓ (시도 {attempt}회)")
+                return True
+            _err = r.stderr.decode(errors='replace').strip()[:100]
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                log.warning(f"[POR] NVMe 미응답 — 시도 {attempt}회 모두 실패. 마지막 err: {_err}")
                 break
             wait = min(1.0, remaining)
+            log.warning(f"[POR] NVMe 미응답 (시도 {attempt}회) — {wait:.1f}초 후 재시도 "
+                        f"(남은 {remaining:.1f}초) err={_err}")
             time.sleep(wait)
 
         log.error(f"[POR] NVMe 장치 미응답 — boot sweep + por_boot_wait({self.config.por_boot_wait:.0f}s) "
