@@ -2456,9 +2456,6 @@ class NVMeFuzzer:
         self.passthru_stats = {"admin-passthru": 0, "io-passthru": 0}
 
         self._timeout_crash = False
-        # v7.6: _shutdown_openocd_for_jlink() 멱등 보장용 플래그.
-        # timeout crash 시 dump 실행 여부와 무관하게 1회만 shutdown 실행.
-        self._openocd_shutdown_done = False
         # calibration 구간 stderr 억제(fd 2 → /dev/null) 중 저장된 원본 fd.
         # _handle_timeout_crash()에서 log.error() 전에 복원하기 위해 사용.
         self._cal_saved_stderr_fd: Optional[int] = None
@@ -6895,13 +6892,17 @@ class NVMeFuzzer:
         shutdown 없이 process kill만 하면 libjaylink가 USB를 잠근 채 종료되어
         후속 JLinkExe 호출(메모리 덤프, PC 모니터링)이 실패한다.
 
-        멱등 동작: 이미 종료된 상태에서 재호출되어도 안전.
+        멱등 동작: 호출 시점의 OpenOCD 살아있음 여부 (sampler._openocd_alive())
+        기준으로 판단. 이전 _openocd_shutdown_done flag 방식은 recovery 후 OpenOCD
+        가 재시작되어도 reset 안 되어 두 번째 J-Link dump 가 OpenOCD 와 USB 충돌
+        하는 버그가 있었음 — flag 제거.
         """
-        if getattr(self, '_openocd_shutdown_done', False):
+        sampler = self.sampler
+        if not sampler._openocd_alive():
+            log.info("[JLINK] OpenOCD 이미 종료 상태 — shutdown 생략")
             return
         log.warning("[JLINK] OpenOCD shutdown (J-Link USB 해제)...")
-        sampler = self.sampler
-        if sampler._sock and sampler._openocd_alive():
+        if sampler._sock:
             try:
                 sampler._sock.sendall(b'shutdown\n')
                 time.sleep(1.5)
@@ -6909,7 +6910,6 @@ class NVMeFuzzer:
                 pass
         sampler._close_telnet()
         sampler._terminate_proc()
-        self._openocd_shutdown_done = True
         log.warning("[JLINK] OpenOCD 종료 완료")
 
     def _run_jlink_dump(self) -> None:
