@@ -9865,6 +9865,17 @@ class NVMeFuzzer:
                         self.ps_enter_counts[_next_combo.nvme_ps] += 1
                         self.combo_enter_counts[_next_combo] += 1
 
+                    # Non-Operational PM 상태 복귀 — 이후 어떤 NVMe(C2 state-replay /
+                    # sequence / 단일 명령)보다 *먼저* 수행해야 함. D3hot / L1.2(CLKREQ#
+                    # deasserted)는 컨트롤러가 명령 처리 불가 상태라 복귀 없이 명령을 던지면
+                    # D-state hang. PS3/PS4(NOPS)는 컨트롤러 자동 wake — 복귀 불필요.
+                    # (이전엔 seed 선택/C2 replay 뒤에 복귀해서, replay가 죽은 장치에
+                    #  명령을 발사하는 순서 버그가 있었음.)
+                    if self._is_nonop_combo(self._current_combo):
+                        restored = self._nonop_restore(self._current_combo)
+                        self._current_combo = restored
+                        self._current_ps    = restored.nvme_ps
+
                 is_det_stage = False
                 _used_seq = False   # 매 iteration 초기화 — det-stage가 가로채면 False 유지
                 # sequence 진행 중에는 det-stage / C2 scheduler를 스킵:
@@ -10054,16 +10065,8 @@ class NVMeFuzzer:
                 if mutated_seed.data_len_override is not None:
                     self.mutation_stats["data_len_override"] += 1
 
-                # Non-Operational PM 상태 복귀 — NVMe 커맨드 전 mandatory
-                # D3hot / L1.2(CLKREQ# deasserted): 커맨드 전 반드시 복귀 필요.
-                # PS3/PS4(NOPS): 컨트롤러 자동 wake — 복귀 불필요.
-                if (self.config.pm_inject_prob > 0
-                        and self._is_nonop_combo(self._current_combo)):
-                    restored = self._nonop_restore(self._current_combo)
-                    self._current_combo = restored
-                    self._current_ps    = restored.nvme_ps
-
                 # 실제 명령 전송 상태 기준 실행 카운트 (nonop restore 반영)
+                # 복귀는 PM rotation 직후(seed 선택 전)로 이동됨 — 위 블록 참조.
                 if self.config.pm_inject_prob > 0:
                     self.ps_exec_counts[self._current_ps] += 1
                     self.combo_exec_counts[self._current_combo] += 1
