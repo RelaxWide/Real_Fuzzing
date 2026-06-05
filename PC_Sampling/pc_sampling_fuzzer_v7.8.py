@@ -3330,7 +3330,10 @@ class NVMeFuzzer:
 
     def _replay_state_sequence(self, entry: 'StateCorpusEntry') -> bool:
         """StateCorpusEntry의 명령 시퀀스를 SSD에 재실행해 상태 재현.
-        _cmd_history / executions 는 수정하지 않음 (context 설정 전용).
+        replay 명령도 실제 SSD에서 실행되므로 _cmd_history에 기록한다
+        (record_history=True) → crash replay.sh가 replay 시퀀스까지 그대로 재현.
+        단, replay 중에는 state corpus 신규 캡처를 하지 않는다(_account_command의
+        source='c2' 가드) — 재현 중 새 엔트리 캡처 시 자기복제/중복 방지.
         타임아웃 발생 시 False를 반환."""
         log.warning(f"[State-Replay] found_at={entry.found_at:,}  "
                     f"seq={len(entry.sequence)}  score={entry.score:.1f}")
@@ -3384,7 +3387,9 @@ class NVMeFuzzer:
                 force_admin=_force_admin,
                 data_len_override=hist_item.get('data_len'),  # zero-length 포함 정확히 복원
             )
-            rc = self._send_nvme_command(_data, _seed, record_history=False)
+            # record_history=True: replay 명령도 실제 실행되므로 crash replay.sh가
+            # 그대로 재현하도록 _cmd_history에 기록 (last-100 window 안에서 완전).
+            rc = self._send_nvme_command(_data, _seed, record_history=True)
             last_samples = self.sampler.stop_sampling()
             # PM rotation은 replay 정확도를 위해 의도적으로 제외 (main loop 전용)
             _interesting, _new_pcs, _action = self._account_command(
@@ -3696,7 +3701,8 @@ class NVMeFuzzer:
         # state monitoring
         if (self.config.state_enabled
                 and self.executions % 100 == 0
-                and self.executions > 0):
+                and self.executions > 0
+                and source != 'c2'):   # replay 중에는 신규 캡처 금지 (자기복제 방지)
             _snap = self.state_monitor.capture()
             if _snap is not None:
                 if self._state_snap_prev is not None:
@@ -5644,6 +5650,27 @@ class NVMeFuzzer:
             })
         return all_ok
 
+    def _record_setfeature_history(self, fid: int, value: int,
+                                   data: Optional[bytes] = None,
+                                   label: str = '') -> None:
+        """APST/KeepAlive 등 SetFeatures(admin opcode 0x09)를 _cmd_history에 'nvme'
+        항목으로 기록 → crash replay.sh가 실제 실행된 SetFeatures를 그대로 재현.
+        data가 있으면 write(host→ctrl) 로 기록. 명령 성공(rc==0) 시에만 호출할 것."""
+        self._cmd_history.append({
+            'kind':          'nvme',
+            'label':         label or f'SetFeatures(FID={fid:#04x})',
+            'passthru_type': 'admin-passthru',
+            'device':        self.config.nvme_device,
+            'opcode':        0x09,
+            'nsid':          0,
+            'cdw2': 0, 'cdw3': 0,
+            'cdw10': fid, 'cdw11': value,
+            'cdw12': 0, 'cdw13': 0, 'cdw14': 0, 'cdw15': 0,
+            'data':     bytes(data) if data else None,
+            'data_len': len(data) if data else 0,
+            'is_write': bool(data),
+        })
+
     def _apst_disable(self) -> None:
         """NVMe APST(Autonomous Power State Transition) 비활성화.
 
@@ -5689,6 +5716,8 @@ class NVMeFuzzer:
                 if r.returncode == 0:
                     log.warning(f"[APST] 비활성화 완료 (원본 CDW11={self._orig_apst_cdw11:#010x})")
                     _ok_apst = True
+                    self._record_setfeature_history(
+                        0x0C, 0, b'\x00' * 256, 'APST disable')
                 else:
                     log.warning(f"[APST] set-feature 실패 (rc={r.returncode}): {r.stderr.strip()}")
         except Exception as e:
@@ -5746,6 +5775,8 @@ class NVMeFuzzer:
             if r.returncode == 0:
                 log.warning(f"[APST] enable: ITPT PS0→PS3={ps3_ms}ms, "
                             f"PS3→PS4={ps4_ms}ms")
+                self._record_setfeature_history(
+                    0x0C, 1, bytes(table), 'APST enable')
                 return True
             log.warning(f"[APST] enable 실패 (rc={r.returncode}): {r.stderr.strip()}")
             return False
@@ -5808,6 +5839,7 @@ class NVMeFuzzer:
             if r.returncode == 0:
                 log.warning(f"[KeepAlive] 비활성화 완료 "
                             f"(원본={self._orig_keepalive_val:#010x})")
+                self._record_setfeature_history(0x0F, 0, None, 'KeepAlive disable')
             else:
                 log.warning(f"[KeepAlive] 비활성화 실패 (rc={r.returncode}): "
                             f"{r.stderr.strip()}")
