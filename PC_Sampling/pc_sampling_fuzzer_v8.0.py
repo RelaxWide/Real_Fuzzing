@@ -9617,7 +9617,7 @@ class NVMeFuzzer:
             target = self.output_dir / subdir
             if target.exists():
                 shutil.rmtree(target)
-                log.info(f"[Cleanup] {target} 삭제 완료")
+                log.info(f"[Cleanup] {_logname(target)} 삭제 완료")
             target.mkdir(parents=True, exist_ok=True)
 
         self._load_seeds()
