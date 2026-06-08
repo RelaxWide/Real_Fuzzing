@@ -1149,6 +1149,13 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
 
     return logger, log_file
 
+
+def _logname(p) -> str:
+    """로그 표시용 경로 — 버전이 박힌 output 폴더 prefix 를 떼고 파일/폴더 이름만 남긴다.
+    로그에 버전(vX.Y.Z)이 노출되지 않게 함. 실제 위치는 OUTPUT_DIR 로 알 수 있음."""
+    s = str(p).rstrip('/')
+    return os.path.basename(s) or s
+
 # 모듈 레벨 로거 (setup_logging 호출 전까지 콘솔만 사용)
 log = logging.getLogger('pcfuzz')
 
@@ -1571,7 +1578,7 @@ class NullSampler:
         try:
             with open(pc_path, 'w') as f:
                 pass
-            log.info(f"[NullSampler] empty coverage.txt 작성 → {pc_path}")
+            log.info(f"[NullSampler] empty coverage.txt 작성 → {_logname(pc_path)}")
         except OSError:
             pass
 
@@ -2294,7 +2301,7 @@ class OpenOCDPCSampler:
             for pc in sorted(self.global_coverage):
                 f.write(f"{hex(pc)}\n")
 
-        log.info(f"[Coverage] Saved {len(self.global_coverage)} PCs → {pc_path}")
+        log.info(f"[Coverage] Saved {len(self.global_coverage)} PCs → {_logname(pc_path)}")
 
     def close(self):
         self.stop_event.set()
@@ -7479,7 +7486,7 @@ class NVMeFuzzer:
         ts = crash_time.strftime('%Y%m%d_%H%M%S')
         dest = self.crashes_dir / f"crash_{ts}"
         dest.mkdir(parents=True, exist_ok=True)
-        log.warning(f"[ARTIFACT] 수집 폴더: {dest}")
+        log.warning(f"[ARTIFACT] 수집 폴더: {_logname(dest)}")
 
         crash_epoch = crash_time.timestamp()
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
@@ -7532,7 +7539,7 @@ class NVMeFuzzer:
         except Exception as e:
             log.warning(f"[ARTIFACT] dmesg 저장 실패: {e}")
 
-        log.warning(f"[ARTIFACT] 수집 완료 → {dest}/")
+        log.warning(f"[ARTIFACT] 수집 완료 → {_logname(dest)}/")
 
     def _generate_state_replay_sh(self, entry: 'StateCorpusEntry') -> None:
         """state corpus entry의 100개 명령 시퀀스를 replay .sh로 저장.
@@ -7611,7 +7618,7 @@ class NVMeFuzzer:
         self._cmd_history = deque(history, maxlen=len(history))
         try:
             self._generate_replay_sh(self.seq_corpus_dir, tag)
-            log.info(f"[SeqSeed] replay .sh 저장: {self.seq_corpus_dir / ('replay_' + tag + '.sh')}")
+            log.info(f"[SeqSeed] replay .sh 저장: {_logname(self.seq_corpus_dir / ('replay_' + tag + '.sh'))}")
         except Exception as e:
             log.debug(f"[SeqSeed] replay .sh 생성 실패: {e}")
         finally:
@@ -7989,8 +7996,8 @@ class NVMeFuzzer:
 
         sh_path.write_text("\n".join(lines) + "\n")
         sh_path.chmod(0o755)
-        log.warning(f"[REPLAY] 재현 스크립트 → {sh_path}  ({len(history)}개 명령)")
-        log.warning(f"[REPLAY] 실행: sudo bash {sh_path}")
+        log.warning(f"[REPLAY] 재현 스크립트 → {_logname(sh_path)}  ({len(history)}개 명령)")
+        log.warning(f"[REPLAY] 실행: sudo bash {_logname(sh_path)}")
 
     def _capture_dmesg(self, lines: int = 80) -> str:
         """v4.4: 커널 로그(dmesg) 마지막 N줄을 캡처한다.
@@ -8200,14 +8207,15 @@ class NVMeFuzzer:
         try:
             self._save_crash(fuzz_data, seed, reason="timeout",
                              stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot)
-            log.error(f"  Crash 데이터 저장 완료 → {self.crashes_dir}/")
+            # 경로(버전 폴더 포함)는 로그에 남기지 않음 — 위치는 OUTPUT_DIR 로 알 수 있음.
+            log.error("  Crash 데이터 저장 완료")
         except Exception as _save_exc:
             log.error(f"  Crash 데이터 저장 실패: {_save_exc}")
 
         # 3.5) 재현 TC replay 스크립트 생성 — crash_<ts>/ 안에 직접 생성하여
         # replay_<tag>.sh + replay_data_<tag>/ 가 함께 self-contained.
         _replay_tag = hashlib.md5(fuzz_data).hexdigest()[:8]
-        log.warning(f"[TIMEOUT] 재현 TC 스크립트를 생성합니다 → {_crash_dir}/")
+        log.warning(f"[TIMEOUT] 재현 TC 스크립트를 생성합니다 → {_logname(_crash_dir)}/")
         try:
             self._generate_replay_sh(_crash_dir, _replay_tag)
         except Exception as _replay_exc:
@@ -8256,7 +8264,7 @@ class NVMeFuzzer:
                         f"command     : {cmd.name} (opcode=0x{actual_opcode:02x})\n"
                         f"fuzz_data_md5: {hashlib.md5(fuzz_data).hexdigest()}\n"
                     )
-                    log.warning(f"[UnsupChk] SKIPPED.marker 작성 → {_marker_path}")
+                    log.warning(f"[UnsupChk] SKIPPED.marker 작성 → {_logname(_marker_path)}")
                 except Exception as _mk_exc:
                     log.warning(f"[UnsupChk] SKIPPED.marker 작성 실패: {_mk_exc}")
                 # 복구
@@ -8511,7 +8519,7 @@ class NVMeFuzzer:
         chart_file = graph_dir / 'command_comparison.png'
         plt.savefig(chart_file, dpi=150, bbox_inches='tight')
         plt.close()
-        log.info(f"[Graph] 명령어 비교 차트 → {chart_file}")
+        log.info(f"[Graph] 명령어 비교 차트 → {_logname(chart_file)}")
 
     def _generate_static_coverage_graphs(self):
         """정적 분석 커버리지 시각화 3종 생성 (파일 미로드 시 조용히 스킵).
@@ -8695,7 +8703,7 @@ class NVMeFuzzer:
             growth_file = graph_dir / 'coverage_growth.png'
             plt.savefig(growth_file, dpi=150, bbox_inches='tight')
             plt.close()
-            log.info(f"[StatGraph] 성장 곡선 → {growth_file}")
+            log.info(f"[StatGraph] 성장 곡선 → {_logname(growth_file)}")
 
         # ------------------------------------------------------------------ #
         # 2. Firmware address-space map  (v7.6: BB gradient + 전체 함수 + Top-N)
@@ -8862,7 +8870,7 @@ class NVMeFuzzer:
             plt.savefig(map_file, dpi=160, bbox_inches='tight',
                         facecolor=fig.get_facecolor())
             plt.close()
-            log.info(f"[StatGraph] 펌웨어 맵 → {map_file} "
+            log.info(f"[StatGraph] 펌웨어 맵 → {_logname(map_file)} "
                      f"({n_funcs} funcs / {cols}×{rows} grid)")
 
         # v7.6: uncovered_funcs.png 제거. firmware_map의 Top-N 라벨 + 그라데이션이
@@ -8995,7 +9003,7 @@ class NVMeFuzzer:
         heatmap_file = graph_dir / 'coverage_heatmap_1d.png'
         plt.savefig(heatmap_file, dpi=150, bbox_inches='tight')
         plt.close()
-        log.info(f"[Heatmap] 1D global coverage heatmap → {heatmap_file} "
+        log.info(f"[Heatmap] 1D global coverage heatmap → {_logname(heatmap_file)} "
                  f"(bin={bin_size_1d}B)")
 
     def _generate_mutation_chart(self):
@@ -9140,7 +9148,7 @@ class NVMeFuzzer:
         chart_file = graph_dir / 'mutation_chart.png'
         plt.savefig(chart_file, dpi=150, bbox_inches='tight')
         plt.close()
-        log.info(f"[MutChart] mutation 차트 → {chart_file}")
+        log.info(f"[MutChart] mutation 차트 → {_logname(chart_file)}")
 
     def _generate_csfuzz_dynamics(self):
         """CSFuzz §III-C/D 동역학 시각화 — graphs/csfuzz_dynamics.png.
@@ -9236,7 +9244,7 @@ class NVMeFuzzer:
         out_file = graph_dir / 'csfuzz_dynamics.png'
         plt.savefig(out_file, dpi=150, bbox_inches='tight')
         plt.close()
-        log.info(f"[CSFuzzViz] CSFuzz dynamics → {out_file} "
+        log.info(f"[CSFuzzViz] CSFuzz dynamics → {_logname(out_file)} "
                  f"({len(self._csfuzz_history)} updates)")
 
     def _collect_stats(self) -> dict:
@@ -9537,8 +9545,7 @@ class NVMeFuzzer:
 
         self._setup_directories()
         log, log_file = setup_logging(self.config.output_dir)
-        self._log_file = log_file
-        log.warning(f"Log file: {log_file}")
+        self._log_file = log_file   # 내부 artifact 복사용 (콘솔엔 경로 미출력)
 
         # --settle-sweep: OpenOCD/fuzzing loop 없이 settle 최솟값만 탐색
         if self.config.settle_sweep:
@@ -9546,7 +9553,7 @@ class NVMeFuzzer:
             return
 
         log.warning("=" * 60)
-        log.warning(f" PC Sampling SSD Fuzzer v{self.VERSION}"
+        log.warning(" PC Sampling SSD Fuzzer"
                     + (" [NO-JLINK MODE]" if self.config.no_jlink else ""))
         log.warning("=" * 60)
         log.warning(f"NVMe device : {self.config.nvme_device}")
@@ -9601,7 +9608,7 @@ class NVMeFuzzer:
                     f"({passthru_days:.1f}일, nvme-cli --timeout)")
         log.warning(f"Kernel TO   : {self.config.nvme_kernel_timeout_sec}s "
                     f"(crash 후 커널 reset 유예, nvme_core admin/io_timeout)")
-        log.warning(f"Output      : {self.config.output_dir}")
+        # Output 경로는 로그에 남기지 않음 — 폴더명에 버전이 들어가 노출되므로. (위치는 사용자가 앎)
         log.warning("=" * 60)
 
         # 이전 실행의 corpus/graphs/state_corpus 폴더 비우기
@@ -10646,7 +10653,7 @@ class NVMeFuzzer:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description=f'PC Sampling SSD Fuzzer v{FUZZER_VERSION}')
+    parser = argparse.ArgumentParser(description='PC Sampling SSD Fuzzer')
     # 제품/타겟
     parser.add_argument('--product', choices=list(PRODUCT_CONFIGS.keys()), default=None,
                         help=f'제품 선택 (interface/cfg 자동 설정). '
@@ -10751,7 +10758,7 @@ if __name__ == "__main__":
     print()
     if excluded_opcodes:
         print(f"Excluded opcodes: {[hex(o) for o in excluded_opcodes]}")
-    print(f"\nv{FUZZER_VERSION} Features:")
+    print("\nFeatures:")
     print("  - subprocess (nvme-cli) NVMe passthru")
     print("  - Global PC saturation (configurable) + idle PC detection")
     print("  - Per-execution prev_pc reset (no cross-execution false edges)")
