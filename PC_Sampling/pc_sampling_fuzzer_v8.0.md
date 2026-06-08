@@ -65,7 +65,26 @@ sudo python3 pc_sampling_fuzzer_v8.0.py --product P9 --nvme /dev/nvme0n1 --no-jl
 - placeholder 가 빈 채 `--product P9`(J-Link 사용) 실행 시 **명확한 에러로 중단**.
   `--no-jlink` 면 NullSampler(coverage 0)라 통과 → NVMe/PM 만 검증 가능.
 
-### 3. 코드 영향 범위 (v7.8 → v8.0)
+### 3. 가성 불량 방지 — 호스트 전송로 깨는 admin opcode 전송 차단
+
+`nvme passthru`는 **kernel 소유 I/O 큐**를 쓰므로, 큐 관리 admin 명령을 보내면 firmware 결함이
+아니라 호스트 전송로만 깨져 timeout(가성)이 난다. 예: opcode mutation + admin↔IO swap이 겹쳐
+`nvme admin-passthru --opcode=0x00`(Delete I/O SQ)가 만들어지면 kernel I/O 큐가 삭제되고 이후
+io-passthru가 무응답 → timeout → 불량 오판.
+
+방지: **최종 해석된 명령이 `admin-passthru` 이고 opcode가 차단 세트면 전송 자체를 안 한다.**
+
+- 차단 세트 `BLOCKED_ADMIN_OPCODES = {0x00,0x01,0x04,0x05,0x0C,0x7C}`
+  (Create/Delete I/O SQ·CQ, AER, Doorbell Buffer Config) — 모두 가성/무한 block 유발.
+- **admin-passthru 일 때만** 차단 → 같은 번호의 IO 명령(Flush/Write/WriteUncorrectable/Compare/
+  Verify)은 정상 동작.
+- 이중 방어: `_mutate`(예방, override/force_admin 되돌림) + `_send_nvme_command`(net, `RC_SKIP`
+  반환 → 회계/커버리지/크래시 미반영). seed-from-disk·replay·sequence 등 모든 경로 커버.
+- 종료 summary에 `Blocked admin opcode: N회` 출력.
+- 범위 밖(이번 제외): Format 0x80/Sanitize 0x84 mutation(데이터 손실 — 별도), FWCommit 0x10(의도),
+  vendor 0xC0~0xFF(의도, `--unsupported-skip`가 담당).
+
+### 4. 코드 영향 범위 (v7.8 → v8.0)
 
 | 사이트 | 변경 |
 |--------|------|
@@ -75,6 +94,10 @@ sudo python3 pc_sampling_fuzzer_v8.0.py --product P9 --nvme /dev/nvme0n1 --no-jl
 | `_send_startup_tcl` | `r8.*` → `{tcl_prefix}.*`, power-up 은 `power_addr=None` 시 생략 |
 | `_run_ufas_dump` | `--ini` 하드코딩 → `ufas_ini`(None 이면 생략) |
 | `main()` 제품 해석 | full profile 주입 + bring-up placeholder 가드 + UFAS/JLink dump = profile ∧ CLI |
+| `BLOCKED_ADMIN_OPCODES` / `RC_SKIP` | 신규 상수 (가성 방지 가드) |
+| `_send_nvme_command` | admin-passthru + 차단 opcode → `RC_SKIP` 반환(전송 안 함) |
+| `_mutate` | mutation 결과가 (admin+차단 opcode)면 override/force_admin 되돌림 |
+| `_account_command` | `RC_SKIP` 조기 반환(회계 없이 continue) |
 
 ---
 

@@ -151,21 +151,23 @@ PRODUCT_PROFILES = {
         'ufas_ini':           'PM9M1_A815.ini',
         'enable_jlink_dump':  True,
     },
-    # ── P9: Cortex-R5, SWD ── [v8.0 신규, bring-up placeholder]
-    # 아래 None 값들은 R5 bring-up(jlink_reg_diag.py + OpenOCD _verify_pcsr)으로
-    # 확정한 뒤 채운다. P9_BRINGUP.md 의 "사용자 입력 필요" 표 참조.
-    # UFAS / J-Link 메모리 덤프는 P9 에서 불가 → 둘 다 비활성(영구).
+    # ── P9: Cortex-R5 r1p3, SWD ── [v8.0]
+    # J-Link 로 확정된 것: SW-DP 0x6BA02477, AP[0]=APB-AP 단일(AP[1] 없음 → ap-num 0,
+    #   AXI-AP 없음=power-up 생략), 0x80030000 = Cortex-R5 디버그 base(PID 0xC15), DBGPCSR=base+0x84.
+    # 미확정: 코어 수 — J-Link ROMTbl 출력은 코어 수의 근거가 못 됨(PM9M1 도 ROMTbl 엔 적게
+    #   나왔지만 실제 3코어). 0x80030000/2000/4000.. 를 *APB-AP로* probe 해 DBGDIDR/DBGPCSR
+    #   유효한 base 를 모두 찾아야 함(P9_BRINGUP.md). 확정 전까지 None 유지(가드가 차단).
     'P9': {
         'interface':         'swd',
         'openocd_config':     'r5_pcsr.cfg',
         'jlink_device':       'Cortex-R5',
         'tcl_prefix':         'r5',
-        'pcsr_addrs':         None,    # PLACEHOLDER: [core0, core1, ...] (CoreBase+DBGPCSR offset)
-        'power_addr':         None,    # PLACEHOLDER: debug power-up reg addr (불필요하면 그대로 None)
-        'power_mask':         None,    # PLACEHOLDER: 코어별 enable 비트
-        'invalid_pc_vals':    None,    # PLACEHOLDER: R5 SWD DPIDR pair
-        'fw_addr_start':      None,    # PLACEHOLDER: 펌웨어 .text 시작
-        'fw_addr_end':        None,    # PLACEHOLDER: 펌웨어 .text 끝
+        'pcsr_addrs':         None,    # TODO(코어수 미확정): [0x80030084, (0x80032084, 0x80034084 ...)]
+        'power_addr':         None,    # AXI-AP 없음 → per-core power-up 생략 (확정)
+        'power_mask':         None,
+        'invalid_pc_vals':    (0x6ba02476, 0x6ba02477),  # SWD DPIDR 0x6BA02477 (확정)
+        'fw_addr_start':      None,    # TODO: 펌웨어 .text 시작
+        'fw_addr_end':        None,    # TODO: 펌웨어 .text 끝
         'enable_ufas':        False,   # P9: UFAS 덤프 불가
         'ufas_ini':           None,
         'enable_jlink_dump':  False,   # P9: J-Link 메모리 덤프 불가
@@ -235,6 +237,16 @@ RANDOM_GEN_RATIO  = 0.2
 DET_BUDGET        = 0.20   # det stage가 전체 실행에서 차지할 최대 비율 (0.0~1.0)
 
 EXCLUDED_OPCODES: List[int] = []
+
+# admin-passthru 로 보내면 firmware 결함이 아니라 *호스트(kernel 소유) 전송로/프로토콜*만
+# 깨져 self-inflicted timeout(가성 불량)을 만드는 admin opcode 집합.
+#   0x00 Delete I/O SQ / 0x01 Create I/O SQ / 0x04 Delete I/O CQ / 0x05 Create I/O CQ
+#        → kernel 이 소유한 I/O 큐를 삭제/오염 → 이후 io-passthru 무응답 timeout
+#   0x0C Async Event Request → 이벤트 생길 때까지 무한 block → timeout
+#   0x7C Doorbell Buffer Config → shadow doorbell 재설정으로 kernel I/O doorbell 깨짐 → hang
+# admin-passthru 일 때만 차단. 같은 번호의 IO 명령(Flush 0x00/Write 0x01/WriteUncorrectable
+# 0x04/Compare 0x05/Verify 0x0C)은 정상이므로 영향 없음.
+BLOCKED_ADMIN_OPCODES = frozenset({0x00, 0x01, 0x04, 0x05, 0x0C, 0x7C})
 
 OPCODE_MUT_PROB        = 0.10   # opcode override 확률 (기본 10%)
 NSID_MUT_PROB          = 0.10   # namespace ID override 확률 (기본 10%)
@@ -3571,7 +3583,12 @@ class NVMeFuzzer:
         executions 증가, coverage 평가, corpus 추가, 주기적 Stats/state/cull/graph.
         RC_TIMEOUT → _handle_timeout_crash 호출 후 ('break') 반환.
         RC_ERROR   → ('continue') 반환.
+        RC_SKIP    → 가드가 전송 차단 (전송·샘플링 없었음) → 회계 없이 ('continue').
         """
+        # 가드 차단 명령: 실제 전송/샘플링이 없었으므로 executions/coverage/crash 에 반영하지 않음.
+        if rc == self.RC_SKIP:
+            return False, 0, 'continue'
+
         cmd = seed.cmd
         track_key = self._tracking_label(cmd, seed)
         self.cmd_stats[track_key]["exec"] += 1
@@ -4613,6 +4630,16 @@ class NVMeFuzzer:
             # 원래 admin이면 IO로, IO면 admin으로
             new_seed.force_admin = (seed.cmd.cmd_type != NVMeCommandType.ADMIN)
 
+        # 가성 방지(예방): mutation 결과가 (admin + 호스트 전송로 깨는 opcode) 가 되면
+        # override/force_admin 을 되돌려 안전한 base 명령으로 복원. send-time 가드는 net 으로 유지.
+        _eff_admin = (new_seed.force_admin if new_seed.force_admin is not None
+                      else seed.cmd.cmd_type == NVMeCommandType.ADMIN)
+        _eff_op = (new_seed.opcode_override if new_seed.opcode_override is not None
+                   else seed.cmd.opcode)
+        if _eff_admin and _eff_op in BLOCKED_ADMIN_OPCODES:
+            new_seed.opcode_override = None
+            new_seed.force_admin = None
+
         # [4] data_len mutation — Phase 1: NLB-relative + MDTS boundary + static fallback
         if DATALEN_MUT_PROB > 0 and random.random() < DATALEN_MUT_PROB:
             _MAX_BUF = 2 * 1024 * 1024
@@ -4755,6 +4782,7 @@ class NVMeFuzzer:
     # 반환값 상수: timeout/error를 구분
     RC_TIMEOUT   = -1001   # NVMe 타임아웃 (의미 있는 이벤트)
     RC_ERROR     = -1002   # subprocess 에러 (내부 문제)
+    RC_SKIP      = -1003   # 가드가 전송 차단 (가성 유발 admin opcode) — 회계 없이 다음 iteration
 
     def _load_static_analysis(self) -> None:
         """같은 디렉토리의 basic_blocks.txt / functions.txt 자동 탐지 후 로드.
@@ -6570,6 +6598,15 @@ class NVMeFuzzer:
             passthru_type = "admin-passthru" if seed.force_admin else "io-passthru"
         else:
             passthru_type = "admin-passthru" if cmd.cmd_type == NVMeCommandType.ADMIN else "io-passthru"
+
+        # 가성 불량 방지 가드: host(kernel) 소유 전송로를 깨는 admin opcode 는 전송하지 않는다.
+        # (Delete/Create I/O SQ·CQ, AER, Doorbell Buffer Config — admin 일 때만. IO 동명령은 정상)
+        # mutation/seed/replay/sequence 모든 경로가 여기를 지나므로 단일 chokepoint.
+        if passthru_type == "admin-passthru" and actual_opcode in BLOCKED_ADMIN_OPCODES:
+            log.warning(f"[GUARD] admin opcode 0x{actual_opcode:02x} 전송 차단 — "
+                        f"가성 timeout 방지 (cmd={cmd.name})")
+            self.stats['blocked_admin_opcode'] = self.stats.get('blocked_admin_opcode', 0) + 1
+            return self.RC_SKIP
 
         # Admin 명령어별 고정 응답 크기
         ADMIN_FIXED_RESPONSE = {
@@ -10468,6 +10505,11 @@ class NVMeFuzzer:
                 _unsup = self.stats.get('unsupported_skipped', 0)
                 if _unsup > 0 or self.config.unsupported_skip:
                     summary_lines.append(f"Unsupported skipped: {_unsup}회 (EngineErrInt)")
+                # v8.0: 가성 유발 admin opcode 전송 차단 누적
+                _blk = self.stats.get('blocked_admin_opcode', 0)
+                if _blk > 0:
+                    summary_lines.append(f"Blocked admin opcode: {_blk}회 "
+                                         f"(큐관리/AER/DBBUF 가성 방지)")
                 summary_lines.append(f"MOpt mode        : {self.mopt_mode}")
                 mopt_detail = []
                 for i in range(self.NUM_MUTATION_OPS):
@@ -10725,19 +10767,19 @@ if __name__ == "__main__":
         _ncore = len(_profile['pcsr_addrs']) if _profile['pcsr_addrs'] else '?'
         print(f"Product={args.product}: interface={resolved_interface}, "
               f"cfg={resolved_cfg}, jlink={_profile['jlink_device']}, cores={_ncore}")
-        # bring-up placeholder 검증 — OpenOCD PCSR 샘플링에 필요한 값이 비어 있으면 중단.
+        # bring-up 검증 — PCSR 샘플링의 필수값(pcsr_addrs)이 없으면 중단.
+        # fw_addr_*(coverage 주소필터)는 없어도 동작(전부 카운트) → 경고만.
         # --no-jlink(NullSampler, coverage 0)면 PCSR 값이 불필요하므로 통과.
         if not args.no_jlink:
-            _missing = [k for k in ('pcsr_addrs', 'invalid_pc_vals',
-                                    'fw_addr_start', 'fw_addr_end')
-                        if _profile.get(k) is None]
-            if _missing:
-                print(f"\n[ERROR] Product '{args.product}' bring-up 값 미입력: "
-                      f"{', '.join(_missing)}")
-                print(f"        PRODUCT_PROFILES['{args.product}'] 의 placeholder 를 실제 HW "
-                      "값으로 채우거나, --no-jlink 로 NVMe/PM 만 테스트하세요.")
-                print("        (P9_BRINGUP.md 의 '사용자 입력 필요' 표 참조)")
+            if _profile.get('pcsr_addrs') is None:
+                print(f"\n[ERROR] Product '{args.product}' bring-up 미완: pcsr_addrs 비어 있음.")
+                print(f"        PRODUCT_PROFILES['{args.product}']['pcsr_addrs'] 를 채우거나 "
+                      "--no-jlink 로 NVMe/PM 만 테스트하세요. (P9_BRINGUP.md)")
                 sys.exit(2)
+            _soft = [k for k in ('fw_addr_start', 'fw_addr_end') if _profile.get(k) is None]
+            if _soft:
+                print(f"[WARN] {args.product}: {', '.join(_soft)} 미지정 → "
+                      "coverage 주소필터 없이 전체 PC 카운트 (bring-up 후 .text 범위 입력 권장).")
     else:
         # 구식 경로(--interface only): R8 기본 profile 합성 (하위호환)
         resolved_interface = args.interface
