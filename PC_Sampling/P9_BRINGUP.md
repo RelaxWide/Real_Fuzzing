@@ -1,70 +1,48 @@
-# P9 (Cortex-R5 / SWD) Bring-up — 사용자 입력 필요 항목
+# P9 (Cortex-R5 / SWD) Bring-up
 
-v8.0 에서 P9 제품 **골격(profile + r5 cfg + 코드 경로)** 은 구현 완료. 단, R5 는 현재
-**J-Link 연결만** 확인된 상태라 OpenOCD PCSR 샘플링(coverage)에 필요한 **하드웨어 값들이
-비어 있음(placeholder)**. 평가 환경에서 아래 값을 확보해 채우면 P9 가 정상 동작한다.
+v8.0에서 P9는 **halt 기반 coverage 샘플러**(`sampler_type='halt'`)로 대응한다.
+조사 결과 **P9는 DBGPCSR(비침습 PC 샘플)을 구현하지 않음**(DBGDIDR 0x77040013, 모든 PCSR
+오프셋 0) — 그래서 메인 PCSR 방식 대신, 이 프로젝트의 원래 방식(v2~v5.6)인
+**halt → reg pc → resume**를 OpenOCD telnet으로 되살려 쓴다. (ETM은 트레이스 핀 없어 불가.)
 
-> 값을 채우기 전에도 **`--product P9 --no-jlink`** 로 NVMe/PM 경로(coverage 0)는 바로 테스트 가능.
-> bring-up 값이 빈 채 `--product P9` (J-Link 사용)로 실행하면 명확한 에러로 중단된다.
-
----
-
-## 채워야 할 위치 (딱 두 파일)
-
-### A. `pc_sampling_fuzzer_v8.0.py` → `PRODUCT_PROFILES['P9']`
-
-| 필드 | 의미 | R8 참고값 | P9 확보 방법 | 상태 |
-|------|------|-----------|-------------|------|
-| `pcsr_addrs` | per-core DBGPCSR(샘플 PC) 주소 **리스트** = `[CoreBase + offset, ...]`. **리스트 길이 = 코어 수.** | `[0x80030084, 0x80032084, 0x80034084]` (CoreBase+0x84) | ROM table 로 각 코어 debug base 확인 + R5 DBGPCSR offset(아래) 더하기 | ⬜ |
-| `invalid_pc_vals` | PCSR 필터에서 제외할 R5 **SWD DPIDR** 값들 (tuple) | `(0x6ba02476, 0x6ba02477)` | OpenOCD 연결 로그의 DPIDR, 또는 `jlink_reg_diag.py` | ⬜ |
-| `fw_addr_start` / `fw_addr_end` | 펌웨어 .text(coverage 필터) 주소 범위 | `0x0` / `0x3B7FFF` | Ghidra / map 파일 | ⬜ |
-| `power_addr` | per-core debug power-up 레지스터 주소 (AXI write). **R5 에서 불필요하면 `None` 유지** | `0x30313f30` | 칩 디버그 문서 / R8 설정 참고. 불확실하면 우선 `None` 로 두고 PCSR 읽힘 확인 | ⬜ |
-| `power_mask` | 위 레지스터의 코어별 enable 비트 | `0x00010101` (bit0/8/16) | 위와 동일 | ⬜ |
-
-> `power_addr`/`power_mask` 가 `None` 이면 코드가 **power-up 단계를 자동 생략**한다.
-> SWD 에서는 OpenOCD 가 CDBGPWRUPREQ 를 자동 처리하는 경우가 많으니, **먼저 `None` 으로 두고**
-> PCSR 가 읽히는지 확인 → 안 읽히면 그때 값 입력.
-
-### B. `r5_pcsr.cfg`
-
-| 항목 | 의미 | R8 참고 | 상태 |
-|------|------|---------|------|
-| `swd newdap r5 cpu -expected-id 0x????????` | R5 SWD DPIDR. 모르면 줄 주석 처리 → 자동검출 → 로그값 고정 | — | ⬜ |
-| `target create r5.abp ... -ap-num N` | DBGPCSR 읽는 **APB-AP** 번호 | R8=0 | ⬜ |
-| `target create r5.axi ... -ap-num N` | power-up 쓰는 **AXI-AP** 번호 (power 안 쓰면 무시) | R8=1 | ⬜ |
-| `adapter speed` | 안정 동작 속도 | 4000 | ⬜ (필요 시 조정) |
-
-> cfg 의 target 이름 접두사(`r5`)는 profile 의 `tcl_prefix='r5'` 와 **반드시 일치**.
+확정된 HW 구성 (J-Link connect로 검증):
+- SW-DP 0x6BA02477, **AP[0]=APB-AP 단일**, ROMTbl 0x80020000→**0x80030000 Cortex-R5 (단일코어)**
+- `targets r5 → halt → reg pc → PC 읽힘 ✓` (halt 방식 동작 확인됨)
 
 ---
 
-## 확정해야 할 사실 (HW/문서)
+## 바로 실행 가능 (추가 입력 없이)
 
-1. **코어 수** — R5 몇 코어를 샘플링? (`pcsr_addrs` 리스트 길이로 표현)
-2. **각 코어 debug base 주소** + **R5 DBGPCSR offset** — ARMv7-R 디버그에서 DBGPCSR 은 보통
-   `0x0A0`(또는 구현에 따라 `0x084`). R8 은 `+0x84` 였음. **이 offset 확인이 `pcsr_addrs` 의 핵심.**
-3. **R5 SWD DPIDR** — cfg `-expected-id` + `invalid_pc_vals` 양쪽에 사용.
-4. **DAP AP 레이아웃** — 어느 AP 가 APB(메모리/DBGPCSR), 어느 AP 가 AXI(power)인지.
-5. **debug power-up 필요 여부** — R5 에서 per-core AXI power write 가 필요한지 (불필요하면 생략).
-6. **펌웨어 .text 범위** — coverage 필터용.
-7. **JLinkExe `-device` 문자열** — 현재 `'Cortex-R5'` 로 설정. 실제 장치명과 일치하는지 확인.
+```bash
+sudo python3 pc_sampling_fuzzer_v8.0.py --product P9 --nvme /dev/nvme0n1
+```
+`--product P9` 만으로 자동 설정됨: **halt 샘플러**, swd, `r5_pcsr.cfg`, Cortex-R5,
+UFAS·J-Link덤프 off, **go_settle=50ms**. (`--sampler`/`--go-settle` 등 추가 옵션 불필요.)
 
----
-
-## 권장 bring-up 순서
-
-1. **`--product P9 --no-jlink`** 로 NVMe/PM 경로부터 정상 확인 (coverage 0, OpenOCD 불필요).
-2. `jlink_reg_diag.py --device Cortex-R5 --interface swd` 로 R5 SWD 연결 + DPIDR + PC reg 확인.
-3. `r5_pcsr.cfg` 의 ap-num/DPIDR 채우고 `openocd -f r5_pcsr.cfg` 단독 실행 → telnet(4444) 에서
-   `r5.abp read_memory 0x<DBGPCSR> 32 1` 로 **한 코어 PCSR 수동 읽기** 성공시키기.
-   - 여기서 확정된 DBGPCSR 주소 = `pcsr_addrs` 항목.
-4. 모든 코어 주소를 `PRODUCT_PROFILES['P9']['pcsr_addrs']` 에 입력, `fw_addr_*` / `invalid_pc_vals` 입력.
-5. **`--product P9`** (J-Link) 실행 → 로그 `[OpenOCD] 연결 성공: PCSR read 검증 완료 (N코어)` 확인.
-6. crash 시 UFAS/J-Link 덤프는 P9 에서 **영구 비활성**(profile) — stuck PC / dmesg / replay.sh 만 생성됨(정상).
+전제: `r5_pcsr.cfg`가 폴더에 있고, 그 안에 cortex_r 타깃이 `target create r5 cortex_r4 -dap r5.dap
+-ap-num 0 -dbgbase 0x80030000` 로 정의돼 있을 것(이미 포함됨).
 
 ---
 
-## 현재 고정(변경 불필요)된 P9 설정
+## 평가 환경에서 확인/튜닝할 것 (동작은 하되 품질 관련)
 
-- `interface='swd'`, `openocd_config='r5_pcsr.cfg'`, `jlink_device='Cortex-R5'`, `tcl_prefix='r5'`
-- `enable_ufas=False`, `enable_jlink_dump=False` (사용자: "UFAS·J-Link 덤프 둘 다 불가")
+| 항목 | 의미 | 방법 | 상태 |
+|------|------|------|------|
+| **halt vs NVMe timeout** (핵심) | halt가 단일 컨트롤러 CPU를 멈춰 NVMe 명령을 굶기면 timeout(가성) | NVMe write 도중 샘플링하며 명령 정상완료 확인. timeout 나면 `--go-settle` ↑ | ⬜ |
+| **`--go-settle <ms>`** | resume→다음 halt 최소 실행시간. 기본 50(v5.6 "50ms 안정") | 안정 최소값 탐색(불안정하면 ↑, coverage 밀도 원하면 ↓) | ⬜ |
+| **fw_addr_start/end** | 펌웨어 .text(coverage 주소필터). 미지정(None)이면 **전체 PC 카운트 + 경고**(동작엔 무방) | Ghidra/map으로 .text 범위 확인 후 `PRODUCT_PROFILES['P9']` 에 입력 | ⬜ |
+| resume 진행 확인 | resume 후 코어가 reset 없이 진행(PC가 매번 바뀜) | 부하 주며 reg pc 변화 관찰 | ⬜ |
+
+> PCSR을 안 쓰므로 `pcsr_addrs`/`power_addr`/`power_mask`/DBGPCSR 주소는 **불필요**(profile에서 None 유지).
+
+---
+
+## 권장 순서
+1. `--product P9 --no-jlink` 로 NVMe/PM 경로부터 확인(coverage 0, OpenOCD 불필요).
+2. `--product P9` (기본 halt) 실행 → 로그 `[OpenOCD] 연결 성공 ... (1코어)` + diagnose가 idle PC 수집되나.
+3. **halt vs NVMe**: 명령 timeout이 잦으면 `--go-settle 100`(또는 ↑)로 안정값 탐색.
+4. coverage 누적 확인(`evaluate_coverage` new PC>0) 후, fw_addr .text 범위 입력해 필터 정밀화.
+
+## 고정된 P9 설정 (변경 불필요)
+- `sampler_type='halt'`, `go_settle_ms=50`, interface=swd, `r5_pcsr.cfg`, jlink_device='Cortex-R5',
+  tcl_prefix='r5', `enable_ufas=False`, `enable_jlink_dump=False`.

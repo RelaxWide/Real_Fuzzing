@@ -18,7 +18,7 @@ v7.7 PM Robustness Perturbation(S1+S2), v7.6 시각화, v7.5 SequenceSeed corpus
 |------|-----------|------|-------------|---------------|------|-------------|------|
 | **PM9M1** | SWD | 3 (R8) | `r8_pcsr.cfg` | Cortex-R8 | ✅ | ✅ | 정상 |
 | **BM9H1** | JTAG | 2 (R8) | `r8_pcsr_jtag.cfg` | Cortex-R8 | ✅ | ✅ | 정상 |
-| **P9** | SWD | R5 (TBD) | `r5_pcsr.cfg` | Cortex-R5 | ❌ | ❌ | **bring-up 필요** (`P9_BRINGUP.md`) |
+| **P9** | SWD | R5 단일 | `r5_pcsr.cfg` | Cortex-R5 | ❌ | ❌ | **halt 샘플러** (DBGPCSR 미구현). `--product P9` 단독 동작. 튜닝: `P9_BRINGUP.md` |
 
 ```bash
 sudo python3 pc_sampling_fuzzer_v8.0.py --product PM9M1 --nvme /dev/nvme0n1
@@ -55,15 +55,22 @@ sudo python3 pc_sampling_fuzzer_v8.0.py --product P9 --nvme /dev/nvme0n1 --no-jl
 `--product` 선택지는 `PRODUCT_PROFILES.keys()` 에서 자동 생성. `--interface` 만 쓰는 **구식 호출도
 그대로 동작**(R8 기본 profile 합성). PM9M1/BM9H1 의 resolved 값은 v7.7/v7.8 과 **byte-identical**.
 
-### 2. 신규 제품 P9 (Cortex-R5, SWD)
+### 2. 신규 제품 P9 (Cortex-R5, SWD) + **halt 기반 coverage 샘플러**
 
-- profile + `r5_pcsr.cfg` 템플릿 + 코드 경로 구현 완료.
-- **UFAS·J-Link 메모리 덤프 둘 다 불가** → P9 profile 에서 영구 비활성. crash 시 stuck PC /
-  dmesg / replay.sh 만 생성.
-- coverage 는 OpenOCD PCSR 로 수집(bring-up 후). HW 값(코어 수/PCSR 주소/DPIDR/범위)은
-  **placeholder** 상태 → **`P9_BRINGUP.md` 의 "사용자 입력 필요" 표대로 채우면 완료.**
-- placeholder 가 빈 채 `--product P9`(J-Link 사용) 실행 시 **명확한 에러로 중단**.
-  `--no-jlink` 면 NullSampler(coverage 0)라 통과 → NVMe/PM 만 검증 가능.
+- **P9는 DBGPCSR 미구현** (조사 확정) → 비침습 PCSR 불가. 그래서 이 프로젝트의 원래 방식
+  (v2~v5.6) **halt→reg pc→resume** 를 OpenOCD telnet 으로 되살린 **`OpenOCDHaltSampler`** 추가.
+- **샘플러 추상화로 별개 구현**: `OpenOCDHaltSampler(OpenOCDPCSampler)` 가 연결/복구/diagnose/
+  worker/회계/저장을 **상속**하고 per-sample PC 읽기만 `targets r5; halt; reg pc; resume` 로 override.
+  → 기존 PCSR/메인루프/NVMe/PM 로직 무변경(PM9M1/BM9H1 동작 불변).
+- `sampler_type` 으로 선택: PM9M1/BM9H1=`'pcsr'`, **P9=`'halt'`**, `--no-jlink`=`'null'`.
+  `--sampler {pcsr,halt,null}` 로 override 가능.
+- **GO_SETTLE**: halt 가 단일 컨트롤러 CPU 를 멈춰 NVMe 명령을 굶기지 않도록 resume→다음 halt
+  최소 실행시간 보장. base worker `effective_interval = max(interval, go_settle_ms/1000)`(PCSR=0 무영향).
+  P9 profile 기본 `go_settle_ms=50` (v5.6 "50ms 안정"), `--go-settle` 로 조정.
+- **UFAS·J-Link 메모리 덤프 불가** → P9 profile 에서 영구 비활성. crash 시 stuck PC(halt read)/
+  dmesg/replay.sh 만 생성.
+- **`--product P9` 단독으로 동작** (halt/go_settle 자동). pcsr_addrs 등은 halt 라 불필요.
+  fw_addr_* 미지정 시 coverage 주소필터 없이 전체 카운트 + 경고. 상세 `P9_BRINGUP.md`.
 
 ### 3. 가성 불량 방지 — 호스트 전송로 깨는 admin opcode 전송 차단
 

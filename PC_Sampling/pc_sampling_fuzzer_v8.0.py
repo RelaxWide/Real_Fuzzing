@@ -127,6 +127,8 @@ PRODUCT_PROFILES = {
         'jlink_device':       JLINK_DEVICE,          # Cortex-R8
         'tcl_prefix':         'r8',
         'pcsr_addrs':         PCSR_ADDRS_SWD,         # 3코어
+        'sampler_type':       'pcsr',
+        'go_settle_ms':       0,
         'power_addr':         PCSR_POWER_ADDR,
         'power_mask':         PCSR_POWER_MASK,
         'invalid_pc_vals':    R8_DPIDR_VALS,
@@ -142,6 +144,8 @@ PRODUCT_PROFILES = {
         'jlink_device':       JLINK_DEVICE,           # Cortex-R8
         'tcl_prefix':         'r8',
         'pcsr_addrs':         PCSR_ADDRS_JTAG,         # 2코어
+        'sampler_type':       'pcsr',
+        'go_settle_ms':       0,
         'power_addr':         PCSR_POWER_ADDR,
         'power_mask':         PCSR_POWER_MASK,
         'invalid_pc_vals':    R8_DPIDR_VALS,
@@ -162,7 +166,9 @@ PRODUCT_PROFILES = {
         'openocd_config':     'r5_pcsr.cfg',
         'jlink_device':       'Cortex-R5',
         'tcl_prefix':         'r5',
-        'pcsr_addrs':         None,    # TODO(코어수 미확정): [0x80030084, (0x80032084, 0x80034084 ...)]
+        'pcsr_addrs':         None,    # halt 샘플러는 PCSR 주소 미사용 (reg pc 로 읽음)
+        'sampler_type':       'halt',  # P9: DBGPCSR 미구현 → halt→reg pc→resume
+        'go_settle_ms':       50,      # NVMe 굶김 방지 (v5.6 "50ms 안정"). --go-settle 로 조정
         'power_addr':         None,    # AXI-AP 없음 → per-core power-up 생략 (확정)
         'power_mask':         None,
         'invalid_pc_vals':    (0x6ba02476, 0x6ba02477),  # SWD DPIDR 0x6BA02477 (확정)
@@ -921,6 +927,8 @@ class FuzzConfig:
     power_addr:      Optional[int] = PCSR_POWER_ADDR
     power_mask:      Optional[int] = PCSR_POWER_MASK
     invalid_pc_vals: tuple = R8_DPIDR_VALS        # PCSR 필터 제외 DPIDR 값
+    sampler_type:    str   = 'pcsr'               # 'pcsr' | 'halt' | 'null' (coverage 수집 방식)
+    go_settle_ms:    int   = 0                    # halt 후 resume→다음 halt 최소 실행시간(ms). PCSR=0
     ufas_ini:        Optional[str] = 'PM9M1_A815.ini'  # UFAS --ini (enable_ufas 는 아래 정의)
     allow_no_openocd: bool = False    # OpenOCD 실패 시 --pm 전용 테스트 경로 허용
     no_jlink:         bool = False    # J-Link 자체 없이 NVMe fuzz 만 수행 (coverage 0)
@@ -2119,7 +2127,9 @@ class OpenOCDPCSampler:
         _has_range  = _addr_start is not None and _addr_end is not None
 
         interval = self.config.sample_interval_us / 1_000_000
-        effective_interval = interval
+        # GO_SETTLE: halt 샘플러에서 resume 후 다음 halt 까지 코어 최소 실행시간 보장
+        # (NVMe 명령 굶김/timeout 방지). PCSR 은 go_settle_ms=0 이라 max(interval,0)=interval 무영향.
+        effective_interval = max(interval, self.config.go_settle_ms / 1_000.0)
         sat_limit        = SATURATION_LIMIT
         global_sat_limit = GLOBAL_SATURATION_LIMIT
         idle_pcs         = self.idle_pcs
@@ -2318,6 +2328,58 @@ class OpenOCDPCSampler:
         self._close_telnet()
         self._terminate_proc()
 
+
+class OpenOCDHaltSampler(OpenOCDPCSampler):
+    """halt 기반 PC 샘플러 — DBGPCSR(비침습 PC 샘플) 미구현 타깃용 (예: P9/Cortex-R5).
+
+    OpenOCDPCSampler 의 연결/복구/diagnose/worker/회계/저장 인프라를 그대로 상속하고,
+    per-sample PC 읽기만 `targets <prefix>; halt; reg pc; resume` 로 교체한다(침습적).
+    halt 가 NVMe 명령을 굶겨 timeout 내지 않도록, resume 후 다음 halt 까지 최소 실행시간을
+    config.go_settle_ms 로 보장한다(상속 worker 의 effective_interval 에서 적용). 단일코어 → 1-tuple.
+    """
+
+    # OpenOCD `reg pc` 출력에서 PC 값 추출. 예: "pc (/32): 0x00012345"
+    _REG_PC_RE = re.compile(r'pc\b[^\n]*?(0x[0-9a-fA-F]+)', re.IGNORECASE)
+
+    def __init__(self, config: 'FuzzConfig'):
+        super().__init__(config)
+        # halt 모드는 reg pc 로 단일 코어 PC 를 읽음(PCSR 주소 미사용) → 1코어로 표기.
+        self._pcsr_addrs = [0x80030000]
+
+    def _send_startup_tcl(self):
+        """halt 모드 startup: DP power-up + sticky clear + cortex_r 타깃 선택.
+        (PCSR read_all_pcs proc 정의는 불필요해서 생략.)"""
+        px = self._tcl_prefix
+        log.info(f"[Startup] halt-sampler interface={self.config.interface!r}, target={px!r}")
+        self._telnet_cmd(f'{px}.dap dpreg 4 0x50000000')   # CDBGPWRUPREQ|CSYSPWRUPREQ
+        time.sleep(0.05)
+        self._telnet_cmd(f'{px}.dap dpreg 0 0x1e')          # sticky error clear
+        self._telnet_cmd(f'targets {px}')                   # 이후 halt/reg/resume 대상
+        log.info("[Startup] halt-sampler 준비 완료")
+
+    def _read_all_pcs(self) -> Optional[Tuple[int, ...]]:
+        """halt → reg pc → resume 로 단일코어 PC 1개 샘플. 실패 시 None."""
+        try:
+            self._telnet_cmd('halt')
+            resp = self._telnet_cmd('reg pc')
+            self._telnet_cmd('resume')
+            m = self._REG_PC_RE.search(resp or '')
+            if not m:
+                log.warning(f"[Halt] reg pc 파싱 실패: {repr(resp)}")
+                return None
+            pc = int(m.group(1), 16) & ~1
+            if pc in (0, 0xFFFFFFFE) or pc in self._invalid_pc_mask:
+                return None
+            return (pc,)
+        except Exception as e:
+            log.warning(f"[Halt] _read_all_pcs 예외: {e}")
+            try:
+                self._telnet_cmd('resume')   # 코어가 halt 로 남지 않게
+            except Exception:
+                pass
+            return None
+
+
 class NVMeFuzzer:
     """다중 Opcode 지원 NVMe 퍼저 (v4.3: subprocess nvme-cli + 글로벌 포화 설정 분리)"""
 
@@ -2328,8 +2390,14 @@ class NVMeFuzzer:
         # --no-jlink 활성 시 NullSampler 사용 — coverage 수집 없이 NVMe fuzz 만.
         # J-Link/OpenOCD 가 없어도 fuzz / state telemetry / PM rotation / crash
         # detection (timeout 기준) 은 모두 동작.
-        self.sampler = (NullSampler(config) if config.no_jlink
-                        else OpenOCDPCSampler(config))
+        # sampler 선택: --no-jlink 또는 sampler_type='null' → NullSampler,
+        # 'halt' → OpenOCDHaltSampler(P9 등 DBGPCSR 미구현), 그 외 → OpenOCDPCSampler.
+        if config.no_jlink or config.sampler_type == 'null':
+            self.sampler = NullSampler(config)
+        elif config.sampler_type == 'halt':
+            self.sampler = OpenOCDHaltSampler(config)
+        else:
+            self.sampler = OpenOCDPCSampler(config)
 
         if config.enabled_commands:
             # --commands 지정 시: NVME_COMMANDS 전체에서 이름 매칭
@@ -10662,6 +10730,12 @@ if __name__ == "__main__":
     parser.add_argument('--interface', choices=['swd', 'jtag'], default='swd',
                         help='디버그 transport (swd: r8_pcsr.cfg, jtag: r8_pcsr_jtag.cfg). '
                              '--product 지정 시 무시됨')
+    parser.add_argument('--sampler', choices=['pcsr', 'halt', 'null'], default=None,
+                        help='coverage 수집 방식 override (기본: product profile 값). '
+                             'pcsr=비침습 PCSR, halt=halt→reg pc→resume(DBGPCSR 미구현 타깃), null=수집안함')
+    parser.add_argument('--go-settle', type=int, default=None, dest='go_settle',
+                        help='halt 샘플러: resume 후 다음 halt 까지 최소 실행시간(ms). '
+                             '기본: profile 값(P9=50). NVMe timeout 나면 올릴 것')
     parser.add_argument('--nvme', default=NVME_DEVICE, help='NVMe device')
     parser.add_argument('--namespace', type=int, default=NVME_NAMESPACE)
 
@@ -10774,14 +10848,15 @@ if __name__ == "__main__":
         _ncore = len(_profile['pcsr_addrs']) if _profile['pcsr_addrs'] else '?'
         print(f"Product={args.product}: interface={resolved_interface}, "
               f"cfg={resolved_cfg}, jlink={_profile['jlink_device']}, cores={_ncore}")
-        # bring-up 검증 — PCSR 샘플링의 필수값(pcsr_addrs)이 없으면 중단.
+        # bring-up 검증: PCSR 샘플러(sampler_type='pcsr')만 pcsr_addrs 필수.
+        # halt 샘플러는 reg pc 로 읽어 pcsr_addrs 불필요. --no-jlink/null 도 통과.
         # fw_addr_*(coverage 주소필터)는 없어도 동작(전부 카운트) → 경고만.
-        # --no-jlink(NullSampler, coverage 0)면 PCSR 값이 불필요하므로 통과.
-        if not args.no_jlink:
-            if _profile.get('pcsr_addrs') is None:
+        _st = args.sampler or _profile.get('sampler_type', 'pcsr')
+        if not args.no_jlink and _st != 'null':
+            if _st == 'pcsr' and _profile.get('pcsr_addrs') is None:
                 print(f"\n[ERROR] Product '{args.product}' bring-up 미완: pcsr_addrs 비어 있음.")
                 print(f"        PRODUCT_PROFILES['{args.product}']['pcsr_addrs'] 를 채우거나 "
-                      "--no-jlink 로 NVMe/PM 만 테스트하세요. (P9_BRINGUP.md)")
+                      "--no-jlink / --sampler halt 로 테스트하세요. (P9_BRINGUP.md)")
                 sys.exit(2)
             _soft = [k for k in ('fw_addr_start', 'fw_addr_end') if _profile.get(k) is None]
             if _soft:
@@ -10803,7 +10878,15 @@ if __name__ == "__main__":
             'enable_ufas':       True,
             'ufas_ini':          'PM9M1_A815.ini',
             'enable_jlink_dump': True,
+            'sampler_type':      'pcsr',
+            'go_settle_ms':      0,
         }
+
+    # sampler_type / go_settle 해석: CLI override > profile. --no-jlink 면 null 강제.
+    _resolved_sampler = ('null' if args.no_jlink
+                         else (args.sampler or _profile.get('sampler_type', 'pcsr')))
+    _resolved_go_settle = (args.go_settle if args.go_settle is not None
+                           else _profile.get('go_settle_ms', 0))
 
     config = FuzzConfig(
         openocd_config=resolved_cfg,
@@ -10818,6 +10901,8 @@ if __name__ == "__main__":
         ufas_ini=_profile['ufas_ini'],
         addr_range_start=_profile['fw_addr_start'],
         addr_range_end=_profile['fw_addr_end'],
+        sampler_type=_resolved_sampler,
+        go_settle_ms=_resolved_go_settle,
         nvme_device=args.nvme,
         nvme_namespace=args.namespace,
         nvme_timeouts=nvme_timeouts,
