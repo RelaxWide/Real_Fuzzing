@@ -3010,39 +3010,67 @@ class NVMeFuzzer:
             log.error(f"[Prefill] dd 실행 실패: {e}")
             return False
 
-        # dd 진행 상황을 1분마다 로그 출력
-        POLL_INTERVAL = 60
+        # dd status=progress 출력을 실시간 파싱해 진행률(%) 표시.
+        # dd 는 진행을 "<N> bytes (...) copied, ... , <rate>" 로 \r 갱신, 끝에 \n+요약.
+        # drive_bytes 를 알면 N/drive_bytes 로 % 계산.
+        POLL_INTERVAL = 30      # 진행 로그 간격(초)
         import threading
-        _result: dict = {}
+        _st: dict = {'bytes': 0, 'line': '', 'buf': '', 'tail': [],
+                     'rc': None, 'done': False}
 
-        def _communicate():
+        def _reader():
             try:
-                stdout, _ = proc.communicate()
-                _result['rc'] = proc.returncode
-                _result['out'] = stdout.decode(errors='replace') if stdout else ''
+                while True:
+                    chunk = proc.stdout.read(128)
+                    if not chunk:
+                        break
+                    _st['buf'] += chunk.decode(errors='replace')
+                    segs = re.split(r'[\r\n]', _st['buf'])
+                    _st['buf'] = segs.pop()          # 미완성 조각은 버퍼에 보존
+                    for seg in segs:
+                        seg = seg.strip()
+                        if not seg:
+                            continue
+                        m = re.match(r'(\d+)\s+bytes', seg)
+                        if m:
+                            _st['bytes'] = int(m.group(1))
+                            _st['line'] = seg          # 최신 진행 줄(전송량/속도 포함)
+                        else:
+                            _st['tail'].append(seg)    # records/요약/에러 줄
             except Exception as e:
-                _result['error'] = str(e)
+                _st['tail'].append(f'(reader err: {e})')
+            finally:
+                try:
+                    _st['rc'] = proc.wait()
+                except Exception:
+                    _st['rc'] = proc.returncode
+                _st['done'] = True
 
-        t = threading.Thread(target=_communicate, daemon=True)
+        t = threading.Thread(target=_reader, daemon=True)
         t.start()
-        waited = 0
-        while t.is_alive():
-            t.join(timeout=POLL_INTERVAL)
-            if t.is_alive():
-                waited += POLL_INTERVAL
-                log.warning(f"[Prefill] 진행 중... {waited//60}분 경과")
+        _last = time.monotonic()
+        while not _st['done']:
+            time.sleep(1)
+            if time.monotonic() - _last >= POLL_INTERVAL:
+                _last = time.monotonic()
+                b = _st['bytes']
+                _detail = f"  [{_st['line']}]" if _st['line'] else ""
+                if drive_bytes > 0 and b > 0:
+                    pct = min(100.0, b / drive_bytes * 100)
+                    log.warning(f"[Prefill] 진행 {pct:5.1f}% "
+                                f"({b/(1024**3):.1f}/{drive_bytes/(1024**3):.1f} GB){_detail}")
+                elif b > 0:
+                    log.warning(f"[Prefill] 진행 {b/(1024**3):.1f} GB 기록{_detail}")
+                else:
+                    log.warning("[Prefill] 진행 중... (dd 진행정보 대기)")
+        t.join(timeout=5)
 
-        if 'error' in _result:
-            log.error(f"[Prefill] dd communicate 오류: {_result['error']}")
-            return False
-
-        rc = _result.get('rc', -1)
-        out = _result.get('out', '').strip()
-        # dd 출력 마지막 줄(전송량 요약)만 로그
-        if out:
-            last_line = [l for l in out.splitlines() if l.strip()]
-            if last_line:
-                log.warning(f"[Prefill] dd 출력: {last_line[-1]}")
+        rc = _st['rc'] if _st['rc'] is not None else -1
+        # 완료 요약(전송량/속도) 한 줄
+        if _st['line']:
+            log.warning(f"[Prefill] dd 완료: {_st['line']}")
+        elif _st['tail']:
+            log.warning(f"[Prefill] dd 출력: {_st['tail'][-1]}")
 
         # dd는 디바이스 끝에서 ENOSPC(rc=1)로 종료하는 게 정상
         if rc in (0, 1):
