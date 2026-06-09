@@ -12,8 +12,22 @@
 - **버전당 파일 1개** 패턴: 버전업 시 `.py`/`.md` 를 새 이름으로 복사.
 - **⚠️ 공유 파일(버전 안 붙음 — 복사 금지, 모든 버전이 공유)**:
   - `fuzzer_config.json` — v8.3 신규. 모든 사용자 설정값.
-  - `state_fields.py` — **v8.3 부터 deprecated**(v8.3 은 import 안 함, JSON 으로 이전). v8.2 이하만 사용.
+  - `state_fields.py` — **v8.3 부터 deprecated**(v8.3 은 import 안 함, JSON 으로 이전). 그러나
+    유지된 v8.0~v8.2 가 import 하므로 PC_Sampling 에 **유지**(backup 으로 옮기면 v8.0~v8.2 깨짐).
   - `nvme_seeds.py` — NVMe 시드 템플릿.
+
+### 저장소 정리 (이 세션에서 수행)
+old fuzzer/미사용/업스트림을 backup 으로 이동, 작업 트리 정리. 복원은 git 히스토리(rename).
+- **PC_Sampling/ (활성)**: v8.0~v8.3 fuzzer+md, fuzzer_config.json, nvme_seeds.py, state_fields.py,
+  r5_pcsr.cfg, r8_pcsr_jtag.cfg, install_fuzzer_deps.sh, ghidra_export.py, jlink_reg_diag.py,
+  overview.md, P9_BRINGUP.md, SESSION_HANDOFF_v8.3.md.
+- **PC_Sampling/backup/**: 옛 fuzzer(v2~v7.8)+md, SESSION_HANDOFF_v7.8.md, seminar.md,
+  state_telemetry.md, 옛 도구(p9_core_probe*, sampling_density_test, diag_*.sh, seed_replay_test.sh).
+- **backup/root_scripts/**: 루트 실험 스크립트(NVMeConnection/PMU_POR/dp_ctrl_test/ghidra_bridge/
+  jlink_close_test/jlink_dbgpcsr_probe/poc_bp_coverage/scan/ssd_fuzz.cfg/test).
+- **backup/gdbfuzz_upstream/**: GDBFuzz 업스트림 프레임워크(README/LICENSE/setup.py/Dockerfile/
+  Makefile/src/dependencies/benchmark/evaluation/example_firmware/example_programs 등). v8.3 미사용.
+- 루트 잔여: `.gitignore`, `AGENTS.md`, `PC_Sampling/`, `backup/`, (생성/환경) `build/output/__pycache__/.venv`.
 
 ---
 
