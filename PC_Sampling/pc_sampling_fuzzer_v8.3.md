@@ -1,0 +1,138 @@
+# PC Sampling SSD Firmware Fuzzer v8.3
+
+OpenOCD PCSR 비침습 샘플링 + `nvme-cli` passthru 기반 Coverage-Guided + State-Aware Fuzzer.
+
+**v8.3 핵심: 모든 사용자 설정값·경로를 `fuzzer_config.json` 으로 외부화.**
+코드 상단에 흩어져 있던 상수/타임아웃/주소/확률/경로 + `PRODUCT_PROFILES` 를 JSON 한 파일로 모았다.
+모듈 로드 시 JSON 을 읽어 **같은 이름의 전역**에 주입 → `FuzzConfig` 기본값/argparse default 가
+자동으로 JSON 값을 따른다. JSON 은 **버전 비종속 공유 파일**이라 `.py` 를 버전업 복사해도 그대로
+재사용된다(매 버전 상단 재편집 불필요). **동작은 v8.2 와 byte-동등**(81 상수 + PRODUCT_PROFILES +
+72 FuzzConfig 필드 1:1 검증, 출력 폴더의 버전 문자열만 다름).
+
+v8.2 P9 profile 정리, v8.1 J-Link halt 샘플러, v8.0 제품 일반화, v7.x 기능 모두 유지.
+
+---
+
+## v8.3 변경사항 (JSON 외부화)
+
+### 설정 파일 `fuzzer_config.json`
+- 위치: fuzzer 스크립트와 같은 디렉토리(기본). `--config PATH` 로 교체.
+- 16진수는 `"0x.."` 문자열로 둬도 로더가 int 로 변환. `null`→None, 배열→list/tuple.
+- 없으면 명확한 fatal 에러로 중단(기본 파일을 repo 에 동봉).
+- 우선순위: **JSON 기본값 → 제품 profile override → CLI 인자 override(최우선)**.
+
+### JSON 섹션
+`globals`(FW주소·OpenOCD/J-Link·PCSR·DPIDR·NVMe device) · `paths`(fw_bin·pmu_script·ufas_binary·
+jlink_dump_script·debug_package_dir·parser_script·engine_errint_logs) · `timeouts` · `sampling` ·
+`diagnose_idle_calibration` · `fuzzing` · `mutation` · `power` · `visualization` ·
+`runtime_hw`(clkreq 핀/전압·fw_xfer/slot·prefill_bs·boot_sweep·settle_sweep·nvme_lba_size) ·
+`products`(PM9M1/BM9H1/P9) · `strategy`(blocked_admin_opcodes·builtin_sequences·pcie_pm_fuzz_targets·
+clkreq_fuzz_modes).
+
+### 구현
+- 로더 `load_user_config()` + `_early_config_path()`(import 시점 `--config` 선파싱) + `_cfg_hexnorm()`.
+- 모듈 상수 정의가 `_CFG[...]` 참조로 변경(이름 유지 → 나머지 코드 무수정).
+- 메서드 본문에 박혀 있던 경로(`ufas`/`run_smi_mem_dump_*.sh`/`DebugPackage`/parser/event log)는 신규
+  명명 상수(`UFAS_BINARY`/`JLINK_DUMP_SCRIPT`/`DEBUG_PACKAGE_DIR`/...)로 승격 후 JSON 주입.
+- 코드 유지(외부화 제외): `OUTPUT_DIR`(버전 종속), `CMD_SCHEMAS`/`NVME_COMMANDS`(명령 구조 정의),
+  `POWER_COMBOS`(range 생성식), 파생/런타임값(`_PAGE_SIZE` 등).
+
+### 새 제품/설정 추가
+`fuzzer_config.json` 의 `products` 에 레코드 추가, 또는 각 섹션 값 편집 — **코드 수정 불필요**.
+
+---
+
+## 지원 제품
+
+| 제품 | interface | core | coverage 샘플러 | UFAS | J-Link dump | 상태 |
+|------|-----------|------|-----------------|------|-------------|------|
+| **PM9M1** | SWD | 3 (R8) | OpenOCD PCSR (비침습) | ✅ | ✅ | 정상 |
+| **BM9H1** | JTAG | 2 (R8) | OpenOCD PCSR (비침습) | ✅ | ✅ | 정상 |
+| **P9** | SWD | R5 단일 | **J-Link halt (pylink)** | ❌ | ❌ | v8.1: `sampler_type='jlink_halt'`. `--product P9` 단독 동작. 튜닝: `P9_BRINGUP.md` |
+
+```bash
+sudo python3 pc_sampling_fuzzer_v8.1.py --product PM9M1 --nvme /dev/nvme0n1   # PCSR (변경 없음)
+sudo python3 pc_sampling_fuzzer_v8.1.py --product P9    --nvme /dev/nvme0n1   # J-Link halt 자동
+# pylink 필요: pip3 install pylink-square (install_fuzzer_deps.sh 에 포함)
+```
+
+---
+
+## v8.1 변경사항
+
+### 1. 배경 — OpenOCD telnet halt 의 desync 문제
+
+P9 는 **DBGPCSR 미구현 + ETM 트레이스 핀 없음** → 비침습 PC 샘플링 불가. halt→PC→resume 가
+유일한 방법이다. v8.0 의 `OpenOCDHaltSampler` 는 이를 OpenOCD telnet 으로 했는데:
+
+- OpenOCD `halt` 는 코어가 멈출 때까지 내부적으로 최대 5초 폴링.
+- 그런데 fuzzer 의 telnet 소켓 read 타임아웃은 **2초**(`_SOCK_TIMEOUT`).
+- halt-ack 이 2초를 넘으면 `_telnet_cmd('halt')` 가 프롬프트 없이 빈 값 반환 → 이어진
+  `reg pc` 가 desync 되어 `''` → 그 상태로 `resume` 이 들어가 **실제 실행 안 됨**
+  → 단일 R5 컨트롤러 코어가 halt 로 굳음 → NVMe 명령이 무한 hang(커널 타임아웃 30일).
+
+`--go-settle` 을 올려도(샘플 간격만 늘림) halt-ack 지연 자체는 안 줄어 해결 안 됨.
+
+### 2. 해결 — `JLinkHaltSampler` (pylink 직접 제어)
+
+`OpenOCDPCSampler` 를 상속하되 **연결 계층과 PC 읽기만 pylink 로 교체**. 샘플링 worker /
+diagnose / 회계 / 저장 / 커버리지 평가 인프라는 그대로 상속(코드 재사용, 메인 루프 무변경).
+
+| 동작 | 구현 |
+|------|------|
+| 연결 | `pylink.JLink(); open(); set_tif(SWD); exec_command("CORESIGHT_SetIndexAPBAPToUse=0"); connect("Cortex-R5", speed=4000)` |
+| PC 읽기 | `JLINKARM_Halt → halted() 폴링(≤50ms) → ReadReg(PC) → JLINKARM_Go()`. 전부 블로킹 API → **telnet desync 원천 차단** |
+| resume | 항상 `JLINKARM_Go()`. **`restart()` 절대 안 씀**(CPU 리셋 — 살아있는 SSD 손상 방지). go 실패 시 None 반환 |
+| PC 레지스터 인덱스 | connect 시 `register_list()` 에서 R15/PC 자동 탐지. `--pc-reg-index` 로 강제 지정 가능 |
+| 스레드 안전성 | pylink 단일 세션 → 모든 호출을 `_jlink_lock` 으로 직렬화(worker/메인 스레드 동시 접근 방지) |
+| halt 상한 | halted() 폴링 ~50ms 상한 → 못 멈추면 None. 연속 실패는 base 의 `_CONSECUTIVE_FAIL_LIMIT(10)` → 복구 신호 |
+
+DLL 함수(`_dll.JLINKARM_Halt/ReadReg/Go`)를 캐싱해 wrapper 오버헤드 회피(tight halt 루프 가속).
+
+### 3. 제품/설정 와이어링
+
+- **P9 profile**: `sampler_type` `'halt'` → **`'jlink_halt'`**. 신규 필드 `jlink_speed=4000`,
+  `jlink_ap_index=0`, `pc_reg_index=None`(자동 탐지).
+- **샘플러 선택**(`NVMeFuzzer.__init__`): `'jlink_halt'` → `JLinkHaltSampler` 분기 1개 추가.
+- **CLI**: `--sampler` 에 `jlink_halt` 추가, `--pc-reg-index N`(PC 레지스터 인덱스 override) 추가.
+- **`import pylink`**: try/except 가드 — pylink 없는 PM9M1/BM9H1 호스트는 무영향, P9 선택 시에만
+  필요(미설치면 connect 에서 안내 메시지).
+
+### 4. USB 점유 충돌 처리
+
+P9 는 pylink 가 J-Link USB 를 **in-process 단독 점유**. JLinkExe 를 spawn 하거나 OpenOCD 가
+USB 를 가졌다고 가정하는 경로를 sampler 경유로 우회(isinstance 가드 2곳):
+
+- `_shutdown_openocd_for_jlink`: J-Link 샘플러면 early-return(OpenOCD 없음).
+- 크래시 후 PC 모니터 루프: JLinkExe subprocess 대신 `sampler.read_stuck_pcs()`(pylink 핸들 경유).
+- 크래시 stuck PC 읽기(`_reinit_target`/`read_stuck_pcs`)는 이미 sampler 메서드 경유 → 자동 처리.
+- P9 profile 은 `enable_ufas=False`/`enable_jlink_dump=False` 라 덤프/UFAS 본체는 이미 skip.
+
+### 5. 코드 영향 범위 (v8.0 → v8.1)
+
+| 사이트 | 변경 |
+|--------|------|
+| `import pylink` (try/except) | 신규 (가드) |
+| `FuzzConfig` | `jlink_speed`/`jlink_ap_index`/`pc_reg_index` 추가 |
+| `PRODUCT_PROFILES['P9']` | `sampler_type='jlink_halt'` + 3 필드 |
+| `JLinkHaltSampler` 클래스 | **신규** (~150줄). connect/_read_all_pcs/_openocd_alive/_reconnect/_reinit_target/close override + OpenOCD 메서드 no-op |
+| `NVMeFuzzer.__init__` 샘플러 선택 | `'jlink_halt'` 분기 추가 |
+| `_shutdown_openocd_for_jlink` | J-Link 샘플러 early-return 가드 |
+| 크래시 PC 모니터 | J-Link 샘플러는 `read_stuck_pcs` 경유 |
+| CLI `--sampler`/`--pc-reg-index` | choices 추가 / 신규 옵션 |
+| `install_fuzzer_deps.sh` | `pylink-square` 추가 |
+
+**PM9M1/BM9H1 동작 불변** — PCSR 경로(OpenOCDPCSampler) 코드는 손대지 않음.
+
+---
+
+## 검증
+
+- `python3 -c "import ast; ast.parse(...)"` 문법 OK.
+- `--help` 에 `--sampler {pcsr,halt,jlink_halt,null}` / `--pc-reg-index` 노출 확인.
+- `--product P9` → `sampler_type='jlink_halt'`, `JLinkHaltSampler` 인스턴스화/`_pcsr_addrs=[0x80030000]`/
+  invalid mask(SWD DPIDR) 확인. connect 전 `_openocd_alive()=False`, `_read_all_pcs()=None`(graceful).
+- pylink 2.0.0 설치 확인.
+
+평가 환경에서 할 일은 `P9_BRINGUP.md` 참조 (J-Link halt 실측: idle universe 수렴, NVMe timeout,
+PC 레지스터 인덱스 확인).
