@@ -5115,10 +5115,12 @@ class NVMeFuzzer:
     RC_SKIP      = -1003   # 가드가 전송 차단 (가성 유발 admin opcode) — 회계 없이 다음 iteration
 
     def _load_static_analysis(self) -> None:
-        """같은 디렉토리의 basic_blocks.txt / functions.txt 자동 탐지 후 로드.
+        """제품별 BB/func 파일(config.bb_file/func_file) 자동 탐지 후 로드.
 
-        파일이 없으면 아무것도 하지 않음 (기존 동작 유지).
-        Ghidra의 ghidra_export.py 스크립트로 생성한 파일을 기대함.
+        파일명은 fuzzer_config.json 의 제품 항목에서 옴 (제품별 분리 — 펌웨어가 다른
+        PM9M1/BM9H1/P9 의 BB 가 섞이지 않게):
+          PM9M1=basic_blocks_PM9M1.txt, BM9H1=basic_blocks_BM9H1.txt, P9=basic_blocks_P9.txt
+        파일이 없으면 아무것도 하지 않음. Ghidra ghidra_export.py 로 생성한 파일을 기대함.
         """
         script_dir = Path(__file__).parent.resolve()
         bb_file   = script_dir / self.config.bb_file      # 제품별 (profile)
@@ -5149,7 +5151,7 @@ class NVMeFuzzer:
                 self._sa_bb_starts = [p[0] for p in sorted_pairs]
                 self._sa_bb_ends   = [p[1] for p in sorted_pairs]
                 self._sa_total_bbs = len(self._sa_bb_starts)
-                print(f"[StaticAnalysis] basic_blocks.txt: {self._sa_total_bbs:,}개 BB "
+                print(f"[StaticAnalysis] {self.config.bb_file}: {self._sa_total_bbs:,}개 BB "
                       f"(0x{self._sa_bb_starts[0]:08x} ~ 0x{self._sa_bb_ends[-1]:08x})")
 
         # --- functions.txt ---
@@ -5179,7 +5181,7 @@ class NVMeFuzzer:
                 self._sa_func_ends    = [t[1] for t in sorted_tuples]
                 self._sa_func_names   = [t[2] for t in sorted_tuples]
                 self._sa_total_funcs  = len(self._sa_func_entries)
-                print(f"[StaticAnalysis] functions.txt: {self._sa_total_funcs:,}개 함수")
+                print(f"[StaticAnalysis] {self.config.func_file}: {self._sa_total_funcs:,}개 함수")
 
         self._sa_loaded = self._sa_total_bbs > 0 or self._sa_total_funcs > 0
 
