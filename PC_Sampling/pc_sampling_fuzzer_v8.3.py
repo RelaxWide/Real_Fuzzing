@@ -63,7 +63,8 @@ from typing import Set, List, Optional, Tuple, Dict, Union
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from state_fields import STATE_FIELDS
+# v8.3: state 관측 필드는 fuzzer_config.json 의 state_fields 섹션에서 제품별로 로드
+# (STATE_FIELD_SETS, 아래 _CFG 로드 후 정의). state_fields.py 는 더 이상 import 하지 않음.
 from enum import Enum, IntEnum
 import contextlib
 import bisect
@@ -156,6 +157,9 @@ _PW = _sect('power')
 _VI = _sect('visualization')
 _RT = _sect('runtime_hw')
 _ST = _sect('strategy')
+# 제품별 state 관측 필드 세트 {"r8":[...], "p9":[...]}. 제품의 'state_fields' 키가 세트명을 가리킴.
+STATE_FIELD_SETS = _sect('state_fields')
+_DEFAULT_STATE_FIELDS = STATE_FIELD_SETS.get('r8', [])
 
 # 펌웨어 코드(.text) 영역 주소
 FW_ADDR_START = _G['fw_addr_start']
@@ -1022,6 +1026,8 @@ class FuzzConfig:
 
     # v7.0: State monitoring
     state_enabled: bool = True             # --no-state 시 False
+    # v8.3: 제품별 state 관측 필드 (fuzzer_config.json state_fields 세트). 기본=r8 세트.
+    state_fields: list = field(default_factory=lambda: list(_DEFAULT_STATE_FIELDS))
 
 class _MsFormatter(logging.Formatter):
     """ms 단위 타임스탬프 포매터 (datefmt는 초까지만 지원하므로 formatTime 오버라이드)."""
@@ -1092,6 +1098,7 @@ class _FuzzingTerminalFilter(logging.Filter):
         r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
         r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]|\[State-Replay\]'
         r'|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]|\[Probe-'
+        r'|\[State-Snap\]|\[SMART\]'   # v8.3: 주기적 SMART/전체 state field 출력 터미널 노출
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -2748,7 +2755,7 @@ class NVMeFuzzer:
         self._cmd_history: deque = deque(maxlen=100)
 
         # v7.0: State monitoring
-        self.state_monitor    = NVMeStateMonitor(config.nvme_device, STATE_FIELDS)
+        self.state_monitor    = NVMeStateMonitor(config.nvme_device, config.state_fields)
         self.state_corpus:    List[StateCorpusEntry] = []
         self.state_cov_map:   Dict[str, int] = {}
         self._state_snap_prev: Optional[Dict[str, int]] = None
@@ -3027,7 +3034,7 @@ class NVMeFuzzer:
                     f"state-corpus={len(self.state_corpus)}")
 
         # ── SMART (LID 02h) ───────────────────────────────────────────
-        smart_fields = [f for f in STATE_FIELDS if f['source'] == 'smart']
+        smart_fields = [f for f in self.config.state_fields if f['source'] == 'smart']
         if smart_fields:
             try:
                 proc = subprocess.run(
@@ -3066,7 +3073,7 @@ class NVMeFuzzer:
 
         # ── Vendor log (LID별 1회) ────────────────────────────────────
         vendor_lids: Dict[int, int] = {}
-        for f in STATE_FIELDS:
+        for f in self.config.state_fields:
             if f['source'] == 'vendor':
                 vendor_lids[f['lid']] = f['log_len']
 
@@ -3083,7 +3090,7 @@ class NVMeFuzzer:
                     continue
                 raw = proc.stdout
                 log.warning(f"[State-Snap] ── LID {lid:#04x} ({log_len}B) ──────────────────")
-                for f in STATE_FIELDS:
+                for f in self.config.state_fields:
                     if f['source'] != 'vendor' or f.get('lid') != lid:
                         continue
                     start, end = f['offset'], f['offset'] + f['length']
@@ -3097,7 +3104,7 @@ class NVMeFuzzer:
 
         # ── Security Receive (secp/spsp 그룹별 Send→Recv) ────────────────
         sec_groups: Dict[tuple, int] = {}
-        for f in STATE_FIELDS:
+        for f in self.config.state_fields:
             if f['source'] == 'security_recv':
                 key = (f['secp'], f['spsp'], f.get('nsid', 0))
                 sec_groups[key] = max(sec_groups.get(key, 0), f['size'])
@@ -3152,7 +3159,7 @@ class NVMeFuzzer:
                     continue
                 log.warning(f"[State-Snap] ── Security Recv secp={secp:#x} spsp={spsp:#x} "
                             f"({size}B) ──────────")
-                for f in STATE_FIELDS:
+                for f in self.config.state_fields:
                     if (f['source'] != 'security_recv'
                             or f['secp'] != secp
                             or f['spsp'] != spsp
@@ -11155,6 +11162,13 @@ if __name__ == "__main__":
     _resolved_passthru_ms = _profile.get('nvme_passthru_timeout_ms', NVME_PASSTHRU_TIMEOUT_MS)
     _resolved_kernel_sec  = _profile.get('nvme_kernel_timeout_sec', NVME_KERNEL_TIMEOUT_SEC)
 
+    # v8.3: 제품별 state 관측 필드 세트 해석 (제품의 state_fields 키 = 세트명, 기본 r8).
+    _sf_setname = _profile.get('state_fields', 'r8')
+    _resolved_state_fields = STATE_FIELD_SETS.get(_sf_setname)
+    if _resolved_state_fields is None:
+        print(f"[WARN] state_fields 세트 '{_sf_setname}' 없음 → 'r8' 사용")
+        _resolved_state_fields = STATE_FIELD_SETS.get('r8', [])
+
     config = FuzzConfig(
         openocd_config=resolved_cfg,
         interface=resolved_interface,
@@ -11202,6 +11216,7 @@ if __name__ == "__main__":
         enable_ufas=_profile['enable_ufas'] and not args.no_ufas,
         enable_jlink_dump=_profile['enable_jlink_dump'] and not args.no_jlink_dump,
         state_enabled=not args.no_state,
+        state_fields=_resolved_state_fields,
         prefill=args.prefill,
         prefill_bs=args.prefill_bs,
     )

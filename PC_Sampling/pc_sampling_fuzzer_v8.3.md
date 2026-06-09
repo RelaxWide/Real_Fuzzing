@@ -40,6 +40,22 @@ clkreq_fuzz_modes).
 - 코드 유지(외부화 제외): `OUTPUT_DIR`(버전 종속), `CMD_SCHEMAS`/`NVME_COMMANDS`(명령 구조 정의),
   `POWER_COMBOS`(range 생성식), 파생/런타임값(`_PAGE_SIZE` 등).
 
+### 제품별 State 관측 필드 (state_fields)
+- `fuzzer_config.json` 의 `state_fields` 섹션에 **세트별** 정의: `r8`(PM9M1/BM9H1, 25필드) /
+  `p9`(P9, 22필드 = r8 에서 LID 0xDF `df_*` 3개 제외). 제품의 `state_fields` 키가 세트명을 가리킨다.
+- P9 는 LID 02h(SMART)·01h(err_status)·SecRecv(SECP=0xFE/SPSP=0x3D) 유지, **LID 0xDF 제외**
+  (P9 에 없는 페이지). NVMeStateMonitor 가 제품 세트로 구성돼 해당 명령만 수행한다.
+- `state_fields.py` 는 더 이상 import 하지 않음(정의는 JSON 으로 이전). 세트 추가/편집은 JSON 에서.
+
+### 주기적 전체 State 출력 (터미널)
+- 10000 exec 마다 `_log_state_snapshot()` 이 **모든 state 필드(smart/vendor LID/SecRecv) 명령을
+  수행하고 값 전체를 출력**. v8.3: 터미널 필터에 `[State-Snap]`/`[SMART]` 추가 → 파일 로그뿐 아니라
+  **터미널에도** 표시(PM9M1·P9 공통).
+
+### P9 timeout (예시 기본값)
+`products.P9.nvme_timeouts`: 예외(Format NVM 300s, Async Event Request `aer` 600s)를 빼고 전부 30s
+(`command/flush/selftest_*/verify` = 30000). 그룹 미지정 명령은 `command`(30s) 로 폴백.
+
 ### 새 제품/설정 추가
 `fuzzer_config.json` 의 `products` 에 레코드 추가, 또는 각 섹션 값 편집 — **코드 수정 불필요**.
 
