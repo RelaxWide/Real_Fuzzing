@@ -20,6 +20,9 @@ v8.2 P9 profile 정리, v8.1 J-Link halt 샘플러, v8.0 제품 일반화, v7.x 
 - 16진수는 `"0x.."` 문자열로 둬도 로더가 int 로 변환. `null`→None, 배열→list/tuple.
 - 없으면 명확한 fatal 에러로 중단(기본 파일을 repo 에 동봉).
 - 우선순위: **JSON 기본값 → 제품 profile override → CLI 인자 override(최우선)**.
+- **제품별 timeout override**: `globals/timeouts` 는 기본값, 각 제품의 `nvme_timeouts`(+선택적
+  `nvme_passthru_timeout_ms`/`nvme_kernel_timeout_sec`)가 그 위를 덮어쓴다. 제품마다 다른 값 가능.
+  생략 시 global 사용. (현재는 3제품 모두 global 과 동일하게 시드 — 필요 시 제품별로 편집.)
 
 ### JSON 섹션
 `globals`(FW주소·OpenOCD/J-Link·PCSR·DPIDR·NVMe device) · `paths`(fw_bin·pmu_script·ufas_binary·

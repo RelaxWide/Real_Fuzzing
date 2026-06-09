@@ -164,6 +164,8 @@
 
   "products": {
     "PM9M1": {
+      "_comment_timeouts": "nvme_timeouts/nvme_passthru_timeout_ms/nvme_kernel_timeout_sec 는 제품별 override (global timeouts 위에 덮어씀). 제품마다 다르게 조정 가능. 생략 시 global 사용.",
+      "nvme_timeouts": {"command": 8000, "format": 120000, "flush": 2000, "selftest_short": 120000, "selftest_ext": 900000, "verify": 20000},
       "interface": "swd",
       "openocd_config": "r8_pcsr.cfg",
       "jlink_device": "Cortex-R8",
@@ -183,6 +185,7 @@
       "enable_jlink_dump": true
     },
     "BM9H1": {
+      "nvme_timeouts": {"command": 8000, "format": 120000, "flush": 2000, "selftest_short": 120000, "selftest_ext": 900000, "verify": 20000},
       "interface": "jtag",
       "openocd_config": "r8_pcsr_jtag.cfg",
       "jlink_device": "Cortex-R8",
@@ -202,6 +205,7 @@
       "enable_jlink_dump": true
     },
     "P9": {
+      "nvme_timeouts": {"command": 8000, "format": 120000, "flush": 2000, "selftest_short": 120000, "selftest_ext": 900000, "verify": 20000},
       "interface": "swd",
       "jlink_device": "Cortex-R5",
       "sampler_type": "jlink_halt",

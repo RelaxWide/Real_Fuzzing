@@ -11147,6 +11147,14 @@ if __name__ == "__main__":
     _resolved_go_settle = (args.go_settle if args.go_settle is not None
                            else _profile.get('go_settle_ms', 0))
 
+    # v8.3: 제품별 timeout override — global(NVME_TIMEOUTS) 기본값 위에 제품 항목을 덮어씀.
+    #   nvme_timeouts: 제품의 부분/전체 dict 로 그룹별 갱신. passthru/kernel: 제품 키 있으면 우선.
+    _prod_timeouts = _profile.get('nvme_timeouts')
+    if _prod_timeouts:
+        nvme_timeouts.update(_prod_timeouts)
+    _resolved_passthru_ms = _profile.get('nvme_passthru_timeout_ms', NVME_PASSTHRU_TIMEOUT_MS)
+    _resolved_kernel_sec  = _profile.get('nvme_kernel_timeout_sec', NVME_KERNEL_TIMEOUT_SEC)
+
     config = FuzzConfig(
         openocd_config=resolved_cfg,
         interface=resolved_interface,
@@ -11173,6 +11181,8 @@ if __name__ == "__main__":
         nvme_device=args.nvme,
         nvme_namespace=args.namespace,
         nvme_timeouts=nvme_timeouts,
+        nvme_passthru_timeout_ms=_resolved_passthru_ms,
+        nvme_kernel_timeout_sec=_resolved_kernel_sec,
         enabled_commands=args.commands,
         all_commands=args.all_commands,
         resume_coverage=args.resume_coverage,
