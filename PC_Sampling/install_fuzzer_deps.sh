@@ -47,6 +47,12 @@ else
   sudo pip3 install --break-system-packages intelhex
 fi
 
+# pylink-square : v8.1 P9(Cortex-R5) J-Link halt 샘플러(JLinkHaltSampler) 의존성.
+# PM9M1/BM9H1(PCSR/OpenOCD)만 돌리면 불필요하나, --product P9 사용 시 필요.
+log "Installing pylink-square system-wide (P9 J-Link sampler)"
+sudo pip3 install --break-system-packages pylink-square || \
+  warn "pylink-square install 실패 — --product P9 사용 시 'pip3 install pylink-square' 수동 설치"
+
 # OpenOCD / J-Link USB 권한
 log "Installing OpenOCD udev rules"
 if [ -f /usr/share/openocd/contrib/60-openocd.rules ]; then
