@@ -134,6 +134,8 @@ PRODUCT_PROFILES = {
         'invalid_pc_vals':    R8_DPIDR_VALS,
         'fw_addr_start':      FW_ADDR_START,
         'fw_addr_end':        FW_ADDR_END,
+        'bb_file':            'basic_blocks.txt',
+        'func_file':          'functions.txt',
         'enable_ufas':        True,
         'ufas_ini':           'PM9M1_A815.ini',
         'enable_jlink_dump':  True,
@@ -151,6 +153,8 @@ PRODUCT_PROFILES = {
         'invalid_pc_vals':    R8_DPIDR_VALS,
         'fw_addr_start':      FW_ADDR_START,
         'fw_addr_end':        FW_ADDR_END,
+        'bb_file':            'basic_blocks.txt',
+        'func_file':          'functions.txt',
         'enable_ufas':        True,
         'ufas_ini':           'PM9M1_A815.ini',
         'enable_jlink_dump':  True,
@@ -172,8 +176,10 @@ PRODUCT_PROFILES = {
         'power_addr':         None,    # AXI-AP 없음 → per-core power-up 생략 (확정)
         'power_mask':         None,
         'invalid_pc_vals':    (0x6ba02476, 0x6ba02477),  # SWD DPIDR 0x6BA02477 (확정)
-        'fw_addr_start':      None,    # TODO: 펌웨어 .text 시작
-        'fw_addr_end':        None,    # TODO: 펌웨어 .text 끝
+        'fw_addr_start':      0x000000,  # Ghidra: P9 펌웨어 .text = 0x0 ~ 0x9cffff
+        'fw_addr_end':        0x9cffff,
+        'bb_file':            'basic_blocks_P9.txt',   # P9 전용 (Ghidra ghidra_export.py 산출)
+        'func_file':          'functions_P9.txt',
         'enable_ufas':        False,   # P9: UFAS 덤프 불가
         'ufas_ini':           None,
         'enable_jlink_dump':  False,   # P9: J-Link 메모리 덤프 불가
@@ -964,6 +970,9 @@ class FuzzConfig:
     # 주소 필터 (펌웨어 .text 섹션 범위)
     addr_range_start: Optional[int] = FW_ADDR_START
     addr_range_end: Optional[int] = FW_ADDR_END
+    # Ghidra 정적분석 파일명 (제품별) — script_dir 기준. 없으면 정적 커버리지 통계 생략.
+    bb_file:   str = 'basic_blocks.txt'
+    func_file: str = 'functions.txt'
 
     # 이전 세션 커버리지 파일 (resume용)
     resume_coverage: Optional[str] = RESUME_COVERAGE
@@ -4894,8 +4903,8 @@ class NVMeFuzzer:
         Ghidra의 ghidra_export.py 스크립트로 생성한 파일을 기대함.
         """
         script_dir = Path(__file__).parent.resolve()
-        bb_file   = script_dir / 'basic_blocks.txt'
-        func_file = script_dir / 'functions.txt'
+        bb_file   = script_dir / self.config.bb_file      # 제품별 (profile)
+        func_file = script_dir / self.config.func_file
 
         if not bb_file.exists() and not func_file.exists():
             return  # 파일 없음 — 로그 없이 조용히 넘어감
@@ -9695,7 +9704,7 @@ class NVMeFuzzer:
                 sa_info.append(f"funcs={self._sa_total_funcs:,}")
             log.warning(f"StaticAnalysis: {', '.join(sa_info)}")
         else:
-            log.warning("StaticAnalysis: not loaded (basic_blocks.txt / functions.txt 없음)")
+            log.warning(f"StaticAnalysis: not loaded ({self.config.bb_file} / {self.config.func_file} 없음)")
         log.warning(f"Random gen  : {self.config.random_gen_ratio:.0%}")
         timeout_str = ", ".join(f"{k}={v}ms" for k, v in self.config.nvme_timeouts.items())
         log.warning(f"Timeouts    : subprocess={timeout_str}")
@@ -10903,6 +10912,8 @@ if __name__ == "__main__":
             'invalid_pc_vals':   R8_DPIDR_VALS,
             'fw_addr_start':     FW_ADDR_START,
             'fw_addr_end':       FW_ADDR_END,
+            'bb_file':           'basic_blocks.txt',
+            'func_file':         'functions.txt',
             'enable_ufas':       True,
             'ufas_ini':          'PM9M1_A815.ini',
             'enable_jlink_dump': True,
@@ -10929,6 +10940,8 @@ if __name__ == "__main__":
         ufas_ini=_profile['ufas_ini'],
         addr_range_start=_profile['fw_addr_start'],
         addr_range_end=_profile['fw_addr_end'],
+        bb_file=_profile.get('bb_file', 'basic_blocks.txt'),
+        func_file=_profile.get('func_file', 'functions.txt'),
         sampler_type=_resolved_sampler,
         go_settle_ms=_resolved_go_settle,
         nvme_device=args.nvme,
