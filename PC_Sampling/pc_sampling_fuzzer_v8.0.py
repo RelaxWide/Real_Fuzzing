@@ -7005,8 +7005,10 @@ class NVMeFuzzer:
                 addr = Path(addr_file).read_text().strip()  # e.g. "0000:01:00.0"
                 parts = addr.split(':')
                 if len(parts) >= 3:
-                    bus = parts[-2]  # "01"
-                    log.warning(f"[UFAS] sysfs 탐지 성공: {addr} → bus={bus}")
+                    # sysfs/lspci 의 bus 는 hex(예 "81"=0x81). ufas 인자는 decimal 기대 →
+                    # hex→decimal 변환("81"→"129"). 0x01 은 hex/dec 동일해 기존 01:00.0 무영향.
+                    bus = str(int(parts[-2], 16))
+                    log.warning(f"[UFAS] sysfs 탐지 성공: {addr} → bus={bus} (0x{parts[-2]})")
                     return bus
                 else:
                     log.warning(f"[UFAS] sysfs 주소 형식 이상: '{addr}' — lspci fallback")
@@ -7025,8 +7027,9 @@ class NVMeFuzzer:
                 log.warning(f"[UFAS] lspci NVMe 장치 목록:")
                 for line in nvme_lines:
                     log.warning(f"  {line.strip()}")
-                bus = nvme_lines[0].split(':')[0]
-                log.warning(f"[UFAS] lspci 탐지 성공: bus={bus}")
+                bus_hex = nvme_lines[0].split(':')[0]
+                bus = str(int(bus_hex, 16))   # hex→decimal (sysfs 경로와 동일 규칙)
+                log.warning(f"[UFAS] lspci 탐지 성공: bus={bus} (0x{bus_hex})")
                 return bus
             else:
                 log.warning("[UFAS] lspci에서 NVMe 장치를 찾지 못함")
