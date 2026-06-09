@@ -3457,6 +3457,23 @@ class NVMeFuzzer:
             return dev
         return f"{dev}n{self.config.nvme_namespace or 1}"
 
+    def _ctrl_device(self) -> str:
+        """컨트롤러 레벨 admin feature(APST FID 0x0C / KeepAlive 0x0F 등) 대상 디바이스.
+
+        이 feature 들은 namespace 가 아니라 컨트롤러 스코프다. namespace 블록 디바이스
+        (/dev/nvme0n1)로 set-feature 를 보내면 nvme-cli 가 NSID(=namespace)를 실어 보내는데,
+        일부 펌웨어(예: P9)는 컨트롤러 feature 에 NSID≠0 이면 거부(Invalid Field)하여 실패한다.
+        → 컨트롤러 char device(/dev/nvme0)로 보내 NSID 의존성을 제거한다.
+        /dev/nvme0n1 → /dev/nvme0, /dev/nvme1n2 → /dev/nvme1, /dev/nvme0 → /dev/nvme0.
+        컨트롤러 char device 가 없으면(WSL2 등) nvme_device 경로 그대로 폴백.
+        """
+        dev = self._normalize_nvme_path(self.config.nvme_device)
+        m = re.match(r'(/dev/nvme\d+)', dev)
+        ctrl = m.group(1) if m else dev
+        if ctrl != dev and not os.path.exists(ctrl):
+            return dev   # 컨트롤러 char device 없음 → namespace 경로 폴백
+        return ctrl
+
     def _detect_lba_size(self) -> int:
         """blockdev --getss로 LBA 크기 자동 감지. 실패 시 512 반환."""
         ns_dev = self._io_device()
@@ -6124,7 +6141,7 @@ class NVMeFuzzer:
         반복 호출 안전: _orig_apst_cdw11 은 None 일 때만 저장 (이미 캡처된
         '원본' 값을 forced_idle slot 에서 enable→disable 한 후 덮어쓰면 안 됨).
         """
-        dev = self.config.nvme_device
+        dev = self._ctrl_device()   # APST 는 컨트롤러 스코프 → 컨트롤러 char device
         # 원본 cdw11 캡처는 첫 호출 1회만 — 이후엔 (이미 disable 또는 enable→disable
         # 가 한 _orig 가 의미 있는) 상태를 건드리지 않음.
         if self._orig_apst_cdw11 is None:
@@ -6195,7 +6212,7 @@ class NVMeFuzzer:
         호출 후 슬롯 종료 시 _apst_disable() 로 다시 끄기 — 다른 PM rotation 슬롯
         (POWER_COMBO 등) 의 manual PM 제어가 APST 와 충돌하지 않게.
         """
-        dev = self.config.nvme_device
+        dev = self._ctrl_device()   # APST 는 컨트롤러 스코프 → 컨트롤러 char device
         table = bytearray(256)
         # Entry[0] — PS0 → PS3
         _entry0 = (ps3_ms << 8) | (3 << 3)
@@ -6237,7 +6254,7 @@ class NVMeFuzzer:
         """퍼징 종료 시 원본 APST 상태 복원."""
         if self._orig_apst_cdw11 is None or self._orig_apst_cdw11 == 0:
             return  # 원래 비활성화 상태였으면 복원 불필요
-        dev = self.config.nvme_device
+        dev = self._ctrl_device()   # APST 는 컨트롤러 스코프 → 컨트롤러 char device
         try:
             r = subprocess.run(
                 ['nvme', 'set-feature', dev, '-f', '0x0C',
@@ -6257,7 +6274,7 @@ class NVMeFuzzer:
         PS3/PS4 deep sleep에서 컨트롤러를 wake-up시켜 PCIe 트래픽 발생.
         L1/L1.2 idle window를 깨뜨리므로 퍼징 전 비활성화.
         """
-        dev = self.config.nvme_device
+        dev = self._ctrl_device()   # KeepAlive 는 컨트롤러 스코프 → 컨트롤러 char device
         try:
             r = subprocess.run(
                 ['nvme', 'get-feature', dev, '-f', '0x0F'],
@@ -6293,7 +6310,7 @@ class NVMeFuzzer:
         """퍼징 종료 시 원본 Keep-Alive 상태 복원."""
         if self._orig_keepalive_val == 0:
             return
-        dev = self.config.nvme_device
+        dev = self._ctrl_device()   # KeepAlive 는 컨트롤러 스코프 → 컨트롤러 char device
         try:
             r = subprocess.run(
                 ['nvme', 'set-feature', dev, '-f', '0x0F',
