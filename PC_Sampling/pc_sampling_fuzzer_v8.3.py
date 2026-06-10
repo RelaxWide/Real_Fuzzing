@@ -3182,7 +3182,8 @@ class NVMeFuzzer:
 
         목적: FTL GC·Wear Leveling 코드 경로(0x20000+ 영역)를 활성화하여
               퍼징 중 해당 PC 샘플링 확률을 높임.
-        수단: dd if=/dev/urandom of=<ns_dev> bs=<prefill_bs> — 블록 디바이스 전체 덮어쓰기.
+        수단: dd if=/dev/urandom of=<ns_dev> bs=<prefill_bs> oflag=direct — page cache 우회로
+              실제 device 에 기록(버퍼링된 가짜 성공 방지). 블록 디바이스 전체 덮어쓰기.
         주의: 드라이브 용량에 따라 수 분~수십 분 소요. 완료 후 POR로 FTL 상태 리셋됨.
         """
         ns_dev = self._io_device()
@@ -3205,8 +3206,12 @@ class NVMeFuzzer:
         log.warning(f"[Prefill] 전체 쓰기 시작: {ns_dev} ({size_str}), bs={bs//1024//1024}MB")
         log.warning("[Prefill] GC/Wear Leveling 트리거 목적 — 완료 후 POR로 FTL 상태 리셋됩니다")
 
-        cmd = ['dd', f'if=/dev/urandom', f'of={ns_dev}',
-               f'bs={bs}', 'status=progress', 'conv=fsync']
+        # oflag=direct: page cache 우회 → 실제 device 에 즉시 내려감(버퍼링된 가짜 성공 방지).
+        #   device 가 write 못 받으면 EIO 로 즉시 실패가 드러난다. iflag=fullblock: urandom
+        #   short-read 시에도 bs 정렬 유지(O_DIRECT EINVAL 방지). conv=fsync: 끝에 device 캐시 flush.
+        cmd = ['dd', 'if=/dev/urandom', f'of={ns_dev}',
+               f'bs={bs}', 'status=progress',
+               'iflag=fullblock', 'oflag=direct', 'conv=fsync']
         log.warning(f"[Prefill] CMD: {' '.join(cmd)}")
 
         try:
@@ -3282,13 +3287,26 @@ class NVMeFuzzer:
         elif _st['tail']:
             log.warning(f"[Prefill] dd 출력: {_st['tail'][-1]}")
 
-        # dd는 디바이스 끝에서 ENOSPC(rc=1)로 종료하는 게 정상
-        if rc in (0, 1):
-            log.warning(f"[Prefill] 전체 쓰기 완료 (rc={rc}) — POR로 FTL 리셋 진행")
+        # rc 판정: 정상 완료는 (a) rc=0, 또는 (b) 디바이스 끝 ENOSPC(rc=1, "No space left").
+        # O_DIRECT 라 device 가 write 를 거부하면 EIO(역시 rc=1)로 드러난다 — ENOSPC(끝 도달)와
+        # EIO(실패)는 둘 다 rc=1 이므로 stderr 문구/기록량으로 구분해야 가짜 성공을 막는다.
+        _tail_txt  = ' '.join(_st['tail'][-6:]).lower()
+        _enospc    = ('no space left' in _tail_txt) or ('enospc' in _tail_txt)
+        _wrote     = _st['bytes']
+        _near_full = drive_bytes > 0 and _wrote >= int(drive_bytes * 0.99)
+        _wrote_gb  = _wrote / (1024**3)
+        if rc == 0:
+            log.warning(f"[Prefill] 전체 쓰기 완료 (rc=0, {_wrote_gb:.1f} GB) — POR로 FTL 리셋 진행")
             return True
-        else:
-            log.error(f"[Prefill] dd 실패 (rc={rc})")
-            return False
+        if rc == 1 and (_enospc or _near_full):
+            log.warning(f"[Prefill] 디바이스 끝 도달 (ENOSPC, {_wrote_gb:.1f} GB) — 정상 완료, POR 진행")
+            return True
+        # 그 외 — 실제 write 실패. O_DIRECT 라 device 가 write 를 못 받으면 여기서 노출됨.
+        log.error(f"[Prefill] dd 실패 (rc={rc}) — device write 거부/오류 의심. "
+                  f"기록 {_wrote_gb:.1f} GB"
+                  + (f"/{drive_bytes/(1024**3):.1f} GB" if drive_bytes > 0 else "")
+                  + f". dd 출력: {_st['tail'][-1] if _st['tail'] else 'N/A'}")
+        return False
 
     def _power_cycle_ssd(self) -> bool:
         """PMU 보드를 이용한 SSD POR Phase 1: 전원 사이클 + SWD 준비 대기.
