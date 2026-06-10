@@ -314,6 +314,35 @@
       ]
     ]
   },
+  "io_workload": {
+    "_comment": "v8.4 IO 워크로드 엔진. fuzz_gap 명령마다 rc=0 보장 Write/Read block_size 블록 주입(SSD 내부 동작 자극). rc=0 경계(nsze/mdts/lba)는 Identify 런타임 자동. enabled=false 또는 --no-io-workload 로 비활성.",
+    "enabled": true,
+    "block_size": 100,
+    "fuzz_gap": 100,
+    "selection": "round_robin",
+    "patterns": [
+      "seq_write",
+      "rand_write",
+      "overwrite_churn",
+      "hot_cold",
+      "read_disturb",
+      "mixed_rw",
+      "pingpong_write",
+      "pingpong_read",
+      "subpage_rmw",
+      "single_lba_hammer",
+      "strided_write",
+      "reverse_seq",
+      "boundary",
+      "bursty_mixed_size"
+    ],
+    "mdts_fallback_bytes": 262144,
+    "working_set_frac": 0.02,
+    "hot_window_bytes": 8388608,
+    "gc_unit_bytes": 1048576,
+    "strided_period_lbas": 32,
+    "rand_buf_mb": 8
+  },
   "state_fields": {
     "_comment": "제품별 state 관측 필드 세트. 제품의 state_fields 키가 세트명을 가리킴. r8=PM9M1/BM9H1, p9=P9(LID 0xDF df_* 제외).",
     "r8": [
