@@ -306,14 +306,18 @@ EXCLUDED_OPCODES: List[int] = list(_FZ['excluded_opcodes'])
 # 0x04/Compare 0x05/Verify 0x0C)은 정상이므로 영향 없음.
 BLOCKED_ADMIN_OPCODES = frozenset(_ST['blocked_admin_opcodes'])
 
-# SecuritySend(0x81) 로 보내면 device 가 영구적으로 잠기는 Security Protocol(SECP) 집합.
-#   0xEF ATA Security: SECP=0xEF 의 SET PASSWORD/LOCK/ERASE/FREEZE 가 password 를 설정해
-#        host I/O 가 잠김(잠긴 상태로 굳어 가성 불량 + 후속 명령 전부 실패). SECP 단위 차단이
-#        가장 안전(password-set SPSP 만 막아도 다른 잠금성 op 가 남음).
+# SecuritySend(0x81) 로 보내면 device 가 영구적으로 잠기거나 브릭되는 Security Protocol(SECP) 집합.
+#   0x01~0x06 TCG (Opal/Pyrite/Enterprise/Ruby): Locking SP Activate, C_PIN(SID/Admin/User)
+#        credential 설정, Read/WriteLockEnabled → 잠금(PSID revert 외 복구 불가).
+#   0xEC ATA Device Server Password / 0xEF ATA Security: SET PASSWORD/LOCK/ERASE/FREEZE →
+#        password 설정 시 host I/O 잠김(잠긴 채 굳어 가성 불량 + 후속 명령 전부 실패).
+# SECP 단위 차단이 가장 안전(특정 SPSP 만 막아도 다른 잠금성 op 가 남음).
 # SECP = CDW10[31:24]. SecuritySend 일 때만 차단(SecurityReceive 0x82 는 read-only 라 안전).
+# 벤더(0xF0~0xFF)는 잠금 위험 있으나 fuzz 가치 높아 기본 미차단 — 필요 시 config 에 추가.
 _SECURITY_SEND_OPCODE = 0x81
 BLOCKED_SECURITY_SEND_SECP = frozenset(
-    _ST.get('blocked_security_send_secp', [0xEF])
+    _ST.get('blocked_security_send_secp',
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xEC, 0xEF])
 )
 
 OPCODE_MUT_PROB        = _MU['opcode']
@@ -606,10 +610,10 @@ CMD_SCHEMAS: dict = {
         _F("NSSF",  10,  7,  0, _OP),
         _F("SPSP0", 10, 15,  8, _OP),
         _F("SPSP1", 10, 23, 16, _OP),
-        # 0xEF(ATA Security)는 valid 에서 제외 — SET PASSWORD 가 device 를 잠금.
+        # TCG(0x01~0x06)/ATA(0xEC/0xEF) 은 valid 에서 제외 — device 잠금/브릭.
         # send-time GUARD(BLOCKED_SECURITY_SEND_SECP)가 랜덤/opcode 변이 경로도 net 으로 차단.
         _F("SECP",  10, 31, 24, _E,
-           valid=[0x00, 0x01, 0x02, 0xEA],
+           valid=[0x00, 0xEA],
            vendor=(0xF0, 0xFF)),
         _F("TL",    11, 31,  0, _S),
     ]),
