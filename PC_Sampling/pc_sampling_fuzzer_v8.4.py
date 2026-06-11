@@ -848,8 +848,8 @@ NVME_COMMANDS_DEFAULT = [
 
 # 전체 명령어 (위험/파괴적 포함) — --commands 또는 --all-commands로 활성화
 NVME_COMMANDS_EXTENDED = [
-    NVMeCommand("FWDownload",            0x11, NVMeCommandType.ADMIN),
-    NVMeCommand("FWCommit",              0x10, NVMeCommandType.ADMIN, timeout_group="fw_commit"),
+    NVMeCommand("FWDownload",            0x11, NVMeCommandType.ADMIN, needs_namespace=False),
+    NVMeCommand("FWCommit",              0x10, NVMeCommandType.ADMIN, needs_namespace=False, timeout_group="fw_commit"),
     NVMeCommand("FormatNVM",             0x80, NVMeCommandType.ADMIN, timeout_group="format"),
     NVMeCommand("Sanitize",              0x84, NVMeCommandType.ADMIN, needs_namespace=False, timeout_group="sanitize"),
     NVMeCommand("TelemetryHostInitiated",0x02, NVMeCommandType.ADMIN, needs_data=False, timeout_group="telemetry"),
