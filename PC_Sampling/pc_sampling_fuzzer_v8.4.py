@@ -893,10 +893,15 @@ NVME_COMMANDS = NVME_COMMANDS_DEFAULT + NVME_COMMANDS_EXTENDED
 
 # (opcode, cmd_type) → name. 동일 opcode라도 Admin/IO 구분.
 _OPCODE_TO_NAME: dict[tuple[int, str], str] = {}
+# (opcode, cmd_type) → NVMeCommand. mutation(opcode_override/force_admin)으로 실제 전송
+# opcode/타입이 바뀌면 원본 cmd 의 timeout_group 이 무효 → 실제 opcode 의 cmd 로 timeout 재해석.
+_OPCODE_TO_CMD: dict[tuple[int, str], 'NVMeCommand'] = {}
 for _c in NVME_COMMANDS:
     _key = (_c.opcode, _c.cmd_type.value)
     if _key not in _OPCODE_TO_NAME:
         _OPCODE_TO_NAME[_key] = _c.name
+    if _key not in _OPCODE_TO_CMD:
+        _OPCODE_TO_CMD[_key] = _c
 
 @dataclass
 class Seed:
@@ -7270,9 +7275,18 @@ class NVMeFuzzer:
 
         # --- 타임아웃 ---
         # subprocess 감지 timeout: 퍼저가 "이 명령은 crash"라고 판단하는 창
+        # mutation(opcode_override/force_admin)으로 실제 전송 opcode/타입이 원본 cmd 와
+        # 달라지면 원본 timeout_group 은 더 이상 유효하지 않다 → 실제 (opcode, 타입) 에
+        # 해당하는 명령의 timeout_group 으로 재해석한다. 매핑 없는 미지 opcode 는
+        # 'command' 기본값(빠른 거부 가정). 변형 없으면 eff_cmd is cmd → 동작 보존.
+        actual_type_val = "admin" if passthru_type == "admin-passthru" else "io"
+        if (actual_opcode, actual_type_val) == (cmd.opcode, cmd.cmd_type.value):
+            eff_cmd = cmd
+        else:
+            eff_cmd = _OPCODE_TO_CMD.get((actual_opcode, actual_type_val))
+        effective_tg = eff_cmd.timeout_group if eff_cmd is not None else "command"
         # DeviceSelfTest: CDW10[3:0] STC 값으로 Short(0x1)/Extended(0x2) 구분
-        effective_tg = cmd.timeout_group
-        if cmd.name == "DeviceSelfTest":
+        if eff_cmd is not None and eff_cmd.name == "DeviceSelfTest":
             stc = seed.cdw10 & 0xF  # CDW10[3:0]
             if stc == 0x2:
                 effective_tg = "selftest_ext"
@@ -7353,7 +7367,7 @@ class NVMeFuzzer:
         mut_str = f" MUT[{','.join(mut_flags)}]" if mut_flags else ""
 
         log.info(f"[NVMe] {passthru_type} {cmd.name} opcode=0x{actual_opcode:02x} "
-                 f"nsid={actual_nsid} timeout={timeout_ms}ms({cmd.timeout_group}) "
+                 f"nsid={actual_nsid} timeout={timeout_ms}ms({effective_tg}) "
                  f"cdw10=0x{seed.cdw10:08x} cdw11=0x{seed.cdw11:08x} "
                  f"cdw12=0x{seed.cdw12:08x} data_len={data_len}"
                  f" data={data[:16].hex() if data else 'N/A'}"
