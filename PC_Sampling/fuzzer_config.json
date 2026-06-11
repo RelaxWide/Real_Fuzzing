@@ -159,6 +159,10 @@
       "0x0C",
       "0x7C"
     ],
+    "_comment_blocked_security_send_secp": "SecuritySend(0x81) 차단 Security Protocol(SECP=CDW10[31:24]). 0xEF=ATA Security — SET PASSWORD 등이 device I/O 를 잠금. TCG(0x01/0x02) Opal 도 잠글 수 있으면 추가 가능.",
+    "blocked_security_send_secp": [
+      "0xEF"
+    ],
     "builtin_sequences": [
       [
         "Write",

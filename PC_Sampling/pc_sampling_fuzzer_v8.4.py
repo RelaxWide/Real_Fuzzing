@@ -306,6 +306,16 @@ EXCLUDED_OPCODES: List[int] = list(_FZ['excluded_opcodes'])
 # 0x04/Compare 0x05/Verify 0x0C)은 정상이므로 영향 없음.
 BLOCKED_ADMIN_OPCODES = frozenset(_ST['blocked_admin_opcodes'])
 
+# SecuritySend(0x81) 로 보내면 device 가 영구적으로 잠기는 Security Protocol(SECP) 집합.
+#   0xEF ATA Security: SECP=0xEF 의 SET PASSWORD/LOCK/ERASE/FREEZE 가 password 를 설정해
+#        host I/O 가 잠김(잠긴 상태로 굳어 가성 불량 + 후속 명령 전부 실패). SECP 단위 차단이
+#        가장 안전(password-set SPSP 만 막아도 다른 잠금성 op 가 남음).
+# SECP = CDW10[31:24]. SecuritySend 일 때만 차단(SecurityReceive 0x82 는 read-only 라 안전).
+_SECURITY_SEND_OPCODE = 0x81
+BLOCKED_SECURITY_SEND_SECP = frozenset(
+    _ST.get('blocked_security_send_secp', [0xEF])
+)
+
 OPCODE_MUT_PROB        = _MU['opcode']
 NSID_MUT_PROB          = _MU['nsid']
 ADMIN_SWAP_PROB        = _MU['admin_swap']
@@ -596,8 +606,10 @@ CMD_SCHEMAS: dict = {
         _F("NSSF",  10,  7,  0, _OP),
         _F("SPSP0", 10, 15,  8, _OP),
         _F("SPSP1", 10, 23, 16, _OP),
+        # 0xEF(ATA Security)는 valid 에서 제외 — SET PASSWORD 가 device 를 잠금.
+        # send-time GUARD(BLOCKED_SECURITY_SEND_SECP)가 랜덤/opcode 변이 경로도 net 으로 차단.
         _F("SECP",  10, 31, 24, _E,
-           valid=[0x00, 0x01, 0x02, 0xEA, 0xEF],
+           valid=[0x00, 0x01, 0x02, 0xEA],
            vendor=(0xF0, 0xFF)),
         _F("TL",    11, 31,  0, _S),
     ]),
@@ -7215,6 +7227,19 @@ class NVMeFuzzer:
             log.warning(f"[GUARD] admin opcode 0x{actual_opcode:02x} 전송 차단 — "
                         f"가성 timeout 방지 (cmd={cmd.name})")
             self.stats['blocked_admin_opcode'] = self.stats.get('blocked_admin_opcode', 0) + 1
+            return self.RC_SKIP
+
+        # device 잠금 방지 가드: SecuritySend(0x81) 의 SECP(CDW10[31:24])가 잠금성
+        # 프로토콜(예: 0xEF ATA Security SET PASSWORD)이면 전송 차단. 보내면 password 가
+        # 설정돼 host I/O 가 잠기고 후속 명령 전부 실패(영구적 가성 불량). mutation 으로
+        # opcode 가 0x81 로 바뀐 경우도 actual_opcode 로 잡힌다 — 단일 chokepoint.
+        if (passthru_type == "admin-passthru"
+                and actual_opcode == _SECURITY_SEND_OPCODE
+                and ((seed.cdw10 >> 24) & 0xFF) in BLOCKED_SECURITY_SEND_SECP):
+            _secp = (seed.cdw10 >> 24) & 0xFF
+            log.warning(f"[GUARD] SecuritySend SECP=0x{_secp:02x} 전송 차단 — "
+                        f"device 잠금 방지 (cdw10=0x{seed.cdw10:08x})")
+            self.stats['blocked_security_send'] = self.stats.get('blocked_security_send', 0) + 1
             return self.RC_SKIP
 
         # Admin 명령어별 고정 응답 크기
