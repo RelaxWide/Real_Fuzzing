@@ -170,6 +170,9 @@
       "0xEC",
       "0xEF"
     ],
+    "_comment_namespace_guard": "NamespaceManagement Delete(0x0D admin, SEL=cdw10[3:0]=1)는 namespace 영구 파괴(데이터 소멸+NSID 변경 위험) → block_ns_delete=true 로 send-time 차단. 제품이 NS Mgmt 지원·재생성 OK면 false 로. NamespaceAttachment Detach(0x15 admin, SEL=1)는 NS 보존이라 auto_reattach_ns=true 면 실행 후 즉시 attach-ns+ns-rescan 으로 복구(fuzzing 대상 device 유지).",
+    "block_ns_delete": true,
+    "auto_reattach_ns": true,
     "builtin_sequences": [
       [
         "Write",

@@ -320,6 +320,17 @@ BLOCKED_SECURITY_SEND_SECP = frozenset(
             [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xEC, 0xEF])
 )
 
+# Namespace Management/Attachment (admin). SEL = CDW10[3:0].
+#   NamespaceManagement(0x0D): SEL 0=Create, 1=Delete. Delete 는 namespace 를 영구 파괴
+#       → /dev/nvmeXnY 소멸 + 데이터 소멸 + 재생성 시 NSID 변경 위험 → 기본 차단(복구 어려움).
+#   NamespaceAttachment(0x15): SEL 0=Attach, 1=Detach. Detach 는 namespace 보존(컨트롤러에서만
+#       분리) → 실행 허용 후 즉시 재부착(auto re-attach)으로 fuzzing 대상 device 복구.
+# admin 일 때만 적용(IO 0x0D=ReservationRegister/0x15=ReservationRelease 는 정상 — 번호만 겹침).
+_NS_MGMT_OPCODE   = 0x0D
+_NS_ATTACH_OPCODE = 0x15
+BLOCK_NS_DELETE   = bool(_ST.get('block_ns_delete', True))
+AUTO_REATTACH_NS  = bool(_ST.get('auto_reattach_ns', True))
+
 OPCODE_MUT_PROB        = _MU['opcode']
 NSID_MUT_PROB          = _MU['nsid']
 ADMIN_SWAP_PROB        = _MU['admin_swap']
@@ -2762,6 +2773,8 @@ class NVMeFuzzer:
         self._nsze_cache_at: int = 0
         self._mdts_cache: Optional[int] = None
         self._mdts_cache_at: int = 0
+        self._cntlid_cache: Optional[int] = None       # NS re-attach 용 컨트롤러 ID (시작 시 스냅샷)
+        self._ns_mgmt_supported: Optional[bool] = None  # OACS bit3 (Namespace Management 지원)
         # Phase 3: sequence 상태
         self._pending_sequence: Optional[List[str]] = None
         self._pending_seq_ctx: Optional[dict] = None   # 공유 SLBA/NLB/data (Write→Compare 등)
@@ -4600,6 +4613,59 @@ class NVMeFuzzer:
                 self._nsze_cache = 0x100000   # 1M blocks fallback
             self._nsze_cache_at = self.executions
         return self._nsze_cache
+
+    def _snapshot_ctrl_info(self) -> None:
+        """시작 시 1회: Identify Controller 에서 CNTLID(재부착용) + OACS bit3(NS Management
+        지원 여부)를 스냅샷·로깅. NS Delete/Detach 가드가 이 제품에서 의미 있는지 즉시 가시화."""
+        info, _, _ = self._nvme_id_dict(['nvme', 'id-ctrl', self._ctrl_device()])
+        try:
+            self._cntlid_cache = int(info.get('cntlid'))
+        except (ValueError, TypeError, AttributeError):
+            self._cntlid_cache = None
+        try:
+            oacs = int(info.get('oacs', 0))
+            self._ns_mgmt_supported = bool(oacs & (1 << 3))   # OACS[3] = NS Mgmt Supported
+        except (ValueError, TypeError):
+            self._ns_mgmt_supported = None
+        log.warning(f"[Pre-flight] CNTLID={self._cntlid_cache} "
+                    f"NS-Mgmt(OACS[3])={'지원' if self._ns_mgmt_supported else '미지원/미상'} "
+                    f"— Delete 차단={'on' if BLOCK_NS_DELETE else 'off'}, "
+                    f"Detach auto-attach={'on' if AUTO_REATTACH_NS else 'off'}")
+
+    def _get_cntlid(self) -> Optional[int]:
+        """재부착에 쓸 컨트롤러 ID(CNTLID). 스냅샷 안 됐으면 즉시 조회."""
+        if self._cntlid_cache is None:
+            info, _, _ = self._nvme_id_dict(['nvme', 'id-ctrl', self._ctrl_device()])
+            try:
+                self._cntlid_cache = int(info.get('cntlid'))
+            except (ValueError, TypeError, AttributeError):
+                self._cntlid_cache = None
+        return self._cntlid_cache
+
+    def _reattach_namespace(self, nsid: int) -> None:
+        """Detach(SEL=1) 성공 후 namespace 를 컨트롤러에 재부착 — fuzzing 대상 device 복구.
+        nvme attach-ns(-c CNTLID) + ns-rescan. NS 보존 명령이라 inverse 로 되돌릴 수 있다."""
+        cntlid = self._get_cntlid()
+        ctrl = self._ctrl_device()
+        if cntlid is None:
+            log.error(f"[NS-Reattach] CNTLID 미상 — nsid={nsid} 재부착 불가(수동 복구 필요: "
+                      f"nvme attach-ns {ctrl} -n {nsid} -c <cntlid>; nvme ns-rescan {ctrl})")
+            return
+        try:
+            r = subprocess.run(['nvme', 'attach-ns', ctrl,
+                                '-n', str(nsid), '-c', str(cntlid)],
+                               capture_output=True, timeout=10)
+            subprocess.run(['nvme', 'ns-rescan', ctrl], capture_output=True, timeout=10)
+            if r.returncode == 0:
+                log.warning(f"[NS-Reattach] nsid={nsid} → cntlid={cntlid} 재부착 성공 (Detach 복구)")
+                self.stats['ns_reattach_ok'] = self.stats.get('ns_reattach_ok', 0) + 1
+            else:
+                log.error(f"[NS-Reattach] nsid={nsid} 재부착 실패 rc={r.returncode}: "
+                          f"{r.stderr.decode(errors='replace')[:200]}")
+                self.stats['ns_reattach_fail'] = self.stats.get('ns_reattach_fail', 0) + 1
+        except Exception as e:
+            log.error(f"[NS-Reattach] nsid={nsid} 재부착 예외: {e}")
+            self.stats['ns_reattach_fail'] = self.stats.get('ns_reattach_fail', 0) + 1
 
     @staticmethod
     def _parse_nvme_text(text: str) -> dict:
@@ -7246,6 +7312,16 @@ class NVMeFuzzer:
             self.stats['blocked_security_send'] = self.stats.get('blocked_security_send', 0) + 1
             return self.RC_SKIP
 
+        # namespace 파괴 방지 가드: NamespaceManagement Delete(SEL=cdw10[3:0]=1)는 namespace 를
+        # 영구 파괴 → block device 소멸 + 데이터 소멸 + 재생성 시 NSID 변경 → fuzzing 정지.
+        # Detach(0x15)와 달리 복구 어려움 → 차단(config block_ns_delete). admin 일 때만.
+        if (passthru_type == "admin-passthru" and BLOCK_NS_DELETE
+                and actual_opcode == _NS_MGMT_OPCODE and (seed.cdw10 & 0xF) == 1):
+            log.warning(f"[GUARD] NamespaceManagement Delete(SEL=1) 전송 차단 — "
+                        f"namespace 파괴 방지 (nsid={actual_nsid} cdw10=0x{seed.cdw10:08x})")
+            self.stats['blocked_ns_delete'] = self.stats.get('blocked_ns_delete', 0) + 1
+            return self.RC_SKIP
+
         # Admin 명령어별 고정 응답 크기
         ADMIN_FIXED_RESPONSE = {
             "Identify": 4096,
@@ -7447,6 +7523,13 @@ class NVMeFuzzer:
                 time.sleep(self.config.post_cmd_delay_ms / 1000.0)
 
             log.info(f"[NVMe RET] rc={rc}")
+
+            # NamespaceAttachment Detach(SEL=1) 가 실제 성공(rc=0)했으면 즉시 재부착으로
+            # fuzzing 대상 device 복구. Detach 는 NS 보존이라 inverse(Attach)로 되돌릴 수 있다.
+            if (AUTO_REATTACH_NS and rc == 0 and passthru_type == "admin-passthru"
+                    and actual_opcode == _NS_ATTACH_OPCODE and (seed.cdw10 & 0xF) == 1):
+                self._reattach_namespace(actual_nsid)
+
             return rc
 
         except KeyboardInterrupt:
@@ -10342,6 +10425,9 @@ class NVMeFuzzer:
                         f"(변경: --lba-size 로 수동 지정)")
         else:
             log.warning(f"[Pre-flight] LBA size 수동 지정: {self.config.nvme_lba_size}B")
+
+        # 컨트롤러 정보 스냅샷 (CNTLID=NS 재부착용, OACS=NS Mgmt 지원 여부)
+        self._snapshot_ctrl_info()
 
         # 이전 커버리지 로드 (resume)
         if self.config.resume_coverage:
