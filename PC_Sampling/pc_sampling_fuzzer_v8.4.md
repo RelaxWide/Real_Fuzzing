@@ -36,6 +36,62 @@ PM9M1/BM9H1/P9 기존 fuzz·PCSR·state·PM 경로 불변(워크로드는 독립
 
 ---
 
+## v8.4 안전성·정확성 수정 (세션 후속)
+
+### 1. mutation 으로 바뀐 실제 opcode/타입 기준 timeout 재해석
+`opcode_override`/`force_admin` 으로 device 에 전달되는 실제 명령이 원본 `cmd` 와 달라져도
+timeout 이 원본 `cmd.timeout_group` 으로 평가되던 버그. 예: Write(8s)가 Format(0x80)으로 변형되면
+펌웨어는 수십초 Format 실행 중인데 8s 만에 가성 crash 오판(반대로 Format→빠른 명령은 과대기).
+- `_OPCODE_TO_CMD` 역참조 맵((opcode, admin/io)→NVMeCommand) 추가.
+- `effective_tg` 를 실제 `(actual_opcode, actual_type_val)` 기준으로 해석. 변형 없으면 `eff_cmd is cmd`
+  → 동작 보존. 매핑 없는 미지 opcode 는 `command` 기본값. DeviceSelfTest STC 분기도 `eff_cmd.name` 기준.
+- `[NVMe]` 로그가 실제 적용 `effective_tg` 표시(원래 `cmd.timeout_group` 와 불일치하던 것 수정).
+
+### 2. FWDownload/FWCommit 컨트롤러 스코프 전송 (NSID=0)
+FWDownload(0x11)/FWCommit(0x10)이 `needs_namespace` 기본값(True)이라 `--namespace-id=<ns>`(예:1)가
+실려, 컨트롤러 스코프 펌웨어 명령이 **Invalid Field in Command(rc=2)** 로 거부 → seq-acc
+FWDownload→FWCommit 이 첫 FWDownload 부터 실패(FW.bin 제공 여부 무관). → 두 명령에 `needs_namespace=False`
+추가 → `actual_nsid=0`. (APST/KeepAlive NSID 수정과 동일 부류.)
+
+### 3. SecuritySend 잠금성 Security Protocol(SECP) 전송 차단 — device 잠금 방지
+`nvme ... --opcode=0x81 --cdw10=0xef000100`(SECP=CDW10[31:24]=0xEF ATA Security SET PASSWORD)이
+device I/O 를 영구적으로 잠그는 현상. SECP 단위 차단(특정 SPSP 만 막으면 LOCK/ERASE/FREEZE 가 남음).
+- `BLOCKED_SECURITY_SEND_SECP`(config `strategy.blocked_security_send_secp`) — `_send_nvme_command`
+  chokepoint 에서 SecuritySend(0x81) + SECP∈차단셋이면 `RC_SKIP`. opcode 변이로 0x81 이 돼도 net.
+- **차단**: TCG `0x01~0x06`(Opal/Pyrite/Enterprise/Ruby — Locking SP Activate·C_PIN set→잠금, PSID
+  revert 외 복구 불가) + ATA `0xEC`(Device Server Password)/`0xEF`(ATA Security).
+- **허용(무해)**: `0x00`(info)·`0xEA`(NVMe)·`0xED`(SA capabilities)·`0xEE`(IKEv2). 벤더 `0xF0~0xFF`는
+  잠금 위험 있으나 fuzz 가치 높아 기본 미차단(필요 시 config 추가).
+- SecuritySend 스키마 SECP valid 를 안전값(`[0x00,0xEA]`)만 남김(의도적 생성 방지). **SecurityReceive
+  (0x82)는 read-only 라 무해** → 미적용(상태 관측에 정상 사용). 잠금은 비밀을 알아야 풀려 복구 불가라
+  "실행 후 복구"가 원리적으로 안 됨 → **차단이 유일 방법**.
+
+### 4. Namespace Detach 자동 재부착 + Delete 차단 — fuzzing 정지 방지
+스키마 valid 는 mutation 가이드일 뿐 send net 이 없어, 일반 cdw 비트플립/opcode 변이가 SEL=1 에
+도달 가능. SEL=CDW10[3:0]. **admin 일 때만** 적용(IO 0x0D ReservationRegister/0x15 ReservationRelease 무영향).
+- **Detach**(NamespaceAttachment 0x15, SEL=1): NS 보존(컨트롤러에서만 분리) → 실행 허용 후 rc=0 이면
+  즉시 `_reattach_namespace()` → `nvme attach-ns -n <nsid> -c <CNTLID>` + `ns-rescan` 로 device 복구.
+  CNTLID 는 시작 시 Identify Controller 스냅샷. config `auto_reattach_ns`(기본 on).
+- **Delete**(NamespaceManagement 0x0D, SEL=1): namespace 영구 파괴(데이터 소멸 + 재생성 시 NSID 변경 →
+  device 경로 깨짐)라 복구 어려움 → send-time 차단(`block_ns_delete`, 기본 on). 표준상 Create/Delete 는
+  OACS bit3 로 함께 게이팅(둘 중 하나만 막는 제품 없음) — 제품이 지원·재생성 OK면 toggle off.
+- 시작 시 **OACS[3](NS Mgmt 지원 여부) 로깅** — 미지원 제품은 두 명령을 펌웨어가 애초에 거부(무해),
+  지원 제품에서만 가드가 의미. stats: `blocked_ns_delete`/`ns_reattach_ok`/`ns_reattach_fail`.
+
+### 거부/제외 메커니즘 4층 (참고)
+| 층 | 단계 | 입자도 | 내용 |
+|----|------|--------|------|
+| L1 명령 집합 | 시작 | 명령명 | 기본 비파괴 6종 / `--commands` / `--all-commands` |
+| L2 생성 제외 | 시드·변이 생성 | opcode | `excluded_opcodes`(`--exclude-opcodes`) + 시드 `_DESTRUCTIVE`(Format/Sanitize) |
+| L3 전송 가드 | `_send_nvme_command` chokepoint | opcode / 서브필드 | `BLOCKED_ADMIN_OPCODES`(큐 0x00/01/04/05·AER 0x0C·Doorbell 0x7C) · `BLOCKED_SECURITY_SEND_SECP` · NS Delete · (NS Detach 는 실행+복구) |
+| L4 런타임 거부 | 실행 중 | 명령 결과 | `unsupported_skip`(v7.8 EngineErrInt, J-Link dump 필요 → PM9M1/BM9H1 만) |
+
+명령 차단/제외는 **세 제품 공통**(config `products` 에 명령 override 없음). 제품 차이는 *명령 거부* 가
+아니라 state 관측 범위(P9 LID 0xDF 제외)·런타임 EngineErrInt skip(P9 미동작)·timeout 값.
+Sanitize 는 미차단(긴 timeout 흡수).
+
+---
+
 **v8.3 핵심: 모든 사용자 설정값·경로를 `fuzzer_config.json` 으로 외부화.**
 코드 상단에 흩어져 있던 상수/타임아웃/주소/확률/경로 + `PRODUCT_PROFILES` 를 JSON 한 파일로 모았다.
 모듈 로드 시 JSON 을 읽어 **같은 이름의 전역**에 주입 → `FuzzConfig` 기본값/argparse default 가
