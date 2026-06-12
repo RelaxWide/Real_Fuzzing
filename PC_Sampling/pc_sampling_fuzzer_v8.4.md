@@ -66,6 +66,14 @@ device I/O 를 영구적으로 잠그는 현상. SECP 단위 차단(특정 SPSP 
   (0x82)는 read-only 라 무해** → 미적용(상태 관측에 정상 사용). 잠금은 비밀을 알아야 풀려 복구 불가라
   "실행 후 복구"가 원리적으로 안 됨 → **차단이 유일 방법**.
 
+### 3.5. FWDownload 멀티청크 timeout 시 FAIL CMD 시드 불일치 수정
+FWDownload 는 `self._fw_chunks` 원본 청크들을 순서대로 전송하는데, 회계/리포트는 대표 시드
+(`mutated_seed`)로 `_account_command` 를 호출 → 청크 N 이 timeout 나면 `[NVMe TIMEOUT]`(실제 청크 N)
+과 `!! FAIL CMD !!`(mutated_seed: cdw10=NUMD/cdw11=OFST/data 전부 다름)가 **불일치**. crash 저장·
+replay 태그도 어긋남. → 실제 실패한 청크(`_acct_seed`/`_acct_data`)로 회계하도록 수정 → 로그·FAIL
+CMD·crash·replay 가 timeout 유발 청크와 일치. (다른 경로(일반/replay/workload/calibration)는 전송
+seed == 회계 seed 라 원래 정상.)
+
 ### 4. Namespace Detach 자동 재부착 + Delete 차단 — fuzzing 정지 방지
 스키마 valid 는 mutation 가이드일 뿐 send net 이 없어, 일반 cdw 비트플립/opcode 변이가 SEL=1 에
 도달 가능. SEL=CDW10[3:0]. **admin 일 때만** 적용(IO 0x0D ReservationRegister/0x15 ReservationRelease 무영향).

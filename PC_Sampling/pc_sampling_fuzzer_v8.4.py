@@ -11001,14 +11001,19 @@ class NVMeFuzzer:
                 # timeout은 _send_nvme_command 내부에서 PS_ENTRY_EXIT_MARGIN_MS(105ms) 고정 가산
                 # FWDownload + 실제 청크 목록이 있으면 전체 청크를 순서대로 전송,
                 # exec 카운터는 1만 증가 (CLI 기준 1회 실행)
+                # 회계/리포트(FAIL CMD·crash·replay)에 쓸 "실제 전송된" seed/data.
+                # FWDownload 멀티청크는 원본 청크들을 보내므로 mutated_seed 가 아닌
+                # 실제 실패한 청크로 회계해야 [NVMe TIMEOUT] 로그와 FAIL CMD 가 일치한다.
+                _acct_seed, _acct_data = mutated_seed, fuzz_data
                 if cmd.name == "FWDownload" and self._fw_chunks:
                     # _send_nvme_command 내부에서 start_sampling() 호출됨
                     # alive 체크로 중복 시작 방지 → 첫 청크가 자동으로 샘플링 시작
                     rc = self.RC_ERROR
                     for _chunk_seed in self._fw_chunks:
                         rc = self._send_nvme_command(_chunk_seed.data, _chunk_seed)
-                        # 청크 중간에 타임아웃/에러 발생 시 즉시 중단
+                        # 청크 중간에 타임아웃/에러 발생 시 즉시 중단 — 그 청크로 회계
                         if rc in (self.RC_TIMEOUT, self.RC_ERROR):
+                            _acct_seed, _acct_data = _chunk_seed, _chunk_seed.data
                             break
                     last_samples = self.sampler.stop_sampling()
                 else:
@@ -11030,7 +11035,7 @@ class NVMeFuzzer:
                         log.warning("[OpenOCD] 타겟 재초기화 성공 — 퍼징 재개")
 
                 is_interesting, new_pcs, _action = self._account_command(
-                    mutated_seed, fuzz_data, rc, last_samples,
+                    _acct_seed, _acct_data, rc, last_samples,
                     source='c1' if is_det_stage else self._csfuzz_last_from,
                     is_det_stage=is_det_stage,
                     seq_member=_used_seq,
