@@ -85,8 +85,11 @@ seed == 회계 seed 라 원래 정상.)
 남고 SCT(Status Code Type, bits[10:8])·DNR/More 는 사라진다 → 같은 SC·다른 SCT 가 한 rc 로 충돌
 (예: SC=0x80 이 CONFLICTING_ATTRS(SCT=1)·WRITE_FAULT(SCT=2) 둘 다 rc=128). nvme-cli 는 stderr 에
 `NVMe status: <NAME>(0xVAL)` 로 full status 를 출력하므로 이를 파싱해 함께 로깅한다.
-- `_parse_nvme_status()`(stderr regex) + `_fmt_nvme_status()` → `[NVMe RET] rc=N status=0xVVVV
-  SCT=n(이름) SC=0xSS [NAME]`. rc>0 일 때만 파싱(성공 rc=0 은 status 없음). rc 기반 판정 로직 불변.
+- `_parse_nvme_status()`(stderr/stdout regex) + `_fmt_nvme_status()` → `[NVMe RET] rc=N
+  status=0xVVVV SCT=n(이름) SC=0xSS [NAME]`. rc>0 일 때만(성공 rc=0 은 status 없음). 판정 로직 불변.
+- **NVMe status 없는 rc>0**(errno/내부 실패, 예: rc=1 `Invalid argument` — NVMe 제출 전 거부)은
+  `msg="<stderr 첫 줄>"` 로 원문 표시 → rc=1 이 SC=0x01(Invalid Opcode, NVMe 완료에러)인지 errno
+  실패인지 로그로 구분됨. (rc=1 에 status 가 안 붙던 건 버그 아님 — 완료 status 자체가 없는 케이스.)
 - timeout 은 완료(CQE) 자체가 없어 status 없음 → 변경 없음.
 
 ### 4. Namespace Detach 자동 재부착 + Delete 차단 — fuzzing 정지 방지

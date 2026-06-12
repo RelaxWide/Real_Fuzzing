@@ -7548,9 +7548,20 @@ class NVMeFuzzer:
             if self.config.post_cmd_delay_ms > 0:
                 time.sleep(self.config.post_cmd_delay_ms / 1000.0)
 
-            # rc(exit code)는 SC 하위 8비트만 → stderr 에서 full status(SCT 포함) 추가 출력.
-            _status_info = self._fmt_nvme_status(
-                stderr.decode(errors='replace') if rc > 0 and stderr else "")
+            # rc(exit code)는 SC 하위 8비트만 → 추가 정보 출력.
+            #  · NVMe 완료 에러: stderr/stdout 의 'NVMe status: NAME(0xVAL)' → full status(SCT 포함).
+            #  · errno/내부 실패(예: rc=1 Invalid argument, NVMe 제출 전 거부): status 없음 →
+            #    stderr 원문 일부를 대신 표시(rc=1 이 SC=0x01 인지 errno 인지 구분됨).
+            _status_info = ""
+            if rc > 0:
+                _err_txt = stderr.decode(errors='replace') if stderr else ""
+                _out_txt = stdout.decode(errors='replace') if stdout else ""
+                _status_info = (self._fmt_nvme_status(_err_txt)
+                                or self._fmt_nvme_status(_out_txt))
+                if not _status_info:
+                    _raw = [l for l in (_err_txt or _out_txt).splitlines() if l.strip()]
+                    _status_info = (f" msg=\"{_raw[0].strip()[:120]}\"" if _raw
+                                    else " (NVMe status 없음 — errno/내부 실패)")
             log.info(f"[NVMe RET] rc={rc}{_status_info}")
 
             # Detach(SEL=1) 성공 시 즉시 재부착 — NS 보존이라 inverse(Attach)로 device 복구.
