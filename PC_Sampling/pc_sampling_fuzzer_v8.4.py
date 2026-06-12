@@ -7312,9 +7312,7 @@ class NVMeFuzzer:
             self.stats['blocked_security_send'] = self.stats.get('blocked_security_send', 0) + 1
             return self.RC_SKIP
 
-        # namespace 파괴 방지 가드: NamespaceManagement Delete(SEL=cdw10[3:0]=1)는 namespace 를
-        # 영구 파괴 → block device 소멸 + 데이터 소멸 + 재생성 시 NSID 변경 → fuzzing 정지.
-        # Detach(0x15)와 달리 복구 어려움 → 차단(config block_ns_delete). admin 일 때만.
+        # NamespaceManagement Delete(SEL=1) 차단 — namespace 영구 파괴(복구 어려움, 상단 상수 참조).
         if (passthru_type == "admin-passthru" and BLOCK_NS_DELETE
                 and actual_opcode == _NS_MGMT_OPCODE and (seed.cdw10 & 0xF) == 1):
             log.warning(f"[GUARD] NamespaceManagement Delete(SEL=1) 전송 차단 — "
@@ -7378,12 +7376,9 @@ class NVMeFuzzer:
                     f.write(data[:data_len].ljust(data_len, b'\x00'))
             input_file = self._nvme_input_path
 
-        # --- 타임아웃 ---
-        # subprocess 감지 timeout: 퍼저가 "이 명령은 crash"라고 판단하는 창
-        # mutation(opcode_override/force_admin)으로 실제 전송 opcode/타입이 원본 cmd 와
-        # 달라지면 원본 timeout_group 은 더 이상 유효하지 않다 → 실제 (opcode, 타입) 에
-        # 해당하는 명령의 timeout_group 으로 재해석한다. 매핑 없는 미지 opcode 는
-        # 'command' 기본값(빠른 거부 가정). 변형 없으면 eff_cmd is cmd → 동작 보존.
+        # --- 타임아웃 --- (퍼저가 "crash"로 판단하는 창)
+        # mutation 으로 실제 전송 opcode/타입이 바뀌면 원본 timeout_group 무효 →
+        # 실제 (opcode, 타입) 명령으로 재해석. 미지 opcode 는 'command' 기본값.
         actual_type_val = "admin" if passthru_type == "admin-passthru" else "io"
         if (actual_opcode, actual_type_val) == (cmd.opcode, cmd.cmd_type.value):
             eff_cmd = cmd
@@ -7524,8 +7519,7 @@ class NVMeFuzzer:
 
             log.info(f"[NVMe RET] rc={rc}")
 
-            # NamespaceAttachment Detach(SEL=1) 가 실제 성공(rc=0)했으면 즉시 재부착으로
-            # fuzzing 대상 device 복구. Detach 는 NS 보존이라 inverse(Attach)로 되돌릴 수 있다.
+            # Detach(SEL=1) 성공 시 즉시 재부착 — NS 보존이라 inverse(Attach)로 device 복구.
             if (AUTO_REATTACH_NS and rc == 0 and passthru_type == "admin-passthru"
                     and actual_opcode == _NS_ATTACH_OPCODE and (seed.cdw10 & 0xF) == 1):
                 self._reattach_namespace(actual_nsid)
@@ -11001,13 +10995,11 @@ class NVMeFuzzer:
                 # timeout은 _send_nvme_command 내부에서 PS_ENTRY_EXIT_MARGIN_MS(105ms) 고정 가산
                 # FWDownload + 실제 청크 목록이 있으면 전체 청크를 순서대로 전송,
                 # exec 카운터는 1만 증가 (CLI 기준 1회 실행)
-                # 회계/리포트(FAIL CMD·crash·replay)에 쓸 "실제 전송된" seed/data.
-                # FWDownload 멀티청크는 원본 청크들을 보내므로 mutated_seed 가 아닌
-                # 실제 실패한 청크로 회계해야 [NVMe TIMEOUT] 로그와 FAIL CMD 가 일치한다.
+                # 회계/리포트(FAIL CMD·crash·replay)용 "실제 전송된" seed/data.
+                # FWDownload 멀티청크는 원본 청크를 보내므로 실패 청크로 회계해야
+                # [NVMe TIMEOUT] 로그와 FAIL CMD 가 일치(미일치 버그 수정).
                 _acct_seed, _acct_data = mutated_seed, fuzz_data
                 if cmd.name == "FWDownload" and self._fw_chunks:
-                    # _send_nvme_command 내부에서 start_sampling() 호출됨
-                    # alive 체크로 중복 시작 방지 → 첫 청크가 자동으로 샘플링 시작
                     rc = self.RC_ERROR
                     for _chunk_seed in self._fw_chunks:
                         rc = self._send_nvme_command(_chunk_seed.data, _chunk_seed)
