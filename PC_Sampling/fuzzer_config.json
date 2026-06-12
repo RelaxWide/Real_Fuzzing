@@ -911,10 +911,11 @@
       "nvme_timeouts": {
         "command": 8000,
         "format": 120000,
-        "flush": 2000,
-        "selftest_short": 120000,
-        "selftest_ext": 900000,
-        "verify": 20000
+        "flush": 8000,
+        "selftest_short": 8000,
+        "selftest_ext": 8000,
+        "verify": 22000,
+        "sanitize": 180000
       },
       "interface": "swd",
       "openocd_config": "r8_pcsr.cfg",
