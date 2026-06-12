@@ -80,6 +80,15 @@ seed == 회계 seed 라 원래 정상.)
 > chunk·opcode)는 fuzz 되지 않는다. 반면 **FWCommit 은 변이됨**(FS/CA/BPID + cdw/opcode/data).
 > FW.bin 없는 dummy FWDownload 는 일반 경로라 변이됨. (real-FW 청크 변이는 검토 후 미적용 — 현행 유지.)
 
+### 3.6. NVMe 완료 status 추가 출력 (rc=SC 만 → SCT 포함 full status)
+`nvme passthru` 의 프로세스 exit code(rc)는 8비트 절단으로 **status 하위 8비트 = SC(Status Code)만**
+남고 SCT(Status Code Type, bits[10:8])·DNR/More 는 사라진다 → 같은 SC·다른 SCT 가 한 rc 로 충돌
+(예: SC=0x80 이 CONFLICTING_ATTRS(SCT=1)·WRITE_FAULT(SCT=2) 둘 다 rc=128). nvme-cli 는 stderr 에
+`NVMe status: <NAME>(0xVAL)` 로 full status 를 출력하므로 이를 파싱해 함께 로깅한다.
+- `_parse_nvme_status()`(stderr regex) + `_fmt_nvme_status()` → `[NVMe RET] rc=N status=0xVVVV
+  SCT=n(이름) SC=0xSS [NAME]`. rc>0 일 때만 파싱(성공 rc=0 은 status 없음). rc 기반 판정 로직 불변.
+- timeout 은 완료(CQE) 자체가 없어 status 없음 → 변경 없음.
+
 ### 4. Namespace Detach 자동 재부착 + Delete 차단 — fuzzing 정지 방지
 스키마 valid 는 mutation 가이드일 뿐 send net 이 없어, 일반 cdw 비트플립/opcode 변이가 SEL=1 에
 도달 가능. SEL=CDW10[3:0]. **admin 일 때만** 적용(IO 0x0D ReservationRegister/0x15 ReservationRelease 무영향).

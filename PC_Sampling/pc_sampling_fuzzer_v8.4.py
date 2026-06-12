@@ -7266,6 +7266,37 @@ class NVMeFuzzer:
         log.warning(f"[IO-WL] block#{self._wl_blocks_done} pattern={pattern} "
                     f"cmds={len(cmds)} rc0={n_ok} max_nlb={lim['max_nlb']} nsze={lim['nsze']:,}")
 
+    # NVMe CQE Status Code Type (SCT, bits[10:8]) → 이름. SC(bits[7:0])는 nvme-cli stderr 의
+    # 이름 문자열을 그대로 사용(자체 테이블 유지 불필요).
+    _SCT_NAMES = {0: 'Generic', 1: 'CmdSpecific', 2: 'Media/DataIntegrity',
+                  3: 'Path', 7: 'Vendor'}
+
+    @staticmethod
+    def _parse_nvme_status(text: str):
+        """nvme-cli stderr 에서 'NVMe status: <NAME>(0xVAL)' 의 full status·이름 추출.
+        exit code(rc)는 8비트 절단으로 SC 만 남지만, stderr 는 SCT 포함 full status 를 담는다.
+        반환 (full_status:int, name:str) 또는 None."""
+        if not text:
+            return None
+        m = re.search(r'NVMe status:\s*([^\n(]*?)\s*\(\s*0x([0-9a-fA-F]+)\s*\)',
+                      text, re.IGNORECASE)
+        if not m:
+            return None
+        name = m.group(1).strip().split(':')[0].strip()   # 'NAME: 설명' → 'NAME'
+        return int(m.group(2), 16), name
+
+    def _fmt_nvme_status(self, stderr_text: str) -> str:
+        """rc 옆에 붙일 ' status=0x.. SCT=..(..) SC=0x.. [NAME]' 문자열. 없으면 ''."""
+        st = self._parse_nvme_status(stderr_text)
+        if st is None:
+            return ""
+        full, name = st
+        sc  = full & 0xFF
+        sct = (full >> 8) & 0x7
+        flags = ''.join(f for b, f in ((14, ' DNR'), (13, ' More')) if (full >> b) & 1)
+        return (f" status=0x{full:04x} SCT={sct}({self._SCT_NAMES.get(sct, '?')}) "
+                f"SC=0x{sc:02x}{flags} [{name}]")
+
     def _send_nvme_command(self, data: bytes, seed: Seed,
                            record_history: bool = True) -> int:
         """subprocess(nvme-cli) 기반 NVMe passthru 명령 전송.
@@ -7517,7 +7548,10 @@ class NVMeFuzzer:
             if self.config.post_cmd_delay_ms > 0:
                 time.sleep(self.config.post_cmd_delay_ms / 1000.0)
 
-            log.info(f"[NVMe RET] rc={rc}")
+            # rc(exit code)는 SC 하위 8비트만 → stderr 에서 full status(SCT 포함) 추가 출력.
+            _status_info = self._fmt_nvme_status(
+                stderr.decode(errors='replace') if rc > 0 and stderr else "")
+            log.info(f"[NVMe RET] rc={rc}{_status_info}")
 
             # Detach(SEL=1) 성공 시 즉시 재부착 — NS 보존이라 inverse(Attach)로 device 복구.
             if (AUTO_REATTACH_NS and rc == 0 and passthru_type == "admin-passthru"
