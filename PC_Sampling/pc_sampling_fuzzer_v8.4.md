@@ -74,6 +74,12 @@ replay 태그도 어긋남. → 실제 실패한 청크(`_acct_seed`/`_acct_data
 CMD·crash·replay 가 timeout 유발 청크와 일치. (다른 경로(일반/replay/workload/calibration)는 전송
 seed == 회계 seed 라 원래 정상.)
 
+> **설계 메모(의도된 동작, 버그 아님)**: FWDownload 는 FW.bin 제공 시 원본 청크를 그대로 전송하며
+> **변이하지 않는다**(직전 계산된 `mutated_seed` 는 버려짐 — 유효 펌웨어를 내려야 FWCommit 이 정상
+> 활성화/CRC 경로를 타기 때문). 따라서 real-FW 에선 FWDownload 파싱 경로(NUMD/OFST·malformed
+> chunk·opcode)는 fuzz 되지 않는다. 반면 **FWCommit 은 변이됨**(FS/CA/BPID + cdw/opcode/data).
+> FW.bin 없는 dummy FWDownload 는 일반 경로라 변이됨. (real-FW 청크 변이는 검토 후 미적용 — 현행 유지.)
+
 ### 4. Namespace Detach 자동 재부착 + Delete 차단 — fuzzing 정지 방지
 스키마 valid 는 mutation 가이드일 뿐 send net 이 없어, 일반 cdw 비트플립/opcode 변이가 SEL=1 에
 도달 가능. SEL=CDW10[3:0]. **admin 일 때만** 적용(IO 0x0D ReservationRegister/0x15 ReservationRelease 무영향).
