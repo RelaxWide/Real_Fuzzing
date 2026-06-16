@@ -1286,6 +1286,50 @@ class StateCorpusEntry:
     energy:     float = 16.0   # AFLfast 초기 에너지
 
 
+# state 관측(smart-log/get-log/security)용 nvme 호출 — 최대 STATE_MONITOR_SEC 초 대기, 못 끝내면
+# 프로세스를 버리고(D-state 는 SIGKILL 도 무시 → communicate 재호출 시 영구 블록 → 회피) 실패 반환.
+# crash 보존이 필요 없는 관측 명령이라 길게 기다릴 이유가 없다 → device 무응답 시 fuzzer 멈춤 방지.
+STATE_MONITOR_SEC = int(_T.get('state_monitor_sec', 60))
+
+
+class _StateProc:
+    """_run_nvme_state_cmd 반환 — subprocess.run 결과처럼 .returncode/.stdout/.stderr 제공."""
+    __slots__ = ('returncode', 'stdout', 'stderr')
+
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _run_nvme_state_cmd(cmd, timeout_sec=STATE_MONITOR_SEC, merge_stderr=False):
+    """관측용 nvme 명령 실행. 타임아웃(기본 60s) 시 프로세스를 버리고 returncode=-1 반환(블록 회피)."""
+    try:
+        _p = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE,
+            stderr=(subprocess.STDOUT if merge_stderr else subprocess.PIPE),
+            start_new_session=True)
+    except Exception as _e:
+        return _StateProc(-1, b'', str(_e).encode())
+    try:
+        _out, _err = _p.communicate(timeout=timeout_sec)
+        return _StateProc(_p.returncode, _out or b'', _err if _err is not None else b'')
+    except subprocess.TimeoutExpired:
+        # D-state 면 SIGKILL 무시 → communicate 재호출 금지. kill 시도 후 파이프만 닫고 버린다.
+        try:
+            _p.kill()
+        except Exception:
+            pass
+        for _pipe in (_p.stdout, _p.stderr):
+            if _pipe:
+                try:
+                    _pipe.close()
+                except Exception:
+                    pass
+        _p.poll()
+        return _StateProc(-1, b'', b'timeout')
+
+
 class NVMeStateMonitor:
     """100회마다 nvme smart-log / nvme get-log를 실행해 state를 관측."""
 
@@ -1330,10 +1374,7 @@ class NVMeStateMonitor:
         }
         if self._smart_needed:
             try:
-                proc = subprocess.run(
-                    ['nvme', 'smart-log', self._device],
-                    capture_output=True, timeout=5,
-                )
+                proc = _run_nvme_state_cmd(['nvme', 'smart-log', self._device])
                 if proc.returncode != 0:
                     log.warning(f"[State] smart-log 실패 "
                                 f"(rc={proc.returncode}): "
@@ -1397,13 +1438,11 @@ class NVMeStateMonitor:
         # LID 실패 시 해당 LID 필드만 skip — 다른 LID/SMART 결과는 유지
         for (lid, log_len) in self._vendor_lids:
             try:
-                proc = subprocess.run(
+                proc = _run_nvme_state_cmd(
                     ['nvme', 'get-log', self._device,
                      f'--log-id={lid:#x}',
                      f'--log-len={log_len}',
-                     '--raw-binary'],
-                    capture_output=True, timeout=5,
-                )
+                     '--raw-binary'])
                 if proc.returncode != 0:
                     log.warning(f"[State] get-log LID={lid:#x} 실패 "
                                 f"(rc={proc.returncode}): "
@@ -1450,7 +1489,7 @@ class NVMeStateMonitor:
                 ]
                 if nsid:
                     send_cmd += ['-n', str(nsid)]
-                proc_s = subprocess.run(send_cmd, capture_output=True, timeout=5)
+                proc_s = _run_nvme_state_cmd(send_cmd)
                 if proc_s.returncode not in (0, 1):
                     log.debug(f"[State] security-send secp={secp:#x} spsp={spsp:#x} "
                               f"rc={proc_s.returncode}: "
@@ -1466,8 +1505,7 @@ class NVMeStateMonitor:
                 ]
                 if nsid:
                     recv_cmd += ['-n', str(nsid)]
-                proc_r = subprocess.run(recv_cmd, stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT, timeout=5)
+                proc_r = _run_nvme_state_cmd(recv_cmd, merge_stderr=True)
                 if proc_r.returncode != 0:
                     log.debug(f"[State] security-recv secp={secp:#x} spsp={spsp:#x} "
                               f"rc={proc_r.returncode}: "
@@ -3119,10 +3157,8 @@ class NVMeFuzzer:
         smart_fields = [f for f in self.config.state_fields if f['source'] == 'smart']
         if smart_fields:
             try:
-                proc = subprocess.run(
-                    ['nvme', 'smart-log', self.config.nvme_device],
-                    capture_output=True, timeout=10,
-                )
+                proc = _run_nvme_state_cmd(
+                    ['nvme', 'smart-log', self.config.nvme_device])
                 raw_out = proc.stdout or proc.stderr
                 smart_text: Dict[str, int] = {}
                 for line in raw_out.decode(errors='replace').splitlines():
@@ -3161,11 +3197,9 @@ class NVMeFuzzer:
 
         for lid, log_len in sorted(vendor_lids.items()):
             try:
-                proc = subprocess.run(
+                proc = _run_nvme_state_cmd(
                     ['nvme', 'get-log', self.config.nvme_device,
-                     f'--log-id={lid:#x}', f'--log-len={log_len}', '--raw-binary'],
-                    capture_output=True, timeout=10,
-                )
+                     f'--log-id={lid:#x}', f'--log-len={log_len}', '--raw-binary'])
                 if proc.returncode != 0:
                     log.warning(f"[State-Snap] LID={lid:#x} 실패: "
                                 f"{proc.stderr.decode(errors='replace').strip()}")
@@ -3208,7 +3242,7 @@ class NVMeFuzzer:
                 ]
                 if nsid:
                     send_cmd += ['-n', str(nsid)]
-                proc_s = subprocess.run(send_cmd, capture_output=True, timeout=10)
+                proc_s = _run_nvme_state_cmd(send_cmd)
                 if proc_s.returncode not in (0, 1):
                     log.warning(f"[State-Snap] security-send secp={secp:#x} spsp={spsp:#x} "
                                 f"실패 rc={proc_s.returncode}: "
@@ -3222,8 +3256,7 @@ class NVMeFuzzer:
                 ]
                 if nsid:
                     recv_cmd += ['-n', str(nsid)]
-                proc_r = subprocess.run(recv_cmd, stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT, timeout=10)
+                proc_r = _run_nvme_state_cmd(recv_cmd, merge_stderr=True)
                 if proc_r.returncode != 0:
                     log.warning(f"[State-Snap] security-recv secp={secp:#x} spsp={spsp:#x} "
                                 f"실패 rc={proc_r.returncode}: "

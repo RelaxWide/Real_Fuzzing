@@ -60,7 +60,9 @@
       "verify": 20000
     },
     "nvme_passthru_timeout_ms": 2592000000,
-    "nvme_kernel_timeout_sec": 2592000
+    "nvme_kernel_timeout_sec": 2592000,
+    "_comment_state_monitor_sec": "state 관측(smart-log/get-log/security) 명령의 wall-clock 상한(초). crash 보존 불필요한 관측이라 짧게. device 무응답 시 이 시간 후 프로세스 버리고 스킵(fuzzer 멈춤 방지).",
+    "state_monitor_sec": 60
   },
   "sampling": {
     "sample_interval_us": 0,
