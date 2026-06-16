@@ -4243,6 +4243,7 @@ class NVMeFuzzer:
                     os.fsync(h.stream.fileno())
 
         if self.executions % 10000 == 0 and self.executions > 0:
+            self._log_device_info()   # 주기적 Device Information(id-ctrl/id-ns) 재출력
             self._log_smart()
             if self.config.state_enabled:
                 self._log_state_snapshot()
