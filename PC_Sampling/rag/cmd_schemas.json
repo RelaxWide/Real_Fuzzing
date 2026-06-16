@@ -1,0 +1,2725 @@
+{
+  "fuzzer_version": "9.0.0",
+  "commands": {
+    "Identify": {
+      "opcode": 6,
+      "cmd_type": "admin",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "GetLogPage": {
+      "opcode": 2,
+      "cmd_type": "admin",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "GetFeatures": {
+      "opcode": 10,
+      "cmd_type": "admin",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "SetFeatures": {
+      "opcode": 9,
+      "cmd_type": "admin",
+      "needs_namespace": true,
+      "needs_data": true,
+      "timeout_group": "command"
+    },
+    "Read": {
+      "opcode": 2,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "Write": {
+      "opcode": 1,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": true,
+      "timeout_group": "command"
+    },
+    "FWDownload": {
+      "opcode": 17,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": true,
+      "timeout_group": "command"
+    },
+    "FWCommit": {
+      "opcode": 16,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": true,
+      "timeout_group": "fw_commit"
+    },
+    "FormatNVM": {
+      "opcode": 128,
+      "cmd_type": "admin",
+      "needs_namespace": true,
+      "needs_data": true,
+      "timeout_group": "format"
+    },
+    "Sanitize": {
+      "opcode": 132,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": true,
+      "timeout_group": "sanitize"
+    },
+    "TelemetryHostInitiated": {
+      "opcode": 2,
+      "cmd_type": "admin",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "telemetry"
+    },
+    "Flush": {
+      "opcode": 0,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "flush"
+    },
+    "DatasetManagement": {
+      "opcode": 9,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": true,
+      "timeout_group": "dsm"
+    },
+    "WriteZeroes": {
+      "opcode": 8,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "Compare": {
+      "opcode": 5,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": true,
+      "timeout_group": "command"
+    },
+    "WriteUncorrectable": {
+      "opcode": 4,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "Verify": {
+      "opcode": 12,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "verify"
+    },
+    "DeviceSelfTest": {
+      "opcode": 20,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": false,
+      "timeout_group": "selftest_short"
+    },
+    "SecuritySend": {
+      "opcode": 129,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": true,
+      "timeout_group": "security"
+    },
+    "SecurityReceive": {
+      "opcode": 130,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": false,
+      "timeout_group": "security"
+    },
+    "GetLBAStatus": {
+      "opcode": 134,
+      "cmd_type": "admin",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "NamespaceManagement": {
+      "opcode": 13,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": true,
+      "timeout_group": "command"
+    },
+    "NamespaceAttachment": {
+      "opcode": 21,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "KeepAlive": {
+      "opcode": 24,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "DirectiveSend": {
+      "opcode": 25,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": true,
+      "timeout_group": "command"
+    },
+    "DirectiveReceive": {
+      "opcode": 26,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "VirtMgmt": {
+      "opcode": 28,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "CapacityMgmt": {
+      "opcode": 32,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "Lockdown": {
+      "opcode": 36,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "MigrationSend": {
+      "opcode": 65,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": true,
+      "timeout_group": "command"
+    },
+    "MigrationReceive": {
+      "opcode": 66,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "ControllerDataQueue": {
+      "opcode": 69,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "Abort": {
+      "opcode": 8,
+      "cmd_type": "admin",
+      "needs_namespace": false,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "Copy": {
+      "opcode": 25,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": true,
+      "timeout_group": "command"
+    },
+    "ReservationRegister": {
+      "opcode": 13,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": true,
+      "timeout_group": "command"
+    },
+    "ReservationReport": {
+      "opcode": 14,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "ReservationAcquire": {
+      "opcode": 17,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": true,
+      "timeout_group": "command"
+    },
+    "ReservationRelease": {
+      "opcode": 21,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": true,
+      "timeout_group": "command"
+    },
+    "Cancel": {
+      "opcode": 24,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "IOMgmtReceive": {
+      "opcode": 18,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": false,
+      "timeout_group": "command"
+    },
+    "IOMgmtSend": {
+      "opcode": 29,
+      "cmd_type": "io",
+      "needs_namespace": true,
+      "needs_data": true,
+      "timeout_group": "command"
+    }
+  },
+  "schemas": {
+    "Identify": [
+      {
+        "name": "CNS",
+        "word": 10,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          16,
+          17,
+          18,
+          19,
+          20,
+          26,
+          28,
+          29,
+          30
+        ],
+        "reserved": [
+          31,
+          111
+        ],
+        "vendor": [
+          112,
+          255
+        ],
+        "max_val": 0
+      },
+      {
+        "name": "CNTID",
+        "word": 10,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      },
+      {
+        "name": "CNSSI",
+        "word": 11,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "CSI",
+        "word": 11,
+        "hi": 31,
+        "lo": 24,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          2
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "UIDX",
+        "word": 14,
+        "hi": 6,
+        "lo": 0,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 127
+      }
+    ],
+    "GetLogPage": [
+      {
+        "name": "LID",
+        "word": 10,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          25,
+          26,
+          27,
+          32,
+          33,
+          34,
+          35,
+          112,
+          113,
+          114,
+          115,
+          128,
+          129
+        ],
+        "reserved": [],
+        "vendor": [
+          192,
+          255
+        ],
+        "max_val": 0
+      },
+      {
+        "name": "LSP",
+        "word": 10,
+        "hi": 14,
+        "lo": 8,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "RAE",
+        "word": 10,
+        "hi": 15,
+        "lo": 15,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "NUMDL",
+        "word": 10,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "NUMDU",
+        "word": 11,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LSI",
+        "word": 11,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LPOL",
+        "word": 12,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "OFFSET_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LPOU",
+        "word": 13,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "OFFSET_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "GetFeatures": [
+      {
+        "name": "FID",
+        "word": 10,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          25,
+          26,
+          27,
+          28,
+          29,
+          126,
+          127,
+          120,
+          121,
+          122,
+          123,
+          124,
+          125
+        ],
+        "reserved": [
+          22,
+          119
+        ],
+        "vendor": [
+          128,
+          255
+        ],
+        "max_val": 0
+      },
+      {
+        "name": "SEL",
+        "word": 10,
+        "hi": 10,
+        "lo": 8,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "UIDX",
+        "word": 14,
+        "hi": 6,
+        "lo": 0,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 127
+      }
+    ],
+    "SetFeatures": [
+      {
+        "name": "FID",
+        "word": 10,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          25,
+          26,
+          27,
+          28,
+          29,
+          120,
+          121,
+          122,
+          123,
+          124,
+          125,
+          126,
+          127
+        ],
+        "reserved": [
+          22,
+          119
+        ],
+        "vendor": [
+          128,
+          255
+        ],
+        "max_val": 0
+      },
+      {
+        "name": "SV",
+        "word": 10,
+        "hi": 31,
+        "lo": 31,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "CDW11",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "UIDX",
+        "word": 14,
+        "hi": 6,
+        "lo": 0,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 127
+      }
+    ],
+    "DeviceSelfTest": [
+      {
+        "name": "STC",
+        "word": 10,
+        "hi": 3,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          1,
+          2,
+          3,
+          14,
+          15
+        ],
+        "reserved": [
+          4,
+          13
+        ],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "FWCommit": [
+      {
+        "name": "FS",
+        "word": 10,
+        "hi": 2,
+        "lo": 0,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 7
+      },
+      {
+        "name": "CA",
+        "word": 10,
+        "hi": 5,
+        "lo": 3,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "BPID",
+        "word": 10,
+        "hi": 31,
+        "lo": 31,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "FWDownload": [
+      {
+        "name": "NUMD",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "OFST",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "OFFSET_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "FormatNVM": [
+      {
+        "name": "LBAFL",
+        "word": 10,
+        "hi": 3,
+        "lo": 0,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 15
+      },
+      {
+        "name": "MSET",
+        "word": 10,
+        "hi": 4,
+        "lo": 4,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "PI",
+        "word": 10,
+        "hi": 7,
+        "lo": 5,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "PIL",
+        "word": 10,
+        "hi": 8,
+        "lo": 8,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LBAFU",
+        "word": 10,
+        "hi": 13,
+        "lo": 12,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 3
+      }
+    ],
+    "Sanitize": [
+      {
+        "name": "SANACT",
+        "word": 10,
+        "hi": 2,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          1,
+          5
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "SecuritySend": [
+      {
+        "name": "NSSF",
+        "word": 10,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SPSP0",
+        "word": 10,
+        "hi": 15,
+        "lo": 8,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SPSP1",
+        "word": 10,
+        "hi": 23,
+        "lo": 16,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SECP",
+        "word": 10,
+        "hi": 31,
+        "lo": 24,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          234
+        ],
+        "reserved": [],
+        "vendor": [
+          240,
+          255
+        ],
+        "max_val": 0
+      },
+      {
+        "name": "TL",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "SecurityReceive": [
+      {
+        "name": "NSSF",
+        "word": 10,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SPSP0",
+        "word": 10,
+        "hi": 15,
+        "lo": 8,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SPSP1",
+        "word": 10,
+        "hi": 23,
+        "lo": 16,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SECP",
+        "word": 10,
+        "hi": 31,
+        "lo": 24,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2,
+          234,
+          239
+        ],
+        "reserved": [],
+        "vendor": [
+          240,
+          255
+        ],
+        "max_val": 0
+      },
+      {
+        "name": "AL",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "GetLBAStatus": [
+      {
+        "name": "SLBA_LO",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SLBA_HI",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "MNDW",
+        "word": 12,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "RL",
+        "word": 13,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      },
+      {
+        "name": "ATYPE",
+        "word": 13,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "NamespaceManagement": [
+      {
+        "name": "SEL",
+        "word": 10,
+        "hi": 3,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "CSI",
+        "word": 11,
+        "hi": 31,
+        "lo": 24,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          2
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "TelemetryHostInitiated": [
+      {
+        "name": "CTHID",
+        "word": 10,
+        "hi": 8,
+        "lo": 8,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "RAE",
+        "word": 10,
+        "hi": 15,
+        "lo": 15,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "NUMDL",
+        "word": 10,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "Abort": [
+      {
+        "name": "SQID",
+        "word": 10,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      },
+      {
+        "name": "CID",
+        "word": 10,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      }
+    ],
+    "NamespaceAttachment": [
+      {
+        "name": "SEL",
+        "word": 10,
+        "hi": 3,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "KeepAlive": [],
+    "DirectiveSend": [
+      {
+        "name": "NUMD",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DOPER",
+        "word": 11,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DTYPE",
+        "word": 11,
+        "hi": 15,
+        "lo": 8,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DSPEC",
+        "word": 11,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "DirectiveReceive": [
+      {
+        "name": "NUMD",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DOPER",
+        "word": 11,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DTYPE",
+        "word": 11,
+        "hi": 15,
+        "lo": 8,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DSPEC",
+        "word": 11,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "VirtMgmt": [
+      {
+        "name": "ACT",
+        "word": 10,
+        "hi": 3,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          1,
+          7,
+          8,
+          9
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "RT",
+        "word": 10,
+        "hi": 6,
+        "lo": 5,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "CNTLID",
+        "word": 10,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      },
+      {
+        "name": "NR",
+        "word": 11,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      }
+    ],
+    "CapacityMgmt": [
+      {
+        "name": "OP",
+        "word": 10,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "EGID",
+        "word": 10,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      },
+      {
+        "name": "EGCAP_LO",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "EGCAP_HI",
+        "word": 12,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "Lockdown": [
+      {
+        "name": "OFI",
+        "word": 10,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "UUID",
+        "word": 10,
+        "hi": 14,
+        "lo": 9,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 63
+      },
+      {
+        "name": "PRHBT",
+        "word": 10,
+        "hi": 15,
+        "lo": 15,
+        "ftype": "ENUM",
+        "valid": [
+          0
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SCP",
+        "word": 10,
+        "hi": 19,
+        "lo": 16,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "IFC",
+        "word": 10,
+        "hi": 25,
+        "lo": 24,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "MigrationSend": [
+      {
+        "name": "NUMD",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SEQIND",
+        "word": 11,
+        "hi": 1,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "CSVI",
+        "word": 11,
+        "hi": 15,
+        "lo": 8,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 255
+      }
+    ],
+    "MigrationReceive": [
+      {
+        "name": "NUMD",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "CSVI",
+        "word": 11,
+        "hi": 15,
+        "lo": 8,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 255
+      }
+    ],
+    "ControllerDataQueue": [
+      {
+        "name": "OP",
+        "word": 10,
+        "hi": 3,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "CNTLID",
+        "word": 10,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      },
+      {
+        "name": "NUMD",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "Read": [
+      {
+        "name": "SLBA_LO",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SLBA_HI",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "NLB",
+        "word": 12,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "LBA_CNT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "STCR",
+        "word": 12,
+        "hi": 25,
+        "lo": 25,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "PRINFO",
+        "word": 12,
+        "hi": 29,
+        "lo": 26,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1,
+          2,
+          4,
+          8,
+          15
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LR",
+        "word": 12,
+        "hi": 30,
+        "lo": 30,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "FUA",
+        "word": 12,
+        "hi": 31,
+        "lo": 31,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DSM",
+        "word": 13,
+        "hi": 3,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "ILBRT",
+        "word": 14,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "ELBAT",
+        "word": 15,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "ELBATM",
+        "word": 15,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "Write": [
+      {
+        "name": "SLBA_LO",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SLBA_HI",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "NLB",
+        "word": 12,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "LBA_CNT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "STCW",
+        "word": 12,
+        "hi": 25,
+        "lo": 25,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "CETYPE",
+        "word": 12,
+        "hi": 19,
+        "lo": 16,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DTYPE",
+        "word": 12,
+        "hi": 23,
+        "lo": 20,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "PRINFO",
+        "word": 12,
+        "hi": 29,
+        "lo": 26,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1,
+          2,
+          4,
+          8,
+          15
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LR",
+        "word": 12,
+        "hi": 30,
+        "lo": 30,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "FUA",
+        "word": 12,
+        "hi": 31,
+        "lo": 31,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DSPEC",
+        "word": 13,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DSM",
+        "word": 13,
+        "hi": 3,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "ILBRT",
+        "word": 14,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LBAT",
+        "word": 15,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LBATM",
+        "word": 15,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "WriteUncorrectable": [
+      {
+        "name": "SLBA_LO",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SLBA_HI",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "NLB",
+        "word": 12,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "LBA_CNT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "Compare": [
+      {
+        "name": "SLBA_LO",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SLBA_HI",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "NLB",
+        "word": 12,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "LBA_CNT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "STCR",
+        "word": 12,
+        "hi": 25,
+        "lo": 25,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "PRINFO",
+        "word": 12,
+        "hi": 29,
+        "lo": 26,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1,
+          2,
+          4,
+          8,
+          15
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LR",
+        "word": 12,
+        "hi": 30,
+        "lo": 30,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "FUA",
+        "word": 12,
+        "hi": 31,
+        "lo": 31,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "ELBRT",
+        "word": 14,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "ELBAT",
+        "word": 15,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "ELBATM",
+        "word": 15,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "OPAQUE",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "WriteZeroes": [
+      {
+        "name": "SLBA_LO",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SLBA_HI",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "NLB",
+        "word": 12,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "LBA_CNT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DEAC",
+        "word": 12,
+        "hi": 25,
+        "lo": 25,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "PRINFO",
+        "word": 12,
+        "hi": 29,
+        "lo": 26,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1,
+          2,
+          4,
+          8,
+          15
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LR",
+        "word": 12,
+        "hi": 30,
+        "lo": 30,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "FUA",
+        "word": 12,
+        "hi": 31,
+        "lo": 31,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "Verify": [
+      {
+        "name": "SLBA_LO",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SLBA_HI",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "NLB",
+        "word": 12,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "LBA_CNT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "STC",
+        "word": 12,
+        "hi": 25,
+        "lo": 25,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "PRINFO",
+        "word": 12,
+        "hi": 29,
+        "lo": 26,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1,
+          2,
+          4,
+          8,
+          15
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LR",
+        "word": 12,
+        "hi": 30,
+        "lo": 30,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "Flush": [],
+    "DatasetManagement": [
+      {
+        "name": "NR",
+        "word": 10,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "LBA_CNT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "IDR",
+        "word": 11,
+        "hi": 0,
+        "lo": 0,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "IDW",
+        "word": 11,
+        "hi": 1,
+        "lo": 1,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "AD",
+        "word": 11,
+        "hi": 2,
+        "lo": 2,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "Copy": [
+      {
+        "name": "SDLBA_LO",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "SDLBA_HI",
+        "word": 11,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "LBA",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DF",
+        "word": 12,
+        "hi": 7,
+        "lo": 4,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "NR",
+        "word": 12,
+        "hi": 11,
+        "lo": 8,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 255
+      },
+      {
+        "name": "PRINFOR",
+        "word": 12,
+        "hi": 15,
+        "lo": 12,
+        "ftype": "FLAGS",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "STCW",
+        "word": 12,
+        "hi": 24,
+        "lo": 24,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "STCR",
+        "word": 12,
+        "hi": 25,
+        "lo": 25,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "PRINFOW",
+        "word": 12,
+        "hi": 29,
+        "lo": 26,
+        "ftype": "FLAGS",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "FUA",
+        "word": 12,
+        "hi": 30,
+        "lo": 30,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "LR",
+        "word": 12,
+        "hi": 31,
+        "lo": 31,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "ReservationRegister": [
+      {
+        "name": "RREGA",
+        "word": 10,
+        "hi": 2,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "IEKEY",
+        "word": 10,
+        "hi": 3,
+        "lo": 3,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DISNSRS",
+        "word": 10,
+        "hi": 4,
+        "lo": 4,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "CPTPL",
+        "word": 10,
+        "hi": 31,
+        "lo": 30,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          2,
+          3
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "ReservationReport": [
+      {
+        "name": "NUMD",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "EDS",
+        "word": 11,
+        "hi": 0,
+        "lo": 0,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "ReservationAcquire": [
+      {
+        "name": "RACQA",
+        "word": 10,
+        "hi": 2,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "IEKEY",
+        "word": 10,
+        "hi": 3,
+        "lo": 3,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "DISNSRS",
+        "word": 10,
+        "hi": 4,
+        "lo": 4,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "RTYPE",
+        "word": 10,
+        "hi": 15,
+        "lo": 8,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "ReservationRelease": [
+      {
+        "name": "RRELA",
+        "word": 10,
+        "hi": 2,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "IEKEY",
+        "word": 10,
+        "hi": 3,
+        "lo": 3,
+        "ftype": "FLAGS",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "RTYPE",
+        "word": 10,
+        "hi": 15,
+        "lo": 8,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "Cancel": [
+      {
+        "name": "SQID",
+        "word": 10,
+        "hi": 15,
+        "lo": 0,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      },
+      {
+        "name": "CID",
+        "word": 10,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      },
+      {
+        "name": "CA",
+        "word": 11,
+        "hi": 3,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1,
+          2
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      }
+    ],
+    "IOMgmtReceive": [
+      {
+        "name": "NUMD",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "MO",
+        "word": 11,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          0,
+          1
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "MOSPC",
+        "word": 11,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      }
+    ],
+    "IOMgmtSend": [
+      {
+        "name": "NUMD",
+        "word": 10,
+        "hi": 31,
+        "lo": 0,
+        "ftype": "SIZE_DW",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "MO",
+        "word": 11,
+        "hi": 7,
+        "lo": 0,
+        "ftype": "ENUM",
+        "valid": [
+          1,
+          2
+        ],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 0
+      },
+      {
+        "name": "MOSPC",
+        "word": 11,
+        "hi": 31,
+        "lo": 16,
+        "ftype": "SLOT",
+        "valid": [],
+        "reserved": [],
+        "vendor": [],
+        "max_val": 65535
+      }
+    ]
+  },
+  "guards": {
+    "destructive": [
+      "FormatNVM",
+      "Sanitize"
+    ],
+    "blocked_admin_opcodes": [
+      0,
+      1,
+      4,
+      5,
+      12,
+      124
+    ],
+    "blocked_security_send_secp": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      236,
+      239
+    ],
+    "security_send_opcode": 129,
+    "ns_mgmt_opcode": 13,
+    "ns_attach_opcode": 21,
+    "block_ns_delete": true
+  }
+}
