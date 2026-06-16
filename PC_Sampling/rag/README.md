@@ -10,6 +10,17 @@ NVMe base / 고객·vendor / TCG·ATA 스펙의 산문 지식을 RAG/LLM 으로 
 - **Intranet PC**: RAG 서비스 + 사내 LLM(HTTP REST, OpenAI 호환) + 로컬 임베딩. 스펙 문서 로컬 read.
 - **공유 FS(NFS/SMB)**: `rag/{requests,inbox,sequences,archive,rejects,status}` drop-box.
 
+## 문서 준비 — PDF 100페이지 분할 (사내 PDF→JSONL 입력 제한 대응)
+
+사내 PDF→JSONL 시스템이 **100페이지까지만** 받으므로, NVMe spec(700+p) 등은 먼저 100p 청크로 쪼갠다.
+```bash
+pip install pypdf
+python3 split_pdf.py NVMe_Base_Spec.pdf            # → NVMe_Base_Spec_split/ 에 100p 청크들
+python3 split_pdf.py NVMe_Base_Spec.pdf --pages 100 --out ./chunks
+```
+출력: `<stem>_p0001-0100.pdf`, `_p0101-0200.pdf`, ... (각 ≤100p, 마지막은 나머지). `--overlap N` 으로
+경계 섹션 겹침 가능(기본 0 — JSONL 중복 방지). → 각 청크를 사내 시스템에 넣어 JSONL 수집 → RAG ingest.
+
 ## 이 폴더의 현재 파일 (스키마 ground-truth 다리)
 
 | 파일 | 실행 위치 | 역할 |
