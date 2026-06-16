@@ -6304,7 +6304,7 @@ class NVMeFuzzer:
         if self._orig_apst_cdw11 is None:
             try:
                 r = subprocess.run(
-                    ['nvme', 'get-feature', dev, '-f', '0x0C'],
+                    ['nvme', 'get-feature', dev, '-n', '0', '-f', '0x0C'],
                     capture_output=True, text=True, timeout=5)
                 for line in r.stdout.splitlines():
                     if 'value:' in line.lower() or 'Current value' in line:
@@ -6333,7 +6333,7 @@ class NVMeFuzzer:
                 _f.write(b'\x00' * 256)
                 _fname = _f.name
             r = subprocess.run(
-                ['nvme', 'set-feature', dev, '-f', '0x0C', '-v', '0',
+                ['nvme', 'set-feature', dev, '-n', '0', '-f', '0x0C', '-v', '0',
                  '--data-len', '256', '--data', _fname],
                 capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
@@ -6398,7 +6398,7 @@ class NVMeFuzzer:
                 _fname = _f.name
             # CDW11 bit0=1 (APSTE) — '-v 1'
             r = subprocess.run(
-                ['nvme', 'set-feature', dev, '-f', '0x0C', '-v', '1',
+                ['nvme', 'set-feature', dev, '-n', '0', '-f', '0x0C', '-v', '1',
                  '--data-len', '256', '--data', _fname],
                 capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
@@ -6426,7 +6426,7 @@ class NVMeFuzzer:
         dev = self._ctrl_device()   # APST 는 컨트롤러 스코프 → 컨트롤러 char device
         try:
             r = subprocess.run(
-                ['nvme', 'set-feature', dev, '-f', '0x0C',
+                ['nvme', 'set-feature', dev, '-n', '0', '-f', '0x0C',
                  '-v', str(self._orig_apst_cdw11)],
                 capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
@@ -6446,7 +6446,7 @@ class NVMeFuzzer:
         dev = self._ctrl_device()   # KeepAlive 는 컨트롤러 스코프 → 컨트롤러 char device
         try:
             r = subprocess.run(
-                ['nvme', 'get-feature', dev, '-f', '0x0F'],
+                ['nvme', 'get-feature', dev, '-n', '0', '-f', '0x0F'],
                 capture_output=True, text=True, timeout=5)
             for line in r.stdout.splitlines():
                 if 'value:' in line.lower() or 'Current value' in line:
@@ -6463,7 +6463,7 @@ class NVMeFuzzer:
             return
         try:
             r = subprocess.run(
-                ['nvme', 'set-feature', dev, '-f', '0x0F', '-v', '0'],
+                ['nvme', 'set-feature', dev, '-n', '0', '-f', '0x0F', '-v', '0'],
                 capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
                 log.warning(f"[KeepAlive] 비활성화 완료 "
@@ -6482,7 +6482,7 @@ class NVMeFuzzer:
         dev = self._ctrl_device()   # KeepAlive 는 컨트롤러 스코프 → 컨트롤러 char device
         try:
             r = subprocess.run(
-                ['nvme', 'set-feature', dev, '-f', '0x0F',
+                ['nvme', 'set-feature', dev, '-n', '0', '-f', '0x0F',
                  '-v', str(self._orig_keepalive_val)],
                 capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
