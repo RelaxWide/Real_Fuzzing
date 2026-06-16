@@ -6279,7 +6279,7 @@ class NVMeFuzzer:
             'kind':          'nvme',
             'label':         label or f'SetFeatures(FID={fid:#04x})',
             'passthru_type': 'admin-passthru',
-            'device':        self.config.nvme_device,
+            'device':        self._ctrl_device(),   # 실제 전송 device(컨트롤러 char)와 일치 → replay 충실
             'opcode':        0x09,
             'nsid':          0,
             'cdw2': 0, 'cdw3': 0,
