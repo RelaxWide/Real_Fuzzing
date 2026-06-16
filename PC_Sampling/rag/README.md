@@ -15,8 +15,10 @@ NVMe base / 고객·vendor / TCG·ATA 스펙의 산문 지식을 RAG/LLM 으로 
 사내 PDF→JSONL 시스템이 **100페이지까지만** 받으므로, NVMe spec(700+p) 등은 먼저 100p 청크로 쪼갠다.
 **여러 파일·폴더 통째 처리 가능**(파일/디렉토리 혼합 입력, 디렉토리는 내부 *.pdf 전부).
 
+백엔드는 **pikepdf(권장, qpdf 기반)** — 대형·복잡 spec PDF 에 견고(pypdf 는 일부 spec 에서 clone
+재귀로 실패). 없으면 pypdf 로 자동 폴백.
 ```bash
-pip install pypdf
+pip install pikepdf      # 권장 (pypdf 도 가능하나 NVMe/PCIe spec 에서 실패할 수 있음)
 
 # (Windows) 폴더 통째 — G:\NVMe_Spec 안의 5개 PDF 전부 분할
 python split_pdf.py "G:\NVMe_Spec"
