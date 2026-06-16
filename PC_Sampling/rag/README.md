@@ -13,13 +13,26 @@ NVMe base / 고객·vendor / TCG·ATA 스펙의 산문 지식을 RAG/LLM 으로 
 ## 문서 준비 — PDF 100페이지 분할 (사내 PDF→JSONL 입력 제한 대응)
 
 사내 PDF→JSONL 시스템이 **100페이지까지만** 받으므로, NVMe spec(700+p) 등은 먼저 100p 청크로 쪼갠다.
+**여러 파일·폴더 통째 처리 가능**(파일/디렉토리 혼합 입력, 디렉토리는 내부 *.pdf 전부).
+
 ```bash
 pip install pypdf
-python3 split_pdf.py NVMe_Base_Spec.pdf            # → NVMe_Base_Spec_split/ 에 100p 청크들
-python3 split_pdf.py NVMe_Base_Spec.pdf --pages 100 --out ./chunks
+
+# (Windows) 폴더 통째 — G:\NVMe_Spec 안의 5개 PDF 전부 분할
+python split_pdf.py "G:\NVMe_Spec"
+#   → 각 PDF 옆에 <stem>_split\ 생성. 한 폴더에 모으려면:
+python split_pdf.py "G:\NVMe_Spec" --out "G:\NVMe_Spec\chunks"
+
+# (Linux) 동일
+python3 split_pdf.py /path/to/NVMe_Spec
+
+# 파일 명시(여러 개)도 가능
+python split_pdf.py "G:\NVMe_Spec\NVM-Express-Base-...-2.3-...pdf" "G:\NVMe_Spec\PCIe_Express_5.0.pdf"
 ```
-출력: `<stem>_p0001-0100.pdf`, `_p0101-0200.pdf`, ... (각 ≤100p, 마지막은 나머지). `--overlap N` 으로
-경계 섹션 겹침 가능(기본 0 — JSONL 중복 방지). → 각 청크를 사내 시스템에 넣어 JSONL 수집 → RAG ingest.
+출력: `<stem>_p0001-0100.pdf`, `_p0101-0200.pdf`, ... (각 ≤100p, 마지막은 나머지). `--pages N` 으로 청크
+크기 조정, `--overlap N` 으로 경계 섹션 겹침(기본 0 — JSONL 중복 방지). → 각 청크를 사내 PDF→JSONL
+시스템에 넣어 JSONL 수집 → RAG ingest. (예: Base 2.3 / NVM Command Set 1.2 / PCIe 5.0 / TCG Storage
+Core 2.01 / NVMe-MI 2.1 — 5개를 폴더에 두고 `split_pdf.py "G:\NVMe_Spec"` 한 번.)
 
 ## 이 폴더의 현재 파일 (스키마 ground-truth 다리)
 
