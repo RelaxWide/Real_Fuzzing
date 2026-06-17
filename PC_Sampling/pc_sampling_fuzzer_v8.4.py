@@ -1162,6 +1162,7 @@ class _FuzzingTerminalFilter(logging.Filter):
         r'|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]|\[Probe-'
         r'|\[State-Snap\]|\[SMART\]'   # v8.3: 주기적 SMART/전체 state field 출력 터미널 노출
         r'|\[IO-WL\]'                   # v8.4: IO 워크로드 블록/검증 로그
+        r'|\[DevInfo\]'                 # Device Information(주기 출력) 터미널 노출
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -4775,22 +4776,24 @@ class NVMeFuzzer:
             return {}, str(e), -1
 
     def _log_device_info(self) -> None:
-        """nvme id-ctrl / id-ns 결과 + PCIe 정보를 정리해서 한 번에 터미널 출력.
-        idle universe 수집 직후 호출 → 어떤 device 에서 fuzz 돌렸는지 명확히 기록.
+        """nvme id-ctrl / id-ns + PCIe 정보를 한 번에 출력 (시작 시 + 주기적).
+        모든 줄을 [DevInfo] 태그로 출력 → 터미널 필터 통과(=== 만 보이고 내용이 사라지던 문제 해결).
         실패해도 fuzz 진행에 영향 없음 (best-effort).
         """
-        log.warning("=" * 60)
-        log.warning(" Device Information")
-        log.warning("=" * 60)
+        def _w(s):
+            log.warning(f"[DevInfo] {s}")
+
+        _w("=" * 56)
+        _w("Device Information")
 
         # id-ctrl — JSON 우선, 실패 시 text 파싱 fallback (_nvme_id_dict)
         _cmd = ['nvme', 'id-ctrl', self.config.nvme_device]
         ctrl, _err, _rc = self._nvme_id_dict(_cmd)
         if not ctrl:
-            log.warning(f"  id-ctrl rc={_rc}")
-            log.warning(f"    cmd    : {' '.join(_cmd)}")
+            _w(f"  id-ctrl rc={_rc}")
+            _w(f"    cmd    : {' '.join(_cmd)}")
             if _err:
-                log.warning(f"    stderr : {_err}")
+                _w(f"    stderr : {_err}")
 
         if ctrl:
             _model  = str(ctrl.get('mn', '')).strip()
@@ -4811,27 +4814,27 @@ class NVMeFuzzer:
             _major  = (_ver >> 16) & 0xFFFF
             _minor  = (_ver >> 8) & 0xFF
             _tert   = _ver & 0xFF
-            log.warning(f"  Model       : {_model}")
-            log.warning(f"  Serial      : {_serial}")
-            log.warning(f"  Firmware    : {_fw}")
-            log.warning(f"  Vendor ID   : 0x{_vid:04x}  /  Subsys 0x{_ssvid:04x}")
-            log.warning(f"  IEEE OUI    : {_ieee}")
-            log.warning(f"  NVMe spec   : {_major}.{_minor}.{_tert}  (raw 0x{_ver:08x})")
-            log.warning(f"  Namespaces  : {_nn}")
-            log.warning(f"  MDTS        : {_mdts}  (0 = unlimited)")
+            _w(f"  Model       : {_model}")
+            _w(f"  Serial      : {_serial}")
+            _w(f"  Firmware    : {_fw}")
+            _w(f"  Vendor ID   : 0x{_vid:04x}  /  Subsys 0x{_ssvid:04x}")
+            _w(f"  IEEE OUI    : {_ieee}")
+            _w(f"  NVMe spec   : {_major}.{_minor}.{_tert}  (raw 0x{_ver:08x})")
+            _w(f"  Namespaces  : {_nn}")
+            _w(f"  MDTS        : {_mdts}  (0 = unlimited)")
             if _subnqn:
-                log.warning(f"  SubNQN      : {_subnqn}")
+                _w(f"  SubNQN      : {_subnqn}")
 
         # id-ns — JSON 우선, 실패 시 text 파싱 fallback
         _ns = self.config.nvme_namespace or 1
         _ns_cmd = ['nvme', 'id-ns', self.config.nvme_device, '-n', str(_ns)]
         ns_info, _err, _rc = self._nvme_id_dict(_ns_cmd)
         if not ns_info:
-            log.warning(f"  id-ns rc={_rc}")
-            log.warning(f"    cmd    : {' '.join(_ns_cmd)}")
+            _w(f"  id-ns rc={_rc}")
+            _w(f"    cmd    : {' '.join(_ns_cmd)}")
             if _err:
-                log.warning(f"    stderr : {_err}")
-            log.warning("=" * 60)
+                _w(f"    stderr : {_err}")
+            _w("=" * 56)
             return
         try:
             nsze = ns_info.get('nsze', 0)
@@ -4847,26 +4850,26 @@ class NVMeFuzzer:
                 lba_size = 1 << _ds
             _size_gb = nsze * lba_size / 1e9
             _use_pct = (100 * nuse / ncap) if ncap else 0.0
-            log.warning(f"  Namespace {_ns}")
-            log.warning(f"    LBA size  : {lba_size} B  (lbaf={cur_idx})")
-            log.warning(f"    NSZE      : {nsze:,} LBAs  ({_size_gb:,.2f} GB)")
-            log.warning(f"    NCAP      : {ncap:,} LBAs")
-            log.warning(f"    NUSE      : {nuse:,} LBAs  ({_use_pct:.1f}% used)")
+            _w(f"  Namespace {_ns}")
+            _w(f"    LBA size  : {lba_size} B  (lbaf={cur_idx})")
+            _w(f"    NSZE      : {nsze:,} LBAs  ({_size_gb:,.2f} GB)")
+            _w(f"    NCAP      : {ncap:,} LBAs")
+            _w(f"    NUSE      : {nuse:,} LBAs  ({_use_pct:.1f}% used)")
         except Exception as e:
-            log.warning(f"  id-ns 조회 실패: {e}")
+            _w(f"  id-ns 조회 실패: {e}")
 
         # PCIe 정보 (이미 _detect_pcie_info 가 호출되었으면 출력)
         if self._pcie_bdf:
-            log.warning(f"  PCIe BDF    : {self._pcie_bdf}")
+            _w(f"  PCIe BDF    : {self._pcie_bdf}")
             if self._pcie_root_bdf:
-                log.warning(f"  Root Port   : {self._pcie_root_bdf}")
+                _w(f"  Root Port   : {self._pcie_root_bdf}")
             if self._pcie_lnkcap is not None:
                 _aspms = (self._pcie_lnkcap >> 10) & 0x3
                 _cpm   = (self._pcie_lnkcap >> 18) & 0x1
                 _aspm_str = {0:'none',1:'L0s',2:'L1',3:'L0s+L1'}.get(_aspms, f'?{_aspms}')
-                log.warning(f"  ASPM cap    : {_aspm_str}  /  ClockPM={_cpm}")
+                _w(f"  ASPM cap    : {_aspm_str}  /  ClockPM={_cpm}")
 
-        log.warning("=" * 60)
+        _w("=" * 56)
 
     MDTS_CACHE_TTL = 5000
 
