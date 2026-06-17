@@ -357,20 +357,19 @@ SEED_TEMPLATES = {
         dict(cdw10=0x1FFF, cdw11=0, data=b'\x00' * 32768),
     ],
 
-    # FWCommit — CDW10[2:0]=CA (Commit Action), CDW10[5:3]=FS (Firmware Slot)
-    #             CA=0: replace, no activate
-    #             CA=1: replace, activate on next reset
-    #             CA=2: replace + activate on next reset (w/ reset)
-    #             CA=3: activate without replace (existing slot)
-    #             CA=5: replace + activate immediately (NVMe 1.3+)
+    # FWCommit — CDW10[2:0]=FS (Firmware Slot), CDW10[5:3]=CA (Commit Action)  [NVMe 표준 레이아웃]
+    #   cdw10 = (CA << 3) | (FS & 0x7)
+    #   CA=0: 다운로드 이미지를 슬롯 FS 에 기록, 활성 안 함
+    #   CA=1: 슬롯 FS 에 기록 + 다음 reset 시 활성
+    #   (CA=2/3=기존 슬롯 이미지 활성, CA=4·5=boot partition → 다른 FW 활성화 회피 위해 제외)
     "FWCommit": [
-        dict(cdw10=0x00),
-        dict(cdw10=0x01),
-        dict(cdw10=0x09),
-        dict(cdw10=0x02),
-        dict(cdw10=0x03),
-        dict(cdw10=0x05),
-        dict(cdw10=0x0D),
+        dict(cdw10=0x00, description="CA=0 FS=0 (slot0 기록)"),
+        dict(cdw10=0x01, description="CA=0 FS=1 (slot1 기록)"),
+        dict(cdw10=0x02, description="CA=0 FS=2 (slot2 기록)"),
+        dict(cdw10=0x03, description="CA=0 FS=3 (slot3 기록)"),
+        dict(cdw10=0x09, description="CA=1 FS=1 (slot1 기록+리셋활성)"),
+        dict(cdw10=0x0A, description="CA=1 FS=2 (slot2 기록+리셋활성)"),
+        dict(cdw10=0x0B, description="CA=1 FS=3 (slot3 기록+리셋활성)"),
     ],
 
     # FormatNVM — SES=0(비파괴)만 유지.
