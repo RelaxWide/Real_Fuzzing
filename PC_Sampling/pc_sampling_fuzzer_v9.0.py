@@ -3098,6 +3098,45 @@ class NVMeFuzzer:
                 self.mopt_pilot_rounds = 0
                 log.info("[MOpt] Core→Pilot (reset)")
 
+    def _preload_fw_slots(self) -> None:
+        """calibration: config fw_bin 을 (read-only 제외) 모든 firmware slot 에 미리 기록(CA=0, 비활성).
+        이후 어떤 FWCommit(기존 슬롯 활성 CA=2/3 포함)이 와도 모든 슬롯=config fw_bin → '다른 FW
+        활성화' 차단. boot partition(BPID/CA4·5)은 대상 아님(특정 시퀀스 필요한 드문 케이스라 제외)."""
+        if not self._fw_chunks:
+            log.warning("[FW-Preload] config fw_bin 청크 없음 — 슬롯 프리로드 skip")
+            return
+        ctrl, _, _ = self._nvme_id_dict(['nvme', 'id-ctrl', self.config.nvme_device])
+        _frmw = ctrl.get('frmw', 0)
+        try:
+            frmw = int(_frmw, 0) if isinstance(_frmw, str) else int(_frmw or 0)
+        except (ValueError, TypeError):
+            frmw = 0
+        nslots = ((frmw >> 1) & 0x7) or 1
+        slot1_ro = bool(frmw & 0x1)
+        fwc = next((c for c in NVME_COMMANDS if c.name == 'FWCommit'), None)
+        if fwc is None:
+            return
+        log.warning(f"[FW-Preload] FRMW=0x{frmw:02x} slots={nslots} slot1_ro={slot1_ro} "
+                    f"→ config fw_bin 슬롯 프리로드(CA=0, 비활성)")
+        for slot in range(1, nslots + 1):
+            if slot == 1 and slot1_ro:
+                log.warning("[FW-Preload] 슬롯1 read-only — skip")
+                continue
+            _ok = True
+            for _chunk in self._fw_chunks:        # FWDownload 전체 청크 → 컨트롤러 버퍼
+                if self._send_nvme_command(_chunk.data, _chunk, record_history=False) != 0:
+                    _ok = False
+                    break
+            if _ok:
+                _seed = Seed(data=b'', cmd=fwc,
+                             cdw10=(0x00 << 3) | (slot & 0x7),  # CA=0(슬롯 기록·비활성), FS=slot
+                             found_at=0)
+                _rc = self._send_nvme_command(b'', _seed, record_history=False)
+                log.warning(f"[FW-Preload] 슬롯{slot} 기록 완료 (FWCommit CA=0 rc={_rc})")
+            else:
+                log.warning(f"[FW-Preload] 슬롯{slot} FWDownload 실패 — skip")
+            self.sampler.stop_sampling()
+
     def _log_smart(self):
         """v4.3: NVMe SMART / Health 로그를 읽어 INFO 레벨로 기록.
 
@@ -3681,7 +3720,7 @@ class NVMeFuzzer:
 
             if cmd.name == "FWCommit":
                 if use_real_fw:
-                    cdw10_commit = (fw_slot << 3) | 0x01  # CA=1: replace, activate on reset
+                    cdw10_commit = (0x01 << 3) | (fw_slot & 0x7)  # CA=001(슬롯 기록+리셋 활성), FS=fw_slot (이전: FS/CA 뒤바뀜 버그)
                     seed = Seed(data=b'', cmd=cmd, cdw10=cdw10_commit, found_at=0)
                     seeds.append(seed)
                     log.info(f"[Seed] FWCommit slot={fw_slot} action=1 "
@@ -10652,6 +10691,11 @@ class NVMeFuzzer:
             # 메인 루프에서 재실행되지 않도록 제거
             self.commands = [c for c in self.commands if c.name not in ("FormatNVM", "Sanitize")]
             log.info("[Calibration] FormatNVM/Sanitize self.commands에서 제거됨")
+
+        # config fw_bin 을 (쓰기 가능) 모든 firmware slot 에 프리로드 → 이후 FWCommit 이 어떤 슬롯을
+        # 활성화(CA=2/3)해도 같은 이미지 → 다른 FW 활성화 방지. FWCommit fuzz + fw_bin 있을 때만.
+        if self._fw_chunks and any(c.name == 'FWCommit' for c in self.commands):
+            self._preload_fw_slots()
 
         # Prefill: FormatNVM/Sanitize 이후 드라이브 전체 쓰기 (Verify 등이 참조할 데이터 확보)
         # FormatNVM이 LBA 맵핑을 초기화하므로 prefill은 반드시 format 완료 후 실행해야 의미 있음.
