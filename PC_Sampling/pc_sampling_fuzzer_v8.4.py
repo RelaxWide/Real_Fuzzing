@@ -3418,6 +3418,31 @@ class NVMeFuzzer:
 
         t = threading.Thread(target=_reader, daemon=True)
         t.start()
+
+        # 비침습(PCSR) 샘플러일 때만 prefill 중 동시 PC 샘플링 — write/GC/WL 경로 가시화.
+        # PCSR 은 코어 halt 없이 읽으므로 dd 스루풋에 영향 없음. halt/jlink_halt/null 은
+        # 제외(코어 halt → write 경로 교란 + prefill 지연). 수집 PC 는 static BB/func
+        # 커버리지에만 반영하고 guidance global_coverage 에는 넣지 않는다 — fuzzing 이 GC
+        # 경로 재도달 시 new-PC 크레딧을 받도록(idle_pcs 와 동일 정책).
+        _pf_sample = (self.config.sampler_type == 'pcsr')
+        _pf_pcs: set = set()
+        _pf_cnt = {'samples': 0, 'failures': 0}
+
+        def _pf_sampler():
+            while not _st['done']:
+                res = self.sampler._read_all_pcs()
+                _pf_cnt['samples'] += 1
+                if res is not None:
+                    _pf_pcs.update(res)
+                else:
+                    _pf_cnt['failures'] += 1
+
+        _pf_thread = None
+        if _pf_sample:
+            log.warning("[Prefill] PCSR 비침습 동시 샘플링 시작 (write/GC PC 수집)")
+            _pf_thread = threading.Thread(target=_pf_sampler, daemon=True)
+            _pf_thread.start()
+
         _last = time.monotonic()
         while not _st['done']:
             time.sleep(1)
@@ -3434,6 +3459,19 @@ class NVMeFuzzer:
                 else:
                     log.warning("[Prefill] 진행 중... (dd 진행정보 대기)")
         t.join(timeout=5)
+
+        if _pf_thread is not None:
+            _pf_thread.join(timeout=5)
+            if _pf_pcs:
+                _pf_new = sum(1 for p in _pf_pcs if p not in self.sampler.global_coverage)
+                self._update_static_coverage(_pf_pcs)
+                log.warning(
+                    f"[Prefill] PCSR 샘플 {_pf_cnt['samples']}회 (실패={_pf_cnt['failures']}) — "
+                    f"수집 PC {len(_pf_pcs)}개 (global 대비 신규 {_pf_new}개) → static BB/func 반영")
+            else:
+                log.warning(
+                    f"[Prefill] PCSR 샘플 {_pf_cnt['samples']}회 — 수집 PC 없음 "
+                    f"(실패={_pf_cnt['failures']})")
 
         rc = _st['rc'] if _st['rc'] is not None else -1
         # 완료 요약(전송량/속도) 한 줄
