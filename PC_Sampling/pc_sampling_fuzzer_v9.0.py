@@ -999,6 +999,7 @@ class FuzzConfig:
     no_jlink:         bool = False    # J-Link 자체 없이 NVMe fuzz 만 수행 (coverage 0)
     unsupported_skip: bool = False    # v7.8: J-Link dump 의 EngineErrInt 검출 시 자동 skip + power cycle
     repro_opcodes: tuple = ()  # 재현 모드: 이 opcode(들) timeout 만 크래시 캡처, 나머지는 POR 복구 후 계속
+    ignore_opcodes: tuple = ()  # denylist: 이 opcode(들) timeout 은 크래시로 안 치고 POR 복구 후 계속
     pm_test_cycles:   int  = PM_TEST_CYCLES   # OpenOCD 없이 preflight 후 추가 랜덤 PM cycle 수
 
     nvme_device: str = NVME_DEVICE
@@ -8972,6 +8973,18 @@ class NVMeFuzzer:
         actual_opcode = (seed.opcode_override if seed.opcode_override is not None
                          else cmd.opcode)
 
+        # ignore-list: 지정 opcode 의 timeout 은 크래시로 취급하지 않고 POR 복구 후 계속.
+        # (알려진 hang opcode 를 흘려보내고 나머지는 정상 크래시 헌팅.) repro 게이트보다 먼저 검사.
+        if actual_opcode in self.config.ignore_opcodes:
+            log.warning(f"[IGN] opcode 0x{actual_opcode:02x} ({cmd.name}) timeout "
+                        f"— ignore-list → POR 복구 후 계속")
+            self.stats['ignored_timeout'] = self.stats.get('ignored_timeout', 0) + 1
+            if self._recover_after_unsupported_skip():
+                return   # _timeout_crash 미설정 → caller 가 continue
+            log.error("[IGN] POR 복구 실패 — 중단 (POR/PMU 사용 가능해야 함)")
+            self._timeout_crash = True
+            return
+
         # 재현 모드: 타겟 opcode 가 아닌 timeout 은 무거운 dump/artifact 없이 POR 로 복구하고 계속.
         # (타겟이면 아래 전체 크래시 캡처로 진행.) unsupported-skip 의 POR 복구 로직 재사용 —
         # 복구 함수가 device 재생+sampler 재연결까지 수행하므로 메인 루프가 그대로 이어진다.
@@ -11660,6 +11673,10 @@ if __name__ == "__main__":
                         help='재현 모드: 지정 opcode 가 timeout 날 때만 크래시 캡처+중단, 다른 opcode '
                              'timeout 은 POR 로 복구 후 계속(POR/PMU 필요). 여러 개는 콤마로 '
                              '(예: 0x84,0x80,0x0d). unsupported-skip 의 복구 로직 재사용.')
+    parser.add_argument('--ignore-opcodes', type=str, default='',
+                        help='denylist: 이 opcode(들) 가 timeout 나도 크래시로 안 치고 POR 복구 후 '
+                             '계속(알려진 hang opcode 흘려보내기). 여러 개는 콤마로 '
+                             '(예: 0x84,0x0d). repro-opcode 보다 우선.')
 
     # 토글
     parser.add_argument('--no-por', action='store_true', default=False,
@@ -11702,6 +11719,15 @@ if __name__ == "__main__":
                 repro_opcodes.append(int(_tok, 16))
     repro_opcodes = tuple(repro_opcodes)
 
+    # ignore-list opcode 파싱 (--ignore-opcodes, hex, 콤마로 여러 개)
+    ignore_opcodes = []
+    if args.ignore_opcodes.strip():
+        for _tok in args.ignore_opcodes.split(','):
+            _tok = _tok.strip()
+            if _tok and int(_tok, 16) not in ignore_opcodes:
+                ignore_opcodes.append(int(_tok, 16))
+    ignore_opcodes = tuple(ignore_opcodes)
+
     # NVMe 타임아웃 — 그룹별 조정은 코드 상단 NVME_TIMEOUTS 상수에서 직접 수정
     nvme_timeouts = NVME_TIMEOUTS.copy()
 
@@ -11734,6 +11760,9 @@ if __name__ == "__main__":
     if repro_opcodes:
         print(f"[REPRO] 재현 모드: 타겟 opcode {[hex(o) for o in repro_opcodes]} timeout 만 크래시 "
               f"캡처, 나머지 opcode timeout 은 POR 복구 후 계속 (POR/PMU 필요)")
+    if ignore_opcodes:
+        print(f"[IGN] ignore-list: opcode {[hex(o) for o in ignore_opcodes]} timeout 은 "
+              f"크래시로 안 치고 POR 복구 후 계속 (POR/PMU 필요)")
     print("\nFeatures:")
     print("  - subprocess (nvme-cli) NVMe passthru")
     print("  - Global PC saturation (configurable) + idle PC detection")
@@ -11852,6 +11881,7 @@ if __name__ == "__main__":
         no_jlink=args.no_jlink,
         unsupported_skip=args.unsupported_skip,
         repro_opcodes=repro_opcodes,
+        ignore_opcodes=ignore_opcodes,
         # 토글
         enable_por=not args.no_por,
         # v8.0: profile 이 끈 제품(P9)은 CLI 와 무관하게 비활성 유지
