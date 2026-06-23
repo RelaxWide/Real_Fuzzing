@@ -1723,6 +1723,7 @@ class OpenOCDPCSampler:
     _CONSECUTIVE_FAIL_LIMIT = 10  # 연속 read 실패 시 stop_event 세팅
     _always_on  = False           # PCSR 비침습: 상시 워커 + per-command 윈도우 (기본 off)
     _win_active = False           # always-on: 현재 명령 윈도우 활성 여부
+    _prefill_active = False       # always-on: prefill 구간(별도 버킷 수집) 여부
 
     def __init__(self, config: FuzzConfig):
         self.config = config
@@ -1752,6 +1753,8 @@ class OpenOCDPCSampler:
         self._always_on  = (config.sampler_type == 'pcsr')
         self._win_active = False
         self._bg_pcs: Set[int] = set()
+        self._prefill_active = False
+        self._prefill_pcs: Set[int] = set()
 
         self.idle_pc:  Optional[int] = None
         self.idle_pcs: Set[int]      = set()
@@ -2402,6 +2405,10 @@ class OpenOCDPCSampler:
                     self.current_trace.add(pc)
                     if pc not in self.global_coverage:
                         self._last_new_at = sample_count   # plateau 신호(글로벌 갱신은 evaluate)
+            elif self._prefill_active:
+                # prefill 구간: 별도 버킷에만 수집 → static BB/func 전용(global_coverage 제외).
+                # 단일 워커가 소켓을 전담하므로 별도 prefill 스레드/소켓 경합 없음.
+                self._prefill_pcs.update(in_range_pcs)
             else:
                 for pc in in_range_pcs:
                     if pc not in self.global_coverage:
@@ -2431,19 +2438,42 @@ class OpenOCDPCSampler:
                 self.sample_thread.join(timeout=1.0)
         self.sample_thread = None
 
+    def _ensure_worker(self) -> bool:
+        """always-on 상시 워커가 안 떠 있으면 기동(POR/연속실패로 죽은 경우 재가동). 성공 시 True."""
+        if self.sample_thread and self.sample_thread.is_alive():
+            return True
+        if not self._openocd_alive():
+            log.warning("[OpenOCD] 프로세스가 종료됨 — always-on 재시작 시도...")
+            if not self._reconnect():
+                log.error("[OpenOCD] 재시작 실패 — 이번 실행 샘플링 스킵")
+                return False
+        self.stop_event.clear()
+        self.sample_thread = threading.Thread(
+            target=self._sampling_worker_always_on, daemon=True)
+        self.sample_thread.start()
+        return True
+
+    def begin_prefill(self):
+        """always-on: prefill 구간 PC 를 별도 버킷(_prefill_pcs)에 수집(BB/func 전용).
+        소켓 reader 는 상시 워커 1개뿐 → 별도 prefill 스레드 불필요, 경합 없음."""
+        if not self._always_on:
+            return
+        self._prefill_pcs = set()
+        self._prefill_active = True
+        self._ensure_worker()
+
+    def end_prefill(self) -> Set[int]:
+        """prefill 구간 종료 — 수집한 PC 집합 반환(호출자가 BB/func 에만 반영)."""
+        if not self._always_on:
+            return set()
+        self._prefill_active = False
+        return self._prefill_pcs
+
     def start_sampling(self):
         if self._always_on:
             # 상시 워커 lazy-start (POR/연속실패로 죽었으면 재가동)
-            if not (self.sample_thread and self.sample_thread.is_alive()):
-                if not self._openocd_alive():
-                    log.warning("[OpenOCD] 프로세스가 종료됨 — always-on 재시작 시도...")
-                    if not self._reconnect():
-                        log.error("[OpenOCD] 재시작 실패 — 이번 실행 샘플링 스킵")
-                        return
-                self.stop_event.clear()
-                self.sample_thread = threading.Thread(
-                    target=self._sampling_worker_always_on, daemon=True)
-                self.sample_thread.start()
+            if not self._ensure_worker():
+                return
             # 이미 윈도우 활성이면(FWDownload 다중 청크 등) 리셋 없이 누적 유지
             if self._win_active:
                 return
@@ -3537,33 +3567,15 @@ class NVMeFuzzer:
         t = threading.Thread(target=_reader, daemon=True)
         t.start()
 
-        # 비침습(PCSR) 샘플러일 때만 prefill 중 동시 PC 샘플링 — write/GC/WL 경로 가시화.
-        # PCSR 은 코어 halt 없이 읽으므로 dd 스루풋에 영향 없음. halt/jlink_halt/null 은
-        # 제외(코어 halt → write 경로 교란 + prefill 지연). 수집 PC 는 static BB/func
-        # 커버리지에만 반영하고 guidance global_coverage 에는 넣지 않는다 — fuzzing 이 GC
-        # 경로 재도달 시 new-PC 크레딧을 받도록(idle_pcs 와 동일 정책).
-        _pf_sample = (self.config.sampler_type == 'pcsr')
-        _pf_pcs: set = set()
-        _pf_cnt = {'samples': 0, 'failures': 0}
-
-        def _pf_sampler():
-            while not _st['done']:
-                res = self.sampler._read_all_pcs()
-                _pf_cnt['samples'] += 1
-                if res is not None:
-                    _pf_pcs.update(res)
-                else:
-                    _pf_cnt['failures'] += 1
-
-        _pf_thread = None
-        if _pf_sample:
-            # always-on 워커가 calibration 에서 이미 떠 있으면 같은 telnet 소켓을 동시 read 해
-            # 파싱 충돌(read_all_pcs echo 섞임)이 난다 → 워커를 잠시 정지하고 이 prefill 전용
-            # 샘플러만 소켓을 쓴다. prefill 종료 후 다음 명령의 start_sampling 이 워커를 재가동.
-            self.sampler._stop_worker()
-            log.warning("[Prefill] PCSR 비침습 동시 샘플링 시작 (write/GC PC 수집)")
-            _pf_thread = threading.Thread(target=_pf_sampler, daemon=True)
-            _pf_thread.start()
+        # 비침습(PCSR=always-on) 일 때만 prefill 중 PC 수집 — write/GC/WL 경로 가시화.
+        # 별도 스레드를 두지 않고 always-on 상시 워커가 prefill 구간 PC 를 별도 버킷에 모으게
+        # 한다(소켓 reader 1개 → 충돌 없음). 수집분은 prefill 종료 후 static BB/func 에만 반영
+        # 하고 guidance global_coverage 에는 넣지 않는다 — fuzzing 이 GC 경로 재도달 시 new-PC
+        # 크레딧을 받도록(idle_pcs 와 동일 정책). halt/jlink_halt/null 은 begin_prefill no-op.
+        _pf_prefill = (self.config.sampler_type == 'pcsr')
+        if _pf_prefill:
+            self.sampler.begin_prefill()
+            log.warning("[Prefill] always-on 워커로 write/GC PC 수집 (BB/func 전용)")
 
         _last = time.monotonic()
         while not _st['done']:
@@ -3582,18 +3594,16 @@ class NVMeFuzzer:
                     log.warning("[Prefill] 진행 중... (dd 진행정보 대기)")
         t.join(timeout=5)
 
-        if _pf_thread is not None:
-            _pf_thread.join(timeout=5)
+        if _pf_prefill:
+            _pf_pcs = self.sampler.end_prefill()
             if _pf_pcs:
                 _pf_new = sum(1 for p in _pf_pcs if p not in self.sampler.global_coverage)
                 self._update_static_coverage(_pf_pcs)
                 log.warning(
-                    f"[Prefill] PCSR 샘플 {_pf_cnt['samples']}회 (실패={_pf_cnt['failures']}) — "
-                    f"수집 PC {len(_pf_pcs)}개 (global 대비 신규 {_pf_new}개) → static BB/func 반영")
+                    f"[Prefill] 수집 PC {len(_pf_pcs)}개 (global 대비 신규 {_pf_new}개) "
+                    f"→ static BB/func 반영")
             else:
-                log.warning(
-                    f"[Prefill] PCSR 샘플 {_pf_cnt['samples']}회 — 수집 PC 없음 "
-                    f"(실패={_pf_cnt['failures']})")
+                log.warning("[Prefill] 수집 PC 없음 (always-on 워커 미가동/응답 없음?)")
 
         rc = _st['rc'] if _st['rc'] is not None else -1
         # 완료 요약(전송량/속도) 한 줄
