@@ -3557,6 +3557,10 @@ class NVMeFuzzer:
 
         _pf_thread = None
         if _pf_sample:
+            # always-on 워커가 calibration 에서 이미 떠 있으면 같은 telnet 소켓을 동시 read 해
+            # 파싱 충돌(read_all_pcs echo 섞임)이 난다 → 워커를 잠시 정지하고 이 prefill 전용
+            # 샘플러만 소켓을 쓴다. prefill 종료 후 다음 명령의 start_sampling 이 워커를 재가동.
+            self.sampler._stop_worker()
             log.warning("[Prefill] PCSR 비침습 동시 샘플링 시작 (write/GC PC 수집)")
             _pf_thread = threading.Thread(target=_pf_sampler, daemon=True)
             _pf_thread.start()
