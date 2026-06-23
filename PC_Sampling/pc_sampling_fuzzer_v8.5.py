@@ -2869,6 +2869,17 @@ class NVMeFuzzer:
             # 기본: 안전(비파괴) 명령어만
             base = NVME_COMMANDS_DEFAULT.copy()
 
+        # excluded_opcodes 에 든 opcode 의 명령은 선택 풀에서도 제거 → random_gen 선택 차단 +
+        # 초기 Format/Sanitize one-shot(아래 게이트가 self.commands 멤버십을 봄)까지 자동 스킵.
+        # (seed 생성/opcode 변이는 이미 excluded 를 존중. 이로써 --exclude-opcodes 가 전 경로 차단.)
+        _excl = set(config.excluded_opcodes)
+        if _excl:
+            _filtered = [c for c in base if c.opcode not in _excl]
+            if _filtered:
+                base = _filtered
+            else:
+                log.warning("[Fuzzer] excluded_opcodes 가 모든 명령을 제외 — 필터 무시(빈 풀 방지)")
+
         # weight에 따라 리스트 확장 — random.choice()가 가중치 선택을 자동 처리
         # IO_ADMIN_RATIO: I/O 커맨드를 Admin 대비 추가 weight 부여 (75%:25% 비율)
         self.commands = []
@@ -11778,6 +11789,10 @@ if __name__ == "__main__":
     parser.add_argument('--exclude-opcodes', type=str, default='',
                         help='Comma-separated hex opcodes to exclude from fuzzing, '
                              'e.g. "0xC1,0xC0" or "C1,C0"')
+    parser.add_argument('--no-erase', action='store_true', default=False,
+                        help='전체 소거 명령(FormatNVM 0x80 / Sanitize 0x84)을 완전 차단 — 초기 '
+                             '1회 FTL 리셋·메인 루프 선택·opcode 변이 전 경로. 기존 데이터 보존용. '
+                             'Write/WriteZeroes/Deallocate 등 부분 덮어쓰기는 그대로 동작.')
 
     # 커버리지 resume
     parser.add_argument('--resume-coverage', default=RESUME_COVERAGE,
@@ -11846,6 +11861,12 @@ if __name__ == "__main__":
                 val = int(tok, 16) if tok.startswith(('0x', '0X')) else int(tok, 16)
                 if val not in excluded_opcodes:
                     excluded_opcodes.append(val)
+
+    # --no-erase: 전체 소거 명령(FormatNVM 0x80 / Sanitize 0x84) 차단 → excluded 에 추가.
+    if args.no_erase:
+        for _op in (0x80, 0x84):
+            if _op not in excluded_opcodes:
+                excluded_opcodes.append(_op)
 
     # 재현 모드 타겟 opcode 파싱 (--repro-opcode, hex, 콤마로 여러 개)
     repro_opcodes = []
