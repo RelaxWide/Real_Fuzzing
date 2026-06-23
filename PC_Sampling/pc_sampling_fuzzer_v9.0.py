@@ -4316,8 +4316,10 @@ class NVMeFuzzer:
                 self._update_static_coverage(self.sampler.current_trace)
         else:
             _seed_covered = set(self.sampler.current_trace)
-            if self._sa_loaded and self.sampler._last_new_pcs:
-                self._update_static_coverage(self.sampler._last_new_pcs)
+            # func/PC-only static 도 밟은 전체로 갱신(_last_new_pcs 아님) — always-on 백그라운드
+            # PC 누락 방지(BB 브랜치와 동일 이유).
+            if self._sa_loaded and self.sampler.current_trace:
+                self._update_static_coverage(self.sampler.current_trace)
 
         self.cmd_pcs[track_key].update(self.sampler.current_trace)
         if self.sampler._last_raw_pcs:
@@ -11072,7 +11074,7 @@ class NVMeFuzzer:
                             self.sampler.global_coverage.update(self.sampler.current_trace)
                             if _pm_new_cnt > 0:
                                 if self._sa_loaded:
-                                    self._update_static_coverage(_pm_new_set)
+                                    self._update_static_coverage(self.sampler.current_trace)
                                 log.info(f"[+][PM-Cov] APST-idle (PS3→PS4) +{_pm_new_cnt} new PCs")
                             # APST 다시 disable — 다음 PM rotation 슬롯이 manual 제어
                             # 가능하도록. 다음 NVMe 명령이 디바이스를 자연 wake.
@@ -11095,7 +11097,7 @@ class NVMeFuzzer:
                         self.sampler.global_coverage.update(self.sampler.current_trace)
                         if _pm_new_cnt > 0:
                             if self._sa_loaded:
-                                self._update_static_coverage(_pm_new_set)
+                                self._update_static_coverage(self.sampler.current_trace)
                             log.info(f"[+][PM-Cov] pcie_bit +{_pm_new_cnt} new PCs")
 
                     # ── CLKREQ# timing slot (v7.7 S2, 4 mode random) ─────
@@ -11108,7 +11110,7 @@ class NVMeFuzzer:
                         self.sampler.global_coverage.update(self.sampler.current_trace)
                         if _pm_new_cnt > 0:
                             if self._sa_loaded:
-                                self._update_static_coverage(_pm_new_set)
+                                self._update_static_coverage(self.sampler.current_trace)
                             log.info(f"[+][PM-Cov] clkreq +{_pm_new_cnt} new PCs")
 
                     # ── POWER_COMBO slot (기존) ──────────────────────────
@@ -11130,7 +11132,7 @@ class NVMeFuzzer:
                         self.sampler.global_coverage.update(self.sampler.current_trace)
                         if _pm_new_cnt > 0:
                             if self._sa_loaded:
-                                self._update_static_coverage(_pm_new_set)
+                                self._update_static_coverage(self.sampler.current_trace)
                             log.info(
                                 f"[+][PM-Cov] {_next_combo.label} "
                                 f"+{_pm_new_cnt} new PCs "
