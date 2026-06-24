@@ -1087,6 +1087,7 @@ class FuzzConfig:
     # v7.0: State monitoring
     state_enabled: bool = True             # --no-state 시 False
     vmon_enabled:  bool = True             # --no-vmon 시 False (v8.6: vmalloc/taint 진단 watchdog)
+    no_always_on:  bool = False            # True면 PCSR always-on 끄고 v8.4 windowed 샘플링(freeze 격리용)
     # v8.3: 제품별 state 관측 필드 (fuzzer_config.json state_fields 세트). 기본=r8 세트.
     state_fields: list = field(default_factory=lambda: list(_DEFAULT_STATE_FIELDS))
 
@@ -1801,7 +1802,9 @@ class OpenOCDPCSampler:
         # 잡고, per-command 신규 판정은 윈도우(_win_active) 구간으로 한정. 워커는 global_coverage
         # 를 직접 건드리지 않는다(락 회피) — 명령 사이 샘플은 _bg_pcs(워커 전용)에 모았다가
         # 메인 스레드가 _fold_bg() 로 안전하게 global_coverage 에 합친다.
-        self._always_on  = (config.sampler_type == 'pcsr')
+        # --no-always-on 이면 always-on 을 끄고 v8.4 windowed 경로(아래 start/stop_sampling 의
+        # else 분기 + _sampling_worker)를 사용 → 명령 사이 OpenOCD/USB idle (freeze 원인 격리용).
+        self._always_on  = (config.sampler_type == 'pcsr') and not getattr(config, 'no_always_on', False)
         self._win_active = False
         self._bg_pcs: Set[int] = set()
         self._prefill_active = False
@@ -11982,6 +11985,10 @@ if __name__ == "__main__":
     parser.add_argument('--no-vmon', action='store_true', default=False,
                         help='vmalloc/메모리 + kernel taint 진단 watchdog 비활성화 '
                              '(기본: 30s마다 /proc/meminfo·tainted 로깅 — freeze 원인 진단용, 무영향)')
+    parser.add_argument('--no-always-on', action='store_true', default=False,
+                        help='PCSR always-on 상시 샘플링을 끄고 v8.4 windowed(명령마다 start/stop) '
+                             '방식 사용. 명령 사이 OpenOCD/USB idle → always-on이 host freeze 원인인지 '
+                             '격리 테스트용. (PCSR 제품에만 의미)')
     parser.add_argument('--prefill', action='store_true', default=False,
                         help='POR 전 드라이브 전체 랜덤 쓰기 수행 (GC/Wear Leveling 트리거, 수 분 소요)')
     parser.add_argument('--prefill-bs', type=int, default=PREFILL_BS,
@@ -12190,6 +12197,7 @@ if __name__ == "__main__":
         enable_jlink_dump=_profile['enable_jlink_dump'] and not args.no_jlink_dump,
         state_enabled=not args.no_state,
         vmon_enabled=not args.no_vmon,
+        no_always_on=args.no_always_on,
         state_fields=_resolved_state_fields,
         prefill=args.prefill,
         prefill_bs=args.prefill_bs,
