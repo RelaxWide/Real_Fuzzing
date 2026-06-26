@@ -87,7 +87,7 @@ except Exception:
     _pylink = None
 
 # 버전
-FUZZER_VERSION = "9.0.0"
+FUZZER_VERSION = "8.7.0"
 
 # ─────────────────────────────────────────────────────────────────────────
 # USER CONFIGURATION  — 값은 모두 fuzzer_config.json 에서 로드한다 (v8.3).
