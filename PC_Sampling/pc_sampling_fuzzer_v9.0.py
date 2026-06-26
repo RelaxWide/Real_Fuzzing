@@ -4249,17 +4249,13 @@ class NVMeFuzzer:
             is_interesting = len(_new_bbs) > 0
             new_pcs = len(_new_bbs)
             _seed_covered = _cur_bbs
-            # static 갱신은 이 명령이 밟은 전체 current_trace 로 한다(_last_new_pcs 아님).
-            # always-on 백그라운드 PC 는 _fold_bg 로 global_coverage 에만 들어가 _last_new_pcs
-            # 에서 빠지므로, _last_new_pcs 만 쓰면 그 BB 가 _sa_covered_bbs 에 영영 안 들어가
-            # new_BB 가 매번 재카운트되고 total_BB 는 정체된다. current_trace 로 주면 명령이
-            # 밟은 모든 BB 가 반영돼 total_BB 가 new_BB 만큼 정확히 증가(_update 는 멱등).
+            # static 갱신은 이 명령이 밟은 전체 current_trace 로 한다(_update 는 멱등).
+            # → 명령이 밟은 모든 BB 가 _sa_covered_bbs 에 반영돼 total_BB 가 new_BB 만큼 정확히 증가.
             if self.sampler.current_trace:
                 self._update_static_coverage(self.sampler.current_trace)
         else:
             _seed_covered = set(self.sampler.current_trace)
-            # func/PC-only static 도 밟은 전체로 갱신(_last_new_pcs 아님) — always-on 백그라운드
-            # PC 누락 방지(BB 브랜치와 동일 이유).
+            # func/PC-only static 도 밟은 전체(current_trace)로 갱신 — BB 브랜치와 동일.
             if self._sa_loaded and self.sampler.current_trace:
                 self._update_static_coverage(self.sampler.current_trace)
 
