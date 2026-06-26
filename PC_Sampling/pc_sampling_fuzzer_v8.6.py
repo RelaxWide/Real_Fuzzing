@@ -1166,7 +1166,7 @@ class _FuzzingTerminalFilter(logging.Filter):
         r'|\[State-Snap\]|\[SMART\]'   # v8.3: 주기적 SMART/전체 state field 출력 터미널 노출
         r'|\[IO-WL\]'                   # v8.4: IO 워크로드 블록/검증 로그
         r'|\[DevInfo\]'                 # Device Information(주기 출력) 터미널 노출
-        r'|\[VMon\]|\[Taint\]'          # v8.6: vmalloc/메모리 watchdog + kernel taint 진단
+        r'|\[Taint\]'                   # v8.6: kernel taint 진단(시작/변화). [VMon] 은 파일만(터미널 제외)
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -1343,7 +1343,7 @@ def _run_nvme_state_cmd(cmd, timeout_sec=STATE_MONITOR_SEC, merge_stderr=False):
 #   fuzz/디바이스/프로브 경로에 영향 없음.
 #   주의: /proc/vmallocinfo 는 vmap_area_lock 을 잡으므로 절대 읽지 않는다(/proc/meminfo 만).
 # ──────────────────────────────────────────────────────────────────────────
-VMON_INTERVAL_SEC          = 30      # watchdog 폴링 간격(초)
+VMON_EXEC_INTERVAL         = 10000   # vmon 샘플 주기(exec 횟수) — 메인 루프에서 호출
 VMON_VMALLOC_CHUNK_WARN_KB = 65536   # 최대 free vmalloc chunk 이 이 값(64MB) 미만이면 경고
 
 _KERNEL_TAINT_BITS = [
@@ -2898,8 +2898,10 @@ class NVMeFuzzer:
 
     def __init__(self, config: FuzzConfig):
         self.config = config
-        self._vmon_thread = None              # v8.6: vmalloc/taint 진단 watchdog 스레드
-        self._stop_event_vmon = None
+        self._vmon_prev_used = None           # v8.6: vmon exec-기반 샘플 상태(스레드 없음)
+        self._vmon_last_taint = None
+        self._graph_child_pid = None          # v8.6: 차트 생성 격리 subprocess(fork) PID
+        self._mpl_warmed = False              # 부모에서 matplotlib 1회 선import(자식 fork 안전)
         # --no-jlink 활성 시 NullSampler 사용 — coverage 수집 없이 NVMe fuzz 만.
         # J-Link/OpenOCD 가 없어도 fuzz / state telemetry / PM rotation / crash
         # detection (timeout 기준) 은 모두 동작.
@@ -4566,6 +4568,11 @@ class NVMeFuzzer:
             if self.config.state_enabled:
                 self._log_state_snapshot()
 
+        if (self.config.vmon_enabled
+                and self.executions % VMON_EXEC_INTERVAL == 0
+                and self.executions > 0):
+            self._vmon_sample()       # vmalloc/taint 진단(파일 로그만)
+
         # state monitoring
         if (self.config.state_enabled
                 and self.executions % 100 == 0
@@ -4631,17 +4638,10 @@ class NVMeFuzzer:
 
         if (self.executions % GRAPH_REFRESH_INTERVAL == 0
                 and self.executions > 0):
-            try:
-                _gdir = self.output_dir / 'graphs'
-                _gdir.mkdir(parents=True, exist_ok=True)
-                self._generate_comparison_chart(_gdir)
-                self._generate_static_coverage_graphs()
-                self._generate_heatmaps()
-                self._generate_mutation_chart()
-                self._generate_csfuzz_dynamics()
-                log.info(f"[Graph] 주기 갱신 완료 (exec={self.executions:,})")
-            except Exception as _ge:
-                log.warning(f"[Graph] 주기 갱신 실패 (무시): {_ge}")
+            # matplotlib/numpy(C 확장)의 장시간 반복 figure 생성이 인터프리터 힙을 손상시켜
+            # fuzzer 가 segfault 하던 문제 → 차트 생성을 격리된 fork 자식에서 수행.
+            # 자식이 죽어도 부모(fuzzer)는 생존하며, 자식 비정상 종료는 로그로 남긴다.
+            self._generate_graphs_isolated()
 
         return is_interesting, new_pcs, 'ok'
 
@@ -9514,6 +9514,85 @@ class NVMeFuzzer:
         with open(graph_dir / 'summary.json', 'w') as f:
             json.dump(all_data, f, indent=2)
 
+    def _warm_matplotlib(self) -> None:
+        """부모 프로세스에서 matplotlib 을 1회 선import — fork 자식이 import 락 없이
+        바로 차트를 그리게 함(멀티스레드 fork 안전성 보강). 1회만 수행."""
+        if self._mpl_warmed:
+            return
+        try:
+            _setup_matplotlib_chart_env()
+            import matplotlib.pyplot  # noqa: F401  (워밍 import)
+            self._mpl_warmed = True
+        except Exception as _e:
+            log.info(f"[Graph] matplotlib 선import 실패(차트 비활성 가능): {_e}")
+            self._mpl_warmed = True   # 재시도 안 함
+
+    def _generate_all_charts(self) -> None:
+        """5종 차트를 순서대로 생성(인프로세스 본체). fork 자식 또는 종료 시 직접 호출."""
+        _gdir = self.output_dir / 'graphs'
+        _gdir.mkdir(parents=True, exist_ok=True)
+        self._generate_comparison_chart(_gdir)
+        self._generate_static_coverage_graphs()
+        self._generate_heatmaps()
+        self._generate_mutation_chart()
+        self._generate_csfuzz_dynamics()
+
+    def _reap_graph_child(self, block: bool = False) -> None:
+        """차트 생성 fork 자식 회수. 시그널 종료(segfault 등)면 경고 로그.
+        block=False: 논블로킹(아직 살아있으면 그대로 둠). block=True: 종료까지 대기."""
+        pid = self._graph_child_pid
+        if pid is None:
+            return
+        try:
+            wpid, status = os.waitpid(pid, 0 if block else os.WNOHANG)
+        except ChildProcessError:
+            self._graph_child_pid = None
+            return
+        except Exception:
+            return
+        if wpid == 0:
+            return  # 논블로킹 — 아직 실행 중
+        self._graph_child_pid = None
+        if os.WIFSIGNALED(status):
+            _sig = os.WTERMSIG(status)
+            _name = '(SIGSEGV)' if _sig == 11 else ('(SIGABRT)' if _sig == 6 else '')
+            log.warning(f"[Graph] ⚠️ 차트 생성 자식 프로세스가 시그널 {_sig}{_name} 로 비정상 종료 "
+                        f"— matplotlib/numpy(C) 크래시 의심. fuzzer 본체는 계속 진행.")
+        elif os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+            log.warning(f"[Graph] 차트 생성 자식 rc={os.WEXITSTATUS(status)} 로 종료(차트 일부 누락 가능).")
+
+    def _generate_graphs_isolated(self) -> None:
+        """차트 생성을 격리된 fork 자식에서 수행 → matplotlib/numpy(C) 크래시가
+        fuzzer 본체를 죽이지 못하게 함. 자식은 COW 로 현재 self 상태 전체를 그대로 받으므로
+        데이터 직렬화 불필요. 자식 비정상 종료는 _reap_graph_child 가 로그로 남긴다.
+
+        Python 3.7+ 는 fork 시 logging/import/threading 락을 자식에서 자동 재초기화하므로
+        (+부모에서 matplotlib 선import) 멀티스레드 fork 데드락 위험을 최소화한다."""
+        # 이전 주기 자식이 아직 돌고 있으면 이번 주기는 건너뜀(자식 누적 방지)
+        self._reap_graph_child(block=False)
+        if self._graph_child_pid is not None:
+            log.info("[Graph] 이전 차트 자식 아직 실행 중 — 이번 주기 건너뜀")
+            return
+        self._warm_matplotlib()
+        try:
+            pid = os.fork()
+        except OSError as _fe:
+            log.info(f"[Graph] fork 실패 — 인프로세스 폴백: {_fe}")
+            try:
+                self._generate_all_charts()
+            except Exception as _ge:
+                log.warning(f"[Graph] 인프로세스 차트 생성 실패(무시): {_ge}")
+            return
+        if pid == 0:
+            # ── 자식: 차트만 그리고 즉시 종료(atexit/정리 경로 회피로 부모 상태 비오염) ──
+            try:
+                self._generate_all_charts()
+                os._exit(0)
+            except BaseException:
+                os._exit(3)
+        # ── 부모(fuzzer): PID 기록만, 논블로킹. 다음 주기/종료 시 회수 ──
+        self._graph_child_pid = pid
+
     def _generate_graphs(self):
         """그래프 생성 진입점.
 
@@ -10709,45 +10788,41 @@ class NVMeFuzzer:
             pass
         return d
 
-    def _vmalloc_watchdog(self) -> None:
-        """백그라운드 진단 스레드 — vmalloc 추세 + taint 변화 감시.
-        VmallocUsed 계단식 상승=고갈, 평탄→급사=손상. 퍼징 중 새 out-of-tree 모듈
-        로드(taint 변화)를 잡아 손상 의심원을 특정. (순수 /proc 읽기 → fuzz 무영향)"""
-        prev_used = None
-        last_taint = _read_kernel_taint()[0]
-        while not self._stop_event_vmon.is_set():
-            m = self._vmon_read_meminfo()
-            used  = m.get('VmallocUsed')
-            chunk = m.get('VmallocChunk')
-            if used is not None:
-                delta = "" if prev_used is None else f" (Δ{used - prev_used:+d}kB)"
-                parts = [f"VmallocUsed={used}kB{delta}"]
-                if chunk:               parts.append(f"maxfreechunk={chunk}kB")
-                if 'Slab' in m:         parts.append(f"Slab={m['Slab']}kB")
-                if 'PageTables' in m:   parts.append(f"PageTables={m['PageTables']}kB")
-                if 'MemAvailable' in m: parts.append(f"MemAvail={m['MemAvailable']}kB")
-                log.warning("[VMon] " + " ".join(parts))
-                if chunk is not None and 0 < chunk < VMON_VMALLOC_CHUNK_WARN_KB:
-                    log.warning(f"[VMon] *** VMALLOC LOW: 최대 free chunk={chunk}kB "
-                                f"< {VMON_VMALLOC_CHUNK_WARN_KB}kB — 단편화/고갈 임박 가능 ***")
-                prev_used = used
-            cur_taint = _read_kernel_taint()[0]
-            if (cur_taint is not None and last_taint is not None
-                    and cur_taint != last_taint):
-                log.warning(f"[VMon] *** kernel taint 변화: 0x{last_taint:x} → 0x{cur_taint:x} "
-                            f"(퍼징 중 모듈 로드/이벤트) ***")
-                self._log_taint_snapshot(tag="taint-change")
-                last_taint = cur_taint
-            self._stop_event_vmon.wait(VMON_INTERVAL_SEC)
+    def _vmon_sample(self) -> None:
+        """vmalloc 추세 + taint 변화 1회 샘플 — 메인 루프에서 주기(VMON_EXEC_INTERVAL exec)마다 호출.
+        VmallocUsed 계단식 상승=고갈, 평탄→급사=손상. taint 변화 시 손상 의심 모듈 특정.
+        순수 /proc 읽기(vmallocinfo 미접근) → fuzz 무영향. [VMon] 은 파일에만 남고 터미널 미노출.
+        (스레드 아님 → 별도 동시성/소켓 경합 0. taint 변화만 [Taint] 로 터미널 노출.)"""
+        m = self._vmon_read_meminfo()
+        used  = m.get('VmallocUsed')
+        chunk = m.get('VmallocChunk')
+        if used is not None:
+            delta = "" if self._vmon_prev_used is None else f" (Δ{used - self._vmon_prev_used:+d}kB)"
+            parts = [f"VmallocUsed={used}kB{delta}"]
+            if chunk:               parts.append(f"maxfreechunk={chunk}kB")
+            if 'Slab' in m:         parts.append(f"Slab={m['Slab']}kB")
+            if 'PageTables' in m:   parts.append(f"PageTables={m['PageTables']}kB")
+            if 'MemAvailable' in m: parts.append(f"MemAvail={m['MemAvailable']}kB")
+            log.warning("[VMon] " + " ".join(parts))
+            if chunk is not None and 0 < chunk < VMON_VMALLOC_CHUNK_WARN_KB:
+                log.warning(f"[VMon] *** VMALLOC LOW: 최대 free chunk={chunk}kB "
+                            f"< {VMON_VMALLOC_CHUNK_WARN_KB}kB — 단편화/고갈 임박 가능 ***")
+            self._vmon_prev_used = used
+        cur_taint = _read_kernel_taint()[0]
+        if (cur_taint is not None and self._vmon_last_taint is not None
+                and cur_taint != self._vmon_last_taint):
+            log.warning(f"[VMon] *** kernel taint 변화: 0x{self._vmon_last_taint:x} → "
+                        f"0x{cur_taint:x} (퍼징 중 모듈 로드/이벤트) ***")
+            self._log_taint_snapshot(tag="taint-change")   # [Taint] → 터미널 노출(중요)
+            self._vmon_last_taint = cur_taint
 
     def _start_vmalloc_watchdog(self) -> None:
-        """taint 스냅샷 1회 + vmalloc/메모리 watchdog 스레드 기동(순수 /proc 읽기)."""
+        """taint 스냅샷 1회 + vmon exec-기반 샘플 상태 초기화(스레드 없음 — 메인 루프가 주기 호출)."""
         self._log_taint_snapshot(tag="startup")
-        self._stop_event_vmon = threading.Event()
-        self._vmon_thread = threading.Thread(target=self._vmalloc_watchdog, daemon=True)
-        self._vmon_thread.start()
-        log.warning(f"[VMon] vmalloc/메모리 watchdog 시작 (간격 {VMON_INTERVAL_SEC}s, "
-                    f"/proc/meminfo 만 사용 — vmallocinfo 미접근)")
+        self._vmon_prev_used = None
+        self._vmon_last_taint = _read_kernel_taint()[0]
+        log.warning(f"[VMon] vmalloc/메모리 진단 시작 ({VMON_EXEC_INTERVAL}회 exec 마다, "
+                    f"/proc/meminfo 만 — 터미널 미노출, 파일 로그만)")
 
     def run(self):
         global log
@@ -11776,6 +11851,9 @@ class NVMeFuzzer:
                 self.sampler.save_coverage(str(self.output_dir))
             except Exception as e:
                 log.error(f"Coverage save failed: {e}")
+
+            # 진행 중이던 주기 차트 fork 자식 회수(좀비 방지 + 비정상 종료 로그)
+            self._reap_graph_child(block=True)
 
             try:
                 self._save_per_command_data()
