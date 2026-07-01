@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v9.0 (base: v8.7)
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v8.8
 
 OpenOCD PCSR 비침습 샘플링 + nvme-cli passthru 기반 Coverage-Guided + State-Aware
 Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/덤프를 데이터 주도 설정.
@@ -103,7 +103,7 @@ except Exception:
     _pylink = None
 
 # 버전
-FUZZER_VERSION = "9.0.0"
+FUZZER_VERSION = "8.8.0"
 
 # ─────────────────────────────────────────────────────────────────────────
 # USER CONFIGURATION  — 값은 모두 fuzzer_config.json 에서 로드한다 (v8.3).
@@ -11961,7 +11961,7 @@ class NVMeFuzzer:
 
                 log.warning("[MONITOR] 모니터링 종료")
 
-                # v9.0: timeout-crash 종료 경로에서도 샘플러(pylink JLink)를 명시적으로
+                # v8.8: timeout-crash 종료 경로에서도 샘플러(pylink JLink)를 명시적으로
                 # 닫는다. 이 분기는 그동안 close() 를 호출하지 않아, 열린 JLink 세션
                 # (JLinkARM DLL 의 ctypes 핸들)이 인터프리터 종료 시 순서 없이 finalize 되며
                 # "Segmentation fault (core dumped)" 를 유발했다(P9/jlink_halt — [MONITOR]

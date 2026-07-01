@@ -9220,7 +9220,17 @@ class NVMeFuzzer:
         log.error(f"  cdw13     : 0x{seed.cdw13:08x}")
         log.error(f"  cdw14     : 0x{seed.cdw14:08x}")
         log.error(f"  cdw15     : 0x{seed.cdw15:08x}")
-        log.error(f"  data_len  : {len(fuzz_data) if fuzz_data else 0} bytes")
+        # data_len: 실제 device 로 전송된 transfer length(--data-len)를 보고한다.
+        # 그 값은 _cmd_history 마지막 항목(=이 실패 명령)에 기록돼 있으며 replay .sh 가
+        # 쓰는 값과 동일하다. read/응답형 명령은 입력 payload(fuzz_data)가 비어 있어
+        # len(fuzz_data) 로 찍으면 항상 0 → replay(예: 512)와 불일치하던 버그 수정.
+        _in_buf_len = len(fuzz_data) if fuzz_data else 0
+        _sent_dlen = (self._cmd_history[-1].get('data_len', _in_buf_len)
+                      if self._cmd_history
+                      and self._cmd_history[-1].get('kind') == 'nvme'
+                      else _in_buf_len)
+        log.error(f"  data_len  : {_sent_dlen} bytes (전송 transfer length)")
+        log.error(f"  in_buf    : {_in_buf_len} bytes (호스트 입력 payload)")
         log.error(f"  data(hex) : {_data_hex}{_data_suffix}")
         if _mut_parts:
             log.error(f"  mutations : {', '.join(_mut_parts)}")
