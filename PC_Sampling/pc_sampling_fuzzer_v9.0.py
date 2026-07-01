@@ -10851,22 +10851,46 @@ class NVMeFuzzer:
         log.warning("=" * 60)
         log.warning(f"NVMe device : {self.config.nvme_device}")
         log.warning(f"Commands    : {[c.name for c in self.commands]}")
+        # v9.0: 배너를 sampler-aware 로 — jlink_halt(P9)/halt/pcsr 에 맞는 정보만 출력.
+        # (예전엔 sampler 종류와 무관하게 항상 OpenOCD/openocd_config 를 찍어, P9 처럼
+        #  openocd_config 키가 없는 J-Link 제품이 기본값 r8_pcsr.cfg 로 오표기됐음.)
         if self.config.no_jlink:
-            log.warning("OpenOCD     : DISABLED (--no-jlink) — coverage 수집 안 함, "
+            log.warning("Sampler     : DISABLED (--no-jlink) — coverage 수집 안 함, "
                         "NVMe fuzz + state + PM 만 동작")
+        elif self.config.sampler_type == 'jlink_halt':
+            _pcreg = 'auto' if self.config.pc_reg_index is None else self.config.pc_reg_index
+            log.warning(f"Sampler     : J-Link halt (pylink) — device={self.config.jlink_device}, "
+                        f"speed={self.config.jlink_speed}kHz, AP={self.config.jlink_ap_index}, "
+                        f"pc_reg={_pcreg} (OpenOCD 미사용)")
+        elif self.config.sampler_type == 'halt':
+            log.warning(f"Sampler     : OpenOCD halt→reg pc→resume — "
+                        f"{self.config.openocd_binary} / {self.config.openocd_config} "
+                        f"(telnet {self.config.openocd_host}:{self.config.openocd_port})")
         else:
-            log.warning(f"OpenOCD     : {self.config.openocd_binary} / {self.config.openocd_config} "
+            log.warning(f"Sampler     : OpenOCD PCSR (비침습) — "
+                        f"{self.config.openocd_binary} / {self.config.openocd_config} "
                         f"(telnet {self.config.openocd_host}:{self.config.openocd_port})")
         if self.config.addr_range_start is not None:
             log.warning(f"Addr filter : {hex(self.config.addr_range_start)}"
                      f" - {hex(self.config.addr_range_end)}")
         else:
             log.warning("Addr filter : NONE (all PCs collected - noisy!)")
-        log.warning(f"Sampling    : interval={self.config.sample_interval_us}us (PCSR, no-halt), "
-                 f"max={self.config.max_samples_per_run}/run, "
-                 f"idle_sat={SATURATION_LIMIT}, "
-                 f"global_sat={GLOBAL_SATURATION_LIMIT}, "
-                 f"post_cmd={self.config.post_cmd_delay_ms}ms")
+        _samp_mode = ('PCSR, no-halt' if self.config.sampler_type == 'pcsr'
+                      else 'J-Link halt' if self.config.sampler_type == 'jlink_halt'
+                      else 'OpenOCD halt' if self.config.sampler_type == 'halt'
+                      else self.config.sampler_type)
+        if self.config.sampler_type in ('halt', 'jlink_halt'):
+            log.warning(f"Sampling    : {_samp_mode}, go_settle={self.config.go_settle_ms}ms, "
+                     f"max={self.config.max_samples_per_run}/run, "
+                     f"idle_sat={SATURATION_LIMIT}, "
+                     f"global_sat={GLOBAL_SATURATION_LIMIT}, "
+                     f"post_cmd={self.config.post_cmd_delay_ms}ms")
+        else:
+            log.warning(f"Sampling    : interval={self.config.sample_interval_us}us ({_samp_mode}), "
+                     f"max={self.config.max_samples_per_run}/run, "
+                     f"idle_sat={SATURATION_LIMIT}, "
+                     f"global_sat={GLOBAL_SATURATION_LIMIT}, "
+                     f"post_cmd={self.config.post_cmd_delay_ms}ms")
         _diag_worst = self.config.diagnose_max * self.config.diagnose_sample_ms / 1000
         log.warning(f"Diagnose    : stability={self.config.diagnose_stability}, "
                     f"max={self.config.diagnose_max}, "
