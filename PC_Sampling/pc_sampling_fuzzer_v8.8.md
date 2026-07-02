@@ -7,9 +7,10 @@ OpenOCD PCSR 비침습 샘플링 + `nvme-cli` passthru 기반 Coverage-Guided + 
 > segfault 수정, `FAIL CMD` 의 `data_len` 을 실제 전송 transfer length 로 수정, 시작 배너를
 > sampler-aware 로 정리. **fuzzing/샘플링/state/PM 경로 자체는 v8.7 과 동일.**
 >
-> ※ `pc_sampling_fuzzer_v9.0.py` 는 이 v8.8 과 **바이트 동일**(버전 문자열/주석 라벨 8곳만 다름).
-> v9.0.md 가 예고한 RAG/LLM 통합(`RagBridge`/`--rag`/`seed_class`)은 **아직 코드에 미구현**이며
-> `rag/` 디렉토리에 스캐폴딩(스키마·서비스 설계)만 존재한다. 즉 현재 최신 동작 코드는 이 v8.8 이다.
+> ※ 구 `pc_sampling_fuzzer_v9.0.py`/`.md` 는 **삭제됨**. v9.0.py 는 v8.8 의 버전 문자열만 바꾼
+> 복사본이었고, v9.0.md 가 예고한 RAG/LLM 통합(`RagBridge`/`--rag`/`seed_class`)은 코드로 구현된
+> 적이 없다. RAG 는 실제 major 버전으로 재도입 예정이며 스캐폴딩(스키마·서비스 설계)만 `rag/`
+> 에 남아 있다. **현재 최신 동작 코드는 이 v8.8 이다.**
 
 ---
 
@@ -135,7 +136,7 @@ sudo python3 pc_sampling_fuzzer_v8.8.py --product P9    --nvme /dev/nvme0n1   # 
 ## 검증
 
 - `python3 -c "import ast; ast.parse(open('pc_sampling_fuzzer_v8.8.py').read())"` 문법 OK.
-- `FUZZER_VERSION == "8.8.0"`. v9.0.py 와 diff 시 버전 문자열/주석 라벨 8줄만 차이(동작 동일).
+- `FUZZER_VERSION == "8.8.0"` (현재 최신 — v9.0 은 삭제됨).
 - `--render-charts <snap.pkl>` 분기가 argparse/디바이스 초기화보다 먼저 실행되어 렌더만 하고 종료.
 - 차트 렌더가 이제 별도 프로세스라, 렌더 크래시 시 `.chart_render.log` + `[Graph] ⚠️` 경고만 남고
   fuzzer 본체·호스트 무영향.

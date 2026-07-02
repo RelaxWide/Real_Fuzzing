@@ -8,7 +8,7 @@
 
 usage:
     python3 export_cmd_schemas.py [fuzzer.py 경로] [출력.json 경로]
-기본: ../pc_sampling_fuzzer_v9.0.py  →  ./cmd_schemas.json
+기본: ../pc_sampling_fuzzer_v8.8.py  →  ./cmd_schemas.json
 """
 import importlib.util
 import json
@@ -16,11 +16,11 @@ import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-_DEFAULT_FUZZER = _HERE.parent / "pc_sampling_fuzzer_v9.0.py"
+_DEFAULT_FUZZER = _HERE.parent / "pc_sampling_fuzzer_v8.8.py"
 
 
 def _load_fuzzer(path: Path):
-    # 파일명에 '.'(v9.0)이 있어 일반 import 불가 → importlib 로 파일 경로 로드.
+    # 파일명에 '.'(v8.8)이 있어 일반 import 불가 → importlib 로 파일 경로 로드.
     spec = importlib.util.spec_from_file_location("fuzzer_mod", str(path))
     m = importlib.util.module_from_spec(spec)
     sys.modules["fuzzer_mod"] = m   # dataclass __module__ 이슈 방지(선등록)

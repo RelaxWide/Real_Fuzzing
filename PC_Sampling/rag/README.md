@@ -1,4 +1,4 @@
-# RAG seed/sequence/classification — v9.0 (작업 중)
+# RAG seed/sequence/classification — 향후 major (미구현, 스캐폴딩만)
 
 NVMe base / 고객·vendor / TCG·ATA 스펙의 산문 지식을 RAG/LLM 으로 활용해 ① spec-aware 시드 생성
 ② 기존 시드 유의미성 분류·필터링 ③ 시퀀스 skeleton ④ coverage plateau 시 보강을 제공하기 위한
@@ -6,7 +6,7 @@ NVMe base / 고객·vendor / TCG·ATA 스펙의 산문 지식을 RAG/LLM 으로 
 로만 통신한다. (전체 설계는 세션 plan 참조.)
 
 ## 2노드 구성
-- **Test PC**: NVMe + `pc_sampling_fuzzer_v9.0.py` 실행(stdlib-only, LLM 미설치).
+- **Test PC**: NVMe + `pc_sampling_fuzzer_v8.8.py` 실행(stdlib-only, LLM 미설치).
 - **Intranet PC**: RAG 서비스 + 사내 LLM(HTTP REST, OpenAI 호환) + 로컬 임베딩. 스펙 문서 로컬 read.
 - **공유 FS(NFS/SMB)**: `rag/{requests,inbox,sequences,archive,rejects,status}` drop-box.
 
