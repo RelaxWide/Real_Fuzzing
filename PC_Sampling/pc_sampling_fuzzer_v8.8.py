@@ -470,7 +470,8 @@ MOPT_CORE_PERIOD  = _MU['mopt_core_period']
 MAX_CORPUS_HARD_LIMIT = _FZ['max_corpus_hard_limit']
 
 # v8.3: 외부 파일 경로/파일명 (paths 섹션) — 메서드 본문에서 참조 (script_dir 기준).
-UFAS_BINARY        = _P['ufas_binary']            # crash UFAS 덤프 실행 파일
+UFAS_BINARY        = _P['ufas_binary']            # crash UFAS 덤프 실행 파일 (PM9M1/BM9H1)
+DEBUG_TOOL_BINARY  = _P.get('debug_tool_binary', 'Debug_Tool_v1.0.0.2')  # crash P9 RDDump 실행 파일 (UFAS 대체)
 JLINK_DUMP_SCRIPT  = _P['jlink_dump_script']      # crash J-Link 메모리 덤프 셸 스크립트
 DEBUG_PACKAGE_DIR  = _P['debug_package_dir']      # vendor 파서 위치 (script_dir 기준 상대)
 PARSER_SCRIPT_SH   = _P['parser_script_sh']       # customer parsing tool (.sh 우선)
@@ -1082,6 +1083,7 @@ class FuzzConfig:
     fw_slot: int = FW_SLOT              # FWCommit 슬롯 번호
 
     enable_ufas: bool = True            # crash 시 UFAS 펌웨어 덤프 실행 여부 (--no-ufas로 비활성화)
+    enable_debug_tool_dump: bool = False  # crash 시 P9 Debug_Tool RDDump 실행 여부 (UFAS 대체, --no-debug-tool-dump)
     enable_jlink_dump: bool = True      # crash 시 JLink 메모리 덤프 실행 여부 (--no-jlink-dump로 비활성화)
 
     prefill: bool = False               # POR 전 드라이브 전체 쓰기 (GC/WL 트리거용, --prefill)
@@ -8479,6 +8481,99 @@ class NVMeFuzzer:
         else:
             log.warning(f"[UFAS] 덤프 실패 (rc={rc})")
 
+    def _run_debug_tool_dump(self) -> None:
+        """crash 발생 시 P9 Debug_Tool RDDump 를 실행한다 (UFAS 대체).
+
+        실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./Debug_Tool_v1.0.0.2
+        명령: ./Debug_Tool_v1.0.0.2 RDDump <controller device>
+        device 경로(/dev/nvmeN)는 --nvme/config 에 맞춰 _ctrl_device() 로 자동 결정
+        (상황별 번호 변경). P9 는 J-Link/UFAS 를 쓰지 않으므로 이 경로만 탄다.
+        Popen 으로 PID 추적, timeout 후 D-state 대비 포기 처리(UFAS 와 동일 구조).
+        """
+        TIMEOUT = 600   # 10분 — 펌웨어 덤프는 수 분 소요될 수 있음
+
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        tool_path = os.path.join(script_dir, DEBUG_TOOL_BINARY)
+
+        log.warning(f"[DebugTool] 실행 파일 경로: {tool_path}")
+        if not os.path.isfile(tool_path):
+            log.warning("[DebugTool] 실행 파일 없음 — 덤프 건너뜀")
+            return
+        if not os.access(tool_path, os.X_OK):
+            log.warning("[DebugTool] 실행 권한 없음 (chmod +x 필요) — 덤프 건너뜀")
+            return
+        log.warning("[DebugTool] 실행 파일 확인 OK")
+
+        device = self._ctrl_device()   # 상황별 컨트롤러 경로 (/dev/nvme0 등)
+        cmd = [tool_path, 'RDDump', device]
+        log.warning(f"[DebugTool] 실행 명령: {' '.join(cmd)}")
+        log.warning(f"[DebugTool] 작업 디렉토리: {script_dir}")
+
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=script_dir,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            log.warning(f"[DebugTool] Popen 실패: {e}")
+            return
+
+        log.warning(f"[DebugTool] 프로세스 시작 PID={proc.pid} — 최대 {TIMEOUT}초 대기")
+
+        import threading
+        _result: dict = {}
+
+        def _communicate():
+            try:
+                out, err = proc.communicate()
+                _result['stdout'] = out
+                _result['stderr'] = err
+                _result['rc'] = proc.returncode
+            except Exception as ex:
+                _result['error'] = ex
+
+        t = threading.Thread(target=_communicate, daemon=True)
+        t.start()
+
+        POLL_INTERVAL = 30
+        waited = 0
+        while waited < TIMEOUT:
+            t.join(timeout=POLL_INTERVAL)
+            if not t.is_alive():
+                break
+            waited += POLL_INTERVAL
+            log.warning(f"[DebugTool] 진행 중... {waited}s 경과")
+
+        if t.is_alive():
+            log.warning(f"[DebugTool] {TIMEOUT}초 timeout — SIGKILL 전송 (PID={proc.pid})")
+            try:
+                proc.kill()
+            except Exception as e:
+                log.warning(f"[DebugTool] kill 실패: {e}")
+            t.join(timeout=5)
+            if t.is_alive():
+                log.warning("[DebugTool] kill 후에도 프로세스 미종료 — D-state 의심, 포기")
+            else:
+                log.warning("[DebugTool] kill 후 프로세스 종료 확인")
+            return
+
+        if 'error' in _result:
+            log.warning(f"[DebugTool] communicate 오류: {_result['error']}")
+            return
+
+        rc = _result.get('rc', -1)
+        out = _result.get('stdout', b'').decode(errors='replace').strip()
+        err = _result.get('stderr', b'').decode(errors='replace').strip()
+        if out:
+            log.info(f"[DebugTool] stdout:\n{out}")
+        if err:
+            log.info(f"[DebugTool] stderr:\n{err}")
+        if rc == 0:
+            log.warning("[DebugTool] RDDump 완료 (rc=0)")
+        else:
+            log.warning(f"[DebugTool] RDDump 실패 (rc={rc})")
+
     def _collect_crash_artifacts(self, crash_time: datetime) -> None:
         """JLink/UFAS dump 완료 후 관련 파일을 날짜 폴더에 모아 복사한다.
 
@@ -9347,6 +9442,16 @@ class NVMeFuzzer:
             log.warning("[UFAS] _run_ufas_dump 반환")
         else:
             log.warning("[TIMEOUT] UFAS 덤프 건너뜀 (--no-ufas)")
+
+        # 3.7-b) P9 Debug_Tool RDDump — UFAS 대체 (P9 는 JLink/UFAS 미사용).
+        #        ./Debug_Tool_v1.0.0.2 RDDump <controller device>. device 는 상황별 자동.
+        if self.config.enable_debug_tool_dump:
+            log.warning("[TIMEOUT] P9 Debug_Tool RDDump 를 실행합니다...")
+            try:
+                self._run_debug_tool_dump()
+            except Exception as _dt_exc:
+                log.warning(f"[DebugTool] _run_debug_tool_dump 예기치 않은 예외: {_dt_exc}")
+            log.warning("[DebugTool] _run_debug_tool_dump 반환")
 
         # 3.8) 모든 dump 완료 후 artifact 수집 (crash 폴더에 날짜 폴더 생성)
         log.warning("[TIMEOUT] Crash artifact 수집을 시작합니다...")
@@ -12167,6 +12272,8 @@ if __name__ == "__main__":
                         help='crash 시 UFAS 펌웨어 덤프 건너뜀 (기본: ./ufas 파일이 있으면 자동 실행)')
     parser.add_argument('--no-jlink-dump', action='store_true', default=False,
                         help='crash 시 JLink 메모리 덤프 건너뜀 (기본: run_smi_mem_dump_JLINK_USB.sh가 있으면 자동 실행)')
+    parser.add_argument('--no-debug-tool-dump', action='store_true', default=False,
+                        help='crash 시 P9 Debug_Tool RDDump 건너뜀 (기본: 제품 profile 에서 활성 시 자동 실행)')
     parser.add_argument('--no-state', action='store_true', default=False,
                         help='State monitoring 비활성화 (기본: 100회마다 nvme smart-log / get-log 실행)')
     parser.add_argument('--no-vmon', action='store_true', default=False,
@@ -12304,6 +12411,7 @@ if __name__ == "__main__":
             'func_file':         'functions.txt',
             'enable_ufas':       True,
             'ufas_ini':          'PM9M1_A815.ini',
+            'enable_debug_tool_dump': False,
             'enable_jlink_dump': True,
             'sampler_type':      'pcsr',
             'go_settle_ms':      0,
@@ -12377,6 +12485,7 @@ if __name__ == "__main__":
         enable_por=not args.no_por,
         # v8.0: profile 이 끈 제품(P9)은 CLI 와 무관하게 비활성 유지
         enable_ufas=_profile['enable_ufas'] and not args.no_ufas,
+        enable_debug_tool_dump=_profile.get('enable_debug_tool_dump', False) and not args.no_debug_tool_dump,
         enable_jlink_dump=_profile['enable_jlink_dump'] and not args.no_jlink_dump,
         state_enabled=not args.no_state,
         vmon_enabled=not args.no_vmon,

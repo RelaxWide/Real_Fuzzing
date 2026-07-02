@@ -41,6 +41,7 @@
     "fw_bin": null,
     "pmu_script": "pmu_4_1.py",
     "ufas_binary": "ufas",
+    "debug_tool_binary": "Debug_Tool_v1.0.0.2",
     "jlink_dump_script": "run_smi_mem_dump_JLINK_USB.sh",
     "debug_package_dir": "DebugPackage/smi_mem_parsing",
     "parser_script_sh": "customer_parsing_dump.sh",
@@ -1009,6 +1010,7 @@
       "bb_file": "basic_blocks_P9.txt",
       "func_file": "functions_P9.txt",
       "enable_ufas": false,
+      "enable_debug_tool_dump": true,
       "enable_jlink_dump": false,
       "state_fields": "p9"
     }
