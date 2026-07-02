@@ -379,3 +379,6 @@ TSWLatexianTemp*
 node_modules
 
 output
+
+# WSL/Windows alternate-data-stream 메타데이터 (다운로드 파일에 붙음 — 리포에 불필요)
+*:Zone.Identifier
