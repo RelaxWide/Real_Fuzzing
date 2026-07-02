@@ -5260,6 +5260,10 @@ class NVMeFuzzer:
             cdw10=seed.cdw10, cdw11=seed.cdw11,
             cdw12=seed.cdw12, cdw13=seed.cdw13,
             cdw14=seed.cdw14, cdw15=seed.cdw15,
+            opcode_override=seed.opcode_override,
+            nsid_override=seed.nsid_override,
+            force_admin=seed.force_admin,
+            data_len_override=seed.data_len_override,
         )
 
     def _mutate(self, seed: Seed) -> Seed:
@@ -6528,7 +6532,8 @@ class NVMeFuzzer:
                 for line in r.stdout.splitlines():
                     if 'value:' in line.lower() or 'Current value' in line:
                         import re as _re
-                        m = _re.search(r'0x([0-9a-fA-F]+)', line)
+                        m = _re.search(r'value\s*:?\s*0x([0-9a-fA-F]+)',
+                                       line, _re.IGNORECASE)
                         if m:
                             self._orig_apst_cdw11 = int(m.group(1), 16)
                             break
@@ -6670,7 +6675,8 @@ class NVMeFuzzer:
             for line in r.stdout.splitlines():
                 if 'value:' in line.lower() or 'Current value' in line:
                     import re as _re
-                    m = _re.search(r'0x([0-9a-fA-F]+)', line)
+                    m = _re.search(r'value\s*:?\s*0x([0-9a-fA-F]+)',
+                                   line, _re.IGNORECASE)
                     if m:
                         self._orig_keepalive_val = int(m.group(1), 16)
                         break
@@ -8564,7 +8570,10 @@ class NVMeFuzzer:
         for seed in seq_seed.commands:
             cmd = seed.cmd
             opcode = seed.opcode_override if seed.opcode_override is not None else cmd.opcode
-            nsid   = seed.nsid_override   if seed.nsid_override   is not None else ns
+            # 전송 경로(_send_nvme_command)와 동일하게: needs_namespace=False 명령은
+            # nsid=0 으로 전송되므로 replay 도 0 이어야 재현된다(원래 ns 로 기록해 불일치).
+            nsid   = (seed.nsid_override if seed.nsid_override is not None
+                      else (ns if cmd.needs_namespace else 0))
             if seed.force_admin is not None:
                 passthru_type = 'admin-passthru' if seed.force_admin else 'io-passthru'
             else:
@@ -9029,8 +9038,17 @@ class NVMeFuzzer:
           - 명령 데이터: replay_data_<tag>/data_NNN.bin 에 이미 포함됨
           - dmesg: .json 의 dmesg_snapshot 필드 + dmesg_<ts>.txt (수집 시점) 으로 충분
         """
-        input_hash = hashlib.md5(data).hexdigest()[:12]
-        filename = f"crash_{seed.cmd.name}_{hex(seed.cmd.opcode)}_{input_hash}"
+        # crash 식별자는 data 만이 아니라 명령 파라미터(cdw/override) 전체로 해시한다.
+        # data 가 빈 명령(DeviceSelfTest 등)은 md5(b'') 가 상수라, cdw10 만 다른 별개
+        # 크래시가 같은 파일명으로 서로 덮어쓰던 문제 방지. opcode 도 변형 후 실제값 사용.
+        _actual_opcode = (seed.opcode_override if seed.opcode_override is not None
+                          else seed.cmd.opcode)
+        _ident = (data, seed.cdw2, seed.cdw3, seed.cdw10, seed.cdw11,
+                  seed.cdw12, seed.cdw13, seed.cdw14, seed.cdw15,
+                  seed.opcode_override, seed.nsid_override,
+                  seed.force_admin, seed.data_len_override)
+        input_hash = hashlib.md5(repr(_ident).encode()).hexdigest()[:12]
+        filename = f"crash_{seed.cmd.name}_{hex(_actual_opcode)}_{input_hash}"
         filepath = self.crashes_dir / filename
 
         meta = self._seed_meta(seed)
@@ -9485,7 +9503,7 @@ class NVMeFuzzer:
         '_sa_entered_funcs', '_sa_func_ends', '_sa_func_entries', '_sa_func_names',
         '_sa_loaded', '_sa_total_bbs', '_sa_total_funcs', 'cmd_pcs', 'cmd_stats',
         'cmd_traces', 'executions', 'mopt_finds', 'mopt_uses', 'mutation_stats',
-        'rc_stats',
+        'rc_stats', 'NUM_MUTATION_OPS',
     )
 
     @staticmethod
