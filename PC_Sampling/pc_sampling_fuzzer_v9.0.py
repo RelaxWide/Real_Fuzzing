@@ -11089,7 +11089,18 @@ class NVMeFuzzer:
         # POR Phase 2: boot sweep 완료 후 PCIe rescan + NVMe 응답 확인
         # firmware 부팅이 완료됐을 것으로 기대하므로 대부분 즉시 성공.
         if self.config.enable_por:
-            self._por_pcie_rescan()
+            # POR 후 device(/dev/nvme) 재검출 실패 시 idle 유니버스/메인 루프로
+            # 진입하지 않고 abort — 모든 NVMe 명령이 실패하는 무의미한 세션 방지.
+            # (_por_pcie_rescan 은 por_boot_wait 동안 1초 간격으로 rescan+id-ctrl 재시도)
+            if not self._por_pcie_rescan():
+                log.error(f"[POR] NVMe 장치 미검출 — POR 후 "
+                          f"por_boot_wait({self.config.por_boot_wait:.0f}s) 내 재검출 실패. "
+                          f"세션을 중단합니다 (전원/케이블/--por-boot-wait 확인).")
+                try:
+                    self.sampler.close()
+                except Exception:
+                    pass
+                return
             # rescan 후 PCIe capability offset 재탐지 — 커널이 장치를 재초기화하면서
             # L1SS 레지스터가 리셋될 수 있으므로 재탐지 후 L0으로 명시 초기화.
             if self.config.pm_inject_prob > 0:
