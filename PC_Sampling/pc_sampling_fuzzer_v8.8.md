@@ -88,6 +88,55 @@ finalize 되며 **`Segmentation fault (core dumped)`** 를 유발했다(P9/`jlin
 
 ---
 
+## v8.8 세션 후속 (코드 리뷰 수정 · POR · P9 dump)
+
+v8.8 배포 후 같은 세션에서 이어진 수정·추가. 모두 v8.8.py 에 반영됨(별도 버전 안 올림).
+
+### A. 코드 리뷰로 확인된 확정 버그 6건 수정
+620KB 단일 파일을 영역별로 검토해 트레이스로 확정한 버그만 수정(동작/알고리즘 변경이 얽힌
+항목은 별도 보류).
+
+1. **차트 렌더 subprocess 회귀** — `_CHART_SNAPSHOT_ATTRS` 에 `NUM_MUTATION_OPS` 누락으로
+   렌더 subprocess(`__init__` 우회)가 `_generate_mutation_chart` 에서 매 주기 `AttributeError`
+   (rc=3) → mutation/csfuzz 차트가 실행 중 갱신 안 되던 문제. 스냅샷 속성에 추가.
+2. **APST 원본값 오파싱** — `nvme get-feature` 한 줄 출력에서 정규식이 줄 첫머리 Feature ID
+   (`0x0c`)를 잡던 버그 → `value:` 뒤로 앵커. 종료 시 잘못된 값 복원 방지.
+3. **KeepAlive 원본값 오파싱** — 동일(`0x0f`=FID) 수정 → 종료 시 KATO 오복원(예: 15) 방지.
+4. **크래시 파일명 충돌** — `md5(data)` 만 써서 빈-data 명령(DeviceSelfTest 등)이 서로
+   덮어쓰던 문제 → cdw/override 전체 + `actual_opcode` 해시로 파일명 구성.
+5. **seq replay nsid** — `needs_namespace=False` 명령은 전송 시 nsid=0 인데 replay 는 1 로
+   기록해 재현 실패 → 전송 경로와 동일 로직으로 수정.
+6. **`_splice` override 손실** — 새 Seed 에 `opcode/nsid/force_admin/data_len` override 를
+   안 넘겨 splice(15%) 때 변형 의도 소실 → 4개 필드 전달.
+
+> **보류(의도/알고리즘 확인 필요)**: energy 스케줄 포화, MOpt 크레딧 순서, 변이 필드폭 overflow
+> 붕괴, CSFuzz-p bang-bang, 및 잠재 항목(J-Link ReadReg signed[P9 범위는 양수라 미발동] 등).
+
+### B. POR 후 device 미검출 대기 30s + abort
+POR 시작 경로에서 `_por_pcie_rescan()` 반환값을 검사하지 않아, `/dev/nvme` 재검출 실패에도
+idle 유니버스→메인 루프로 진입(모든 NVMe 명령 실패)하던 문제.
+- `por_boot_wait` 8 → **30초**(config): `_por_pcie_rescan` 이 1초 간격 rescan+id-ctrl 을 최대
+  30초까지 재시도.
+- 시작 경로 `run()`: `if not self._por_pcie_rescan():` → 미검출 시 샘플러를 닫고 abort.
+  (복구 경로 8339 는 원래 검사 중 — 시작 경로 누락만 보완.)
+
+### C. P9 crash dump — Debug_Tool RDDump (UFAS 대체)
+P9 는 J-Link/UFAS 를 안 써서 crash 시 아무 덤프도 안 하던 것을 전용 경로로 대체.
+- config: `paths.debug_tool_binary="Debug_Tool_v1.0.0.2"`, `products.P9.enable_debug_tool_dump=true`
+  (`enable_ufas`/`enable_jlink_dump` 는 false 유지).
+- 신규 `_run_debug_tool_dump()` — `./Debug_Tool_v1.0.0.2 RDDump <device>` 실행. `<device>` 는
+  `_ctrl_device()` 로 상황별 자동(`/dev/nvme0` 등). UFAS 와 동일한 Popen/폴링/timeout-kill 구조.
+- crash 핸들러의 UFAS 블록 뒤에 `enable_debug_tool_dump` 블록 추가. CLI `--no-debug-tool-dump`.
+- **P9 는 JLink dump 로직을 원래 안 탐**: `enable_jlink_dump=false` + `_shutdown_openocd_for_jlink`
+  가 `JLinkHaltSampler` 면 early-return(v8.1). 추가 조치 불필요.
+- 평가 환경: `Debug_Tool_v1.0.0.2` 를 `PC_Sampling/` 에 두고 `chmod +x`(없으면 로그 후 안전 skip).
+
+### D. v9.0 삭제
+구 `pc_sampling_fuzzer_v9.0.py`/`.md` 삭제(위 상단 노트 참조). RAG 는 실제 major 로 재도입 예정,
+스캐폴딩만 `rag/` 에 유지.
+
+---
+
 ## v8.7 이하 (전부 v8.8 에 그대로 유지)
 
 세부는 각 버전 md 참조. 요지만:
