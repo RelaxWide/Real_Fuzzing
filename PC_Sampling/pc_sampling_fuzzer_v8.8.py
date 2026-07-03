@@ -1184,6 +1184,7 @@ class _FuzzingTerminalFilter(logging.Filter):
         r'|\[IO-WL\]'                   # v8.4: IO 워크로드 블록/검증 로그
         r'|\[DevInfo\]'                 # Device Information(주기 출력) 터미널 노출
         r'|\[Taint\]'                   # v8.6: kernel taint 진단(시작/변화). [VMon] 은 파일만(터미널 제외)
+        r'|\[Sampler\]'                 # 샘플러 halt 실패→복구 알림 (커버리지 측정 정상 재개 확인)
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -2340,6 +2341,12 @@ class OpenOCDPCSampler:
                 if effective_interval > 0:
                     time.sleep(effective_interval)
                 continue
+            # 실패 스트릭 후 성공 시 복구 알림 — "CPU not halted" 가 반복돼도 커버리지
+            # 측정이 재개됨을 확인시켜 준다(3회 이상 연속 실패 후 유효 PC 읽힘). 성공이
+            # 드문 sleep-heavy 워크로드(가벼운 admin 위주)에선 이 로그도 드물게 뜬다.
+            if _consecutive_fail >= 3:
+                log.warning(f"[Sampler] PC 읽기 정상 재개 — halt {_consecutive_fail}회 실패 후 "
+                            f"PC={hex(pcs_tuple[0])} 읽힘 (커버리지 측정 계속됨)")
             _consecutive_fail = 0
 
             # 범위 분류
