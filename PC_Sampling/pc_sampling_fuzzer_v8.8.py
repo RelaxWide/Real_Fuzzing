@@ -1070,6 +1070,8 @@ class FuzzConfig:
 
     # POR
     enable_por:        bool  = ENABLE_POR
+    por_remove_bdf:    Optional[str] = None   # POR PCIe remove 대상 BDF override
+                                              # (제품별; P9: topology 최상단 root port)
     por_poweroff_wait: float = POR_POWEROFF_WAIT
     por_boot_wait:     float = POR_BOOT_WAIT   # PCIe rescan 후 NVMe 응답 최대 대기 (초)
     boot_sweep_s:      float = BOOT_SWEEP_S    # connect() 직후 boot-phase PC 수집 창 (초, 0=비활성화)
@@ -3612,6 +3614,15 @@ class NVMeFuzzer:
                   + f". dd 출력: {_st['tail'][-1] if _st['tail'] else 'N/A'}")
         return False
 
+    def _por_remove_target(self) -> Optional[str]:
+        """POR 시 PCIe 로 remove 할 대상 BDF.
+
+        제품이 por_remove_bdf 를 지정하면 그 BDF 를, 없으면 자동 탐지된 EP 자신
+        (_pcie_bdf)을 반환한다. P9 는 PMU 보드 특성상 device 자신이 아니라
+        `lspci -tvvv` topology 최상단(root port/bridge, 예: 0000:00:01.1)을 제거해야
+        전원 사이클이 제대로 걸린다 → profile 에서 por_remove_bdf 로 지정."""
+        return self.config.por_remove_bdf or self._pcie_bdf
+
     def _power_cycle_ssd(self) -> bool:
         """PMU 보드를 이용한 SSD POR Phase 1: 전원 사이클 + SWD 준비 대기.
 
@@ -3628,14 +3639,15 @@ class NVMeFuzzer:
 
         # 1. PCIe 장치 제거. nvme_kernel_timeout_sec 가 크게 설정된 상태에서 device 가
         # 응답 안 하면 sysfs write 영구 block 가능 → subprocess timeout 10초 강제 진행.
-        if self._pcie_bdf:
-            remove_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/remove"
+        _rm_bdf = self._por_remove_target()
+        if _rm_bdf:
+            remove_path = f"/sys/bus/pci/devices/{_rm_bdf}/remove"
             try:
                 _r = subprocess.run(
                     ['bash', '-c', f'echo 1 > {remove_path}'],
                     timeout=10, capture_output=True)
                 if _r.returncode == 0:
-                    log.warning(f"[POR] PCIe 장치 제거: {self._pcie_bdf}")
+                    log.warning(f"[POR] PCIe 장치 제거: {_rm_bdf}")
                 else:
                     log.warning(f"[POR] PCIe 장치 제거 rc={_r.returncode}: "
                                 f"{_r.stderr.decode(errors='replace').strip()} — 무시")
@@ -8305,14 +8317,15 @@ class NVMeFuzzer:
 
         # 1-b) PCIe 장치 제거 — link down 후라 in-flight ioctl 없음 → sysfs write
         # 빠르게 통과. driver unbind + BDF entry 정리 → PMU on 시 fresh bind.
-        if self._pcie_bdf:
-            _remove_path = f"/sys/bus/pci/devices/{self._pcie_bdf}/remove"
+        _rm_bdf = self._por_remove_target()
+        if _rm_bdf:
+            _remove_path = f"/sys/bus/pci/devices/{_rm_bdf}/remove"
             try:
                 _r = subprocess.run(
                     ['bash', '-c', f'echo 1 > {_remove_path}'],
                     timeout=10, capture_output=True)
                 if _r.returncode == 0:
-                    log.warning(f"[POR] PCIe 장치 제거 (driver unbind): {self._pcie_bdf}")
+                    log.warning(f"[POR] PCIe 장치 제거 (driver unbind): {_rm_bdf}")
                 else:
                     log.warning(f"[POR] PCIe remove rc={_r.returncode}: "
                                 f"{_r.stderr.decode(errors='replace').strip()} — 무시")
@@ -12490,6 +12503,7 @@ if __name__ == "__main__":
         ignore_opcodes=ignore_opcodes,
         # 토글
         enable_por=not args.no_por,
+        por_remove_bdf=_profile.get('por_remove_bdf'),   # 제품별 POR remove BDF override
         # v8.0: profile 이 끈 제품(P9)은 CLI 와 무관하게 비활성 유지
         enable_ufas=_profile['enable_ufas'] and not args.no_ufas,
         enable_debug_tool_dump=_profile.get('enable_debug_tool_dump', False) and not args.no_debug_tool_dump,
