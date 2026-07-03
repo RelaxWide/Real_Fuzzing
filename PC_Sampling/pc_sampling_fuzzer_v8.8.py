@@ -2684,17 +2684,18 @@ class JLinkHaltSampler(OpenOCDPCSampler):
     def _read_all_pcs(self) -> Optional[Tuple[int, ...]]:
         """halt → register_read(PC) → JLINKARM_Go() 로 단일코어 PC 1개. 실패 시 None.
 
-        모든 pylink 호출은 _jlink_lock 으로 직렬화. resume 은 항상 JLINKARM_Go()
-        (CPU 리셋 없음). go 실패해도 restart() 로 폴백하지 않음(살아있는 SSD 리셋 방지).
-        halted() 폴링은 ~50ms 상한 → 못 멈추면 go 후 None(연속 실패는 base 가 복구 신호로).
+        모든 pylink 호출은 _jlink_lock 으로 직렬화. resume(Go) 은 **halt 성공 시에만** 호출
+        (CPU 리셋 없음). 실행 중 코어에 Go 를 보내면 DLL 이 'CPU is not halted' 를 찍으므로
+        halt 실패 시엔 Go 하지 않는다. go 실패해도 restart() 로 폴백하지 않음(SSD 리셋 방지).
+        halted() 폴링은 ~50ms 상한 → 못 멈추면 Go 없이 None(연속 실패는 base 가 복구 신호로).
         """
         if self.jlink is None:
             return None
         with self._jlink_lock:
             pc = None
+            halted = False
             try:
                 self._halt_func()
-                halted = False
                 for _ in range(50):   # 최대 ~50ms 대기
                     try:
                         if self.jlink.halted():
@@ -2705,13 +2706,18 @@ class JLinkHaltSampler(OpenOCDPCSampler):
                     time.sleep(0.001)
                 if halted:
                     pc = self._read_reg_func(self._pc_reg_index)
-                self._go_func()       # 항상 resume (halt 로 남기지 않음)
+                    self._go_func()   # halt 성공 시에만 resume
+                # halt 실패(코어가 clock-gated/WFI 로 안 멈춤)면 Go 하지 않는다: 코어는
+                # 이미 실행 중이라 resume 할 게 없고, 실행 중 코어에 JLINKARM_Go 를 보내면
+                # DLL 이 "CPU is not halted" 를 찍는다(그동안 이 노이즈의 실제 원인). 이번
+                # 샘플만 PC 를 못 읽고 코어는 계속 실행 → 다음 시도에서 잡으면 됨.
             except Exception as e:
                 log.warning(f"[J-Link] _read_all_pcs 예외: {e}")
-                try:
-                    self._go_func()
-                except Exception:
-                    pass
+                if halted:
+                    try:
+                        self._go_func()   # 실제로 멈췄을 때만 resume
+                    except Exception:
+                        pass
                 return None
         if pc is None:
             return None
@@ -10983,44 +10989,6 @@ class NVMeFuzzer:
         log.warning(f"[VMon] vmalloc/메모리 진단 시작 ({VMON_EXEC_INTERVAL}회 exec 마다, "
                     f"/proc/meminfo 만 — 터미널 미노출, 파일 로그만)")
 
-    def _suppress_dll_stderr(self) -> None:
-        """J-Link DLL 이 fd 2 로 직접 찍는 halt 노이즈('CPU is not halted' 등)를 억제.
-
-        DLL 은 Python sys.stderr 가 아니라 C 레벨 fd 2 로 직접 쓴다. 그래서 Python
-        logging(console handler)의 stream 을 '보존한 실 stderr' 로 재지정한 뒤 fd 2 만
-        /dev/null 로 돌린다 → DLL 메시지는 사라지고 Python 로그·파일 로그는 그대로 출력.
-        _restore_dll_stderr 로 teardown 시 원복(트레이스백 유실 방지). 실패해도 무해."""
-        if getattr(self, '_dll_stderr_suppressed', False):
-            return
-        try:
-            self._dll_orig_stderr_fd = os.dup(2)   # 원복용 실 stderr 사본
-            _preserved = os.fdopen(os.dup(2), 'w', encoding='utf-8', errors='replace')
-            for _h in list(log.handlers):
-                if (isinstance(_h, logging.StreamHandler)
-                        and not isinstance(_h, logging.FileHandler)):
-                    try:
-                        _h.setStream(_preserved)   # Python 콘솔 로그 → 보존 stderr
-                    except Exception:
-                        pass
-            _dn = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(_dn, 2)                          # fd 2(DLL) → /dev/null
-            os.close(_dn)
-            self._dll_stderr_suppressed = True
-            log.warning("[Sampler] J-Link DLL stderr(halt 메시지) 억제 활성 — Python 로그는 계속 출력")
-        except Exception as _e:
-            log.info(f"[Sampler] DLL stderr 억제 실패(무시): {_e}")
-
-    def _restore_dll_stderr(self) -> None:
-        """_suppress_dll_stderr 로 돌린 fd 2 를 실 stderr 로 원복."""
-        if not getattr(self, '_dll_stderr_suppressed', False):
-            return
-        try:
-            os.dup2(self._dll_orig_stderr_fd, 2)
-            os.close(self._dll_orig_stderr_fd)
-        except Exception:
-            pass
-        self._dll_stderr_suppressed = False
-
     def run(self):
         global log
 
@@ -11283,11 +11251,6 @@ class NVMeFuzzer:
                 return
             log.error("J-Link connection failed, aborting")
             return
-
-        # jlink_halt: 코어 실행 확인 후 연결됐으므로, J-Link DLL 이 fd 2 로 직접 찍는
-        # halt 노이즈(idle 구간의 'CPU (is|could) not ... halted')를 억제(Python 로그 유지).
-        if self.config.sampler_type == 'jlink_halt':
-            self._suppress_dll_stderr()
 
         # 비침습 PCSR(PM9M1/BM9H1) 경로만: boot sweep(부팅 중 PC 수집) → rescan.
         # halt 경로는 위에서 rescan 선행 + boot sweep 생략.
@@ -12225,9 +12188,6 @@ class NVMeFuzzer:
                 self._apst_restore()
                 self._keepalive_restore()
                 self._restore_nvme_timeouts()
-
-            # DLL stderr 억제 원복(jlink_halt 에서 활성화됐던 경우) — 이후 로그/트레이스백 정상 출력
-            self._restore_dll_stderr()
 
             # 정리 완료 — SIGINT 핸들러 복원
             if _old_sigint is not None:
