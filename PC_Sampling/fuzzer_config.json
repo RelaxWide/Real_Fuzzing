@@ -998,7 +998,7 @@
       "jlink_device": "Cortex-R5",
       "sampler_type": "jlink_halt",
       "go_settle_ms": 50,
-      "jlink_speed": 4000,
+      "jlink_speed": 2000,
       "jlink_ap_index": 0,
       "pc_reg_index": null,
       "invalid_pc_vals": [
