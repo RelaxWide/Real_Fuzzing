@@ -10983,6 +10983,44 @@ class NVMeFuzzer:
         log.warning(f"[VMon] vmalloc/메모리 진단 시작 ({VMON_EXEC_INTERVAL}회 exec 마다, "
                     f"/proc/meminfo 만 — 터미널 미노출, 파일 로그만)")
 
+    def _suppress_dll_stderr(self) -> None:
+        """J-Link DLL 이 fd 2 로 직접 찍는 halt 노이즈('CPU is not halted' 등)를 억제.
+
+        DLL 은 Python sys.stderr 가 아니라 C 레벨 fd 2 로 직접 쓴다. 그래서 Python
+        logging(console handler)의 stream 을 '보존한 실 stderr' 로 재지정한 뒤 fd 2 만
+        /dev/null 로 돌린다 → DLL 메시지는 사라지고 Python 로그·파일 로그는 그대로 출력.
+        _restore_dll_stderr 로 teardown 시 원복(트레이스백 유실 방지). 실패해도 무해."""
+        if getattr(self, '_dll_stderr_suppressed', False):
+            return
+        try:
+            self._dll_orig_stderr_fd = os.dup(2)   # 원복용 실 stderr 사본
+            _preserved = os.fdopen(os.dup(2), 'w', encoding='utf-8', errors='replace')
+            for _h in list(log.handlers):
+                if (isinstance(_h, logging.StreamHandler)
+                        and not isinstance(_h, logging.FileHandler)):
+                    try:
+                        _h.setStream(_preserved)   # Python 콘솔 로그 → 보존 stderr
+                    except Exception:
+                        pass
+            _dn = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(_dn, 2)                          # fd 2(DLL) → /dev/null
+            os.close(_dn)
+            self._dll_stderr_suppressed = True
+            log.warning("[Sampler] J-Link DLL stderr(halt 메시지) 억제 활성 — Python 로그는 계속 출력")
+        except Exception as _e:
+            log.info(f"[Sampler] DLL stderr 억제 실패(무시): {_e}")
+
+    def _restore_dll_stderr(self) -> None:
+        """_suppress_dll_stderr 로 돌린 fd 2 를 실 stderr 로 원복."""
+        if not getattr(self, '_dll_stderr_suppressed', False):
+            return
+        try:
+            os.dup2(self._dll_orig_stderr_fd, 2)
+            os.close(self._dll_orig_stderr_fd)
+        except Exception:
+            pass
+        self._dll_stderr_suppressed = False
+
     def run(self):
         global log
 
@@ -11187,9 +11225,40 @@ class NVMeFuzzer:
         else:
             log.info("[POR] 비활성화됨 (--no-por)")
 
-        # OpenOCD 연결: 전원 ON 직후부터 SWD 준비될 때까지 즉시 재시도.
-        # 상한을 boot_sweep_s로 통합 — SWD가 올라오는 즉시 연결 성공 후 남은 시간은
-        # boot sweep PC 수집에 사용. 별도 swd_wait 파라미터 없음.
+        _is_halt = self.config.sampler_type in ('halt', 'jlink_halt')
+
+        def _rescan_and_l0() -> bool:
+            """PCIe rescan(+id-ctrl 재검출). 실패 시 샘플러 닫고 False(→ run abort).
+            성공 시 PM 제품은 L1SS 리셋 대비 재탐지 + L0 초기화."""
+            if not self._por_pcie_rescan():
+                log.error(f"[POR] NVMe 장치 미검출 — POR 후 "
+                          f"por_boot_wait({self.config.por_boot_wait:.0f}s) 내 재검출 실패. "
+                          f"세션을 중단합니다 (전원/케이블/--por-boot-wait 확인).")
+                try:
+                    self.sampler.close()
+                except Exception:
+                    pass
+                return False
+            # rescan 후 PCIe capability offset 재탐지 — 커널이 장치를 재초기화하면서
+            # L1SS 레지스터가 리셋될 수 있으므로 재탐지 후 L0으로 명시 초기화.
+            if self.config.pm_inject_prob > 0:
+                self._detect_pcie_info()
+                self._set_pcie_l_state(PCIeLState.L0)
+                log.warning("[POR] PCIe rescan 후 L0 초기화 완료")
+            return True
+
+        # 침습 halt 샘플러(jlink_halt/halt): DAP 연결만으론 코어 실행을 보장 못 함
+        # (전원 ON 직후 코어가 reset/부팅 전일 수 있음). → device 가 id-ctrl 에 응답
+        # (=코어가 펌웨어 실행 중)한 뒤에 connect 하고, 부팅 중 halt 샘플링(boot sweep)은
+        # 하지 않는다(코어 미실행 상태에서 halt spam 방지). 비침습 PCSR 은 기존대로.
+        if _is_halt and self.config.enable_por:
+            log.warning("[POR] 침습 halt 샘플러 — device id-ctrl 응답(코어 실행) 확인 후 "
+                        "connect (boot sweep 생략)")
+            if not _rescan_and_l0():
+                return
+
+        # 샘플러 연결: 준비될 때까지 즉시 재시도(상한 boot_sweep_s). halt+POR 경로는
+        # 위에서 이미 device 가 올라와 즉시 성공.
         _swd_deadline = time.monotonic() + (
             self.config.boot_sweep_s if self.config.enable_por else 0
         )
@@ -11215,35 +11284,20 @@ class NVMeFuzzer:
             log.error("J-Link connection failed, aborting")
             return
 
-        # Boot-phase PC 수집: connect() 성공 시점부터 남은 boot_sweep_s 창 동안 수집.
-        # firmware 부팅 중 초기화 경로(FTL 테이블 로드 등) PC를 global_coverage에 반영.
-        # 이 시점은 PCIe rescan 전이므로 NVMe 명령 없이 순수 PCSR 폴링만 수행.
-        # --no-jlink 모드면 J-Link 없이 PCSR 못 읽으므로 boot sweep 건너뜀.
-        if not self.config.no_jlink:
-            _sweep_remaining = max(0.0, _swd_deadline - time.monotonic())
-            self._collect_boot_coverage(_sweep_remaining)
+        # jlink_halt: 코어 실행 확인 후 연결됐으므로, J-Link DLL 이 fd 2 로 직접 찍는
+        # halt 노이즈(idle 구간의 'CPU (is|could) not ... halted')를 억제(Python 로그 유지).
+        if self.config.sampler_type == 'jlink_halt':
+            self._suppress_dll_stderr()
 
-        # POR Phase 2: boot sweep 완료 후 PCIe rescan + NVMe 응답 확인
-        # firmware 부팅이 완료됐을 것으로 기대하므로 대부분 즉시 성공.
-        if self.config.enable_por:
-            # POR 후 device(/dev/nvme) 재검출 실패 시 idle 유니버스/메인 루프로
-            # 진입하지 않고 abort — 모든 NVMe 명령이 실패하는 무의미한 세션 방지.
-            # (_por_pcie_rescan 은 por_boot_wait 동안 1초 간격으로 rescan+id-ctrl 재시도)
-            if not self._por_pcie_rescan():
-                log.error(f"[POR] NVMe 장치 미검출 — POR 후 "
-                          f"por_boot_wait({self.config.por_boot_wait:.0f}s) 내 재검출 실패. "
-                          f"세션을 중단합니다 (전원/케이블/--por-boot-wait 확인).")
-                try:
-                    self.sampler.close()
-                except Exception:
-                    pass
-                return
-            # rescan 후 PCIe capability offset 재탐지 — 커널이 장치를 재초기화하면서
-            # L1SS 레지스터가 리셋될 수 있으므로 재탐지 후 L0으로 명시 초기화.
-            if self.config.pm_inject_prob > 0:
-                self._detect_pcie_info()
-                self._set_pcie_l_state(PCIeLState.L0)
-                log.warning("[POR] PCIe rescan 후 L0 초기화 완료")
+        # 비침습 PCSR(PM9M1/BM9H1) 경로만: boot sweep(부팅 중 PC 수집) → rescan.
+        # halt 경로는 위에서 rescan 선행 + boot sweep 생략.
+        if not _is_halt:
+            if not self.config.no_jlink:
+                _sweep_remaining = max(0.0, _swd_deadline - time.monotonic())
+                self._collect_boot_coverage(_sweep_remaining)
+            if self.config.enable_por:
+                if not _rescan_and_l0():
+                    return
 
         # APST / Keep-Alive 비활성화 — NVMe 접근 가능 상태에서 실행
         # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
@@ -12171,6 +12225,9 @@ class NVMeFuzzer:
                 self._apst_restore()
                 self._keepalive_restore()
                 self._restore_nvme_timeouts()
+
+            # DLL stderr 억제 원복(jlink_halt 에서 활성화됐던 경우) — 이후 로그/트레이스백 정상 출력
+            self._restore_dll_stderr()
 
             # 정리 완료 — SIGINT 핸들러 복원
             if _old_sigint is not None:
