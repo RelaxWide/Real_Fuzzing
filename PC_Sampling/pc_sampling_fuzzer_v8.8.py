@@ -2336,12 +2336,19 @@ class OpenOCDPCSampler:
             if pcs_tuple is None:
                 _consecutive_fail += 1
                 if _consecutive_fail >= self._CONSECUTIVE_FAIL_LIMIT:
-                    log.error(f"[OpenOCD] PCSR read 연속 {_consecutive_fail}회 실패 — 샘플링 중단")
+                    log.error(f"[Sampler] PC read 연속 {_consecutive_fail}회 실패 — 이 윈도우 샘플링 중단")
                     self.stop_event.set()
                     self.openocd_error.set()
                     break
-                if effective_interval > 0:
-                    time.sleep(effective_interval)
+                # backoff: 연속 실패 시 재시도 간격을 지수적으로 늘린다. SSD 코어는 I/O-bound
+                # 라 명령 처리 중에도 대부분 WFI(클럭게이팅) 상태이고, 그때 halt 를 두드리면
+                # JLINKARM_Halt 가 timeout → 'CPU could not be halted' 를 찍는다. 잠든 코어를
+                # 50ms 마다 하머링하는 대신 간격을 늘려 실패 halt 시도(=메시지) 자체를 줄인다.
+                # (WFI 구간엔 실행 중 코드가 없어 놓치는 커버리지 없음.) 성공 시 즉시 리셋.
+                # PCSR(effective_interval=0)은 _backoff=0 → 기존과 동일(영향 없음).
+                _backoff = min(effective_interval * (2 ** min(_consecutive_fail - 1, 5)), 1.0)
+                if _backoff > 0:
+                    time.sleep(_backoff)
                 continue
             # 실패 스트릭 후 성공 시 복구 알림 — "CPU not halted" 가 반복돼도 커버리지
             # 측정이 재개됨을 확인시켜 준다(3회 이상 연속 실패 후 유효 PC 읽힘). 성공이
