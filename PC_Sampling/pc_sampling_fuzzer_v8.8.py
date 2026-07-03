@@ -1181,7 +1181,7 @@ class _FuzzingTerminalFilter(logging.Filter):
     _ALLOW = _re.compile(
         r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
         r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]|\[State-Replay\]'
-        r'|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]|\[Probe-'
+        r'|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]|\[BootSweep\]|\[Probe-'
         r'|\[State-Snap\]|\[SMART\]'   # v8.3: 주기적 SMART/전체 state field 출력 터미널 노출
         r'|\[IO-WL\]'                   # v8.4: IO 워크로드 블록/검증 로그
         r'|\[DevInfo\]'                 # Device Information(주기 출력) 터미널 노출
@@ -3640,7 +3640,11 @@ class NVMeFuzzer:
         # 1. PCIe 장치 제거. nvme_kernel_timeout_sec 가 크게 설정된 상태에서 device 가
         # 응답 안 하면 sysfs write 영구 block 가능 → subprocess timeout 10초 강제 진행.
         _rm_bdf = self._por_remove_target()
+        if not _rm_bdf:
+            log.warning("[POR] PCIe remove 대상 BDF 없음 — remove 건너뜀 (전원 사이클만 수행)")
         if _rm_bdf:
+            log.warning(f"[POR] PCIe remove 시도: {_rm_bdf} "
+                        f"(echo 1 > /sys/bus/pci/devices/{_rm_bdf}/remove)")
             remove_path = f"/sys/bus/pci/devices/{_rm_bdf}/remove"
             try:
                 _r = subprocess.run(
@@ -3689,6 +3693,8 @@ class NVMeFuzzer:
         오는 경우 다중 rescan 으로 다시 잡힘). 단일 rescan 만 했을 때 놓치는 케이스
         를 보완.
         """
+        log.warning(f"[POR] PCIe rescan 시작 — device({self.config.nvme_device}) 재검출 대기 "
+                    f"(최대 {self.config.por_boot_wait:.0f}s, 1초 간격 rescan + id-ctrl 재시도)")
         deadline = time.monotonic() + self.config.por_boot_wait
         attempt = 0
         _first_rescan = True
@@ -3761,6 +3767,12 @@ class NVMeFuzzer:
             f"[BootSweep] 완료: {samples}회 샘플, 신규 PC {len(new_pcs)}개, "
             f"실패={failures}회 → global_coverage={len(self.sampler.global_coverage)}개"
         )
+        if samples > 0 and failures == samples:
+            log.error(
+                "[BootSweep] 코어를 한 번도 halt하지 못함 (전 샘플 실패) — 코어가 실행 상태가 "
+                "아닐 가능성. halt 는 침습이라 코어가 '실행 중'이어야만 PC 를 읽을 수 있는데, "
+                "POR(전원 ON)이 제대로 안 됐거나 코어가 reset/미부팅 상태로 보임. "
+                "→ PMU 전원 사이클/por_remove_bdf/전원·케이블 확인. (DAP 연결 성공 ≠ 코어 실행)")
         return len(new_pcs)
 
     def _setup_directories(self):
