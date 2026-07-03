@@ -986,13 +986,13 @@
     },
     "P9": {
       "nvme_timeouts": {
-        "command": 30000,
-        "format": 300000,
-        "flush": 30000,
-        "selftest_short": 30000,
-        "selftest_ext": 30000,
-        "verify": 30000,
-        "aer": 600000
+        "command": 40000,
+        "format": 310000,
+        "flush": 40000,
+        "selftest_short": 40000,
+        "selftest_ext": 40000,
+        "verify": 40000,
+        "aer": 610000
       },
       "interface": "swd",
       "jlink_device": "Cortex-R5",
