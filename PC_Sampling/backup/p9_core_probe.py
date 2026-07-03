@@ -69,6 +69,26 @@ def rd(jl, addr):
         return None
 
 
+def decode_auth(auth):
+    """DBGAUTHSTATUS(0xFB8) 디코드 → 각 debug 도메인의 구현/잠금 상태.
+
+    각 2비트 필드: 0b00=미구현, 0b10=구현됐으나 인증잠금(disabled),
+    0b11=구현+활성(enabled). NSNID(비침습, NIDEN/PCSR)가 핵심.
+      NSNID=미구현 → DBGPCSR 자체가 없음(인증 풀어도 비침습 불가).
+      NSNID=구현·잠금 → HW 는 있으나 NIDEN 차단 → 벤더 인증 unlock 대상.
+      NSNID=활성 → 비침습 사용 가능(PCSR read 로 전환 가능).
+    """
+    if auth is None or auth in BAD:
+        return f"AUTH={auth} (무효 — 미응답/비파워)"
+    names = {0b00: "미구현", 0b10: "구현·잠금", 0b11: "구현·활성"}
+
+    def f(shift):
+        return names.get((auth >> shift) & 0b11, f"0b{(auth >> shift) & 0b11:02b}")
+    return (f"AUTH=0x{auth:08x} ["
+            f"NSNID(비침습)={f(0)}, NSID(halt)={f(2)}, "
+            f"SNID={f(4)}, SID={f(6)}]")
+
+
 def probe_base(jl, base, pcsr_off, samples, settle):
     """한 후보 base 판정 → dict."""
     didr = rd(jl, base + OFF_DIDR)
@@ -147,6 +167,7 @@ def main():
             samp = ' '.join(f'{v:#010x}' for v in r['sample'])
             print(f"  0x{base:08x}: DBGDIDR={r['didr']:#010x} "
                   f"PCSR(uniq={r['uniq']},valid={r['valid']}) [{samp}]  {r['reason']}")
+            print(f"             {decode_auth(r.get('auth'))}")
     jl.close()
 
     live = [r for r in results if r['live']]
@@ -165,7 +186,11 @@ def main():
     if idle:
         bases = ", ".join(f"0x{r['base']:08x}" for r in idle)
         print(f"보류(존재하나 PCSR 고정/무효): {bases}")
-        print("  → NVMe 부하(sudo dd if=/dev/nvme0n1 of=/dev/null bs=1M) 주면서 재실행 권장.")
+        print("  → 위 AUTH 의 NSNID(비침습) 로 판정:")
+        print("     · 구현·잠금 → NIDEN 인증 차단. 벤더 secure-debug unlock 대상.")
+        print("     · 미구현    → DBGPCSR 없음. 인증 풀어도 비침습 불가(현 결론 재확인).")
+        print("     · 활성인데 PCSR 고정 → idle/WFI. NVMe 부하 주고 재실행:")
+        print("       sudo dd if=/dev/nvme0n1 of=/dev/null bs=1M")
 
 
 if __name__ == '__main__':
