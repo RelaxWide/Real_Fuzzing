@@ -15,7 +15,7 @@ J-Link connect 에서 확인한 debug base(기본 0x80030000)부터 stride(기�
   python3 p9_core_probe.py --ap-index 1            # 멀티 AP: APB-AP 인덱스 변경
   python3 p9_core_probe.py --device Cortex-R5 --interface swd --speed 4000
 
-확정 후 입력 위치 (P9_BRINGUP.md 참조):
+확정 후 입력 위치 (SESSION_HANDOFF_v8.8.md 참조):
   PRODUCT_PROFILES['P9']['pcsr_addrs'] = [<LIVE base + 0x84>, ...]   # 개수 = 코어 수
   r5_pcsr.cfg 의 APB target -ap-num = (통한 --ap-index 값)
 

@@ -50,7 +50,7 @@ Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/�
 - v8.0: 제품 추가 P9(Cortex-R5·SWD). 모든 target-specific 값을 PRODUCT_PROFILES 한 곳으로
         일반화(interface/cfg/jlink_device/tcl_prefix/pcsr_addrs/power/DPIDR/addr_range/
         UFAS·JLink dump on-off). 신규 제품은 데이터만 추가. P9 는 UFAS·J-Link 덤프 불가 →
-        둘 다 비활성, bring-up 값은 placeholder(P9_BRINGUP.md 참조).
+        둘 다 비활성, bring-up 값은 placeholder(SESSION_HANDOFF_v8.8.md 참조).
 - v7.8: `--unsupported-skip` (EngineErrInt 자동 감지 → power cycle 후 메인 루프 계속),
         `--no-jlink` (J-Link 없이 NVMe-only fuzz).
 - v7.7: S1 PCIe config bit perturb + S2 CLKREQ# timing perturb (PM rotation 통합).
@@ -12444,7 +12444,7 @@ if __name__ == "__main__":
             if _st == 'pcsr' and _profile.get('pcsr_addrs') is None:
                 print(f"\n[ERROR] Product '{args.product}' bring-up 미완: pcsr_addrs 비어 있음.")
                 print(f"        PRODUCT_PROFILES['{args.product}']['pcsr_addrs'] 를 채우거나 "
-                      "--no-jlink / --sampler halt 로 테스트하세요. (P9_BRINGUP.md)")
+                      "--no-jlink / --sampler halt 로 테스트하세요. (SESSION_HANDOFF_v8.8.md)")
                 sys.exit(2)
             _soft = [k for k in ('fw_addr_start', 'fw_addr_end') if _profile.get(k) is None]
             if _soft:
