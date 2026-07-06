@@ -1008,6 +1008,9 @@ class FuzzConfig:
     invalid_pc_vals: tuple = R8_DPIDR_VALS        # PCSR 필터 제외 DPIDR 값
     sampler_type:    str   = 'pcsr'               # 'pcsr' | 'halt' | 'jlink_halt' | 'null'
     go_settle_ms:    int   = 0                    # halt 후 resume→다음 halt 최소 실행시간(ms). PCSR=0
+    halt_poll_ms:    int   = 50                   # halt 후 halted() 확인 최대 대기(ms, 1ms 간격).
+    #                                             짧을수록 WFI 실패 halt 를 빨리 포기 → 단위시간당
+    #                                             시도↑ → 짧은 펌웨어 실행 창을 잡을 확률↑ (P9 튜닝용).
     # v8.1: JLinkHaltSampler(P9) 전용 — pylink 직접 제어 파라미터
     jlink_speed:     int   = 4000                 # J-Link SWD/JTAG 속도 (kHz)
     jlink_ap_index:  int   = 0                    # CoreSight APB-AP 인덱스 (P9: AP[0])
@@ -2768,7 +2771,7 @@ class JLinkHaltSampler(OpenOCDPCSampler):
             halted = False
             try:
                 self._halt_func()
-                for _ in range(50):   # 최대 ~50ms 대기
+                for _ in range(self.config.halt_poll_ms):   # 최대 ~halt_poll_ms ms 대기(1ms 간격)
                     try:
                         if self.jlink.halted():
                             halted = True
@@ -2887,7 +2890,8 @@ class NVMeFuzzer:
         self._health_prev_cov       = 0       # 직전 평가 시 global_coverage 크기
         self._health_prev_halt_ok   = 0       # 직전 평가 시 sampler.halt_ok_total
         self._health_prev_halt_fail = 0       # 직전 평가 시 sampler.halt_fail_total
-        self._health_stuck_streak   = 0       # coverage 정체+halt 대량실패 연속 횟수
+        self._health_prev_timeouts  = 0       # 직전 평가 시 stats['ignored_timeout'] (NVMe timeout 동반 판별)
+        self._health_stuck_streak   = 0       # coverage 정체+halt 대량실패+timeout 연속 횟수
         self._graph_child_proc = None         # v8.8: 차트 렌더 subprocess(Popen) — fork 제거
         self._graph_snapshot_path = None      # v8.8: 현재 렌더에 넘긴 스냅샷 pkl 경로(정리용)
         self._mpl_warmed = False              # (구) 부모 선import 플래그 — subprocess 렌더에선 미사용
@@ -7937,10 +7941,11 @@ class NVMeFuzzer:
                                 f"벽시계 {_wall:.1f}s 상한 초과 (프리즈 회계 이상? "
                                 f"프리즈={_freeze:.1f}s)")
                 # 성공 완료 — 이번 명령의 halt 오버헤드를 짧게 남긴다(사용자 관측용: 항목#1 실측).
+                # 펌웨어 실행이 sub-10ms 로 빨라 초 단위 소수 둘째자리로는 0 이 되므로 ms 로 표기.
                 _wall   = time.monotonic() - _start_t
                 _freeze = max(0.0, self.sampler.halt_freeze_accum - _freeze0)
-                log.info(f"[FWTime] {cmd.name}: 벽시계 {_wall:.2f}s − halt 프리즈 "
-                         f"{_freeze:.2f}s → 펌웨어 {_wall - _freeze:.2f}s")
+                log.info(f"[FWTime] {cmd.name}: 벽시계 {_wall*1000:.1f}ms − halt 프리즈 "
+                         f"{_freeze*1000:.1f}ms → 펌웨어 {(_wall - _freeze)*1000:.1f}ms")
 
             rc = process.returncode
 
@@ -11095,45 +11100,67 @@ class NVMeFuzzer:
         return d
 
     def _halt_health_check(self) -> None:
-        """halt 샘플러(P9) 건강도 평가 — (A)무해 WFI 와 (B)코어 고착 을 구분한다.
+        """halt 샘플러(P9) 건강도 평가 — 세 상태를 구분한다:
 
-        구분 기준(사용자 관측과 동일): halt 가 대량으로 실패해도 **coverage 가 계속
-        증가하면 무해**(WFI). halt 대량 실패가 이어지면서 **coverage 가 정체**하면 (B)
-        코어 고착 의심 → 이때만 터미널 경고를 낸다. 무해 구간은 파일 info 만 남긴다.
-        per-sample 카운터/커버리지 델타만 읽는 순수 관측 — fuzz 동작 무영향."""
+          1. 정상(A): coverage 가 계속 증가 → 조용히 파일 info.
+          2. under-sampling: halt 대량 실패 + coverage 정체 이면서 **NVMe 는 정상 완료**
+             (timeout 없음) → 펌웨어는 살아있고 halt 샘플러가 짧은 실행 창을 못 잡는 것.
+             크래시 아님 → 파일 info(겁주지 않음). go_settle/halt_poll 튜닝 대상.
+          3. 진짜 트러블(B): coverage 정체 + halt 실패 + **NVMe timeout 동반**(ignore-opcodes
+             로 crash 안 하고 계속되는 경우) → 터미널 경고.
+
+        진짜 코어 hang 이면 NVMe 가 timeout → crash 핸들러가 캠페인을 멈추므로, 이 체크가
+        도는 동안(=명령이 계속 완료됨)의 정체는 대부분 under-sampling 이다. per-sample
+        카운터·coverage·timeout stat 만 읽는 순수 관측 — fuzz 동작 무영향."""
         _s = self.sampler
         ok_now, fail_now = _s.halt_ok_total, _s.halt_fail_total
         cov_now = len(_s.global_coverage)
+        to_now  = self.stats.get('ignored_timeout', 0)   # crash 안 하고 계속된 NVMe timeout 누적
 
         d_ok   = ok_now   - self._health_prev_halt_ok
         d_fail = fail_now - self._health_prev_halt_fail
         d_cov  = cov_now  - self._health_prev_cov
+        d_to   = to_now   - self._health_prev_timeouts
         attempts = d_ok + d_fail
         self._health_prev_halt_ok, self._health_prev_halt_fail = ok_now, fail_now
-        self._health_prev_cov = cov_now
+        self._health_prev_cov      = cov_now
+        self._health_prev_timeouts = to_now
 
         if attempts < HALT_HEALTH_MIN_ATTEMPTS:
             return   # 이 주기 halt 시도가 너무 적어 판단 불가(명령이 드문 구간 등)
         fail_ratio = d_fail / attempts
 
-        # 무해가 아니려면: halt 실패율이 높고 AND 새 coverage 가 0.
-        if fail_ratio >= HALT_HEALTH_FAIL_RATIO and d_cov == 0:
-            self._health_stuck_streak += 1
-            if self._health_stuck_streak >= HALT_HEALTH_STUCK_STREAK:
-                _win = HALT_HEALTH_EXEC_INTERVAL * self._health_stuck_streak
-                log.error(
-                    f"[Sampler] ⚠️ 코어 고착 의심(B): 최근 {_win} exec 동안 halt "
-                    f"{fail_ratio:.0%} 실패 + coverage 정체(+0). NVMe timeout/직전 명령·"
-                    f"PM 이벤트 확인 요망. (무해 WFI 라면 coverage 가 계속 늘어야 함)")
-        else:
-            # 회복(또는 애초에 무해): 정체 스트릭이 쌓여 있었으면 해제 알림, 아니면 파일 info.
-            if self._health_stuck_streak >= HALT_HEALTH_STUCK_STREAK:
-                log.warning(f"[Sampler] 코어 회복 — coverage +{d_cov} PCs (halt "
-                            f"{fail_ratio:.0%} 실패지만 진행 중, 정상)")
-            else:
-                log.info(f"[Sampler] halt {fail_ratio:.0%} 실패 / coverage +{d_cov} PCs "
-                         f"— WFI 우세이나 진행 중(정상 A)")
+        # coverage 가 늘고 있으면 무조건 정상.
+        if d_cov > 0:
             self._health_stuck_streak = 0
+            log.info(f"[Sampler] 정상 — coverage +{d_cov} PCs (halt 성공 {d_ok}/{attempts}, "
+                     f"실패 {fail_ratio:.0%})")
+            return
+
+        # coverage 정체 + halt 대량 실패: NVMe timeout 동반 여부로 (B) vs under-sampling 구분.
+        if fail_ratio >= HALT_HEALTH_FAIL_RATIO:
+            if d_to > 0:
+                # (B) 진짜 트러블 — 명령이 계속 timeout 나면서 coverage 도 정체. 터미널 경고.
+                self._health_stuck_streak += 1
+                _win = HALT_HEALTH_EXEC_INTERVAL * self._health_stuck_streak
+                log.warning(
+                    f"[Sampler] ⚠️ 코어 이상 의심(B): 최근 {_win} exec 동안 halt {fail_ratio:.0%} "
+                    f"실패 + coverage 정체 + NVMe timeout {d_to}회. 직전 명령·PM 이벤트 확인 요망.")
+            else:
+                # under-sampling — 펌웨어 정상(NVMe timeout 0), halt 로 짧은 실행 창을 못 잡음.
+                # 겁주지 않게 파일 info 만. d_ok 로 '아예 못 잡음' vs '잡히나 새 PC 없음' 구분.
+                self._health_stuck_streak = 0
+                if d_ok == 0:
+                    log.info(f"[Sampler] under-sampling — 펌웨어 정상(NVMe timeout 0)인데 halt "
+                             f"{fail_ratio:.0%} 실패로 PC 미포착, coverage 정체. 펌웨어 실행이 "
+                             f"짧아 halt 가 못 잡음 → go_settle/halt_poll 낮춰 밀도↑ 검토.")
+                else:
+                    log.info(f"[Sampler] coverage 포화 추정 — 샘플은 잡히나(성공 {d_ok}) 새 PC 0. "
+                             f"halt {fail_ratio:.0%} 실패. 상태/시퀀스 기반 탐색 전환 시점일 수 있음.")
+        else:
+            # halt 는 잘 되는데 새 PC 만 0 → 진짜 포화(catch 되는 코드가 다 알려진 PC).
+            self._health_stuck_streak = 0
+            log.info(f"[Sampler] coverage 포화 추정 — halt 성공 {d_ok}/{attempts}인데 새 PC 0.")
 
     def _vmon_sample(self) -> None:
         """vmalloc 추세 + taint 변화 1회 샘플 — 메인 루프에서 주기(VMON_EXEC_INTERVAL exec)마다 호출.
@@ -12647,6 +12674,7 @@ if __name__ == "__main__":
             'enable_jlink_dump': True,
             'sampler_type':      'pcsr',
             'go_settle_ms':      0,
+            'halt_poll_ms':      50,
         }
 
     # sampler_type / go_settle 해석: CLI override > profile. --no-jlink 면 null 강제.
@@ -12654,6 +12682,7 @@ if __name__ == "__main__":
                          else (args.sampler or _profile.get('sampler_type', 'pcsr')))
     _resolved_go_settle = (args.go_settle if args.go_settle is not None
                            else _profile.get('go_settle_ms', 0))
+    _resolved_halt_poll = _profile.get('halt_poll_ms', 50)
 
     # v8.3: 제품별 timeout override — global(NVME_TIMEOUTS) 기본값 위에 제품 항목을 덮어씀.
     #   nvme_timeouts: 제품의 부분/전체 dict 로 그룹별 갱신. passthru/kernel: 제품 키 있으면 우선.
@@ -12688,6 +12717,7 @@ if __name__ == "__main__":
         func_file=_profile.get('func_file', 'functions.txt'),
         sampler_type=_resolved_sampler,
         go_settle_ms=_resolved_go_settle,
+        halt_poll_ms=_resolved_halt_poll,
         # v8.1: JLinkHaltSampler(P9) 파라미터 — profile 기본값, pc_reg_index 는 CLI override 우선
         jlink_speed=_profile.get('jlink_speed', 4000),
         jlink_ap_index=_profile.get('jlink_ap_index', 0),
