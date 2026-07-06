@@ -7976,11 +7976,16 @@ class NVMeFuzzer:
                                 f"벽시계 {_wall:.1f}s 상한 초과 (프리즈 회계 이상? "
                                 f"프리즈={_freeze:.1f}s)")
                 # 성공 완료 — 이번 명령의 halt 오버헤드를 짧게 남긴다(사용자 관측용: 항목#1 실측).
-                # 펌웨어 실행이 sub-10ms 로 빨라 초 단위 소수 둘째자리로는 0 이 되므로 ms 로 표기.
+                # 펌웨어 실행이 sub-ms 로 빨라 ms 로 표기. 초고속 명령은 halt 1회의 프리즈(≈1.8ms)가
+                # 명령 자체보다 크고, 프리즈 누적이 워치독 창 시작 경계를 걸친 샘플까지 포함해 _freeze
+                # > _wall 이 될 수 있다(측정 아티팩트) → 펌웨어시간이 음수로 보임. 표시는 0 으로 클램프
+                # (음수는 '펌웨어 실행 < halt 오버헤드'=초고속 명령이라는 뜻). 워치독 판정(30s)엔 무영향.
                 _wall   = time.monotonic() - _start_t
                 _freeze = max(0.0, self.sampler.halt_freeze_accum - _freeze0)
+                _fw_ms  = max(0.0, (_wall - _freeze) * 1000)
                 log.info(f"[FWTime] {cmd.name}: 벽시계 {_wall*1000:.1f}ms − halt 프리즈 "
-                         f"{_freeze*1000:.1f}ms → 펌웨어 {(_wall - _freeze)*1000:.1f}ms")
+                         f"{_freeze*1000:.1f}ms → 펌웨어 {_fw_ms:.1f}ms"
+                         + ("  (halt 오버헤드 지배 — 초고속 명령)" if _freeze > _wall else ""))
 
             rc = process.returncode
 
