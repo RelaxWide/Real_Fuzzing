@@ -4392,15 +4392,17 @@ class NVMeFuzzer:
         # (이 명령의 coverage 는 이미 current_trace 에 수집돼 있어 재연결 영향 없음.)
         if self._fw_commit_reset_pending:
             self._fw_commit_reset_pending = False
-            log.warning("[Sampler] FWCommit 후 J-Link 재연결로 디버그 halt 재확립 시도...")
+            # 성공 복구는 정상 동작 → 파일 info(터미널 스팸 방지). 실패만 터미널 경고.
+            log.info("[Sampler] FWCommit 후 J-Link 재연결로 디버그 halt 재확립...")
             try:
                 _fw_rc_ok = self.sampler._reconnect()
             except Exception as _fw_re_exc:
                 _fw_rc_ok = False
                 log.warning(f"[Sampler] 재연결 예외: {_fw_re_exc}")
-            log.warning("[Sampler] J-Link 재연결 "
-                        + ("성공 — halt 복구" if _fw_rc_ok
-                           else "실패 — POR/재시작 필요할 수 있음"))
+            if _fw_rc_ok:
+                log.info("[Sampler] J-Link 재연결 성공 — halt 복구")
+            else:
+                log.warning("[Sampler] J-Link 재연결 실패 — POR/재시작 필요할 수 있음")
 
         # P3: passthru_stats (replay 포함 모든 경로 추적)
         if seed.force_admin is True:
@@ -7989,8 +7991,8 @@ class NVMeFuzzer:
             if (rc == 0 and actual_opcode == 0x10
                     and isinstance(self.sampler, JLinkHaltSampler)):
                 self._fw_commit_reset_pending = True
-                log.warning("[Sampler] FWCommit 성공 감지 — 코어 리셋으로 디버그 halt 소실 가능, "
-                            "재연결 예약(다음 회계 시점)")
+                log.info("[Sampler] FWCommit 성공 감지 — 코어 리셋으로 디버그 halt 소실 가능, "
+                         "재연결 예약(다음 회계 시점)")
 
             # SSD 내부에서 명령 완료 후에도 후처리(캐시 플러시, 로그 기록 등)가
             # 진행될 수 있으므로, 해당 시간만큼 샘플링을 계속 유지
