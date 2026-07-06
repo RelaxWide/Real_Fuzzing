@@ -1188,6 +1188,7 @@ class _FuzzingTerminalFilter(logging.Filter):
         r'|\[DevInfo\]'                 # Device Information(주기 출력) 터미널 노출
         r'|\[Taint\]'                   # v8.6: kernel taint 진단(시작/변화). [VMon] 은 파일만(터미널 제외)
         r'|\[Sampler\]'                 # 샘플러 halt 실패→복구 알림 (커버리지 측정 정상 재개 확인)
+        r'|\[J-Link DLL\]'              # JLinkARM DLL 메시지 중 halt 노이즈 외 실제 경고/에러
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -1365,6 +1366,12 @@ def _run_nvme_state_cmd(cmd, timeout_sec=STATE_MONITOR_SEC, merge_stderr=False):
 #   주의: /proc/vmallocinfo 는 vmap_area_lock 을 잡으므로 절대 읽지 않는다(/proc/meminfo 만).
 # ──────────────────────────────────────────────────────────────────────────
 VMON_EXEC_INTERVAL         = 10000   # vmon 샘플 주기(exec 횟수) — 메인 루프에서 호출
+# halt 샘플러(P9) health 모니터: 아래 주기마다 halt 성공률·coverage 델타를 비교해
+# (A)무해 WFI vs (B)코어 고착 을 판별. 무해는 로그 없음(파일 info), (B)만 터미널 경고.
+HALT_HEALTH_EXEC_INTERVAL  = 2000    # health 평가 주기(exec 횟수)
+HALT_HEALTH_FAIL_RATIO     = 0.95    # 이 주기 halt 실패율이 이 이상이고
+HALT_HEALTH_MIN_ATTEMPTS   = 50      # 최소 이만큼 halt 시도가 있었고
+HALT_HEALTH_STUCK_STREAK   = 2       # coverage 정체가 이 횟수(=주기×2) 연속이면 (B) 경고
 VMON_VMALLOC_CHUNK_WARN_KB = 65536   # 최대 free vmalloc chunk 이 이 값(64MB) 미만이면 경고
 
 _KERNEL_TAINT_BITS = [
@@ -1806,6 +1813,10 @@ class OpenOCDPCSampler:
 
         self.stop_event    = threading.Event()
         self.openocd_error = threading.Event()  # 연속 실패로 샘플링 불가 → 메인 루프에 통보
+        # halt 샘플러 health 카운터(누적) — 메인 루프의 health 모니터가 델타로 읽음.
+        # PCSR 은 _read_all_pcs 가 halt 를 안 하므로 사실상 fail=0(무영향).
+        self.halt_ok_total   = 0
+        self.halt_fail_total = 0
         self.sample_thread: Optional[threading.Thread] = None
         self.total_samples    = 0
         self.interesting_inputs = 0
@@ -2290,6 +2301,13 @@ class OpenOCDPCSampler:
             return True
         return self.config.addr_range_start <= pc <= self.config.addr_range_end
 
+    def _read_fail_needs_recovery(self) -> bool:
+        """연속 read 실패가 '링크 복구가 필요한 오류'인지 여부.
+
+        PCSR(OpenOCD): 연속 실패 = telnet/OpenOCD 링크 desync → 복구 필요(True).
+        halt(J-Link) 는 이 메서드를 override 하여 링크 생존 시 False(코어 WFI, 무해)."""
+        return True
+
     # ------------------------------------------------------------------
     # Module 6: 샘플링 스레드 (3코어 튜플 처리)
     # ------------------------------------------------------------------
@@ -2335,11 +2353,22 @@ class OpenOCDPCSampler:
             pcs_tuple = self._read_all_pcs()
 
             if pcs_tuple is None:
+                self.halt_fail_total += 1
                 _consecutive_fail += 1
                 if _consecutive_fail >= self._CONSECUTIVE_FAIL_LIMIT:
-                    log.error(f"[Sampler] PC read 연속 {_consecutive_fail}회 실패 — 이 윈도우 샘플링 중단")
+                    # 연속 실패의 의미가 샘플러마다 다르다:
+                    #  - PCSR(OpenOCD): 읽기 연속 실패 = telnet/OpenOCD 링크 손실 → 복구 필요.
+                    #  - halt(J-Link): 링크가 살아있는데 halt 만 실패 = 코어가 이 윈도우 내내
+                    #    WFI(무해). 재연결할 링크 문제가 없다 → openocd_error 를 세우지 않는다
+                    #    (안 그러면 메인 루프가 매 명령 [OpenOCD] 복구 경로를 헛돌며 로그 노이즈).
+                    #    실제 (B)코어 고착은 별도 health 모니터(coverage 정체 병행)가 잡는다.
+                    if self._read_fail_needs_recovery():
+                        log.error(f"[Sampler] PC read 연속 {_consecutive_fail}회 실패 — 링크 손실 의심, 복구")
+                        self.openocd_error.set()
+                    else:
+                        log.debug(f"[Sampler] halt 연속 {_consecutive_fail}회 실패 — 코어 WFI 추정"
+                                  f"(링크 정상, 무해) — 이 윈도우 샘플링 종료")
                     self.stop_event.set()
-                    self.openocd_error.set()
                     break
                 # backoff: 연속 실패 시 재시도 간격을 지수적으로 늘린다. SSD 코어는 I/O-bound
                 # 라 명령 처리 중에도 대부분 WFI(클럭게이팅) 상태이고, 그때 halt 를 두드리면
@@ -2351,12 +2380,12 @@ class OpenOCDPCSampler:
                 if _backoff > 0:
                     time.sleep(_backoff)
                 continue
-            # 실패 스트릭 후 성공 시 복구 알림 — "CPU not halted" 가 반복돼도 커버리지
-            # 측정이 재개됨을 확인시켜 준다(3회 이상 연속 실패 후 유효 PC 읽힘). 성공이
-            # 드문 sleep-heavy 워크로드(가벼운 admin 위주)에선 이 로그도 드물게 뜬다.
+            self.halt_ok_total += 1
+            # 실패 스트릭 후 성공 시 복구 확인 — 파일 로그(debug)로만. 무해 WFI 구간에서
+            # 자주 떠 터미널 노이즈가 되므로, 터미널 신호는 health 모니터로 일원화한다.
             if _consecutive_fail >= 3:
-                log.warning(f"[Sampler] PC 읽기 정상 재개 — halt {_consecutive_fail}회 실패 후 "
-                            f"PC={hex(pcs_tuple[0])} 읽힘 (커버리지 측정 계속됨)")
+                log.debug(f"[Sampler] PC 읽기 정상 재개 — halt {_consecutive_fail}회 실패 후 "
+                          f"PC={hex(pcs_tuple[0])} 읽힘 (커버리지 측정 계속됨)")
             _consecutive_fail = 0
 
             # 범위 분류
@@ -2628,6 +2657,23 @@ class JLinkHaltSampler(OpenOCDPCSampler):
         self._pcsr_addrs = [0x80030000]
         self._invalid_pc_mask = frozenset(set(config.invalid_pc_vals) | {0x80030000})
 
+    # DLL 메시지 필터 — halt timeout 노이즈만 debug 로, 나머지는 그대로 노출.
+    _HALT_NOISE = ('could not be halted', 'is not halted', 'has been halted')
+
+    def _jlink_dll_msg(self, msg) -> None:
+        try:
+            s = msg.decode('utf-8', 'replace') if isinstance(msg, (bytes, bytearray)) else str(msg)
+        except Exception:
+            s = str(msg)
+        s = s.strip()
+        if not s:
+            return
+        low = s.lower()
+        if any(n in low for n in self._HALT_NOISE):
+            log.debug(f"[J-Link DLL] {s}")        # WFI halt 노이즈 — 파일 debug 만
+        else:
+            log.warning(f"[J-Link DLL] {s}")      # 그 외 DLL 경고/에러는 노출
+
     # ── 연결 계층 (pylink) ──────────────────────────────────────────
     def connect(self) -> bool:
         if _pylink is None:
@@ -2640,7 +2686,11 @@ class JLinkHaltSampler(OpenOCDPCSampler):
                         self.jlink.close()
                 except Exception:
                     pass
-            jl = _pylink.JLink()
+            # warn/error 핸들러 주입: JLinkARM DLL 이 stderr 로 직접 찍는 타이밍 경고
+            # ('CPU could not be halted' 등, WFI 코어 halt timeout)를 Python 콜백으로
+            # 가로채 파일 debug 로만 보낸다. fd-2 통짜 억제와 달리 이 문자열만 선택적으로
+            # 강등하고 그 외 DLL 경고/에러는 그대로 노출한다.
+            jl = _pylink.JLink(error=self._jlink_dll_msg, warn=self._jlink_dll_msg)
             jl.open()
             tif = (_pylink.enums.JLinkInterfaces.JTAG if self.config.interface == 'jtag'
                    else _pylink.enums.JLinkInterfaces.SWD)
@@ -2763,6 +2813,12 @@ class JLinkHaltSampler(OpenOCDPCSampler):
             return self._reconnect()
         return True
 
+    def _read_fail_needs_recovery(self) -> bool:
+        """halt 연속 실패가 링크 문제인지 판별. J-Link 세션이 살아있으면 halt 실패는
+        코어 WFI(무해)이지 링크 손실이 아니다 → 재연결 불필요(False). 세션이 죽었을
+        때만 True → 메인 루프가 재연결한다. (진짜 코어 고착(B)은 health 모니터가 담당.)"""
+        return not self._openocd_alive()
+
     def close(self):
         self.stop_event.set()
         if self.sample_thread:
@@ -2809,6 +2865,11 @@ class NVMeFuzzer:
         self.config = config
         self._vmon_prev_used = None           # v8.6: vmon exec-기반 샘플 상태(스레드 없음)
         self._vmon_last_taint = None
+        # halt 샘플러 health 모니터 상태 — (A)무해 WFI vs (B)코어 고착 판별용
+        self._health_prev_cov       = 0       # 직전 평가 시 global_coverage 크기
+        self._health_prev_halt_ok   = 0       # 직전 평가 시 sampler.halt_ok_total
+        self._health_prev_halt_fail = 0       # 직전 평가 시 sampler.halt_fail_total
+        self._health_stuck_streak   = 0       # coverage 정체+halt 대량실패 연속 횟수
         self._graph_child_proc = None         # v8.8: 차트 렌더 subprocess(Popen) — fork 제거
         self._graph_snapshot_path = None      # v8.8: 현재 렌더에 넘긴 스냅샷 pkl 경로(정리용)
         self._mpl_warmed = False              # (구) 부모 선import 플래그 — subprocess 렌더에선 미사용
@@ -4516,6 +4577,12 @@ class NVMeFuzzer:
                 and self.executions % VMON_EXEC_INTERVAL == 0
                 and self.executions > 0):
             self._vmon_sample()       # vmalloc/taint 진단(파일 로그만)
+
+        # halt 샘플러 health 평가 (P9): halt 대량실패 + coverage 정체 지속 → (B)경고
+        if (self.executions % HALT_HEALTH_EXEC_INTERVAL == 0
+                and self.executions > 0
+                and isinstance(self.sampler, JLinkHaltSampler)):
+            self._halt_health_check()
 
         # state monitoring
         if (self.config.state_enabled
@@ -10977,6 +11044,47 @@ class NVMeFuzzer:
             pass
         return d
 
+    def _halt_health_check(self) -> None:
+        """halt 샘플러(P9) 건강도 평가 — (A)무해 WFI 와 (B)코어 고착 을 구분한다.
+
+        구분 기준(사용자 관측과 동일): halt 가 대량으로 실패해도 **coverage 가 계속
+        증가하면 무해**(WFI). halt 대량 실패가 이어지면서 **coverage 가 정체**하면 (B)
+        코어 고착 의심 → 이때만 터미널 경고를 낸다. 무해 구간은 파일 info 만 남긴다.
+        per-sample 카운터/커버리지 델타만 읽는 순수 관측 — fuzz 동작 무영향."""
+        _s = self.sampler
+        ok_now, fail_now = _s.halt_ok_total, _s.halt_fail_total
+        cov_now = len(_s.global_coverage)
+
+        d_ok   = ok_now   - self._health_prev_halt_ok
+        d_fail = fail_now - self._health_prev_halt_fail
+        d_cov  = cov_now  - self._health_prev_cov
+        attempts = d_ok + d_fail
+        self._health_prev_halt_ok, self._health_prev_halt_fail = ok_now, fail_now
+        self._health_prev_cov = cov_now
+
+        if attempts < HALT_HEALTH_MIN_ATTEMPTS:
+            return   # 이 주기 halt 시도가 너무 적어 판단 불가(명령이 드문 구간 등)
+        fail_ratio = d_fail / attempts
+
+        # 무해가 아니려면: halt 실패율이 높고 AND 새 coverage 가 0.
+        if fail_ratio >= HALT_HEALTH_FAIL_RATIO and d_cov == 0:
+            self._health_stuck_streak += 1
+            if self._health_stuck_streak >= HALT_HEALTH_STUCK_STREAK:
+                _win = HALT_HEALTH_EXEC_INTERVAL * self._health_stuck_streak
+                log.error(
+                    f"[Sampler] ⚠️ 코어 고착 의심(B): 최근 {_win} exec 동안 halt "
+                    f"{fail_ratio:.0%} 실패 + coverage 정체(+0). NVMe timeout/직전 명령·"
+                    f"PM 이벤트 확인 요망. (무해 WFI 라면 coverage 가 계속 늘어야 함)")
+        else:
+            # 회복(또는 애초에 무해): 정체 스트릭이 쌓여 있었으면 해제 알림, 아니면 파일 info.
+            if self._health_stuck_streak >= HALT_HEALTH_STUCK_STREAK:
+                log.warning(f"[Sampler] 코어 회복 — coverage +{d_cov} PCs (halt "
+                            f"{fail_ratio:.0%} 실패지만 진행 중, 정상)")
+            else:
+                log.info(f"[Sampler] halt {fail_ratio:.0%} 실패 / coverage +{d_cov} PCs "
+                         f"— WFI 우세이나 진행 중(정상 A)")
+            self._health_stuck_streak = 0
+
     def _vmon_sample(self) -> None:
         """vmalloc 추세 + taint 변화 1회 샘플 — 메인 루프에서 주기(VMON_EXEC_INTERVAL exec)마다 호출.
         VmallocUsed 계단식 상승=고갈, 평탄→급사=손상. taint 변화 시 손상 의심 모듈 특정.
@@ -11817,19 +11925,20 @@ class NVMeFuzzer:
                     rc = self._send_nvme_command(fuzz_data, mutated_seed)
                     last_samples = self.sampler.stop_sampling()
 
-                # OpenOCD 연속 실패 감지 → 2단계 복구
-                # 1단계: 타겟 재초기화 (OpenOCD 유지, 전원 레지스터 재활성화)
-                # 2단계: OpenOCD 완전 재시작
+                # 샘플러 링크 손실 감지 → 2단계 복구. halt(J-Link) 샘플러는
+                # _read_fail_needs_recovery() 가 링크 죽음일 때만 openocd_error 를
+                # 세우므로, 무해 WFI 로는 이 경로에 들어오지 않는다. 라벨은 샘플러별로.
                 if self.sampler.openocd_error.is_set():
                     self.sampler.openocd_error.clear()
+                    _lk = '[J-Link]' if isinstance(self.sampler, JLinkHaltSampler) else '[OpenOCD]'
                     if not self.sampler._reinit_target():
-                        log.warning("[OpenOCD] 타겟 재초기화 실패 — OpenOCD 재시작 시도...")
+                        log.warning(f"{_lk} 타겟 재초기화 실패 — 재연결 시도...")
                         if not self.sampler._reconnect():
-                            log.error("[OpenOCD] 재시작 실패 — 퍼저를 종료합니다.")
+                            log.error(f"{_lk} 재연결 실패 — 퍼저를 종료합니다.")
                             break
-                        log.warning("[OpenOCD] OpenOCD 재시작 성공 — 퍼징 재개")
+                        log.warning(f"{_lk} 재연결 성공 — 퍼징 재개")
                     else:
-                        log.warning("[OpenOCD] 타겟 재초기화 성공 — 퍼징 재개")
+                        log.warning(f"{_lk} 타겟 재초기화 성공 — 퍼징 재개")
 
                 is_interesting, new_pcs, _action = self._account_command(
                     _acct_seed, _acct_data, rc, last_samples,
