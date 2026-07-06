@@ -986,14 +986,15 @@
       "state_fields": "r8"
     },
     "P9": {
+      "_comment_timeouts": "펌웨어시간 워치독(halt 프리즈 차감)이 halt 오버헤드를 명령마다 실측·보정하므로, 이 값은 '진짜 펌웨어 실행시간' 기준(구 +10s halt 마진 제거). 잔차 흡수는 코드 HALT_FWTIME_MARGIN_SEC(≈1s).",
       "nvme_timeouts": {
-        "command": 40000,
-        "format": 310000,
-        "flush": 40000,
-        "selftest_short": 40000,
-        "selftest_ext": 40000,
-        "verify": 40000,
-        "aer": 610000
+        "command": 30000,
+        "format": 300000,
+        "flush": 30000,
+        "selftest_short": 30000,
+        "selftest_ext": 30000,
+        "verify": 30000,
+        "aer": 600000
       },
       "interface": "swd",
       "jlink_device": "Cortex-R5",

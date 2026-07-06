@@ -1372,6 +1372,11 @@ HALT_HEALTH_EXEC_INTERVAL  = 2000    # health 평가 주기(exec 횟수)
 HALT_HEALTH_FAIL_RATIO     = 0.95    # 이 주기 halt 실패율이 이 이상이고
 HALT_HEALTH_MIN_ATTEMPTS   = 50      # 최소 이만큼 halt 시도가 있었고
 HALT_HEALTH_STUCK_STREAK   = 2       # coverage 정체가 이 횟수(=주기×2) 연속이면 (B) 경고
+# halt 샘플러(P9) 펌웨어시간 워치독 — 벽시계에서 halt 프리즈를 빼 '진짜 펌웨어 N초'로
+# crash 판정한다. PCSR(비침습)은 프리즈=0 → 기존 벽시계 경로 그대로(무영향).
+HALT_FWTIME_POLL_SEC         = 0.5   # 워치독 폴링 간격(초)
+HALT_FWTIME_MARGIN_SEC       = 1.0   # 잔차(측정오차·resume 2차교란) 흡수용 작은 마진 — +10초 추측 대체
+HALT_FWTIME_WALL_CEILING_SEC = 60.0  # fw_deadline 초과분 벽시계 상한(프리즈 회계 이상 시 폭주 방지)
 VMON_VMALLOC_CHUNK_WARN_KB = 65536   # 최대 free vmalloc chunk 이 이 값(64MB) 미만이면 경고
 
 _KERNEL_TAINT_BITS = [
@@ -1817,6 +1822,9 @@ class OpenOCDPCSampler:
         # PCSR 은 _read_all_pcs 가 halt 를 안 하므로 사실상 fail=0(무영향).
         self.halt_ok_total   = 0
         self.halt_fail_total = 0
+        # halt 프리즈 누적(초) — halt→Go 로 코어를 얼린 시간의 합. 펌웨어시간 워치독이
+        # (벽시계 − 프리즈)로 진짜 펌웨어 실행시간을 재는 데 쓴다. PCSR 은 halt 안 함 → 0.
+        self.halt_freeze_accum = 0.0
         self.sample_thread: Optional[threading.Thread] = None
         self.total_samples    = 0
         self.interesting_inputs = 0
@@ -2661,18 +2669,24 @@ class JLinkHaltSampler(OpenOCDPCSampler):
     _HALT_NOISE = ('could not be halted', 'is not halted', 'has been halted')
 
     def _jlink_dll_msg(self, msg) -> None:
+        # 이 콜백은 JLinkARM DLL 이 _jlink_lock 을 잡은 halt hot-path 에서 직접 호출한다
+        # (ctypes 콜백 컨텍스트). 여기서 예외가 새면 DLL 콜백을 통해 전파돼 위험하므로
+        # 전체를 방어적으로 감싼다 — 로그 실패가 샘플링/halt 를 깨뜨리지 않게.
         try:
-            s = msg.decode('utf-8', 'replace') if isinstance(msg, (bytes, bytearray)) else str(msg)
+            try:
+                s = msg.decode('utf-8', 'replace') if isinstance(msg, (bytes, bytearray)) else str(msg)
+            except Exception:
+                s = str(msg)
+            s = s.strip()
+            if not s:
+                return
+            low = s.lower()
+            if any(n in low for n in self._HALT_NOISE):
+                log.debug(f"[J-Link DLL] {s}")        # WFI halt 노이즈 — 파일 debug 만
+            else:
+                log.warning(f"[J-Link DLL] {s}")      # 그 외 DLL 경고/에러는 노출
         except Exception:
-            s = str(msg)
-        s = s.strip()
-        if not s:
-            return
-        low = s.lower()
-        if any(n in low for n in self._HALT_NOISE):
-            log.debug(f"[J-Link DLL] {s}")        # WFI halt 노이즈 — 파일 debug 만
-        else:
-            log.warning(f"[J-Link DLL] {s}")      # 그 외 DLL 경고/에러는 노출
+            pass
 
     # ── 연결 계층 (pylink) ──────────────────────────────────────────
     def connect(self) -> bool:
@@ -2763,8 +2777,12 @@ class JLinkHaltSampler(OpenOCDPCSampler):
                         break
                     time.sleep(0.001)
                 if halted:
+                    # 프리즈 측정: halted 확정 시점 → Go 반환 까지 코어가 정지한 시간.
+                    # (halt 요청~halted 확정 사이는 코어가 아직 실행 중이라 제외 → 보수적.)
+                    _fz0 = time.monotonic()
                     pc = self._read_reg_func(self._pc_reg_index)
                     self._go_func()   # halt 성공 시에만 resume
+                    self.halt_freeze_accum += time.monotonic() - _fz0
                 # halt 실패(코어가 clock-gated/WFI 로 안 멈춤)면 Go 하지 않는다: 코어는
                 # 이미 실행 중이라 resume 할 게 없고, 실행 중 코어에 JLINKARM_Go 를 보내면
                 # DLL 이 "CPU is not halted" 를 찍는다(그동안 이 노이즈의 실제 원인). 이번
@@ -7869,17 +7887,11 @@ class NVMeFuzzer:
                 start_new_session=True,  # v4.6: setsid() — 부모 종료/SIGHUP 후에도 생존
             )
 
-            # subprocess 타임아웃 = NVMe 타임아웃 + 여유 2초
-            timeout_sec = timeout_ms / 1000.0 + 2.0
-            try:
-                stdout, stderr = process.communicate(timeout=timeout_sec)
-            except subprocess.TimeoutExpired:
-                # kill → fd 닫힘 → 커널 abort → controller reset → SSD 상태 소멸.
-                # nvme-cli를 살려두면 fd가 유지되어 커널은 --timeout(30일)까지 대기.
-                # → SSD 펌웨어 상태가 장기간 보존됨.
-                #
-                # nvme-cli는 D-state(ioctl 대기)이므로 stdout/stderr에 쓰지 않음.
-                # 파이프 부모 쪽만 닫아 나중에 SIGPIPE로 조용히 처리.
+            # 타임아웃 시 공통 처리: kill → fd 닫힘 → 커널 abort → controller reset →
+            # SSD 상태 소멸. nvme-cli를 살려두면 fd가 유지되어 커널은 --timeout(30일)까지
+            # 대기 → SSD 펌웨어 상태가 장기간 보존됨. D-state(ioctl 대기)라 stdout/stderr
+            # 에 쓰지 않으므로 파이프 부모 쪽만 닫아 나중에 SIGPIPE로 조용히 처리.
+            def _on_timeout(desc: str):
                 try:
                     if process.stdout:
                         process.stdout.close()
@@ -7888,9 +7900,47 @@ class NVMeFuzzer:
                 except OSError:
                     pass
                 self._crash_nvme_pid = process.pid
-                log.warning(f"[NVMe TIMEOUT] {cmd.name} (>{timeout_sec:.0f}s) "
+                log.warning(f"[NVMe TIMEOUT] {cmd.name} ({desc}) "
                             f"— nvme-cli PID={process.pid} 보존 (fd 유지 → SSD 상태 보존)")
                 return self.RC_TIMEOUT
+
+            _is_halt = isinstance(self.sampler, JLinkHaltSampler)
+            if not _is_halt:
+                # 비침습(PCSR)/기타: 코어가 풀스피드 → 벽시계 ≈ 펌웨어시간. 기존 경로 그대로.
+                timeout_sec = timeout_ms / 1000.0 + 2.0
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout_sec)
+                except subprocess.TimeoutExpired:
+                    return _on_timeout(f">{timeout_sec:.0f}s")
+            else:
+                # 침습 halt 샘플러(P9): 벽시계 = 펌웨어시간 + halt 프리즈. 펌웨어시간
+                # 워치독으로 프리즈를 실측·차감해 '진짜 펌웨어 {fw_deadline}초'를 정확 판정.
+                # (+10초 고정 마진 대신 명령마다 실제 프리즈를 빼므로 오버헤드가 얼마든 무관.)
+                fw_deadline  = timeout_ms / 1000.0                       # 펌웨어시간 기준(예: 30s)
+                wall_ceiling = fw_deadline + HALT_FWTIME_WALL_CEILING_SEC  # 폭주 방지 상한
+                _start_t = time.monotonic()
+                _freeze0 = self.sampler.halt_freeze_accum
+                while True:
+                    try:
+                        stdout, stderr = process.communicate(timeout=HALT_FWTIME_POLL_SEC)
+                        break
+                    except subprocess.TimeoutExpired:
+                        _wall   = time.monotonic() - _start_t
+                        _freeze = max(0.0, self.sampler.halt_freeze_accum - _freeze0)
+                        _fw     = _wall - _freeze
+                        if _fw >= fw_deadline + HALT_FWTIME_MARGIN_SEC:
+                            return _on_timeout(
+                                f"펌웨어 {_fw:.1f}s (벽시계 {_wall:.1f}s − halt 프리즈 "
+                                f"{_freeze:.1f}s) ≥ {fw_deadline:.0f}s")
+                        if _wall >= wall_ceiling:
+                            return _on_timeout(
+                                f"벽시계 {_wall:.1f}s 상한 초과 (프리즈 회계 이상? "
+                                f"프리즈={_freeze:.1f}s)")
+                # 성공 완료 — 이번 명령의 halt 오버헤드를 짧게 남긴다(사용자 관측용: 항목#1 실측).
+                _wall   = time.monotonic() - _start_t
+                _freeze = max(0.0, self.sampler.halt_freeze_accum - _freeze0)
+                log.info(f"[FWTime] {cmd.name}: 벽시계 {_wall:.2f}s − halt 프리즈 "
+                         f"{_freeze:.2f}s → 펌웨어 {_wall - _freeze:.2f}s")
 
             rc = process.returncode
 
