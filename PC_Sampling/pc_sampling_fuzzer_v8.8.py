@@ -2830,16 +2830,30 @@ class JLinkHaltSampler(OpenOCDPCSampler):
             self.jlink = None
         return self.connect()
 
+    def _target_debug_alive(self) -> bool:
+        """타겟(R5) 디버그 연결 생존 — opened()(프로브 USB) + target_connected()(타겟 디버그).
+        코어 리셋(FWCommit 활성화 등)은 프로브는 살려둔 채 타겟 디버그만 끊어 halt 를 죽인다.
+        opened() 만으로는 이를 못 잡으므로 target_connected() 까지 확인한다. 참고: hung 코어는
+        디버그가 붙어있어 target_connected()=True → 크래시 시 stuck PC 를 계속 읽을 수 있다."""
+        try:
+            return (self.jlink is not None and self.jlink.opened()
+                    and self.jlink.target_connected())
+        except Exception:
+            return False
+
     def _reinit_target(self) -> bool:
-        """크래시 후 디버그 인프라 접근 가능 여부 (stuck PC 읽기 전제)."""
-        if not self._openocd_alive():
+        """디버그 인프라 접근 가능 여부. 타겟 디버그가 끊겼으면(코어 리셋 등) 재연결.
+        hung 코어(크래시)는 target_connected=True 로 남아 재연결 없이 stuck PC 를 읽는다."""
+        if not self._target_debug_alive():
             return self._reconnect()
         return True
 
     def _read_fail_needs_recovery(self) -> bool:
-        """halt 연속 실패가 링크 문제인지 판별. J-Link 세션이 살아있으면 halt 실패는
-        코어 WFI(무해)이지 링크 손실이 아니다 → 재연결 불필요(False). 세션이 죽었을
-        때만 True → 메인 루프가 재연결한다. (진짜 코어 고착(B)은 health 모니터가 담당.)"""
+        """worker 의 10-연속 실패 시 메인 루프 재연결(openocd_error) 을 걸지 여부. 프로브가
+        살아있으면(WFI 등) 여기선 재연결을 걸지 않는다 — 타겟 디버그가 끊긴 코어 리셋 복구는
+        (a) FWCommit 성공 선제 재연결, (b) health 모니터의 nocatch 창(rate-limited) 이 담당한다.
+        여기서 target_connected() 로 매 실패마다 재연결을 걸면, 영구 미복구(POR 필요) 시 명령마다
+        재연결을 시도해 스팸/저하가 되므로 프로브 생존(opened)만 본다."""
         return not self._openocd_alive()
 
     def close(self):
@@ -2895,6 +2909,7 @@ class NVMeFuzzer:
         self._health_prev_timeouts  = 0       # 직전 평가 시 stats['ignored_timeout'] (NVMe timeout 동반 판별)
         self._health_stuck_streak   = 0       # coverage 정체+halt 대량실패+timeout 연속 횟수
         self._health_nocatch_streak = 0       # halt 성공 0 연속 창수 — 디버그 손실(코어 리셋) 감지·재연결용
+        self._fw_commit_reset_pending = False  # FWCommit 성공(코어 리셋 가능) → 다음 회계 시 J-Link 재연결
         self._graph_child_proc = None         # v8.8: 차트 렌더 subprocess(Popen) — fork 제거
         self._graph_snapshot_path = None      # v8.8: 현재 렌더에 넘긴 스냅샷 pkl 경로(정리용)
         self._mpl_warmed = False              # (구) 부모 선import 플래그 — subprocess 렌더에선 미사용
@@ -4371,6 +4386,21 @@ class NVMeFuzzer:
         self.cmd_stats[track_key]["exec"] += 1
 
         self.executions += 1
+
+        # FWCommit 성공 후 예약된 재연결 처리 — 여기(stop_sampling 이후)는 샘플러 스레드가
+        # 정지 상태라 안전하다. 코어 리셋으로 끊긴 타겟 디버그를 재확립해 halt 를 살린다.
+        # (이 명령의 coverage 는 이미 current_trace 에 수집돼 있어 재연결 영향 없음.)
+        if self._fw_commit_reset_pending:
+            self._fw_commit_reset_pending = False
+            log.warning("[Sampler] FWCommit 후 J-Link 재연결로 디버그 halt 재확립 시도...")
+            try:
+                _fw_rc_ok = self.sampler._reconnect()
+            except Exception as _fw_re_exc:
+                _fw_rc_ok = False
+                log.warning(f"[Sampler] 재연결 예외: {_fw_re_exc}")
+            log.warning("[Sampler] J-Link 재연결 "
+                        + ("성공 — halt 복구" if _fw_rc_ok
+                           else "실패 — POR/재시작 필요할 수 있음"))
 
         # P3: passthru_stats (replay 포함 모든 경로 추적)
         if seed.force_admin is True:
@@ -7951,6 +7981,16 @@ class NVMeFuzzer:
                          f"{_freeze*1000:.1f}ms → 펌웨어 {(_wall - _freeze)*1000:.1f}ms")
 
             rc = process.returncode
+
+            # FWCommit(0x10) 성공 = 펌웨어 활성화로 R5 코어가 리셋될 수 있고, 그러면 프로브(USB)는
+            # 살아있어도 타겟 디버그가 끊겨 halt 가 죽는다. 즉시 재연결하면 아직 샘플링 스레드가
+            # 살아있어 충돌하므로, 플래그만 세우고 _account_command(stop_sampling 이후)에서 재연결.
+            # 에러 리턴(rc≠0)하는 FWCommit 은 활성화가 안 돼 코어 리셋도 없다 → 무시(사용자 관측 일치).
+            if (rc == 0 and actual_opcode == 0x10
+                    and isinstance(self.sampler, JLinkHaltSampler)):
+                self._fw_commit_reset_pending = True
+                log.warning("[Sampler] FWCommit 성공 감지 — 코어 리셋으로 디버그 halt 소실 가능, "
+                            "재연결 예약(다음 회계 시점)")
 
             # SSD 내부에서 명령 완료 후에도 후처리(캐시 플러시, 로그 기록 등)가
             # 진행될 수 있으므로, 해당 시간만큼 샘플링을 계속 유지
