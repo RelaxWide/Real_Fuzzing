@@ -63,6 +63,8 @@
     },
     "nvme_passthru_timeout_ms": 2592000000,
     "nvme_kernel_timeout_sec": 2592000,
+    "_comment_halt_fwtime_margin_sec": "P9 펌웨어시간 워치독이 crash 로 판정하는 여유(초). nvme_timeouts 값은 '진짜 문제 기준'(예: 30s)이고, 실제 발화는 각 카테고리마다 (기준 + 이 마진). 경계의 정상 명령을 오탐하지 않도록 1s. 늘리면 더 보수적(문제만 확실히 잡음), 줄이면 더 민감.",
+    "halt_fwtime_margin_sec": 1.0,
     "_comment_state_monitor_sec": "state 관측(smart-log/get-log/security) 명령의 wall-clock 상한(초). crash 보존 불필요한 관측이라 짧게. device 무응답 시 이 시간 후 프로세스 버리고 스킵(fuzzer 멈춤 방지).",
     "state_monitor_sec": 60
   },

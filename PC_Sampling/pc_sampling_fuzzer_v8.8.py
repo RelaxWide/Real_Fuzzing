@@ -1380,7 +1380,9 @@ HALT_RECONNECT_NOCATCH_WINDOWS = 2   # halt 성공 0 이 이 창수 연속이면
 # halt 샘플러(P9) 펌웨어시간 워치독 — 벽시계에서 halt 프리즈를 빼 '진짜 펌웨어 N초'로
 # crash 판정한다. PCSR(비침습)은 프리즈=0 → 기존 벽시계 경로 그대로(무영향).
 HALT_FWTIME_POLL_SEC         = 0.5   # 워치독 폴링 간격(초)
-HALT_FWTIME_MARGIN_SEC       = 1.0   # 잔차(측정오차·resume 2차교란) 흡수용 작은 마진 — +10초 추측 대체
+HALT_FWTIME_MARGIN_SEC       = _T.get('halt_fwtime_margin_sec', 1.0)  # 각 timeout 카테고리의 crash 판정
+#                                    여유(초). nvme_timeouts 값(진짜 기준) 위에 카테고리마다 +이 마진에서
+#                                    발화 → 경계 정상 명령 오탐 방지. config timeouts.halt_fwtime_margin_sec.
 HALT_FWTIME_WALL_CEILING_SEC = 60.0  # fw_deadline 초과분 벽시계 상한(프리즈 회계 이상 시 폭주 방지)
 VMON_VMALLOC_CHUNK_WARN_KB = 65536   # 최대 free vmalloc chunk 이 이 값(64MB) 미만이면 경고
 
@@ -11346,6 +11348,12 @@ class NVMeFuzzer:
                     f"d3_extra={D3_EXTRA_S}s")
         log.warning(f"Power Sched : max_energy={MAX_ENERGY}")
         log.warning(f"NVMe I/O    : subprocess (nvme-cli passthru)")
+        if self.config.sampler_type == 'jlink_halt':
+            # halt 워치독: 각 timeout 카테고리는 (nvme_timeouts 기준 + 마진)에서 crash 판정.
+            log.warning(f"FWTime crash: 각 카테고리 = 기준 + {HALT_FWTIME_MARGIN_SEC:.1f}s 마진 "
+                        f"(예: command {self.config.nvme_timeouts.get('command', 0)/1000:.0f}s"
+                        f"→{self.config.nvme_timeouts.get('command', 0)/1000 + HALT_FWTIME_MARGIN_SEC:.0f}s"
+                        f" 펌웨어시간). 경계 정상 명령 오탐 방지.")
         if self.config.pm_inject_prob > 0:
             self._detect_pcie_info()
             log.warning(f"PM Rotate   : interval={PM_ROTATE_INTERVAL}cmds, "
