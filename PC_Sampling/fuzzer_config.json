@@ -42,6 +42,7 @@
     "pmu_script": "pmu_4_1.py",
     "ufas_binary": "ufas",
     "debug_tool_binary": "Debug_Tool_v1.0.0.2",
+    "debug_tool_timeout_sec": 7200,
     "jlink_dump_script": "run_smi_mem_dump_JLINK_USB.sh",
     "debug_package_dir": "DebugPackage/smi_mem_parsing",
     "parser_script_sh": "customer_parsing_dump.sh",

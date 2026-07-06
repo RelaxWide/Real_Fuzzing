@@ -472,6 +472,7 @@ MAX_CORPUS_HARD_LIMIT = _FZ['max_corpus_hard_limit']
 # v8.3: 외부 파일 경로/파일명 (paths 섹션) — 메서드 본문에서 참조 (script_dir 기준).
 UFAS_BINARY        = _P['ufas_binary']            # crash UFAS 덤프 실행 파일 (PM9M1/BM9H1)
 DEBUG_TOOL_BINARY  = _P.get('debug_tool_binary', 'Debug_Tool_v1.0.0.2')  # crash P9 RDDump 실행 파일 (UFAS 대체)
+DEBUG_TOOL_TIMEOUT = _P.get('debug_tool_timeout_sec', 7200)  # RDDump 최대 대기(초). 덤프가 오래 걸려 중간 종료 금지 → 기본 2시간
 JLINK_DUMP_SCRIPT  = _P['jlink_dump_script']      # crash J-Link 메모리 덤프 셸 스크립트
 DEBUG_PACKAGE_DIR  = _P['debug_package_dir']      # vendor 파서 위치 (script_dir 기준 상대)
 PARSER_SCRIPT_SH   = _P['parser_script_sh']       # customer parsing tool (.sh 우선)
@@ -8535,7 +8536,8 @@ class NVMeFuzzer:
         (상황별 번호 변경). P9 는 J-Link/UFAS 를 쓰지 않으므로 이 경로만 탄다.
         Popen 으로 PID 추적, timeout 후 D-state 대비 포기 처리(UFAS 와 동일 구조).
         """
-        TIMEOUT = 600   # 10분 — 펌웨어 덤프는 수 분 소요될 수 있음
+        TIMEOUT = DEBUG_TOOL_TIMEOUT   # config debug_tool_timeout_sec (기본 7200=2시간).
+        #                              RDDump 자체가 오래 걸려 중간 종료 금지.
 
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         tool_path = os.path.join(script_dir, DEBUG_TOOL_BINARY)
@@ -8555,9 +8557,10 @@ class NVMeFuzzer:
         log.warning(f"[DebugTool] 작업 디렉토리: {script_dir}")
 
         try:
+            # stderr 를 stdout 으로 합쳐 라인 순서를 보존하고 실시간 스트리밍한다.
             proc = subprocess.Popen(
                 cmd, cwd=script_dir,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
             )
         except Exception as e:
@@ -8567,22 +8570,31 @@ class NVMeFuzzer:
         log.warning(f"[DebugTool] 프로세스 시작 PID={proc.pid} — 최대 {TIMEOUT}초 대기")
 
         import threading
-        _result: dict = {}
+        _reader_err: dict = {}
 
-        def _communicate():
+        def _stream_output():
+            # RDDump 의 출력을 라인 단위로 즉시 로그에 흘려보낸다(communicate 버퍼링 제거).
+            # → 2시간 덤프 중에도 진행 내용이 텍스트 로그·터미널에 실시간으로 남는다.
             try:
-                out, err = proc.communicate()
-                _result['stdout'] = out
-                _result['stderr'] = err
-                _result['rc'] = proc.returncode
+                for raw in iter(proc.stdout.readline, b''):
+                    line = raw.decode(errors='replace').rstrip('\r\n')
+                    if line:
+                        log.warning(f"[DebugTool] {line}")
             except Exception as ex:
-                _result['error'] = ex
+                _reader_err['error'] = ex
+            finally:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
 
-        t = threading.Thread(target=_communicate, daemon=True)
+        t = threading.Thread(target=_stream_output, daemon=True)
         t.start()
 
         POLL_INTERVAL = 30
         waited = 0
+        # reader 스레드는 stdout EOF(=프로세스 종료) 시 끝난다. 출력이 없는 조용한
+        # 구간에도 살아있음을 알리기 위해 경과 시간을 주기적으로 찍는다.
         while waited < TIMEOUT:
             t.join(timeout=POLL_INTERVAL)
             if not t.is_alive():
@@ -8603,17 +8615,15 @@ class NVMeFuzzer:
                 log.warning("[DebugTool] kill 후 프로세스 종료 확인")
             return
 
-        if 'error' in _result:
-            log.warning(f"[DebugTool] communicate 오류: {_result['error']}")
-            return
+        if 'error' in _reader_err:
+            log.warning(f"[DebugTool] 출력 스트리밍 오류: {_reader_err['error']}")
 
-        rc = _result.get('rc', -1)
-        out = _result.get('stdout', b'').decode(errors='replace').strip()
-        err = _result.get('stderr', b'').decode(errors='replace').strip()
-        if out:
-            log.info(f"[DebugTool] stdout:\n{out}")
-        if err:
-            log.info(f"[DebugTool] stderr:\n{err}")
+        # reader 종료(stdout EOF) → 프로세스 종료 대기하여 rc 확보.
+        try:
+            rc = proc.wait(timeout=10)
+        except Exception:
+            rc = proc.returncode if proc.returncode is not None else -1
+
         if rc == 0:
             log.warning("[DebugTool] RDDump 완료 (rc=0)")
         else:
@@ -9282,7 +9292,11 @@ class NVMeFuzzer:
         if not _infra_ok:
             log.error("[TIMEOUT] 디버그 인프라 접근 불가 — 펌웨어 hang 여부 자동 판단 불가")
             log.error("[TIMEOUT] ── 수동 확인 절차 ──────────────────────────────────")
-            log.error(f"[TIMEOUT]  1) sudo pkill -9 openocd")
+            if isinstance(self.sampler, JLinkHaltSampler):
+                # P9 는 OpenOCD 미사용 — pylink 가 J-Link USB 를 in-process 점유.
+                log.error(f"[TIMEOUT]  1) 이 프로세스 종료로 J-Link USB 해제 (OpenOCD 없음)")
+            else:
+                log.error(f"[TIMEOUT]  1) sudo pkill -9 openocd")
             log.error(f"[TIMEOUT]  2) nvme id-ctrl {_nvme_dev}")
             log.error(f"[TIMEOUT]     응답 있음  → SSD 생존 (인프라 문제였을 가능성)")
             log.error(f"[TIMEOUT]     응답 없음  → SSD 사망 (펌웨어 crash 가능성)")
@@ -9527,11 +9541,14 @@ class NVMeFuzzer:
             f"(nvme_core admin/io_timeout 설정값)")
         log.error("")
 
-        # 6) PC 분석 완료 — OpenOCD + telnet 유지 (hang 상태 보존)
-        # run()의 모니터링 루프에서 10초 간격으로 PC를 계속 찍기 위해
-        # 여기서는 telnet을 닫지 않는다. OpenOCD kill 시 J-Link가 nSRST를
-        # assert할 수 있어 펌웨어 상태가 바뀌므로 OpenOCD도 종료하지 않는다.
-        if self.sampler._openocd_alive():
+        # 6) PC 분석 완료 — 디버그 세션을 유지해 hang 상태 보존.
+        # run()의 모니터링 루프가 PC를 계속 찍기 위해 세션을 닫지 않는다.
+        # - PCSR/OpenOCD 제품: OpenOCD kill 시 J-Link가 nSRST를 assert할 수 있어
+        #   펌웨어 상태가 바뀌므로 OpenOCD+telnet 도 종료하지 않는다.
+        # - P9(J-Link halt): OpenOCD 자체가 없다. pylink 세션(in-process)만 유지.
+        if isinstance(self.sampler, JLinkHaltSampler):
+            log.warning("[TIMEOUT] J-Link 세션 유지 — 시각화 후 PC 모니터링 진입")
+        elif self.sampler._openocd_alive():
             log.warning("[TIMEOUT] OpenOCD + telnet 유지 — 시각화 후 PC 모니터링 진입")
 
         # 7) 플래그 설정 — caller가 break로 루프 탈출
