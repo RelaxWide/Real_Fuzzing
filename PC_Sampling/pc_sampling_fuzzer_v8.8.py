@@ -1375,6 +1375,8 @@ HALT_HEALTH_EXEC_INTERVAL  = 2000    # health 평가 주기(exec 횟수)
 HALT_HEALTH_FAIL_RATIO     = 0.95    # 이 주기 halt 실패율이 이 이상이고
 HALT_HEALTH_MIN_ATTEMPTS   = 50      # 최소 이만큼 halt 시도가 있었고
 HALT_HEALTH_STUCK_STREAK   = 2       # coverage 정체가 이 횟수(=주기×2) 연속이면 (B) 경고
+HALT_RECONNECT_NOCATCH_WINDOWS = 2   # halt 성공 0 이 이 창수 연속이면 디버그 손실(코어 리셋 등)로
+#                                    보고 J-Link 재연결 시도. FWCommit 등 코어 리셋 후 halt 복구용.
 # halt 샘플러(P9) 펌웨어시간 워치독 — 벽시계에서 halt 프리즈를 빼 '진짜 펌웨어 N초'로
 # crash 판정한다. PCSR(비침습)은 프리즈=0 → 기존 벽시계 경로 그대로(무영향).
 HALT_FWTIME_POLL_SEC         = 0.5   # 워치독 폴링 간격(초)
@@ -2892,6 +2894,7 @@ class NVMeFuzzer:
         self._health_prev_halt_fail = 0       # 직전 평가 시 sampler.halt_fail_total
         self._health_prev_timeouts  = 0       # 직전 평가 시 stats['ignored_timeout'] (NVMe timeout 동반 판별)
         self._health_stuck_streak   = 0       # coverage 정체+halt 대량실패+timeout 연속 횟수
+        self._health_nocatch_streak = 0       # halt 성공 0 연속 창수 — 디버그 손실(코어 리셋) 감지·재연결용
         self._graph_child_proc = None         # v8.8: 차트 렌더 subprocess(Popen) — fork 제거
         self._graph_snapshot_path = None      # v8.8: 현재 렌더에 넘긴 스냅샷 pkl 경로(정리용)
         self._mpl_warmed = False              # (구) 부모 선import 플래그 — subprocess 렌더에선 미사용
@@ -11130,6 +11133,14 @@ class NVMeFuzzer:
             return   # 이 주기 halt 시도가 너무 적어 판단 불가(명령이 드문 구간 등)
         fail_ratio = d_fail / attempts
 
+        # 디버그 손실(코어 리셋) 감지: halt 성공이 0 이면 일시적 WFI 가 아니라 halt 자체가
+        # 안 되는 상태(예: FWCommit 활성화로 코어 리셋 → 디버그 halt-enable 소실). 명령이
+        # 돌면 WFI 라도 가끔은 잡히므로, 성공 0 이 연속되면 디버그 손실로 본다.
+        if d_ok > 0:
+            self._health_nocatch_streak = 0
+        else:
+            self._health_nocatch_streak += 1
+
         # coverage 가 늘고 있으면 무조건 정상.
         if d_cov > 0:
             self._health_stuck_streak = 0
@@ -11151,9 +11162,24 @@ class NVMeFuzzer:
                 # 겁주지 않게 파일 info 만. d_ok 로 '아예 못 잡음' vs '잡히나 새 PC 없음' 구분.
                 self._health_stuck_streak = 0
                 if d_ok == 0:
-                    log.info(f"[Sampler] under-sampling — 펌웨어 정상(NVMe timeout 0)인데 halt "
-                             f"{fail_ratio:.0%} 실패로 PC 미포착, coverage 정체. 펌웨어 실행이 "
-                             f"짧아 halt 가 못 잡음 → go_settle/halt_poll 낮춰 밀도↑ 검토.")
+                    log.info(f"[Sampler] under-sampling/디버그손실 의심 — 펌웨어 정상(NVMe timeout 0)"
+                             f"인데 halt {fail_ratio:.0%} 실패로 PC 미포착({self._health_nocatch_streak}"
+                             f"창 연속), coverage 정체. 펌웨어 실행이 짧거나 코어 리셋(FWCommit 등) 후 "
+                             f"디버그 halt 손실 가능.")
+                    # 연속 0 포착이 이어지면 = 디버그 halt 손실로 보고 J-Link 재연결로 복구 시도.
+                    if self._health_nocatch_streak >= HALT_RECONNECT_NOCATCH_WINDOWS:
+                        log.warning(f"[Sampler] halt {self._health_nocatch_streak}창 연속 0 포착 — "
+                                    f"코어 리셋(예: FWCommit 활성화) 후 디버그 halt 손실 의심. "
+                                    f"J-Link 재연결로 halt 복구 시도...")
+                        try:
+                            _rc_ok = self.sampler._reconnect()
+                        except Exception as _re_exc:
+                            _rc_ok = False
+                            log.warning(f"[Sampler] 재연결 예외: {_re_exc}")
+                        log.warning("[Sampler] J-Link 재연결 "
+                                    + ("성공 — halt 복구 여부는 다음 창에서 확인"
+                                       if _rc_ok else "실패 — POR/재시작 필요할 수 있음"))
+                        self._health_nocatch_streak = 0
                 else:
                     log.info(f"[Sampler] coverage 포화 추정 — 샘플은 잡히나(성공 {d_ok}) 새 PC 0. "
                              f"halt {fail_ratio:.0%} 실패. 상태/시퀀스 기반 탐색 전환 시점일 수 있음.")
