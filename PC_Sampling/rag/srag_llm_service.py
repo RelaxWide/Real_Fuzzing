@@ -5,14 +5,10 @@
 함수(generate_rag_response)를 호출하고 _BRIDGE/responses/ 에 답을 쓴다. 온라인 PC 에서
 계속 띄워둔다. 요청/응답 파일은 처리 후 삭제(stateless — 서비스 재시작해도 남은 요청부터).
 
-실행:
-  RAG_LLM_MODULE=<실제LLM모듈> python3 srag_llm_service.py
+실행 (인자 불필요 — 같은 폴더에 srag_llm_guide.py 두고):
+  python3 srag_llm_service.py
 
-환경변수:
-  RAG_LLM_MODULE : 실제 LLM 함수가 있는 모듈명(필수). 예: my_internal_llm
-                   (그 함수는 generate_rag_response(user_prompt) -> str 형태, system 내장)
-  RAG_LLM_FUNC   : 함수명(기본 generate_rag_response)
-  RAG_BRIDGE_DIR : 공유 drop-box 경로(기본: 이 파일 옆 bridge/). 오프라인 PC 와 같은 물리 폴더.
+설정은 아래 상수만 필요시 수정(환경변수로도 override 가능).
 """
 import importlib
 import json
@@ -21,22 +17,31 @@ import sys
 import time
 from pathlib import Path
 
-_LLM_MODULE = os.environ.get("RAG_LLM_MODULE")
-_LLM_FUNC = os.environ.get("RAG_LLM_FUNC", "generate_rag_response")
-_BRIDGE = Path(os.environ.get("RAG_BRIDGE_DIR",
-                              Path(__file__).resolve().parent / "bridge"))
-_REQ = _BRIDGE / "requests"
-_RESP = _BRIDGE / "responses"
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))   # 같은 폴더의 srag_llm_guide.py 를 import 가능하게
+
+# ═══════════════ 설정 — 필요시 이 값만 수정 (실행 인자 불필요) ═══════════════
+LLM_MODULE = "srag_llm_guide"          # 같은 폴더의 srag_llm_guide.py (실제 LLM 함수 보유)
+LLM_FUNC   = "generate_rag_response"   # 그 안의 함수명. generate_rag_response(user)->str
+BRIDGE_DIR = _HERE / "bridge"          # Samba 공유 drop-box. 오프라인 PC 와 같은 물리 폴더여야 함.
+#            ↑ 이 서비스가 공유 폴더에서 돌면 그대로 OK. 마운트 위치가 다르면 실제 경로로:
+#              예) BRIDGE_DIR = Path("/mnt/samba_share/bridge")
+# ══════════════════════════════════════════════════════════════════════════
+
+# (선택) 환경변수 override — 없으면 위 기본값 사용
+LLM_MODULE = os.environ.get("RAG_LLM_MODULE", LLM_MODULE)
+LLM_FUNC = os.environ.get("RAG_LLM_FUNC", LLM_FUNC)
+BRIDGE_DIR = Path(os.environ.get("RAG_BRIDGE_DIR", BRIDGE_DIR))
+
+_REQ = BRIDGE_DIR / "requests"
+_RESP = BRIDGE_DIR / "responses"
 _POLL = 0.5
 
-if not _LLM_MODULE:
-    sys.exit("[RAG service] RAG_LLM_MODULE 환경변수로 실제 LLM 모듈명을 지정하세요 "
-             "(예: RAG_LLM_MODULE=my_internal_llm python3 srag_llm_service.py)")
-
 try:
-    _llm_call = getattr(importlib.import_module(_LLM_MODULE), _LLM_FUNC)
+    _llm_call = getattr(importlib.import_module(LLM_MODULE), LLM_FUNC)
 except Exception as e:
-    sys.exit(f"[RAG service] LLM 로드 실패: {_LLM_MODULE}.{_LLM_FUNC} — {e}")
+    sys.exit(f"[RAG service] LLM 로드 실패: {LLM_MODULE}.{LLM_FUNC} — {e}\n"
+             f"  → 같은 폴더에 {LLM_MODULE}.py 가 있고 {LLM_FUNC}() 가 정의됐는지 확인하세요.")
 
 _REQ.mkdir(parents=True, exist_ok=True)
 _RESP.mkdir(parents=True, exist_ok=True)
@@ -56,7 +61,7 @@ def _unlink(path: Path):
 
 
 def main():
-    print(f"[RAG service] watching {_REQ}  (LLM={_LLM_MODULE}.{_LLM_FUNC})", flush=True)
+    print(f"[RAG service] watching {_REQ}  (LLM={LLM_MODULE}.{LLM_FUNC})", flush=True)
     while True:
         for req in sorted(_REQ.glob("req_*.json")):
             try:
