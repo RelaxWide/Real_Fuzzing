@@ -9721,6 +9721,16 @@ class NVMeFuzzer:
         # 3.7-b) P9 Debug_Tool RDDump — UFAS 대체 (P9 는 JLink/UFAS 미사용).
         #        ./Debug_Tool_v1.0.0.2 RDDump <controller device>. device 는 상황별 자동.
         if self.config.enable_debug_tool_dump:
+            # RDDump 는 컨트롤러(/dev/nvmeN)로 NVMe 접근한다. P9 는 pylink 가 R5 를 attach/
+            # halt 로 붙잡은 채라(stuck PC 는 이미 위에서 캡처됨), 코어가 halt 로 남거나 디버그
+            # 세션이 컨트롤러 응답을 막으면 '디바이스 못 찾음'이 된다. RDDump 전에 J-Link 를
+            # 닫아 코어 resume(close()가 Go 후 종료) + USB 해제 → 컨트롤러 자유 실행/응답 복구.
+            if isinstance(self.sampler, JLinkHaltSampler):
+                try:
+                    self.sampler.close()   # Go(resume) → jlink.close() → USB 해제
+                    log.warning("[TIMEOUT] RDDump 전 J-Link 해제(코어 resume) — 컨트롤러 응답 복구")
+                except Exception as _rel_exc:
+                    log.warning(f"[TIMEOUT] J-Link 해제 예외: {_rel_exc}")
             log.warning("[TIMEOUT] P9 Debug_Tool RDDump 를 실행합니다...")
             try:
                 self._run_debug_tool_dump()
