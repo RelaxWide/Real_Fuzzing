@@ -53,19 +53,29 @@ def _looks_like(user_prompt, *keys):
     return any(k in u for k in keys)
 
 
-def ask(system_prompt: str, user_prompt: str) -> str:
-    """(system, user) -> JSON 문자열. user_prompt 로 task 를 추정해 canned JSON 반환."""
+def _respond(text_in: str) -> str:
+    """입력 텍스트로 task 추정 → canned JSON(절반은 prose 로 감싸 파서 강건성 시험)."""
     if _SLEEP > 0:
         time.sleep(_SLEEP)
-    if _looks_like(user_prompt, "sequence", "시퀀스", "setup", "trigger"):
+    if _looks_like(text_in, "sequence", "시퀀스", "setup", "trigger"):
         body = _SEQS
-    elif _looks_like(user_prompt, "evaluate", "score", "평가", "keep"):
+    elif _looks_like(text_in, "evaluate", "score", "평가", "keep"):
         # task4: 평가는 seed_id 를 모르는 mock 이라 빈 목록(파이프라인만 확인).
         body = {"evaluations": []}
     else:
         body = _SEEDS
-    # 절반은 prose 로 감싸 파서의 brace-scan 강건성도 시험.
     text = json.dumps(body, ensure_ascii=False)
-    if len(user_prompt or "") % 2 == 0:
+    if len(text_in or "") % 2 == 0:
         return f"다음은 요청하신 시드입니다:\n```json\n{text}\n```\n안전에 유의하세요."
     return text
+
+
+def ask(system_prompt: str, user_prompt: str) -> str:
+    """2-인자형 (system, user) -> JSON. config pass_system_prompt=true 용(예: 개발 mock)."""
+    return _respond(user_prompt)
+
+
+def generate_rag_response(user_prompt: str) -> str:
+    """1-인자형 (user만) -> JSON. 사내 래퍼와 동일 시그니처. config pass_system_prompt=false 용.
+    실제 사내 함수는 system_prompt('참고 문서 기반 답변…')를 내장하고 user_prompt 만 받는다."""
+    return _respond(user_prompt)

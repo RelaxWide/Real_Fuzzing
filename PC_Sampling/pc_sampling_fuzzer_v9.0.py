@@ -189,6 +189,7 @@ _RAG = _CFG.get('rag', {})
 RAG_ENABLED          = bool(_RAG.get('enabled', False))
 RAG_MODULE_PATH      = str(_RAG.get('module_path', 'rag.mock_llm'))
 RAG_FUNC_NAME        = str(_RAG.get('func_name', 'ask'))
+RAG_PASS_SYSTEM      = bool(_RAG.get('pass_system_prompt', True))  # False=단일인자 func(system+user)
 RAG_REQUEST_CADENCE  = int(_RAG.get('request_cadence', 5000))
 RAG_PLATEAU_EXECS    = int(_RAG.get('plateau_exec_threshold', 20000))
 RAG_MAX_SEEDS        = int(_RAG.get('max_seeds_per_round', 8))
@@ -1147,6 +1148,7 @@ class FuzzConfig:
     rag_enabled:     bool = RAG_ENABLED
     rag_module_path: str  = RAG_MODULE_PATH
     rag_func_name:   str  = RAG_FUNC_NAME
+    rag_pass_system: bool = RAG_PASS_SYSTEM   # False → 단일인자 func(system+"\n\n"+user)
 
 class _MsFormatter(logging.Formatter):
     """ms 단위 타임스탬프 포매터 (datefmt는 초까지만 지원하므로 formatTime 오버라이드)."""
@@ -3019,6 +3021,7 @@ class LlmBridge:
         self._worker = None
         self._stop = threading.Event()
         self._inflight = False
+        self._pass_system = getattr(config, 'rag_pass_system', True)
         if not config.rag_enabled:
             return
         try:
@@ -3032,7 +3035,9 @@ class LlmBridge:
             self._callable = None
             return
         self.enabled = True
-        log.warning(f"[LLM] 활성 — {config.rag_module_path}.{config.rag_func_name} "
+        _call = (f"{config.rag_func_name}(system, user)" if self._pass_system
+                 else f"{config.rag_func_name}(user)  [system 접합]")
+        log.warning(f"[LLM] 활성 — {config.rag_module_path}.{_call} "
                     f"(cadence={RAG_REQUEST_CADENCE}, tasks={RAG_TASKS})")
 
     # ── 모듈/스키마 로드 (import-guarded) ─────────────────────────────
@@ -3075,7 +3080,12 @@ class LlmBridge:
             except queue.Empty:
                 continue
             try:
-                text = self._callable(req['system'], req['user'])   # 수 초 — 여기서만 블록
+                # 수 초 — 여기서만 블록. 사내 래퍼가 단일인자(generate_rag_response(user))면
+                # system 을 user 에 접어 넣어 호출(그쪽 system_prompt 는 고정 내장).
+                if self._pass_system:
+                    text = self._callable(req['system'], req['user'])
+                else:
+                    text = self._callable(req['system'] + "\n\n" + req['user'])
                 self._out_q.put({'task': req['task'], 'raw': text,
                                  'error': None, 'submitted_at': req['submitted_at']})
             except Exception as e:

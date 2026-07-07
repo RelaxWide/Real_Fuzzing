@@ -335,10 +335,12 @@
     ]
   },
   "rag": {
-    "_comment": "v9.0 LLM-guided fuzzing. enabled=false 또는 --no-rag 면 이 섹션 전체 무시(v8.8 byte-동등). module_path/func_name = 사내 LLM callable(ChatGPT-API 유사 ask(system,user)->text). dev 는 rag.mock_llm. request_cadence exec 마다 백그라운드로 1 라운드(in-flight 1건), plateau_exec_threshold exec coverage 정체 시 우선 요청. LLM 산출물은 스키마 검증+위험필터 통과분만 corpus 주입.",
+    "_comment": "v9.0 LLM-guided fuzzing. enabled=false 또는 --no-rag 면 이 섹션 전체 무시(v8.8 byte-동등). module_path/func_name = LLM callable. request_cadence exec 마다 백그라운드로 1 라운드(in-flight 1건), plateau_exec_threshold exec coverage 정체 시 우선 요청. LLM 산출물은 스키마 검증+위험필터 통과분만 corpus 주입.",
+    "_comment_call": "pass_system_prompt=true → func(system, user) 2-인자(개발 mock ask). false → func(system+user 결합) 1-인자. 사내 래퍼가 generate_rag_response(user_prompt) 단일인자·system 내장이면 func_name='generate_rag_response', pass_system_prompt=false 로 설정.",
     "enabled": false,
     "module_path": "rag.mock_llm",
     "func_name": "ask",
+    "pass_system_prompt": true,
     "request_cadence": 5000,
     "plateau_exec_threshold": 20000,
     "max_seeds_per_round": 8,
