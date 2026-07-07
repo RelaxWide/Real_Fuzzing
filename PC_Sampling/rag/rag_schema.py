@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""RAG 서비스용 스키마 브리지 — cmd_schemas.json 기반 (fuzzer import 불필요, Intranet PC 이식 가능).
+"""스키마 브리지 — LLM 생성 시드/시퀀스를 fuzzer 발송 기준(CMD_SCHEMAS)으로 검증·보정.
 
-생성된 cmd_schemas.json(= export_cmd_schemas.py 산출)만 있으면 동작한다. fuzzer 의 CMD_SCHEMAS 와
-동일 기준이므로, 여기서 validate_and_repair 를 통과한 시드는 fuzzer 흡수 시에도 schema-valid.
+v9.0 fuzzer 는 이 클래스를 in-process 로 쓴다: SchemaBridge.from_dict(_llm_schema_dict())
+— live CMD_SCHEMAS/가드로 dict 를 만들어 넘기므로 **파일 불필요**. 여기서 validate_and_repair
+를 통과한 시드는 fuzzer 흡수 시에도 schema-valid. (파일 기반 SchemaBridge(json_path) 도
+가능하나 선택 — 별도 노드에서 JSON 만으로 쓸 때.)
 
 API:
-  b = SchemaBridge("cmd_schemas.json")
+  b = SchemaBridge.from_dict(schema_dict)   # v9.0 fuzzer 경로(파일 불필요)
   b.schema_to_prompt("Identify")            # LLM 프롬프트에 넣을 CDW 필드 정의 표(텍스트)
   b.is_dangerous("Sanitize", cdw)           # (bool, reason) — 위험명령이면 생성 금지
   b.validate_and_repair("Read", cdw)        # (repaired_cdw, repaired_fields, ok)
@@ -16,6 +18,7 @@ reserved_policy: "reject"(기본) = 유효하지 않은 ENUM 값이면 시드 �
 import json
 from pathlib import Path
 
+# 파일 기반 SchemaBridge(json_path=None) 의 기본 경로(선택). v9.0 fuzzer 는 from_dict 를 써서 미사용.
 _DEFAULT_JSON = Path(__file__).resolve().parent / "cmd_schemas.json"
 
 
@@ -145,25 +148,35 @@ class SchemaBridge:
 
 
 def _selftest():
-    b = SchemaBridge()
-    print(f"[rag_schema] cmd_schemas.json fuzzer_version={b.fuzzer_version} "
-          f"commands={len(b.commands)}")
+    # from_dict 경로 스모크(파일 불필요). fuzzer 는 실제로 live CMD_SCHEMAS 로 dict 를 만든다.
+    sample = {
+        "fuzzer_version": "selftest",
+        "commands": {
+            "Identify": {"opcode": 0x06, "cmd_type": "admin"},
+            "Sanitize": {"opcode": 0x84, "cmd_type": "admin"},
+        },
+        "schemas": {
+            "Identify": [{"name": "CNS", "word": 10, "hi": 7, "lo": 0, "ftype": "ENUM",
+                          "valid": [0x00, 0x01, 0x02, 0x03, 0x06], "reserved": [],
+                          "vendor": [], "max_val": 0}],
+        },
+        "guards": {"destructive": ["FormatNVM", "Sanitize"], "blocked_admin_opcodes": [],
+                   "blocked_security_send_secp": [], "security_send_opcode": 0x81,
+                   "ns_mgmt_opcode": 0x0D, "ns_attach_opcode": 0x15, "block_ns_delete": True},
+    }
+    b = SchemaBridge.from_dict(sample)
+    print(f"[rag_schema] from_dict OK — commands={len(b.commands)}")
     print("--- schema_to_prompt('Identify') ---")
     print(b.schema_to_prompt("Identify"))
     print("--- validate_and_repair cases ---")
-    cases = [
-        ("Read",        {"cdw10": 0, "cdw11": 0, "cdw12": 7}),       # valid
-        ("Identify",    {"cdw10": 0x06}),                            # CNS=6 valid
-        ("Identify",    {"cdw10": 0x1F}),                            # CNS=0x1F reserved → reject
-        ("Sanitize",    {"cdw10": 0x02}),                            # destructive → reject
-        ("SecuritySend",{"cdw10": 0xEF000100}),                      # locking SECP → reject
-        ("UnknownCmd",  {"cdw10": 0}),                               # 미지 → reject
-    ]
-    for cmd, cdw in cases:
+    for cmd, cdw in [("Identify", {"cdw10": 0x06}),   # valid
+                     ("Identify", {"cdw10": 0x1F}),   # reserved ENUM → reject
+                     ("Sanitize", {"cdw10": 0x02}),   # destructive → reject
+                     ("UnknownCmd", {"cdw10": 0})]:    # 미지 → reject
         rep, fixed, ok = b.validate_and_repair(cmd, cdw)
         dang, reason = b.is_dangerous(cmd, cdw)
-        print(f"  {cmd:14} cdw10=0x{cdw.get('cdw10',0):08x} -> ok={ok} "
-              f"{'danger='+reason if dang else ''} {('repaired='+str(fixed)) if fixed else ''}")
+        print(f"  {cmd:12} cdw10=0x{cdw.get('cdw10', 0):08x} -> ok={ok} "
+              f"{'danger=' + reason if dang else ''}")
 
 
 if __name__ == "__main__":

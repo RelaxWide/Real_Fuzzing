@@ -2939,9 +2939,9 @@ class JLinkHaltSampler(OpenOCDPCSampler):
 # ══════════════════════════════════════════════════════════════════════════
 
 def _llm_schema_dict() -> dict:
-    """live CMD_SCHEMAS/NVME_COMMANDS/가드상수로 rag_schema.SchemaBridge 용 dict 구성.
-    export_cmd_schemas.py 산출과 동일 형태 — 검증 기준을 발송 기준과 완전 일치시키고
-    파일 export 단계를 제거한다(in-process)."""
+    """live CMD_SCHEMAS/NVME_COMMANDS/가드상수로 rag_schema.SchemaBridge.from_dict 용 dict 구성.
+    검증 기준을 발송 기준과 완전 일치시키고 파일 의존(cmd_schemas.json export)을 제거한다(in-process).
+    형태: {fuzzer_version, commands, schemas, guards}."""
     commands = {}
     for c in NVME_COMMANDS:
         commands[c.name] = {
