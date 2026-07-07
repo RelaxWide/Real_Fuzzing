@@ -8726,26 +8726,41 @@ class NVMeFuzzer:
         log.warning("[DebugTool] 실행 파일 확인 OK")
 
         device = self._ctrl_device()   # 상황별 컨트롤러 경로 (/dev/nvme0 등)
-        _base_cmd = [tool_path, 'RDDump', device]
-        # 툴 stdout 이 파이프라 glibc 가 라인→블록 버퍼링으로 전환 → 실시간 출력이 안
-        # 흘러나오고(종료 시에나 flush, kill 되면 유실) readline 이 아무것도 못 받는다.
-        # stdbuf 로 라인 버퍼링 강제(glibc stdio 툴에 한함). 없으면 원본 그대로.
-        if shutil.which('stdbuf'):
-            cmd = ['stdbuf', '-oL', '-eL', *_base_cmd]
-        else:
-            cmd = _base_cmd
+        cmd = [tool_path, 'RDDump', device]
         log.warning(f"[DebugTool] 실행 명령: {' '.join(cmd)}")
         log.warning(f"[DebugTool] 작업 디렉토리: {script_dir}")
 
+        # PTY(가짜 터미널)로 실행한다. vendor 툴은 stdout 이 파이프면 (a)glibc 블록버퍼링으로
+        # 출력을 안 흘리거나 (b)isatty() 검사로 출력 모드를 바꾸거나 (c)/dev/tty 로 직접 쓰는
+        # 경우가 있어, 일반 PIPE 로는 시작 배너(이름/버전/argv)조차 못 잡힌다. PTY 를 붙이면
+        # 툴이 '터미널 연결'로 인식해 수동 실행과 동일하게 라인버퍼링·정상 출력한다.
+        import pty as _pty
+        master_fd = None
         try:
-            # stderr 를 stdout 으로 합쳐 라인 순서를 보존하고 실시간 스트리밍한다.
-            proc = subprocess.Popen(
-                cmd, cwd=script_dir,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-            )
+            master_fd, slave_fd = _pty.openpty()
+        except Exception as e:
+            log.warning(f"[DebugTool] pty 생성 실패({e}) — PIPE 폴백")
+
+        try:
+            if master_fd is not None:
+                proc = subprocess.Popen(
+                    cmd, cwd=script_dir,
+                    stdout=slave_fd, stderr=slave_fd, stdin=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                os.close(slave_fd)   # 부모는 slave 불필요 — 닫아야 child 종료 시 master 가 EOF
+            else:
+                proc = subprocess.Popen(
+                    cmd, cwd=script_dir,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                )
         except Exception as e:
             log.warning(f"[DebugTool] Popen 실패: {e}")
+            if master_fd is not None:
+                for _fd in (master_fd, slave_fd):
+                    try: os.close(_fd)
+                    except Exception: pass
             return
 
         log.warning(f"[DebugTool] 프로세스 시작 PID={proc.pid} — 최대 {TIMEOUT}초 대기")
@@ -8754,20 +8769,40 @@ class NVMeFuzzer:
         _reader_err: dict = {}
 
         def _stream_output():
-            # RDDump 의 출력을 라인 단위로 즉시 로그에 흘려보낸다(communicate 버퍼링 제거).
-            # → 2시간 덤프 중에도 진행 내용이 텍스트 로그·터미널에 실시간으로 남는다.
+            # 툴 출력을 즉시 로그로 흘려보낸다. \r(프로그레스 바)도 라인으로 취급.
+            # PTY 면 master_fd 를, PIPE 폴백이면 proc.stdout 을 읽는다.
+            def _emit(chunks):
+                for ln in chunks:
+                    s = ln.decode(errors='replace').strip()
+                    if s:
+                        log.warning(f"[DebugTool] {s}")
+            buf = b''
             try:
-                for raw in iter(proc.stdout.readline, b''):
-                    line = raw.decode(errors='replace').rstrip('\r\n')
-                    if line:
-                        log.warning(f"[DebugTool] {line}")
+                if master_fd is not None:
+                    while True:
+                        try:
+                            data = os.read(master_fd, 4096)
+                        except OSError:
+                            break   # slave 닫힘(child 종료) → EIO = EOF
+                        if not data:
+                            break
+                        buf = (buf + data).replace(b'\r', b'\n')
+                        *full, buf = buf.split(b'\n')
+                        _emit(full)
+                    if buf.strip():
+                        _emit([buf])
+                else:
+                    for raw in iter(proc.stdout.readline, b''):
+                        _emit([raw])
             except Exception as ex:
                 _reader_err['error'] = ex
             finally:
-                try:
-                    proc.stdout.close()
-                except Exception:
-                    pass
+                if master_fd is not None:
+                    try: os.close(master_fd)
+                    except Exception: pass
+                else:
+                    try: proc.stdout.close()
+                    except Exception: pass
 
         t = threading.Thread(target=_stream_output, daemon=True)
         t.start()
