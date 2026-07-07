@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v8.8
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v9.0
 
 OpenOCD PCSR 비침습 샘플링 + nvme-cli passthru 기반 Coverage-Guided + State-Aware
 Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/덤프를 데이터 주도 설정.
@@ -10,11 +10,17 @@ Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/�
 - Coverage: OpenOCD telnet → PCSR (CoreBase+0x84). Ghidra BB 정보가 있으면 BB 기준.
 - State:    NVMeStateMonitor delta → state corpus. CSFuzz 적응형 p.
 - Mutation: Havoc/Splice + Deterministic + MOpt + Schema + Phase 1/2/3.
+- LLM:      v9.0 사내 LLM 기반 spec-aware 시드/시퀀스 생성·corpus 평가(--rag, 백그라운드).
 - Power:    PS0~4 × L0/L1/L1.2 × D0/D3 + S1/S2 perturb (PCIe bit / CLKREQ#).
 - POR:      pmu_4_1.py 전원 사이클 → PCIe rescan → OpenOCD 재연결.
 - Defect:   timeout 시 stuck PC 분석 → JLink dump → UFAS dump → PC 모니터링.
 
 버전 요약 (자세한 내용은 git log / 각 버전 md 참조)
+- v9.0: LLM-guided fuzzing 추가(in-process 직접 호출). 기존 fuzzing 루프는 무변경, 스펙 아는
+        사내 LLM 을 백그라운드 워커로 돌려 신규 명령군 시드·멀티-명령 시퀀스를 시드 풀에 주기
+        주입하고 corpus 를 평가. LLM 산출물은 스키마 검증(validate_and_repair)+위험필터
+        (is_dangerous)+발송 가드 3중 방어. --rag off/import실패 시 v8.8 byte-동등. 사내 래퍼는
+        generate_rag_response(user) 단일인자 지원(config pass_system_prompt=false). 상세: v9.0.md.
 - v8.8: 주기 차트 생성을 os.fork() → '완전 독립 subprocess'(--render-charts)로 교체. 거대
         퍼저 프로세스 fork(주소공간 COW + FD 상속 + 멀티스레드 fork)가 호스트 OS 를 logless
         즉시 재부팅시키는 트리거임이 실측 확인 → fork 완전 제거. 차트 데이터만 pickle 스냅샷
