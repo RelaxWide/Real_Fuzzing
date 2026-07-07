@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """온라인 PC 용 RAG 브리지 서비스 — Samba 공유 drop-box 를 폴링해 실제 LLM 을 처리한다.
 
-오프라인 fuzzer 의 srag_llm_guide.py 가 _BRIDGE/requests/ 에 쓴 요청을 읽어 실제 LLM
+오프라인 fuzzer 의 rag_bridge_client.py 가 _BRIDGE/requests/ 에 쓴 요청을 읽어 실제 LLM
 함수(generate_rag_response)를 호출하고 _BRIDGE/responses/ 에 답을 쓴다. 온라인 PC 에서
 계속 띄워둔다. 요청/응답 파일은 처리 후 삭제(stateless — 서비스 재시작해도 남은 요청부터).
 

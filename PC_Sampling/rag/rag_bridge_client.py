@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """오프라인 PC(fuzzer)용 RAG 브리지 클라이언트 — Samba 공유 drop-box 경유로 온라인 LLM 호출.
 
+주의: 이 파일은 LLM 을 직접 부르지 않는 '배달부'다. 실제 LLM 코드(env 설정 + generate_rag
+_response)는 온라인 PC 에 두고 srag_llm_service.py 가 부른다(같은 이름과 헷갈리지 말 것).
+
 fuzzer 는 이 파일의 generate_rag_response(user_prompt) 를 백그라운드 워커로 호출한다
-(config: module_path="rag.srag_llm_guide", func_name="generate_rag_response",
-pass_system_prompt=false). 이 함수는 LLM 을 직접 부르지 않고, 공유 폴더(_BRIDGE)에 요청
-파일을 쓰고 응답 파일이 나타날 때까지 폴링(블록)한다. LLM 은 온라인 PC 의
+(config: module_path="rag.rag_bridge_client", func_name="generate_rag_response",
+pass_system_prompt=false). 이 함수는 공유 폴더(_BRIDGE)의 requests/ 에 요청 파일을 쓰고
+responses/ 에 응답이 나타날 때까지 폴링(블록)한다. 실제 LLM 은 온라인 PC 의
 srag_llm_service.py 가 처리한다. 워커 스레드에서 블록하므로 fuzzing 은 멈추지 않고,
 서비스가 죽거나 느리면 timeout → 워커가 잡아 그 라운드만 건너뛴다(graceful).
 
