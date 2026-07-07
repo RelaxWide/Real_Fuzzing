@@ -334,6 +334,26 @@
       ]
     ]
   },
+  "rag": {
+    "_comment": "v9.0 LLM-guided fuzzing. enabled=false 또는 --no-rag 면 이 섹션 전체 무시(v8.8 byte-동등). module_path/func_name = 사내 LLM callable(ChatGPT-API 유사 ask(system,user)->text). dev 는 rag.mock_llm. request_cadence exec 마다 백그라운드로 1 라운드(in-flight 1건), plateau_exec_threshold exec coverage 정체 시 우선 요청. LLM 산출물은 스키마 검증+위험필터 통과분만 corpus 주입.",
+    "enabled": false,
+    "module_path": "rag.mock_llm",
+    "func_name": "ask",
+    "request_cadence": 5000,
+    "plateau_exec_threshold": 20000,
+    "max_seeds_per_round": 8,
+    "max_seq_per_round": 4,
+    "max_uncov_funcs": 40,
+    "seed_at_startup": true,
+    "llm_energy_boost": 1.5,
+    "reserved_policy": "reject",
+    "result_stale_execs": 50000,
+    "tasks": {
+      "new_group_seeds": true,
+      "sequences": true,
+      "corpus_eval": true
+    }
+  },
   "io_workload": {
     "_comment": "v8.4 IO 워크로드 엔진. fuzz_gap 명령마다 rc=0 보장 Write/Read block_size 블록 주입(SSD 내부 동작 자극). rc=0 경계(nsze/mdts/lba)는 Identify 런타임 자동. enabled=false 또는 --no-io-workload 로 비활성.",
     "enabled": true,

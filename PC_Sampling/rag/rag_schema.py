@@ -22,11 +22,24 @@ _DEFAULT_JSON = Path(__file__).resolve().parent / "cmd_schemas.json"
 class SchemaBridge:
     def __init__(self, json_path=None, reserved_policy="reject"):
         data = json.loads(Path(json_path or _DEFAULT_JSON).read_text())
+        self._init_from(data, reserved_policy)
+
+    def _init_from(self, data, reserved_policy):
         self.fuzzer_version = data.get("fuzzer_version", "?")
         self.commands = data["commands"]
         self.schemas = data["schemas"]
         self.guards = data["guards"]
         self.reserved_policy = reserved_policy
+
+    @classmethod
+    def from_dict(cls, data, reserved_policy="reject"):
+        """cmd_schemas.json 파일 없이 in-memory dict 로 구성 (fuzzer in-process 용).
+        data = export_cmd_schemas.py / fuzzer 의 _llm_schema_dict() 산출과 동일한
+        {commands, schemas, guards[, fuzzer_version]} 형태. 검증 기준을 발송 기준(live
+        CMD_SCHEMAS)과 완전 일치시키고 export 단계·파일 의존을 제거한다."""
+        self = cls.__new__(cls)
+        self._init_from(data, reserved_policy)
+        return self
 
     # ---------- bit helpers ----------
     @staticmethod
