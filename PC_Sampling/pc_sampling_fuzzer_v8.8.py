@@ -1184,7 +1184,7 @@ class _FuzzingTerminalFilter(logging.Filter):
     import re as _re
     _ALLOW = _re.compile(
         r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
-        r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]|\[State-Replay\]'
+        r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]|\[DebugTool\]|\[State-Replay\]'
         r'|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]|\[BootSweep\]|\[Probe-'
         r'|\[State-Snap\]|\[SMART\]'   # v8.3: 주기적 SMART/전체 state field 출력 터미널 노출
         r'|\[IO-WL\]'                   # v8.4: IO 워크로드 블록/검증 로그
@@ -8726,7 +8726,14 @@ class NVMeFuzzer:
         log.warning("[DebugTool] 실행 파일 확인 OK")
 
         device = self._ctrl_device()   # 상황별 컨트롤러 경로 (/dev/nvme0 등)
-        cmd = [tool_path, 'RDDump', device]
+        _base_cmd = [tool_path, 'RDDump', device]
+        # 툴 stdout 이 파이프라 glibc 가 라인→블록 버퍼링으로 전환 → 실시간 출력이 안
+        # 흘러나오고(종료 시에나 flush, kill 되면 유실) readline 이 아무것도 못 받는다.
+        # stdbuf 로 라인 버퍼링 강제(glibc stdio 툴에 한함). 없으면 원본 그대로.
+        if shutil.which('stdbuf'):
+            cmd = ['stdbuf', '-oL', '-eL', *_base_cmd]
+        else:
+            cmd = _base_cmd
         log.warning(f"[DebugTool] 실행 명령: {' '.join(cmd)}")
         log.warning(f"[DebugTool] 작업 디렉토리: {script_dir}")
 
