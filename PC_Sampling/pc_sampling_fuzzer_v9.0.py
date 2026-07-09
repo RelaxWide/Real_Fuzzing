@@ -208,6 +208,8 @@ RAG_RESULT_STALE     = int(_RAG.get('result_stale_execs', 50000))
 RAG_TASKS            = dict(_RAG.get('tasks', {}))
 RAG_DEBUG            = bool(_RAG.get('debug', False))      # 단계별 [LLM/raw|parse|item|stats] 상세 로그
 RAG_JSON_RETRIES     = int(_RAG.get('json_retries', 2))   # 응답이 JSON 아니면 교정 리프롬프트 재시도 상한
+RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 시퀀스(llm_seq) 전용 부스트
+RAG_TASK_WEIGHTS     = dict(_RAG.get('task_weights', {}))  # task별 가중 라운드로빈(미설정=1:1:1)
 
 # v8.4: IO 워크로드 엔진 설정 (io_workload 섹션). 섹션이 없어도 fatal 아님 — 기본값으로 비활성/동작.
 #   fuzz 100 명령 사이에 rc=0 보장 Write/Read 100 명령 블록을 주입하여 SSD 내부 동작 자극.
@@ -4442,11 +4444,18 @@ class NVMeFuzzer:
         if task == 'sequences':
             names = sorted(self.llm.schema_bridge.commands.keys())
             schema = self._llm_schema_summary(names[:20])
-            user = (f"Coverage gaps:\n{cov or '  (static map unavailable)'}\n\n"
+            user = (f"Coverage gaps (firmware functions NOT yet reached — target these):\n"
+                    f"{cov or '  (static map unavailable)'}\n\n"
                     f"Available commands: {names}\n\nSchemas:\n{schema}\n\n"
-                    f"Task: emit up to {RAG_MAX_SEQS} multi-command \"sequences\" (setup->trigger, "
-                    f"e.g. SetFeatures->Write->Flush->GetLogPage) likely to reach new firmware "
-                    f"paths. JSON only.")
+                    f"Task: emit up to {RAG_MAX_SEQS} multi-command \"sequences\" of 3-5 commands each. "
+                    f"Blind mutation CANNOT discover state-dependent paths — that is exactly your value. "
+                    f"Build setup->trigger chains where earlier commands establish firmware state that a "
+                    f"later command exercises, aimed at the un-reached functions above. State-transition "
+                    f"patterns to consider: SetFeatures(config)->IO->GetLogPage(observe); "
+                    f"NamespaceManagement(create,SEL=0)->NamespaceAttach->Identify(new NS); "
+                    f"ReservationRegister->ReservationAcquire->ReservationReport; "
+                    f"DirectiveSend->DirectiveReceive->Write(stream). Prefer LONGER chains that build up "
+                    f"state over single-shot commands. Do NOT use destructive/locking ops. JSON only.")
             return self._LLM_SYSTEM, user
         if task == 'corpus_eval':
             sample = [s for s in self.corpus if isinstance(s, Seed)][:40]
@@ -4470,21 +4479,25 @@ class NVMeFuzzer:
                   if RAG_TASKS.get(t, True)]
         if not active:
             return
-        # plateau 감지: coverage 정체가 임계 초과면 seeds/seq 우선.
+        # 가중 라운드로빈: task_weights 만큼 반복해 시퀀스 등에 비중을 준다(미설정=1).
+        weighted = []
+        for t in active:
+            weighted += [t] * max(1, int(RAG_TASK_WEIGHTS.get(t, 1)))
+        # plateau 감지: coverage 정체가 임계 초과면 시퀀스(상태의존 경로) 우선.
         cov_now = len(self.sampler.global_coverage)
         if cov_now > self._llm_last_cov:
             self._llm_last_cov = cov_now
             self._llm_plateau_since = self.executions
         plateau = (self.executions - self._llm_plateau_since) >= RAG_PLATEAU_EXECS
         if plateau:
-            for t in ('new_group_seeds', 'sequences'):
+            for t in ('sequences', 'new_group_seeds'):   # 정체 돌파는 시퀀스가 유리
                 if t in active:
                     task = t
                     break
             else:
-                task = active[self._llm_task_rr % len(active)]
+                task = weighted[self._llm_task_rr % len(weighted)]
         else:
-            task = active[self._llm_task_rr % len(active)]
+            task = weighted[self._llm_task_rr % len(weighted)]
         self._llm_task_rr += 1
         built = self._llm_build_request(task)
         if built is None:
@@ -4639,9 +4652,13 @@ class NVMeFuzzer:
             pass
 
     def _llm_energy_adjust(self, seed, e: float) -> float:
-        """LLM 출처 시드 가중, 낮은 llm_score 비우선화. 기존 시드는 무변경."""
-        sc = getattr(seed, 'seed_class', None)
-        if sc and str(sc).startswith('llm'):
+        """LLM 출처 시드 가중, 낮은 llm_score 비우선화. 기존 시드는 무변경.
+        시퀀스(llm_seq)는 _calculate_energy 의 /len(commands) 페널티로 선택이 불리하므로
+        전용 부스트(RAG_SEQ_ENERGY_BOOST, 기본=일반 부스트)로 상쇄해 실제 탐색되게 한다."""
+        sc = str(getattr(seed, 'seed_class', '') or '')
+        if sc == 'llm_seq':
+            e *= RAG_SEQ_ENERGY_BOOST
+        elif sc.startswith('llm'):
             e *= RAG_ENERGY_BOOST
         ls = getattr(seed, 'llm_score', None)
         if ls is not None and ls < 0.3:

@@ -64,6 +64,13 @@ opcode-이진 신호가 캘리브레이션 후 죽는 문제 등 5개 보강 (�
 - **B 기여도 요약**: `[LLM/stats]` 주기 출력 — corpus내 llm시드 수 / favored(컬링 생존=유용) / 누적 주입·drop·dup.
 - **테스트값**: `fuzzer_config.json` rag 에 request_cadence=200, plateau=500, debug=true 적용(원복값은
   `_comment_TEST` 에 명시: 5000/20000/false). mock 로 재시도·dedup·로깅 동작 확인 완료.
+- **시퀀스 강화(단일시드보다 상태의존 시퀀스가 LLM 강점)**: (a) `task_weights`(seeds:1/seq:2/eval:1)로
+  시퀀스 라운드 비중 33%→50% (b) `seq_energy_boost`(2.5)로 SequenceSeed 의 /len 선택 페널티 상쇄
+  (c) 시퀀스 프롬프트를 3~5단계 상태전이 체인 요청 + NVMe 패턴 예시로 강화 (d) plateau 시 시퀀스 우선.
+  기본값(가중치 미설정=1:1:1, seq부스트 미설정=일반부스트)은 기존 동작 보존.
+- **관측 결과(30k execs 테스트)**: 주입/dedup/필터 정상(seeds 55/seqs 6/dropped 12/dupes 19)이나
+  favored=0(LLM 시드가 새 커버리지 못 뚫어 컬링). 판정 지표 = `[LLM/stats]` favored 추이 + total_BB 추이.
+  favored 지속 0이면 컬링 보호/부스트 상향 필요. → 시퀀스 강화가 첫 대응.
 
 ### 검증 상태
 mock 로 end-to-end(seeds/sequences 주입, 위험/무효 필터, graceful disable, drop-box 왕복, 단일인자
