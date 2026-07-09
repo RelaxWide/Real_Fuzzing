@@ -342,6 +342,7 @@
     "enabled": false,
     "debug": true,
     "json_retries": 2,
+    "log_responses": true,
     "module_path": "rag.rag_bridge_client",
     "func_name": "generate_rag_response",
     "pass_system_prompt": false,

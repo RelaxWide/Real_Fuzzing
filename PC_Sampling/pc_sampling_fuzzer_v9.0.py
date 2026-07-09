@@ -210,6 +210,7 @@ RAG_DEBUG            = bool(_RAG.get('debug', False))      # 단계별 [LLM/raw|
 RAG_JSON_RETRIES     = int(_RAG.get('json_retries', 2))   # 응답이 JSON 아니면 교정 리프롬프트 재시도 상한
 RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 시퀀스(llm_seq) 전용 부스트
 RAG_TASK_WEIGHTS     = dict(_RAG.get('task_weights', {}))  # task별 가중 라운드로빈(미설정=1:1:1)
+RAG_LOG_RESPONSES    = bool(_RAG.get('log_responses', False))  # LLM 원본 요청/응답을 output/llm_io.jsonl 에 전량 기록
 RAG_MAX_SEQ_LEN      = int(_RAG.get('max_seq_len', 16))    # 시퀀스 최대 명령 수(리플레이 비용 상한, 초과=drop).
 #   유효성 제한이 아님 — NVMe엔 정당한 긴 체인 존재(ZNS 존 라이프사이클/Reservation 다단계/FW다운로드
 #   청크 등). 매 반복마다 체인 전체를 리플레이하므로 반복 속도를 위한 상한. 펌웨어에 긴 정상 워크플로가
@@ -3120,11 +3121,13 @@ class LlmBridge:
                     _head = (text or '')[:200].replace('\n', ' ')
                     log.warning(f"[LLM/raw] task={req['task']} len={len(text or '')} "
                                 f"retries={attempt} head={_head}")
-                self._out_q.put({'task': req['task'], 'raw': text,
-                                 'error': None, 'submitted_at': req['submitted_at']})
+                self._out_q.put({'task': req['task'], 'raw': text, 'error': None,
+                                 'submitted_at': req['submitted_at'],
+                                 'user': req.get('user'), 'retries': attempt})
             except Exception as e:
-                self._out_q.put({'task': req['task'], 'raw': None,
-                                 'error': str(e), 'submitted_at': req['submitted_at']})
+                self._out_q.put({'task': req['task'], 'raw': None, 'error': str(e),
+                                 'submitted_at': req['submitted_at'],
+                                 'user': req.get('user'), 'retries': 0})
             finally:
                 self._inflight = False
 
@@ -3175,6 +3178,7 @@ class NVMeFuzzer:
         self._llm_task_rr = 0                 # task 라운드로빈 인덱스
         self._llm_stats = {'seeds': 0, 'seqs': 0, 'dropped': 0, 'dupes': 0, 'rounds': 0}
         self._llm_seen = set()                # A: 주입한 LLM 시드 시그니처(중복 주입 방지)
+        self._llm_io_fh = None                # LLM 원본 요청/응답 아카이브 파일 핸들(lazy)
         self._graph_child_proc = None         # v8.8: 차트 렌더 subprocess(Popen) — fork 제거
         self._graph_snapshot_path = None      # v8.8: 현재 렌더에 넘긴 스냅샷 pkl 경로(정리용)
         self._mpl_warmed = False              # (구) 부모 선import 플래그 — subprocess 렌더에선 미사용
@@ -4550,10 +4554,36 @@ class NVMeFuzzer:
         except Exception:
             return None
 
+    def _llm_archive(self, res, data=None, added_s=None, added_q=None):
+        """LLM 원본 요청/응답을 output/llm_io.jsonl 에 append(분석용). 파싱실패/에러 포함
+        전량 기록. 절대 raise 안 함."""
+        if not RAG_LOG_RESPONSES:
+            return
+        try:
+            if self._llm_io_fh is None:
+                p = self.output_dir / 'llm_io.jsonl'
+                self._llm_io_fh = open(p, 'a', encoding='utf-8')
+                log.warning(f"[LLM] 원본 요청/응답 기록 시작: {p}")
+            rec = {
+                'submitted_at': res.get('submitted_at'),
+                'task': res.get('task'),
+                'retries': res.get('retries'),
+                'error': res.get('error'),
+                'parse_ok': isinstance(data, dict),
+                'injected': None if added_s is None else {'seeds': added_s, 'seqs': added_q},
+                'prompt': res.get('user'),
+                'response': res.get('raw'),
+            }
+            self._llm_io_fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            self._llm_io_fh.flush()
+        except Exception:
+            pass
+
     def _llm_apply_result(self, res):
         """워커 결과 1건을 파싱·검증·주입(메인 스레드). 절대 raise 안 함."""
         # stale 결과(너무 오래된 요청)는 무시.
         if res.get('error'):
+            self._llm_archive(res)
             log.info(f"[LLM] 호출 오류: {res['error']}")
             return
         if self.executions - res.get('submitted_at', 0) > RAG_RESULT_STALE:
@@ -4561,6 +4591,7 @@ class NVMeFuzzer:
             return
         data = _llm_extract_json(res.get('raw'))
         if not isinstance(data, dict):
+            self._llm_archive(res, data)          # 파싱 실패한 원본도 기록
             self._llm_stats['dropped'] += 1
             log.info("[LLM] JSON 파싱 실패 — 결과 폐기")   # ③(2) 파싱 실패
             return
@@ -4596,8 +4627,8 @@ class NVMeFuzzer:
                 if s is not None:
                     seeds.append(s)
             if len(seeds) < 2 or len(seeds) > RAG_MAX_SEQ_LEN:
-                # 최소 2, 최대 RAG_MAX_SEQ_LEN. 초과분은 truncate(=trigger 유실로 의미 파괴)
-                # 대신 drop. 유효명령 0~1개이거나 병적으로 긴 체인은 폐기.
+                # 최소 2, 최대 RAG_MAX_SEQ_LEN(리플레이 비용 상한). 초과분은 truncate(=trigger
+                # 유실로 의미 파괴) 대신 drop. 유효명령 0~1개인 무효 체인도 폐기.
                 if sq.get('commands'):
                     self._llm_stats['dropped'] += 1
                     if RAG_DEBUG and len(seeds) > RAG_MAX_SEQ_LEN:
@@ -4628,6 +4659,7 @@ class NVMeFuzzer:
         self._llm_stats['seeds'] += added_s
         self._llm_stats['seqs'] += added_q
         self._llm_stats['rounds'] += 1
+        self._llm_archive(res, data, added_s, added_q)   # 성공 라운드 원본+주입결과 기록
         if added_s or added_q:
             log.warning(f"[LLM] 주입: seeds+{added_s} seqs+{added_q} "
                         f"(누적 seeds={self._llm_stats['seeds']} seqs={self._llm_stats['seqs']} "
