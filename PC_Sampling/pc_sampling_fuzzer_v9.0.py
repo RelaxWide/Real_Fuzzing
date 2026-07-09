@@ -1233,6 +1233,9 @@ class _FuzzingTerminalFilter(logging.Filter):
         r'|\[Taint\]'                   # v8.6: kernel taint 진단(시작/변화). [VMon] 은 파일만(터미널 제외)
         r'|\[Sampler\]'                 # 샘플러 halt 실패→복구 알림 (커버리지 측정 정상 재개 확인)
         r'|\[J-Link DLL\]'              # JLinkARM DLL 메시지 중 halt 노이즈 외 실제 경고/에러
+        r'|\[LLM'                       # v9.0: RAG 관련(주입/활성/raw/parse/item/stats) 터미널 노출.
+                                        #       raw/parse/item 은 rag.debug=true 일 때만 생성되므로
+                                        #       debug=false 로 두면 터미널엔 주입/stats 요약만 남음.
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
