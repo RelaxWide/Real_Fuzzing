@@ -352,6 +352,7 @@
     "task_weights": { "new_group_seeds": 1, "sequences": 2, "corpus_eval": 1 },
     "max_seeds_per_round": 8,
     "max_seq_per_round": 6,
+    "max_seq_len": 8,
     "max_uncov_funcs": 40,
     "seed_at_startup": true,
     "llm_energy_boost": 1.5,
