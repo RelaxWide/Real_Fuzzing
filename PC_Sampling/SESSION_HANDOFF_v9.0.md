@@ -53,6 +53,18 @@ CLI: `--rag / --no-rag / --rag-module / --rag-func`. `sudo -E` 로 실행(env �
 `is_dangerous`(Format/Sanitize/lock/NS-delete drop) → `validate_and_repair`(reserved ENUM reject)
 → `_send_nvme_command` 발송 가드(`RC_SKIP`). LLM 은 새 발송 경로 추가 안 함.
 
+### v9.0 관측/품질 보강 (테스트 세션 추가)
+opcode-이진 신호가 캘리브레이션 후 죽는 문제 등 5개 보강 (전부 LLM 경로 안, off=v8.8 동등):
+- **① 후보 신호**: `new_group_seeds`를 coverage-gap(미접촉 함수, SA 로드 전제) 주 타깃 + 명령은
+  never-sent + under-explored(interesting 오름차순) 랭킹으로. "NOT exercised" 오해 라벨 제거.
+- **② JSON 재시도**: 워커에서 응답이 JSON 아니면 교정 리프롬프트로 `json_retries`(기본 2)회 재요청.
+- **③ 단계별 로그**: config `rag.debug=true` → `[LLM/raw]`(원본) `[LLM/parse]`(파싱) `[LLM/item]`
+  (accept/dup/drop) `[LLM/stats]`(기여도). "LLM품질 / 파싱 / 주입"을 분리 확인 가능.
+- **A dedup**: `_llm_seen` 시그니처(cmd+cdw+data)로 중복 시드/시퀀스 재주입 차단(cadence 낮을 때 corpus 폭증 방지).
+- **B 기여도 요약**: `[LLM/stats]` 주기 출력 — corpus내 llm시드 수 / favored(컬링 생존=유용) / 누적 주입·drop·dup.
+- **테스트값**: `fuzzer_config.json` rag 에 request_cadence=200, plateau=500, debug=true 적용(원복값은
+  `_comment_TEST` 에 명시: 5000/20000/false). mock 로 재시도·dedup·로깅 동작 확인 완료.
+
 ### 검증 상태
 mock 로 end-to-end(seeds/sequences 주입, 위험/무효 필터, graceful disable, drop-box 왕복, 단일인자
 경로) 전부 통과. **온라인 `srag_llm_guide` 단독 test_llm.py → [PASS](JSON 시드 나옴) 확인됨.**

@@ -206,6 +206,8 @@ RAG_ENERGY_BOOST     = float(_RAG.get('llm_energy_boost', 1.5))
 RAG_RESERVED_POLICY  = str(_RAG.get('reserved_policy', 'reject'))
 RAG_RESULT_STALE     = int(_RAG.get('result_stale_execs', 50000))
 RAG_TASKS            = dict(_RAG.get('tasks', {}))
+RAG_DEBUG            = bool(_RAG.get('debug', False))      # 단계별 [LLM/raw|parse|item|stats] 상세 로그
+RAG_JSON_RETRIES     = int(_RAG.get('json_retries', 2))   # 응답이 JSON 아니면 교정 리프롬프트 재시도 상한
 
 # v8.4: IO 워크로드 엔진 설정 (io_workload 섹션). 섹션이 없어도 fatal 아님 — 기본값으로 비활성/동작.
 #   fuzz 100 명령 사이에 rc=0 보장 Write/Read 100 명령 블록을 주입하여 SSD 내부 동작 자극.
@@ -3079,6 +3081,13 @@ class LlmBridge:
     def stop(self):
         self._stop.set()
 
+    def _call_llm(self, system: str, user: str) -> str:
+        # 사내 래퍼가 단일인자(generate_rag_response(user))면 system 을 user 에 접어 호출
+        # (그쪽 system_prompt 는 고정 내장). 2-인자 mock 은 (system, user).
+        if self._pass_system:
+            return self._callable(system, user)
+        return self._callable(system + "\n\n" + user)
+
     def _run(self):
         while not self._stop.is_set():
             try:
@@ -3086,12 +3095,22 @@ class LlmBridge:
             except queue.Empty:
                 continue
             try:
-                # 수 초 — 여기서만 블록. 사내 래퍼가 단일인자(generate_rag_response(user))면
-                # system 을 user 에 접어 넣어 호출(그쪽 system_prompt 는 고정 내장).
-                if self._pass_system:
-                    text = self._callable(req['system'], req['user'])
-                else:
-                    text = self._callable(req['system'] + "\n\n" + req['user'])
+                system, user = req['system'], req['user']
+                text = self._call_llm(system, user)   # 수 초 — 여기서만 블록
+                # ② JSON 유효성 체크 → 무효면 교정 리프롬프트로 상한 재시도(회수율↑).
+                attempt = 0
+                while _llm_extract_json(text) is None and attempt < RAG_JSON_RETRIES:
+                    attempt += 1
+                    if RAG_DEBUG:
+                        log.warning(f"[LLM/retry] task={req['task']} JSON 무효 → 재요청 "
+                                    f"{attempt}/{RAG_JSON_RETRIES}")
+                    corr = user + ("\n\nYour previous reply was NOT valid JSON. Return ONLY the "
+                                   "single JSON object described above — no prose, no code fence.")
+                    text = self._call_llm(system, corr)
+                if RAG_DEBUG:
+                    _head = (text or '')[:200].replace('\n', ' ')
+                    log.warning(f"[LLM/raw] task={req['task']} len={len(text or '')} "
+                                f"retries={attempt} head={_head}")
                 self._out_q.put({'task': req['task'], 'raw': text,
                                  'error': None, 'submitted_at': req['submitted_at']})
             except Exception as e:
@@ -3145,7 +3164,8 @@ class NVMeFuzzer:
         self._llm_last_cov = 0                # plateau 감지용 직전 coverage 크기
         self._llm_plateau_since = 0           # coverage 정체 시작 exec
         self._llm_task_rr = 0                 # task 라운드로빈 인덱스
-        self._llm_stats = {'seeds': 0, 'seqs': 0, 'dropped': 0, 'rounds': 0}
+        self._llm_stats = {'seeds': 0, 'seqs': 0, 'dropped': 0, 'dupes': 0, 'rounds': 0}
+        self._llm_seen = set()                # A: 주입한 LLM 시드 시그니처(중복 주입 방지)
         self._graph_child_proc = None         # v8.8: 차트 렌더 subprocess(Popen) — fork 제거
         self._graph_snapshot_path = None      # v8.8: 현재 렌더에 넘긴 스냅샷 pkl 경로(정리용)
         self._mpl_warmed = False              # (구) 부모 선import 플래그 — subprocess 렌더에선 미사용
@@ -4388,16 +4408,29 @@ class NVMeFuzzer:
         exercised = self._llm_exercised_names()
         cov = self._llm_coverage_context()
         if task == 'new_group_seeds':
-            candidates = [c.name for c in NVME_COMMANDS
-                          if c.name not in exercised and c.name in self.llm.schema_bridge.commands]
-            if not candidates:
-                candidates = [c.name for c in NVME_COMMANDS if c.name in self.llm.schema_bridge.commands]
+            # ① opcode-이진("안 쐈나") 만으로는 캘리브레이션 후 전부 exercised 되어 신호가 죽는다.
+            #   → coverage-gap(미접촉 함수)을 주 타깃으로, 명령은 never-sent + under-explored
+            #     (쐈지만 새 커버리지 수확 낮은=interesting 오름차순)로 랭킹해 넘긴다.
+            sb = self.llm.schema_bridge
+            known = [c.name for c in NVME_COMMANDS if c.name in sb.commands]
+            never = [n for n in known if n not in exercised]
+            explored = sorted(
+                [n for n in known if n in exercised],
+                key=lambda n: (self.cmd_stats.get(n, {}).get('interesting', 0),
+                               self.cmd_stats.get(n, {}).get('exec', 0)))
+            candidates = never + explored            # never-entered 우선, 그다음 low-yield
             schema = self._llm_schema_summary(candidates[:20])
-            user = (f"Coverage gaps (functions not yet reached):\n{cov or '  (static map unavailable)'}\n\n"
-                    f"Command groups NOT yet exercised: {sorted(set(candidates))[:30]}\n\n"
-                    f"Schemas for these commands:\n{schema}\n\n"
-                    f"Task: emit up to {RAG_MAX_SEEDS} \"seeds\" that exercise these un-tested "
-                    f"command groups with meaningful CDW parameters. JSON only.")
+            _low_lbl = [f"{n}(exec={self.cmd_stats.get(n, {}).get('exec', 0)},"
+                        f"cov+={self.cmd_stats.get(n, {}).get('interesting', 0)})"
+                        for n in explored[:15]]
+            user = (f"Coverage gaps (firmware functions NOT yet reached — PRIMARY target):\n"
+                    f"{cov or '  (static map unavailable)'}\n\n"
+                    f"Never-sent command groups: {sorted(never)[:30]}\n\n"
+                    f"Under-explored command groups (sent but low new-coverage yield): {_low_lbl}\n\n"
+                    f"Schemas:\n{schema}\n\n"
+                    f"Task: emit up to {RAG_MAX_SEEDS} \"seeds\" whose CDW parameters are most likely "
+                    f"to reach the un-reached functions above. Prefer never-sent groups, then "
+                    f"under-explored ones with NEW parameter values. JSON only.")
             return self._LLM_SYSTEM, user
         if task == 'sequences':
             names = sorted(self.llm.schema_bridge.commands.keys())
@@ -4459,10 +4492,14 @@ class NVMeFuzzer:
             name = item.get('command')
             cmd = _NAME_TO_CMD.get(name)
             if cmd is None:
+                if RAG_DEBUG:
+                    log.warning(f"[LLM/item] drop {name!r} (unknown command)")
                 return None
             cdw = {f'cdw{w}': int(item.get(f'cdw{w}', 0)) for w in (2, 3, 10, 11, 12, 13, 14, 15)}
             repaired, _fixed, ok = self.llm.schema_bridge.validate_and_repair(name, cdw)
             if not ok:
+                if RAG_DEBUG:
+                    log.warning(f"[LLM/item] drop {name} (schema invalid/reserved)")
                 return None
             danger, reason = self.llm.schema_bridge.is_dangerous(name, repaired)
             if danger:
@@ -4499,31 +4536,56 @@ class NVMeFuzzer:
         data = _llm_extract_json(res.get('raw'))
         if not isinstance(data, dict):
             self._llm_stats['dropped'] += 1
-            log.info("[LLM] JSON 파싱 실패 — 결과 폐기")
+            log.info("[LLM] JSON 파싱 실패 — 결과 폐기")   # ③(2) 파싱 실패
             return
+        if RAG_DEBUG:   # ③(2) 파싱 성공 — 항목 수
+            log.warning(f"[LLM/parse] ok task={res.get('task')} "
+                        f"seeds={len(data.get('seeds') or [])} "
+                        f"seqs={len(data.get('sequences') or [])} "
+                        f"evals={len(data.get('evaluations') or [])}")
         added_s = added_q = 0
-        # seeds
+        # seeds — A: 중복 주입 방지, ③(3): 항목별 accept/dup 로그
         for item in (data.get('seeds') or [])[:RAG_MAX_SEEDS]:
             seed = self._llm_make_seed(item, item.get('seed_class') or 'llm_new_group')
-            if seed is not None:
-                self.corpus.append(seed)
-                added_s += 1
-            else:
+            if seed is None:
                 self._llm_stats['dropped'] += 1
-        # sequences
+                continue
+            sig = self._llm_seed_sig(seed)
+            if sig in self._llm_seen:
+                self._llm_stats['dupes'] += 1
+                if RAG_DEBUG:
+                    log.warning(f"[LLM/item] dup {seed.cmd.name} cdw10={seed.cdw10} → skip")
+                continue
+            self._llm_seen.add(sig)
+            self.corpus.append(seed)
+            added_s += 1
+            if RAG_DEBUG:
+                log.warning(f"[LLM/item] accept {seed.cmd.name} cdw10={seed.cdw10} "
+                            f"cdw11={seed.cdw11} data={len(seed.data)}B")
+        # sequences — 멤버 시그니처로 dedup
         for sq in (data.get('sequences') or [])[:RAG_MAX_SEQS]:
             seeds = []
             for citem in (sq.get('commands') or []):
                 s = self._llm_make_seed(citem, 'llm_seq')
                 if s is not None:
                     seeds.append(s)
-            if len(seeds) >= 2:
-                self.corpus.append(SequenceSeed(
-                    commands=seeds, found_at=self.executions,
-                    covered_pcs=set(), seed_class='llm_seq'))
-                added_q += 1
-            elif sq.get('commands'):
-                self._llm_stats['dropped'] += 1
+            if len(seeds) < 2:
+                if sq.get('commands'):
+                    self._llm_stats['dropped'] += 1
+                continue
+            sig = ('seq',) + tuple(self._llm_seed_sig(s) for s in seeds)
+            if sig in self._llm_seen:
+                self._llm_stats['dupes'] += 1
+                if RAG_DEBUG:
+                    log.warning(f"[LLM/item] dup seq len={len(seeds)} → skip")
+                continue
+            self._llm_seen.add(sig)
+            self.corpus.append(SequenceSeed(
+                commands=seeds, found_at=self.executions,
+                covered_pcs=set(), seed_class='llm_seq'))
+            added_q += 1
+            if RAG_DEBUG:
+                log.warning(f"[LLM/item] accept seq [{'->'.join(s.cmd.name for s in seeds)}]")
         # evaluations (corpus_eval)
         _targets = getattr(self, '_llm_eval_targets', {})
         for ev in (data.get('evaluations') or []):
@@ -4547,6 +4609,27 @@ class NVMeFuzzer:
             return
         for res in self.llm.drain():
             self._llm_apply_result(res)
+
+    @staticmethod
+    def _llm_seed_sig(seed):
+        """A: 중복 주입 판정용 시그니처 (명령+CDW+데이터)."""
+        return (seed.cmd.name, seed.cdw2, seed.cdw3, seed.cdw10, seed.cdw11,
+                seed.cdw12, seed.cdw13, seed.cdw14, seed.cdw15, bytes(seed.data))
+
+    def _llm_log_stats(self):
+        """B: RAG 기여도 주기 요약 — 주입/생존(favored=유용)/drop/dup. 절대 raise 안 함."""
+        if not self.llm.enabled:
+            return
+        try:
+            llm_seeds = [s for s in self.corpus
+                         if str(getattr(s, 'seed_class', '') or '').startswith('llm')]
+            favored = sum(1 for s in llm_seeds if getattr(s, 'is_favored', False))
+            st = self._llm_stats
+            log.warning(f"[LLM/stats] corpus내 llm시드={len(llm_seeds)} (favored/유용={favored}) | "
+                        f"누적 주입 seeds={st['seeds']} seqs={st['seqs']} "
+                        f"dropped={st['dropped']} dupes={st['dupes']} rounds={st['rounds']}")
+        except Exception:
+            pass
 
     def _llm_energy_adjust(self, seed, e: float) -> float:
         """LLM 출처 시드 가중, 낮은 llm_score 비우선화. 기존 시드는 무변경."""
@@ -5108,6 +5191,7 @@ class NVMeFuzzer:
         if self.llm.enabled:
             if self.executions % RAG_REQUEST_CADENCE == 0 and self.executions > 0:
                 self._llm_maybe_submit()
+                self._llm_log_stats()          # B: 요청 낼 때마다 기여도 요약
             self._llm_drain_and_apply()
 
         # state monitoring
