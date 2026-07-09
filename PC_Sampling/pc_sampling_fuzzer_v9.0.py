@@ -210,7 +210,10 @@ RAG_DEBUG            = bool(_RAG.get('debug', False))      # 단계별 [LLM/raw|
 RAG_JSON_RETRIES     = int(_RAG.get('json_retries', 2))   # 응답이 JSON 아니면 교정 리프롬프트 재시도 상한
 RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 시퀀스(llm_seq) 전용 부스트
 RAG_TASK_WEIGHTS     = dict(_RAG.get('task_weights', {}))  # task별 가중 라운드로빈(미설정=1:1:1)
-RAG_MAX_SEQ_LEN      = int(_RAG.get('max_seq_len', 8))     # 시퀀스 최대 명령 수(초과=drop, 최소는 2 고정)
+RAG_MAX_SEQ_LEN      = int(_RAG.get('max_seq_len', 16))    # 시퀀스 최대 명령 수(리플레이 비용 상한, 초과=drop).
+#   유효성 제한이 아님 — NVMe엔 정당한 긴 체인 존재(ZNS 존 라이프사이클/Reservation 다단계/FW다운로드
+#   청크 등). 매 반복마다 체인 전체를 리플레이하므로 반복 속도를 위한 상한. 펌웨어에 긴 정상 워크플로가
+#   있으면 올리거나 매우 크게(사실상 무제한) 둬도 됨 — /len 에너지 페널티가 선택 빈도는 이미 억제.
 
 # v8.4: IO 워크로드 엔진 설정 (io_workload 섹션). 섹션이 없어도 fatal 아님 — 기본값으로 비활성/동작.
 #   fuzz 100 명령 사이에 rc=0 보장 Write/Read 100 명령 블록을 주입하여 SSD 내부 동작 자극.
@@ -4448,7 +4451,9 @@ class NVMeFuzzer:
             user = (f"Coverage gaps (firmware functions NOT yet reached — target these):\n"
                     f"{cov or '  (static map unavailable)'}\n\n"
                     f"Available commands: {names}\n\nSchemas:\n{schema}\n\n"
-                    f"Task: emit up to {RAG_MAX_SEQS} multi-command \"sequences\" of 3-5 commands each. "
+                    f"Task: emit up to {RAG_MAX_SEQS} multi-command \"sequences\", typically 3-6 commands "
+                    f"but longer (up to {RAG_MAX_SEQ_LEN}) when the state setup genuinely needs it "
+                    f"(e.g. ZNS zone lifecycle, multi-step reservations). "
                     f"Blind mutation CANNOT discover state-dependent paths — that is exactly your value. "
                     f"Build setup->trigger chains where earlier commands establish firmware state that a "
                     f"later command exercises, aimed at the un-reached functions above. State-transition "
