@@ -56,7 +56,20 @@ CLI: `--rag / --no-rag / --rag-module / --rag-func`. `sudo -E` 로 실행(env �
 ### 검증 상태
 mock 로 end-to-end(seeds/sequences 주입, 위험/무효 필터, graceful disable, drop-box 왕복, 단일인자
 경로) 전부 통과. **온라인 `srag_llm_guide` 단독 test_llm.py → [PASS](JSON 시드 나옴) 확인됨.**
-**남은 것: 실제 2-PC Samba 왕복 → fuzzer `--rag` 실행.**
+**실제 2-PC Samba 왕복(`rag/test_bridge.py`) → [PASS] 확인됨** — 온라인 LLM→Samba→오프라인
+클라이언트 전 구간 실제 동작. (주의: 온라인 Windows 는 `python3`=Store 스텁이라 반드시 `python`
+으로 실행. venv 도 `python3.exe` 미생성이라 python3 새어나감.)
+**남은 것: fuzzer `--rag` 실장비 실행(하드웨어 필요) — 아래 절차.**
+
+### fuzzer `--rag` 실행 절차 (다음 단계)
+1. 온라인 PC: `python srag_llm_service.py` 띄워둠(`watching ...` 나오고 대기).
+2. 오프라인: config `rag.enabled=true`(또는 `--rag`), `module_path=rag.rag_bridge_client`,
+   `func_name=generate_rag_response`, `pass_system_prompt=false` 확인.
+3. `sudo -E python3 pc_sampling_fuzzer_v9.0.py --product P9 ... --rag` (`-E`=RAG_BRIDGE_DIR env 전달).
+4. 확인 포인트: 워커 스레드 기동 로그, RAG_REQUEST_CADENCE(기본 5000 exec)마다 요청, 응답 시드가
+   `seed_class='llm_new_group'` 로 corpus 진입, 미탐색 명령군 `cmd_stats` exec 상승.
+> freeze 조사 중이면 **freeze-repro 캠페인은 v8.8(--rag 없이) 로 깨끗하게 유지**하고, `--rag` 검증은
+> 별도 실행으로 분리 권장(백그라운드 워커·Samba I/O 는 freeze 변수와 무관해야 판정이 깨끗함).
 
 ### 사용자 srag_llm_guide.py 주의 (해결됨, 기록용)
 - 함수 4개(env+client 생성 / generate_response / retrieve_from_rag / generate_rag_response).
@@ -82,9 +95,21 @@ mock 로 end-to-end(seeds/sequences 주입, 위험/무효 필터, graceful disab
 
 ---
 
-## 4. 미해결 최우선 — 호스트 OS freeze (go_settle 10 에서도 발생)
+## 4. 호스트 OS freeze — 결론: halt-vs-controller 타이밍 레이스 (근본원인 캡처 종료)
 
-### 증상
+### 세션 최종 결론 (2026-07 갱신)
+- **성격**: 특정 명령이 방아쇠가 아님. 로그 끊김 지점이 [NVMe RET]/[Stats-cov]/[admin-passthru] 제각각
+  = halt 샘플러(별도 스레드)가 컨트롤러 활동과 우연히 겹치는 **타이밍 레이스**. 메인스레드 로그는 red herring.
+- **go_settle로 튜닝 불가**: freeze까지 명령수 1ms=25만·37만 / 5ms=44만 / 10ms=18만·9만 — 같은 설정서도
+  2배+ 분산, n=1~2. go_settle↔freeze 상관이 노이즈에 묻힘 (10ms가 오히려 최단 → "높이면 안전" 반증).
+- **캡처 시도 전부 실패·종료**: kdump 캡처커널 2단계(부팅+makedumpfile) 무증거 실패, ramoops는 memmap `$`
+  이스케이프 문제로 boot 반복 사망(헤드리스라 콘솔 못 봄). 커널 Call Trace 나와도 "nvme kworker가 wedge된
+  컨트롤러 대기"라는 뻔한 확인뿐 → 조치 불가 → **근본원인 캡처 포기가 합리적.**
+- **결정**: (1) default `go_settle_ms=5` (freeze 아닌 샘플링 품질 기준) (2) corpus 체크포인트+재부팅 자동재시작
+  으로 freeze를 "리부팅 1회 비용"으로 흡수 (3) **확정 실험 대기**: `--no-jlink`(rag 없이) overnight 무이상 시
+  halt 원인 최종 확정.
+
+### (구 기록) 증상
 P9 캠페인 중 **호스트 Ubuntu 가 logless freeze**(dmesg 확인 불가). 이전 관측: `soft lockup
 kworker/u64:3 stuck 26s`, `RIP: 0033:0x1`(유저스페이스 CS + 주소 0x1 = 네이티브 제어흐름 붕괴).
 
