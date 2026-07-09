@@ -4386,19 +4386,23 @@ class NVMeFuzzer:
         return "\n\n".join(out)
 
     def _llm_coverage_context(self) -> str:
-        """미접촉 함수 상위 N개 텍스트(정적분석 로드된 경우). 없으면 빈 문자열."""
+        """미접촉 함수 상위 N개 텍스트(정적분석 로드된 경우). 없거나 실패 시 빈 문자열.
+        _collect_uncov_funcs 반환은 튜플: not_entered=[(name,size,entry)],
+        partial=[(name,size,entry,bb_pct)]. (dict 아님 — 튜플 인덱스로 접근)"""
         try:
             if not getattr(self, '_sa_loaded', False):
                 return ""
             not_entered, partial = self._collect_uncov_funcs()
-        except Exception:
+            lines = []
+            for f in (not_entered or [])[:RAG_MAX_UNCOV_FUNCS]:
+                lines.append(f"  - {f[0]} (size={f[1]}, NEVER entered)")
+            for f in (partial or [])[:RAG_MAX_UNCOV_FUNCS // 2]:
+                lines.append(f"  - {f[0]} (bb={f[3]:.0f}% partial)")
+            return "\n".join(lines)
+        except Exception as e:
+            if RAG_DEBUG:
+                log.warning(f"[LLM] coverage context 생성 실패(무시): {e}")
             return ""
-        lines = []
-        for f in (not_entered or [])[:RAG_MAX_UNCOV_FUNCS]:
-            lines.append(f"  - {f.get('name','?')} (size={f.get('size',0)}, NEVER entered)")
-        for f in (partial or [])[:RAG_MAX_UNCOV_FUNCS // 2]:
-            lines.append(f"  - {f.get('name','?')} (bb={f.get('bb_pct',0):.0f}% partial)")
-        return "\n".join(lines)
 
     def _llm_exercised_names(self):
         return {n for n, st in self.cmd_stats.items() if st.get('exec', 0) > 0}
