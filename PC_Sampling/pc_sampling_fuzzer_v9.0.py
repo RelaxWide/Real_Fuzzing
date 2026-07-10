@@ -3209,7 +3209,8 @@ class NVMeFuzzer:
         self._llm_last_cov = 0                # plateau 감지용 직전 coverage 크기
         self._llm_plateau_since = 0           # coverage 정체 시작 exec
         self._llm_task_rr = 0                 # task 라운드로빈 인덱스
-        self._llm_stats = {'seeds': 0, 'seqs': 0, 'dropped': 0, 'dupes': 0, 'rounds': 0}
+        self._llm_stats = {'seeds': 0, 'seqs': 0, 'dropped': 0, 'dupes': 0, 'rounds': 0,
+                           'new_cov': 0}   # LLM 계보가 뚫은 새 커버리지(new_pcs) 누적 — "얼마나 잘 뚫나"
         self._llm_seen = set()                # A: 주입한 LLM 시드 시그니처(중복 주입 방지)
         self._llm_io_fh = None                # LLM 원본 요청/응답 아카이브 파일 핸들(lazy)
         self._llm_device_info = {}            # 디바이스 grounding: Identify Controller 실능력(OACS/ONCS/NN)
@@ -4792,7 +4793,8 @@ class NVMeFuzzer:
                          if str(getattr(s, 'seed_class', '') or '').startswith('llm')]
             favored = sum(1 for s in llm_seeds if getattr(s, 'is_favored', False))
             st = self._llm_stats
-            log.warning(f"[LLM/stats] corpus내 llm시드={len(llm_seeds)} (favored/유용={favored}) | "
+            log.warning(f"[LLM/stats] ★LLM이 뚫은 새 커버리지(누적)={st.get('new_cov', 0)}★ | "
+                        f"corpus내 llm시드={len(llm_seeds)} (지금 favored={favored}) | "
                         f"누적 주입 seeds={st['seeds']} seqs={st['seqs']} "
                         f"dropped={st['dropped']} dupes={st['dupes']} rounds={st['rounds']}")
         except Exception:
@@ -5274,6 +5276,9 @@ class NVMeFuzzer:
 
             # 단일 명령 모드: 기존 경로
             self.corpus.append(new_seed)
+            # LLM 계보가 뚫은 새 커버리지 누적 ("얼마나 잘 뚫나" 지표)
+            if new_pcs > 0 and str(getattr(new_seed, 'seed_class', '') or '').startswith('llm'):
+                self._llm_stats['new_cov'] += new_pcs
             _cov_label = "BB" if (self._sa_loaded and self._sa_bb_starts) else "PC"
             log.warning(
                 f"[+][Edge-Cov] cmd={cmd.name}  "
@@ -9776,6 +9781,10 @@ class NVMeFuzzer:
                 seed_class=self._seq_sink.get('seed_class'),   # v9.0: LLM 계보 태그 전파
             )
             self.corpus.append(_seq_seed)
+            # LLM 시퀀스 계보가 뚫은 새 커버리지 누적
+            if (_seq_seed.new_pcs > 0
+                    and str(getattr(_seq_seed, 'seed_class', '') or '').startswith('llm')):
+                self._llm_stats['new_cov'] += _seq_seed.new_pcs
             _cov_label = "BB" if (self._sa_loaded and self._sa_bb_starts) else "PC"
             log.warning(
                 f"[+][SeqSeed] cmds={_n}  "
