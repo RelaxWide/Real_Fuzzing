@@ -3442,7 +3442,8 @@ class NVMeFuzzer:
         return cmd.name
 
     def _clone_seed(self, seed: Seed) -> Seed:
-        """시드의 mutation 대상 필드를 복사한 새 Seed 반환 (실행 통계 제외)"""
+        """시드의 mutation 대상 필드를 복사한 새 Seed 반환 (실행 통계 제외).
+        v9.0: seed_class(LLM 계보 태그)를 전파 — 변이 파생이 favored 되어도 LLM 기여로 집계되게."""
         return Seed(
             data=seed.data, cmd=seed.cmd,
             cdw2=seed.cdw2, cdw3=seed.cdw3,
@@ -3453,6 +3454,7 @@ class NVMeFuzzer:
             nsid_override=seed.nsid_override,
             force_admin=seed.force_admin,
             data_len_override=seed.data_len_override,
+            seed_class=getattr(seed, 'seed_class', None),
         )
 
     def _calibrate_seed(self, seed: Seed) -> Seed:
@@ -5200,6 +5202,7 @@ class NVMeFuzzer:
                 found_at=self.executions,
                 new_pcs=new_pcs,
                 covered_pcs=_seed_covered,
+                seed_class=getattr(seed, 'seed_class', None),   # v9.0: LLM 계보 태그 전파
             )
 
             # 단일 명령 모드: 기존 경로
@@ -6090,6 +6093,7 @@ class NVMeFuzzer:
             nsid_override=seed.nsid_override,
             force_admin=seed.force_admin,
             data_len_override=seed.data_len_override,
+            seed_class=getattr(seed, 'seed_class', None),   # v9.0: splice 도 주 시드 계보 유지
         )
 
     def _mutate(self, seed: Seed) -> Seed:
@@ -6111,6 +6115,7 @@ class NVMeFuzzer:
             nsid_override=seed.nsid_override,
             force_admin=seed.force_admin,
             data_len_override=seed.data_len_override,
+            seed_class=getattr(seed, 'seed_class', None),   # v9.0: LLM 계보 태그 전파(주 변이 경로)
         )
 
         # 30% 확률로 CDW 필드 변형
@@ -9679,6 +9684,7 @@ class NVMeFuzzer:
                 energy=MAX_ENERGY / _n,
                 found_at=self.executions,
                 covered_pcs=self._seq_sink['covered_pcs'],
+                seed_class=self._seq_sink.get('seed_class'),   # v9.0: LLM 계보 태그 전파
             )
             self.corpus.append(_seq_seed)
             _cov_label = "BB" if (self._sa_loaded and self._sa_bb_starts) else "PC"
@@ -12702,6 +12708,14 @@ class NVMeFuzzer:
                         # v4: Power Schedule 기반 시드 선택 + CDW 변형
                         if self.corpus and random.random() >= self.config.random_gen_ratio:
                             base_seed = self._select_seed()
+                            # v9.0: 런타임 주입된 LLM 단일시드는 calibration 을 안 거쳐 covered_pcs
+                            #   가 없다 → _cull_corpus 의 favored 마킹에서 제외되어 구조적으로 favored
+                            #   불가 + 2회 후 컬링. 선택 시 1회 calibrate 해 covered_pcs 를 채운다
+                            #   (이미 covered_pcs 있는 fuzzing 발견 시드는 스킵 → 불필요한 halt 회피).
+                            if (isinstance(base_seed, Seed)
+                                    and not base_seed.is_calibrated
+                                    and not base_seed.covered_pcs):
+                                base_seed = self._calibrate_seed(base_seed)
                             if base_seed is None:
                                 cmd = random.choice(self.commands)
                                 fuzz_data = os.urandom(random.randint(64, 512))
@@ -12731,6 +12745,8 @@ class NVMeFuzzer:
                                     self._seq_sink = {
                                         'commands': [], 'new_pcs': 0,
                                         'covered_pcs': set(), 'interesting': False,
+                                        # v9.0: LLM 시퀀스 계보 태그 전파(replay 파생 SequenceSeed 로)
+                                        'seed_class': getattr(base_seed, 'seed_class', None),
                                     }
                                     mutated_seed = _first
                                     fuzz_data = mutated_seed.data
