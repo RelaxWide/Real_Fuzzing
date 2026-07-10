@@ -211,6 +211,7 @@ RAG_JSON_RETRIES     = int(_RAG.get('json_retries', 2))   # 응답이 JSON 아�
 RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 시퀀스(llm_seq) 전용 부스트
 RAG_TASK_WEIGHTS     = dict(_RAG.get('task_weights', {}))  # task별 가중 라운드로빈(미설정=1:1:1)
 RAG_LOG_RESPONSES    = bool(_RAG.get('log_responses', False))  # LLM 원본 요청/응답을 output/llm_io.jsonl 에 전량 기록
+RAG_MIN_REQ_INTERVAL = float(_RAG.get('min_request_interval_sec', 0.0))  # 요청 최소 시간간격(초). rate-limit 회피. 0=끔
 RAG_MAX_SEQ_LEN      = int(_RAG.get('max_seq_len', 16))    # 시퀀스 최대 명령 수(리플레이 비용 상한, 초과=drop).
 #   유효성 제한이 아님 — NVMe엔 정당한 긴 체인 존재(ZNS 존 라이프사이클/Reservation 다단계/FW다운로드
 #   청크 등). 매 반복마다 체인 전체를 리플레이하므로 반복 속도를 위한 상한. 펌웨어에 긴 정상 워크플로가
@@ -3039,6 +3040,7 @@ class LlmBridge:
         self._worker = None
         self._stop = threading.Event()
         self._inflight = False
+        self._last_submit_ts = 0.0            # 시간 기반 rate-limit 스로틀(마지막 제출 시각, monotonic)
         self._pass_system = getattr(config, 'rag_pass_system', True)
         if not config.rag_enabled:
             return
@@ -3133,9 +3135,13 @@ class LlmBridge:
 
     # ── 메인 스레드에서 호출 (non-blocking) ───────────────────────────
     def submit(self, task: str, system: str, user: str, now_exec: int) -> bool:
-        """in-flight 없을 때만 요청 제출. 이미 진행 중이면 False(스킵)."""
+        """in-flight 없고 최소 시간간격 지났을 때만 요청 제출. 아니면 False(스킵)."""
         if not self.enabled or self._inflight:
             return False
+        now = time.monotonic()
+        if RAG_MIN_REQ_INTERVAL > 0 and (now - self._last_submit_ts) < RAG_MIN_REQ_INTERVAL:
+            return False   # rate-limit 스로틀: 아직 최소 간격 안 지남
+        self._last_submit_ts = now
         self._inflight = True
         self._in_q.put({'task': task, 'system': system, 'user': user,
                         'submitted_at': now_exec})
