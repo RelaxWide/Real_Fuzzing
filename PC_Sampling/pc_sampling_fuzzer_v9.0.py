@@ -1251,6 +1251,14 @@ class _FuzzingTerminalFilter(logging.Filter):
             return True
         return bool(self._ALLOW.search(record.getMessage()))
 
+
+class _LlmOnlyFilter(logging.Filter):
+    """RAG 관련([LLM 으로 시작) 레코드만 통과 — llm/ 전용 로그 파일용.
+    검증 로그([LLM/raw|parse|item|stats], 주입/drop/활성/오류 등)를 한 곳에 모은다."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        return '[LLM' in record.getMessage()
+
+
 def _setup_matplotlib_chart_env():
     """차트 생성용 matplotlib 환경 — ASCII 폰트 고정 + glyph missing 경고 억제.
 
@@ -1295,6 +1303,16 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
+
+    # LLM 전용 로그: 모든 [LLM* 레코드를 output/llm/ 하위폴더에 별도로 모은다(검증 편의).
+    # 요청/응답 원본 아카이브(llm_io.jsonl)도 이 폴더에 쌓임 → RAG 관련은 전부 llm/ 에서 확인.
+    llm_dir = Path(output_dir) / 'llm'
+    llm_dir.mkdir(parents=True, exist_ok=True)
+    lfh = logging.FileHandler(llm_dir / f'llm_{timestamp}.log', encoding='utf-8')
+    lfh.setLevel(logging.INFO)      # INFO 이상 — 요청제출/drop dangerous/파싱실패 등 INFO 도 포함
+    lfh.setFormatter(fmt)
+    lfh.addFilter(_LlmOnlyFilter())
+    logger.addHandler(lfh)
 
     # 콘솔: 초기화 단계에서는 WARNING 이상 전부 출력
     # 메인 퍼징 루프 진입 시 _FuzzingTerminalFilter 추가로 제한됨
@@ -4567,7 +4585,9 @@ class NVMeFuzzer:
             return
         try:
             if self._llm_io_fh is None:
-                p = self.output_dir / 'llm_io.jsonl'
+                _ld = self.output_dir / 'llm'
+                _ld.mkdir(parents=True, exist_ok=True)
+                p = _ld / 'llm_io.jsonl'
                 self._llm_io_fh = open(p, 'a', encoding='utf-8')
                 log.warning(f"[LLM] 원본 요청/응답 기록 시작: {p}")
             rec = {
