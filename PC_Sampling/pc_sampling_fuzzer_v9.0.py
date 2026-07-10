@@ -213,6 +213,12 @@ RAG_TASK_WEIGHTS     = dict(_RAG.get('task_weights', {}))  # task별 가중 라�
 RAG_LOG_RESPONSES    = bool(_RAG.get('log_responses', False))  # LLM 원본 요청/응답을 output/llm_io.jsonl 에 전량 기록
 RAG_MIN_REQ_INTERVAL = float(_RAG.get('min_request_interval_sec', 0.0))  # 요청 최소 시간간격(초). rate-limit 회피. 0=끔
 RAG_CULL_GRACE       = int(_RAG.get('cull_grace', 8))     # LLM 시드 컬링 유예: exec_count < 이 값이면 보호(변이 탐색 기회)
+# 디바이스 grounding용: Identify Controller OACS/ONCS 비트 → 지원 명령 매핑 (프롬프트에 실제 능력 주입)
+_OACS_CMDS = {0: 'SecuritySend/Receive', 1: 'FormatNVM', 2: 'FWDownload/FWCommit',
+              3: 'NamespaceManagement', 4: 'DeviceSelfTest', 5: 'DirectiveSend/Receive',
+              6: 'NVMe-MI', 7: 'VirtMgmt', 9: 'GetLBAStatus', 10: 'Lockdown'}
+_ONCS_CMDS = {0: 'Compare', 1: 'WriteUncorrectable', 2: 'DatasetManagement', 3: 'WriteZeroes',
+              5: 'Reservations', 6: 'Timestamp', 7: 'Verify', 8: 'Copy'}
 # 심볼 없는 자동생성 함수명(Ghidra FUN_/IDA sub_ 등) — LLM 에 무의미하므로 coverage-gap 에서 제외.
 _AUTONAME_RE = re.compile(r'^(FUN_|sub_|loc_|unk_|nullsub_|j_|switchD_|caseD_|LAB_|DAT_|thunk_FUN_)[0-9a-fA-F]+', re.I)
 RAG_MAX_SEQ_LEN      = int(_RAG.get('max_seq_len', 16))    # 시퀀스 최대 명령 수(리플레이 비용 상한, 초과=drop).
@@ -3206,6 +3212,7 @@ class NVMeFuzzer:
         self._llm_stats = {'seeds': 0, 'seqs': 0, 'dropped': 0, 'dupes': 0, 'rounds': 0}
         self._llm_seen = set()                # A: 주입한 LLM 시드 시그니처(중복 주입 방지)
         self._llm_io_fh = None                # LLM 원본 요청/응답 아카이브 파일 핸들(lazy)
+        self._llm_device_info = {}            # 디바이스 grounding: Identify Controller 실능력(OACS/ONCS/NN)
         self._graph_child_proc = None         # v8.8: 차트 렌더 subprocess(Popen) — fork 제거
         self._graph_snapshot_path = None      # v8.8: 현재 렌더에 넘긴 스냅샷 pkl 경로(정리용)
         self._mpl_warmed = False              # (구) 부모 선import 플래그 — subprocess 렌더에선 미사용
@@ -4457,10 +4464,58 @@ class NVMeFuzzer:
     def _llm_exercised_names(self):
         return {n for n, st in self.cmd_stats.items() if st.get('exec', 0) > 0}
 
+    def _llm_grounding_block(self) -> str:
+        """연구 기반 프롬프트 보강(ChatAFL/Fuzz4All/feedback-driven):
+          ④ 디바이스 grounding — Identify OACS/ONCS 실능력(지원/미지원 명령).
+          ① 되먹임 — 이 디바이스에서 실제 새 커버리지를 뚫은 LLM 시드(favored/new_pcs>0).
+          ② few-shot — 그 성공 시드를 예제로 제시(복사 아닌 신규 변형 유도).
+          + 저수확(많이 쐈는데 커버리지 0) 명령 회피.
+        실패 시 빈 문자열(프롬프트 무해). """
+        lines = []
+        try:
+            d = getattr(self, '_llm_device_info', None) or {}
+            if d.get('supported_admin') or d.get('supported_io'):
+                lines.append("Device capabilities (propose ONLY what THIS device supports):")
+                if d.get('supported_admin'):
+                    lines.append("  supported admin: " + ", ".join(d['supported_admin']))
+                if d.get('supported_io'):
+                    lines.append("  supported I/O: " + ", ".join(d['supported_io']))
+                if d.get('unsupported'):
+                    lines.append("  NOT supported (do NOT propose): " + ", ".join(d['unsupported'][:12]))
+                if d.get('nn') is not None:
+                    lines.append(f"  namespaces={d['nn']}")
+            # 되먹임 + few-shot: 실제 커버리지 뚫은 LLM 계보 시드
+            prod = [s for s in self.corpus
+                    if isinstance(s, Seed)
+                    and str(getattr(s, 'seed_class', '') or '').startswith('llm')
+                    and (getattr(s, 'is_favored', False) or getattr(s, 'new_pcs', 0) > 0)]
+            prod.sort(key=lambda s: (bool(getattr(s, 'is_favored', False)),
+                                     getattr(s, 'new_pcs', 0)), reverse=True)
+            if prod:
+                lines.append("\nYour past seeds that found NEW firmware coverage on this device — "
+                             "generate NOVEL variations that push FURTHER (not copies):")
+                for s in prod[:6]:
+                    lines.append(f'  {{"command":"{s.cmd.name}","cdw10":{s.cdw10},'
+                                 f'"cdw11":{s.cdw11}}}  (favored={bool(getattr(s,"is_favored",False))})')
+            # 저수확 회피
+            low = sorted([(n, st) for n, st in self.cmd_stats.items()
+                          if st.get('exec', 0) >= 20 and st.get('interesting', 0) == 0],
+                         key=lambda x: x[1]['exec'], reverse=True)[:8]
+            if low:
+                lines.append("\nHeavily tried but ZERO new coverage (avoid, or use very different "
+                             "parameters): " + ", ".join(n for n, _ in low))
+        except Exception as e:
+            if RAG_DEBUG:
+                log.warning(f"[LLM] grounding block 실패(무시): {e}")
+            return ""
+        return "\n".join(lines)
+
     def _llm_build_request(self, task: str):
         """task 별 (system, user) 프롬프트 구성. 불가하면 None. 전부 메인 스레드 스냅샷."""
         exercised = self._llm_exercised_names()
         cov = self._llm_coverage_context()
+        ground = self._llm_grounding_block()   # 디바이스 grounding + 되먹임 + few-shot (연구 기반)
+        _gp = (ground + "\n\n") if ground else ""
         if task == 'new_group_seeds':
             # ① opcode-이진("안 쐈나") 만으로는 캘리브레이션 후 전부 exercised 되어 신호가 죽는다.
             #   → coverage-gap(미접촉 함수)을 주 타깃으로, 명령은 never-sent + under-explored
@@ -4477,7 +4532,8 @@ class NVMeFuzzer:
             _low_lbl = [f"{n}(exec={self.cmd_stats.get(n, {}).get('exec', 0)},"
                         f"cov+={self.cmd_stats.get(n, {}).get('interesting', 0)})"
                         for n in explored[:15]]
-            user = (f"Coverage gaps (firmware functions NOT yet reached — PRIMARY target):\n"
+            user = (_gp
+                    + f"Coverage gaps (firmware functions NOT yet reached — PRIMARY target):\n"
                     f"{cov or '  (static map unavailable)'}\n\n"
                     f"Never-sent command groups: {sorted(never)[:30]}\n\n"
                     f"Under-explored command groups (sent but low new-coverage yield): {_low_lbl}\n\n"
@@ -4489,7 +4545,8 @@ class NVMeFuzzer:
         if task == 'sequences':
             names = sorted(self.llm.schema_bridge.commands.keys())
             schema = self._llm_schema_summary(names[:20])
-            user = (f"Coverage gaps (firmware functions NOT yet reached — target these):\n"
+            user = (_gp
+                    + f"Coverage gaps (firmware functions NOT yet reached — target these):\n"
                     f"{cov or '  (static map unavailable)'}\n\n"
                     f"Available commands: {names}\n\nSchemas:\n{schema}\n\n"
                     f"Task: emit up to {RAG_MAX_SEQS} multi-command \"sequences\", typically 3-6 commands "
@@ -5692,6 +5749,17 @@ class NVMeFuzzer:
             self._ns_mgmt_supported = bool(oacs & (1 << 3))   # OACS[3] = NS Mgmt Supported
         except (ValueError, TypeError):
             self._ns_mgmt_supported = None
+        # 디바이스 grounding: OACS/ONCS 를 지원/미지원 명령 목록으로 디코딩 (LLM 프롬프트용)
+        try:
+            _oacs = int(info.get('oacs', 0)); _oncs = int(info.get('oncs', 0))
+            _sup_a = [n for b, n in _OACS_CMDS.items() if _oacs & (1 << b)]
+            _sup_i = [n for b, n in _ONCS_CMDS.items() if _oncs & (1 << b)]
+            _unsup = ([n for b, n in _OACS_CMDS.items() if not (_oacs & (1 << b))]
+                      + [n for b, n in _ONCS_CMDS.items() if not (_oncs & (1 << b))])
+            self._llm_device_info = {'supported_admin': _sup_a, 'supported_io': _sup_i,
+                                     'unsupported': _unsup, 'nn': info.get('nn')}
+        except (ValueError, TypeError):
+            self._llm_device_info = {}
         log.warning(f"[Pre-flight] CNTLID={self._cntlid_cache} "
                     f"NS-Mgmt(OACS[3])={'지원' if self._ns_mgmt_supported else '미지원/미상'} "
                     f"— Delete 차단={'on' if BLOCK_NS_DELETE else 'off'}, "
