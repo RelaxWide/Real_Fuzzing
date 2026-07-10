@@ -33,14 +33,9 @@ _RESP.mkdir(parents=True, exist_ok=True)
 
 
 def _atomic_write(path: Path, text: str):
-    """.tmp 로 쓰고 rename → 읽는 쪽이 부분 파일을 보지 않게. SMB 공유는 write 버퍼가
-    서버에 늦게 반영되어 온라인쪽이 '빈 파일'을 먼저 볼 수 있으므로, flush+fsync 로
-    내용을 서버에 완전히 밀어넣은 뒤 rename 한다(빈/부분 파일 경합 방지)."""
+    """.tmp 로 쓰고 rename → 읽는 쪽이 부분 파일을 보지 않게(같은 폴더 rename = atomic)."""
     tmp = path.parent / (path.name + ".tmp")
-    with open(tmp, 'w', encoding='utf-8') as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
 
 

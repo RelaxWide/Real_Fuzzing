@@ -48,15 +48,8 @@ _RESP.mkdir(parents=True, exist_ok=True)
 
 
 def _atomic_write(path: Path, text: str):
-    # SMB 공유서 부분/빈 파일 경합 방지 — flush+fsync 로 서버에 완전히 밀어넣은 뒤 rename.
     tmp = path.parent / (path.name + ".tmp")
-    with open(tmp, 'w', encoding='utf-8') as f:
-        f.write(text)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
 
 
