@@ -1196,6 +1196,7 @@ class _ColorFormatter(_MsFormatter):
         (_re.compile(r'CRASH'),                              "\033[1;31m"),  # 굵은 빨강
         (_re.compile(r'FAIL CMD'),                           "\033[31m"),    # 빨강
         (_re.compile(r'\[TIMEOUT\]'),                        "\033[31m"),    # 빨강
+        (_re.compile(r'\[LLM'),                              "\033[93m"),    # 밝은 노랑 — RAG/LLM 관련 전부
         (_re.compile(r'\[\+\]'),                             "\033[32m"),    # 초록
         (_re.compile(r'\[PM\]'),                             "\033[33m"),    # 노랑
         (_re.compile(r'\[Stats\]|\[StatCov\]'),              "\033[36m"),    # 시안
