@@ -5241,12 +5241,14 @@ class NVMeFuzzer:
                 covered_pcs=_seed_covered,
             )
             self._seq_sink['commands'].append(_cmd_seed)
+            # replay 가 실제로 밟은 PC 를 interesting 여부와 무관하게 전부 누적 — 원본 시퀀스
+            # covered_pcs 가 실제 replay 커버리지를 반영하게(J-Link 가 잡았는지 정직히 보이게).
+            self._seq_sink['covered_pcs'].update(_seed_covered)
             if is_interesting:
                 self.sampler.interesting_inputs += 1
                 self.cmd_stats[track_key]["interesting"] += 1
                 self._seq_sink['interesting'] = True
                 self._seq_sink['new_pcs'] += new_pcs
-                self._seq_sink['covered_pcs'].update(_seed_covered)
                 if self.config.state_enabled and source == 'c1':
                     self._csfuzz_c1_rewards.append(1)
                 log.info(f"[+][Seq-Acc] cmd={cmd.name} +{new_pcs} PCs "
@@ -9771,6 +9773,13 @@ class NVMeFuzzer:
         interesting 여부와 무관하게 _seq_sink를 None으로 리셋."""
         if self._seq_sink is None:
             return
+        # replay 가 밟은 PC 를 원본 시퀀스(base_seed)의 covered_pcs 에 반영 → [LLM/exec] 로그가
+        # 실제 replay 커버리지를 정직히 보이게(0이면 정말 J-Link 가 못 잡은 것). interesting 무관.
+        _bs = self._seq_sink.get('base_seed')
+        if _bs is not None:
+            if getattr(_bs, 'covered_pcs', None) is None:
+                _bs.covered_pcs = set()
+            _bs.covered_pcs.update(self._seq_sink['covered_pcs'])
         if self._seq_sink['interesting']:
             _n = max(len(self._seq_sink['commands']), 1)
             _seq_seed = SequenceSeed(
@@ -12818,16 +12827,16 @@ class NVMeFuzzer:
                             # ① 가시성: LLM 시드 선택 시 exec/covered_pcs/favored 상태
                             if (RAG_DEBUG and base_seed is not None
                                     and str(getattr(base_seed, 'seed_class', '') or '').startswith('llm')):
+                                _cp = len(base_seed.covered_pcs) if getattr(base_seed, 'covered_pcs', None) else 0
                                 if isinstance(base_seed, Seed):
-                                    _cp = len(base_seed.covered_pcs) if base_seed.covered_pcs else 0
                                     log.warning(f"[LLM/exec] 선택 {base_seed.cmd.name} "
                                                 f"exec_count={base_seed.exec_count} covered_pcs={_cp} "
                                                 f"favored={base_seed.is_favored}")
                                 else:
-                                    # 시퀀스: covered_pcs 는 원본에 안 채워짐 → replay 파생 SequenceSeed 에서 측정.
+                                    # covered_pcs 는 직전 replay 가 밟은 PC 수(첫 선택 전엔 0). 0이 계속이면 실제로 못 잡는 것.
                                     _sn = "->".join(s.cmd.name for s in base_seed.commands[:4])
                                     log.warning(f"[LLM/exec] 선택 seq[{_sn}] exec_count={base_seed.exec_count} "
-                                                f"favored={base_seed.is_favored} (커버리지는 replay 파생 시드서 측정)")
+                                                f"covered_pcs={_cp} favored={base_seed.is_favored}")
                             if base_seed is None:
                                 cmd = random.choice(self.commands)
                                 fuzz_data = os.urandom(random.randint(64, 512))
@@ -12859,6 +12868,7 @@ class NVMeFuzzer:
                                         'covered_pcs': set(), 'interesting': False,
                                         # v9.0: LLM 시퀀스 계보 태그 전파(replay 파생 SequenceSeed 로)
                                         'seed_class': getattr(base_seed, 'seed_class', None),
+                                        'base_seed': base_seed,   # replay 커버리지를 원본에 반영용
                                     }
                                     mutated_seed = _first
                                     fuzz_data = mutated_seed.data
