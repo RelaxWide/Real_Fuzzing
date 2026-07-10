@@ -12808,10 +12808,16 @@ class NVMeFuzzer:
                             # ① 가시성: LLM 시드 선택 시 exec/covered_pcs/favored 상태
                             if (RAG_DEBUG and base_seed is not None
                                     and str(getattr(base_seed, 'seed_class', '') or '').startswith('llm')):
-                                _cp = len(base_seed.covered_pcs) if getattr(base_seed, 'covered_pcs', None) else 0
-                                _nm = base_seed.cmd.name if isinstance(base_seed, Seed) else 'seq'
-                                log.warning(f"[LLM/exec] 선택 {_nm} exec_count={base_seed.exec_count} "
-                                            f"covered_pcs={_cp} favored={base_seed.is_favored}")
+                                if isinstance(base_seed, Seed):
+                                    _cp = len(base_seed.covered_pcs) if base_seed.covered_pcs else 0
+                                    log.warning(f"[LLM/exec] 선택 {base_seed.cmd.name} "
+                                                f"exec_count={base_seed.exec_count} covered_pcs={_cp} "
+                                                f"favored={base_seed.is_favored}")
+                                else:
+                                    # 시퀀스: covered_pcs 는 원본에 안 채워짐 → replay 파생 SequenceSeed 에서 측정.
+                                    _sn = "->".join(s.cmd.name for s in base_seed.commands[:4])
+                                    log.warning(f"[LLM/exec] 선택 seq[{_sn}] exec_count={base_seed.exec_count} "
+                                                f"favored={base_seed.is_favored} (커버리지는 replay 파생 시드서 측정)")
                             if base_seed is None:
                                 cmd = random.choice(self.commands)
                                 fuzz_data = os.urandom(random.randint(64, 512))
