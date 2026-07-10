@@ -4657,8 +4657,10 @@ class NVMeFuzzer:
             if self._llm_io_fh is None:
                 _ld = self.output_dir / 'llm'
                 _ld.mkdir(parents=True, exist_ok=True)
-                p = _ld / 'llm_io.jsonl'
-                self._llm_io_fh = open(p, 'a', encoding='utf-8')
+                # 실행마다 새 파일(타임스탬프) — 누적/append 방지 (.log 파일 규칙과 일관).
+                _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                p = _ld / f'llm_io_{_ts}.jsonl'
+                self._llm_io_fh = open(p, 'w', encoding='utf-8')
                 log.warning(f"[LLM] 원본 요청/응답 기록 시작: {p}")
             rec = {
                 'submitted_at': res.get('submitted_at'),
