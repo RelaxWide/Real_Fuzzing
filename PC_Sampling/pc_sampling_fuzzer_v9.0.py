@@ -212,6 +212,8 @@ RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 
 RAG_TASK_WEIGHTS     = dict(_RAG.get('task_weights', {}))  # task별 가중 라운드로빈(미설정=1:1:1)
 RAG_LOG_RESPONSES    = bool(_RAG.get('log_responses', False))  # LLM 원본 요청/응답을 output/llm_io.jsonl 에 전량 기록
 RAG_MIN_REQ_INTERVAL = float(_RAG.get('min_request_interval_sec', 0.0))  # 요청 최소 시간간격(초). rate-limit 회피. 0=끔
+# 심볼 없는 자동생성 함수명(Ghidra FUN_/IDA sub_ 등) — LLM 에 무의미하므로 coverage-gap 에서 제외.
+_AUTONAME_RE = re.compile(r'^(FUN_|sub_|loc_|unk_|nullsub_|j_|switchD_|caseD_|LAB_|DAT_|thunk_FUN_)[0-9a-fA-F]+', re.I)
 RAG_MAX_SEQ_LEN      = int(_RAG.get('max_seq_len', 16))    # 시퀀스 최대 명령 수(리플레이 비용 상한, 초과=drop).
 #   유효성 제한이 아님 — NVMe엔 정당한 긴 체인 존재(ZNS 존 라이프사이클/Reservation 다단계/FW다운로드
 #   청크 등). 매 반복마다 체인 전체를 리플레이하므로 반복 속도를 위한 상한. 펌웨어에 긴 정상 워크플로가
@@ -4430,12 +4432,20 @@ class NVMeFuzzer:
             if not getattr(self, '_sa_loaded', False):
                 return ""
             not_entered, partial = self._collect_uncov_funcs()
+            # 심볼 없는 자동생성명(FUN_/sub_ 등)은 LLM 에 무의미 → 제외. 실제 심볼명만 전달.
+            named   = [f for f in (not_entered or []) if not _AUTONAME_RE.match(str(f[0]))]
+            named_p = [f for f in (partial or [])     if not _AUTONAME_RE.match(str(f[0]))]
             lines = []
-            for f in (not_entered or [])[:RAG_MAX_UNCOV_FUNCS]:
+            for f in named[:RAG_MAX_UNCOV_FUNCS]:
                 lines.append(f"  - {f[0]} (size={f[1]}, NEVER entered)")
-            for f in (partial or [])[:RAG_MAX_UNCOV_FUNCS // 2]:
+            for f in named_p[:RAG_MAX_UNCOV_FUNCS // 2]:
                 lines.append(f"  - {f[0]} (bb={f[3]:.0f}% partial)")
-            return "\n".join(lines)
+            if lines:
+                return "\n".join(lines)
+            # 심볼명이 하나도 없으면(스트립 바이너리) 이름 대신 미접촉 개수 힌트만 — 명령 커버리지에 의존
+            n = len(not_entered or [])
+            return (f"  ({n} firmware functions still unreached, but binary is stripped "
+                    f"(no symbol names) — rely on the command coverage below)") if n else ""
         except Exception as e:
             if RAG_DEBUG:
                 log.warning(f"[LLM] coverage context 생성 실패(무시): {e}")
