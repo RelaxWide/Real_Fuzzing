@@ -212,6 +212,7 @@ RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 
 RAG_TASK_WEIGHTS     = dict(_RAG.get('task_weights', {}))  # task별 가중 라운드로빈(미설정=1:1:1)
 RAG_LOG_RESPONSES    = bool(_RAG.get('log_responses', False))  # LLM 원본 요청/응답을 output/llm_io.jsonl 에 전량 기록
 RAG_MIN_REQ_INTERVAL = float(_RAG.get('min_request_interval_sec', 0.0))  # 요청 최소 시간간격(초). rate-limit 회피. 0=끔
+RAG_CULL_GRACE       = int(_RAG.get('cull_grace', 8))     # LLM 시드 컬링 유예: exec_count < 이 값이면 보호(변이 탐색 기회)
 # 심볼 없는 자동생성 함수명(Ghidra FUN_/IDA sub_ 등) — LLM 에 무의미하므로 coverage-gap 에서 제외.
 _AUTONAME_RE = re.compile(r'^(FUN_|sub_|loc_|unk_|nullsub_|j_|switchD_|caseD_|LAB_|DAT_|thunk_FUN_)[0-9a-fA-F]+', re.I)
 RAG_MAX_SEQ_LEN      = int(_RAG.get('max_seq_len', 16))    # 시퀀스 최대 명령 수(리플레이 비용 상한, 초과=drop).
@@ -4716,6 +4717,13 @@ class NVMeFuzzer:
         return (seed.cmd.name, seed.cdw2, seed.cdw3, seed.cdw10, seed.cdw11,
                 seed.cdw12, seed.cdw13, seed.cdw14, seed.cdw15, bytes(seed.data))
 
+    @staticmethod
+    def _llm_cull_protected(seed) -> bool:
+        """②: LLM 출처 시드는 exec_count < RAG_CULL_GRACE 동안 컬링 보호.
+        부스트로 exec_count 가 빨리 2에 닿아도 변이가 커버리지 찾을 기회를 더 준다."""
+        sc = str(getattr(seed, 'seed_class', '') or '')
+        return sc.startswith('llm') and getattr(seed, 'exec_count', 0) < RAG_CULL_GRACE
+
     def _llm_log_stats(self):
         """B: RAG 기여도 주기 요약 — 주입/생존(favored=유용)/drop/dup. 절대 raise 안 함."""
         if not self.llm.enabled:
@@ -5408,11 +5416,22 @@ class NVMeFuzzer:
         # 제거 대상: favored 아님 + exec_count >= 2 + 기본 시드 아님 (found_at > 0)
         # SequenceSeed도 단일 Seed와 동일한 선택 압력 적용.
         before = len(self.corpus)
+        # v9.0 ②: LLM 시드는 exec_count < RAG_CULL_GRACE 동안 컬링 보호(변이 탐색 기회 부여) —
+        #   부스트로 자주 뽑혀 exec_count 가 빨리 2에 닿아도 바로 안 잘리게.
         _to_remove = [s for s in self.corpus
-                      if not (s.is_favored or s.exec_count < 2 or s.found_at == 0)]
+                      if not (s.is_favored or s.exec_count < 2 or s.found_at == 0
+                              or self._llm_cull_protected(s))]
         _removed_seq_set = {id(s) for s in _to_remove if isinstance(s, SequenceSeed)}
+        if RAG_DEBUG:   # ① 가시성: 어느 LLM 시드가 왜 잘리는지
+            for s in _to_remove:
+                if str(getattr(s, 'seed_class', '') or '').startswith('llm'):
+                    _nm = s.cmd.name if isinstance(s, Seed) else 'seq'
+                    log.warning(f"[LLM/cull] {_nm} exec_count={s.exec_count} "
+                                f"covered_pcs={len(s.covered_pcs) if s.covered_pcs else 0} "
+                                f"favored={s.is_favored}")
         self.corpus = [s for s in self.corpus
-                       if s.is_favored or s.exec_count < 2 or s.found_at == 0]
+                       if s.is_favored or s.exec_count < 2 or s.found_at == 0
+                       or self._llm_cull_protected(s)]
         removed = before - len(self.corpus)
         if removed > 0:
             log.info(f"[Cull] corpus {before} → {len(self.corpus)} "
@@ -12716,6 +12735,13 @@ class NVMeFuzzer:
                                     and not base_seed.is_calibrated
                                     and not base_seed.covered_pcs):
                                 base_seed = self._calibrate_seed(base_seed)
+                            # ① 가시성: LLM 시드 선택 시 exec/covered_pcs/favored 상태
+                            if (RAG_DEBUG and base_seed is not None
+                                    and str(getattr(base_seed, 'seed_class', '') or '').startswith('llm')):
+                                _cp = len(base_seed.covered_pcs) if getattr(base_seed, 'covered_pcs', None) else 0
+                                _nm = base_seed.cmd.name if isinstance(base_seed, Seed) else 'seq'
+                                log.warning(f"[LLM/exec] 선택 {_nm} exec_count={base_seed.exec_count} "
+                                            f"covered_pcs={_cp} favored={base_seed.is_favored}")
                             if base_seed is None:
                                 cmd = random.choice(self.commands)
                                 fuzz_data = os.urandom(random.randint(64, 512))
