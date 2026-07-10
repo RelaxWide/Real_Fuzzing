@@ -124,9 +124,12 @@ mock 로 end-to-end(seeds/sequences 주입, 위험/무효 필터, graceful disab
 - **캡처 시도 전부 실패·종료**: kdump 캡처커널 2단계(부팅+makedumpfile) 무증거 실패, ramoops는 memmap `$`
   이스케이프 문제로 boot 반복 사망(헤드리스라 콘솔 못 봄). 커널 Call Trace 나와도 "nvme kworker가 wedge된
   컨트롤러 대기"라는 뻔한 확인뿐 → 조치 불가 → **근본원인 캡처 포기가 합리적.**
+- **✅ 최종 확정 (2026-07)**: `--no-jlink` 로 **60만 execs 무이상** 확인 → J-Link halt 없으면 안정,
+  있으면 1만~45만서 터짐 = **freeze 원인 = halt 샘플링(halt-vs-컨트롤러 타이밍 레이스). 조사 종료.**
 - **결정**: (1) default `go_settle_ms=5` (freeze 아닌 샘플링 품질 기준) (2) corpus 체크포인트+재부팅 자동재시작
-  으로 freeze를 "리부팅 1회 비용"으로 흡수 (3) **확정 실험 대기**: `--no-jlink`(rag 없이) overnight 무이상 시
-  halt 원인 최종 확정.
+  으로 freeze를 "리부팅 1회 비용"으로 흡수 (3) **생산적 J-Link 캠페인 = 희소 샘플링(go_settle↑로 halt 수↓
+  → 레이스 기회↓, 커버리지 해상도와 트레이드오프) + 복원력**. RAG 실검증은 J-Link 필요(커버리지 피드백)라
+  이 복원력 위에서 돌려야 함.
 
 ### (구 기록) 증상
 P9 캠페인 중 **호스트 Ubuntu 가 logless freeze**(dmesg 확인 불가). 이전 관측: `soft lockup
