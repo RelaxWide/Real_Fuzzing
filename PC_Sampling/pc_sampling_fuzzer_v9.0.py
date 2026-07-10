@@ -3252,6 +3252,10 @@ class NVMeFuzzer:
             self.commands.extend([c] * (c.weight * extra))
 
         log.info(f"[Fuzzer] Enabled commands: {[c.name for c in self.commands]}")
+        # v9.0: LLM 제안을 '활성 명령 집합'으로 제한한다(--all-commands/--commands/기본 스코프 존중).
+        #   전체 NVME_COMMANDS 로 흩뿌리지 않고, 실제 fuzzing 대상 명령에 집중 → 한정 스코프에서
+        #   LLM 이 그 명령들의 CDW/시퀀스를 깊이 파도록. (활성 아닌 명령 제안은 drop)
+        self._active_cmd_names = frozenset(c.name for c in self.commands)
 
         # v4: Seed 리스트로 변경
         self.corpus: List[Seed] = []
@@ -4463,7 +4467,9 @@ class NVMeFuzzer:
             #   → coverage-gap(미접촉 함수)을 주 타깃으로, 명령은 never-sent + under-explored
             #     (쐈지만 새 커버리지 수확 낮은=interesting 오름차순)로 랭킹해 넘긴다.
             sb = self.llm.schema_bridge
-            known = [c.name for c in NVME_COMMANDS if c.name in sb.commands]
+            _active = getattr(self, '_active_cmd_names', None)
+            known = [c.name for c in NVME_COMMANDS if c.name in sb.commands
+                     and (_active is None or c.name in _active)]   # 활성 명령만
             never = [n for n in known if n not in exercised]
             explored = sorted(
                 [n for n in known if n in exercised],
@@ -4484,7 +4490,10 @@ class NVMeFuzzer:
                     f"under-explored ones with NEW parameter values. JSON only.")
             return self._LLM_SYSTEM, user
         if task == 'sequences':
-            names = sorted(self.llm.schema_bridge.commands.keys())
+            _active = getattr(self, '_active_cmd_names', None)
+            names = sorted(n for n in self.llm.schema_bridge.commands.keys()
+                           if _active is None or n in _active)   # 활성 명령만
+
             schema = self._llm_schema_summary(names[:20])
             user = (f"Coverage gaps (firmware functions NOT yet reached — target these):\n"
                     f"{cov or '  (static map unavailable)'}\n\n"
@@ -4558,6 +4567,11 @@ class NVMeFuzzer:
             if cmd is None:
                 if RAG_DEBUG:
                     log.warning(f"[LLM/item] drop {name!r} (unknown command)")
+                return None
+            _active = getattr(self, '_active_cmd_names', None)
+            if _active is not None and cmd.name not in _active:
+                if RAG_DEBUG:
+                    log.warning(f"[LLM/item] drop {cmd.name} (not in active command set)")
                 return None
             cdw = {f'cdw{w}': int(item.get(f'cdw{w}', 0)) for w in (2, 3, 10, 11, 12, 13, 14, 15)}
             repaired, _fixed, ok = self.llm.schema_bridge.validate_and_repair(name, cdw)
