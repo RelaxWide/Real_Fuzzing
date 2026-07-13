@@ -351,7 +351,11 @@
     "_comment_seq": "시퀀스 강화: task_weights 로 sequences 라운드 비중↑, seq_energy_boost 로 시퀀스 선택 불이익(/len 페널티) 상쇄. 단일시드보다 상태의존 시퀀스가 LLM 강점. 미설정 시 1:1:1 라운드로빈+일반부스트(기존동작).",
     "seq_energy_boost": 2.5,
     "cull_grace": 8,
-    "task_weights": { "new_group_seeds": 1, "sequences": 2, "corpus_eval": 1 },
+    "task_weights": {
+      "new_group_seeds": 1,
+      "sequences": 2,
+      "corpus_eval": 1
+    },
     "max_seeds_per_round": 8,
     "max_seq_per_round": 6,
     "max_seq_len": 16,
@@ -364,7 +368,12 @@
       "new_group_seeds": true,
       "sequences": true,
       "corpus_eval": true
-    }
+    },
+    "_comment_v91": "v9.1: SC=0x01(Invalid Opcode) 지배 명령 = 이 펌웨어 미구현 → LLM 제안 제외 + 에너지 바닥",
+    "unimpl_min_exec": 5,
+    "unimpl_ratio": 0.9,
+    "unimpl_energy_floor": 0.05,
+    "unimpl_energy_floor_on": true
   },
   "io_workload": {
     "_comment": "v8.4 IO 워크로드 엔진. fuzz_gap 명령마다 rc=0 보장 Write/Read block_size 블록 주입(SSD 내부 동작 자극). rc=0 경계(nsze/mdts/lba)는 Identify 런타임 자동. enabled=false 또는 --no-io-workload 로 비활성.",
