@@ -226,6 +226,10 @@ RAG_UNIMPL_MIN_EXEC  = int(_RAG.get('unimpl_min_exec', 5))         # 미구현 �
 RAG_UNIMPL_RATIO     = float(_RAG.get('unimpl_ratio', 0.9))        # invalid_opcode / reached_fw 임계
 RAG_ENERGY_FLOOR     = float(_RAG.get('unimpl_energy_floor', 0.05))# 확정 미구현 시드 에너지 바닥(0 아님=시퀀스 부활 여지)
 RAG_UNIMPL_FLOOR_ON  = bool(_RAG.get('unimpl_energy_floor_on', True))
+# v9.1: 스키마 요약 상한 — 기존 [:20] 고정캡이 랭킹 바닥 명령(Read/Write 등) 스키마를 아예
+#   숨겨 LLM 명령 고착을 유발했음. 8k 토큰 입력 예산상 구현된 전 명령(~28개) 노출이 여유(~4k tok).
+#   이 값은 vendor 명령 폭증 같은 극단만 막는 안전상한(정상 구간에선 안 걸림).
+RAG_SCHEMA_MAX       = int(_RAG.get('schema_max', 48))
 RAG_MAX_SEQ_LEN      = int(_RAG.get('max_seq_len', 16))    # 시퀀스 최대 명령 수(리플레이 비용 상한, 초과=drop).
 #   유효성 제한이 아님 — NVMe엔 정당한 긴 체인 존재(ZNS 존 라이프사이클/Reservation 다단계/FW다운로드
 #   청크 등). 매 반복마다 체인 전체를 리플레이하므로 반복 속도를 위한 상한. 펌웨어에 긴 정상 워크플로가
@@ -4618,14 +4622,18 @@ class NVMeFuzzer:
             #   → coverage-gap(미접촉 함수)을 주 타깃으로, 명령은 never-sent + under-explored
             #     (쐈지만 새 커버리지 수확 낮은=interesting 오름차순)로 랭킹해 넘긴다.
             sb = self.llm.schema_bridge
-            known = [c.name for c in NVME_COMMANDS if c.name in sb.commands]
+            # v9.1: 확정 미구현(SC=0x01) 제외 — 죽은 명령이 후보 top 을 점거해 다른 명령을
+            #   밀어내던 고착 제거(#1 digest 와도 일관). 스키마는 [:20] 캡 제거로 구현된 전부 노출
+            #   → Read/Write 등 랭킹 바닥 명령도 항상 보임. never/explored 는 우선순위 힌트로만 유지.
+            known = [c.name for c in NVME_COMMANDS
+                     if c.name in sb.commands and c.name not in self._unimpl_cmds]
             never = [n for n in known if n not in exercised]
             explored = sorted(
                 [n for n in known if n in exercised],
                 key=lambda n: (self.cmd_stats.get(n, {}).get('interesting', 0),
                                self.cmd_stats.get(n, {}).get('exec', 0)))
             candidates = never + explored            # never-entered 우선, 그다음 low-yield
-            schema = self._llm_schema_summary(candidates[:20])
+            schema = self._llm_schema_summary(candidates[:RAG_SCHEMA_MAX])
             _low_lbl = [f"{n}(exec={self.cmd_stats.get(n, {}).get('exec', 0)},"
                         f"cov+={self.cmd_stats.get(n, {}).get('interesting', 0)})"
                         for n in explored[:15]]
@@ -4644,7 +4652,7 @@ class NVMeFuzzer:
             # v9.1 #5: 확정 미구현 opcode 는 시퀀스 재료에서 제외(죽은 opcode 로 체인 조립 방지).
             names = [n for n in sorted(self.llm.schema_bridge.commands.keys())
                      if n not in self._unimpl_cmds]
-            schema = self._llm_schema_summary(names[:20])
+            schema = self._llm_schema_summary(names[:RAG_SCHEMA_MAX])  # v9.1: 캡 제거(구현된 전부)
             user = (_gp
                     + f"Coverage gaps (firmware functions NOT yet reached — target these):\n"
                     f"{cov or '  (static map unavailable)'}\n\n"
