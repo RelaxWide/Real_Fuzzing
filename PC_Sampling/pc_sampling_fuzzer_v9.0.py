@@ -3516,6 +3516,13 @@ class NVMeFuzzer:
         seed.stable_pcs = stable_pcs
         seed.covered_pcs = all_seen_pcs
 
+        # LLM 계보 시드가 calibration 중 '새' 커버리지를 발견하면 new_cov 에 반영(favored 원천).
+        # (기존엔 변이 파생만 셌음 → 원본 LLM 시드의 직접 발견을 놓쳐 favored↑ 인데 new_cov=0 이 됨.)
+        _new = all_seen_pcs - self.sampler.global_coverage   # global 반영 전 = 신규분
+        if _new and str(getattr(seed, 'seed_class', '') or '').startswith('llm'):
+            self._llm_stats['new_cov'] += len(_new)
+            seed.new_pcs = len(_new)
+
         # global_coverage에 관측된 전체 PC 합집합을 반영
         self.sampler.global_coverage.update(all_seen_pcs)
         # calibration PC를 BB/func 커버리지 통계에도 반영
