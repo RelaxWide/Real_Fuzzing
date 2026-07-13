@@ -3522,6 +3522,9 @@ class NVMeFuzzer:
         if _new and str(getattr(seed, 'seed_class', '') or '').startswith('llm'):
             self._llm_stats['new_cov'] += len(_new)
             seed.new_pcs = len(_new)
+            # calibration 발견은 mutation 경로가 아니라 [+][Edge-Cov]가 안 찍힌다 → 여기서 명시.
+            log.warning(f"[LLM/cov] {seed.cmd.name} calibration +{len(_new)} new PCs "
+                        f"→ 누적 new_cov={self._llm_stats['new_cov']}")
 
         # global_coverage에 관측된 전체 PC 합집합을 반영
         self.sampler.global_coverage.update(all_seen_pcs)
