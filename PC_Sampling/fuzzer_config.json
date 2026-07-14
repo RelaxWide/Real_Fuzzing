@@ -332,7 +332,8 @@
           "count_max": 8
         }
       ]
-    ]
+    ],
+    "state_global_event_fields": 6
   },
   "rag": {
     "_comment": "v9.0 LLM-guided fuzzing. enabled=false 또는 --no-rag 면 이 섹션 전체 무시(v8.8 byte-동등). module_path/func_name = LLM callable. request_cadence exec 마다 백그라운드로 1 라운드(in-flight 1건), plateau_exec_threshold exec coverage 정체 시 우선 요청. LLM 산출물은 스키마 검증+위험필터 통과분만 corpus 주입.",

@@ -1409,6 +1409,10 @@ class StateCorpusEntry:
 # 프로세스를 버리고(D-state 는 SIGKILL 도 무시 → communicate 재호출 시 영구 블록 → 회피) 실패 반환.
 # crash 보존이 필요 없는 관측 명령이라 길게 기다릴 이유가 없다 → device 무응답 시 fuzzer 멈춤 방지.
 STATE_MONITOR_SEC = int(_T.get('state_monitor_sec', 60))
+# v9.1: 전역 백그라운드 이벤트(Sanitize/Format In Progress·self-test·controller reset)는 디바이스
+#   상태 전체를 한꺼번에 스윙시켜 spurious state-cov 를 만든다. 한 delta 에서 동시 변경(비-init) 필드가
+#   이 값을 넘으면 "명령이 발견한 새 상태"가 아니라 전역 이벤트로 보고 harvest 제외 + 재baseline.
+STATE_GLOBAL_EVENT_FIELDS = int(_ST.get('state_global_event_fields', 6))
 
 
 class _StateProc:
@@ -5536,7 +5540,16 @@ class NVMeFuzzer:
             if _snap is not None:
                 if self._state_snap_prev is not None:
                     _delta = self.state_monitor.delta(self._state_snap_prev, _snap)
-                    if (_delta.is_interesting
+                    # v9.1: 전역 백그라운드 이벤트(Sanitize/Format In Progress·self-test·controller
+                    #   reset)는 상태 전체를 한꺼번에 스윙 → spurious state-cov. 명령별 처리 대신
+                    #   "동시 변경 필드 과다 → 전역 이벤트" 단일 필터로 harvest·cov_map 제외.
+                    #   baseline 은 아래(_state_snap_prev = _snap)서 재설정 → 진입/탈출 delta 둘 다 무시.
+                    _changed_n = sum(1 for b in _delta.state_buckets()
+                                     if not b.endswith(':=init'))
+                    if _changed_n > STATE_GLOBAL_EVENT_FIELDS:
+                        log.warning(f"[State-Cov] 전역 이벤트 감지 — {_changed_n} 필드 동시 변경 → "
+                                    f"state-cov 제외 + 재baseline (sanitize/format 등 백그라운드)")
+                    elif (_delta.is_interesting
                             and self.state_monitor.update_cov_map(_delta, self.state_cov_map)
                             and self._cmd_history):
                         _entry = StateCorpusEntry(
