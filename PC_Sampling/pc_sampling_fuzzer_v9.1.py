@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v9.0
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v9.1
 
 OpenOCD PCSR 비침습 샘플링 + nvme-cli passthru 기반 Coverage-Guided + State-Aware
 Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/덤프를 데이터 주도 설정.
@@ -10,12 +10,17 @@ Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/�
 - Coverage: OpenOCD telnet → PCSR (CoreBase+0x84). Ghidra BB 정보가 있으면 BB 기준.
 - State:    NVMeStateMonitor delta → state corpus. CSFuzz 적응형 p.
 - Mutation: Havoc/Splice + Deterministic + MOpt + Schema + Phase 1/2/3.
-- LLM:      v9.0 사내 LLM 기반 spec-aware 시드/시퀀스 생성·corpus 평가(--rag, 백그라운드).
+- LLM:      사내 LLM 기반 spec-aware 시드/시퀀스 생성·corpus 평가(--rag, 백그라운드).
+            v9.1: 디바이스 실제 NVMe 완료상태(SC) 되먹임으로 조준·스케줄 교정.
 - Power:    PS0~4 × L0/L1/L1.2 × D0/D3 + S1/S2 perturb (PCIe bit / CLKREQ#).
 - POR:      pmu_4_1.py 전원 사이클 → PCIe rescan → OpenOCD 재연결.
 - Defect:   timeout 시 stuck PC 분석 → JLink dump → UFAS dump → PC 모니터링.
 
 버전 요약 (자세한 내용은 git log / 각 버전 md 참조)
+- v9.1: 디바이스 실제 NVMe SC 되먹임 — SC=0x01(Invalid Opcode)=미구현 판정으로 LLM 조준
+        (미구현 회피/구현 필드교정 분리, accept-CDW few-shot, 구조적 data_hex, 스키마 캡 제거)
+        + 확정 미구현 시드 에너지 바닥 + state-cov 전역이벤트 필터 + J-Link close resume 하드닝.
+        상세: pc_sampling_fuzzer_v9.1.md.
 - v9.0: LLM-guided fuzzing 추가(in-process 직접 호출). 기존 fuzzing 루프는 무변경, 스펙 아는
         사내 LLM 을 백그라운드 워커로 돌려 신규 명령군 시드·멀티-명령 시퀀스를 시드 풀에 주기
         주입하고 corpus 를 평가. LLM 산출물은 스키마 검증(validate_and_repair)+위험필터
