@@ -11966,6 +11966,16 @@ class NVMeFuzzer:
                 n_f  = len(self._sa_entered_funcs)
                 fpct = 100.0 * n_f / self._sa_total_funcs
                 sa_parts.append(f"funcs: {n_f}/{self._sa_total_funcs} ({fpct:.1f}%)")
+            # v9.2: LLM 기여율 — LLM 계보가 '처음 발견'한 커버리지(new_cov)가 전체 발견 커버리지에서
+            #   차지하는 비율. 분모=커버된 것(SA면 BB, 아니면 global PC). SA 모드에서 new_cov 는 대부분
+            #   new-BB(정확)이나 calibration 발견분은 PC 단위라 근사치.
+            if self.llm.enabled:
+                _nc  = self._llm_stats.get('new_cov', 0)
+                _tot = (len(self._sa_covered_bbs) if self._sa_total_bbs > 0
+                        else len(self.sampler.global_coverage))
+                _pct = (100.0 * _nc / _tot) if _tot > 0 else 0.0
+                sa_parts.append(f"LLM기여: {_pct:.1f}% ({_nc}/{_tot}, "
+                                f"depth_adv={self._llm_stats.get('depth_adv', 0)})")
             if sa_parts:
                 log.warning(f"[StatCov] {' | '.join(sa_parts)}")
 
