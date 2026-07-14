@@ -5039,9 +5039,15 @@ class NVMeFuzzer:
                          if self._is_llm_seed(s)]
             favored = sum(1 for s in llm_seeds if getattr(s, 'is_favored', False))
             st = self._llm_stats
+            # v9.2: corpus 내 LLM 시드를 단일/seq 로 분해 — "단일 LLM 시드가 살아남나" 진단.
+            _llm_single = sum(1 for s in llm_seeds if isinstance(s, Seed))
+            _llm_seq    = sum(1 for s in llm_seeds if isinstance(s, SequenceSeed))
+            _fav_single = sum(1 for s in llm_seeds if isinstance(s, Seed) and getattr(s, 'is_favored', False))
+            _fav_seq    = favored - _fav_single
             log.warning(f"[LLM/stats] ★LLM이 뚫은 새 커버리지(누적)={st.get('new_cov', 0)}★ | "
                         f"★SC-depth 전진(누적)={st.get('depth_adv', 0)}★ | "
-                        f"corpus내 llm시드={len(llm_seeds)} (지금 favored={favored}) | "
+                        f"corpus내 llm시드={len(llm_seeds)}(단일 {_llm_single}[fav {_fav_single}]/"
+                        f"seq {_llm_seq}[fav {_fav_seq}]) | "
                         f"누적 주입 seeds={st['seeds']} seqs={st['seqs']} "
                         f"dropped={st['dropped']} dupes={st['dupes']} rounds={st['rounds']}")
             # v9.1: 되먹임 신호 성숙도 — 확정 미구현 / accept 예시 보유 / 구현됐으나 얕게 반송
