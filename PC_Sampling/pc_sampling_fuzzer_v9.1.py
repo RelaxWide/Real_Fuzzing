@@ -3575,7 +3575,7 @@ class NVMeFuzzer:
         # LLM 계보 시드가 calibration 중 '새' 커버리지를 발견하면 new_cov 에 반영(favored 원천).
         # (기존엔 변이 파생만 셌음 → 원본 LLM 시드의 직접 발견을 놓쳐 favored↑ 인데 new_cov=0 이 됨.)
         _new = all_seen_pcs - self.sampler.global_coverage   # global 반영 전 = 신규분
-        if _new and str(getattr(seed, 'seed_class', '') or '').startswith('llm'):
+        if _new and self._is_llm_seed(seed):
             self._llm_stats['new_cov'] += len(_new)
             seed.new_pcs = len(_new)
             # calibration 발견은 mutation 경로가 아니라 [+][Edge-Cov]가 안 찍힌다 → 여기서 명시.
@@ -4538,6 +4538,7 @@ class NVMeFuzzer:
                  0x09: "Invalid Log Page", 0x80: "LBA Out of Range"}
 
     def _sc_name(self, full: int) -> str:
+        """NVMe full status(=SCT<<8|SC, flags 무시) → 사람이 읽는 요약 문자열(LLM digest 용)."""
         sc = full & 0xFF
         sct = (full >> 8) & 0x7
         base = self._SC_KNOWN.get(sc, f"SC=0x{sc:02x}")
@@ -4584,7 +4585,7 @@ class NVMeFuzzer:
             # 되먹임 + few-shot: 실제 커버리지 뚫은 LLM 계보 시드
             prod = [s for s in self.corpus
                     if isinstance(s, Seed)
-                    and str(getattr(s, 'seed_class', '') or '').startswith('llm')
+                    and self._is_llm_seed(s)
                     and (getattr(s, 'is_favored', False) or getattr(s, 'new_pcs', 0) > 0)]
             prod.sort(key=lambda s: (bool(getattr(s, 'is_favored', False)),
                                      getattr(s, 'new_pcs', 0)), reverse=True)
@@ -4902,6 +4903,12 @@ class NVMeFuzzer:
             self._llm_apply_result(res)
 
     @staticmethod
+    def _is_llm_seed(seed) -> bool:
+        """v9.1: seed_class 가 'llm' 접두(LLM 계보)인지 — None/blank 안전.
+        new_cov 귀속·grounding·컬링·에너지 등 여러 곳에서 쓰던 동일 판정을 단일화."""
+        return str(getattr(seed, 'seed_class', '') or '').startswith('llm')
+
+    @staticmethod
     def _llm_seed_sig(seed):
         """A: 중복 주입 판정용 시그니처 (명령+CDW+데이터)."""
         return (seed.cmd.name, seed.cdw2, seed.cdw3, seed.cdw10, seed.cdw11,
@@ -4920,7 +4927,7 @@ class NVMeFuzzer:
             return
         try:
             llm_seeds = [s for s in self.corpus
-                         if str(getattr(s, 'seed_class', '') or '').startswith('llm')]
+                         if self._is_llm_seed(s)]
             favored = sum(1 for s in llm_seeds if getattr(s, 'is_favored', False))
             st = self._llm_stats
             log.warning(f"[LLM/stats] ★LLM이 뚫은 새 커버리지(누적)={st.get('new_cov', 0)}★ | "
@@ -5437,7 +5444,7 @@ class NVMeFuzzer:
             # 단일 명령 모드: 기존 경로
             self.corpus.append(new_seed)
             # LLM 계보가 뚫은 새 커버리지 누적 ("얼마나 잘 뚫나" 지표)
-            if new_pcs > 0 and str(getattr(new_seed, 'seed_class', '') or '').startswith('llm'):
+            if new_pcs > 0 and self._is_llm_seed(new_seed):
                 self._llm_stats['new_cov'] += new_pcs
             _cov_label = "BB" if (self._sa_loaded and self._sa_bb_starts) else "PC"
             log.warning(
@@ -5657,7 +5664,7 @@ class NVMeFuzzer:
         _removed_seq_set = {id(s) for s in _to_remove if isinstance(s, SequenceSeed)}
         if RAG_DEBUG:   # ① 가시성: 어느 LLM 시드가 왜 잘리는지
             for s in _to_remove:
-                if str(getattr(s, 'seed_class', '') or '').startswith('llm'):
+                if self._is_llm_seed(s):
                     _nm = s.cmd.name if isinstance(s, Seed) else 'seq'
                     log.warning(f"[LLM/cull] {_nm} exec_count={s.exec_count} "
                                 f"covered_pcs={len(s.covered_pcs) if s.covered_pcs else 0} "
@@ -9966,7 +9973,7 @@ class NVMeFuzzer:
             self.corpus.append(_seq_seed)
             # LLM 시퀀스 계보가 뚫은 새 커버리지 누적
             if (_seq_seed.new_pcs > 0
-                    and str(getattr(_seq_seed, 'seed_class', '') or '').startswith('llm')):
+                    and self._is_llm_seed(_seq_seed)):
                 self._llm_stats['new_cov'] += _seq_seed.new_pcs
             _cov_label = "BB" if (self._sa_loaded and self._sa_bb_starts) else "PC"
             log.warning(
@@ -12999,7 +13006,7 @@ class NVMeFuzzer:
                                 base_seed = self._calibrate_seed(base_seed)
                             # ① 가시성: LLM 시드 선택 시 exec/covered_pcs/favored 상태
                             if (RAG_DEBUG and base_seed is not None
-                                    and str(getattr(base_seed, 'seed_class', '') or '').startswith('llm')):
+                                    and self._is_llm_seed(base_seed)):
                                 _cp = len(base_seed.covered_pcs) if getattr(base_seed, 'covered_pcs', None) else 0
                                 if isinstance(base_seed, Seed):
                                     log.warning(f"[LLM/exec] 선택 {base_seed.cmd.name} "
