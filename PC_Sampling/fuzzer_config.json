@@ -365,7 +365,8 @@
     "task_weights": {
       "new_group_seeds": 1,
       "sequences": 2,
-      "corpus_eval": 1
+      "corpus_eval": 1,
+      "io_patterns": 2
     },
     "max_seeds_per_round": 8,
     "max_seq_per_round": 6,
@@ -378,7 +379,8 @@
     "tasks": {
       "new_group_seeds": true,
       "sequences": true,
-      "corpus_eval": true
+      "corpus_eval": true,
+      "io_patterns": true
     },
     "_comment_v91": "v9.1: SC=0x01(Invalid Opcode) 지배 명령 = 이 펌웨어 미구현 → LLM 제안 제외 + 에너지 바닥",
     "unimpl_min_exec": 5,
@@ -414,7 +416,12 @@
     "hot_window_bytes": 8388608,
     "gc_unit_bytes": 1048576,
     "strided_period_lbas": 32,
-    "rand_buf_mb": 8
+    "rand_buf_mb": 8,
+    "burst_blocks_max": 50,
+    "burst_snap_blocks": 5,
+    "burst_patience_k": 3,
+    "ffm_field": "ffm_frag",
+    "burst_walltime_cap_sec": 120.0
   },
   "state_fields": {
     "_comment": "제품별 state 관측 필드 세트. 제품의 state_fields 키가 세트명을 가리킴. r8=PM9M1/BM9H1, p9=P9(LID 0xDF df_* 제외).",
@@ -705,6 +712,46 @@
         "endian": "little",
         "weight": 1.5,
         "desc": "[SecRecv 240h] System data % used"
+      },
+      {
+        "name": "ffm_frag",
+        "source": "derived",
+        "fn": "frag_pressure",
+        "weight": 3.0,
+        "desc": "FFM: FTL 조각화/GC 압력 지수(0-100). free_block 고갈+PE skew+usage 정규화 가중합 — I/O 워크로드가 내부 상태를 미는 정도. 파생값(디바이스 로그 아님).",
+        "inputs": [
+          {
+            "term": "fill",
+            "kind": "inv_pct",
+            "field": "sec_free_blocks_pct",
+            "weight": 0.4
+          },
+          {
+            "term": "skew",
+            "kind": "skew",
+            "field": "df_max_pe_cycles",
+            "field2": "df_avg_pe_cycles",
+            "weight": 0.25
+          },
+          {
+            "term": "slc",
+            "kind": "pct",
+            "field": "sec_slc_pct_used",
+            "weight": 0.15
+          },
+          {
+            "term": "sys",
+            "kind": "pct",
+            "field": "sec_sys_data_pct_used",
+            "weight": 0.1
+          },
+          {
+            "term": "end",
+            "kind": "pct",
+            "field": "percent_used",
+            "weight": 0.1
+          }
+        ]
       }
     ],
     "p9": [
@@ -961,6 +1008,46 @@
         "endian": "little",
         "weight": 1.5,
         "desc": "[SecRecv 240h] System data % used"
+      },
+      {
+        "name": "ffm_frag",
+        "source": "derived",
+        "fn": "frag_pressure",
+        "weight": 3.0,
+        "desc": "FFM: FTL 조각화/GC 압력 지수(0-100). free_block 고갈+PE skew+usage 정규화 가중합 — I/O 워크로드가 내부 상태를 미는 정도. 파생값(디바이스 로그 아님). p9는 df_* 없어 skew 항 자동 제외.",
+        "inputs": [
+          {
+            "term": "fill",
+            "kind": "inv_pct",
+            "field": "sec_free_blocks_pct",
+            "weight": 0.4
+          },
+          {
+            "term": "skew",
+            "kind": "skew",
+            "field": "df_max_pe_cycles",
+            "field2": "df_avg_pe_cycles",
+            "weight": 0.25
+          },
+          {
+            "term": "slc",
+            "kind": "pct",
+            "field": "sec_slc_pct_used",
+            "weight": 0.15
+          },
+          {
+            "term": "sys",
+            "kind": "pct",
+            "field": "sec_sys_data_pct_used",
+            "weight": 0.1
+          },
+          {
+            "term": "end",
+            "kind": "pct",
+            "field": "percent_used",
+            "weight": 0.1
+          }
+        ]
       }
     ]
   },
