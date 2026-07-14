@@ -5012,7 +5012,17 @@ class NVMeFuzzer:
             _acc_n = sum(1 for _n, _s in self.cmd_stats.items() if _s.get('accepted'))
             _impl_low = [ _n for _n, _s in self.cmd_stats.items()
                           if _s.get('sc_hist') and _n not in self._unimpl_cmds ]
-            log.warning(f"[LLM/v9.1] 확정 미구현={sorted(self._unimpl_cmds)} | "
+            # v9.2: 확정 미구현 전체 목록을 매 라운드 로그에 덤프하면 길어짐(터미널 스팸) →
+            #   개수만 로그, 전체 목록은 사이드카 파일(overwrite)로. 어느 명령이 언제 확정됐는지는
+            #   [LLM/unimpl] 확정 로그(1회/명령)에 이미 남는다.
+            try:
+                _ld = self.output_dir / 'llm'
+                _ld.mkdir(parents=True, exist_ok=True)
+                (_ld / 'unimpl_cmds.txt').write_text(
+                    "\n".join(sorted(self._unimpl_cmds)) + "\n", encoding='utf-8')
+            except Exception:
+                pass
+            log.warning(f"[LLM/v9.1] 확정 미구현={len(self._unimpl_cmds)}개(→llm/unimpl_cmds.txt) | "
                         f"accept예시 보유 명령={_acc_n} | 구현됐으나 필드거부 관측={len(_impl_low)}")
             # v9.2 Tier1: 명령별 SC-depth(도달 깊이 0~3) — depth_adv 전역합 대신 per-opcode 가시화.
             #   0=Invalid Opcode, 1=필드검증, 2=핸들러, 3=성공. LLM 이 진전시킨 명령은 (★).
