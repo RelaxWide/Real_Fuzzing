@@ -14,7 +14,7 @@
 
 ## 1. v9.3 변경 (이번 세션) — 상세 `pc_sampling_fuzzer_v9.3.md`
 - **FFM 파생 필드**(`source:'derived'`): `capture()` 가 raw 읽은 뒤 `_derive_frag_pressure` 로 FTL 조각화/GC 압력 지수(0..100) 계산·주입. %-타입 압력 필드 정규화 가중평균, **존재 항 재정규화**(제품 무관). delta/state_cov/LLM 되먹임 전부 기존 파이프라인 자동.
-- **io_patterns task**: LLM에 텔레메트리 `{값+desc}` 주고 워크로드 descriptor 받음. `_llm_make_workload_desc` 검증 → `_pending_workload`.
+- **io_patterns task**: LLM에 텔레메트리 `{값+desc}` 주고 워크로드 descriptor 받음. `_llm_make_workload_desc` 검증 → `_pending_workload`. **⚠️ plateau-gated**: edge-cov 정체 시에만 돌파 로테이션 합류(비-plateau=v9.2 스케줄 동일). 초기 v9.3 이 io_patterns 를 공유 회전(weight=2)에 상시 넣어 LLM breakthrough 가 급감한 회귀를 이 게이팅으로 수정(단일 워커 슬롯 → 상시 포함은 seed/sequence 를 뺏음).
 - **descriptor 증폭 버스트**(`_run_llm_workload_burst`): `_gen_workload_block(desc=)` 로 패턴/파라미터 오버라이드, block 반복하며 FFM **상승 후 정체(patience) 시 조기 종료**(안 오르면 천장까지). 매 명령 PC샘플 → edge-cov 자동. 되먹임(`_llm_workload_feedback`)으로 다음 라운드 개선.
 - config: `ffm_frag` 필드(r8/p9), `rag.tasks/task_weights.io_patterns`, `io_workload.burst_*`.
 - **미구현(다음)**: 워크로드 corpus(효과적 descriptor 저장·replay/mutate). 현재 버스트 1회성.

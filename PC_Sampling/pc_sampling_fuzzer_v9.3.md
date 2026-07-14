@@ -18,7 +18,7 @@ v9.2(SC-depth·구조적 data·피드백) 위에 — **LLM-구동 I/O 워크로�
 - 활성 카운터(patrol/reclaim/refresh/wear_count)는 FFM에 안 섞고 **각자 EVENT 필드**로 유지(무한 카운터 스케일 함정 회피).
 
 ### 2. io_patterns LLM task + descriptor
-- 4번째 task `io_patterns`(가중 라운드로빈, 기존 3 task 무변경). `_pending_workload` 있으면 새 요청 안 함(중복 적체 방지).
+- 4번째 task `io_patterns`. **edge-cov 정체(plateau)일 때만** 돌파 로테이션(seq/ngs/io_patterns)에 합류 — 활발히 뚫는 동안엔 후보에서 제외해 **LLM 을 seed/sequence 에 100% 집중(=v9.2 스케줄 동일)**. LLM 워커 슬롯이 1개뿐이라 상시 넣으면 seed/sequence 를 뺏어 breakthrough 급감(초기 v9.3 회귀 → 이 게이팅으로 수정). `_pending_workload` 있으면 새 요청 안 함(중복 적체 방지).
 - `_llm_build_request('io_patterns')`: **텔레메트리 `{name=value [desc]}` 스냅샷**(FFM 포함) + 패턴 enum + descriptor 스키마 요청. LLM은 값+설명으로 판단(제품 바뀌어도 적용).
 - LLM 출력 = 단일 `io_workload` descriptor `{pattern, lba_span, block_size, hot_fraction, read_ratio, direction}`. `_llm_make_workload_desc` 검증(pattern∈enum, 범위체크; LBA/NLB 실상한은 발송 시 `_wl_clamp`).
 

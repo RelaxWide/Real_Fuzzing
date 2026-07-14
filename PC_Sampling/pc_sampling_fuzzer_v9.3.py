@@ -4917,36 +4917,37 @@ class NVMeFuzzer:
         return None
 
     def _llm_maybe_submit(self):
-        """활성 task 중 하나를 라운드로빈(또는 plateau 시 seeds/seq 우선) 선택해 제출."""
+        """활성 task 중 하나를 라운드로빈(또는 plateau 시 seeds/seq/io_patterns) 선택해 제출."""
         if not self.llm.enabled:
             return
-        active = [t for t in ('new_group_seeds', 'sequences', 'corpus_eval')
-                  if RAG_TASKS.get(t, True)]
-        # v9.3: io_patterns — io_workload 엔진이 켜져 있고 대기 중 descriptor 가 없을 때만 후보.
-        #   (버스트 1건이 소비되기 전엔 새 descriptor 를 요청하지 않아 중복 적체 방지.)
-        if (RAG_TASKS.get('io_patterns', True)
-                and self.config.io_workload_enabled and IO_WL_ENABLED
-                and self._pending_workload is None):
-            active.append('io_patterns')
-        if not active:
-            return
-        # 가중 라운드로빈: task_weights 만큼 반복해 시퀀스 등에 비중을 준다(미설정=1).
-        weighted = []
-        for t in active:
-            weighted += [t] * max(1, int(RAG_TASK_WEIGHTS.get(t, 1)))
-        # plateau 감지: coverage 정체가 임계 초과면 시퀀스(상태의존 경로) 우선.
+        # plateau 감지: global coverage 정체가 임계 초과면 정체(돌파 모드).
         cov_now = len(self.sampler.global_coverage)
         if cov_now > self._llm_last_cov:
             self._llm_last_cov = cov_now
             self._llm_plateau_since = self.executions
         plateau = (self.executions - self._llm_plateau_since) >= RAG_PLATEAU_EXECS
+
+        # v9.2 3-task 스케줄은 그대로. io_patterns 는 공유 회전에 넣지 않는다 —
+        #   LLM 워커 슬롯이 1개뿐이라 상시 포함하면 seed/sequence 를 뺏어 breakthrough 가 급감
+        #   (v9.3 회귀). io_patterns(I/O state 축)는 **edge-cov 가 정체(plateau)일 때만** 합류:
+        #   활발히 뚫는 동안엔 LLM 을 seed/sequence 에 100% 집중(=v9.2 동일 스케줄).
+        active = [t for t in ('new_group_seeds', 'sequences', 'corpus_eval')
+                  if RAG_TASKS.get(t, True)]
+        if not active:
+            return
+        weighted = []
+        for t in active:
+            weighted += [t] * max(1, int(RAG_TASK_WEIGHTS.get(t, 1)))
+        io_pat_on = (RAG_TASKS.get('io_patterns', True)
+                     and self.config.io_workload_enabled and IO_WL_ENABLED
+                     and self._pending_workload is None)
         if plateau:
-            for t in ('sequences', 'new_group_seeds'):   # 정체 돌파는 시퀀스가 유리
-                if t in active:
-                    task = t
-                    break
-            else:
-                task = weighted[self._llm_task_rr % len(weighted)]
+            # 정체 돌파: 시퀀스/신규군(상태의존·미접촉 경로) + io_patterns(state 축) 라운드로빈.
+            breakers = [t for t in ('sequences', 'new_group_seeds') if t in active]
+            if io_pat_on:
+                breakers.append('io_patterns')
+            task = (breakers[self._llm_task_rr % len(breakers)] if breakers
+                    else weighted[self._llm_task_rr % len(weighted)])
         else:
             task = weighted[self._llm_task_rr % len(weighted)]
         self._llm_task_rr += 1
