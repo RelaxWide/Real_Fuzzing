@@ -28,6 +28,11 @@ RDDump 경로(`enable_debug_tool_dump`)가 컨트롤러 응답 복구를 위해 
 - SC digest(#1)에 **best_depth·"성공까지 남은 거리"** 명시 → LLM 이 어느 명령을 얼마나 밀면 되는지 판단(repair).
 - **자기 제안 되먹임:** `_llm_depth_cmds`(LLM 계보가 진전시킨 명령) → "Your proposals already advanced these — keep pushing" 라인. KernelGPT식 iterative repair.
 
+### 보안 잠금 방지 강화 (v9.2 후속)
+- **SecuritySend(0x81) SECP = ALLOWLIST**(`ALLOWED_SECURITY_SEND_SECP`, 기본 `0x00` info만) — denylist 로는 0xEE(IEEE1667)·vendor(0xF0~) 잠금 벡터를 놓칠 수 있어 허용 목록 외 전부 차단. opcode_override 도 `actual_opcode` 로 잡힘. config `strategy.allowed_security_send_secp` 로 안전 SECP 추가 가능.
+- **Lockdown(0x24) 차단** — 관리 인터페이스 잠금 명령을 `blocked_admin_opcodes` 에 추가.
+- **SecuritySend → `_DATA_LLM_EXCLUDE`** — FWDownload(실 fw_bin)와 함께 LLM data 생성 대상에서 제외.
+
 ## 관측 로그 (신규)
 - `[LLM/depth] <cmd> SC-depth 전진 →N (<status>) | 누적=M` — LLM 이 깊이 전진시킴.
 - `[LLM/stats] ... ★SC-depth 전진(누적)=M★ ...` — new_cov 옆 보완 지표.

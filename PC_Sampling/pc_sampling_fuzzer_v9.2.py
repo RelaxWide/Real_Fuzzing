@@ -393,6 +393,13 @@ BLOCKED_SECURITY_SEND_SECP = frozenset(
     _ST.get('blocked_security_send_secp',
             [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xEC, 0xEF])
 )
+# v9.2: denylist 대신 ALLOWLIST 로 강화 — SecuritySend 는 host→device 로 크리덴셜/락을 설정하는
+#   명령이라, denylist 는 0xEE(IEEE1667)·vendor(0xF0~) 같은 잠금 벡터를 놓칠 수 있다. 허용된 SECP
+#   (기본 0x00=Security Protocol Information, read-only info) 외 전부 차단해 디바이스 잠김을 원천 봉쇄.
+#   SecuritySend 핸들러를 더 탐색하려면 config allowed_security_send_secp 에 안전 SECP 를 추가.
+ALLOWED_SECURITY_SEND_SECP = frozenset(
+    _ST.get('allowed_security_send_secp', [0x00])
+)
 
 # Namespace Management/Attachment (admin). SEL = CDW10[3:0].
 #   NamespaceManagement(0x0D): SEL 0=Create, 1=Delete. Delete 는 namespace 를 영구 파괴
@@ -4592,7 +4599,9 @@ class NVMeFuzzer:
     # v9.2: LLM 이 data_hex 를 생성하면 안 되는 명령 — 실제 준비된 자산(바이너리 등)을 쓰거나
     #   합성 payload 가 무의미/위험한 것. FWDownload = fuzzer 가 config fw_bin(실제 FW 이미지)을
     #   청크로 전송(brick 위험 + LLM 생성 이미지는 검증 통과 못 함).
-    _DATA_LLM_EXCLUDE = {"FWDownload"}
+    #   SecuritySend = 크리덴셜/락 설정(write) → 잠금 위험 + allowlist 로 info(0x00)만 허용되므로
+    #   LLM payload 생성 무의미. FWDownload = 실제 fw_bin 사용.
+    _DATA_LLM_EXCLUDE = {"FWDownload", "SecuritySend"}
 
     def _llm_data_directive(self) -> str:
         """v9.1 #4 / v9.2 Tier2: 구현된 needs_data 명령에만 valid 구조 data_hex 요청 —
@@ -8760,16 +8769,17 @@ class NVMeFuzzer:
             self.stats['blocked_admin_opcode'] = self.stats.get('blocked_admin_opcode', 0) + 1
             return self.RC_SKIP
 
-        # device 잠금 방지 가드: SecuritySend(0x81) 의 SECP(CDW10[31:24])가 잠금성
-        # 프로토콜(예: 0xEF ATA Security SET PASSWORD)이면 전송 차단. 보내면 password 가
-        # 설정돼 host I/O 가 잠기고 후속 명령 전부 실패(영구적 가성 불량). mutation 으로
-        # opcode 가 0x81 로 바뀐 경우도 actual_opcode 로 잡힌다 — 단일 chokepoint.
+        # device 잠금 방지 가드(v9.2: ALLOWLIST): SecuritySend(0x81) 의 SECP(CDW10[31:24])가
+        # 허용 목록(기본 0x00 info) 밖이면 전송 차단. SecuritySend 는 크리덴셜/락을 설정하는
+        # write 계열이라 denylist 로는 0xEE(IEEE1667)·vendor(0xF0~) 잠금 벡터를 놓칠 수 있어
+        # allowlist 로 봉쇄. mutation 으로 opcode 가 0x81 로 바뀐 경우도 actual_opcode 로 잡힌다.
         if (passthru_type == "admin-passthru"
                 and actual_opcode == _SECURITY_SEND_OPCODE
-                and ((seed.cdw10 >> 24) & 0xFF) in BLOCKED_SECURITY_SEND_SECP):
+                and ((seed.cdw10 >> 24) & 0xFF) not in ALLOWED_SECURITY_SEND_SECP):
             _secp = (seed.cdw10 >> 24) & 0xFF
             log.warning(f"[GUARD] SecuritySend SECP=0x{_secp:02x} 전송 차단 — "
-                        f"device 잠금 방지 (cdw10=0x{seed.cdw10:08x})")
+                        f"허용 SECP({sorted(ALLOWED_SECURITY_SEND_SECP)}) 외 잠금 방지 "
+                        f"(cdw10=0x{seed.cdw10:08x})")
             self.stats['blocked_security_send'] = self.stats.get('blocked_security_send', 0) + 1
             return self.RC_SKIP
 
