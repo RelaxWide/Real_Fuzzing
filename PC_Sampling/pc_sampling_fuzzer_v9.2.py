@@ -235,6 +235,15 @@ RAG_UNIMPL_FLOOR_ON  = bool(_RAG.get('unimpl_energy_floor_on', True))
 #   숨겨 LLM 명령 고착을 유발했음. 8k 토큰 입력 예산상 구현된 전 명령(~28개) 노출이 여유(~4k tok).
 #   이 값은 vendor 명령 폭증 같은 극단만 막는 안전상한(정상 구간에선 안 걸림).
 RAG_SCHEMA_MAX       = int(_RAG.get('schema_max', 48))
+# v9.2: ① 시퀀스 패턴 dedupe — 같은 명령-시퀀스가 corpus 에 이 수를 넘으면 새 복사본 미추가.
+#   단조 state(WriteUncorrectable→GetLogPage 등)가 카운터 버킷마다 중복 수확돼 flood 되는 것 차단.
+MAX_SEQ_PER_PATTERN  = int(_ST.get('max_seq_per_pattern', 2))
+# v9.2: ② staleness 에너지 감쇠(생산성 항) — 시드가 grace 초과로 선택됐는데 새 코드 0 이면 감쇠.
+#   기본 OFF(전역 edge-cov 스케줄 변경이라 A/B 후 채택). Entropic 근거.
+ENERGY_STALENESS_ON  = bool(_ST.get('energy_staleness_on', False))
+STALENESS_GRACE      = int(_ST.get('staleness_grace', 2))    # 이 횟수까진 무감쇠(늦게 터지는 시드 보호)
+STALENESS_K          = float(_ST.get('staleness_k', 8.0))    # 감쇠 완만도(클수록 천천히)
+STALENESS_FLOOR      = float(_ST.get('staleness_floor', 0.05))  # 감쇠 바닥(0 아님=부활 여지)
 RAG_MAX_SEQ_LEN      = int(_RAG.get('max_seq_len', 16))    # 시퀀스 최대 명령 수(리플레이 비용 상한, 초과=drop).
 #   유효성 제한이 아님 — NVMe엔 정당한 긴 체인 존재(ZNS 존 라이프사이클/Reservation 다단계/FW다운로드
 #   청크 등). 매 반복마다 체인 전체를 리플레이하므로 반복 속도를 위한 상한. 펌웨어에 긴 정상 워크플로가
@@ -1048,6 +1057,7 @@ class Seed:
     # v9.0 LLM-guided: 출처 태그(예: 'llm_new_group')와 LLM 유용성 점수(0~1). None=기존 경로.
     seed_class: Optional[str] = None
     llm_score: Optional[float] = None
+    last_gain_exec: int = 0      # v9.2 staleness: 마지막으로 새 코드 커버리지를 낸 exec_count
 
 @dataclass
 class SequenceSeed:
@@ -1061,6 +1071,7 @@ class SequenceSeed:
     is_favored: bool = False
     covered_pcs: Optional[set] = None
     seed_class: Optional[str] = None   # v9.0: 'llm_seq' 등 출처 태그
+    last_gain_exec: int = 0      # v9.2 staleness: 마지막으로 새 코드 커버리지를 낸 exec_count
 
 @dataclass
 class FuzzConfig:
@@ -3380,6 +3391,7 @@ class NVMeFuzzer:
         self._last_nvme_status: Optional[int] = None  # 직전 send 의 NVMe full status(0=성공, None=errno/내부)
         self._last_depth_adv: bool = False            # v9.2 Tier1: 직전 실행이 SC-depth 를 전진시켰나
         self._llm_depth_cmds: set = set()             # v9.2 Tier3: LLM 계보가 SC-depth 를 전진시킨 명령들(피드백)
+        self._last_selected = None                    # v9.2 staleness: 직전 _select_seed 가 고른 corpus 시드
 
         self.mutation_stats = {
             "opcode_override": 0,     # opcode가 변형된 횟수
@@ -4943,6 +4955,12 @@ class NVMeFuzzer:
                 if RAG_DEBUG:
                     log.warning(f"[LLM/item] dup seq len={len(seeds)} → skip")
                 continue
+            # v9.2 ①: 같은 명령-패턴이 이미 corpus 에 cap 만큼 있으면 flood 방지 위해 스킵
+            if self._seq_at_pattern_cap(seeds):
+                self._llm_stats['dupes'] += 1
+                if RAG_DEBUG:
+                    log.warning(f"[LLM/item] pattern-cap seq [{'->'.join(s.cmd.name for s in seeds)}] → skip")
+                continue
             self._llm_seen.add(sig)
             self.corpus.append(SequenceSeed(
                 commands=seeds, found_at=self.executions,
@@ -4980,6 +4998,24 @@ class NVMeFuzzer:
         """v9.1: seed_class 가 'llm' 접두(LLM 계보)인지 — None/blank 안전.
         new_cov 귀속·grounding·컬링·에너지 등 여러 곳에서 쓰던 동일 판정을 단일화."""
         return str(getattr(seed, 'seed_class', '') or '').startswith('llm')
+
+    def _seq_at_pattern_cap(self, commands) -> bool:
+        """v9.2 ①: 같은 명령-시퀀스 패턴(명령이름 순서, CDW 무관)이 corpus 에
+        MAX_SEQ_PER_PATTERN 이상 있으면 True → 새 복사본 추가 스킵. 단조 state
+        (WriteUncorrectable→GetLogPage 등)가 카운터 버킷마다 중복 수확돼 flood 되는 것 차단."""
+        if MAX_SEQ_PER_PATTERN <= 0:
+            return False
+        try:
+            _pat = tuple(s.cmd.name for s in commands)
+        except Exception:
+            return False
+        _cnt = 0
+        for s in self.corpus:
+            if isinstance(s, SequenceSeed) and tuple(c.cmd.name for c in s.commands) == _pat:
+                _cnt += 1
+                if _cnt >= MAX_SEQ_PER_PATTERN:
+                    return True
+        return False
 
     @staticmethod
     def _llm_seed_sig(seed):
@@ -5067,7 +5103,7 @@ class NVMeFuzzer:
 
         ratio = self.executions / seed.exec_count
         if ratio <= 1:
-            return self._llm_energy_adjust(seed, 1.0 / n)
+            return self._apply_staleness(seed, self._llm_energy_adjust(seed, 1.0 / n))
 
         try:
             power = int(math.log2(ratio))
@@ -5075,7 +5111,20 @@ class NVMeFuzzer:
         except (ValueError, OverflowError):
             factor = 1.0
 
-        return self._llm_energy_adjust(seed, factor / n)
+        return self._apply_staleness(seed, self._llm_energy_adjust(seed, factor / n))
+
+    @staticmethod
+    def _apply_staleness(seed, e: float) -> float:
+        """v9.2 staleness(생산성 항): 시드가 grace 초과로 선택됐는데 그동안 새 코드를 못 냈으면
+        energy 를 지수 감쇠(바닥 STALENESS_FLOOR). 새 코드를 내면 last_gain_exec 가 갱신돼 리셋.
+        기본 OFF(ENERGY_STALENESS_ON) — 전역 edge-cov 스케줄 변경이라 A/B 후 채택."""
+        if not ENERGY_STALENESS_ON:
+            return e
+        _st = getattr(seed, 'exec_count', 0) - getattr(seed, 'last_gain_exec', 0)
+        if _st <= STALENESS_GRACE:
+            return e
+        _decay = 2.0 ** (-(_st - STALENESS_GRACE) / STALENESS_K)
+        return e * max(STALENESS_FLOOR, _decay)
 
     def _select_seed(self) -> 'Optional[Union[Seed, SequenceSeed]]':
         """v4: 에너지 기반 가중치 랜덤 선택.
@@ -5092,6 +5141,7 @@ class NVMeFuzzer:
         if total_energy <= 0:
             seed = random.choice(self.corpus)
             seed.exec_count += 1
+            self._last_selected = seed   # v9.2 staleness 귀속용
             return seed
 
         r = random.uniform(0, total_energy)
@@ -5100,10 +5150,12 @@ class NVMeFuzzer:
             cumulative += seed.energy
             if r <= cumulative:
                 seed.exec_count += 1
+                self._last_selected = seed
                 return seed
 
         # fallback
         self.corpus[-1].exec_count += 1
+        self._last_selected = self.corpus[-1]
         return self.corpus[-1]
 
     def _epoch_reset_corpus(self):
@@ -5433,6 +5485,11 @@ class NVMeFuzzer:
         #   (corpus 진입 → 프론티어[구현-얕음] 탐색 유도). depth 전진은 명령당 ≤3회라 corpus 폭증 없음.
         if self._last_depth_adv:
             is_interesting = True
+
+        # v9.2 staleness: 이 실행이 새 코드 커버리지를 냈으면 직전 선택된 corpus 시드의 last_gain 갱신
+        #   (energy staleness 감쇠 리셋). 새 코드 못 내면 갱신 안 됨 → staleness 누적 → 감쇠.
+        if new_pcs > 0 and self._last_selected is not None:
+            self._last_selected.last_gain_exec = getattr(self._last_selected, 'exec_count', 0)
 
         self.cmd_pcs[track_key].update(self.sampler.current_trace)
         if self.sampler._last_raw_pcs:
@@ -10081,7 +10138,13 @@ class NVMeFuzzer:
                 covered_pcs=self._seq_sink['covered_pcs'],
                 seed_class=self._seq_sink.get('seed_class'),   # v9.0: LLM 계보 태그 전파
             )
-            self.corpus.append(_seq_seed)
+            # v9.2 ①: 같은 명령-패턴이 corpus 에 cap 만큼 있으면 corpus 추가만 스킵(flood 방지).
+            #   new_cov 크레딧/replay .sh 는 유지(정확성). 단조 state 중복 수확이 corpus 를 채우는 것 차단.
+            if not self._seq_at_pattern_cap(self._seq_sink['commands']):
+                self.corpus.append(_seq_seed)
+            elif RAG_DEBUG:
+                _sp = "->".join(c.cmd.name for c in self._seq_sink['commands'][:4])
+                log.warning(f"[Seq] pattern-cap harvest seq[{_sp}] → corpus 추가 스킵")
             # LLM 시퀀스 계보가 뚫은 새 커버리지 누적
             if (_seq_seed.new_pcs > 0
                     and self._is_llm_seed(_seq_seed)):
