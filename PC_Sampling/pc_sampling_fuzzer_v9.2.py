@@ -4586,10 +4586,13 @@ class NVMeFuzzer:
         "DirectiveSend":       "DTYPE/DOPER(CDW11)별 구조 (Identify Directive: enable 파라미터 구조체)",
         "SetFeatures":         "선택 FID(CDW10[7:0])의 데이터 구조체 (예: FID 0x0D Host Memory Buffer descriptor list)",
         "NamespaceManagement": "SEL=0(Create): NS 관리 데이터 구조(NSZE/NCAP/FLBAS/DPS 등 4096B)",
-        "FWDownload":          "FW 이미지 청크 (CDW10=NUMD dwords, CDW11=OFST offset)",
         "IOMgmtSend":          "MO(CDW11[7:0])별 구조 (RUH Update: Placement Handle 리스트)",
         "DatasetManagement":   "Range Definitions, 16B each: <ctx_attr:4><len:4 LBA><SLBA:8 LE>; NR(CDW10)+1",
     }
+    # v9.2: LLM 이 data_hex 를 생성하면 안 되는 명령 — 실제 준비된 자산(바이너리 등)을 쓰거나
+    #   합성 payload 가 무의미/위험한 것. FWDownload = fuzzer 가 config fw_bin(실제 FW 이미지)을
+    #   청크로 전송(brick 위험 + LLM 생성 이미지는 검증 통과 못 함).
+    _DATA_LLM_EXCLUDE = {"FWDownload"}
 
     def _llm_data_directive(self) -> str:
         """v9.1 #4 / v9.2 Tier2: 구현된 needs_data 명령에만 valid 구조 data_hex 요청 —
@@ -4599,7 +4602,8 @@ class NVMeFuzzer:
             tgt = [c.name for c in self.commands
                    if c.needs_data
                    and self.cmd_stats.get(c.name, {}).get('reached_fw', 0) > 0
-                   and c.name not in self._unimpl_cmds]
+                   and c.name not in self._unimpl_cmds
+                   and c.name not in self._DATA_LLM_EXCLUDE]   # v9.2: FWDownload 등 실자산 명령 제외
         except Exception:
             return ""
         if not tgt:
@@ -5001,6 +5005,15 @@ class NVMeFuzzer:
                           if _s.get('sc_hist') and _n not in self._unimpl_cmds ]
             log.warning(f"[LLM/v9.1] 확정 미구현={sorted(self._unimpl_cmds)} | "
                         f"accept예시 보유 명령={_acc_n} | 구현됐으나 필드거부 관측={len(_impl_low)}")
+            # v9.2 Tier1: 명령별 SC-depth(도달 깊이 0~3) — depth_adv 전역합 대신 per-opcode 가시화.
+            #   0=Invalid Opcode, 1=필드검증, 2=핸들러, 3=성공. LLM 이 진전시킨 명령은 (★).
+            _depths = sorted(((_n, _s.get('best_depth', -1)) for _n, _s in self.cmd_stats.items()
+                              if _s.get('best_depth', -1) >= 0),
+                             key=lambda x: x[1], reverse=True)
+            if _depths:
+                _dstr = " ".join(f"{_n}={_bd}{'★' if _n in self._llm_depth_cmds else ''}"
+                                 for _n, _bd in _depths[:20])
+                log.warning(f"[LLM/depth] 명령별 SC-depth(0~3, ★=LLM전진): {_dstr}")
         except Exception:
             pass
 
