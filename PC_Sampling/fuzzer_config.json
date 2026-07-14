@@ -380,7 +380,7 @@
       "new_group_seeds": true,
       "sequences": true,
       "corpus_eval": true,
-      "io_patterns": false
+      "io_patterns": true
     },
     "_comment_v91": "v9.1: SC=0x01(Invalid Opcode) 지배 명령 = 이 펌웨어 미구현 → LLM 제안 제외 + 에너지 바닥",
     "unimpl_min_exec": 5,

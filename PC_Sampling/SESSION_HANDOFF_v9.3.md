@@ -7,7 +7,8 @@
 
 ## 0. 현재 상태 한 줄
 - **최신 = `pc_sampling_fuzzer_v9.3.py`** (`FUZZER_VERSION="9.3.0"`). 상세: `pc_sampling_fuzzer_v9.3.md`, 설계: `v9.3_IO_workload_design.md`.
-- **⚠️ io_patterns 는 현재 config 기본 OFF (`rag.tasks.io_patterns:false`)** — 실호스트에서 `[LLM/exec]` 가 10만+ 명령 동안 하드 제로(회귀)로 보고돼, io_patterns/버스트가 단일 LLM 슬롯·메인루프를 점유한 게 원인인지 **A/B 격리 중**. OFF 면 LLM 경로가 v9.2 와 동일(버스트 미발생, FFM 필드만 수동 존재). OFF 로 돌렸는데도 `[LLM/exec]` 가 여전히 0 이면 원인은 io_patterns 밖(FFM 필드/타 편집/기존 v9.2 미해결 이슈) → 그쪽 조사. **다음 세션 최우선 확인.**
+- **io_patterns 는 config ON (`rag.tasks.io_patterns:true`), plateau-gated.** (한때 `[LLM/exec]` 하드 제로로 io_patterns 를 의심해 OFF A/B 를 걸었으나, **실제 원인 = 온라인 RAG 서비스 python 이 꺼져 있어** LLM 응답 자체가 안 온 것(환경). v9.3 코드 무관 확인 → 재ON.)
+  - **동작 조건**: 온라인 PC 의 RAG 서비스 실행 + `rag.enabled:true`(또는 `--rag`) + `io_workload.enabled:true` + `rag.tasks.io_patterns:true`. 모두 충족 시, **edge-cov plateau(RAG_PLATEAU_EXECS=2만 execs 무성장) 때만** io_patterns 제출 → 즉시 안 떠도 정상(활발히 뚫는 중엔 seed/sequence 집중).
 - `--rag` off 또는 `rag.tasks.io_patterns` off → v9.2와 동등(버스트 미발생, 기존 round-robin 워크로드 무변경). FFM 필드는 순수 추가(입력 없으면 degrade).
 - 구버전(v8.0~v9.2 .py/.md) = `backup/`. git 이력 보존.
 
