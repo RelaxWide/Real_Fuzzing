@@ -2953,11 +2953,29 @@ class JLinkHaltSampler(OpenOCDPCSampler):
             self.sample_thread.join(timeout=2.0)
         with self._jlink_lock:
             if self.jlink is not None:
-                try:
-                    if self._go_func:   # 코어를 resume 상태로 두고 닫기
-                        self._go_func()
-                except Exception:
-                    pass
+                # v9.1: R5 resume 검증·재시도 — Go 실패를 silent 로 삼키면 코어가 halt 로 남아
+                #   이후 NVMe(RDDump)가 컨트롤러 응답을 못 받아 'device 못 찾음'(crash 덤프 실패)이 된다.
+                #   Go 후 halted() 재확인, 여전히 halt 면 재시도, 끝내 실패면 경고(자가진단용).
+                if self._go_func:
+                    _resumed = False
+                    for _ in range(3):
+                        try:
+                            self._go_func()
+                        except Exception:
+                            pass   # 이미 running 이면 'CPU is not halted' 예외 → 아래 halted() 로 판정
+                        try:
+                            if not self.jlink.halted():
+                                _resumed = True
+                                break
+                        except Exception:
+                            pass   # halted() 조회 실패 → 판단 불가, 재시도
+                        time.sleep(0.02)
+                    if _resumed:
+                        log.info("[J-Link] close: R5 resume 확인")
+                    else:
+                        log.warning("[J-Link] close: R5 resume 실패 — 코어가 halt 로 남았을 수 있음 "
+                                    "(이후 NVMe/RDDump 무응답 가능, 수동 resume 필요). "
+                                    "모드A=resume실패 / (resume OK인데 RDDump 실패면)모드B=펌웨어hung")
                 try:
                     self.jlink.close()
                 except Exception:
