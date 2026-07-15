@@ -139,4 +139,3 @@ industrial이면 불필요. 만약 알고리즘 기여를 원하면 유일하게
 - **staleness(Entropic-inspired)** = 선택빈도를 productivity로 조절(포화 시드만 감쇠). 포화 전엔 no-op.
 - halt 샘플링 확률성 → **단일 Seed covered_pcs union 누적**(재-calibration)으로 cull 오컬링 완화. 시퀀스는 replay union으로 이미 안정.
 - new_cov는 **하한**(halt under-sampling). `[+][SC-depth]`는 edge-cov 증가 아님(프론티어 진입).
-</content>
