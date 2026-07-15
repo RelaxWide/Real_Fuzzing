@@ -238,6 +238,11 @@ RAG_SCHEMA_MAX       = int(_RAG.get('schema_max', 48))
 # v9.2: ① 시퀀스 패턴 dedupe — 같은 명령-시퀀스가 corpus 에 이 수를 넘으면 새 복사본 미추가.
 #   단조 state(WriteUncorrectable→GetLogPage 등)가 카운터 버킷마다 중복 수확돼 flood 되는 것 차단.
 MAX_SEQ_PER_PATTERN  = int(_ST.get('max_seq_per_pattern', 2))
+# v9.3: 위 pattern-cap 을 LLM 시퀀스 추가에도 걸면 부작용 — 패턴이 '명령이름 순서(CDW 무관)'라
+#   LLM 이 같은 명령 체인을 파라미터만 바꿔 낸 다양한 시퀀스가 2개 넘으면 전부 버려져 LLM 기여가
+#   억압됨. flood 는 harvest(단조 state 수확)에서 오지 LLM 이 아니고(LLM 은 _llm_seen 정확중복제거+
+#   라운드당 개수제한), harvest cap 은 그대로 유지하므로 LLM 시퀀스는 기본 면제. 필요시 true 로 복원.
+RAG_CAP_LLM_SEQ_PATTERN = bool(_RAG.get('cap_llm_seq_pattern', False))
 # v9.2: ② staleness 에너지 감쇠(생산성 항) — 시드가 grace 초과로 선택됐는데 새 코드 0 이면 감쇠.
 #   기본 OFF(전역 edge-cov 스케줄 변경이라 A/B 후 채택). Entropic 근거.
 ENERGY_STALENESS_ON  = bool(_ST.get('energy_staleness_on', False))
@@ -5088,8 +5093,9 @@ class NVMeFuzzer:
                 if RAG_DEBUG:
                     log.warning(f"[LLM/item] dup seq len={len(seeds)} → skip")
                 continue
-            # v9.2 ①: 같은 명령-패턴이 이미 corpus 에 cap 만큼 있으면 flood 방지 위해 스킵
-            if self._seq_at_pattern_cap(seeds):
+            # v9.3: LLM 시퀀스는 pattern-cap 기본 면제(위 상수 설명) — 같은 명령체인의 파라미터
+            #   변주를 살려 LLM 기여를 억압하지 않음. flood 방지는 harvest 경로 cap 이 담당.
+            if RAG_CAP_LLM_SEQ_PATTERN and self._seq_at_pattern_cap(seeds):
                 self._llm_stats['dupes'] += 1
                 if RAG_DEBUG:
                     log.warning(f"[LLM/item] pattern-cap seq [{'->'.join(s.cmd.name for s in seeds)}] → skip")
