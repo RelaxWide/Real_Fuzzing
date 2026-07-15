@@ -4957,6 +4957,8 @@ class NVMeFuzzer:
         sys_p, usr_p = built
         if self.llm.submit(task, sys_p, usr_p, self.executions):
             log.info(f"[LLM] 요청 제출: task={task} (plateau={plateau})")
+            if task == 'io_patterns':   # io_patterns 는 터미널에서도 보이게(진단)
+                log.warning("[LLM] io_patterns 요청 제출 — I/O 워크로드 descriptor 요청")
 
     def _llm_make_seed(self, item, seed_class):
         """LLM seed 항목 dict → 검증된 Seed 또는 None(폐기). 메인 스레드."""
@@ -5115,6 +5117,12 @@ class NVMeFuzzer:
             log.warning(f"[LLM] 워크로드 descriptor 수신: pattern={_wl.get('pattern')} "
                         f"span={_wl.get('lba_span')} bs={_wl.get('block_size')} "
                         f"hot={_wl.get('hot_fraction')} rd={_wl.get('read_ratio')}")
+        elif res.get('task') == 'io_patterns':
+            # io_patterns 응답인데 유효 descriptor 가 안 나옴(io_workload 키 없음/pattern enum 밖 등)
+            #   → 조용히 버려지던 것을 터미널에 노출(진단: LLM 이 뭘 냈는지 확인).
+            log.warning(f"[LLM] io_patterns 응답에 유효 descriptor 없음: "
+                        f"io_workload={data.get('io_workload')!r} "
+                        f"(응답 키={sorted(data.keys())})")
         self._llm_stats['seeds'] += added_s
         self._llm_stats['seqs'] += added_q
         self._llm_stats['rounds'] += 1
