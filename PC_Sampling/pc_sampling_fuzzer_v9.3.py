@@ -8895,14 +8895,18 @@ class NVMeFuzzer:
                 cmds.append(('w', clamp(random.randint(0, max(0, nsze - 1)), small, nsze), small))
         return cmds
 
-    def _wl_send_one(self, op: str, slba: int, nlb: int, lba: int) -> int:
-        """워크로드 단일 명령 전송 + 회계(source='workload'). 반환 rc."""
+    def _wl_send_one(self, op: str, slba: int, nlb: int, lba: int,
+                     seed_class: Optional[str] = None) -> int:
+        """워크로드 단일 명령 전송 + 회계(source='workload'). 반환 rc.
+        seed_class='llm_io' 면 LLM-구동 버스트 명령 → new_cov(LLM 기여)에 크레딧.
+        config round-robin 워크로드는 None(LLM 무관)."""
         cmd_obj = self._wl_write_cmd if op == 'w' else self._wl_read_cmd
         data = self._wl_rand_data((nlb + 1) * lba) if op == 'w' else b''
         seed = Seed(
             data=data, cmd=cmd_obj,
             cdw10=slba & 0xFFFFFFFF, cdw11=(slba >> 32) & 0xFFFFFFFF,
             cdw12=nlb & 0xFFFF, found_at=self.executions,
+            seed_class=seed_class,
         )
         self._current_mutations = []   # MOpt 무오염
         rc = self._send_nvme_command(data, seed, record_history=True)
@@ -9032,7 +9036,10 @@ class NVMeFuzzer:
                 for (op, slba, nlb) in cmds:
                     if self._timeout_crash:
                         break
-                    if self._wl_send_one(op, slba, nlb, lim['lba']) == 0:
+                    # seed_class='llm_io' → LLM 이 이 워크로드를 지시했으므로 발견 커버리지를
+                    #   LLM 기여(new_cov)로 크레딧. source='workload' 는 유지(C1/C2 에너지 무오염).
+                    if self._wl_send_one(op, slba, nlb, lim['lba'],
+                                         seed_class='llm_io') == 0:
                         n_ok += 1
                     if self._timeout_crash:
                         break
