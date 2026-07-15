@@ -340,7 +340,7 @@
     ],
     "_comment_v92_seq": "v9.2: 같은 명령-시퀀스 패턴 corpus 상한(단조 state flood 방지) + staleness 에너지(기본 off, A/B)",
     "max_seq_per_pattern": 2,
-    "energy_staleness_on": false,
+    "energy_staleness_on": true,
     "staleness_grace": 2,
     "staleness_k": 8.0,
     "staleness_floor": 0.05
