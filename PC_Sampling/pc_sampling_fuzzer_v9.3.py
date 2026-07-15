@@ -249,6 +249,11 @@ ENERGY_STALENESS_ON  = bool(_ST.get('energy_staleness_on', False))
 STALENESS_GRACE      = int(_ST.get('staleness_grace', 2))    # 이 횟수까진 무감쇠(늦게 터지는 시드 보호)
 STALENESS_K          = float(_ST.get('staleness_k', 8.0))    # 감쇠 완만도(클수록 천천히)
 STALENESS_FLOOR      = float(_ST.get('staleness_floor', 0.05))  # 감쇠 바닥(0 아님=부활 여지)
+# v9.3: 단일 Seed covered_pcs 를 주기적 재-calibration 으로 union 누적 — halt 확률샘플링의 단발
+#   스냅샷 노이즈로 favored/cull 이 productive 단일 시드를 오컬링하는 것 완화(시퀀스는 replay union 이미).
+COVERED_PCS_RECAL_ON       = bool(_ST.get('covered_pcs_recal_on', True))
+COVERED_PCS_RECAL_INTERVAL = int(_ST.get('covered_pcs_recal_interval', 16))  # 시드 exec 이 배수일 때 재calibration
+COVERED_PCS_RECAL_MAX      = int(_ST.get('covered_pcs_recal_max', 4))        # 시드당 재calibration 상한(비용 통제)
 RAG_MAX_SEQ_LEN      = int(_RAG.get('max_seq_len', 16))    # 시퀀스 최대 명령 수(리플레이 비용 상한, 초과=drop).
 #   유효성 제한이 아님 — NVMe엔 정당한 긴 체인 존재(ZNS 존 라이프사이클/Reservation 다단계/FW다운로드
 #   청크 등). 매 반복마다 체인 전체를 리플레이하므로 반복 속도를 위한 상한. 펌웨어에 긴 정상 워크플로가
@@ -1071,6 +1076,7 @@ class Seed:
     seed_class: Optional[str] = None
     llm_score: Optional[float] = None
     last_gain_exec: int = 0      # v9.2 staleness: 마지막으로 새 코드 커버리지를 낸 exec_count
+    recal_count: int = 0         # v9.3: covered_pcs union 재-calibration 횟수(비용 상한용)
 
 @dataclass
 class SequenceSeed:
@@ -3674,14 +3680,18 @@ class NVMeFuzzer:
         seed.is_calibrated = True
         seed.stability = stability
         seed.stable_pcs = stable_pcs
-        seed.covered_pcs = all_seen_pcs
+        # v9.3: 덮어쓰기 대신 union — halt 확률샘플링은 실행마다 PC 부분집합만 잡으므로,
+        #   재-calibration(아래 메인루프) 때 합집합으로 누적해 진짜 커버리지로 수렴시킨다.
+        #   → favored/cull 이 단발 스냅샷 노이즈로 productive 단일 시드를 오컬링하는 것 완화.
+        seed.covered_pcs = (seed.covered_pcs or set()) | all_seen_pcs
 
         # LLM 계보 시드가 calibration 중 '새' 커버리지를 발견하면 new_cov 에 반영(favored 원천).
         # (기존엔 변이 파생만 셌음 → 원본 LLM 시드의 직접 발견을 놓쳐 favored↑ 인데 new_cov=0 이 됨.)
+        #   재-calibration 시 확률샘플링이 새 global PC 를 잡으면 그것도 크레딧(누적).
         _new = all_seen_pcs - self.sampler.global_coverage   # global 반영 전 = 신규분
         if _new and self._is_llm_seed(seed):
             self._llm_stats['new_cov'] += len(_new)
-            seed.new_pcs = len(_new)
+            seed.new_pcs += len(_new)
             # calibration 발견은 mutation 경로가 아니라 [+][Edge-Cov]가 안 찍힌다 → 여기서 명시.
             log.warning(f"[LLM/cov] {seed.cmd.name} calibration +{len(_new)} new PCs "
                         f"→ 누적 new_cov={self._llm_stats['new_cov']}")
@@ -13550,6 +13560,18 @@ class NVMeFuzzer:
                                     and not base_seed.is_calibrated
                                     and not base_seed.covered_pcs):
                                 base_seed = self._calibrate_seed(base_seed)
+                            # v9.3: 이미 calibrate 된 단일 시드도 주기적으로 재-calibration →
+                            #   covered_pcs union 누적(halt 확률샘플링 단발노이즈 완화). 비용통제:
+                            #   exec 이 INTERVAL 배수일 때 + 시드당 RECAL_MAX 회까지만.
+                            elif (COVERED_PCS_RECAL_ON
+                                    and isinstance(base_seed, Seed)
+                                    and base_seed.is_calibrated
+                                    and base_seed.recal_count < COVERED_PCS_RECAL_MAX
+                                    and base_seed.exec_count > 0
+                                    and base_seed.exec_count % COVERED_PCS_RECAL_INTERVAL == 0):
+                                base_seed.is_calibrated = False   # _calibrate_seed 재실행 허용
+                                base_seed = self._calibrate_seed(base_seed)
+                                base_seed.recal_count += 1
                             # ① 가시성: LLM 시드 선택 시 exec/covered_pcs/favored 상태
                             if (RAG_DEBUG and base_seed is not None
                                     and self._is_llm_seed(base_seed)):
