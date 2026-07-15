@@ -5797,11 +5797,20 @@ class NVMeFuzzer:
             if new_pcs > 0 and self._is_llm_seed(new_seed):
                 self._llm_stats['new_cov'] += new_pcs
             _cov_label = "BB" if (self._sa_loaded and self._sa_bb_starts) else "PC"
-            log.warning(
-                f"[+][Edge-Cov] cmd={cmd.name}  "
-                f"new_{_cov_label}={new_pcs}  "
-                f"total_{_cov_label}={len(self._sa_covered_bbs) if (self._sa_loaded and self._sa_bb_starts) else len(self.sampler.global_coverage)}  "
-                f"corpus={len(self.corpus)}  exec={self.executions:,}")
+            _total_cov = (len(self._sa_covered_bbs) if (self._sa_loaded and self._sa_bb_starts)
+                          else len(self.sampler.global_coverage))
+            if new_pcs > 0:
+                log.warning(
+                    f"[+][Edge-Cov] cmd={cmd.name}  new_{_cov_label}={new_pcs}  "
+                    f"total_{_cov_label}={_total_cov}  "
+                    f"corpus={len(self.corpus)}  exec={self.executions:,}")
+            else:
+                # new_pcs=0 인데 is_interesting → SC-depth 전진으로 프론티어 corpus 진입.
+                #   edge-cov(BB/PC)는 증가하지 않음 — [+][Edge-Cov] 로 찍으면 오해라 별도 레이블.
+                log.warning(
+                    f"[+][SC-depth] cmd={cmd.name}  new_{_cov_label}=0 (프론티어 진입, edge-cov 불변)  "
+                    f"total_{_cov_label}={_total_cov}  "
+                    f"corpus={len(self.corpus)}  exec={self.executions:,}")
             if self.config.state_enabled and source == 'c1':
                 self._csfuzz_c1_rewards.append(1)
 
@@ -8983,16 +8992,39 @@ class NVMeFuzzer:
         log.warning(f"[IO-WL] block#{self._wl_blocks_done} pattern={pattern} "
                     f"cmds={len(cmds)} rc0={n_ok} max_nlb={lim['max_nlb']} nsze={lim['nsze']:,}")
 
+    def _state_capture_safe(self) -> Optional[dict]:
+        """state 전체 스냅샷(파생 필드 포함) 안전 캡처. 실패 시 None."""
+        try:
+            return self.state_monitor.capture()
+        except Exception as e:
+            log.debug(f"[IO-WL/burst] state capture 예외: {e}")
+            return None
+
     def _ffm_snapshot(self) -> Optional[int]:
         """현재 FFM(파생 필드) 값 관측. state capture 실패/필드 없음 → None."""
-        try:
-            snap = self.state_monitor.capture()
-        except Exception as e:
-            log.debug(f"[IO-WL/burst] FFM 스냅 예외: {e}")
-            return None
-        if not snap:
-            return None
-        return snap.get(IO_WL_FFM_FIELD)
+        snap = self._state_capture_safe()
+        return snap.get(IO_WL_FFM_FIELD) if snap else None
+
+    def _telemetry_delta_summary(self, before: Optional[dict], after: Optional[dict],
+                                 top: int = 12) -> str:
+        """워크로드 전후 state 스냅샷의 변화 필드를 요약 문자열로(절대 델타 큰 순). desc 첨부."""
+        if not before or not after:
+            return "(telemetry 스냅 불가)"
+        _desc = {f.get('name'): (f.get('desc') or '') for f in self.config.state_fields}
+        changes = []
+        for name, a in after.items():
+            b = before.get(name)
+            if b is None or a is None or a == b:
+                continue
+            changes.append((name, b, a, a - b))
+        if not changes:
+            return "변화 없음"
+        changes.sort(key=lambda x: abs(x[3]), reverse=True)
+        lines = [f"    {n}: {b:,} → {a:,} (Δ{d:+,})  [{_desc.get(n, '')[:42]}]"
+                 for (n, b, a, d) in changes[:top]]
+        _more = len(changes) - top
+        tail = f"\n    …외 {_more}개 필드" if _more > 0 else ""
+        return f"{len(changes)}개 필드 변화:\n" + "\n".join(lines) + tail
 
     def _run_llm_workload_burst(self, desc: dict) -> None:
         """v9.3: LLM descriptor 로 워크로드를 포화까지 증폭 실행(버스트).
@@ -9022,7 +9054,9 @@ class NVMeFuzzer:
             self._wl_prewrite_read_targets(lim, pattern)
             self._wl_read_target_written = True
 
-        ffm0 = self._ffm_snapshot()
+        _snap_start = self._state_capture_safe()      # 전체 telemetry 스냅(전)
+        _snap_last  = _snap_start                       # interval 캡처로 갱신될 최신 스냅(후)
+        ffm0 = _snap_start.get(IO_WL_FFM_FIELD) if _snap_start else None
         ffm_max = ffm0 if ffm0 is not None else 0
         stale = 0
         armed = False           # FFM 이 한 번이라도 오른 뒤에만 patience 발동(조기종료 오발 방지)
@@ -9058,7 +9092,10 @@ class NVMeFuzzer:
             if time.monotonic() - t_start > IO_WL_BURST_WALLTIME_S:
                 stop_reason = 'walltime'
                 break
-            ffm = self._ffm_snapshot()
+            _snap = self._state_capture_safe()
+            if _snap:
+                _snap_last = _snap                      # 최신 스냅 갱신(후 telemetry 요약용)
+            ffm = _snap.get(IO_WL_FFM_FIELD) if _snap else None
             if ffm is not None:
                 if ffm > ffm_max:
                     ffm_max = ffm
@@ -9080,6 +9117,9 @@ class NVMeFuzzer:
                     f"FFM {ffm0}→{ffm_max} (Δ{ffm_delta}) stop={stop_reason} "
                     f"span={desc.get('lba_span')} bs={desc.get('block_size')} "
                     f"hot={desc.get('hot_fraction')} rd={desc.get('read_ratio')}")
+        # 워크로드 전후 telemetry 변화 요약(터미널) — 어느 내부 상태를 얼마나 밀었나.
+        log.warning(f"[IO-WL/telemetry] pattern={pattern} 전후 변화 — "
+                    f"{self._telemetry_delta_summary(_snap_start, _snap_last)}")
 
     # NVMe CQE Status Code Type (SCT, bits[10:8]) → 이름. SC(bits[7:0])는 nvme-cli stderr 의
     # 이름 문자열을 그대로 사용(자체 테이블 유지 불필요).
