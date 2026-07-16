@@ -2919,23 +2919,17 @@ class JLinkHaltSampler(OpenOCDPCSampler):
                         self.jlink.close()
                 except Exception:
                     pass
-            # v9.3: DLL→Python 로그 콜백을 쓰지 않는다. JLinkARM DLL 이 halt hot-path
-            # (JLINKARM_Halt) 에서 이 콜백을 ctypes 트램폴린으로 되불러 파이썬을 실행하다
-            # 인터프리터 힙을 손상시켜 SIGSEGV(PyObject_GetAttr) 가 났다(gdb 스택으로 확인:
-            # JLINKARM_Halt → _ctypes → PyObject_GetAttr). halt/reg/go 정방향 호출은 그대로라
-            # PC 샘플링/커버리지는 무영향. halt 실패는 정방향 관측(halt_ok_total/halt_fail_total)
-            # 으로 안전하게 모니터링한다(콜백 불필요).
-            jl = _pylink.JLink()
+            # warn/error 핸들러 주입: JLinkARM DLL 이 stderr 로 직접 찍는 타이밍 경고
+            # ('CPU could not be halted' 등, WFI 코어 halt timeout)를 Python 콜백으로
+            # 가로채 파일 debug 로만 보낸다. fd-2 통짜 억제와 달리 이 문자열만 선택적으로
+            # 강등하고 그 외 DLL 경고/에러는 그대로 노출한다.
+            # NOTE(v9.3): DLL→Python 콜백(_jlink_dll_msg)이 halt hot-path 에서 인터프리터
+            #   힙을 손상시켜 SIGSEGV(PyObject_GetAttr) 를 낸다(gdb 확인). DLL 콜백을 NULL 로
+            #   끄는 시도는 이 DLL 이 NULL 을 무시해 실패했고, 커스텀 콜백을 빼면 pylink 기본
+            #   logger.info 콜백으로 떨어져 오히려 더 빨리 크래시했다 → 원복. 근본해법은
+            #   샘플러 서브프로세스 격리(진행 예정). 그때까지는 가벼운 커스텀 콜백 유지.
+            jl = _pylink.JLink(error=self._jlink_dll_msg, warn=self._jlink_dll_msg)
             jl.open()
-            # open() 이 OpenEx 로 기본 로그 핸들러를 DLL 에 등록하므로, 그 직후 DLL 콜백을
-            # NULL 로 되돌려 DLL→Python 되불림 통로를 완전히 차단한다(크래시 벡터 제거).
-            # 각 함수 개별 try — 일부 미지원/NULL 거부여도 나머지는 계속 적용.
-            for _lfn in ('JLINKARM_EnableLog', 'JLINKARM_EnableLogCom',
-                         'JLINKARM_SetWarnOutHandler', 'JLINKARM_SetErrorOutHandler'):
-                try:
-                    getattr(jl._dll, _lfn)(None)
-                except Exception as _le:
-                    log.warning(f"[J-Link] DLL 로그 콜백({_lfn}) 비활성화 경고: {_le}")
             tif = (_pylink.enums.JLinkInterfaces.JTAG if self.config.interface == 'jtag'
                    else _pylink.enums.JLinkInterfaces.SWD)
             jl.set_tif(tif)
