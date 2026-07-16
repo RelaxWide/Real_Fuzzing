@@ -1337,30 +1337,14 @@ _FAULTHANDLER_FP = None   # faulthandler 덤프 대상 파일 — 프로세스 �
 
 
 def _code_signature() -> str:
-    """실행 중인 코드 버전 식별자. FUZZER_VERSION 은 v9.3 커밋 전부 '9.3.0' 이라 구분
-    불가 → git 커밋 해시(있으면)와 이 파일의 sha256[:12](git 없어도 유일 식별)로 스탬프.
-    로그 최상단에 찍어 '이 로그가 어느 커밋으로 돌았나'를 사후에 판별하기 위함."""
+    """실행 중인 코드 파일의 sha256[:12]. 어느 코드로 돌았는지 사후 식별용 —
+    버전 문자열/커밋 노출 없이 파일 해시만 출력한다."""
     import hashlib
-    _f = os.path.abspath(__file__)
-    _d = os.path.dirname(_f)
-    parts = []
     try:
-        h = subprocess.run(['git', '-C', _d, 'rev-parse', '--short', 'HEAD'],
-                           capture_output=True, text=True, timeout=5)
-        if h.returncode == 0 and h.stdout.strip():
-            commit = h.stdout.strip()
-            dj = subprocess.run(['git', '-C', _d, 'status', '--porcelain', '--', _f],
-                                capture_output=True, text=True, timeout=5)
-            dirty = '+dirty' if (dj.returncode == 0 and dj.stdout.strip()) else ''
-            parts.append(f"git={commit}{dirty}")
+        with open(os.path.abspath(__file__), 'rb') as _fp:
+            return hashlib.sha256(_fp.read()).hexdigest()[:12]
     except Exception:
-        pass
-    try:
-        with open(_f, 'rb') as _fp:
-            parts.append("sha=" + hashlib.sha256(_fp.read()).hexdigest()[:12])
-    except Exception:
-        pass
-    return " ".join(parts) if parts else "unknown"
+        return "unknown"
 
 
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
@@ -1430,8 +1414,8 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     ) if is_tty else fmt)
     logger.addHandler(ch)
 
-    # v9.3: 실행 코드 버전 스탬프 — 이 로그가 어느 git 커밋/파일버전으로 돌았는지 사후 식별.
-    logger.warning(f"[VERSION] FUZZER_VERSION={FUZZER_VERSION}  code=({_code_signature()})")
+    # v9.3: 실행 코드 파일 해시 스탬프 — 어느 코드로 돌았는지 사후 식별(버전 미노출).
+    logger.warning(f"[CODE] sha={_code_signature()}")
 
     return logger, log_file
 
