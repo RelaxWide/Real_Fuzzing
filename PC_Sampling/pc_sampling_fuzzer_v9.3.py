@@ -1333,9 +1333,6 @@ def _setup_matplotlib_chart_env():
         'ignore', message=r'.*missing from (current )?font.*')
 
 
-_FAULTHANDLER_FP = None   # faulthandler 덤프 대상 파일 — 프로세스 수명 내내 참조 유지(GC 방지)
-
-
 def _code_signature() -> str:
     """실행 중인 코드 파일의 sha256[:12]. 어느 코드로 돌았는지 사후 식별용 —
     버전 문자열/커밋 노출 없이 파일 해시만 출력한다."""
@@ -1352,20 +1349,6 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_file = os.path.join(output_dir, f'fuzzer_{timestamp}.log')
-
-    # 치명 시그널(SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL) 발생 시 전(全) 스레드 Python 스택을
-    # 파일로 덤프. stderr 가 아니라 전용 파일에 고정하는 이유: 이 퍼저는 halt/DLL 노이즈 억제
-    # 구간에 fd 2(stderr)를 /dev/null 로 dup2 하므로(아래 _read_all_pcs/calibration 경로),
-    # 기본 stderr 덤프는 크래시가 가장 잘 나는 그 순간 사라질 수 있다. 전용 fd(>2)는 그 dup2 와
-    # 무관하다. 정상 실행 오버헤드 0(시그널 시에만 기록). 파일 객체는 전역으로 살려 GC/닫힘 방지.
-    global _FAULTHANDLER_FP
-    try:
-        import faulthandler
-        _fh_path = os.path.join(output_dir, f'faulthandler_{timestamp}.log')
-        _FAULTHANDLER_FP = open(_fh_path, 'w')
-        faulthandler.enable(file=_FAULTHANDLER_FP, all_threads=True)
-    except Exception as _fe:                       # 계측 실패가 기동을 막지 않도록 방어
-        print(f"[faulthandler] 활성화 실패(무시): {_fe}", file=sys.stderr)
 
     logger = logging.getLogger('pcfuzz')
     logger.setLevel(logging.DEBUG)
