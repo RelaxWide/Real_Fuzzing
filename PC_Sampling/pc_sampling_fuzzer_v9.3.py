@@ -12976,6 +12976,33 @@ class NVMeFuzzer:
                             f"--namespace {self.config.nvme_namespace} 와 불일치 → "
                             f"path 기준으로 보정 (namespace := {_path_ns})")
                 self.config.nvme_namespace = _path_ns
+        # v9.3: I/O 대상 namespace 블록 디바이스가 실제로 존재하는지 확인 → 없으면 동일
+        #   controller 의 노출된 namespace 를 glob 으로 자동 감지. 활성 NS 가 n1 이 아닌
+        #   경우(예: vendor format/NS management 후 n2 만 존재)에 --nvme 없이도 대응.
+        #   컨트롤러 char device 유무와 무관(아래 fallback 은 컨트롤러 부재 시에만 발동).
+        _io_dev = (nvme_dev if _NVME_NS_SUFFIX_RE.search(nvme_dev)
+                   else f"{nvme_dev}n{self.config.nvme_namespace or 1}")
+        if not os.path.exists(_io_dev):
+            _cm = re.match(r'(/dev/nvme\d+)', nvme_dev)
+            _ctrl_base = _cm.group(1) if _cm else nvme_dev
+            import glob as _glob
+            _cands = sorted(
+                [p for p in _glob.glob(f"{_ctrl_base}n*")
+                 if re.match(rf"^{re.escape(_ctrl_base)}n\d+$", p)],
+                key=lambda p: int(re.search(r'n(\d+)$', p).group(1)))
+            if _cands:
+                _picked = _cands[0]
+                _pid = int(re.search(r'n(\d+)$', _picked).group(1))
+                if len(_cands) > 1:
+                    log.warning(f"[Pre-flight] namespace device {_io_dev} 없음 — 활성 NS "
+                                f"여럿 {[os.path.basename(p) for p in _cands]} → 최소 "
+                                f"{os.path.basename(_picked)} 자동 선택 (다른 NS 는 --nvme 로 명시).")
+                else:
+                    log.warning(f"[Pre-flight] namespace device {_io_dev} 없음 → 자동 감지 "
+                                f"{os.path.basename(_picked)} (활성 namespace={_pid}).")
+                self.config.nvme_device = _picked
+                self.config.nvme_namespace = _pid
+                nvme_dev = _picked
         if not os.path.exists(nvme_dev):
             # WSL2 / 일부 인클로저 환경: controller char device(/dev/nvme0)는 없고
             # namespace block device(/dev/nvme0nN)만 노출됨. namespace 번호는
