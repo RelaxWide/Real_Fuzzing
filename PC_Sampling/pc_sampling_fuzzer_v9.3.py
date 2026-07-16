@@ -1339,11 +1339,28 @@ def _setup_matplotlib_chart_env():
         'ignore', message=r'.*missing from (current )?font.*')
 
 
+_FAULTHANDLER_FP = None   # faulthandler 덤프 대상 파일 — 프로세스 수명 내내 참조 유지(GC 방지)
+
+
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     """파일 + 콘솔 동시 로깅 설정 (실행마다 날짜시간 로그 파일 생성)"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_file = os.path.join(output_dir, f'fuzzer_{timestamp}.log')
+
+    # 치명 시그널(SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL) 발생 시 전(全) 스레드 Python 스택을
+    # 파일로 덤프. stderr 가 아니라 전용 파일에 고정하는 이유: 이 퍼저는 halt/DLL 노이즈 억제
+    # 구간에 fd 2(stderr)를 /dev/null 로 dup2 하므로(아래 _read_all_pcs/calibration 경로),
+    # 기본 stderr 덤프는 크래시가 가장 잘 나는 그 순간 사라질 수 있다. 전용 fd(>2)는 그 dup2 와
+    # 무관하다. 정상 실행 오버헤드 0(시그널 시에만 기록). 파일 객체는 전역으로 살려 GC/닫힘 방지.
+    global _FAULTHANDLER_FP
+    try:
+        import faulthandler
+        _fh_path = os.path.join(output_dir, f'faulthandler_{timestamp}.log')
+        _FAULTHANDLER_FP = open(_fh_path, 'w')
+        faulthandler.enable(file=_FAULTHANDLER_FP, all_threads=True)
+    except Exception as _fe:                       # 계측 실패가 기동을 막지 않도록 방어
+        print(f"[faulthandler] 활성화 실패(무시): {_fe}", file=sys.stderr)
 
     logger = logging.getLogger('pcfuzz')
     logger.setLevel(logging.DEBUG)
@@ -2902,12 +2919,23 @@ class JLinkHaltSampler(OpenOCDPCSampler):
                         self.jlink.close()
                 except Exception:
                     pass
-            # warn/error 핸들러 주입: JLinkARM DLL 이 stderr 로 직접 찍는 타이밍 경고
-            # ('CPU could not be halted' 등, WFI 코어 halt timeout)를 Python 콜백으로
-            # 가로채 파일 debug 로만 보낸다. fd-2 통짜 억제와 달리 이 문자열만 선택적으로
-            # 강등하고 그 외 DLL 경고/에러는 그대로 노출한다.
-            jl = _pylink.JLink(error=self._jlink_dll_msg, warn=self._jlink_dll_msg)
+            # v9.3: DLL→Python 로그 콜백을 쓰지 않는다. JLinkARM DLL 이 halt hot-path
+            # (JLINKARM_Halt) 에서 이 콜백을 ctypes 트램폴린으로 되불러 파이썬을 실행하다
+            # 인터프리터 힙을 손상시켜 SIGSEGV(PyObject_GetAttr) 가 났다(gdb 스택으로 확인:
+            # JLINKARM_Halt → _ctypes → PyObject_GetAttr). halt/reg/go 정방향 호출은 그대로라
+            # PC 샘플링/커버리지는 무영향. halt 실패는 정방향 관측(halt_ok_total/halt_fail_total)
+            # 으로 안전하게 모니터링한다(콜백 불필요).
+            jl = _pylink.JLink()
             jl.open()
+            # open() 이 OpenEx 로 기본 로그 핸들러를 DLL 에 등록하므로, 그 직후 DLL 콜백을
+            # NULL 로 되돌려 DLL→Python 되불림 통로를 완전히 차단한다(크래시 벡터 제거).
+            # 각 함수 개별 try — 일부 미지원/NULL 거부여도 나머지는 계속 적용.
+            for _lfn in ('JLINKARM_EnableLog', 'JLINKARM_EnableLogCom',
+                         'JLINKARM_SetWarnOutHandler', 'JLINKARM_SetErrorOutHandler'):
+                try:
+                    getattr(jl._dll, _lfn)(None)
+                except Exception as _le:
+                    log.warning(f"[J-Link] DLL 로그 콜백({_lfn}) 비활성화 경고: {_le}")
             tif = (_pylink.enums.JLinkInterfaces.JTAG if self.config.interface == 'jtag'
                    else _pylink.enums.JLinkInterfaces.SWD)
             jl.set_tif(tif)
@@ -3337,6 +3365,8 @@ class NVMeFuzzer:
         self._health_prev_timeouts  = 0       # 직전 평가 시 stats['ignored_timeout'] (NVMe timeout 동반 판별)
         self._health_stuck_streak   = 0       # coverage 정체+halt 대량실패+timeout 연속 횟수
         self._health_nocatch_streak = 0       # halt 성공 0 연속 창수 — 디버그 손실(코어 리셋) 감지·재연결용
+        self._halt_report_prev_ok   = 0       # 10000회 halt 실패율 한 줄 로그용 직전 스냅샷(ok)
+        self._halt_report_prev_fail = 0       # 〃 (fail) — 이 주기 구간 실패율 계산
         self._fw_commit_reset_pending = False  # FWCommit 성공(코어 리셋 가능) → 다음 회계 시 J-Link 재연결
         # v9.0: LLM-guided fuzzing 브리지 (비활성 시 모든 메서드 no-op = v8.8 동등).
         self.llm = LlmBridge(config)
@@ -5887,6 +5917,16 @@ class NVMeFuzzer:
             self._log_smart()
             if self.config.state_enabled:
                 self._log_state_snapshot()
+            # v9.3: halt 샘플러 실패율 한 줄(이 10000 구간 기준). 대량 실패 = I/O 중 코어가
+            #   안 멈춰 PC 샘플을 놓치는 신호. 정방향 카운터라 안전(DLL 콜백과 무관).
+            if isinstance(self.sampler, JLinkHaltSampler):
+                _hok, _hfl = self.sampler.halt_ok_total, self.sampler.halt_fail_total
+                _dfl = _hfl - self._halt_report_prev_fail
+                _datt = (_hok - self._halt_report_prev_ok) + _dfl
+                self._halt_report_prev_ok, self._halt_report_prev_fail = _hok, _hfl
+                if _datt > 0:
+                    log.warning(f"[Sampler] halt 실패율 {_dfl}/{_datt} "
+                                f"({100.0 * _dfl / _datt:.1f}%) [누적 {_hfl}/{_hok + _hfl}]")
 
         if (self.config.vmon_enabled
                 and self.executions % VMON_EXEC_INTERVAL == 0
