@@ -1,147 +1,82 @@
-# HANDOFF — segfault / kernel memory corruption 조사 (미확정, 진행중)
+# HANDOFF — segfault / pagealloc memory corruption 조사 (해결)
 
-> 목적: "동작 중 segfault/bus error + dmesg `pagealloc: memory corruption`" 조사 기록.
-> **아직 근본원인 확정 안 됨.** 지금까지 배제한 것·확정한 것·유력 가설·다음 테스트를 남긴다.
-> 작성 시점 최신 코드: `pc_sampling_fuzzer_v9.3.py` @ commit `72710f8`.
-
----
-
-## 0. 증상 (관측된 것)
-
-- 퍼저 실행 중 **segfault / bus error / GPF** 로 프로세스 사망. 크래시 위치가 **매번 다름**:
-  - `PyObject_GetAttr`, `PyObject_IsTrue`, `_PyEval_EvalFrameDefault` (python3.8 내부)
-  - `libc-2.31.so` GPF (malloc/free/memcpy류)
-  - python3 "trap stack segment" (SIGBUS, 스택 손상)
-  - **nvme-cli 자식 프로세스**가 쓰레기 주소로 점프(별개 exec 프로세스 손상)
-- **dmesg 커널 로그**: `check_poison_mem: N callbacks suppressed`, **`pagealloc: memory corruption`**,
-  `__kernel_unpoison_pages`/`prep_new_page` 콜스택, `page dumped because: corrupted page details`.
-  → **커널이 free 페이지가 덮어써진 걸 검출**(page poisoning). 이건 fuzzer segfault "이전에" 이미 뜸.
-- 크래시 시그널·위치가 비결정적 = **메모리 손상**이 어딘가에서 나고, 다음에 그 메모리를 건드리는
-  곳에서 터지는 패턴(비국소).
+> **결론 먼저:** "동작 중 비결정적 segfault + dmesg `pagealloc: memory corruption`"의 관측된
+> 원인은 **퍼저도 장치도 아니라, 진단하려고 호스트 GRUB에 추가한 커널 debug 계측**이었다.
+> 그걸 제거하니 **v9.3(in-process J-Link)이 J-Link 연결 + LLM 포함 16만+ 명령 안정 동작.**
+> 즉 우리가 쫓던 "알 수 없는 segfault"의 대부분은 **진단 도구가 스스로 만든 것**(관측자 효과).
 
 ---
 
-## 1. 핵심 판정 근거: `pagealloc: memory corruption`
+## 0. 최종 판정 — 크래시를 지배한 것
 
-- **커널 페이지 레벨 손상** = (a) 하드웨어 RAM, (b) DMA-capable 디바이스(NVMe/J-Link)가 free 페이지에
-  씀, (c) 커널/드라이버 버그 — 셋 중 하나. **파이썬(유저스페이스) 코드는 커널 free 페이지를 못 망가뜨림.**
-- 따라서 **fuzzer의 파이썬 코드 자체가 근본원인일 수 없음.** NVMe/J-Link 명령이 유발하는 **디바이스 DMA
-  손상** 또는 하드웨어가 유력.
+진단용으로 호스트 GRUB `GRUB_CMDLINE_LINUX_DEFAULT`에 넣었던 커널 debug 옵션:
+`slub_debug=FZPU`, `debug_pagealloc=on`, `page_poison=1`, `softlockup_panic`,
+`hardlockup_panic`, `nmi_watchdog`.
 
----
+이것들이:
+- **(a) `*_panic`** — 락업/멈춤을 경고가 아니라 **호스트 panic(크래시)** 으로 승격. 퍼저는
+  crash 보존(JTAG)을 위해 **30일 nvme 커널 타임아웃**으로 명령을 D-state로 *의도적으로* 얼려두는데,
+  그 멈춤이 lockup으로 잡히면 곧장 panic. (주범으로 추정)
+- **(b) `debug_pagealloc`/`slub_debug`** — 큰 오버헤드 + free 페이지 unmap → 평소 조용히 넘어갈
+  상황을 즉시 fault/crash로.
 
-## 2. 배제한 것 (증거와 함께)
+→ **관측자 효과(heisenbug): 프로브가 측정 대상보다 시스템을 더 크게 흔들었다.** debug 제거 후
+같은 v9.3 코드가 disk-특이성 없이 안정. ("이 OS 디스크에서만" 크래시난 이유 = 그 디스크에만 이
+옵션이 켜져 있었기 때문. 클론 디스크엔 없었음 → 그래서 클론은 멀쩡했던 것.)
+
+## 1. 이건 faulthandler 재현이다
+
+이 프로젝트에서 **두 번째** 같은 함정: 예전 `faulthandler`(진단 도구)가 스스로 크래시를
+유발/오염시킨 것과 동일 패턴. **교훈:** 간헐적 메모리 손상엔
+- 행동을 바꾸는 계측(panic / halt / heavy-debug)을 상시로 넣지 말 것,
+- **비침습 관찰(core dump, dmesg, IOMMU DMAR fault)** 을 우선,
+- 계측 전에 **계측 없는 baseline** 을 먼저 확보,
+- **한 번에 한 변수**만 바꿀 것.
+
+## 2. 배제된 것 (증거와 함께)
 
 | 후보 | 배제 근거 |
 |---|---|
-| **faulthandler(내가 추가한 진단도구)** | **오히려 크래시 유발원이었음.** bab8f6a(--no-jlink) 무사고 vs 내 faulthandler 얹은 버전 크래시. `--no-jlink` 실행경로 차이 중 유일한 활성 신규코드가 faulthandler. → 제거(58aeca0). ⚠️ 이전 세션에서 내가 "분석"한 gdb/faulthandler 스택 상당수가 이 도구가 만든 크래시였을 수 있음. |
-| **재-calibration(2fb417b)** | 제거(41a070f) 후에도 `--no-jlink` 크래시 지속 → 트리거 아님. (단 stateful SSD에 명령 반복은 부적절해 제거 자체는 유지.) |
-| **io_patterns 버스트 / FFM** | bab8f6a(=io_patterns 이미 포함)가 `--no-jlink` 무사고 → 버스트 아님. |
-| **data_len↔CDW 의도적 불일치** | 정당한 퍼징 동작 + **v9.1 이전부터 있던 오래된 기능** → v9.1에서 갑자기 나는 것 설명 못 함. |
-| **차트/matplotlib 인프로세스** | snapshot pickle 정상(폴백 안 뜸), gdb가 차트 프레임 한 번도 안 잡음, 차트는 오래된 코드. |
-| **알려진 커널-손상 admin 명령(큐/doorbell/AER/lockdown)** | `BLOCKED_ADMIN_OPCODES=[0x00,01,04,05,0C,7C,24]` + send-time 단일 chokepoint(9214, actual_opcode+passthru_type) → **확실히 차단됨**(정적 검증). |
+| 퍼저 코드/버전 | v8.3·v8.8·v9.0·v9.3 전부 크래시했었음. 3개월 상수인 코드가 새 증상 원인일 수 없음 |
+| LLM enabled-set 우회 (구 유력가설) | 버전·`--no-rag` 무관하게 재현 → 근본원인에서 강등 |
+| J-Link native 콜백 | `--no-jlink`(NullSampler)에서도 크래시 → J-Link 무관. **v9.4 격리의 전제가 무효** |
+| 물리 RAM | memtest 다중 패스 통과 |
+| 호스트 하드웨어(PSU/열/보드) | **같은 HW·다른 OS 디스크(클론)에서 정상** → HW 아님 |
+| config 파일 (30일 타임아웃 등) | 최신 config 그대로 다른 디스크에선 정상 → 단독 원인 아님 |
+| OS 설치본 손상 | 클론이고, 재부팅으론 안 나았지만 **debug 옵션 제거로 해결** → 설치본 손상 아님 |
 
-### 방법론 주의 (중요)
-- **재부팅 없는 버전 bisect는 누적 손상으로 오염될 수 있음.** 단 사용자 실측 순서는 **v9.3(fresh,첫)→크래시,
-  v9.2/v9.1→크래시, v8.8/v9.0→무사고** = 나중에 돌린 게 오히려 무사고 → **누적/열 아님, 버전 의존 진짜.**
-  (v9.0은 길게 안 돌려봐서 완벽 확정은 아님. **v8.8 무사고가 가장 단단한 기준.**)
+## 3. 미해결(정직) — 진짜 손상이 있었나?
 
----
+`pagealloc: memory corruption`은 page_poison이 **실제 덮임을 탐지**했을 때만 뜬다. 그래서 계측이
+잡은 게 **진짜 손상일 가능성**을 100% 배제하진 못한다. 두 경우가 남는다:
+- **(A) 순수 계측 아티팩트** — debug 옵션이 만든 크래시. 제거로 진짜 종결.
+- **(B) 계측이 실제 손상을 드러낸 것** — 지금은 탐지기를 껐으니 **조용히 진행 중**일 수 있음
+  (유력 메커니즘: wedge된 컨트롤러의 late/stale DMA가 free/재사용 페이지 침).
 
-## 3. 확정한 것 (정적 코드 검증)
+**크래시 없이 확인하는 법:** debug 옵션은 뺀 채 `iommu.strict=1`만 켜고(아래) 원래 크래시
+임계량을 넘겨 실행하며 카나리아로 관찰 —
+```
+dmesg | grep -iE "DMAR|pagealloc corruption"
+```
+- 깨끗 → (A). 순수 아티팩트. 종결.
+- `DMAR fault` 또는 corruption **경고**(크래시 아님)가 뜸 → (B). 실제 장치 DMA 손상 잔존 →
+  이제 오염 없이 그 신호로 정상 조사 가능.
 
-### 3-1. 버전 경계 = v8.8(무사고) → v9.0(LLM 도입) → v9.1(LLM 확장)
-- v8.8: blind 퍼징(LLM 없음/약함). **무사고.**
-- v9.0: **LLM(RAG) 도입.**
-- v9.1: 스키마 [:20] 캡 제거(→48), 구조적 data_hex, SC-status 조준. **LLM 탐색 대폭 확장.**
-- v9.0→v9.1 **명령 전송/버퍼/DMA/passthru 코드는 무변경**(diff 확인). 바뀐 건 **LLM 명령 생성 범위**뿐.
+## 4. 환경 권고 (JTAG crash 보존과 무충돌)
 
-### 3-2. 기본 명령 세트는 6개뿐 (`--all-commands` 없이)
-- `NVME_COMMANDS_DEFAULT` = **Identify, GetLogPage, GetFeatures, SetFeatures, Read, Write**.
-- exotic 명령(VirtMgmt 0x1C, MigrationSend 0x41, ControllerDataQueue 0x45, FWCommit 0x10,
-  FWDownload 0x11, NamespaceAttachment 0x15, CapacityMgmt 0x20 등)은 `--all-commands` 뒤 gated.
-- **사용자는 `--all-commands` 안 씀.**
+- **30일 nvme 커널 타임아웃 유지 가능** — 컨트롤러를 리셋하지 않아 펌웨어 crash 상태를 JTAG로
+  분석할 수 있음. 단독으로는 위험 아님.
+- **`iommu.strict=1`** (GRUB `GRUB_CMDLINE_LINUX_DEFAULT`에 추가 → `update-grub` → 재부팅):
+  wedge된 컨트롤러의 late/stale DMA를 **컨트롤러 리셋 없이** 차단하고 `DMAR fault`로 기록.
+  → host 보호 + 범인 명령 특정. (디스크마다 GRUB이 다르니 클론마다 각각 넣어야 함.)
+- **debug 옵션은 상시 켜지 말 것.** 꼭 탐지가 필요하면 `page_poison=1` **하나만**(panic 없이)
+  카나리아로.
 
-### 3-3. ★ LLM은 enabled-set을 우회한다 (핵심 gap, 코드 확정) ★
-- `_llm_schema_dict()`(3128): **전체 NVME_COMMANDS(30개)를 LLM에 노출**(enabled 6개 아님).
-- `_llm_make_seed()`(4989): `cmd = _NAME_TO_CMD.get(name)` → **전체 30개에서 조회**(self.commands 아님).
-  `is_dangerous`만 통과하면 corpus 주입 → 전송.
-- `is_dangerous`(rag_schema.py): **FormatNVM/Sanitize(destructive) + blocked_admin_opcodes +
-  locking SECP + NS-delete만** 차단. **exotic 명령(VirtMgmt/MigrationSend/ControllerDataQueue/
-  FWCommit/FWDownload/NamespaceAttachment/CapacityMgmt/DirectiveSend/Abort)은 안 막음.**
-- **결론: `--all-commands` 없이도 LLM은 exotic admin 명령을 생성·실행할 수 있다.**
-  (`--all-commands`는 blind 선택 풀만 제한, LLM 경로는 우회.)
+## 5. 현재 상태 / 버전
 
----
-
-## 4. 유력 가설 (미확정)
-
-**LLM이 enabled-set을 우회해 exotic admin 명령(VirtMgmt/MigrationSend/ControllerDataQueue/FWCommit 등,
-컨트롤러 상태/DMA 조작 명령)을 실행 → SSD 펌웨어/커널 소유 NVMe 전송로(큐/DMA)를 손상 → `pagealloc`
-커널 페이지 손상 → 유저스페이스 프로세스로 전파돼 segfault/bus error.**
-
-정합성: 커널 DMA 손상 ✓, 특정 명령 아님(여러 exotic) ✓, admin+io 둘 다 ✓, `--all-commands` 불필요 ✓,
-**v8.8(blind, 6개만) 무사고 / v9.0+(LLM) 크래시** ✓, 버전 의존(v9.0 도입, v9.1 확장) ✓.
-
-**단 "그 exotic 명령이 실제로 커널을 손상시킨다"는 아직 미확인.** gap(LLM 우회)은 정적 확정, 인과는 테스트 필요.
-
-### 대안 가설 (아직 열려있음)
-- **하드웨어(불량 RAM/열/전원)**: `--no-jlink`로도 크래시하면 이쪽. memtest86+ 로 확진 필요.
-  (nvme-cli 별개 프로세스 손상은 소프트웨어로 설명 어려워 하드웨어도 배제 못 함. 단 버전 의존이 강해
-  순수 랜덤 하드웨어와는 안 맞음.)
-- **IOMMU off**: 켜져 있으면 디바이스 DMA가 mapped 영역 밖으로 못 나감(오버플로 시 DMA fault).
-  꺼져 있으면 임의 물리페이지 손상 가능. → `dmesg | grep -i 'iommu\|DMAR'` 확인 필요.
-
----
-
-## 5. 다음 테스트 (확정용, 우선순위)
-
-1. **`--no-rag`(LLM off) 장시간** → v8.8처럼 무사고면 **LLM이 원인 확정**(blind는 exotic 안 보냄).
-   여전히 크래시면 LLM 아님 → 하드웨어/드라이버/DMA 쪽.
-2. **LLM 로그 상관**: `output/pc_sampling_v9.3.0/llm/` 에서 **LLM이 실제로 VirtMgmt/MigrationSend/
-   ControllerDataQueue/FWCommit 등 exotic 명령을 제안·전송했는지**. 찍혀 있으면 gap 발화 확인.
-   그리고 `pagealloc` dmesg 타임스탬프 ↔ 퍼저 로그 직전 명령 상관.
-3. **하드웨어 배제(병행)**: `dmesg|grep -iE 'mce|edac'`, `memtester`/memtest86+, `sensors`,
-   `nvme smart-log`(온도/throttle), `dmesg|grep -i iommu`.
-4. **콜드 리부팅 후 fresh 단일 실행** → 다시 한동안 깨끗하다 시간지나 터지면 누적/열, 바로 터지면 코드/디바이스.
-
----
-
-## 6. 수정 후보 (원인 확정 후)
-
-- **`_llm_make_seed`가 `self.commands`(enabled)로 조회하도록 제한** → LLM도 사용자가 켠 명령만 제안
-  (`--all-commands` 존중, blind와 동일 안전경계). **가장 깔끔.**
-- 또는 커널-손상 exotic 명령을 `is_dangerous`/blocklist에 확대(VirtMgmt/MigrationSend/ControllerDataQueue/
-  FWCommit/CapacityMgmt/NamespaceAttachment 등).
-- (독립) J-Link halt 샘플러 서브프로세스 격리는 v9.4(`pc_sampling_fuzzer_v9.4.py`, commit bd2742e)에
-  이미 구현·스캐폴딩 검증됨(하드웨어 미검증). 단 이번 crash 는 `--no-jlink`에서도 나므로 pylink 격리로는
-  해결 안 됨 — **접어둔 상태.**
-
----
-
-## 7. 이번 세션 코드 변경 (main, 커밋됨)
-
-| commit | 내용 | 상태 |
-|---|---|---|
-| 20ab3b2 | J-Link DLL 콜백 NULL 해제 시도 | **오판 → 52c0a04로 원복** |
-| 52c0a04 | 위 원복 | |
-| bd2742e | v9.4: halt 샘플러 서브프로세스 격리 | 구현·스캐폴딩 검증, 하드웨어 미검증, **접어둠** |
-| b49c4ac→2fe28e0 | 시작 로그 코드 스탬프 `[CODE] sha=<12>` (버전 미노출) | **유지** |
-| 41a070f | 주기적 재-calibration 제거 | **유지**(stateful SSD 부적절) — 단 crash 트리거는 아니었음 |
-| 58aeca0 | **faulthandler 제거** | **유지**(진단도구가 크래시 유발) |
-| 72710f8 | NVMe 활성 namespace 자동 감지(n1 부재→glob) | **유지** — rc=22(EINVAL) 해소. 사용자 SSD는 `/dev/nvme0n2`. |
-
-### 실행 참고
-- 현재 sha 확인: 로그 상단 `[CODE] sha=...`.
-- J-Link 포함 실행 = 평소 명령에서 **`--no-jlink`만 제거**. namespace는 자동 감지(또는 `--nvme /dev/nvme0n2`).
-- 크래시 진단은 **core dump**(`ulimit -c unlimited`)로 — faulthandler는 실행을 오염시키므로 재도입 금지.
-
----
-
-## 8. 반성 / 다음 세션 주의
-- 이번 조사에서 여러 번(NULL콜백/v9.4격리/재-cal/data_len) **크래시 데이터 없이 추측으로 단정**해 헛다리.
-  특히 **faulthandler(진단도구)가 스스로 크래시를 유발**해 그 위 분석이 오염됨.
-- 교훈: **추측 패치 전에 (a) 재현이 코드/버전인지 하드웨어/환경인지부터 가르고(--no-rag, memtest, 콜드부팅),
-  (b) 진단은 실행 비침습 방식(core dump)으로**, (c) 정적으로 확정 가능한 것(가드/우회경로)부터 코드로 확인.
-- **가장 유력·정적확정된 실마리 = §3-3 LLM enabled-set 우회.** 다음 세션은 **§5-1(--no-rag) + §5-2(LLM 로그
-  상관)로 이 가설부터 확정/기각**할 것.
+- **현행 = v9.3** (in-process J-Link halt 샘플러). 16만+ 명령 · J-Link 연결 · LLM(RAG) 포함
+  안정 실측.
+- **v9.4** (J-Link 프로세스 격리 + mmap PC ring) = `backup/pc_sampling_fuzzer_v9.4_shelved.*` 로
+  **접음(shelve).** 전제(J-Link native 크래시가 퍼저를 죽인다)가 무효로 판명되어 현재 불필요.
+  향후 실운영에서 **계측 유발이 아닌 진짜 native SIGSEGV**를 재현하게 되면 재검토. (mmap
+  coverage 동기화 등 내부는 하드웨어 없이 15/15 검증돼 있으니 그대로 재사용 가능.)
