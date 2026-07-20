@@ -102,18 +102,28 @@ from pathlib import Path
 from enum import Enum, IntEnum
 import contextlib
 import bisect
+import mmap
+import tempfile
+import select
 
 # 시드 파일 import (같은 디렉토리의 nvme_seeds.py)
 sys.path.insert(0, str(Path(__file__).parent))
 from nvme_seeds import SEED_TEMPLATES as _DEFAULT_SEED_TEMPLATES
 
-# pylink (J-Link Python SDK) — P9 의 JLinkHaltSampler 에서만 사용.
-# 미설치 호스트(PM9M1/BM9H1 만 돌리는 경우)에서도 import 실패로 죽지 않도록 가드.
-# 실제 사용 시점(JLinkHaltSampler.connect)에 None 체크로 안내 메시지 출력.
-try:
-    import pylink as _pylink
-except Exception:
-    _pylink = None
+# pylink 는 J-Link 를 실제 소유하는 프로세스에서만 지연 import 한다. 기본 v9.4 경로에서는
+# 부모 fuzzer 프로세스가 native DLL/ctypes callback 을 전혀 만들지 않고 sampler child 만 만든다.
+_pylink = None
+
+
+def _load_pylink():
+    global _pylink
+    if _pylink is None:
+        try:
+            import pylink as _loaded_pylink
+            _pylink = _loaded_pylink
+        except Exception:
+            return None
+    return _pylink
 
 # 버전
 FUZZER_VERSION = "9.4.0"
@@ -249,11 +259,6 @@ ENERGY_STALENESS_ON  = bool(_ST.get('energy_staleness_on', False))
 STALENESS_GRACE      = int(_ST.get('staleness_grace', 2))    # 이 횟수까진 무감쇠(늦게 터지는 시드 보호)
 STALENESS_K          = float(_ST.get('staleness_k', 8.0))    # 감쇠 완만도(클수록 천천히)
 STALENESS_FLOOR      = float(_ST.get('staleness_floor', 0.05))  # 감쇠 바닥(0 아님=부활 여지)
-# v9.3: 단일 Seed covered_pcs 를 주기적 재-calibration 으로 union 누적 — halt 확률샘플링의 단발
-#   스냅샷 노이즈로 favored/cull 이 productive 단일 시드를 오컬링하는 것 완화(시퀀스는 replay union 이미).
-COVERED_PCS_RECAL_ON       = bool(_ST.get('covered_pcs_recal_on', True))
-COVERED_PCS_RECAL_INTERVAL = int(_ST.get('covered_pcs_recal_interval', 16))  # 시드 exec 이 배수일 때 재calibration
-COVERED_PCS_RECAL_MAX      = int(_ST.get('covered_pcs_recal_max', 4))        # 시드당 재calibration 상한(비용 통제)
 RAG_MAX_SEQ_LEN      = int(_RAG.get('max_seq_len', 16))    # 시퀀스 최대 명령 수(리플레이 비용 상한, 초과=drop).
 #   유효성 제한이 아님 — NVMe엔 정당한 긴 체인 존재(ZNS 존 라이프사이클/Reservation 다단계/FW다운로드
 #   청크 등). 매 반복마다 체인 전체를 리플레이하므로 반복 속도를 위한 상한. 펌웨어에 긴 정상 워크플로가
@@ -1076,7 +1081,6 @@ class Seed:
     seed_class: Optional[str] = None
     llm_score: Optional[float] = None
     last_gain_exec: int = 0      # v9.2 staleness: 마지막으로 새 코드 커버리지를 낸 exec_count
-    recal_count: int = 0         # v9.3: covered_pcs union 재-calibration 횟수(비용 상한용)
 
 @dataclass
 class SequenceSeed:
@@ -1117,10 +1121,13 @@ class FuzzConfig:
     jlink_speed:     int   = 4000                 # J-Link SWD/JTAG 속도 (kHz)
     jlink_ap_index:  int   = 0                    # CoreSight APB-AP 인덱스 (P9: AP[0])
     pc_reg_index:    Optional[int] = None         # PC(R15) 레지스터 인덱스. None=connect 시 자동 탐지
+    # v9.4: J-Link native DLL 을 영구 child 에 격리. False 는 비교/긴급 폴백용.
+    jlink_process_isolation: bool = True
+    sampler_ring_capacity: int = 65536
+    sampler_stop_timeout_sec: float = 3.0
     ufas_ini:        Optional[str] = 'PM9M1_A815.ini'  # UFAS --ini (enable_ufas 는 아래 정의)
     allow_no_openocd: bool = False    # OpenOCD 실패 시 --pm 전용 테스트 경로 허용
     no_jlink:         bool = False    # J-Link 자체 없이 NVMe fuzz 만 수행 (coverage 0)
-    jlink_subprocess: bool = True     # v9.4: jlink_halt 를 서브프로세스 격리(pylink 콜백 SIGSEGV 를 자식에 가둠). false=구 in-process
     unsupported_skip: bool = False    # v7.8: J-Link dump 의 EngineErrInt 검출 시 자동 skip + power cycle
     repro_opcodes: tuple = ()  # 재현 모드: 이 opcode(들) timeout 만 크래시 캡처, 나머지는 POR 복구 후 계속
     ignore_opcodes: tuple = ()  # denylist: 이 opcode(들) timeout 은 크래시로 안 치고 POR 복구 후 계속
@@ -1340,7 +1347,15 @@ def _setup_matplotlib_chart_env():
         'ignore', message=r'.*missing from (current )?font.*')
 
 
-_FAULTHANDLER_FP = None   # faulthandler 덤프 대상 파일 — 프로세스 수명 내내 참조 유지(GC 방지)
+def _code_signature() -> str:
+    """실행 중인 코드 파일의 sha256[:12]. 어느 코드로 돌았는지 사후 식별용 —
+    버전 문자열/커밋 노출 없이 파일 해시만 출력한다."""
+    import hashlib
+    try:
+        with open(os.path.abspath(__file__), 'rb') as _fp:
+            return hashlib.sha256(_fp.read()).hexdigest()[:12]
+    except Exception:
+        return "unknown"
 
 
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
@@ -1348,20 +1363,6 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_file = os.path.join(output_dir, f'fuzzer_{timestamp}.log')
-
-    # 치명 시그널(SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL) 발생 시 전(全) 스레드 Python 스택을
-    # 파일로 덤프. stderr 가 아니라 전용 파일에 고정하는 이유: 이 퍼저는 halt/DLL 노이즈 억제
-    # 구간에 fd 2(stderr)를 /dev/null 로 dup2 하므로(아래 _read_all_pcs/calibration 경로),
-    # 기본 stderr 덤프는 크래시가 가장 잘 나는 그 순간 사라질 수 있다. 전용 fd(>2)는 그 dup2 와
-    # 무관하다. 정상 실행 오버헤드 0(시그널 시에만 기록). 파일 객체는 전역으로 살려 GC/닫힘 방지.
-    global _FAULTHANDLER_FP
-    try:
-        import faulthandler
-        _fh_path = os.path.join(output_dir, f'faulthandler_{timestamp}.log')
-        _FAULTHANDLER_FP = open(_fh_path, 'w')
-        faulthandler.enable(file=_FAULTHANDLER_FP, all_threads=True)
-    except Exception as _fe:                       # 계측 실패가 기동을 막지 않도록 방어
-        print(f"[faulthandler] 활성화 실패(무시): {_fe}", file=sys.stderr)
 
     logger = logging.getLogger('pcfuzz')
     logger.setLevel(logging.DEBUG)
@@ -1409,6 +1410,9 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
         datefmt='%Y-%m-%d %H:%M:%S'
     ) if is_tty else fmt)
     logger.addHandler(ch)
+
+    # v9.3: 실행 코드 파일 해시 스탬프 — 어느 코드로 돌았는지 사후 식별(버전 미노출).
+    logger.warning(f"[CODE] sha={_code_signature()}")
 
     return logger, log_file
 
@@ -2910,7 +2914,8 @@ class JLinkHaltSampler(OpenOCDPCSampler):
 
     # ── 연결 계층 (pylink) ──────────────────────────────────────────
     def connect(self) -> bool:
-        if _pylink is None:
+        _pylink_mod = _load_pylink()
+        if _pylink_mod is None:
             log.error("[J-Link] pylink 미설치 — `pip3 install pylink-square` 후 재시도하세요.")
             return False
         try:
@@ -2929,10 +2934,10 @@ class JLinkHaltSampler(OpenOCDPCSampler):
             #   끄는 시도는 이 DLL 이 NULL 을 무시해 실패했고, 커스텀 콜백을 빼면 pylink 기본
             #   logger.info 콜백으로 떨어져 오히려 더 빨리 크래시했다 → 원복. 근본해법은
             #   샘플러 서브프로세스 격리(진행 예정). 그때까지는 가벼운 커스텀 콜백 유지.
-            jl = _pylink.JLink(error=self._jlink_dll_msg, warn=self._jlink_dll_msg)
+            jl = _pylink_mod.JLink(error=self._jlink_dll_msg, warn=self._jlink_dll_msg)
             jl.open()
-            tif = (_pylink.enums.JLinkInterfaces.JTAG if self.config.interface == 'jtag'
-                   else _pylink.enums.JLinkInterfaces.SWD)
+            tif = (_pylink_mod.enums.JLinkInterfaces.JTAG if self.config.interface == 'jtag'
+                   else _pylink_mod.enums.JLinkInterfaces.SWD)
             jl.set_tif(tif)
             # 멀티-AP 시스템: 사용할 APB-AP 인덱스 선택 (P9: AP[0])
             try:
@@ -3129,6 +3134,779 @@ class JLinkHaltSampler(OpenOCDPCSampler):
 
     def _launch_openocd(self) -> bool:
         return True
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v9.4: J-Link native 경계 격리 — persistent child + mmap epoch/ring
+# ══════════════════════════════════════════════════════════════════════════
+
+class _SamplerSharedRegion:
+    """부모/자식 사이의 단일-writer mmap 제어 블록과 PC ring.
+
+    부모는 DESIRED_* 만, 자식은 CHILD_*/통계/ring 만 쓴다. stop ack 뒤에는 ring writer가
+    완전히 멈추므로 lock 없는 mmap이라도 부모가 반쯤 쓰인 entry를 읽지 않는다.
+    """
+
+    MAGIC = b'JLSRNG01'
+    HEADER_SIZE = 256
+    COVERAGE_CAPACITY = 1 << 19             # exact open-address table: 4 MiB
+    ENTRY = struct.Struct('<QQQ')              # sequence, epoch, raw PC
+    ENTRY_SIZE = ENTRY.size
+
+    OFF_EPOCH = 8
+    OFF_DESIRED_ENABLED = 16
+    OFF_CHILD_EPOCH = 24
+    OFF_CHILD_ENABLED = 32
+    OFF_WRITE_SEQ = 40
+    OFF_HEARTBEAT_NS = 48
+    OFF_HALT_OK = 56
+    OFF_HALT_FAIL = 64
+    OFF_FREEZE_NS = 72
+    OFF_TOTAL_SAMPLES = 80
+    OFF_GENERATION = 88
+    OFF_CONNECTED = 96
+    OFF_ERROR = 104
+    OFF_REASON = 112
+    OFF_CAPACITY = 120
+    OFF_COVERAGE_COUNT = 128
+    OFF_COVERAGE_OVERFLOW = 136
+
+    REASON_NONE = 0
+    REASON_STOP = 1
+    REASON_MAX_SAMPLES = 2
+    REASON_IDLE_CONSECUTIVE = 3
+    REASON_IDLE_WINDOW = 4
+    REASON_READ_FAILURE = 5
+    REASON_CHILD_ERROR = 6
+    REASON_GLOBAL_SATURATION = 7
+
+    def __init__(self, path: str, fh, mm: mmap.mmap, capacity: int, owner: bool):
+        self.path = path
+        self._fh = fh
+        self.mm = mm
+        self.capacity = capacity
+        self.owner = owner
+
+    @classmethod
+    def create(cls, capacity: int) -> '_SamplerSharedRegion':
+        capacity = max(1024, int(capacity))
+        fd, path = tempfile.mkstemp(prefix='pcfuzz_jlink_', suffix='.mmap')
+        total = (cls.HEADER_SIZE + capacity * cls.ENTRY_SIZE
+                 + cls.COVERAGE_CAPACITY * 8)
+        os.ftruncate(fd, total)
+        fh = os.fdopen(fd, 'r+b', buffering=0)
+        mm = mmap.mmap(fh.fileno(), total, access=mmap.ACCESS_WRITE)
+        mm[:cls.HEADER_SIZE] = b'\x00' * cls.HEADER_SIZE
+        mm[:8] = cls.MAGIC
+        struct.pack_into('<Q', mm, cls.OFF_CAPACITY, capacity)
+        return cls(path, fh, mm, capacity, True)
+
+    @classmethod
+    def open(cls, path: str) -> '_SamplerSharedRegion':
+        fh = open(path, 'r+b', buffering=0)
+        mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_WRITE)
+        if mm[:8] != cls.MAGIC:
+            mm.close()
+            fh.close()
+            raise ValueError('sampler shared-memory magic mismatch')
+        capacity = struct.unpack_from('<Q', mm, cls.OFF_CAPACITY)[0]
+        expected = (cls.HEADER_SIZE + capacity * cls.ENTRY_SIZE
+                    + cls.COVERAGE_CAPACITY * 8)
+        if capacity < 1 or len(mm) != expected:
+            mm.close()
+            fh.close()
+            raise ValueError('sampler shared-memory size mismatch')
+        return cls(path, fh, mm, capacity, False)
+
+    def get(self, offset: int) -> int:
+        return struct.unpack_from('<Q', self.mm, offset)[0]
+
+    def set(self, offset: int, value: int) -> None:
+        struct.pack_into('<Q', self.mm, offset, int(value) & 0xFFFFFFFFFFFFFFFF)
+
+    def append_pc(self, epoch: int, pc: int) -> int:
+        seq = self.get(self.OFF_WRITE_SEQ)
+        pos = self.HEADER_SIZE + (seq % self.capacity) * self.ENTRY_SIZE
+        # write_seq는 entry 전체가 기록된 뒤 publish한다.
+        self.ENTRY.pack_into(self.mm, pos, seq, epoch, pc & 0xFFFFFFFFFFFFFFFF)
+        self.set(self.OFF_WRITE_SEQ, seq + 1)
+        return seq
+
+    def read_entry(self, seq: int) -> Optional[Tuple[int, int, int]]:
+        pos = self.HEADER_SIZE + (seq % self.capacity) * self.ENTRY_SIZE
+        entry = self.ENTRY.unpack_from(self.mm, pos)
+        return entry if entry[0] == seq else None
+
+    def _coverage_pos(self, slot: int) -> int:
+        return self.HEADER_SIZE + self.capacity * self.ENTRY_SIZE + slot * 8
+
+    def coverage_contains(self, pc: int) -> bool:
+        mask = self.COVERAGE_CAPACITY - 1
+        slot = ((pc * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF) & mask
+        for _ in range(self.COVERAGE_CAPACITY):
+            value = struct.unpack_from('<Q', self.mm, self._coverage_pos(slot))[0]
+            if value == pc:
+                return True
+            if value == 0:
+                return False
+            slot = (slot + 1) & mask
+        return False
+
+    def coverage_add(self, pc: int) -> bool:
+        if pc == 0:
+            return False
+        mask = self.COVERAGE_CAPACITY - 1
+        slot = ((pc * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF) & mask
+        for _ in range(self.COVERAGE_CAPACITY):
+            pos = self._coverage_pos(slot)
+            value = struct.unpack_from('<Q', self.mm, pos)[0]
+            if value == pc:
+                return False
+            if value == 0:
+                struct.pack_into('<Q', self.mm, pos, pc & 0xFFFFFFFFFFFFFFFF)
+                self.set(self.OFF_COVERAGE_COUNT, self.get(self.OFF_COVERAGE_COUNT) + 1)
+                return True
+            slot = (slot + 1) & mask
+        self.set(self.OFF_COVERAGE_OVERFLOW, 1)
+        return False
+
+    def coverage_add_many(self, pcs) -> None:
+        for pc in pcs:
+            self.coverage_add(int(pc))
+
+    def close(self, unlink: bool = False) -> None:
+        try:
+            self.mm.close()
+        except Exception:
+            pass
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        if unlink and self.owner:
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+
+
+def _pipe_read_exact(stream, size: int) -> Optional[bytes]:
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b''.join(chunks)
+
+
+def _sampler_child_worker(shared: _SamplerSharedRegion, sampler: JLinkHaltSampler,
+                          shutdown: threading.Event, state: dict) -> None:
+    """J-Link를 호출하는 유일한 hot-path. control RPC와 native 호출은 sampler lock으로 직렬화."""
+    active_epoch = 0
+    finished_epoch = 0
+    consecutive_fail = 0
+    consecutive_idle = 0
+    recent = deque(maxlen=IDLE_WINDOW_SIZE)
+    recent_idle_count = 0
+    sample_count = 0
+    since_last_global_new = 0
+    shared_freeze_ns = shared.get(shared.OFF_FREEZE_NS)
+    effective_interval = max(sampler.config.sample_interval_us / 1_000_000.0,
+                             sampler.config.go_settle_ms / 1_000.0)
+    idle_win_thresh = int(IDLE_WINDOW_SIZE * IDLE_RATIO_THRESH)
+
+    while not shutdown.is_set():
+        shared.set(shared.OFF_HEARTBEAT_NS, time.monotonic_ns())
+        desired = shared.get(shared.OFF_DESIRED_ENABLED)
+        epoch = shared.get(shared.OFF_EPOCH)
+
+        if not desired:
+            if shared.get(shared.OFF_CHILD_ENABLED):
+                shared.set(shared.OFF_REASON, shared.REASON_STOP)
+                shared.set(shared.OFF_CHILD_ENABLED, 0)
+            # 빠른 start→stop에서 child가 enable=1을 한 번도 못 보더라도 이 epoch의
+            # disabled 상태를 ack한다. 부모는 epoch+disabled 둘 다 확인한 뒤 ring을 읽는다.
+            shared.set(shared.OFF_CHILD_EPOCH, epoch)
+            active_epoch = 0
+            shutdown.wait(0.001)
+            continue
+
+        if epoch == finished_epoch:
+            shared.set(shared.OFF_CHILD_ENABLED, 0)
+            shutdown.wait(0.001)
+            continue
+
+        if epoch != active_epoch:
+            active_epoch = epoch
+            consecutive_fail = 0
+            consecutive_idle = 0
+            recent.clear()
+            recent_idle_count = 0
+            sample_count = 0
+            since_last_global_new = 0
+            shared.set(shared.OFF_ERROR, 0)
+            shared.set(shared.OFF_REASON, shared.REASON_NONE)
+            shared.set(shared.OFF_CHILD_EPOCH, epoch)
+            shared.set(shared.OFF_CHILD_ENABLED, 1)
+
+        freeze_before = sampler.halt_freeze_accum
+        try:
+            pcs_tuple = sampler._read_all_pcs()
+        except BaseException as exc:
+            # Python 예외는 child window만 종료한다. SIGSEGV/SIGBUS는 OS가 child를 종료하고
+            # 부모가 poll/heartbeat로 감지한다.
+            sys.stderr.write(f"[J-Link child] sampling exception: {exc}\n")
+            shared.set(shared.OFF_ERROR, 1)
+            shared.set(shared.OFF_REASON, shared.REASON_CHILD_ERROR)
+            shared.set(shared.OFF_CHILD_ENABLED, 0)
+            finished_epoch = epoch
+            continue
+        freeze_delta = max(0.0, sampler.halt_freeze_accum - freeze_before)
+        shared_freeze_ns += int(freeze_delta * 1_000_000_000)
+        shared.set(shared.OFF_FREEZE_NS, shared_freeze_ns)
+
+        if pcs_tuple is None:
+            shared.set(shared.OFF_HALT_FAIL, shared.get(shared.OFF_HALT_FAIL) + 1)
+            consecutive_fail += 1
+            if consecutive_fail >= sampler._CONSECUTIVE_FAIL_LIMIT:
+                if sampler._read_fail_needs_recovery():
+                    shared.set(shared.OFF_ERROR, 1)
+                shared.set(shared.OFF_REASON, shared.REASON_READ_FAILURE)
+                shared.set(shared.OFF_CHILD_ENABLED, 0)
+                finished_epoch = epoch
+                continue
+            backoff = min(effective_interval * (2 ** min(consecutive_fail - 1, 5)), 1.0)
+            shutdown.wait(backoff if backoff > 0 else 0.0005)
+            continue
+
+        consecutive_fail = 0
+        shared.set(shared.OFF_HALT_OK, shared.get(shared.OFF_HALT_OK) + 1)
+        shared.set(shared.OFF_TOTAL_SAMPLES, shared.get(shared.OFF_TOTAL_SAMPLES) + 1)
+        sample_count += 1
+        for pc in pcs_tuple:
+            shared.append_pc(epoch, pc)
+
+        start = sampler.config.addr_range_start
+        end = sampler.config.addr_range_end
+        in_range = [pc for pc in pcs_tuple if start is None or end is None or start <= pc <= end]
+        if in_range:
+            if any(not shared.coverage_contains(pc) for pc in in_range):
+                since_last_global_new = 0
+            else:
+                since_last_global_new += 1
+        idle_pcs = state.get('idle_pcs', frozenset())
+        all_idle = bool(in_range and idle_pcs and all(pc in idle_pcs for pc in in_range))
+        consecutive_idle = consecutive_idle + 1 if all_idle else 0
+        evicted = recent[0] if len(recent) == IDLE_WINDOW_SIZE else False
+        recent.append(all_idle)
+        recent_idle_count += int(all_idle) - int(evicted)
+
+        # 조기종료 조건 — in-process _sampling_worker 와 동일하게 3종 saturation 은 모두
+        # SATURATION_LIMIT>0 하에서만 활성(사용자가 SATURATION_LIMIT=0 으로 조기종료 자체를
+        # 끈 경우 global-saturation 도 함께 꺼져야 parity).
+        reason = shared.REASON_NONE
+        if sample_count >= sampler.config.max_samples_per_run:
+            reason = shared.REASON_MAX_SAMPLES
+        elif (SATURATION_LIMIT > 0 and GLOBAL_SATURATION_LIMIT > 0
+              and since_last_global_new >= GLOBAL_SATURATION_LIMIT):
+            reason = shared.REASON_GLOBAL_SATURATION
+        elif SATURATION_LIMIT > 0 and idle_pcs and consecutive_idle >= SATURATION_LIMIT:
+            reason = shared.REASON_IDLE_CONSECUTIVE
+        elif (SATURATION_LIMIT > 0 and idle_pcs and len(recent) == IDLE_WINDOW_SIZE
+              and recent_idle_count >= idle_win_thresh):
+            reason = shared.REASON_IDLE_WINDOW
+        if reason:
+            shared.set(shared.OFF_REASON, reason)
+            shared.set(shared.OFF_CHILD_ENABLED, 0)
+            finished_epoch = epoch
+            continue
+
+        if effective_interval > 0:
+            shutdown.wait(effective_interval)
+
+    shared.set(shared.OFF_CHILD_ENABLED, 0)
+    shared.set(shared.OFF_HEARTBEAT_NS, time.monotonic_ns())
+
+
+def _sampler_child_main(shared_path: str) -> int:
+    """숨은 child entrypoint. stdout은 framed RPC 전용이며 J-Link 로그는 stderr로만 간다."""
+    try:
+        shared = _SamplerSharedRegion.open(shared_path)
+    except Exception as exc:
+        sys.stderr.write(f"[J-Link child] shared memory open failed: {exc}\n")
+        return 2
+
+    sampler = None
+    worker = None
+    shutdown = threading.Event()
+    state = {'idle_pcs': frozenset()}
+    shared.set(shared.OFF_GENERATION, os.getpid())
+    shared.set(shared.OFF_HEARTBEAT_NS, time.monotonic_ns())
+    inp, out = sys.stdin.buffer, sys.stdout.buffer
+    exit_code = 0
+    try:
+        while True:
+            raw_len = _pipe_read_exact(inp, 4)
+            if raw_len is None:
+                break
+            size = struct.unpack('!I', raw_len)[0]
+            if size > 32 * 1024 * 1024:
+                raise ValueError('RPC frame too large')
+            payload = _pipe_read_exact(inp, size)
+            if payload is None:
+                break
+            request = pickle.loads(payload)
+            op = request.get('op')
+            args = request.get('args', ())
+            try:
+                if op == 'init':
+                    if sampler is not None:
+                        raise RuntimeError('sampler already initialized')
+                    sampler = JLinkHaltSampler(FuzzConfig(**args[0]))
+                    worker = threading.Thread(
+                        target=_sampler_child_worker,
+                        args=(shared, sampler, shutdown, state),
+                        name='jlink-sampler-worker', daemon=True)
+                    worker.start()
+                    result = True
+                elif sampler is None:
+                    raise RuntimeError('sampler not initialized')
+                elif op == 'connect':
+                    result = sampler.connect()
+                    shared.set(shared.OFF_CONNECTED, int(bool(result)))
+                elif op == 'alive':
+                    result = sampler._openocd_alive()
+                    shared.set(shared.OFF_CONNECTED, int(bool(result)))
+                elif op == 'target_alive':
+                    result = sampler._target_debug_alive()
+                elif op == 'reconnect':
+                    result = sampler._reconnect()
+                    shared.set(shared.OFF_CONNECTED, int(bool(result)))
+                elif op == 'reinit':
+                    result = sampler._reinit_target()
+                    shared.set(shared.OFF_CONNECTED, int(bool(sampler._openocd_alive())))
+                elif op == 'read_all':
+                    result = sampler._read_all_pcs()
+                elif op == 'set_idle':
+                    state['idle_pcs'] = frozenset(int(x) for x in args[0])
+                    result = True
+                elif op == 'close':
+                    shared.set(shared.OFF_DESIRED_ENABLED, 0)
+                    close_epoch = shared.get(shared.OFF_EPOCH)
+                    deadline = time.monotonic() + 2.0
+                    while ((shared.get(shared.OFF_CHILD_EPOCH) != close_epoch
+                            or shared.get(shared.OFF_CHILD_ENABLED))
+                           and time.monotonic() < deadline):
+                        time.sleep(0.005)
+                    shutdown.set()
+                    if worker:
+                        worker.join(timeout=2.0)
+                    sampler.close()
+                    shared.set(shared.OFF_CONNECTED, 0)
+                    result = True
+                else:
+                    raise ValueError(f'unknown sampler child op: {op}')
+                response = {'ok': True, 'result': result}
+            except BaseException as exc:
+                response = {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+            encoded = pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
+            out.write(struct.pack('!I', len(encoded)))
+            out.write(encoded)
+            out.flush()
+            if op == 'close':
+                break
+    except BaseException as exc:
+        sys.stderr.write(f"[J-Link child] control loop failed: {exc}\n")
+        exit_code = 3
+    finally:
+        shutdown.set()
+        if worker:
+            worker.join(timeout=1.0)
+        if sampler is not None and shared.get(shared.OFF_CONNECTED):
+            try:
+                sampler.close()
+            except Exception:
+                pass
+        shared.set(shared.OFF_CONNECTED, 0)
+        shared.set(shared.OFF_CHILD_ENABLED, 0)
+        shared.close()
+    return exit_code
+
+
+class SharedProcessJLinkHaltSampler(JLinkHaltSampler):
+    """부모측 proxy. JLinkHaltSampler를 상속해 기존 halt 전용 분기와 완전히 호환한다."""
+
+    _REASON_TEXT = {
+        _SamplerSharedRegion.REASON_NONE: '',
+        _SamplerSharedRegion.REASON_STOP: 'stop_event',
+        _SamplerSharedRegion.REASON_MAX_SAMPLES: 'max_samples',
+        _SamplerSharedRegion.REASON_IDLE_CONSECUTIVE: 'idle_saturated (consecutive)',
+        _SamplerSharedRegion.REASON_IDLE_WINDOW: 'idle_saturated (window_ratio)',
+        _SamplerSharedRegion.REASON_READ_FAILURE: 'consecutive_read_failure',
+        _SamplerSharedRegion.REASON_CHILD_ERROR: 'child_python_exception',
+        _SamplerSharedRegion.REASON_GLOBAL_SATURATION: 'global_saturated',
+    }
+
+    def __init__(self, config: 'FuzzConfig'):
+        super().__init__(config)  # 필드만 초기화하며 pylink는 건드리지 않는다.
+        self._child: Optional[subprocess.Popen] = None
+        self._shared: Optional[_SamplerSharedRegion] = None
+        self._rpc_lock = threading.Lock()
+        self._epoch = 0
+        self._window_start_seq = 0
+        self._window_stats = (0, 0, 0, 0)
+        self._sampling_active = False
+        self._want_connected = False
+        self._closed = False
+        # 부모의 global_coverage를 자식이 볼 수 있게 mmap coverage 테이블에 미러링한다.
+        # 자식 worker는 이 테이블로 global-saturation 조기종료를 판정한다(in-process
+        # global_coverage_ref 와 동일 의미). 초기 seed(부팅/이전세션 로드분)는 첫 window
+        # 에서 1회 전체 push, 이후엔 window 별 current_trace delta 만 push.
+        self._coverage_seeded = False
+
+    def _child_alive(self) -> bool:
+        return self._child is not None and self._child.poll() is None
+
+    def _read_response(self, timeout: float) -> dict:
+        if self._child is None or self._child.stdout is None:
+            raise RuntimeError('sampler child stdout unavailable')
+        fd = self._child.stdout.fileno()
+        deadline = time.monotonic() + timeout
+
+        def read_exact(size: int) -> bytes:
+            chunks = []
+            left = size
+            while left:
+                remain = deadline - time.monotonic()
+                if remain <= 0 or not select.select([fd], [], [], remain)[0]:
+                    raise TimeoutError('sampler child RPC timeout')
+                chunk = os.read(fd, left)
+                if not chunk:
+                    raise EOFError('sampler child pipe closed')
+                chunks.append(chunk)
+                left -= len(chunk)
+            return b''.join(chunks)
+
+        size = struct.unpack('!I', read_exact(4))[0]
+        if size > 32 * 1024 * 1024:
+            raise RuntimeError('sampler child response too large')
+        return pickle.loads(read_exact(size))
+
+    def _rpc_direct(self, op: str, *args, timeout: float = 10.0):
+        if not self._child_alive() or self._child is None or self._child.stdin is None:
+            raise RuntimeError('sampler child is not running')
+        request = pickle.dumps({'op': op, 'args': args}, protocol=pickle.HIGHEST_PROTOCOL)
+        with self._rpc_lock:
+            self._child.stdin.write(struct.pack('!I', len(request)))
+            self._child.stdin.write(request)
+            self._child.stdin.flush()
+            response = self._read_response(timeout)
+        if not response.get('ok'):
+            raise RuntimeError(response.get('error', 'sampler child RPC failed'))
+        return response.get('result')
+
+    def _discard_child(self) -> None:
+        child, self._child = self._child, None
+        if child is not None:
+            for stream in (child.stdin, child.stdout):
+                try:
+                    if stream:
+                        stream.close()
+                except Exception:
+                    pass
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=1.0)
+        if self._shared is not None:
+            self._shared.close(unlink=True)
+            self._shared = None
+
+    def _child_argv(self, shared_path: str) -> list:
+        """자식 프로세스 argv. 격리 child 재진입점(`__main__`의 --jlink-sampler-child 분기)을
+        실행한다. 테스트에서 fake sampler child로 바꿔치기할 수 있게 분리해 둔다."""
+        return [sys.executable, str(Path(__file__).resolve()),
+                '--jlink-sampler-child', shared_path]
+
+    def _spawn_child(self) -> bool:
+        self._discard_child()
+        if self._closed:
+            return False
+        try:
+            self._shared = _SamplerSharedRegion.create(self.config.sampler_ring_capacity)
+            # 새 mmap 이므로 coverage 테이블도 비었다 → 다음 window 에서 다시 seed.
+            self._coverage_seeded = False
+            cmd = self._child_argv(self._shared.path)
+            self._child = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, bufsize=0,
+                close_fds=True)
+            config_dict = dict(vars(self.config))
+            self._rpc_direct('init', config_dict, timeout=10.0)
+            log.warning(f"[J-Link] native sampler child 시작 pid={self._child.pid}, "
+                        f"ring={self._shared.capacity} entries")
+            return True
+        except Exception as exc:
+            log.error(f"[J-Link] sampler child 시작 실패: {exc}")
+            self._discard_child()
+            return False
+
+    def _ensure_child(self) -> bool:
+        if self._child_alive() and self._shared is not None:
+            return True
+        if self._child is not None:
+            rc = self._child.poll()
+            log.error(f"[J-Link] native sampler child 종료 감지 (rc={rc}) — 부모 fuzz는 계속")
+        if not self._spawn_child():
+            return False
+        if self._want_connected:
+            try:
+                ok = bool(self._rpc_direct('connect', timeout=20.0))
+                if not ok:
+                    log.error("[J-Link] 재생성한 sampler child의 연결 실패")
+                    return ok
+                # 재기동한 child 는 idle universe 를 모른다 → 마지막 diagnose 결과를 재전송해
+                # idle-saturation 조기종료가 재diagnose 전까지 죽지 않게 한다. (coverage 테이블은
+                # 새 mmap 이므로 다음 start_sampling 에서 _coverage_seeded=False 로 재seed 된다.)
+                if self.idle_pcs:
+                    try:
+                        self._rpc_direct('set_idle', tuple(self.idle_pcs), timeout=5.0)
+                    except Exception as exc:
+                        log.warning(f"[J-Link] 재기동 child idle universe 재전송 실패: {exc}")
+                return ok
+            except Exception as exc:
+                log.error(f"[J-Link] 재생성한 sampler child 연결 예외: {exc}")
+                return False
+        return True
+
+    def connect(self) -> bool:
+        self._want_connected = True
+        if not self._ensure_child():
+            return False
+        if self._shared is not None and self._shared.get(self._shared.OFF_CONNECTED):
+            return True
+        try:
+            return bool(self._rpc_direct('connect', timeout=20.0))
+        except Exception as exc:
+            log.error(f"[J-Link] child connect 실패: {exc}")
+            return False
+
+    def _openocd_alive(self) -> bool:
+        return bool(self._child_alive() and self._shared is not None
+                    and self._shared.get(self._shared.OFF_CONNECTED))
+
+    def _target_debug_alive(self) -> bool:
+        if not self._ensure_child():
+            return False
+        try:
+            return bool(self._rpc_direct('target_alive', timeout=5.0))
+        except Exception:
+            return False
+
+    def _reconnect(self) -> bool:
+        self._want_connected = True
+        self._stop_worker()
+        child_was_alive = self._child_alive()
+        if not self._ensure_child():
+            return False
+        # 죽은 child를 새로 만든 경우 _ensure_child가 이미 새 J-Link 세션을 연결했다.
+        if not child_was_alive and self._shared is not None:
+            return bool(self._shared.get(self._shared.OFF_CONNECTED))
+        try:
+            return bool(self._rpc_direct('reconnect', timeout=20.0))
+        except Exception as exc:
+            log.error(f"[J-Link] child reconnect 실패: {exc}")
+            return False
+
+    def _reinit_target(self) -> bool:
+        self._stop_worker()
+        child_was_alive = self._child_alive()
+        if not self._ensure_child():
+            return False
+        if not child_was_alive and self._shared is not None:
+            return bool(self._shared.get(self._shared.OFF_CONNECTED))
+        try:
+            return bool(self._rpc_direct('reinit', timeout=20.0))
+        except Exception as exc:
+            log.error(f"[J-Link] child target reinit 실패: {exc}")
+            return False
+
+    def _read_fail_needs_recovery(self) -> bool:
+        return not self._openocd_alive()
+
+    def _read_all_pcs(self) -> Optional[Tuple[int, ...]]:
+        if self._sampling_active:
+            self.stop_sampling()
+        if not self._ensure_child():
+            return None
+        try:
+            result = self._rpc_direct('read_all', timeout=5.0)
+            return tuple(result) if result is not None else None
+        except Exception as exc:
+            log.warning(f"[J-Link] child PC read 실패: {exc}")
+            return None
+
+    def diagnose(self, count: int = 20) -> bool:
+        ok = super().diagnose(count)
+        if ok and self._ensure_child():
+            try:
+                self._rpc_direct('set_idle', tuple(self.idle_pcs), timeout=5.0)
+            except Exception as exc:
+                log.warning(f"[J-Link] child idle universe 동기화 실패: {exc}")
+        return ok
+
+    def _sync_new_coverage(self, pcs) -> None:
+        """부모 global_coverage 의 신규 PC 를 자식의 mmap coverage 테이블로 미러링한다.
+        자식은 이 테이블로 global-saturation(신규 PC 없음)을 판정한다. coverage_add 는
+        idempotent 이라 중복 push 는 무해. 실패해도 fuzz 는 계속(조기종료 heuristic 만 영향)."""
+        sh = self._shared
+        if sh is None or not pcs:
+            return
+        try:
+            sh.coverage_add_many(pcs)
+        except Exception as exc:
+            log.debug(f"[J-Link] child coverage 동기화 실패(무해): {exc}")
+
+    def start_sampling(self) -> None:
+        if self._sampling_active:
+            return
+        self.current_trace = set()
+        self._last_raw_pcs = []
+        self._out_of_range_count = 0
+        self._last_new_at = 0
+        self._unique_at_intervals = {}
+        self._stopped_reason = ''
+        if not self._ensure_child() or self._shared is None:
+            self.openocd_error.set()
+            return
+        # 부팅/이전세션 로드로 쌓인 초기 global_coverage 는 첫 window 에서 1회 전체 seed.
+        # 이후 window 별 신규분은 stop_sampling 이 current_trace 로 push 한다.
+        if not self._coverage_seeded:
+            self._sync_new_coverage(self.global_coverage)
+            self._coverage_seeded = True
+        self._epoch = (self._epoch + 1) & 0xFFFFFFFFFFFFFFFF
+        if self._epoch == 0:
+            self._epoch = 1
+        sh = self._shared
+        self._window_start_seq = sh.get(sh.OFF_WRITE_SEQ)
+        self._window_stats = (sh.get(sh.OFF_HALT_OK), sh.get(sh.OFF_HALT_FAIL),
+                              sh.get(sh.OFF_FREEZE_NS), sh.get(sh.OFF_TOTAL_SAMPLES))
+        sh.set(sh.OFF_REASON, sh.REASON_NONE)
+        sh.set(sh.OFF_EPOCH, self._epoch)
+        sh.set(sh.OFF_DESIRED_ENABLED, 1)  # publish last
+        self._sampling_active = True
+
+    def stop_sampling(self) -> int:
+        if not self._sampling_active:
+            return len(self.current_trace)
+        self._sampling_active = False
+        sh = self._shared
+        if sh is None:
+            self.openocd_error.set()
+            return len(self.current_trace)
+        sh.set(sh.OFF_DESIRED_ENABLED, 0)
+        deadline = time.monotonic() + max(0.1, self.config.sampler_stop_timeout_sec)
+        stop_timed_out = False
+        while self._child_alive() and (
+                sh.get(sh.OFF_CHILD_EPOCH) != self._epoch
+                or sh.get(sh.OFF_CHILD_ENABLED)):
+            if time.monotonic() >= deadline:
+                log.error("[J-Link] child stop ack timeout — native child를 종료하고 다음 "
+                          "window에서 재생성")
+                self.openocd_error.set()
+                stop_timed_out = True
+                break
+            time.sleep(0.001)
+
+        # ack가 없으면 writer를 실제로 멈춘 뒤 ring을 읽어야 한다. 프로세스 격리의 핵심은
+        # native 호출이 영구 block돼도 부모가 그 child만 종료할 수 있다는 점이다.
+        if stop_timed_out and self._child is not None and self._child.poll() is None:
+            self._child.terminate()
+            try:
+                self._child.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self._child.kill()
+                self._child.wait(timeout=1.0)
+
+        if not self._child_alive():
+            rc = self._child.poll() if self._child is not None else None
+            log.error(f"[J-Link] sampling 중 native child 종료(rc={rc}); "
+                      "확정된 ring PC만 회수하고 부모 fuzz는 유지")
+            self.openocd_error.set()
+
+        end_seq = sh.get(sh.OFF_WRITE_SEQ)
+        begin = self._window_start_seq
+        if end_seq - begin > sh.capacity:
+            lost = end_seq - begin - sh.capacity
+            begin = end_seq - sh.capacity
+            log.warning(f"[J-Link] sampler ring overflow: {lost} PC 유실 "
+                        f"(capacity={sh.capacity})")
+        raw = []
+        for seq in range(begin, end_seq):
+            entry = sh.read_entry(seq)
+            if entry is not None and entry[1] == self._epoch:
+                raw.append(entry[2])
+        self._last_raw_pcs = raw
+        start, end = self.config.addr_range_start, self.config.addr_range_end
+        self.current_trace = {
+            pc for pc in raw if start is None or end is None or start <= pc <= end
+        }
+        self._out_of_range_count = len(raw) - sum(
+            1 for pc in raw if start is None or end is None or start <= pc <= end)
+        seen = set()
+        for index, pc in enumerate(raw, 1):
+            if start is None or end is None or start <= pc <= end:
+                if pc not in self.global_coverage:
+                    self._last_new_at = index - 1
+                seen.add(pc)
+            if index in self._INTERVAL_CHECKPOINTS:
+                self._unique_at_intervals[index] = len(seen)
+
+        ok0, fail0, freeze0, total0 = self._window_stats
+        self.halt_ok_total += max(0, sh.get(sh.OFF_HALT_OK) - ok0)
+        self.halt_fail_total += max(0, sh.get(sh.OFF_HALT_FAIL) - fail0)
+        self.halt_freeze_accum += max(0, sh.get(sh.OFF_FREEZE_NS) - freeze0) / 1e9
+        self.total_samples += max(0, sh.get(sh.OFF_TOTAL_SAMPLES) - total0)
+        reason = sh.get(sh.OFF_REASON)
+        self._stopped_reason = self._REASON_TEXT.get(reason, f'child_reason_{reason}')
+        if sh.get(sh.OFF_ERROR):
+            self.openocd_error.set()
+        # 이 window 가 관측한 in-range PC 를 자식 coverage 테이블에 반영 → 다음 window 부터
+        # 이 PC 들은 '이미 본 것'으로 취급돼 global-saturation 판정이 부모 global_coverage 와
+        # 일치한다. (부모 global_coverage 자체는 메인 루프 evaluate_coverage 가 갱신.)
+        if self.current_trace and self._coverage_seeded:
+            self._sync_new_coverage(self.current_trace)
+        return len(self.current_trace)
+
+    def _stop_worker(self) -> None:
+        if self._sampling_active:
+            self.stop_sampling()
+
+    def _close_telnet(self) -> None:
+        pass
+
+    def _terminate_proc(self) -> None:
+        self._discard_child()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self._sampling_active:
+            self.stop_sampling()
+        self._closed = True
+        if self._child_alive():
+            try:
+                self._rpc_direct('close', timeout=8.0)
+                if self._child is not None:
+                    self._child.wait(timeout=3.0)
+            except Exception as exc:
+                log.warning(f"[J-Link] sampler child 정상 종료 실패: {exc}")
+        self._discard_child()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -3344,369 +4122,6 @@ class LlmBridge:
         return out
 
 
-
-# ============================================================================
-# v9.4: 서브프로세스 격리 halt 샘플러 (SubprocessHaltSampler)
-#   pylink(JLinkARM DLL)이 halt hot-path 에서 파이썬 로그 콜백을 ctypes 트램폴린으로
-#   되불러 인터프리터 힙을 손상시켜 SIGSEGV(PyObject_GetAttr)를 낸다(v9.3 gdb 확인).
-#   in-process 로는 콜백을 못 막으므로(NULL 무시), pylink 세션 전체를 별도 프로세스로
-#   격리한다. 콜백이 손상을 내도 죽는 건 자식뿐 → 부모(퍼저)는 파이프 EOF 로 감지·자동 재기동.
-#   IPC = 검증된 차트 격리와 동일한 Popen(fork 아님, 재부팅 위험 없음) + stdin/stdout
-#   길이프리픽스 pickle. 파이썬 부기(current_trace/global_coverage/카운터/evaluate_coverage)는
-#   부모가 OpenOCDPCSampler 로부터 상속해 그대로 보유하고, pylink 만지는 동작만 자식에 위임한다.
-# ============================================================================
-
-def _sampler_server_main(cfg_path: str) -> int:
-    """`--sampler-server <cfg.pkl>` 진입점(자식 프로세스). 실제 JLinkHaltSampler 를
-    소유·구동하고 stdin/stdout 바이너리 프로토콜로 부모 프록시의 요청을 처리한다.
-    pylink 콜백이 이 프로세스를 SIGSEGV 로 죽여도 부모는 파이프 EOF 로 감지해 재기동한다."""
-    import pickle as _pk
-    import struct as _st
-    _in = sys.stdin.buffer
-    _out = sys.stdout.buffer
-
-    def _send(obj):
-        b = _pk.dumps(obj, protocol=_pk.HIGHEST_PROTOCOL)
-        _out.write(_st.pack('>I', len(b)))
-        _out.write(b)
-        _out.flush()
-
-    def _recv():
-        h = _in.read(4)
-        if not h or len(h) < 4:
-            return None
-        n = _st.unpack('>I', h)[0]
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = _in.read(n - len(buf))
-            if not chunk:
-                return None
-            buf += chunk
-        return _pk.loads(bytes(buf))
-
-    try:
-        with open(cfg_path, 'rb') as f:
-            _cfg_dict = _pk.load(f)
-        # 클래스 참조/모듈명 의존 회피: 평문 dict 로 FuzzConfig 필드를 복원(생성자 우회).
-        cfg = FuzzConfig.__new__(FuzzConfig)
-        cfg.__dict__.update(_cfg_dict)
-    except Exception as e:
-        try:
-            _send({'ok': False, 'err': f'config load 실패: {e!r}'})
-        except Exception:
-            pass
-        return 2
-
-    s = JLinkHaltSampler(cfg)
-    while True:
-        msg = _recv()
-        if msg is None:
-            break
-        op = msg.get('op')
-        try:
-            if op == 'connect':
-                ok = bool(s.connect())
-                _idle = getattr(s, 'idle_pcs', None)
-                _send({'ok': ok,
-                       'idle_pcs': [list(t) if isinstance(t, tuple) else t for t in _idle]
-                                   if _idle else []})
-            elif op == 'start':
-                s.start_sampling()
-                _send({'ok': True})
-            elif op == 'stop':
-                s.stop_sampling()
-                _send({
-                    'pcs': list(s.current_trace),
-                    'raw': list(getattr(s, '_last_raw_pcs', []) or []),
-                    'halt_ok': int(getattr(s, 'halt_ok_total', 0)),
-                    'halt_fail': int(getattr(s, 'halt_fail_total', 0)),
-                    'freeze': float(getattr(s, 'halt_freeze_accum', 0.0)),
-                    'total': int(getattr(s, 'total_samples', 0)),
-                    'stopped_reason': getattr(s, '_stopped_reason', ''),
-                    'unique_intervals': {int(k): int(v) for k, v
-                                         in (getattr(s, '_unique_at_intervals', {}) or {}).items()},
-                })
-            elif op == 'stop_worker':
-                try:
-                    s._stop_worker()
-                except Exception:
-                    pass
-                _send({'ok': True})
-            elif op == 'read_stuck':
-                pcs = s.read_stuck_pcs(int(msg.get('count', 1)))
-                _send({'pcs': [list(t) for t in (pcs or [])]})
-            elif op == 'read_all':
-                r = s._read_all_pcs()
-                _send({'pcs': list(r) if r else None})
-            elif op == 'reinit':
-                _send({'ok': bool(s._reinit_target())})
-            elif op == 'reconnect':
-                _send({'ok': bool(s._reconnect())})
-            elif op == 'alive':
-                _send({'ok': bool(s._openocd_alive())})
-            elif op == 'diagnose':
-                try:
-                    s.diagnose()
-                except Exception:
-                    pass
-                _send({'ok': True})
-            elif op == 'close':
-                _send({'ok': True})
-                break
-            else:
-                _send({'err': f'unknown op {op}'})
-        except Exception as e:
-            # 서버 로직 예외는 프로토콜로 전달(크래시 아님). pylink 콜백 SIGSEGV 는 파이썬
-            # 예외가 아니라 프로세스가 죽고 → 부모가 파이프 EOF 로 감지해 재기동한다.
-            try:
-                _send({'err': repr(e)})
-            except Exception:
-                break
-    try:
-        s.close()
-    except Exception:
-        pass
-    return 0
-
-
-class SubprocessHaltSampler(OpenOCDPCSampler):
-    """v9.4: JLinkHaltSampler 를 서브프로세스에 격리한 프록시.
-    파이썬 부기는 OpenOCDPCSampler 상속분(부모 프로세스)이 그대로 담당하고, pylink 를
-    만지는 동작만 자식에 위임한다. 자식이 pylink 콜백 SIGSEGV 로 죽어도 파이프 EOF 로
-    감지해 자동 재기동한다(그 윈도우 샘플만 손실, 퍼저는 계속)."""
-
-    def __init__(self, config: 'FuzzConfig'):
-        super().__init__(config)
-        import struct as _st
-        self._struct = _st
-        self._proc: Optional[subprocess.Popen] = None
-        self._cfg_pkl: Optional[str] = None
-        self._rpc_lock = threading.Lock()
-        self._server_errf = None
-        self._restart_count = 0
-
-    # ── 자식 프로세스 관리 ────────────────────────────────────────────
-    def _ensure_cfg_pkl(self) -> str:
-        if self._cfg_pkl and os.path.exists(self._cfg_pkl):
-            return self._cfg_pkl
-        import pickle as _pk
-        import tempfile
-        _dir = str(self.config.output_dir)
-        try:
-            os.makedirs(_dir, exist_ok=True)
-        except Exception:
-            _dir = tempfile.gettempdir()
-        fd, path = tempfile.mkstemp(prefix='.sampler_cfg_', suffix='.pkl', dir=_dir)
-        with os.fdopen(fd, 'wb') as f:
-            # 인스턴스가 아니라 __dict__(평문 필드)만 pickle → 자식이 클래스 참조/모듈명
-            # 의존 없이 FuzzConfig 를 복원. 부모·자식 모두 __main__ 이라 통상 동일하지만
-            # 평문 dict 가 pickle 모듈 참조 이슈에 견고하다.
-            _pk.dump(dict(self.config.__dict__), f, protocol=_pk.HIGHEST_PROTOCOL)
-        self._cfg_pkl = path
-        return path
-
-    def _spawn(self) -> bool:
-        try:
-            cfg_path = self._ensure_cfg_pkl()
-        except Exception as e:
-            log.error(f"[Sampler/proc] config pickle 실패 — 격리 샘플러 기동 불가: {e}")
-            return False
-        try:
-            if self._server_errf is None:
-                self._server_errf = open(str(self.config.output_dir / '.sampler_server.log'), 'ab')
-        except Exception:
-            self._server_errf = subprocess.DEVNULL
-        try:
-            self._proc = subprocess.Popen(
-                [sys.executable, os.path.abspath(__file__), '--sampler-server', cfg_path],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=self._server_errf, close_fds=True, bufsize=0)
-        except Exception as e:
-            log.error(f"[Sampler/proc] 자식 기동 실패: {e}")
-            self._proc = None
-            return False
-        return True
-
-    def _send_raw(self, obj) -> None:
-        import pickle as _pk
-        b = _pk.dumps(obj, protocol=_pk.HIGHEST_PROTOCOL)
-        self._proc.stdin.write(self._struct.pack('>I', len(b)))
-        self._proc.stdin.write(b)
-        self._proc.stdin.flush()
-
-    def _recv_raw(self):
-        import pickle as _pk
-        h = self._proc.stdout.read(4)
-        if not h or len(h) < 4:
-            raise EOFError('sampler child EOF (header)')
-        n = self._struct.unpack('>I', h)[0]
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = self._proc.stdout.read(n - len(buf))
-            if not chunk:
-                raise EOFError('sampler child EOF (body)')
-            buf += chunk
-        return _pk.loads(bytes(buf))
-
-    def _terminate_child(self) -> None:
-        p = self._proc
-        self._proc = None
-        if p is None:
-            return
-        try:
-            if p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=3)
-                except Exception:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    def _restart(self) -> bool:
-        """자식 재기동 + 재연결. 실패해도 부모는 계속(다음 윈도우 재시도)."""
-        self._restart_count += 1
-        log.warning(f"[Sampler/proc] 격리 샘플러 재기동(#{self._restart_count}) — "
-                    "이전 자식 死/미기동(pylink 콜백 크래시 가능성). 부모는 생존.")
-        self._terminate_child()
-        if not self._spawn():
-            return False
-        try:
-            self._send_raw({'op': 'connect'})
-            r = self._recv_raw()
-            if r and r.get('idle_pcs'):
-                try:
-                    self.idle_pcs = set(tuple(t) if isinstance(t, list) else t
-                                        for t in r['idle_pcs'])
-                except Exception:
-                    pass
-            return bool(r and r.get('ok'))
-        except Exception as e:
-            log.warning(f"[Sampler/proc] 재기동 후 connect 실패: {e}")
-            return False
-
-    def _rpc(self, msg: dict, default=None, _retry: bool = True):
-        """자식에 요청 1회. 자식 死/파이프 오류면 재기동 후(재요청 1회) default 반환."""
-        with self._rpc_lock:
-            if self._proc is None or self._proc.poll() is not None:
-                if not self._restart():
-                    return default
-            try:
-                self._send_raw(msg)
-                return self._recv_raw()
-            except Exception as e:
-                log.warning(f"[Sampler/proc] RPC 실패(op={msg.get('op')}): {e}")
-                self.openocd_error.set()
-                if _retry and self._restart():
-                    try:
-                        self._send_raw(msg)
-                        return self._recv_raw()
-                    except Exception as e2:
-                        log.warning(f"[Sampler/proc] 재시도도 실패: {e2}")
-                return default
-
-    # ── 위임 메서드 (pylink 만지는 것만; 나머지는 OpenOCDPCSampler 상속) ────
-    def connect(self) -> bool:
-        if self._proc is None or self._proc.poll() is not None:
-            if not self._spawn():
-                return False
-        r = self._rpc({'op': 'connect'}, default={'ok': False})
-        if r and r.get('idle_pcs'):
-            try:
-                self.idle_pcs = set(tuple(t) if isinstance(t, list) else t
-                                    for t in r['idle_pcs'])
-            except Exception:
-                pass
-        return bool(r and r.get('ok'))
-
-    def start_sampling(self) -> None:
-        self._rpc({'op': 'start'}, default={'ok': False})
-
-    def stop_sampling(self) -> int:
-        r = self._rpc({'op': 'stop'}, default=None)
-        if not r or 'pcs' not in r:
-            # 자식 死 → 이 윈도우 샘플 손실. 빈 트레이스(퍼저는 계속).
-            self.current_trace = set()
-            self._last_raw_pcs = []
-            self._stopped_reason = 'child_dead'
-            return 0
-        self.current_trace = set(r.get('pcs', []))
-        self._last_raw_pcs = list(r.get('raw', []))
-        self.halt_ok_total = int(r.get('halt_ok', self.halt_ok_total))
-        self.halt_fail_total = int(r.get('halt_fail', self.halt_fail_total))
-        self.halt_freeze_accum = float(r.get('freeze', self.halt_freeze_accum))
-        self.total_samples = int(r.get('total', self.total_samples))
-        self._stopped_reason = r.get('stopped_reason', '')
-        try:
-            self._unique_at_intervals = {int(k): int(v)
-                                         for k, v in (r.get('unique_intervals') or {}).items()}
-        except Exception:
-            pass
-        return len(self.current_trace)
-
-    def _stop_worker(self) -> None:
-        self._rpc({'op': 'stop_worker'}, default={'ok': False})
-
-    def read_stuck_pcs(self, count: int = 10):
-        r = self._rpc({'op': 'read_stuck', 'count': int(count)}, default=None)
-        if not r or 'pcs' not in r:
-            return []
-        return [tuple(t) for t in r.get('pcs', [])]
-
-    def _read_all_pcs(self):
-        r = self._rpc({'op': 'read_all'}, default=None)
-        if not r:
-            return None
-        pcs = r.get('pcs')
-        return tuple(pcs) if pcs else None
-
-    def _reinit_target(self) -> bool:
-        r = self._rpc({'op': 'reinit'}, default={'ok': False})
-        return bool(r and r.get('ok'))
-
-    def _reconnect(self) -> bool:
-        r = self._rpc({'op': 'reconnect'}, default={'ok': False})
-        return bool(r and r.get('ok'))
-
-    def _openocd_alive(self) -> bool:
-        if self._proc is None or self._proc.poll() is not None:
-            return False
-        r = self._rpc({'op': 'alive'}, default={'ok': False}, _retry=False)
-        return bool(r and r.get('ok'))
-
-    def diagnose(self) -> None:
-        self._rpc({'op': 'diagnose'}, default={'ok': False})
-
-    def _terminate_proc(self) -> None:
-        self._terminate_child()
-
-    def close(self) -> None:
-        try:
-            if self._proc is not None and self._proc.poll() is None:
-                with self._rpc_lock:
-                    try:
-                        self._send_raw({'op': 'close'})
-                        self._recv_raw()
-                    except Exception:
-                        pass
-        finally:
-            self._terminate_child()
-            if self._server_errf not in (None, subprocess.DEVNULL):
-                try:
-                    self._server_errf.close()
-                except Exception:
-                    pass
-            if self._cfg_pkl:
-                try:
-                    os.unlink(self._cfg_pkl)
-                except OSError:
-                    pass
-
-
-
 class NVMeFuzzer:
     """다중 Opcode 지원 NVMe 퍼저 (v4.3: subprocess nvme-cli + 글로벌 포화 설정 분리)"""
 
@@ -3744,17 +4159,15 @@ class NVMeFuzzer:
         # J-Link/OpenOCD 가 없어도 fuzz / state telemetry / PM rotation / crash
         # detection (timeout 기준) 은 모두 동작.
         # sampler 선택: --no-jlink 또는 sampler_type='null' → NullSampler,
-        # 'jlink_halt' → JLinkHaltSampler(P9, pylink 직접 halt), 'halt' → OpenOCDHaltSampler,
+        # 'jlink_halt' → 기본은 SharedProcessJLinkHaltSampler(native child 격리),
+        # --jlink-in-process 비교 모드만 JLinkHaltSampler, 'halt' → OpenOCDHaltSampler,
         # 그 외 → OpenOCDPCSampler(PCSR 비침습).
         if config.no_jlink or config.sampler_type == 'null':
             self.sampler = NullSampler(config)
         elif config.sampler_type == 'jlink_halt':
-            # v9.4: 기본은 서브프로세스 격리(pylink 콜백 SIGSEGV 를 자식에 가둠).
-            #   --no-jlink-subprocess / config.jlink_subprocess=false 로 구(in-process) 동작.
-            if getattr(config, 'jlink_subprocess', True):
-                self.sampler = SubprocessHaltSampler(config)
-            else:
-                self.sampler = JLinkHaltSampler(config)
+            self.sampler = (SharedProcessJLinkHaltSampler(config)
+                            if config.jlink_process_isolation
+                            else JLinkHaltSampler(config))
         elif config.sampler_type == 'halt':
             self.sampler = OpenOCDHaltSampler(config)
         else:
@@ -4073,18 +4486,14 @@ class NVMeFuzzer:
         seed.is_calibrated = True
         seed.stability = stability
         seed.stable_pcs = stable_pcs
-        # v9.3: 덮어쓰기 대신 union — halt 확률샘플링은 실행마다 PC 부분집합만 잡으므로,
-        #   재-calibration(아래 메인루프) 때 합집합으로 누적해 진짜 커버리지로 수렴시킨다.
-        #   → favored/cull 이 단발 스냅샷 노이즈로 productive 단일 시드를 오컬링하는 것 완화.
-        seed.covered_pcs = (seed.covered_pcs or set()) | all_seen_pcs
+        seed.covered_pcs = all_seen_pcs
 
         # LLM 계보 시드가 calibration 중 '새' 커버리지를 발견하면 new_cov 에 반영(favored 원천).
         # (기존엔 변이 파생만 셌음 → 원본 LLM 시드의 직접 발견을 놓쳐 favored↑ 인데 new_cov=0 이 됨.)
-        #   재-calibration 시 확률샘플링이 새 global PC 를 잡으면 그것도 크레딧(누적).
         _new = all_seen_pcs - self.sampler.global_coverage   # global 반영 전 = 신규분
         if _new and self._is_llm_seed(seed):
             self._llm_stats['new_cov'] += len(_new)
-            seed.new_pcs += len(_new)
+            seed.new_pcs = len(_new)
             # calibration 발견은 mutation 경로가 아니라 [+][Edge-Cov]가 안 찍힌다 → 여기서 명시.
             log.warning(f"[LLM/cov] {seed.cmd.name} calibration +{len(_new)} new PCs "
                         f"→ 누적 new_cov={self._llm_stats['new_cov']}")
@@ -13358,6 +13767,33 @@ class NVMeFuzzer:
                             f"--namespace {self.config.nvme_namespace} 와 불일치 → "
                             f"path 기준으로 보정 (namespace := {_path_ns})")
                 self.config.nvme_namespace = _path_ns
+        # v9.3: I/O 대상 namespace 블록 디바이스가 실제로 존재하는지 확인 → 없으면 동일
+        #   controller 의 노출된 namespace 를 glob 으로 자동 감지. 활성 NS 가 n1 이 아닌
+        #   경우(예: vendor format/NS management 후 n2 만 존재)에 --nvme 없이도 대응.
+        #   컨트롤러 char device 유무와 무관(아래 fallback 은 컨트롤러 부재 시에만 발동).
+        _io_dev = (nvme_dev if _NVME_NS_SUFFIX_RE.search(nvme_dev)
+                   else f"{nvme_dev}n{self.config.nvme_namespace or 1}")
+        if not os.path.exists(_io_dev):
+            _cm = re.match(r'(/dev/nvme\d+)', nvme_dev)
+            _ctrl_base = _cm.group(1) if _cm else nvme_dev
+            import glob as _glob
+            _cands = sorted(
+                [p for p in _glob.glob(f"{_ctrl_base}n*")
+                 if re.match(rf"^{re.escape(_ctrl_base)}n\d+$", p)],
+                key=lambda p: int(re.search(r'n(\d+)$', p).group(1)))
+            if _cands:
+                _picked = _cands[0]
+                _pid = int(re.search(r'n(\d+)$', _picked).group(1))
+                if len(_cands) > 1:
+                    log.warning(f"[Pre-flight] namespace device {_io_dev} 없음 — 활성 NS "
+                                f"여럿 {[os.path.basename(p) for p in _cands]} → 최소 "
+                                f"{os.path.basename(_picked)} 자동 선택 (다른 NS 는 --nvme 로 명시).")
+                else:
+                    log.warning(f"[Pre-flight] namespace device {_io_dev} 없음 → 자동 감지 "
+                                f"{os.path.basename(_picked)} (활성 namespace={_pid}).")
+                self.config.nvme_device = _picked
+                self.config.nvme_namespace = _pid
+                nvme_dev = _picked
         if not os.path.exists(nvme_dev):
             # WSL2 / 일부 인클로저 환경: controller char device(/dev/nvme0)는 없고
             # namespace block device(/dev/nvme0nN)만 노출됨. namespace 번호는
@@ -13963,18 +14399,6 @@ class NVMeFuzzer:
                                     and not base_seed.is_calibrated
                                     and not base_seed.covered_pcs):
                                 base_seed = self._calibrate_seed(base_seed)
-                            # v9.3: 이미 calibrate 된 단일 시드도 주기적으로 재-calibration →
-                            #   covered_pcs union 누적(halt 확률샘플링 단발노이즈 완화). 비용통제:
-                            #   exec 이 INTERVAL 배수일 때 + 시드당 RECAL_MAX 회까지만.
-                            elif (COVERED_PCS_RECAL_ON
-                                    and isinstance(base_seed, Seed)
-                                    and base_seed.is_calibrated
-                                    and base_seed.recal_count < COVERED_PCS_RECAL_MAX
-                                    and base_seed.exec_count > 0
-                                    and base_seed.exec_count % COVERED_PCS_RECAL_INTERVAL == 0):
-                                base_seed.is_calibrated = False   # _calibrate_seed 재실행 허용
-                                base_seed = self._calibrate_seed(base_seed)
-                                base_seed.recal_count += 1
                             # ① 가시성: LLM 시드 선택 시 exec/covered_pcs/favored 상태
                             if (RAG_DEBUG and base_seed is not None
                                     and self._is_llm_seed(base_seed)):
@@ -14537,6 +14961,13 @@ def _render_charts_from_snapshot(snapshot_path: str) -> int:
 
 
 if __name__ == "__main__":
+    # v9.4: native J-Link 전용 persistent child. 일반 argparse/장치 초기화에 진입하지 않는다.
+    if '--jlink-sampler-child' in sys.argv:
+        _si = sys.argv.index('--jlink-sampler-child')
+        _src = (_sampler_child_main(sys.argv[_si + 1])
+                if _si + 1 < len(sys.argv) else 2)
+        raise SystemExit(_src)
+
     # v8.8: 차트 렌더 전용 모드 — fuzzer/디바이스 초기화 전에 즉시 처리 후 종료.
     # _generate_graphs_isolated 가 `--render-charts <snap.pkl>` 로 이 스크립트를 재실행한다.
     if '--render-charts' in sys.argv:
@@ -14544,14 +14975,6 @@ if __name__ == "__main__":
         _rrc = (_render_charts_from_snapshot(sys.argv[_ri + 1])
                 if _ri + 1 < len(sys.argv) else 2)
         raise SystemExit(_rrc)
-
-    # v9.4: 격리 halt 샘플러 서버 모드 — 부모 프록시가 Popen 으로 이 스크립트를
-    #   `--sampler-server <cfg.pkl>` 로 재실행한다. pylink 세션은 여기(자식)서만 소유.
-    if '--sampler-server' in sys.argv:
-        _ssi = sys.argv.index('--sampler-server')
-        _src = (_sampler_server_main(sys.argv[_ssi + 1])
-                if _ssi + 1 < len(sys.argv) else 2)
-        raise SystemExit(_src)
 
     import argparse
 
@@ -14577,6 +15000,9 @@ if __name__ == "__main__":
     parser.add_argument('--pc-reg-index', type=int, default=None, dest='pc_reg_index',
                         help='jlink_halt 샘플러: PC(R15) 레지스터 인덱스 강제 지정 '
                              '(기본: connect 시 자동 탐지). jlink_reg_diag.py 로 확인 가능')
+    parser.add_argument('--jlink-in-process', action='store_true', default=False,
+                        help='v9.4 native child 격리를 끄고 v9.3 in-process J-Link를 사용 '
+                             '(A/B 진단 전용; 장시간 운용 비권장)')
     parser.add_argument('--nvme', default=NVME_DEVICE, help='NVMe device')
     parser.add_argument('--namespace', type=int, default=NVME_NAMESPACE)
 
@@ -14616,11 +15042,6 @@ if __name__ == "__main__":
     parser.add_argument('--no-jlink', action='store_true', default=False,
                         help='J-Link 없이 NVMe fuzz 만 수행 (coverage 수집 안 함). '
                              'PM rotation / state telemetry / mutation / crash detection(timeout) 은 모두 동작.')
-    parser.add_argument('--no-jlink-subprocess', dest='jlink_subprocess',
-                        action='store_false', default=True,
-                        help='v9.4: jlink_halt 샘플러를 서브프로세스 격리하지 않고 구(in-process)로 '
-                             '실행. 격리는 pylink 콜백 SIGSEGV 를 자식에 가둬 퍼저 본체를 보호한다 '
-                             '(기본 ON). 이 플래그로 끄면 v9.3 과 동일(크래시 위험).')
     parser.add_argument('--unsupported-skip', action='store_true', default=False,
                         help='timeout 후 J-Link dump 의 event log 에서 EngineErrInt 검출 시 '
                              '미지원 명령으로 간주, power cycle 후 메인 루프 계속. '
@@ -14843,6 +15264,7 @@ if __name__ == "__main__":
         jlink_ap_index=_profile.get('jlink_ap_index', 0),
         pc_reg_index=(args.pc_reg_index if args.pc_reg_index is not None
                       else _profile.get('pc_reg_index')),
+        jlink_process_isolation=not args.jlink_in_process,
         nvme_device=args.nvme,
         nvme_namespace=args.namespace,
         nvme_timeouts=nvme_timeouts,
@@ -14860,7 +15282,6 @@ if __name__ == "__main__":
         pm_inject_prob=1.0 if args.pm else 0.0,
         allow_no_openocd=args.allow_no_openocd,
         no_jlink=args.no_jlink,
-        jlink_subprocess=args.jlink_subprocess,
         unsupported_skip=args.unsupported_skip,
         repro_opcodes=repro_opcodes,
         ignore_opcodes=ignore_opcodes,
