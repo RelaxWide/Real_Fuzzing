@@ -1,0 +1,95 @@
+# pc_sampling_fuzzer v9.4
+
+> per-version 규칙: `v9.4.py` = `v9.3.py` byte-copy + 아래 편집만. 베이스라인 v9.3 은 불변.
+> (참고: 이전의 "J-Link 프로세스 격리 v9.4" 는 크래시 원인이 J-Link native 가 아니라 호스트
+> kernel debug 계측이었음이 밝혀져 폐기 → `backup/pc_sampling_fuzzer_v9.4_shelved.*`.
+> 자세한 경위는 `HANDOFF_crash_investigation.md`.)
+
+## 한 줄 요약
+
+v9.3 위에 **커버리지 소스 라벨링 + SC discovery-count(안 A) + 3축 성장 데이터 persist**를 넣고,
+그 데이터를 읽어 그리는 **별도 오프라인 그래프 파일**(`coverage_growth_plot.py`)을 추가했다.
+
+## 설계 결정 (왜 이렇게)
+
+- **커버리지 축은 3개**: `edge-cov`(코드), `state-cov`(FTL/telemetry 상태), `sc-cov`(펌웨어 응답).
+  각 축은 이미 전용 `[+]` 로그가 있음(`[+][Edge-Cov]`, `[+][State-Cov]`, `[+][SC-depth]`).
+- **소스는 직교 태그**: `origin(blind|llm) × form(cmd|seq|iowl|replay)`. `[+][Seq-Acc]`·`[+][PM-Cov]`
+  는 별도 축이 아니라 seq/pm 이라는 **소스로 얻은 edge/state** 라서 태그로 흡수.
+- **축마다 분모 성질이 다르다(정직하게 혼합, 억지 통일 안 함):**
+  - `edge` = **%** — Ghidra 정적분석이 전체 BB/func 를 주므로 분모 존재(`_sa_total_bbs`/`_sa_total_funcs`).
+  - `sc` = **discovery-count (안 A)** — 분모/스펙테이블 없이 **누적 distinct `(cmd, status)`**. 스펙은
+    계속 변해 per-command status 테이블 유지가 비현실적이라 분모를 안 씀(= AFL 방식의 발견 카운트).
+  - `state` = **discovery-count** — 누적 `state_corpus`.
+- **구 `SC-depth(0~3)` 위상 변경:** 0~3 은 "분모가 없어서" 쓰던 거친 진행 서수(`_sc_depth`, 스펙
+  아님·구조적). SC 커버리지는 이제 discovery-count 가 담당하고, 0~3 은 프론티어 진입 판정용
+  **보조 마일스톤**으로만 남음(`[+][SC-depth]` 로그, is_interesting 보상).
+- **그래프는 별도 파일(오프라인):** 인프로세스 matplotlib 반복 렌더가 인터프리터 힙을 손상시킨
+  전례가 있어, 퍼저는 데이터(jsonl)만 쓰고 렌더는 분리 프로세스가 한다.
+
+## 변경 상세 (`pc_sampling_fuzzer_v9.4.py`, 라인 근사)
+
+| 위치 | 내용 |
+|---|---|
+| **119** | `FUZZER_VERSION = "9.4.0"` |
+| **~3488** | 초기화: `self._sc_seen: set`(안 A 누적), `self._cov_by_src: dict`(소스별 누적), `self._cov_growth_hist: list` |
+| **~5206** | 헬퍼 `_cov_src_tag(seed, source) -> 'origin/form'`, `_cov_credit(src, axis, n)` |
+| **~5663** | `_account_command` 내 `_ns`(status) 처리부: distinct `(track_key, _ns)` 신규면 `_sc_seen` 추가 + `_cov_credit(src,'sc')` + **`[+][SC-Cov] cmd=.. src=.. status=.. total_sc=N`** 로그 |
+| **~5856** | `[+][Edge-Cov]`/`[+][SC-depth]` 로그에 `src={_edge_src}` 추가, edge 신규 시 `_cov_credit(src,'edge',new_pcs)` |
+| **~5914** | 상태출력 주기마다 3축 스냅샷 → `_cov_growth_hist` append + **`output_dir/coverage_growth.jsonl`** 에 한 줄 append. static 없어도 sc/state 는 기록 |
+
+### 소스 태그 taxonomy
+
+- `origin`: `llm`(= `_is_llm_seed`, seed_class 가 'llm*') / `blind`
+- `form`: `iowl`(source=='workload') / `replay`(source=='c2') / `seq`(`SequenceSeed`) / `cmd`(그 외)
+- 예: `src=llm/cmd`, `src=blind/cmd`, `src=llm/iowl`(LLM-지시 IO 워크로드 — 겹침이 명확히 드러남)
+
+### `coverage_growth.jsonl` 스키마 (한 줄 = 한 스냅샷)
+
+```json
+{"exec": 12000, "elapsed_s": 2400.0,
+ "bb_pct": 41.2, "func_pct": 55.7,        // static 없으면 null
+ "sc_count": 37,                          // 누적 distinct (cmd,status)
+ "state_count": 12,                       // 누적 state_corpus
+ "by_src": {"blind/cmd": {"edge": 900, "sc": 15, "state": 0},
+            "llm/cmd":   {"edge": 120, "sc": 18, "state": 0},
+            "llm/iowl":  {"edge": 2,   "sc": 4,  "state": 0}}}
+```
+
+## 그래프 파일 (`coverage_growth_plot.py`, 신규)
+
+퍼저와 분리 실행. `coverage_growth.jsonl` 을 읽어 입력 폴더에 PNG 3장 생성:
+- `coverage_growth_axes.png` — **G1 small-multiples**(3단, X 공유): edge=% / sc=count / state=count
+- `coverage_growth_normalized.png` — **G2 self-정규화 겹침**(각 축 ÷ 최종값): 성장 모양·포화 타이밍
+- `coverage_growth_by_source.png` — **G3 소스 stacked**(edge/sc): 누가 성장을 만들었나
+
+```bash
+/home/ssd/gdbfuzz/.venv/bin/python3 PC_Sampling/coverage_growth_plot.py output/<run_dir>/
+#   [--x exec|time]  X축 전환. matplotlib 필요(.venv). 플롯 텍스트는 ASCII(폰트 한글 글리프 없음).
+```
+
+## 검증 상태
+
+- `py_compile` OK (v9.4.py, coverage_growth_plot.py)
+- 합성 `coverage_growth.jsonl` 로 3장 렌더 확인 — edge% 포화 + sc/state discovery 상승이 정상 표시
+- **하드웨어 실측 미검증** (실제 run 의 jsonl 로 렌더·수치 확인 필요)
+
+## 아직 안 한 것 / 다음 작업 (resume용)
+
+- **`[+][State-Cov]` 에는 src 태그 미추가** — state 발견은 명령 시퀀스 단위라 단일 소스 귀속이
+  애매해서 제외. source-stacked 그래프의 state 도 비움(정직). 필요하면 IO-WL 패턴 태그
+  (`_wl_active_pattern`) 정도로 근사 귀속 가능.
+- **`rc` / `trace_len`(halt 샘플 수) per-command 진단 로깅 미구현** — 원 조사 맥락: "LLM 명령일 때
+  halt PC 가 안 잡히는 것 같다"는 **fast-fail 가설**(exotic/invalid 명령이 즉시 거부돼 halt 창이
+  0). 이걸 확정하려면 명령마다 `rc`+`len(sampler.current_trace)` 를 `src` 태그와 함께 찍으면 됨.
+  현재는 `[+][SC-Cov]` 의 `status=` 로 "LLM 명령이 Invalid Opcode 등으로 거부되는지"만 부분 확인 가능.
+  (구조상 halt 샘플링은 LLM 경로도 `_send_nvme_command`(무조건 start_sampling)+`_calibrate_seed`
+  로 동일하게 탄다 — 스킵 아님. 관건은 명령이 너무 빨리 실패하는지.)
+- **그래프 옵션 여지**: G4 rate(속도) 뷰, G5 마일스톤 오버레이는 미구현. sc 를 자기보정 %(관측
+  universe 분모)로 보고 싶으면 별도 옵션 추가 가능.
+
+## 파일
+
+- `pc_sampling_fuzzer_v9.4.py` — v9.3 byte-copy + 위 편집
+- `coverage_growth_plot.py` — 신규, 분리 그래프 렌더
+- `fuzzer_config.json` — 무변경(공유 파일)
