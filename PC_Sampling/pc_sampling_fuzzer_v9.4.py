@@ -1071,6 +1071,7 @@ class Seed:
     seed_class: Optional[str] = None
     llm_score: Optional[float] = None
     last_gain_exec: int = 0      # v9.2 staleness: 마지막으로 새 코드 커버리지를 낸 exec_count
+    prov_id: Optional[int] = None  # v9.4 ledger: LLM 제안 계보 id(관측 전용, 결정 로직 미참조)
 
 @dataclass
 class SequenceSeed:
@@ -1085,6 +1086,7 @@ class SequenceSeed:
     covered_pcs: Optional[set] = None
     seed_class: Optional[str] = None   # v9.0: 'llm_seq' 등 출처 태그
     last_gain_exec: int = 0      # v9.2 staleness: 마지막으로 새 코드 커버리지를 낸 exec_count
+    prov_id: Optional[int] = None  # v9.4 ledger: LLM 제안 계보 id(관측 전용, 결정 로직 미참조)
 
 @dataclass
 class FuzzConfig:
@@ -3495,7 +3497,21 @@ class NVMeFuzzer:
         self._cov_by_src: dict = {}
         # v9.4: 3축 성장 스냅샷 이력(별도 그래프 파일 coverage_growth_plot.py 가 읽음).
         self._cov_growth_hist: list = []
+        # v9.4 ledger(관측 전용, 궤적 불변): LLM 제안↔실행결과 연결 + 주목할만한 실행 outcome 기록.
+        #   Gate 0/Phase 0(v9.5)의 matched-contrastive·bandit reward 가 읽을 데이터 토대.
+        self._run_id: Optional[str] = None
+        self._prov_counter: int = 0           # LLM 제안 계보 id 카운터(run-scoped)
+        self._ledger_fh = None                # outcome_ledger jsonl 핸들(lazy, False=열기실패→무음)
+        self._prop_fh = None                  # llm_proposals jsonl 핸들(lazy)
+        self._cg_warned: bool = False         # coverage_growth.jsonl 쓰기실패 warn-once 플래그
+        self._ledger_dropped: int = 0         # ledger/proposal write 실패로 유실된 record 수(진단)
+        self._ledger_wwarn: bool = False      # write 실패 warn-once(ledger/proposal 공통)
         self._last_selected = None                    # v9.2 staleness: 직전 _select_seed 가 고른 corpus 시드
+        # v9.4 ledger: 이번 iteration 의 '명시적' 소스 corpus 시드(계보 귀속 전용). 매 iteration
+        #   최상단에서 None 리셋되고 det/seq/base 각 경로가 실제 소스일 때만 세팅 → source 추론이
+        #   양방향으로 틀리던 문제(det/random 이 stale _last_selected 를 붙이거나, c2 뒤 정당 선택이
+        #   누락되던 것) 제거. staleness(_last_selected) 와 달리 스케줄에 미참여(관측 전용).
+        self._credit_seed = None
 
         self.mutation_stats = {
             "opcode_override": 0,     # opcode가 변형된 횟수
@@ -3669,6 +3685,11 @@ class NVMeFuzzer:
             seed.is_calibrated = True
             return seed
 
+        # v9.4 ledger 정직성 주의: calibration 실행은 _account_command 를 거치지 않으므로
+        #   (self.executions 는 직접 증가) outcome_ledger 에 개별 record 로 남지 않는다. 시드의
+        #   '첫' 직접 coverage/timeout 이 여기서 측정되지만 ledger 커버리지 밖 — 소급분석 시
+        #   executions 총합과 ledger record 수의 차이는 이 calibration 실행 때문이다(v9.5 에서
+        #   calibration 요약 record 추가 고려).
         pc_appearances: Dict[int, int] = {}          # PC → 등장 횟수
         actual_runs = 0
         self._cal_last_rc = 0  # 호출자에게 마지막 rc 전달용
@@ -3716,6 +3737,29 @@ class NVMeFuzzer:
             # calibration 발견은 mutation 경로가 아니라 [+][Edge-Cov]가 안 찍힌다 → 여기서 명시.
             log.warning(f"[LLM/cov] {seed.cmd.name} calibration +{len(_new)} new PCs "
                         f"→ 누적 new_cov={self._llm_stats['new_cov']}")
+
+        # v9.4 ledger: calibration 은 _account_command 를 우회하므로 개별 outcome 이 안 남는다.
+        #   LLM 제안(prov_id 보유) 또는 신규 발견/timeout 인 경우 '요약 outcome' 을 한 줄 남겨
+        #   proposal 평가 데이터가 구조적으로 누락되지 않게 한다(kind='calibration').
+        _cal_timeout = (self._cal_last_rc == self.RC_TIMEOUT)
+        if getattr(seed, 'prov_id', None) is not None or _new or _cal_timeout:
+            self._ledger_write({
+                'run_id': self._run_id_get(),
+                'exec': self.executions,
+                'elapsed_s': (round((datetime.now() - self.start_time).total_seconds(), 1)
+                              if self.start_time else 0),
+                'cmd': seed.cmd.name,
+                'src': self._cov_src_tag(seed, 'c1'),
+                'seed_class': getattr(seed, 'seed_class', None),
+                'prov_id': getattr(seed, 'prov_id', None),
+                'prov_source': 'direct' if getattr(seed, 'prov_id', None) is not None else None,
+                'kind': 'calibration',
+                'rc': self._cal_last_rc,
+                'runs': actual_runs,
+                'stability': round(stability, 3),
+                'new_pcs': len(_new),
+                'cal_timeout': _cal_timeout,
+            })
 
         # global_coverage에 관측된 전체 PC 합집합을 반영
         self.sampler.global_coverage.update(all_seen_pcs)
@@ -5098,8 +5142,18 @@ class NVMeFuzzer:
                     log.warning(f"[LLM/item] dup {seed.cmd.name} cdw10={seed.cdw10} → skip")
                 continue
             self._llm_seen.add(sig)
+            seed.prov_id = self._prov_next()   # v9.4 ledger: 제안 계보 id(관측 전용)
             self.corpus.append(seed)
             added_s += 1
+            self._proposal_write({
+                'run_id': self._run_id_get(), 'prov_id': seed.prov_id,
+                'task': res.get('task'), 'kind': 'seed', 'exec': self.executions,
+                'elapsed_s': (round((datetime.now() - self.start_time).total_seconds(), 1)
+                              if self.start_time else 0),
+                'seed_class': seed.seed_class, 'command': seed.cmd.name,
+                'cdw10': seed.cdw10, 'cdw11': seed.cdw11,
+                'data_len': (len(seed.data) if getattr(seed, 'data', None) is not None else None),
+            })
             if RAG_DEBUG:
                 log.warning(f"[LLM/item] accept {seed.cmd.name} cdw10={seed.cdw10} "
                             f"cdw11={seed.cdw11} data={len(seed.data)}B")
@@ -5132,10 +5186,20 @@ class NVMeFuzzer:
                     log.warning(f"[LLM/item] pattern-cap seq [{'->'.join(s.cmd.name for s in seeds)}] → skip")
                 continue
             self._llm_seen.add(sig)
+            _seq_pid = self._prov_next()   # v9.4 ledger: 시퀀스+멤버 공통 계보 id
+            for _m in seeds:
+                _m.prov_id = _seq_pid
             self.corpus.append(SequenceSeed(
                 commands=seeds, found_at=self.executions,
-                covered_pcs=set(), seed_class='llm_seq'))
+                covered_pcs=set(), seed_class='llm_seq', prov_id=_seq_pid))
             added_q += 1
+            self._proposal_write({
+                'run_id': self._run_id_get(), 'prov_id': _seq_pid,
+                'task': res.get('task'), 'kind': 'seq', 'exec': self.executions,
+                'elapsed_s': (round((datetime.now() - self.start_time).total_seconds(), 1)
+                              if self.start_time else 0),
+                'seed_class': 'llm_seq', 'members': [s.cmd.name for s in seeds],
+            })
             if RAG_DEBUG:
                 log.warning(f"[LLM/item] accept seq [{'->'.join(s.cmd.name for s in seeds)}]")
         # evaluations (corpus_eval)
@@ -5150,7 +5214,19 @@ class NVMeFuzzer:
         # io_workload descriptor (io_patterns) — 검증 통과 시 pending 슬롯에 저장(1건).
         _wl = self._llm_make_workload_desc(data.get('io_workload'))
         if _wl is not None:
+            # v9.4 ledger: io_patterns 도 계보 id 부여 + proposal 기록. 이 prov_id 는 버스트의
+            #   모든 워크로드 명령에 전파(_run_llm_workload_burst → _wl_send_one)돼 outcome 을 귀속.
+            _wl['prov_id'] = self._prov_next()
             self._pending_workload = _wl
+            self._proposal_write({
+                'run_id': self._run_id_get(), 'prov_id': _wl['prov_id'],
+                'task': res.get('task'), 'kind': 'workload', 'exec': self.executions,
+                'elapsed_s': (round((datetime.now() - self.start_time).total_seconds(), 1)
+                              if self.start_time else 0),
+                'seed_class': 'llm_io', 'pattern': _wl.get('pattern'),
+                'lba_span': _wl.get('lba_span'), 'block_size': _wl.get('block_size'),
+                'hot_fraction': _wl.get('hot_fraction'), 'read_ratio': _wl.get('read_ratio'),
+            })
             log.warning(f"[LLM] 워크로드 descriptor 수신: pattern={_wl.get('pattern')} "
                         f"span={_wl.get('lba_span')} bs={_wl.get('block_size')} "
                         f"hot={_wl.get('hot_fraction')} rd={_wl.get('read_ratio')}")
@@ -5228,6 +5304,66 @@ class NVMeFuzzer:
         """v9.4: 소스별 커버리지 누적(스택 그래프용). axis ∈ {'edge','sc','state'}."""
         d = self._cov_by_src.setdefault(src, {'edge': 0, 'sc': 0, 'state': 0})
         d[axis] = d.get(axis, 0) + n
+
+    # ── v9.4 ledger (관측 전용 — 어떤 결정 로직도 이 값을 읽지 않는다) ──────────────
+    def _run_id_get(self) -> str:
+        """run 식별자(lazy). output_dir 이름 + 최초 기록 시각. jsonl 조인·소급분석용."""
+        if not self._run_id:
+            self._run_id = f"{self.output_dir.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        return self._run_id
+
+    def _prov_next(self) -> int:
+        """LLM 제안 계보 id 발급(process-local id() 대신 지속 가능한 순번)."""
+        self._prov_counter += 1
+        return self._prov_counter
+
+    def _ledger_write(self, rec: dict) -> None:
+        """outcome_ledger jsonl 한 줄 append. 열기 실패는 1회 warn 후 무음(궤적 영향 없음)."""
+        if self._ledger_fh is None:
+            try:
+                _d = self.output_dir / 'ledger'
+                _d.mkdir(parents=True, exist_ok=True)
+                _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                self._ledger_fh = open(_d / f'outcome_ledger_{_ts}.jsonl', 'w', encoding='utf-8')
+                log.warning(f"[Ledger] outcome ledger 기록 시작: {self._ledger_fh.name}")
+            except Exception as e:
+                self._ledger_fh = False
+                log.warning(f"[Ledger] outcome ledger 열기 실패(이후 무음): {e}")
+        if self._ledger_fh:
+            try:
+                self._ledger_fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
+                self._ledger_fh.flush()
+            except Exception as e:
+                self._ledger_record_dropped(e)
+
+    def _ledger_record_dropped(self, e) -> None:
+        """ledger/proposal write 실패 처리: 유실 카운트 + 최초 1회 warn(disk-full/I/O 노출)."""
+        self._ledger_dropped += 1
+        if not self._ledger_wwarn:
+            self._ledger_wwarn = True
+            try:
+                log.warning(f"[Ledger] jsonl write 실패 — record 유실 시작(이후 카운트만): {e}")
+            except Exception:
+                pass
+
+    def _proposal_write(self, rec: dict) -> None:
+        """llm_proposals jsonl 한 줄 append. 열기 실패는 1회 warn 후 무음."""
+        if self._prop_fh is None:
+            try:
+                _d = self.output_dir / 'ledger'
+                _d.mkdir(parents=True, exist_ok=True)
+                _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                self._prop_fh = open(_d / f'llm_proposals_{_ts}.jsonl', 'w', encoding='utf-8')
+                log.warning(f"[Ledger] LLM proposals 기록 시작: {self._prop_fh.name}")
+            except Exception as e:
+                self._prop_fh = False
+                log.warning(f"[Ledger] LLM proposals 열기 실패(이후 무음): {e}")
+        if self._prop_fh:
+            try:
+                self._prop_fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
+                self._prop_fh.flush()
+            except Exception as e:
+                self._ledger_record_dropped(e)
 
     def _seq_at_pattern_cap(self, commands) -> bool:
         """v9.2 ①: 같은 명령-시퀀스 패턴(명령이름 순서, CDW 무관)이 corpus 에
@@ -5629,6 +5765,11 @@ class NVMeFuzzer:
         if rc == self.RC_SKIP:
             return False, 0, 'continue'
 
+        # v9.4 ledger: 이 send 의 SC 를 지금 캡처(아래 회계가 _last_nvme_status 를 None 으로 지운
+        #   뒤에도 outcome 기록에 쓰기 위함). _led_new_sc = 이번 실행이 신규 distinct SC 를 냈나.
+        _led_sc = self._last_nvme_status
+        _led_new_sc = False
+
         cmd = seed.cmd
         track_key = self._tracking_label(cmd, seed)
         self.cmd_stats[track_key]["exec"] += 1
@@ -5671,6 +5812,7 @@ class NVMeFuzzer:
                 _sc_key = (track_key, _ns)
                 if _sc_key not in self._sc_seen:
                     self._sc_seen.add(_sc_key)
+                    _led_new_sc = True   # v9.4 ledger: 신규 distinct SC 발견 플래그
                     _sc_src = self._cov_src_tag(seed, source, seq_member=seq_member)
                     self._cov_credit(_sc_src, 'sc')
                     log.warning(f"[+][SC-Cov] cmd={track_key} src={_sc_src} "
@@ -5730,10 +5872,14 @@ class NVMeFuzzer:
         if self._last_depth_adv:
             is_interesting = True
 
-        # v9.2 staleness: 이 실행이 새 코드 커버리지를 냈으면 직전 선택된 corpus 시드의 last_gain 갱신
-        #   (energy staleness 감쇠 리셋). 새 코드 못 내면 갱신 안 됨 → staleness 누적 → 감쇠.
-        if new_pcs > 0 and self._last_selected is not None:
-            self._last_selected.last_gain_exec = getattr(self._last_selected, 'exec_count', 0)
+        # v9.2 staleness: 이 실행이 새 코드 커버리지를 냈으면 그 실행의 **실제 소스** corpus 시드의
+        #   last_gain 갱신(energy staleness 감쇠 리셋). 새 코드 못 내면 갱신 안 됨 → staleness 누적 → 감쇠.
+        # v9.4 fix(궤적 변경): 전역 _last_selected → iteration 소스 _credit_seed. 기존엔 workload/c2/
+        #   random 이 새 PC 를 내면 _select_seed 를 안 거쳤는데도 stale _last_selected(무관 시드)의 감쇠를
+        #   리셋해 스케줄을 왜곡했음(v9.3 부터의 버그). _credit_seed 는 그 경로에서 None 이라 오갱신 없음.
+        #   (정상 c1 경로는 _credit_seed==base_seed==_last_selected 라 동일 동작.)
+        if new_pcs > 0 and self._credit_seed is not None:
+            self._credit_seed.last_gain_exec = getattr(self._credit_seed, 'exec_count', 0)
 
         self.cmd_pcs[track_key].update(self.sampler.current_trace)
         if self.sampler._last_raw_pcs:
@@ -5759,6 +5905,42 @@ class NVMeFuzzer:
             log.debug(f"  saturation: {self.sampler._unique_at_intervals}")
         if self.sampler._last_raw_pcs:
             log.debug(f"  ALL raw PCs: {[hex(pc) for pc in self.sampler._last_raw_pcs]}")
+
+        # v9.4 ledger(관측 전용, 궤적 불변): 주목할만한 실행만 기록 — interesting / SC-depth 전진 /
+        #   신규 SC / LLM 귀속. blind no-op 대량 기록을 피해 파일 크기를 억제한다.
+        # prov_id 귀속 정직성: 실행 시드가 직접 prov_id 를 지녔으면 그것(=direct 계보 — LLM 단일시드/
+        #   시퀀스 멤버/워크로드). 없으면 이번 iteration 의 **명시적** 소스 corpus 시드 `_credit_seed`
+        #   에서만 귀속(prov_source='parent'). source 로 추론하지 않는다 — det/random(source='c1' 이나
+        #   _select_seed 미경유)이 stale 을 붙이거나 c2 replay 뒤 정당한 선택이 누락되던 문제를 제거.
+        #   _credit_seed 는 매 iteration 최상단 None 리셋 → workload/replay 시점엔 None(직접 prov_id 만).
+        _led_prov = getattr(seed, 'prov_id', None)
+        if _led_prov is not None:
+            _led_prov_src = 'direct'
+        else:
+            _cs = getattr(self, '_credit_seed', None)
+            _led_prov = getattr(_cs, 'prov_id', None) if _cs is not None else None
+            _led_prov_src = 'parent' if _led_prov is not None else None
+        _led_is_llm = bool(self._is_llm_seed(seed)) or (_led_prov is not None)
+        if is_interesting or self._last_depth_adv or _led_new_sc or _led_is_llm:
+            self._ledger_write({
+                'run_id': self._run_id_get(),
+                'exec': self.executions,
+                'elapsed_s': (round((datetime.now() - self.start_time).total_seconds(), 1)
+                              if self.start_time else 0),
+                'cmd': track_key,
+                'src': self._cov_src_tag(seed, source, seq_member=seq_member),
+                'seed_class': getattr(seed, 'seed_class', None),
+                'prov_id': _led_prov,
+                'prov_source': _led_prov_src,
+                'rc': rc,
+                'sc': _led_sc,
+                'sc_depth': (self._sc_depth(_led_sc) if _led_sc is not None else None),
+                'sc_depth_adv': bool(self._last_depth_adv),
+                'sc_new': _led_new_sc,
+                'new_pcs': new_pcs,
+                'interesting': bool(is_interesting),
+                'source': source,
+            })
 
         # timeout / error
         if rc == self.RC_TIMEOUT:
@@ -5938,6 +6120,7 @@ class NVMeFuzzer:
             #   edge=% (BB/func, 분모 있음), sc=discovery count(안 A), state=discovery count.
             #   별도 그래프 파일 coverage_growth_plot.py 가 이 jsonl 을 읽어 렌더한다.
             _snap_row = {
+                'run_id': self._run_id_get(),
                 'exec': self.executions, 'elapsed_s': round(_elapsed_snap, 1),
                 'bb_pct': round(_bbpct, 3) if _bbpct is not None else None,
                 'func_pct': round(_fpct, 3) if _fpct is not None else None,
@@ -5945,14 +6128,18 @@ class NVMeFuzzer:
                 # v9.4 fix: 누적 distinct state discovery(cull 로 안 줄어듦). 구현은 len(state_corpus)
                 #   였는데 cull(dedup+cap50)로 감소·톱니가 나서 "누적 discovery-count" 문서와 어긋났음.
                 'state_count': len(self._state_seen),
+                'ledger_dropped': self._ledger_dropped,   # ledger/proposal write 유실 누적(0=정상)
                 'by_src': {k: dict(v) for k, v in self._cov_by_src.items()},
             }
             self._cov_growth_hist.append(_snap_row)
             try:
                 with open(self.output_dir / 'coverage_growth.jsonl', 'a') as _gf:
                     _gf.write(json.dumps(_snap_row) + '\n')
-            except Exception:
-                pass
+            except Exception as _cg_e:
+                # v9.4 ledger 신뢰성: 무음 무시 대신 최초 1회만 warn(디스크/권한 원인 노출).
+                if not self._cg_warned:
+                    self._cg_warned = True
+                    log.warning(f"[Ledger] coverage_growth.jsonl 쓰기 실패(이후 무음): {_cg_e}")
 
             stats = self._collect_stats()
             self._print_status(stats, last_samples, window_eps=_window_eps)
@@ -9013,17 +9200,19 @@ class NVMeFuzzer:
         return cmds
 
     def _wl_send_one(self, op: str, slba: int, nlb: int, lba: int,
-                     seed_class: Optional[str] = None) -> int:
+                     seed_class: Optional[str] = None,
+                     prov_id: Optional[int] = None) -> int:
         """워크로드 단일 명령 전송 + 회계(source='workload'). 반환 rc.
         seed_class='llm_io' 면 LLM-구동 버스트 명령 → new_cov(LLM 기여)에 크레딧.
-        config round-robin 워크로드는 None(LLM 무관)."""
+        config round-robin 워크로드는 None(LLM 무관).
+        prov_id: LLM io_patterns descriptor 의 계보 id(ledger 귀속). config 워크로드는 None."""
         cmd_obj = self._wl_write_cmd if op == 'w' else self._wl_read_cmd
         data = self._wl_rand_data((nlb + 1) * lba) if op == 'w' else b''
         seed = Seed(
             data=data, cmd=cmd_obj,
             cdw10=slba & 0xFFFFFFFF, cdw11=(slba >> 32) & 0xFFFFFFFF,
             cdw12=nlb & 0xFFFF, found_at=self.executions,
-            seed_class=seed_class,
+            seed_class=seed_class, prov_id=prov_id,
         )
         self._current_mutations = []   # MOpt 무오염
         rc = self._send_nvme_command(data, seed, record_history=True)
@@ -9031,9 +9220,12 @@ class NVMeFuzzer:
         _i, _np, _action = self._account_command(seed, data, rc, last_samples, source='workload')
         return rc if _action != 'break' else self.RC_TIMEOUT
 
-    def _wl_prewrite_read_targets(self, lim: dict, pattern: str) -> None:
+    def _wl_prewrite_read_targets(self, lim: dict, pattern: str,
+                                  seed_class: Optional[str] = None,
+                                  prov_id: Optional[int] = None) -> None:
         """read_disturb/pingpong_read 의 read 타겟을 1회 write 해 mapped 상태로 만든다.
-        unmapped read 의 zero-page 단축 응답으로 NAND 미접근 → disturb 0 방지."""
+        unmapped read 의 zero-page 단축 응답으로 NAND 미접근 → disturb 0 방지.
+        v9.4 ledger: LLM 버스트의 pre-write 도 그 descriptor 계보(seed_class/prov_id)로 귀속한다."""
         nsze = lim['nsze']
         if pattern == 'pingpong_read':
             targets = [(0, 1), (min(nsze // 2, max(0, nsze - 1)), 1)]
@@ -9046,7 +9238,8 @@ class NVMeFuzzer:
                 slba = base + covered
                 if slba + this > nsze:
                     break
-                if self._wl_send_one('w', slba, this - 1, lim['lba']) == self.RC_TIMEOUT:
+                if self._wl_send_one('w', slba, this - 1, lim['lba'],
+                                     seed_class=seed_class, prov_id=prov_id) == self.RC_TIMEOUT:
                     return
                 covered += this
         log.info(f"[IO-WL] read 타겟 pre-write 완료 (pattern={pattern})")
@@ -9150,10 +9343,12 @@ class NVMeFuzzer:
             self._current_combo = restored
             self._current_ps    = restored.nvme_ps
         self._wl_active_pattern = pattern
-        # read 패턴: 타겟 1회 pre-write
+        _wl_prov = desc.get('prov_id')   # v9.4 ledger: 이 descriptor(io_patterns 제안)의 계보 id
+        # read 패턴: 타겟 1회 pre-write (v9.4 ledger: pre-write 도 이 proposal 계보로 귀속)
         if (pattern in ('read_disturb', 'pingpong_read')
                 and not self.config.prefill and not self._wl_read_target_written):
-            self._wl_prewrite_read_targets(lim, pattern)
+            self._wl_prewrite_read_targets(lim, pattern,
+                                           seed_class='llm_io', prov_id=_wl_prov)
             self._wl_read_target_written = True
 
         _snap_start = self._state_capture_safe()      # 전체 telemetry 스냅(전)
@@ -9181,7 +9376,7 @@ class NVMeFuzzer:
                     # seed_class='llm_io' → LLM 이 이 워크로드를 지시했으므로 발견 커버리지를
                     #   LLM 기여(new_cov)로 크레딧. source='workload' 는 유지(C1/C2 에너지 무오염).
                     if self._wl_send_one(op, slba, nlb, lim['lba'],
-                                         seed_class='llm_io') == 0:
+                                         seed_class='llm_io', prov_id=_wl_prov) == 0:
                         n_ok += 1
                     if self._timeout_crash:
                         break
@@ -13409,6 +13604,7 @@ class NVMeFuzzer:
                 # 기존 코드는 _mutate() 호출 이후에 = []로 비워서 MOpt reward(line ~7962)에
                 # 항상 빈 리스트가 전달되어 mopt_finds/mopt_uses가 누적되지 않는 버그가 있었음.
                 self._current_mutations = []
+                self._credit_seed = None   # v9.4 ledger: 매 iteration 계보 소스 리셋(stale 방지)
 
                 # v9.3: LLM-구동 워크로드 버스트 — pending descriptor 있으면 포화까지 증폭 실행.
                 #   기존 round-robin 블록보다 우선. 소비 즉시 슬롯 비움(1회성). io_workload 엔진 필요.
@@ -13563,6 +13759,7 @@ class NVMeFuzzer:
                 # havoc/random/admin 경로가 완전히 차단되는 다양성 편향 문제가 있었음.
                 if not _seq_in_progress and self._det_queue and random.random() < DET_BUDGET:
                     det_seed, det_gen = self._det_queue[0]
+                    self._credit_seed = det_seed   # v9.4 ledger: det 소스는 det_seed(계보 귀속)
                     try:
                         mutated_seed = next(det_gen)
                         fuzz_data = mutated_seed.data
@@ -13606,6 +13803,7 @@ class NVMeFuzzer:
                     # [3a] corpus SequenceSeed replay continuation
                     if self._pending_seq_seeds:
                         _next_seed = self._pending_seq_seeds.pop(0)
+                        self._credit_seed = _next_seed   # v9.4 ledger: 시퀀스 멤버(LLM seq 계보 보유)
                         log.debug(f"[Seq/Corp] continuation: cmd={_next_seed.cmd.name} "
                                   f"remaining={len(self._pending_seq_seeds)}")
                         mutated_seed = self._mutate(_next_seed)
@@ -13671,6 +13869,7 @@ class NVMeFuzzer:
                         # v4: Power Schedule 기반 시드 선택 + CDW 변형
                         if self.corpus and random.random() >= self.config.random_gen_ratio:
                             base_seed = self._select_seed()
+                            self._credit_seed = base_seed   # v9.4 ledger: 선택된 corpus 시드가 소스
                             # v9.0: 런타임 주입된 LLM 단일시드는 calibration 을 안 거쳐 covered_pcs
                             #   가 없다 → _cull_corpus 의 favored 마킹에서 제외되어 구조적으로 favored
                             #   불가 + 2회 후 컬링. 선택 시 1회 calibrate 해 covered_pcs 를 채운다

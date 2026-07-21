@@ -46,6 +46,34 @@ v9.3 위에 **커버리지 소스 라벨링 + SC discovery-count(안 A) + 3축 �
 | **~5914** | 상태출력 주기마다 3축 스냅샷 → `_cov_growth_hist` append + **`output_dir/coverage_growth.jsonl`** 에 한 줄 append. static 없어도 sc/state 는 기록. `state_count`=`len(_state_seen)`(v9.4 fix) |
 | **~6018** | v9.4 fix: `state_corpus.append` 지점에서 `_state_seen.add('|'.join(sorted(causes)))` — cull 무관 누적 |
 
+### v9.4 ledger (관측 전용 — 궤적 불변, v9.5 Phase 0 데이터 토대)
+
+퍼징 결정 로직은 이 값을 **하나도 읽지 않는다**(순수 관측). v9.5 의 matched-contrastive
+feedback·bandit reward·transition 재현성 측정이 읽을 데이터를 미리 깔아둔다.
+
+| 위치 | 내용 |
+|---|---|
+| `Seed`/`SequenceSeed` | `prov_id: Optional[int]` 필드 추가(LLM 제안 계보 id) |
+| 초기화(`_sc_seen` 옆) | `_run_id`, `_prov_counter`, `_ledger_fh`, `_prop_fh`, `_cg_warned`, `_ledger_dropped`, `_ledger_wwarn`, **`_credit_seed`**(iteration 계보 소스) |
+| 헬퍼(`_cov_credit` 뒤) | `_run_id_get()`, `_prov_next()`, `_ledger_write()`/`_proposal_write()`(lazy jsonl). write 실패 → `_ledger_record_dropped()`(유실 카운트 + 최초 1회 warn) |
+| main loop | iteration 최상단 `self._credit_seed = None` 리셋 + det/seq-continuation/base 각 분기에서 **실제 소스 corpus 시드**를 `_credit_seed` 에 세팅(계보 귀속 전용, 스케줄 미참여) |
+| `_llm_apply_result` | 수용된 LLM 시드/시퀀스/**io_patterns descriptor** 에 `prov_id` 부여 + `llm_proposals.jsonl` 기록. 시퀀스는 멤버 전원 동일 `prov_id`. workload 는 descriptor `prov_id` 를 버스트 전 명령 + **read pre-write**(`_wl_prewrite_read_targets(prov_id=...)`)까지 전파 |
+| `_account_command` 상단 | `_led_sc` 선캡처, `_led_new_sc` 플래그 |
+| `_account_command`(timeout 처리 前) | **주목할만한 실행만** → `outcome_ledger.jsonl`. **prov_id 귀속**: 실행시드 직접 보유 시 `prov_source='direct'`; 없으면 **iteration `_credit_seed`** 에서만(`'parent'`). **source 로 추론 안 함** — det/random(source='c1' 이나 `_select_seed` 미경유)의 stale 오귀속·c2 replay 뒤 정당 선택 누락 둘 다 제거. **mutation 경로 무수정** |
+| `coverage_growth.jsonl` | 무음 `except: pass` → 최초 1회 warn(`_cg_warned`). 스냅샷 row 에 `run_id`+`ledger_dropped` 추가 |
+| `_calibrate_seed` | calibration 은 `_account_command` 우회 → 개별 record 없음. **요약 outcome**(`kind='calibration'`: runs/stability/new_pcs/cal_timeout) 을 prov_id 보유·신규발견·timeout 시 1줄 기록 → proposal 평가 데이터 구조적 누락 해소 |
+
+산출물(`output_dir/ledger/`, run 타임스탬프별 파일):
+- `outcome_ledger_<ts>.jsonl` — 한 줄=주목 실행 1건: `{run_id, exec, elapsed_s, cmd, src, seed_class,
+  prov_id, prov_source, rc, sc, sc_depth, sc_depth_adv, sc_new, new_pcs, interesting, source}`
+  (+ calibration 요약: `kind='calibration', runs, stability, cal_timeout`)
+- `llm_proposals_<ts>.jsonl` — 한 줄=수용된 LLM 제안 1건: `{run_id, prov_id, task,
+  kind(seed|seq|workload), exec, elapsed_s, seed_class, command|members|pattern, ...}`
+- **조인**: `outcome.prov_id == proposal.prov_id`. `prov_source`: `direct`(실행시드 직접) / `parent`
+  (iteration `_credit_seed`) / `null`(미귀속). **한계(정직)**: `prov_id` 는 **직접 계보만** 설명 —
+  device-state carryover·corpus 경쟁·splice(두 부모)·corpus_eval 재가중 같은 **간접효과는 귀속 불가**
+  (campaign A/B 몫). 전체 계보 전파(mutation/splice)·`selected` 이벤트·horizon/감쇠 reward 는 v9.5.
+
 ### 소스 태그 taxonomy
 
 - `origin`: `llm`(= `_is_llm_seed`, seed_class 가 'llm*') / `blind`
@@ -80,10 +108,32 @@ v9.3 위에 **커버리지 소스 라벨링 + SC discovery-count(안 A) + 3축 �
 
 - `py_compile` OK (v9.4.py, coverage_growth_plot.py)
 - 합성 `coverage_growth.jsonl` 로 3장 렌더 확인 — edge% 포화 + sc/state discovery 상승이 정상 표시
-- **하드웨어 실측 미검증** (실제 run 의 jsonl 로 렌더·수치 확인 필요)
+- **ledger 스모크 OK** — 헬퍼(`_run_id_get`/`_prov_next`/`_ledger_write`/`_proposal_write`)가 유효
+  jsonl 2종을 생성하고 `outcome.prov_id == proposal.prov_id` 조인이 동작함을 스텁으로 확인
+- **하드웨어 실측 미검증** (실제 run 의 jsonl 로 렌더·수치·ledger 귀속 확인 필요)
 
 ## 아직 안 한 것 / 다음 작업 (resume용)
 
+- **v9.5 로 넘긴 것(동작 변경/트래픽 주입이라 버전 경계)**: boundary-capture harness(+no-op
+  control), Phase 0 LLM 루프 수정(plateau starvation cap, FFM 단방향 판정 제거, recency/novelty
+  stratified `corpus_eval`, matched-contrastive feedback), hard wear/brick guard 집행. v9.4 는
+  **관측만**(궤적 불변) 유지 — ledger 는 그 정의에 맞아 v9.4 에 포함.
+- **ledger 오귀속 정직성 수정 완료(v9.4)** — source 추론 폐기하고 iteration-local `_credit_seed`
+  (det/seq/base 분기 세팅, 최상단 리셋)로 명시 귀속 → det/random stale·c2 뒤 정당선택 누락 둘 다
+  제거. io_patterns descriptor+read pre-write 까지 prov_id 전파. calibration 요약 record 추가.
+  ledger write 실패 유실 카운트(`_ledger_dropped`)+warn-once. plot `--run` 필터(기본 마지막 run).
+- **staleness 버그 수정 완료(v9.4, 궤적 변경 1건)** — `_account_command` 의 v9.2 staleness 갱신을
+  전역 `_last_selected` → iteration 소스 `_credit_seed` 로 교체. 기존엔 workload/c2/random 이 새 PC 를
+  내면 `_select_seed` 미경유인데도 무관 corpus 시드의 감쇠를 리셋해 스케줄을 왜곡했음(v9.3 버그).
+  **이 한 줄이 v9.4 의 유일한 궤적 변경** — 따라서 v9.4 는 "순수 관측 오버레이"가 아니라 "관측 +
+  staleness 정직성 수정 1건"이다. **ablation 함의**: B0(blind)/B1(LLM)은 반드시 **동일 v9.4 코드**
+  에서 `--rag` 토글로 비교(과거 v9.3 run 과 직접 비교 금지). 정상 c1 경로는 동작 동일(회귀 없음).
+  `_last_selected` 는 이제 write-only(무해·잔존).
+- **ledger 전체 계보 전파·인과는 v9.5** — `prov_id` 는 **직접 계보만** 설명(간접효과=campaign A/B).
+  변이/splice 전 구간 전파, `parent_prov_ids`, `pull_id`, `selected` 이벤트, horizon+감쇠·opportunity
+  정규화 reward, sibling/nearest-neighbor 매칭(matched-contrastive)은 v9.5 스케줄러 몫.
+- **`trace_len`(halt 샘플 수) per-record 미포함** — ledger 가 `rc`+`src`+`sc` 는 남기지만 halt
+  샘플 수는 아직. fast-fail 가설 확정용으로 `len(sampler.current_trace)` 를 record 에 추가 가능.
 - **`[+][State-Cov]` 에는 src 태그 미추가** — state 발견은 명령 시퀀스 단위라 단일 소스 귀속이
   애매해서 제외. source-stacked 그래프의 state 도 비움(정직). 필요하면 IO-WL 패턴 태그
   (`_wl_active_pattern`) 정도로 근사 귀속 가능.

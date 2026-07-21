@@ -15,7 +15,8 @@
   3) coverage_growth_by_source.png  — G3 소스 stacked(누가 성장을 만들었나)
 
 사용:
-  python3 coverage_growth_plot.py <output_dir | coverage_growth.jsonl> [--x exec|time]
+  python3 coverage_growth_plot.py <output_dir | coverage_growth.jsonl> [--x exec|time] [--run <id>|all]
+  # 기본은 파일에 등장한 마지막 run_id 만 그린다(같은 폴더 재실행 시 run 혼합 방지). --run all 로 전체.
 퍼저 프로세스와 분리 실행(인프로세스 matplotlib 반복 렌더가 힙을 손상시킨 전례 회피).
 플롯 텍스트는 ASCII 고정(DejaVu 폰트에 한글 글리프 없음 — 기존 차트 규칙과 동일).
 """
@@ -38,7 +39,9 @@ def _resolve_input(arg):
     return arg
 
 
-def load_rows(path):
+def load_rows(path, run=None):
+    """jsonl 로드. run 필터(v9.4): 같은 output 폴더에 여러 run 이 append 되면 섞이므로,
+    기본은 **가장 최근 run_id 만** 그린다. run='<id>' 로 특정 run, run='all' 로 전체(구버전 호환)."""
     rows = []
     with open(path) as f:
         for line in f:
@@ -49,6 +52,18 @@ def load_rows(path):
                 rows.append(json.loads(line))
             except Exception:
                 continue          # 부분 기록/손상 줄 무시
+    if run != 'all':
+        run_ids = [r.get('run_id') for r in rows if r.get('run_id')]
+        if run_ids:
+            target = run if run else run_ids[-1]   # 지정 없으면 파일에 등장한 마지막 run
+            kept = [r for r in rows if r.get('run_id') == target]
+            if kept:
+                dropped = len(rows) - len(kept)
+                if dropped:
+                    print(f"[coverage_growth_plot] run='{target}' 만 사용 "
+                          f"(다른 run {dropped} 줄 제외; 전체는 --run all)")
+                rows = kept
+            # run_id 없는 구버전 파일이면 필터 없이 전체 사용(kept 비면 그대로).
     rows.sort(key=lambda r: r.get('exec', 0))
     return rows
 
@@ -165,10 +180,15 @@ def main():
         i = sys.argv.index('--x')
         if i + 1 < len(sys.argv):
             xmode = sys.argv[i + 1]
+    run = None                     # 기본: 파일 내 마지막 run_id 만 (여러 run 혼합 방지)
+    if '--run' in sys.argv:
+        i = sys.argv.index('--run')
+        if i + 1 < len(sys.argv):
+            run = sys.argv[i + 1]  # '<run_id>' 특정 run, 'all' 전체
     path = _resolve_input(sys.argv[1])
     if not os.path.isfile(path):
         print(f"[coverage_growth_plot] input not found: {path}"); return 2
-    rows = load_rows(path)
+    rows = load_rows(path, run=run)
     if not rows:
         print(f"[coverage_growth_plot] empty data: {path}"); return 2
     x, xlabel = _xaxis(rows, xmode)
