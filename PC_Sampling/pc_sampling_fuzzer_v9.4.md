@@ -16,11 +16,17 @@ v9.3 위에 **커버리지 소스 라벨링 + SC discovery-count(안 A) + 3축 �
   각 축은 이미 전용 `[+]` 로그가 있음(`[+][Edge-Cov]`, `[+][State-Cov]`, `[+][SC-depth]`).
 - **소스는 직교 태그**: `origin(blind|llm) × form(cmd|seq|iowl|replay)`. `[+][Seq-Acc]`·`[+][PM-Cov]`
   는 별도 축이 아니라 seq/pm 이라는 **소스로 얻은 edge/state** 라서 태그로 흡수.
+  (v9.4 fix: 시퀀스 경로는 `_account_command` 에 시퀀스 내부 개별 `Seed` 가 넘어와
+  `isinstance(SequenceSeed)` 로는 `seq` 를 못 잡았고, edge 는 seq_sink 분기가 `_cov_credit` 를
+  아예 안 불러 by_src 에서 누락됐음. → 호출부가 `seq_member` 플래그를 넘겨 `form='seq'` 확정 +
+  seq_sink 분기에 edge 크레딧 추가.)
 - **축마다 분모 성질이 다르다(정직하게 혼합, 억지 통일 안 함):**
   - `edge` = **%** — Ghidra 정적분석이 전체 BB/func 를 주므로 분모 존재(`_sa_total_bbs`/`_sa_total_funcs`).
   - `sc` = **discovery-count (안 A)** — 분모/스펙테이블 없이 **누적 distinct `(cmd, status)`**. 스펙은
     계속 변해 per-command status 테이블 유지가 비현실적이라 분모를 안 씀(= AFL 방식의 발견 카운트).
-  - `state` = **discovery-count** — 누적 `state_corpus`.
+  - `state` = **discovery-count** — 누적 distinct state 시그니처(`_state_seen`, `causes` 기준).
+    (v9.4 fix: 이전엔 `len(state_corpus)` 를 썼으나 `_cull_state_corpus`(dedup+cap 50)로
+    감소·톱니가 나서 "누적"이 아니었음 → cull 무관한 단조 집합으로 교체.)
 - **구 `SC-depth(0~3)` 위상 변경:** 0~3 은 "분모가 없어서" 쓰던 거친 진행 서수(`_sc_depth`, 스펙
   아님·구조적). SC 커버리지는 이제 discovery-count 가 담당하고, 0~3 은 프론티어 진입 판정용
   **보조 마일스톤**으로만 남음(`[+][SC-depth]` 로그, is_interesting 보상).
@@ -32,11 +38,13 @@ v9.3 위에 **커버리지 소스 라벨링 + SC discovery-count(안 A) + 3축 �
 | 위치 | 내용 |
 |---|---|
 | **119** | `FUZZER_VERSION = "9.4.0"` |
-| **~3488** | 초기화: `self._sc_seen: set`(안 A 누적), `self._cov_by_src: dict`(소스별 누적), `self._cov_growth_hist: list` |
-| **~5206** | 헬퍼 `_cov_src_tag(seed, source) -> 'origin/form'`, `_cov_credit(src, axis, n)` |
-| **~5663** | `_account_command` 내 `_ns`(status) 처리부: distinct `(track_key, _ns)` 신규면 `_sc_seen` 추가 + `_cov_credit(src,'sc')` + **`[+][SC-Cov] cmd=.. src=.. status=.. total_sc=N`** 로그 |
-| **~5856** | `[+][Edge-Cov]`/`[+][SC-depth]` 로그에 `src={_edge_src}` 추가, edge 신규 시 `_cov_credit(src,'edge',new_pcs)` |
-| **~5914** | 상태출력 주기마다 3축 스냅샷 → `_cov_growth_hist` append + **`output_dir/coverage_growth.jsonl`** 에 한 줄 append. static 없어도 sc/state 는 기록 |
+| **~3488** | 초기화: `self._sc_seen: set`(안 A 누적), `self._state_seen: set`(state 누적, cull 무관 — v9.4 fix), `self._cov_by_src: dict`(소스별 누적), `self._cov_growth_hist: list` |
+| **~5206** | 헬퍼 `_cov_src_tag(seed, source, seq_member=False) -> 'origin/form'`(v9.4 fix: `seq_member` 로 `form='seq'` 확정), `_cov_credit(src, axis, n)` |
+| **~5663** | `_account_command` 내 `_ns`(status) 처리부: distinct `(track_key, _ns)` 신규면 `_sc_seen` 추가 + `_cov_credit(src,'sc')`(src 에 `seq_member` 전달) + **`[+][SC-Cov] cmd=.. src=.. status=.. total_sc=N`** 로그 |
+| **~5820** | v9.4 fix: seq_sink 분기(시퀀스 member interesting)에서 `new_pcs>0` 시 `_cov_credit(src(seq_member=True),'edge',new_pcs)` — 시퀀스 edge by_src 누락 해소 |
+| **~5856** | `[+][Edge-Cov]`/`[+][SC-depth]` 로그에 `src={_edge_src}` 추가, edge 신규 시 `_cov_credit(src,'edge',new_pcs)`(단일 명령 경로) |
+| **~5914** | 상태출력 주기마다 3축 스냅샷 → `_cov_growth_hist` append + **`output_dir/coverage_growth.jsonl`** 에 한 줄 append. static 없어도 sc/state 는 기록. `state_count`=`len(_state_seen)`(v9.4 fix) |
+| **~6018** | v9.4 fix: `state_corpus.append` 지점에서 `_state_seen.add('|'.join(sorted(causes)))` — cull 무관 누적 |
 
 ### 소스 태그 taxonomy
 
@@ -50,7 +58,7 @@ v9.3 위에 **커버리지 소스 라벨링 + SC discovery-count(안 A) + 3축 �
 {"exec": 12000, "elapsed_s": 2400.0,
  "bb_pct": 41.2, "func_pct": 55.7,        // static 없으면 null
  "sc_count": 37,                          // 누적 distinct (cmd,status)
- "state_count": 12,                       // 누적 state_corpus
+ "state_count": 12,                       // 누적 distinct state 시그니처(_state_seen, cull 무관)
  "by_src": {"blind/cmd": {"edge": 900, "sc": 15, "state": 0},
             "llm/cmd":   {"edge": 120, "sc": 18, "state": 0},
             "llm/iowl":  {"edge": 2,   "sc": 4,  "state": 0}}}

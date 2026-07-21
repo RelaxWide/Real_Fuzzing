@@ -3487,6 +3487,10 @@ class NVMeFuzzer:
         self._llm_depth_cmds: set = set()             # v9.2 Tier3: LLM 계보가 SC-depth 를 전진시킨 명령들(피드백)
         # v9.4: SC discovery-count (안 A) — 분모 없이 누적 발견. distinct (track_key, status) 집합.
         self._sc_seen: set = set()
+        # v9.4 fix: state discovery-count — 진짜 누적. state_corpus 는 _cull_state_corpus 로
+        #   dedup/cap(50) 돼서 len 이 감소할 수 있어 "누적 발견"이 아니다. cull 과 무관하게 단조
+        #   증가하는 distinct state 시그니처(causes) 집합을 따로 둔다(그래프 state_count 의 분자).
+        self._state_seen: set = set()
         # v9.4: 커버리지 소스별 누적(스택 그래프용). src_tag('origin/form') → {'edge','sc','state'}.
         self._cov_by_src: dict = {}
         # v9.4: 3축 성장 스냅샷 이력(별도 그래프 파일 coverage_growth_plot.py 가 읽음).
@@ -5203,15 +5207,18 @@ class NVMeFuzzer:
         new_cov 귀속·grounding·컬링·에너지 등 여러 곳에서 쓰던 동일 판정을 단일화."""
         return str(getattr(seed, 'seed_class', '') or '').startswith('llm')
 
-    def _cov_src_tag(self, seed, source: str) -> str:
+    def _cov_src_tag(self, seed, source: str, seq_member: bool = False) -> str:
         """v9.4: 커버리지 이벤트 소스 태그 'origin/form'.
-        origin = blind|llm (LLM 계보 여부), form = cmd|seq|iowl|replay."""
+        origin = blind|llm (LLM 계보 여부), form = cmd|seq|iowl|replay.
+        seq_member: 시퀀스 실행 경로에서는 _account_command 에 시퀀스 내부의 개별 Seed 가
+        전달되어 isinstance(seed, SequenceSeed) 로는 seq 를 못 잡는다 → 호출부가 넘겨준
+        seq_member 플래그로 form='seq' 를 확정한다(v9.4 fix)."""
         origin = 'llm' if self._is_llm_seed(seed) else 'blind'
         if source == 'workload':
             form = 'iowl'
         elif source == 'c2':
             form = 'replay'
-        elif isinstance(seed, SequenceSeed):
+        elif seq_member or isinstance(seed, SequenceSeed):
             form = 'seq'
         else:
             form = 'cmd'
@@ -5664,7 +5671,7 @@ class NVMeFuzzer:
                 _sc_key = (track_key, _ns)
                 if _sc_key not in self._sc_seen:
                     self._sc_seen.add(_sc_key)
-                    _sc_src = self._cov_src_tag(seed, source)
+                    _sc_src = self._cov_src_tag(seed, source, seq_member=seq_member)
                     self._cov_credit(_sc_src, 'sc')
                     log.warning(f"[+][SC-Cov] cmd={track_key} src={_sc_src} "
                                 f"status={self._sc_name(_ns)}  total_sc={len(self._sc_seen)}")
@@ -5817,6 +5824,12 @@ class NVMeFuzzer:
                 self.cmd_stats[track_key]["interesting"] += 1
                 self._seq_sink['interesting'] = True
                 self._seq_sink['new_pcs'] += new_pcs
+                # v9.4 fix: 시퀀스 edge 발견도 소스별 by_src 에 적립. 단일 명령 경로(elif 아래)는
+                #   _cov_credit(...,'edge') 를 부르지만 이 seq_sink 분기는 안 불러서 by_src 에서
+                #   시퀀스 edge 가 통째로 누락됐었음. seq_member=True 라 form='seq' 로 태깅된다.
+                if new_pcs > 0:
+                    self._cov_credit(self._cov_src_tag(seed, source, seq_member=True),
+                                     'edge', new_pcs)
                 if self.config.state_enabled and source == 'c1':
                     self._csfuzz_c1_rewards.append(1)
                 log.info(f"[+][Seq-Acc] cmd={cmd.name} +{new_pcs} PCs "
@@ -5929,7 +5942,9 @@ class NVMeFuzzer:
                 'bb_pct': round(_bbpct, 3) if _bbpct is not None else None,
                 'func_pct': round(_fpct, 3) if _fpct is not None else None,
                 'sc_count': len(self._sc_seen),
-                'state_count': len(getattr(self, 'state_corpus', [])),
+                # v9.4 fix: 누적 distinct state discovery(cull 로 안 줄어듦). 구현은 len(state_corpus)
+                #   였는데 cull(dedup+cap50)로 감소·톱니가 나서 "누적 discovery-count" 문서와 어긋났음.
+                'state_count': len(self._state_seen),
                 'by_src': {k: dict(v) for k, v in self._cov_by_src.items()},
             }
             self._cov_growth_hist.append(_snap_row)
@@ -6016,6 +6031,9 @@ class NVMeFuzzer:
                             found_at = self.executions,
                         )
                         self.state_corpus.append(_entry)
+                        # v9.4 fix: cull 과 무관한 진짜 누적 state discovery-count.
+                        #   cull dedup 과 같은 causes 시그니처를 키로 단조 집합에 기록.
+                        self._state_seen.add('|'.join(sorted(_entry.causes)))
                         # C2 reward는 _replay_state_sequence()에서 replay 후 state 재현 여부로 기록.
                         # periodic state-cov 발견은 새 state_corpus 추가만 담당하고 reward는 추가하지 않음.
                         self._generate_state_replay_sh(_entry)
