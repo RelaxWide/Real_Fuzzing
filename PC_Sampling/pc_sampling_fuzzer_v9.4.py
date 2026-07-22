@@ -169,7 +169,9 @@ def load_user_config(path=None):
     return _cfg_hexnorm(_raw)
 
 
-_CFG = load_user_config(_early_config_path())
+_CFG_ARG = _early_config_path()
+_CFG_PATH = Path(_CFG_ARG) if _CFG_ARG else Path(__file__).resolve().parent / 'fuzzer_config.json'
+_CFG = load_user_config(_CFG_ARG)
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 
 
@@ -1346,6 +1348,17 @@ def _code_signature() -> str:
         return "unknown"
 
 
+def _config_signature() -> str:
+    """실행에 쓰인 config 파일(fuzzer_config.json)의 sha256[:12]. 어떤 설정으로 돌았는지 식별용.
+    [CODE] sha 는 .py 만 해시하므로, config 만 다른 경우(예: 제품 프로파일 stale)를 이걸로 구분한다."""
+    import hashlib
+    try:
+        with open(_CFG_PATH, 'rb') as _fp:
+            return hashlib.sha256(_fp.read()).hexdigest()[:12]
+    except Exception:
+        return "unknown"
+
+
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     """파일 + 콘솔 동시 로깅 설정 (실행마다 날짜시간 로그 파일 생성)"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -1400,7 +1413,8 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     logger.addHandler(ch)
 
     # v9.3: 실행 코드 파일 해시 스탬프 — 어느 코드로 돌았는지 사후 식별(버전 미노출).
-    logger.warning(f"[CODE] sha={_code_signature()}")
+    logger.warning(f"[CODE] sha={_code_signature()}  cfg={_config_signature()} "
+                   f"({os.path.basename(str(_CFG_PATH))})")
 
     return logger, log_file
 
