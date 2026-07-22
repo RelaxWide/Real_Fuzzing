@@ -1127,6 +1127,40 @@
       "enable_jlink_dump": true,
       "state_fields": "r8"
     },
+    "P7": {
+      "_comment_timeouts": "펌웨어시간 워치독(halt 프리즈 차감)이 halt 오버헤드를 명령마다 실측·보정하므로, 이 값은 '진짜 펌웨어 실행시간' 기준(구 +10s halt 마진 제거). 잔차 흡수는 코드 HALT_FWTIME_MARGIN_SEC(≈1s).",
+      "nvme_timeouts": {
+        "command": 30000,
+        "format": 300000,
+        "flush": 30000,
+        "selftest_short": 30000,
+        "selftest_ext": 30000,
+        "verify": 30000,
+        "aer": 600000
+      },
+      "interface": "swd",
+      "jlink_device": "Cortex-R5",
+      "sampler_type": "jlink_halt",
+      "_comment_sampling": "go_settle_ms/halt_poll_ms 는 halt 샘플링 밀도 튜닝. go_settle 이 낮을수록 코어가 halt 로 얼어있는 시간비율↑(프리즈1.8ms 기준: 50→3.5%, 5→26%, 1→64%). 이 값은 '샘플링 품질(해상도 vs 침습도)' 기준으로 고를 것 — 커버리지 촘촘히 필요하면 2~3, 펌웨어 자연스럽게 돌리려면 10. 주의: 호스트 OS freeze 는 halt-vs-컨트롤러 '타이밍 레이스'라 go_settle 로 튜닝 불가로 판명됨(freeze까지 명령수: 1ms=25만·37만/5ms=44만/10ms=18만·9만 — 노이즈, 상관 없음). freeze 는 값 조절이 아니라 corpus 체크포인트+재부팅 자동재시작으로 흡수. 상세: SESSION_HANDOFF_v9.0.md §4.",
+      "go_settle_ms": 5,
+      "halt_poll_ms": 8,
+      "jlink_speed": 2000,
+      "jlink_ap_index": 0,
+      "pc_reg_index": null,
+      "por_remove_bdf": "0000:00:01.1",
+      "invalid_pc_vals": [
+        "0x6ba02476",
+        "0x6ba02477"
+      ],
+      "fw_addr_start": "0x0",
+      "fw_addr_end": "0x9cffff",
+      "bb_file": "basic_blocks_P9.txt",
+      "func_file": "functions_P9.txt",
+      "enable_ufas": false,
+      "enable_debug_tool_dump": true,
+      "enable_jlink_dump": false,
+      "state_fields": "p9"
+    },
     "P9": {
       "_comment_timeouts": "펌웨어시간 워치독(halt 프리즈 차감)이 halt 오버헤드를 명령마다 실측·보정하므로, 이 값은 '진짜 펌웨어 실행시간' 기준(구 +10s halt 마진 제거). 잔차 흡수는 코드 HALT_FWTIME_MARGIN_SEC(≈1s).",
       "nvme_timeouts": {
