@@ -14,7 +14,7 @@ v9.3 위에 **커버리지 소스 라벨링 + SC discovery-count(안 A) + 3축 �
 
 - **커버리지 축은 3개**: `edge-cov`(코드), `state-cov`(FTL/telemetry 상태), `sc-cov`(펌웨어 응답).
   각 축은 이미 전용 `[+]` 로그가 있음(`[+][Edge-Cov]`, `[+][State-Cov]`, `[+][SC-depth]`).
-- **소스는 직교 태그**: `origin(blind|llm) × form(cmd|seq|iowl|replay)`. `[+][Seq-Acc]`·`[+][PM-Cov]`
+- **소스는 직교 태그**: `origin(mutation|llm) × form(cmd|seq|iowl|replay)`. `[+][Seq-Acc]`·`[+][PM-Cov]`
   는 별도 축이 아니라 seq/pm 이라는 **소스로 얻은 edge/state** 라서 태그로 흡수.
   (v9.4 fix: 시퀀스 경로는 `_account_command` 에 시퀀스 내부 개별 `Seed` 가 넘어와
   `isinstance(SequenceSeed)` 로는 `seq` 를 못 잡았고, edge 는 seq_sink 분기가 `_cov_credit` 를
@@ -76,9 +76,9 @@ feedback·bandit reward·transition 재현성 측정이 읽을 데이터를 미�
 
 ### 소스 태그 taxonomy
 
-- `origin`: `llm`(= `_is_llm_seed`, seed_class 가 'llm*') / `blind`
+- `origin`: `llm`(= `_is_llm_seed`, seed_class 가 'llm*') / `mutation`(그 외 — 스펙 모르는 전통 변이 경로)
 - `form`: `iowl`(source=='workload') / `replay`(source=='c2') / `seq`(`SequenceSeed`) / `cmd`(그 외)
-- 예: `src=llm/cmd`, `src=blind/cmd`, `src=llm/iowl`(LLM-지시 IO 워크로드 — 겹침이 명확히 드러남)
+- 예: `src=llm/cmd`, `src=mutation/cmd`, `src=llm/iowl`(LLM-지시 IO 워크로드 — 겹침이 명확히 드러남)
 
 ### `coverage_growth.jsonl` 스키마 (한 줄 = 한 스냅샷)
 
@@ -87,7 +87,7 @@ feedback·bandit reward·transition 재현성 측정이 읽을 데이터를 미�
  "bb_pct": 41.2, "func_pct": 55.7,        // static 없으면 null
  "sc_count": 37,                          // 누적 distinct (cmd,status)
  "state_count": 12,                       // 누적 distinct state 시그니처(_state_seen, cull 무관)
- "by_src": {"blind/cmd": {"edge": 900, "sc": 15, "state": 0},
+ "by_src": {"mutation/cmd": {"edge": 900, "sc": 15, "state": 0},
             "llm/cmd":   {"edge": 120, "sc": 18, "state": 0},
             "llm/iowl":  {"edge": 2,   "sc": 4,  "state": 0}}}
 ```
@@ -126,7 +126,7 @@ feedback·bandit reward·transition 재현성 측정이 읽을 데이터를 미�
   전역 `_last_selected` → iteration 소스 `_credit_seed` 로 교체. 기존엔 workload/c2/random 이 새 PC 를
   내면 `_select_seed` 미경유인데도 무관 corpus 시드의 감쇠를 리셋해 스케줄을 왜곡했음(v9.3 버그).
   **이 한 줄이 v9.4 의 유일한 궤적 변경** — 따라서 v9.4 는 "순수 관측 오버레이"가 아니라 "관측 +
-  staleness 정직성 수정 1건"이다. **ablation 함의**: B0(blind)/B1(LLM)은 반드시 **동일 v9.4 코드**
+  staleness 정직성 수정 1건"이다. **ablation 함의**: B0(mutation-only, `--rag` off)/B1(LLM)은 반드시 **동일 v9.4 코드**
   에서 `--rag` 토글로 비교(과거 v9.3 run 과 직접 비교 금지). 정상 c1 경로는 동작 동일(회귀 없음).
   `_last_selected` 는 이제 write-only(무해·잔존).
 - **ledger 전체 계보 전파·인과는 v9.5** — `prov_id` 는 **직접 계보만** 설명(간접효과=campaign A/B).

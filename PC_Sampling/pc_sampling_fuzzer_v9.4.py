@@ -5285,11 +5285,11 @@ class NVMeFuzzer:
 
     def _cov_src_tag(self, seed, source: str, seq_member: bool = False) -> str:
         """v9.4: 커버리지 이벤트 소스 태그 'origin/form'.
-        origin = blind|llm (LLM 계보 여부), form = cmd|seq|iowl|replay.
+        origin = mutation|llm (LLM 계보 여부; mutation=스펙 모르는 전통 변이 경로), form = cmd|seq|iowl|replay.
         seq_member: 시퀀스 실행 경로에서는 _account_command 에 시퀀스 내부의 개별 Seed 가
         전달되어 isinstance(seed, SequenceSeed) 로는 seq 를 못 잡는다 → 호출부가 넘겨준
         seq_member 플래그로 form='seq' 를 확정한다(v9.4 fix)."""
-        origin = 'llm' if self._is_llm_seed(seed) else 'blind'
+        origin = 'llm' if self._is_llm_seed(seed) else 'mutation'
         if source == 'workload':
             form = 'iowl'
         elif source == 'c2':
@@ -5907,7 +5907,7 @@ class NVMeFuzzer:
             log.debug(f"  ALL raw PCs: {[hex(pc) for pc in self.sampler._last_raw_pcs]}")
 
         # v9.4 ledger(관측 전용, 궤적 불변): 주목할만한 실행만 기록 — interesting / SC-depth 전진 /
-        #   신규 SC / LLM 귀속. blind no-op 대량 기록을 피해 파일 크기를 억제한다.
+        #   신규 SC / LLM 귀속. mutation-origin no-op 대량 기록을 피해 파일 크기를 억제한다.
         # prov_id 귀속 정직성: 실행 시드가 직접 prov_id 를 지녔으면 그것(=direct 계보 — LLM 단일시드/
         #   시퀀스 멤버/워크로드). 없으면 이번 iteration 의 **명시적** 소스 corpus 시드 `_credit_seed`
         #   에서만 귀속(prov_source='parent'). source 로 추론하지 않는다 — det/random(source='c1' 이나

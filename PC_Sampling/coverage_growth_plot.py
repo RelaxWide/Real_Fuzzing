@@ -78,8 +78,8 @@ def _all_sources(rows):
     srcs = set()
     for r in rows:
         srcs.update((r.get('by_src') or {}).keys())
-    # blind 먼저, llm 나중 — 색 일관성
-    return sorted(srcs, key=lambda s: (not s.startswith('blind'), s))
+    # mutation 먼저, llm 나중 — 색 일관성
+    return sorted(srcs, key=lambda s: (not s.startswith('mutation'), s))
 
 
 def _series_by_src(rows, axis):
@@ -144,8 +144,8 @@ def plot_normalized(rows, x, xlabel, outpath):
 
 # ── G3: source-stacked ──────────────────────────────────────────────────────
 _SRC_COLORS = {
-    'blind/cmd': '#4c78a8', 'blind/seq': '#72b7b2', 'blind/iowl': '#54a24b',
-    'blind/replay': '#b279a2',
+    'mutation/cmd': '#4c78a8', 'mutation/seq': '#72b7b2', 'mutation/iowl': '#54a24b',
+    'mutation/replay': '#b279a2',
     'llm/cmd': '#f58518', 'llm/seq': '#e45756', 'llm/iowl': '#eeca3b',
     'llm/replay': '#ff9da6',
 }
