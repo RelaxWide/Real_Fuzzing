@@ -4309,14 +4309,35 @@ class NVMeFuzzer:
                   + f". dd 출력: {_st['tail'][-1] if _st['tail'] else 'N/A'}")
         return False
 
+    def _pcie_topmost_bdf(self) -> Optional[str]:
+        """EP 로부터 PCIe topology 최상단(host bridge 바로 아래 = root port) BDF 를 sysfs
+        realpath 로 동적 탐지. PC/슬롯이 바뀌어 root port 주소가 달라져도 자동으로 따라간다.
+        realpath 예: /sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0
+                    → BDF 성분 [root port, (스위치...), EP] 중 첫 번째 = 최상단."""
+        if not self._pcie_bdf:
+            return None
+        try:
+            real = os.path.realpath(f'/sys/bus/pci/devices/{self._pcie_bdf}')
+            bdfs = [p for p in real.split('/')
+                    if _re.match(r'^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$', p)]
+            return bdfs[0] if bdfs else None
+        except Exception as e:
+            log.debug(f"[PCIe] topmost BDF 탐지 실패: {e}")
+            return None
+
     def _por_remove_target(self) -> Optional[str]:
         """POR 시 PCIe 로 remove 할 대상 BDF.
 
-        제품이 por_remove_bdf 를 지정하면 그 BDF 를, 없으면 자동 탐지된 EP 자신
-        (_pcie_bdf)을 반환한다. P9 는 PMU 보드 특성상 device 자신이 아니라
-        `lspci -tvvv` topology 최상단(root port/bridge, 예: 0000:00:01.1)을 제거해야
-        전원 사이클이 제대로 걸린다 → profile 에서 por_remove_bdf 로 지정."""
-        return self.config.por_remove_bdf or self._pcie_bdf
+        - por_remove_bdf='auto-root': PMU 보드용 — topology 최상단(root port)을 **동적 탐지**해
+          remove. PC/슬롯이 바뀌어 root port BDF 가 달라져도 자동 추적(하드코딩 불필요). [P9/P7]
+        - por_remove_bdf=실제 BDF(예 '0000:00:01.1'): 그 값을 그대로(명시 override).
+        - 미지정(None): 자동 탐지된 EP 자신(_pcie_bdf) 을 remove. [PM9M1/BM9H1]
+        P9/P7 은 PMU 보드 특성상 EP 가 아니라 topology 최상단(root port)을 제거해야 전원
+        사이클이 제대로 걸린다."""
+        v = self.config.por_remove_bdf
+        if v == 'auto-root':
+            return self._pcie_topmost_bdf() or self._pcie_root_bdf or self._pcie_bdf
+        return v or self._pcie_bdf
 
     def _power_cycle_ssd(self) -> bool:
         """PMU 보드를 이용한 SSD POR Phase 1: 전원 사이클 + SWD 준비 대기.

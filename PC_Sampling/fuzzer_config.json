@@ -1147,7 +1147,7 @@
       "jlink_speed": 2000,
       "jlink_ap_index": 0,
       "pc_reg_index": null,
-      "por_remove_bdf": "0000:00:01.1",
+      "por_remove_bdf": "auto-root",
       "invalid_pc_vals": [
         "0x6ba02476",
         "0x6ba02477"
@@ -1181,7 +1181,7 @@
       "jlink_speed": 2000,
       "jlink_ap_index": 0,
       "pc_reg_index": null,
-      "por_remove_bdf": "0000:00:01.1",
+      "por_remove_bdf": "auto-root",
       "invalid_pc_vals": [
         "0x6ba02476",
         "0x6ba02477"
