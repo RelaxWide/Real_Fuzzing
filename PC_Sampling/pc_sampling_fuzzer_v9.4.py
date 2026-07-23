@@ -4307,8 +4307,14 @@ class NVMeFuzzer:
         try:
             real = os.path.realpath(f'/sys/bus/pci/devices/{self._pcie_bdf}')
             bdfs = [p for p in real.split('/')
-                    if _re.match(r'^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$', p)]
-            return bdfs[0] if bdfs else None
+                    if re.match(r'^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$', p)]
+            if bdfs:
+                # 체인 = [최상단 root port, ...(스위치)..., EP]. remove 대상 = 첫 성분(최상단).
+                #   이 로그로 실제 하드웨어에서 올바른 대상을 골랐는지 바로 검증 가능.
+                log.warning(f"[PCIe] topology 체인(위→아래): {' -> '.join(bdfs)}"
+                            f"  → remove 대상(최상단) = {bdfs[0]}")
+                return bdfs[0]
+            return None
         except Exception as e:
             log.debug(f"[PCIe] topmost BDF 탐지 실패: {e}")
             return None
