@@ -229,6 +229,7 @@ RAG_MAX_CONSEC_TASK  = int(_RAG.get('max_consec_task', 3))     # 같은 LLM task
 RAG_CONTRAST_MIN_DIFF = int(_RAG.get('contrast_min_field_diff', 1))  # matched-contrastive: sibling 최대 다른 필드 수(1=한 요인만)
 RAG_MIN_REQ_INTERVAL = float(_RAG.get('min_request_interval_sec', 0.0))  # 요청 최소 시간간격(초). rate-limit 회피. 0=끔
 RAG_CULL_GRACE       = int(_RAG.get('cull_grace', 8))     # LLM 시드 컬링 유예: exec_count < 이 값이면 보호(변이 탐색 기회)
+RAG_FAIL_LIMIT       = int(_RAG.get('fail_limit', 3))     # RAG service 호출 연속 실패 이 횟수 도달 시 이후 RAG 비활성(0=끔)
 # 디바이스 grounding용: Identify Controller OACS/ONCS 비트 → 지원 명령 매핑 (프롬프트에 실제 능력 주입)
 _OACS_CMDS = {0: 'SecuritySend/Receive', 1: 'FormatNVM', 2: 'FWDownload/FWCommit',
               3: 'NamespaceManagement', 4: 'DeviceSelfTest', 5: 'DirectiveSend/Receive',
@@ -3383,6 +3384,7 @@ class NVMeFuzzer:
         self._llm_last_cov = 0                # plateau 감지용 직전 coverage 크기
         self._llm_plateau_since = 0           # coverage 정체 시작 exec
         self._llm_task_rr = 0                 # task 라운드로빈 인덱스
+        self._llm_fail_streak = 0             # RAG service 호출 연속 실패 수(서킷브레이커)
         self._llm_last_task = None            # v9.5: 직전 선택 task(연속 상한 추적)
         self._llm_task_consec = 0             # v9.5: 같은 task 연속 선택 횟수(starvation-free cap)
         self._llm_stats = {'seeds': 0, 'seqs': 0, 'dropped': 0, 'dupes': 0, 'rounds': 0,
@@ -5273,9 +5275,17 @@ class NVMeFuzzer:
         """워커 결과 1건을 파싱·검증·주입(메인 스레드). 절대 raise 안 함."""
         # stale 결과(너무 오래된 요청)는 무시.
         if res.get('error'):
+            # RAG service 호출 자체 실패(엔드포인트 down/예외). 서킷브레이커: 연속 RAG_FAIL_LIMIT
+            #   회 실패하면 이후 RAG 를 끄고 blind/mutation fuzzing 으로 계속(무한 재시도 방지).
+            self._llm_fail_streak += 1
             self._llm_archive(res)
-            log.info(f"[LLM] 호출 오류: {res['error']}")
+            log.info(f"[LLM] 호출 오류 ({self._llm_fail_streak}/{RAG_FAIL_LIMIT}): {res['error']}")
+            if RAG_FAIL_LIMIT > 0 and self._llm_fail_streak >= RAG_FAIL_LIMIT:
+                self.llm.enabled = False
+                log.warning(f"[LLM] RAG service 호출 {self._llm_fail_streak}회 연속 실패 → 이후 "
+                            f"RAG 비활성화(blind/mutation fuzzing 계속). 마지막 오류: {res['error']}")
             return
+        self._llm_fail_streak = 0   # 서비스가 응답함(파싱 성패 무관) → 연속 실패 리셋
         if self.executions - res.get('submitted_at', 0) > RAG_RESULT_STALE:
             log.info("[LLM] stale 결과 무시")
             return
