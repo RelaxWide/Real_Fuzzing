@@ -1,8 +1,19 @@
 # HANDOFF — OS Freeze 조사 (J-Link halt 관련), 2026-07 진행 중
 
-퍼징 중 **호스트 OS 하드 프리즈** 조사. 실측으로 firmware-first/SMM → (A) AER 인터럽트 storm →
-(C) non-posted read 무한 정지를 차례로 폐기. 현재 1순위는 **(F) flow-control credit 고갈로 인한
-posted write 백프레셔 데드락**.
+퍼징 중 **호스트 OS 하드 프리즈** 조사.
+
+> ## ★ 2026-07-27 결정적 전환 — 이건 머신 특정 문제다
+> **다른 PC 에서 동일 구성으로 1000만 명령 무프리즈**(= 프리즈 임계치 30~48만의 **20배 이상**).
+> 그 PC 는 **커널 버전이 더 높다.**
+>
+> → "halt 가 PCIe 를 멈춘다"는 게 일반 법칙이 아니라 **이 머신에서만 성립하는 조건**이다.
+> → **조사 방향 전환: 메커니즘 규명(느림) → 두 머신의 차이 이분탐색(빠름).**
+> → 이하의 (F)/(B)/(D) 가설과 실험 순서는 **이 사실을 모르고 세운 것**이라 우선순위가 낮아졌다.
+> 특히 **(F) 는 커널 업그레이드로 고쳐지면 폐기**된다 — 크레딧 데드락은 하드웨어 패브릭 상태라
+> 커널 버전으로 안 고쳐지기 때문. 즉 아래 1번이 수리이자 (F) 검증을 겸한다.
+
+경과: firmware-first/SMM → (A) AER 인터럽트 storm → (C) non-posted read 무한 정지를 차례로 폐기.
+머신 특정 사실이 밝혀지기 전 1순위였던 것은 (F) flow-control credit 고갈.
 
 ## 증상
 - **J-Link halt 샘플러(P7, Cortex-R5)** 사용 시 퍼징 도중 **호스트 전체 프리즈 → 재부팅 필요.**
@@ -87,9 +98,49 @@ corrected 가 누적되다 uncorrectable/link-down 으로 번짐. noaer 로 관�
 이후 MMIO 가 안 돌아오면 (C) 와 같은 정지로 수렴. `pcie_ports=compat` 로 포트 서비스 전면 차단해
 배제한다.
 
-## 다음 단계 (중지 지점)
+## 다음 단계 (중지 지점) — 머신 차분 우선
 
-0. **가시성 확보 — netconsole (최우선).** 이 조사의 최대 제약은 "kernel-silent"인데, 그건 journald
+> 아래 A/B/C 가 현재 우선순위. 그 뒤의 0~5 는 머신 특정 사실을 모르고 세운 순서라
+> **A~C 가 끝난 뒤에도 원인이 안 잡힐 때만** 의미가 있다.
+
+**A. 정상 PC 의 커널을 문제 PC 에 설치 → 재부팅 → 퍼저 80만 명령 (1순위)**
+```bash
+uname -r                                   # 양쪽에서 각각 확인
+sudo apt install linux-image-<정상PC버전>   # 배포판에 맞게
+sudo update-grub && sudo reboot            # 기존 커널은 GRUB 에 남겨 A/B 가능하게
+```
+- 80만 = 기존 재현 상한(48만)의 1.7배. 넘기면 잡힌 것.
+- **동시에 `pci=noaer` 제거** — 원인 아님이 확인됐고 켜두면 링크 카나리아만 가린다.
+- 고쳐지면 → 원인은 커널 쪽(포트 서비스/nvme 타임아웃 경로 등)이거나 칩셋 차이. **(F) 폐기.**
+
+**B. 커널이 안 고치면 — 차분 덤프 (양쪽 5분씩)**
+다른 PC 는 커널만 다른 게 아니라 **보드·칩셋·BIOS·슬롯이 전부 다르다.** 커널이 제일 싸게
+바꿀 수 있는 변수라 먼저 칠 뿐, 음성이면 나머지를 본다.
+```bash
+uname -r; cat /proc/cmdline
+sudo dmidecode -s baseboard-product-name; sudo dmidecode -s bios-version
+sudo lspci -vvv -s <root port BDF> | grep -E "LnkCap|LnkSta|DevCtl2|ASPM|DPC"
+sudo lspci -vvv -s <SSD BDF>       | grep -E "LnkCap|LnkSta|DevCtl2|ASPM"
+journalctl -k -b | grep -iE "_OSC|aer|dpc"
+```
+**특히 `LnkSta` 의 속도/폭이 두 머신에서 같은가.** 문제 PC 만 낮은 폭으로 링크업했거나
+라이저/슬롯이 다르면 그게 곧 답이다.
+
+**C. 링크 프로브 양쪽 비교 (공짜 감별 — (B) 계열을 한 번에 살리거나 죽인다)**
+```bash
+sudo python3 pcie_link_probe.py --root <root> --ep <ssd> --interval 5 --clear
+```
+- **정상 PC 도 링크 에러가 나는데 안 죽는다** → 에러는 무죄, **처리 방식**(커널/칩셋)의 문제
+- **정상 PC 는 0, 문제 PC 만 난다** → 문제 PC 의 링크가 실제로 나쁨(신호무결성/슬롯/라이저)
+
+**실용 선택지:** 정상 PC 를 퍼징에 쓸 수 있으면 **리그를 옮기는 것도 정답**이다. 이 머신을
+꼭 써야 하는 게 아니면 원인 규명은 선택사항.
+
+---
+
+### (이하는 머신 특정 사실 이전에 세운 순서 — A~C 이후에만 의미)
+
+0. **가시성 확보 — netconsole.** 이 조사의 최대 제약은 "kernel-silent"인데, 그건 journald
    가 디스크 flush 라 프리즈를 못 따라오기 때문이기도 하다. netconsole 은 UDP 로 즉시 나간다.
    ```bash
    # 퍼징 호스트
@@ -101,7 +152,14 @@ corrected 가 누적되다 uncorrectable/link-down 으로 번짐. noaer 로 관�
    나오면 (B)/(C)/(D) 를 추측이 아니라 스택으로 가른다.
    **⚠ `softlockup_panic`/`hardlockup_panic` 절대 금지** — 과거 이 옵션들이 퍼저의 *의도적* D-state
    를 호스트 panic 으로 승격시킨 전례(관측자 효과). 상세는 crash 조사 기록.
-1. **★ halt *지속시간* 스윕 — 아직 한 번도 안 건드린 노브 (F 검증 + 잠재적 완화책)**
+1. **halt *지속시간* 스윕 (F 검증 + 잠재적 완화책). ⚠ 비용 주의 — 아래 분산 문제.**
+   **MTBF 비교는 단일 run 으로 불가능하다.** 재현 횟수가 9만~48만(5배)로 흩어지는 기하분포라
+   `speed=12000` 한 번이 `speed=2000` 한 번보다 오래 버텨도 **아무것도 증명 못 한다**(노이즈 안).
+   3배 개선을 노이즈와 구분하려면 **arm 당 4~5회 재현** → arm 당 5~10시간, arm 2~3개면 20~30시간.
+   → **대안: 희귀 사건(프리즈) 대신 선행지표로 최적화.** 퍼저 + `pcie_link_probe --clear` 로
+   halt 가 만드는 링크 이벤트가 **측정되는지** 먼저 보고(분 단위), 측정되면 그 지표로 speed 를
+   비교한 뒤 마지막에만 프리즈로 확증한다. 20~30시간 → ~1시간.
+   링크 이벤트가 0 으로 안 잡히면 → 링크 계층에 안 보인다는 뜻이고 netconsole 백트레이스 외 길 없음.
    지금까지 튜닝한 건 전부 `go_settle`(halt **간격**)이고 **halt 자체의 길이(~1.8ms)는 고정**이었다.
    (F) 가 맞다면 p 를 정하는 건 간격이 아니라 **halt 창 동안 컨트롤러 버퍼가 얼마나 차는가** =
    **halt 지속시간**이다. → `jlink_speed` 2000 → 8000/12000kHz 로 올리면 SWD 트랜잭션이 빨라져
@@ -115,8 +173,12 @@ corrected 가 누적되다 uncorrectable/link-down 으로 번짐. noaer 로 관�
    - 프리즈 **남** → halt 자체가 링크를 죽임 = (B)
    - **⚠ 횟수 주의**: 기하분포라 1회분 노출(~70만 halt)에서의 음성은 증거력이 약하다(절반은 운).
      음성으로 결론내려면 **3배(~200만 halt, ≈3.8h)** — 스크립트 기본값이 200만인 이유.
-3. **confound 닫기 — J-Link USB vs halt.** `--no-jlink` 는 halt 뿐 아니라 **J-Link USB 트래픽
-   전체**를 뺐다. 엄밀히는 "halt 가 유일 변수"가 아니다.
+3. **confound 닫기 — J-Link USB vs halt. ⚠ 수율 낮음, 기본적으로 건너뛸 것.**
+   `--no-jlink` 는 halt 뿐 아니라 **J-Link USB 트래픽 전체**를 뺐으므로 엄밀히는 "halt 가 유일
+   변수"가 아니다. 다만 **닫는 비용이 ~7.8시간인데 산출은 예상된 음성 1비트**다(J-Link USB 가
+   호스트를 무음 하드프리즈시킬 사전확률은 낮다). **퍼저가 30~48만 명령에 재현하므로 다른
+   실험은 전부 퍼저로 하는 게 빠르다.** 스크립트가 퍼저보다 나은 건 **기본 halt 모드 +
+   nvme unbind**(= 퍼저가 구조적으로 못 만드는 "NVMe 트래픽 없는 halt") 하나뿐.
    → **`halt_loop_stress.py --no-halt`** (SWD/USB 트래픽 동일 + 코어 정지 없음).
    - 프리즈 **남** → 원인은 halt 가 아니라 J-Link/SWD/USB 경로
    - 프리즈 **안 남** → confound 닫힘, **halt 가 트리거로 확정**
@@ -144,7 +206,10 @@ corrected 가 누적되다 uncorrectable/link-down 으로 번짐. noaer 로 관�
   재부팅 + systemd/cron 자동재시작 → 프리즈를 "수 분 다운"으로 흡수.
 
 ## 남은 확인 질문
-- 이 프리즈가 **모든 PC 에서 나나, 특정 보드에서만 나나?** (링크 신호무결성/BIOS 의존이면 보드별 차이)
+- ~~이 프리즈가 모든 PC 에서 나나, 특정 보드에서만 나나?~~ → **답 나옴(2026-07-27, 결정적)**:
+  **다른 PC 에서 1000만 명령 무프리즈, 커널 버전 상위.** 머신 특정 문제 확정. 상단 참조.
+- **정상 PC 의 커널로 바꾸면 문제 PC 도 살아나나?** (= 커널 vs 하드웨어 갈림길, 1순위 실험)
+- 두 머신의 `LnkSta`(링크 속도/폭)·보드·BIOS·슬롯이 어떻게 다른가?
 - ~~`pci=noaer` run 의 프리즈 여부 + corrected 카운트~~ → **답 나옴**(위 실험 기록: 프리즈 재현, 0개).
 - ~~root port / endpoint 의 Completion Timeout Disable 이 켜져 있나?~~ → **답 나옴**: 둘 다
   value=0(50us~50ms), Disable=off → (C) 폐기.
