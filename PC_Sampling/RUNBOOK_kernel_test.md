@@ -18,6 +18,7 @@
 ```bash
 # ① Secure Boot — mainline 커널은 서명이 없어서 켜져 있으면 부팅 자체가 안 된다
 sudo apt install -y mokutil 2>/dev/null; mokutil --sb-state
+[ -d /sys/firmware/efi ] && echo "UEFI 부팅" || echo "Legacy BIOS (CSM) 부팅"
 
 # ② /boot 여유 공간 — 20.04 는 /boot 가 512MB 인 경우가 많고 커널 하나가 ~100MB 다
 df -h /boot
@@ -27,9 +28,21 @@ uname -r; cat /proc/cmdline; nvme list
 ```
 
 **판정:**
+- **`EFI variables are not supported on this system`** → **통과. 그냥 진행.**
+  이건 에러가 아니라 이 머신이 **레거시 BIOS(CSM) 모드로 부팅**됐다는 뜻이다. Secure Boot 는
+  UEFI 기능이므로 **애초에 존재하지 않는다** → 서명 없는 mainline 커널이 문제없이 부팅된다.
+  (문제 PC 실측 = 이 케이스, 2026-07-27)
+- `SecureBoot disabled` / `This system doesn't support Secure Boot` → 진행.
 - `SecureBoot enabled` → **BIOS 에서 Secure Boot 를 꺼야 한다.** 못 끄면 여기서 멈추고 알릴 것
   (서명된 커널을 쓰는 다른 경로를 짜야 함).
-- `SecureBoot disabled` 또는 `This system doesn't support Secure Boot` → 진행.
+
+> **⚠ 부수 발견 — 이건 따로 기록해 둘 것:** 문제 PC 가 **레거시 BIOS(CSM) 부팅**이라는 사실
+> 자체가 **두 머신의 또 다른 차이**일 수 있다. 22.04 를 쓰는 정상 PC 는 UEFI 부팅일 가능성이
+> 높다. CSM/레거시 부팅은 펌웨어→OS 의 PCIe 제어권 협상(`_OSC`), ASPM 초기 설정, MMIO 리소스
+> 할당에 영향을 준다 — HANDOFF 가 `_OSC: OS now controls [AER DPC]` 를 근거로 쓴 부분이 있는데
+> **그 협상 자체가 부팅 모드에 따라 달라질 수 있다.**
+> 지금은 커널 테스트를 그대로 진행하되, **7단계에서 "6.8 도 FREEZE"가 나오면 이게 B단계
+> 차분 덤프의 용의자 1순위**다. 그때 정상 PC 에서도 `[ -d /sys/firmware/efi ]` 를 확인할 것.
 - `/boot` 여유가 **300MB 미만**이면 먼저 정리:
   ```bash
   sudo apt autoremove --purge     # 오래된 커널 제거
@@ -183,7 +196,7 @@ sudo .venv/bin/python3 PC_Sampling/pc_sampling_fuzzer_v9.5.py --product P7 --res
 |---|---|---|
 | **PASS** 150만 | **FREEZE** <48만 | **커널 원인 확정.** 6.8 로 퍼징 계속. (F) 폐기 — 크레딧 데드락은 커널로 안 고쳐지므로. 장기적으로 22.04 업그레이드해서 서명된 6.8 HWE 로 갈 것 |
 | **PASS** 150만 | **PASS** 150만 | 커널 무관 — 그 사이 **다른 게** 바뀌었다. 무엇이 바뀌었는지 추적(케이블/슬롯/온도/장치 상태). 재현 자체가 불안정해진 것이므로 신중히 |
-| **FREEZE** | — | **커널 아님.** → `HANDOFF` 의 **B단계(차분 덤프)** 로. 보드·칩셋·BIOS·슬롯 차이를 본다. 특히 두 PC 의 `LnkSta`(링크 속도/폭) 비교 |
+| **FREEZE** | — | **커널 아님.** → `HANDOFF` 의 **B단계(차분 덤프)** 로. 용의자 1순위 = **부팅 모드(레거시 BIOS vs UEFI)** — 0단계 부수 발견 참조. 그다음 두 PC 의 `LnkSta`(링크 속도/폭)·보드·칩셋·BIOS 비교 |
 
 ---
 
