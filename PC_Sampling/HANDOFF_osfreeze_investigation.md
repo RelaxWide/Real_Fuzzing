@@ -116,9 +116,14 @@ corrected 가 누적되다 uncorrectable/link-down 으로 번짐. noaer 로 관�
    - **⚠ 횟수 주의**: 기하분포라 1회분 노출(~70만 halt)에서의 음성은 증거력이 약하다(절반은 운).
      음성으로 결론내려면 **3배(~200만 halt, ≈3.8h)** — 스크립트 기본값이 200만인 이유.
 3. **confound 닫기 — J-Link USB vs halt.** `--no-jlink` 는 halt 뿐 아니라 **J-Link USB 트래픽
-   전체**를 뺐다. 엄밀히는 "halt 가 유일 변수"가 아니다. **P9/PM9M1 의 `sampler_type=pcsr`**
-   (J-Link 연결 유지 + halt 없음) 구성에서 프리즈가 없었다면 USB 는 무죄, halt 확정.
-   → 기존 run 기록으로 답할 수 있으면 실험 하나를 아낀다.
+   전체**를 뺐다. 엄밀히는 "halt 가 유일 변수"가 아니다.
+   → **`halt_loop_stress.py --no-halt`** (SWD/USB 트래픽 동일 + 코어 정지 없음).
+   - 프리즈 **남** → 원인은 halt 가 아니라 J-Link/SWD/USB 경로
+   - 프리즈 **안 남** → confound 닫힘, **halt 가 트리거로 확정**
+   **주의(제품별 sampler 사실관계):** `pcsr` = **PM9M1·BM9H1**, `jlink_halt` = **P7·P9**.
+   즉 "다른 제품으로 halt 를 빼는" 우회는 **제품·컨트롤러·펌웨어가 같이 바뀌어** 깨끗한 대조가
+   안 되고, P7/P9 는 둘 다 halt 라 제품 교체로 halt 를 뺄 수도 없다(R5 가 PCSR 미구현이라
+   halt 를 쓰는 것으로 보임). 그래서 **같은 장치에서 halt 만 빼는 `--no-halt` 대조군**이 필요하다.
 4. **`pcie_ports=compat`** — AER·DPC·PME·hotplug 전부 off → (D) 및 포트 서비스 잔여분 배제.
 5. **링크 안정화 (B 완화)** — `pcie_aspm=off` + BIOS ASPM/L1 substates off. 그래도 나면 root port
    Link Control 2 로 **링크 속도 강제 하향**(Gen4→Gen3→Gen2) 후 retrain (신호무결성 마진).
@@ -146,5 +151,7 @@ corrected 가 누적되다 uncorrectable/link-down 으로 번짐. noaer 로 관�
 - **halt *지속시간*(≠간격)을 줄이면 MTBF 가 늘어나나?** (`jlink_speed`↑) — (F) 의 핵심 검증이자
   유일하게 커버리지 해상도를 안 깎는 완화책 후보. **아직 한 번도 시도 안 함.**
 - halt 단독(NVMe 무트래픽) **200만** 회에서 프리즈가 나나? (halt 단독 vs 호스트 I/O 상호작용)
-- **`sampler_type=pcsr`**(J-Link 연결 유지 + halt 없음) 구성에서 프리즈 전례가 있었나?
-  없었다면 J-Link USB confound 가 닫히고 halt 가 트리거로 확정된다.
+- `--no-halt` 대조군에서 프리즈가 나나? (J-Link USB confound 닫기)
+- **P9 도 프리즈하나?** P7·P9 **둘 다 `jlink_halt`** 다. 둘 다 프리즈하면 halt 가 컨트롤러
+  PCIe 를 멈추는 **제품 무관·일반 메커니즘** = (F) 강화. P7 만이면 제품/펌웨어 특정 문제.
+  (`pcsr` 인 PM9M1·BM9H1 은 halt 를 안 하므로 애초에 비교군이 못 된다 — 제품이 같이 바뀜.)

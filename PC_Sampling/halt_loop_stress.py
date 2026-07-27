@@ -7,8 +7,14 @@
   (C) halt × 호스트 MMIO/DMA 상호작용    ← NVMe 트래픽이 있어야만 발생
   (B) halt 자체의 PCIe 링크 교란          ← 트래픽 없이도 발생
 
-중 어느 쪽인지 가른다. 퍼저 run 과 **같은 halt 횟수**를 채웠는데 프리즈가 안 나면 (C),
+중 어느 쪽인지 가른다. 퍼저 run 과 **같은 halt 횟수**를 채웠는데 프리즈가 안 나면 (C)/(F),
 나면 (B) 다.
+
+**`--no-halt` 대조군(T2):** SWD/USB 트래픽은 같게 내면서 **코어를 멈추지 않는다**(halted() =
+디버그 레지스터 read 만 반복). `--no-jlink` 는 halt 뿐 아니라 J-Link USB 트래픽 전체를 뺐기
+때문에 "halt 가 유일 변수"가 엄밀히는 참이 아니었다 — 이 모드가 그 confound 를 **같은 장치·같은
+리그에서** 닫는다. PM9M1/BM9H1(=`sampler_type=pcsr`, halt 없음)로 비교하면 halt 유무와 제품이
+동시에 바뀌어 깨끗한 대조가 안 된다. P7·P9 는 둘 다 `jlink_halt` 라 제품 교체로는 halt 를 뺄 수 없다.
 
 퍼징 run 의 halt 는 명령당 ~1.7회꼴이었다(실측 665758 halts). 프리즈까지 30만~48만 명령 =
 **~50만~80만 halt** 가 "1회분 노출".
@@ -83,11 +89,20 @@ def main() -> int:
     ap.add_argument('--max-minutes', type=float, default=0.0,
                     help='시간 상한(분). 0=무제한 (default: 0)')
     ap.add_argument('--report-every', type=int, default=5000, help='진행 보고 간격(halt 수)')
+    ap.add_argument('--no-halt', action='store_true',
+                    help='대조군(T2): SWD/USB 트래픽은 동일하게 내되 **코어를 멈추지 않는다**. '
+                         'halted() 폴링(디버그 레지스터 read)만 반복 → J-Link USB confound 분리용. '
+                         '이쪽이 프리즈하면 원인은 halt 가 아니라 J-Link/SWD/USB 경로.')
     args = ap.parse_args()
 
     _p("=" * 72)
-    _p("halt 루프 단독 스트레스 (T1) — NVMe 트래픽 없음, J-Link halt/go 만")
-    _p(f"  target={args.halts} halts  device={args.device} {args.speed}kHz "
+    if args.no_halt:
+        _p("[대조군 T2] --no-halt — SWD/USB 트래픽만, **코어 정지 없음**")
+        _p("  이쪽이 프리즈하면 원인은 halt 가 아니라 J-Link/SWD/USB 경로다.")
+    else:
+        _p("halt 루프 단독 스트레스 (T1) — NVMe 트래픽 없음, J-Link halt/go 만")
+    _p(f"  target={args.halts} {'polls' if args.no_halt else 'halts'}  "
+       f"device={args.device} {args.speed}kHz "
        f"{args.interface.upper()}  go_settle={args.go_settle_ms}ms poll={args.halt_poll_ms}ms")
     _p(f"  pid={os.getpid()}  start={time.strftime('%Y-%m-%d %H:%M:%S')}")
     _p("=" * 72)
@@ -127,6 +142,24 @@ def main() -> int:
 
             halted = False
             try:
+                if args.no_halt:
+                    # 대조군: Halt/Go 를 절대 보내지 않는다. halted() = 디버그 레지스터 read 라
+                    # SWD 트랜잭션·USB 트래픽은 발생하지만 코어는 계속 실행. halt 경로와 폴링
+                    # 횟수를 맞춰 트래픽 양을 비슷하게 유지한다.
+                    for _ in range(args.halt_poll_ms):
+                        jl.halted()
+                        time.sleep(0.001)
+                    n_ok += 1
+                    if settle_s > 0:
+                        time.sleep(settle_s)
+                    total = n_ok + n_fail
+                    if total % args.report_every == 0:
+                        el = time.monotonic() - t0
+                        _p(f"[{time.strftime('%H:%M:%S')}] [no-halt] polls={total} "
+                           f"elapsed={el:.0f}s rate={total / el if el > 0 else 0:.0f}/s "
+                           f"freeze_accum=0.0s (코어 정지 없음)")
+                    continue
+
                 halt_func()
                 for _ in range(args.halt_poll_ms):      # 1ms 간격 폴링 (퍼저와 동일)
                     if jl.halted():
@@ -177,8 +210,13 @@ def main() -> int:
     _p("=" * 72)
     _p(f"완료: halts={n_ok + n_fail} (ok={n_ok} fail={n_fail}) elapsed={el:.0f}s "
        f"freeze_accum={freeze_accum:.1f}s")
-    _p("판정: 목표 halt 를 채우고도 호스트가 살아있으면 → 프리즈는 halt 단독이 아니라")
-    _p("      halt × 호스트 NVMe 트래픽 상호작용 (가설 C). 프리즈했으면 → halt 자체 (가설 B).")
+    if args.no_halt:
+        _p("판정(대조군): 여기서 프리즈 → 원인은 halt 가 아니라 J-Link/SWD/USB 경로.")
+        _p("              무사 → J-Link USB confound 닫힘. halt 가 트리거로 확정.")
+    else:
+        _p("판정: 목표 halt 를 채우고도 호스트가 살아있으면 → halt 단독은 무죄.")
+        _p("      halt × 호스트 posted write 상호작용이 필요 = 가설 (F) 지지.")
+        _p("      프리즈했으면 → halt 자체가 링크를 죽임 = 가설 (B).")
     _p("=" * 72)
     return 0
 
