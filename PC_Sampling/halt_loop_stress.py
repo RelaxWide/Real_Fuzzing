@@ -102,6 +102,13 @@ def main() -> int:
     if args.no_halt:
         _p("[대조군 T2] --no-halt — SWD/USB 트래픽만, **코어 정지 없음**")
         _p("  이쪽이 프리즈하면 원인은 halt 가 아니라 J-Link/SWD/USB 경로다.")
+        _p("  ※ 관측 대상은 진행 로그가 아니라 **호스트 생존 여부(이진값)** 다. 로그는 루프가")
+        _p("    아직 살아있다는 증명·타임스탬프일 뿐이니 지켜볼 필요 없다.")
+        _p("  ※ 이 run 을 1비트에서 데이터셋으로 바꾸려면 pcie_link_probe.py 를 나란히 돌려")
+        _p("    **halt 없을 때의 링크 베이스라인**을 같이 받아둘 것. 실제 halt run 의 --clear")
+        _p("    수치를 해석하려면 어차피 이 기준선이 필요하다.")
+        _p(f"  ※ 반복당 ~{args.halt_poll_ms + args.go_settle_ms:.0f}ms (halt 경로의 약 2배) — "
+           f"{args.halts} 회면 수 시간 걸린다.")
     else:
         _p("halt 루프 단독 스트레스 (T1) — NVMe 트래픽 없음, J-Link halt/go 만")
     _p(f"  target={args.halts} {'polls' if args.no_halt else 'halts'}  "
@@ -147,11 +154,19 @@ def main() -> int:
         now = time.monotonic()
         el = now - t0
         last_report = now
-        pct = (100.0 * freeze_accum / el) if el > 0 else 0.0
-        _p(f"[{time.strftime('%H:%M:%S')}] {tag}{unit}={total} ok={n_ok} fail={n_fail} "
-           f"elapsed={el:.0f}s rate={total / el if el > 0 else 0:.0f}/s "
-           f"freeze_accum={freeze_accum:.1f}s ({pct:.1f}% 정지)"
-           + ("  ← 코어 정지 없음(대조군)" if args.no_halt else ""))
+        eta = ((args.halts - total) / (total / el)) if (total > 0 and el > 0) else 0.0
+        head = (f"[{time.strftime('%H:%M:%S')}] {tag}{unit}={total}/{args.halts} "
+                f"elapsed={el:.0f}s rate={total / el if el > 0 else 0:.0f}/s "
+                f"ETA={eta / 3600.0:.1f}h")
+        if args.no_halt:
+            # freeze_accum 은 이 모드에서 구조적으로 항상 0 — 찍어도 정보가 없다.
+            # 대신 SWD 트랜잭션 수(= USB 노출량)를 보여준다. 이게 이 대조군의 노출 지표.
+            _p(f"{head} swd_tx≈{total * args.halt_poll_ms} (코어 정지 없음 — "
+               f"관측 대상은 로그가 아니라 '호스트 생존' 이진값)")
+        else:
+            pct = (100.0 * freeze_accum / el) if el > 0 else 0.0
+            _p(f"{head} ok={n_ok} fail={n_fail} "
+               f"freeze_accum={freeze_accum:.1f}s ({pct:.1f}% 정지)")
 
     def should_report(total: int) -> bool:
         # 초반 마일스톤: 루프가 실제로 돌기 시작했는지 즉시 눈으로 확인
