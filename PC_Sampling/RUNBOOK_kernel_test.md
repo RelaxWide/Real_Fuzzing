@@ -151,7 +151,7 @@ sudo .venv/bin/python3 PC_Sampling/jlink_reg_diag.py --device Cortex-R5 --interf
 
 ```bash
 cd /home/ssd/gdbfuzz
-sudo .venv/bin/python3 PC_Sampling/pc_sampling_fuzzer_v9.5.py --product P7 --resume-coverage 2>&1 | tee ~/run_6.8.log
+sudo .venv/bin/python3 PC_Sampling/pc_sampling_fuzzer_v9.5.py --product P7 2>&1 | tee ~/run_6.8.log
 ```
 
 - **150만** = 관측 최대(48만)의 3배. 기하분포라 "살아남았다"고 말하려면 3배 노출이 필요하다.
@@ -177,7 +177,7 @@ sudo python3 PC_Sampling/kernel_sweep.py --run       # 부팅할 때마다
 sudo reboot     # GRUB 에서 5.15.0-139-generic 선택
 uname -r        # 5.15.0-139-generic 확인
 cd /home/ssd/gdbfuzz
-sudo .venv/bin/python3 PC_Sampling/pc_sampling_fuzzer_v9.5.py --product P7 --resume-coverage 2>&1 | tee ~/run_5.15.log
+sudo .venv/bin/python3 PC_Sampling/pc_sampling_fuzzer_v9.5.py --product P7 2>&1 | tee ~/run_5.15.log
 ```
 
 **48만 이전에 얼면 → 커널이 원인으로 확정.**
@@ -201,8 +201,11 @@ sudo .venv/bin/python3 PC_Sampling/pc_sampling_fuzzer_v9.5.py --product P7 --res
 ## 알아둘 것
 
 - **프리즈하면 호스트는 스스로 못 살아난다.** 전원 강제 재투입이 필요하다.
-- **corpus 는 `--resume-coverage` 로 이어진다** — 프리즈해도 커버리지가 0 부터 다시 시작하지
-  않는다. 다만 마지막 몇 분은 유실될 수 있다.
+- **`--resume-coverage` 는 on/off 스위치가 아니다** — 이전 `coverage.txt` **경로를 받는 인자**다
+  (`help='Path to previous coverage.txt'`, config 기본값 `None`). 경로 없이 붙이면 무의미하거나
+  인자 오류가 난다. 이 테스트에서는 **안 쓴다.**
+- **두 arm 의 플래그가 같아야 한다.** 이 테스트에서 중요한 건 특정 옵션을 켜는 게 아니라
+  6.8 과 5.15 를 **똑같은 명령**으로 돌리는 것이다. 다르면 커널 차이인지 설정 차이인지 못 가린다.
 - **5.15 를 지우지 말 것.** 되돌릴 수 없으면 6단계를 못 하고, 그러면 결론도 못 낸다.
 - mainline 커널은 **unsupported** 다. 원인 확정용 실험 도구로 쓰고, 장기 운용은 22.04 +
   서명된 HWE 6.8 로 가는 게 맞다.
