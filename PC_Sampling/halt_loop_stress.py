@@ -89,6 +89,9 @@ def main() -> int:
     ap.add_argument('--max-minutes', type=float, default=0.0,
                     help='시간 상한(분). 0=무제한 (default: 0)')
     ap.add_argument('--report-every', type=int, default=5000, help='진행 보고 간격(halt 수)')
+    ap.add_argument('--heartbeat-sec', type=float, default=10.0,
+                    help='진행 보고 시간 간격 초 (default: 10). count 주기와 무관하게 '
+                         '이 간격마다는 무조건 1줄 나온다 — 침묵=행 으로 읽을 수 있게.')
     ap.add_argument('--no-halt', action='store_true',
                     help='대조군(T2): SWD/USB 트래픽은 동일하게 내되 **코어를 멈추지 않는다**. '
                          'halted() 폴링(디버그 레지스터 read)만 반복 → J-Link USB confound 분리용. '
@@ -133,6 +136,30 @@ def main() -> int:
     freeze_accum = 0.0
     t0 = time.monotonic()
     last_report = t0
+    tag = '[no-halt] ' if args.no_halt else ''
+    unit = 'polls' if args.no_halt else 'halts'
+
+    def report(total: int) -> None:
+        """진행 1줄. count 주기와 **시간 주기(heartbeat)** 양쪽으로 찍는다 —
+        프리즈 진단 도구는 침묵 구간이 있으면 '정상 진행'과 '첫 halt 에서 멈춤'을
+        구분할 수 없다. 따라서 무슨 일이 있어도 heartbeat 간격마다는 출력한다."""
+        nonlocal last_report
+        now = time.monotonic()
+        el = now - t0
+        last_report = now
+        pct = (100.0 * freeze_accum / el) if el > 0 else 0.0
+        _p(f"[{time.strftime('%H:%M:%S')}] {tag}{unit}={total} ok={n_ok} fail={n_fail} "
+           f"elapsed={el:.0f}s rate={total / el if el > 0 else 0:.0f}/s "
+           f"freeze_accum={freeze_accum:.1f}s ({pct:.1f}% 정지)"
+           + ("  ← 코어 정지 없음(대조군)" if args.no_halt else ""))
+
+    def should_report(total: int) -> bool:
+        # 초반 마일스톤: 루프가 실제로 돌기 시작했는지 즉시 눈으로 확인
+        if total in (1, 10, 100, 1000):
+            return True
+        if total % args.report_every == 0:
+            return True
+        return (time.monotonic() - last_report) >= args.heartbeat_sec
 
     try:
         while n_ok + n_fail < args.halts:
@@ -152,12 +179,8 @@ def main() -> int:
                     n_ok += 1
                     if settle_s > 0:
                         time.sleep(settle_s)
-                    total = n_ok + n_fail
-                    if total % args.report_every == 0:
-                        el = time.monotonic() - t0
-                        _p(f"[{time.strftime('%H:%M:%S')}] [no-halt] polls={total} "
-                           f"elapsed={el:.0f}s rate={total / el if el > 0 else 0:.0f}/s "
-                           f"freeze_accum=0.0s (코어 정지 없음)")
+                    if should_report(n_ok + n_fail):
+                        report(n_ok + n_fail)
                     continue
 
                 halt_func()
@@ -189,15 +212,8 @@ def main() -> int:
             if settle_s > 0:
                 time.sleep(settle_s)
 
-            total = n_ok + n_fail
-            if total % args.report_every == 0:
-                now = time.monotonic()
-                el = now - t0
-                rate = total / el if el > 0 else 0.0
-                _p(f"[{time.strftime('%H:%M:%S')}] halts={total} ok={n_ok} fail={n_fail} "
-                   f"elapsed={el:.0f}s rate={rate:.0f}/s freeze_accum={freeze_accum:.1f}s "
-                   f"({100.0 * freeze_accum / el if el > 0 else 0:.1f}% 정지)")
-                last_report = now
+            if should_report(n_ok + n_fail):
+                report(n_ok + n_fail)
     except KeyboardInterrupt:
         _p("[stop] Ctrl-C")
     finally:
@@ -208,7 +224,7 @@ def main() -> int:
 
     el = time.monotonic() - t0
     _p("=" * 72)
-    _p(f"완료: halts={n_ok + n_fail} (ok={n_ok} fail={n_fail}) elapsed={el:.0f}s "
+    _p(f"완료: {unit}={n_ok + n_fail} (ok={n_ok} fail={n_fail}) elapsed={el:.0f}s "
        f"freeze_accum={freeze_accum:.1f}s")
     if args.no_halt:
         _p("판정(대조군): 여기서 프리즈 → 원인은 halt 가 아니라 J-Link/SWD/USB 경로.")
