@@ -81,27 +81,25 @@ grep -E "^GRUB_(DEFAULT|TIMEOUT|CMDLINE)" /etc/default/grub    # 확인
 
 ## 2단계 — mainline 6.8 커널 내려받기
 
+> **경로 주의:** 예전 `kernel.ubuntu.com/~kernel-ppa/mainline/...` 는 **더 이상 안 된다.**
+> 현재 경로는 **`kernel.ubuntu.com/mainline/...`** (2026-07-27 실측 확인).
+
 ```bash
-V=v6.8.12
-BASE=https://kernel.ubuntu.com/~kernel-ppa/mainline/${V}/amd64
 mkdir -p ~/mainline && cd ~/mainline
+B=https://kernel.ubuntu.com/mainline/v6.8.12/amd64
+S=6.8.12-060812.202501300202
 
-for f in $(curl -s ${BASE}/ | grep -oE 'linux-[a-z0-9._+-]+\.deb' | sort -u | grep -v lowlatency); do
-    wget -c "${BASE}/${f}"
-done
+wget -c $B/linux-headers-6.8.12-060812_${S}_all.deb \
+        $B/linux-headers-6.8.12-060812-generic_${S}_amd64.deb \
+        $B/linux-image-unsigned-6.8.12-060812-generic_${S}_amd64.deb \
+        $B/linux-modules-6.8.12-060812-generic_${S}_amd64.deb
 
-ls -1 *.deb
+ls -1 *.deb        # 4개 나와야 함
 ```
 
-**받아져야 할 4개** (이름의 날짜 suffix 는 다를 수 있음):
-```
-linux-headers-6.8.12-060812_...._all.deb
-linux-headers-6.8.12-060812-generic_...._amd64.deb
-linux-image-unsigned-6.8.12-060812-generic_...._amd64.deb
-linux-modules-6.8.12-060812-generic_...._amd64.deb
-```
-
-4개가 아니면 브라우저로 `${BASE}/` 를 직접 열어 위 4종을 받을 것 (`lowlatency` 는 제외).
+버전을 바꾸고 싶으면 브라우저로 `https://kernel.ubuntu.com/mainline/` 를 열어 해당
+`vX.Y.Z/amd64/` 의 실제 파일명을 확인할 것 — 빌드 날짜 suffix 가 버전마다 다르다.
+받을 것은 위 4종이며 `lowlatency` 는 제외한다.
 
 ---
 
