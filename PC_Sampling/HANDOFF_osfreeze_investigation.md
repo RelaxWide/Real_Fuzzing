@@ -103,13 +103,32 @@ corrected 가 누적되다 uncorrectable/link-down 으로 번짐. noaer 로 관�
 > 아래 A/B/C 가 현재 우선순위. 그 뒤의 0~5 는 머신 특정 사실을 모르고 세운 순서라
 > **A~C 가 끝난 뒤에도 원인이 안 잡힐 때만** 의미가 있다.
 
-**A. 정상 PC 의 커널을 문제 PC 에 설치 → 재부팅 → 퍼저 80만 명령 (1순위)**
-```bash
-uname -r                                   # 양쪽에서 각각 확인
-sudo apt install linux-image-<정상PC버전>   # 배포판에 맞게
-sudo update-grub && sudo reboot            # 기존 커널은 GRUB 에 남겨 A/B 가능하게
-```
-- 80만 = 기존 재현 상한(48만)의 1.7배. 넘기면 잡힌 것.
+**A. 문제 PC 에 6.x 커널 설치 → 퍼저 150만 명령 → 5.15 로 되돌려 재확인 (1순위)**
+
+실측 환경(2026-07-27):
+| | 배포판 | 커널 |
+|---|---|---|
+| **문제 PC** | Ubuntu **20.04.6** (focal) | **5.15.0-139-generic** |
+| 정상 PC | Ubuntu 22.04 (jammy) | 6.x (= jammy HWE **6.8**) |
+
+> **★ 함정: 20.04 는 5.15 가 천장이다.** focal 의 HWE 커널이 바로 5.15 라 `apt` 로 6.x 를
+> 받을 방법이 없다. "정상 PC 커널을 apt 로 깔면 된다"는 이 조합에서 **성립하지 않는다.**
+> (참고: 22.04 의 **GA 커널도 5.15** 다. 정상 PC 가 6.x 인 건 거기서 HWE 를 쓰기 때문.)
+
+- **권장: mainline 커널 .deb 만 설치** — userspace 를 그대로 두고 **커널만** 바꾼다.
+  배포판 업그레이드(20.04→22.04)는 venv/pylink/nvme-cli/J-Link 가 얹힌 리그의 userspace 를
+  통째로 바꿔 **변수가 다시 뒤섞이므로**, "커널이 원인"이라는 결론을 낼 수 없다.
+  ```bash
+  mokutil --sb-state    # mainline 은 unsigned — Secure Boot 켜져 있으면 부팅 안 됨
+  # https://kernel.ubuntu.com/~kernel-ppa/mainline/v6.8.12/amd64/ 에서 4개:
+  #   linux-headers-*_all.deb / linux-headers-*-generic_*_amd64.deb
+  #   linux-image-unsigned-*-generic_*_amd64.deb / linux-modules-*-generic_*_amd64.deb
+  cd /tmp && sudo dpkg -i linux-*.deb && sudo update-grub    # 5.15 는 GRUB 에 그대로 남는다
+  ```
+  out-of-tree DKMS 의존 없음(pylink=libusb 유저스페이스, nvme=in-tree)이라 모듈 리스크 낮음.
+- **150만 = 관측 최대(48만)의 3배.** 기하분포라 '살아남았다' 주장에는 3배 노출이 필요.
+- **반드시 5.15 로 되돌려 재현시킬 것.** 6.8 통과만으로는 부족하다 — 같은 날 같은 장비에서
+  5.15 가 다시 얼어야 커널이 원인으로 확정된다. (`kernel_sweep.py --plan 6.8...,5.15...`)
 - **동시에 `pci=noaer` 제거** — 원인 아님이 확인됐고 켜두면 링크 카나리아만 가린다.
 - 고쳐지면 → 원인은 커널 쪽(포트 서비스/nvme 타임아웃 경로 등)이거나 칩셋 차이. **(F) 폐기.**
 
