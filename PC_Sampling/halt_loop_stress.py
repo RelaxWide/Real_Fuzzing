@@ -10,8 +10,14 @@
 중 어느 쪽인지 가른다. 퍼저 run 과 **같은 halt 횟수**를 채웠는데 프리즈가 안 나면 (C),
 나면 (B) 다.
 
-퍼징 run 의 halt 는 명령당 ~1.7회꼴이었다(실측 665758 halts). 프리즈까지 30만~48만 명령이었으므로
-halt 노출을 맞추려면 **~50만~80만 halt** 가 목표치다(기본 700000).
+퍼징 run 의 halt 는 명령당 ~1.7회꼴이었다(실측 665758 halts). 프리즈까지 30만~48만 명령 =
+**~50만~80만 halt** 가 "1회분 노출".
+
+**주의 — 기본값이 200만인 이유:** 프리즈까지의 명령수가 9만~48만로 5배 넘게 흩어진다. 이는
+누적 손상이 아니라 **halt 마다 독립적인 작은 확률 p 로 발생하는 사건(기하분포)** 의 지문이다.
+따라서 1회분 노출(~70만)만 채우고 프리즈가 없었다고 "halt 단독은 무죄"라 결론내면 안 된다 —
+절반은 그냥 운이다. **음성 결과로 (F)/(C) 를 주장하려면 3배 노출(~200만 halt)** 이 필요하다.
+go_settle 5ms + halt ~1.8ms ≈ 6.8ms/halt → 200만 halt ≈ 3.8시간(야간 1회분).
 
 사용법:
   # 1) NVMe 드라이버를 떼서 링크를 완전히 idle 로 (가장 깨끗한 T1)
@@ -19,7 +25,7 @@ halt 노출을 맞추려면 **~50만~80만 halt** 가 목표치다(기본 700000
 
   # 2) 모니터링 PC 에서 ssh 로 돌려 출력이 프리즈를 넘겨 살아남게 한다
   ssh rig 'sudo /home/ssd/gdbfuzz/.venv/bin/python3 \
-      /home/ssd/gdbfuzz/PC_Sampling/halt_loop_stress.py --halts 700000' | tee halt_loop.log
+      /home/ssd/gdbfuzz/PC_Sampling/halt_loop_stress.py' | tee halt_loop.log
 
   # 참고: --device/--speed/--interface/--go-settle-ms/--halt-poll-ms 는 fuzzer_config.json
   #       products.P7 값이 기본(Cortex-R5 / 2000kHz / swd / 5ms / 8ms).
@@ -71,8 +77,9 @@ def main() -> int:
                     help='resume→다음 halt 사이 최소 실행시간 ms (default: 5 = P7 프로파일)')
     ap.add_argument('--halt-poll-ms', type=int, default=8,
                     help='halt 후 halted() 확인 최대 대기 ms (default: 8 = P7 프로파일)')
-    ap.add_argument('--halts', type=int, default=700000,
-                    help='목표 halt 횟수 (default: 700000 ≈ 프리즈 재현 run 의 halt 노출)')
+    ap.add_argument('--halts', type=int, default=2000000,
+                    help='목표 halt 횟수 (default: 2000000 = 1회분 노출(~70만)의 3배. '
+                         '기하분포라 음성 결론에는 3배 노출이 필요 — 상단 docstring 참조)')
     ap.add_argument('--max-minutes', type=float, default=0.0,
                     help='시간 상한(분). 0=무제한 (default: 0)')
     ap.add_argument('--report-every', type=int, default=5000, help='진행 보고 간격(halt 수)')

@@ -1,7 +1,8 @@
 # HANDOFF — OS Freeze 조사 (J-Link halt 관련), 2026-07 진행 중
 
-퍼징 중 **호스트 OS 하드 프리즈** 조사. firmware-first/SMM 폐기 → AER 인터럽트 storm 가설도
-**`pci=noaer` 실측으로 폐기**. 현재 1순위는 **미완료 MMIO read 로 인한 CPU 정지(가설 C)**.
+퍼징 중 **호스트 OS 하드 프리즈** 조사. 실측으로 firmware-first/SMM → (A) AER 인터럽트 storm →
+(C) non-posted read 무한 정지를 차례로 폐기. 현재 1순위는 **(F) flow-control credit 고갈로 인한
+posted write 백프레셔 데드락**.
 
 ## 증상
 - **J-Link halt 샘플러(P7, Cortex-R5)** 사용 시 퍼징 도중 **호스트 전체 프리즈 → 재부팅 필요.**
@@ -52,17 +53,30 @@
 있는데 dmesg 로는 안 보인다. 단, **AER status 비트는 리포팅과 무관하게 하드웨어가 계속 셋**하므로
 `setpci` 직접 읽기로 인터럽트 없이 가시성 복구 가능 → `pcie_link_probe.py`.
 
+## 실험 기록 — Completion Timeout 점검 (2026-07-27)
+`pcie_link_probe.py --show-cto` 실측: **root port·endpoint 둘 다 value=0(50us~50ms),
+Disable=off**(= 타임아웃 **활성**).
+
+→ **(C) 폐기.** 완료 안 되는 non-posted read 는 최대 50ms 안에 타임아웃되고 all-Fs 로 반환된다.
+무한 정지가 아니므로 영구 프리즈를 설명 못 함.
+
+**그러나 이 사실이 범위를 좁힌다:** Completion Timeout 은 **non-posted 트랜잭션만** 보호한다.
+**posted write 는 completion 이 없어 타임아웃 개념 자체가 없다.** → 아래 (F).
+
 ## 현재 가설 (우선순위 순)
 
-**★ (C) MMIO non-posted read 정지 — 1순위 (신규, 2026-07-27)**
-R5(=컨트롤러 CPU)를 halt 한 동안 호스트가 SSD BAR 로 **non-posted read**(CSTS 등)를 날리면
-completion 이 돌아오지 않는다. root port 의 **Completion Timeout 이 Disable 이거나 매우 길면**
-그 CPU 는 uncached read 에서 **무한 정지**하고, 다른 코어들이 nvme queue lock 에 줄줄이 물리며
-전 코어 정지 → console/log flush 불가. **"즉각·전체·완전무음"에 정확히 맞고, AER 과 무관하므로
-noaer 가 안 먹힌 것과 일관**된다. 특히 `nvme_timeout` 핸들러가 CSTS 를 읽는다.
-- 성립 조건 확인(재현 불필요): `pcie_link_probe.py --show-cto` → `Completion Timeout Disable=ON`
-  이거나 value 가 긴 range 면 조건 충족.
-- 검증: `--set-cto 2`(1ms~10ms) 후 재실행. **프리즈 → "장치 리셋/컨트롤러 dead"로 바뀌면 확정.**
+**★ (F) Flow-control credit 고갈 → posted write 백프레셔 데드락 — 1순위 (신규, 2026-07-27)**
+R5 halt → 펌웨어가 인바운드 큐를 못 비움 → 컨트롤러가 **UpdateFC DLLP(크레딧 반환) 중단** →
+root port posted 크레딧 고갈 → 호스트 posted write(**NVMe 도어벨 write 가 정확히 이것**)가 발행
+불가 → CPU write buffer 포화 → CPU 정지 → 락 보유 상태라 전 코어 연쇄 → 완전 무음.
+**표준 PCIe 에 크레딧 고갈용 타임아웃이 없다 — 설계상 무음이고 설계상 데드락.**
+
+기존 관측 두 개가 이 가설과 정확히 맞는다(= 사후 설명이 아니라 예측 일치):
+- **`go_settle` 무반응**: 1ms=25만·37만 / 5ms=44만 / 10ms=18만·9만. 누적 노출이 원인이면 duty
+  cycle 에 반응해야 하는데 안 했다. 크레딧 데드락은 *halt 간격*이 아니라 *halt 가 나쁜 순간에
+  착지했는지*의 문제라 간격에 무반응인 게 맞다.
+- **재현 횟수의 큰 산포**: halt 마다 독립적 확률 p → **기하분포** → 9만~48만(5배 이상) 산포가
+  자연스럽다. 지금까지 "노이즈"로 치부한 산포가 사실 메커니즘의 지문.
 
 **(B) 링크 불안정 자체가 치명 — 여전히 유효**
 corrected 가 누적되다 uncorrectable/link-down 으로 번짐. noaer 로 관측을 잃었을 뿐 배제 안 됨.
@@ -87,15 +101,26 @@ corrected 가 누적되다 uncorrectable/link-down 으로 번짐. noaer 로 관�
    나오면 (B)/(C)/(D) 를 추측이 아니라 스택으로 가른다.
    **⚠ `softlockup_panic`/`hardlockup_panic` 절대 금지** — 과거 이 옵션들이 퍼저의 *의도적* D-state
    를 호스트 panic 으로 승격시킨 전례(관측자 효과). 상세는 crash 조사 기록.
-1. **Completion Timeout 점검 (C, 재현 불필요·즉시)**
-   `sudo python3 pcie_link_probe.py --root 0000:00:01.1 --ep <SSD BDF> --show-cto --once`
-   → Disable=ON 이면 `--set-cto 2` 로 짧게 강제 후 재실행.
-2. **halt 단독 스트레스 (B vs C 분리)** — `halt_loop_stress.py`. NVMe 트래픽 없이 halt 루프만
-   ~70만 회(퍼징 run 의 halt 노출과 동등). nvme 드라이버 unbind 하면 링크까지 idle.
-   - 프리즈 **안 남** → halt 단독 무죄, **halt × 호스트 I/O 상호작용** = (C) 지지
+1. **★ halt *지속시간* 스윕 — 아직 한 번도 안 건드린 노브 (F 검증 + 잠재적 완화책)**
+   지금까지 튜닝한 건 전부 `go_settle`(halt **간격**)이고 **halt 자체의 길이(~1.8ms)는 고정**이었다.
+   (F) 가 맞다면 p 를 정하는 건 간격이 아니라 **halt 창 동안 컨트롤러 버퍼가 얼마나 차는가** =
+   **halt 지속시간**이다. → `jlink_speed` 2000 → 8000/12000kHz 로 올리면 SWD 트랜잭션이 빨라져
+   halt 창이 짧아진다(`halt_loop_stress.py` 가 `freeze_accum` 으로 실제 단축을 측정해준다).
+   - MTBF 가 **크게 늘면 (F) 강력 지지 + 그 자체로 실용 완화책**(커버리지 해상도 손실 없음 —
+     `go_settle` 낮추기와 달리 샘플 품질을 안 깎는다).
+   - 무반응이면 지속시간 무관 → (B) 쪽으로.
+2. **halt 단독 스트레스 (halt 단독 vs 호스트 I/O 상호작용 분리)** — `halt_loop_stress.py`.
+   NVMe 트래픽 없이 halt 루프만. nvme 드라이버 unbind 하면 링크까지 idle.
+   - 프리즈 **안 남** → halt 단독 무죄, **halt × 호스트 posted write** 필요 = (F) 지지
    - 프리즈 **남** → halt 자체가 링크를 죽임 = (B)
-3. **`pcie_ports=compat`** — AER·DPC·PME·hotplug 전부 off → (D) 및 포트 서비스 잔여분 배제.
-4. **링크 안정화 (B 완화)** — `pcie_aspm=off` + BIOS ASPM/L1 substates off. 그래도 나면 root port
+   - **⚠ 횟수 주의**: 기하분포라 1회분 노출(~70만 halt)에서의 음성은 증거력이 약하다(절반은 운).
+     음성으로 결론내려면 **3배(~200만 halt, ≈3.8h)** — 스크립트 기본값이 200만인 이유.
+3. **confound 닫기 — J-Link USB vs halt.** `--no-jlink` 는 halt 뿐 아니라 **J-Link USB 트래픽
+   전체**를 뺐다. 엄밀히는 "halt 가 유일 변수"가 아니다. **P9/PM9M1 의 `sampler_type=pcsr`**
+   (J-Link 연결 유지 + halt 없음) 구성에서 프리즈가 없었다면 USB 는 무죄, halt 확정.
+   → 기존 run 기록으로 답할 수 있으면 실험 하나를 아낀다.
+4. **`pcie_ports=compat`** — AER·DPC·PME·hotplug 전부 off → (D) 및 포트 서비스 잔여분 배제.
+5. **링크 안정화 (B 완화)** — `pcie_aspm=off` + BIOS ASPM/L1 substates off. 그래도 나면 root port
    Link Control 2 로 **링크 속도 강제 하향**(Gen4→Gen3→Gen2) 후 retrain (신호무결성 마진).
    원인 규명 뒤에 써도 늦지 않는 완화책.
 
@@ -105,7 +130,7 @@ corrected 가 누적되다 uncorrectable/link-down 으로 번짐. noaer 로 관�
   **ssh 로 원격 tee** 해야 프리즈를 넘겨 살아남는다(로컬 리다이렉트는 유실).
 - **`pcie_link_probe.py`** — noaer 에서 잃은 카나리아 복구. `DevSta`(AER 무관 하드웨어 비트) /
   `LnkSta`(속도·폭 저하) / AER cor·unc status 를 setpci 로 직접 폴링. `--clear` 로 구간별 발생률,
-  `--show-cto`/`--set-cto` 로 (C) 점검·검증.
+  `--show-cto`/`--set-cto` 로 Completion Timeout 점검(→ (C) 폐기에 사용).
 
 ## 완화 옵션 (예방 못 하면)
 - **노출 줄이기**(config): `go_settle_ms`↑ / `halt_poll_ms`↓ / "N명령마다 1회 샘플" 노브(코드 추가) →
@@ -116,5 +141,10 @@ corrected 가 누적되다 uncorrectable/link-down 으로 번짐. noaer 로 관�
 ## 남은 확인 질문
 - 이 프리즈가 **모든 PC 에서 나나, 특정 보드에서만 나나?** (링크 신호무결성/BIOS 의존이면 보드별 차이)
 - ~~`pci=noaer` run 의 프리즈 여부 + corrected 카운트~~ → **답 나옴**(위 실험 기록: 프리즈 재현, 0개).
-- root port / endpoint 의 **Completion Timeout Disable 이 켜져 있나?** (가설 C 성립 조건)
-- halt 단독(NVMe 무트래픽) 70만 회에서 프리즈가 나나? (B vs C 분리)
+- ~~root port / endpoint 의 Completion Timeout Disable 이 켜져 있나?~~ → **답 나옴**: 둘 다
+  value=0(50us~50ms), Disable=off → (C) 폐기.
+- **halt *지속시간*(≠간격)을 줄이면 MTBF 가 늘어나나?** (`jlink_speed`↑) — (F) 의 핵심 검증이자
+  유일하게 커버리지 해상도를 안 깎는 완화책 후보. **아직 한 번도 시도 안 함.**
+- halt 단독(NVMe 무트래픽) **200만** 회에서 프리즈가 나나? (halt 단독 vs 호스트 I/O 상호작용)
+- **`sampler_type=pcsr`**(J-Link 연결 유지 + halt 없음) 구성에서 프리즈 전례가 있었나?
+  없었다면 J-Link USB confound 가 닫히고 halt 가 트리거로 확정된다.
