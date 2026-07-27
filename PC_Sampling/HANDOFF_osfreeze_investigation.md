@@ -74,6 +74,38 @@ Disable=off**(= 타임아웃 **활성**).
 **그러나 이 사실이 범위를 좁힌다:** Completion Timeout 은 **non-posted 트랜잭션만** 보호한다.
 **posted write 는 completion 이 없어 타임아웃 개념 자체가 없다.** → 아래 (F).
 
+## 실험 기록 — 커널 6.8 (mainline v6.8.12) 진행 중 (2026-07-27)
+
+| 항목 | 5.15.0-139 | 6.8.12 |
+|---|---|---|
+| 프리즈 | 9만~48만 명령 | **50만+ 무프리즈** (150만 목표로 진행 중) |
+| `grep -c "Corrected error"` | **106** | **0** |
+| root port `RootCmd` | — | **`CERptEn+`** (= corrected 보고 **활성**) |
+| root port `CESta` | — | **전부 `-`** (하드웨어도 에러 미검출) |
+
+→ **"0" 은 로깅 차이가 아니라 실재.** `CERptEn+` 로 보고가 켜져 있음을 확인했고 하드웨어
+상태 비트도 깨끗하다. **링크가 실제로 다르게 동작한다.**
+
+### ★ 부산물 — 선행지표 확보
+corrected 에러 카운트가 **두 커널을 몇 분 만에 가른다.** 프리즈(수 시간, 기하분포)를 기다릴
+필요 없이 링크 거동을 측정할 수 있다 → 앞서 "희귀 사건 대신 선행지표로 최적화하라"고 한
+요구가 공짜로 충족됨. 6단계(5.15 복귀)에서 `pcie_link_probe.py --clear` 를 나란히 돌려
+**어떤 corrected 비트**가 서는지 볼 것:
+- **`RxErr`** → 수신기/물리 계층
+- **`BadTLP`/`BadDLLP`** → CRC 실패 = **프로토콜 계층** → (F) 계열 확정
+
+## 추가로 배제된 것 (2026-07-27)
+
+| 후보 | 근거 |
+|---|---|
+| **ASPM / L1 substates** | **폐기** — 이 제품은 **link power management 자체를 미지원**(NVMe power state 만 지원). L0s/L1/L1SS 가 성립 불가 |
+| **커널 간 링크 속도 차이** | **폐기** — `LnkCap`=`LnkSta`=**2.5GT/s x1**. `LnkCap` 은 읽기전용 하드웨어 레지스터라 커널이 못 바꾸고, 2.5GT/s x1 은 **PCIe 최저값**이라 내려갈 곳도 없다 |
+| **완화책 "링크 속도 강제 하향"** | **불가** — 이미 최저 속도. 이 옵션은 목록에서 삭제 |
+
+> **주목:** Gen1 x1 은 PCIe 에서 **신호 마진이 가장 큰** 구성이다(긴 트레이스·커넥터용 속도).
+> 거기서 corrected DLL 에러가 106개 났다는 건 원인이 **물리적 신호무결성이 아니라 프로토콜/
+> 버퍼 쪽**일 가능성을 시사한다 → **(B) 보다 (F) 에 무게.**
+
 ## 현재 가설 (우선순위 순)
 
 **★ (F) Flow-control credit 고갈 → posted write 백프레셔 데드락 — 1순위 (신규, 2026-07-27)**
@@ -206,9 +238,9 @@ sudo python3 pcie_link_probe.py --root <root> --ep <ssd> --interval 5 --clear
    안 되고, P7/P9 는 둘 다 halt 라 제품 교체로 halt 를 뺄 수도 없다(R5 가 PCSR 미구현이라
    halt 를 쓰는 것으로 보임). 그래서 **같은 장치에서 halt 만 빼는 `--no-halt` 대조군**이 필요하다.
 4. **`pcie_ports=compat`** — AER·DPC·PME·hotplug 전부 off → (D) 및 포트 서비스 잔여분 배제.
-5. **링크 안정화 (B 완화)** — `pcie_aspm=off` + BIOS ASPM/L1 substates off. 그래도 나면 root port
-   Link Control 2 로 **링크 속도 강제 하향**(Gen4→Gen3→Gen2) 후 retrain (신호무결성 마진).
-   원인 규명 뒤에 써도 늦지 않는 완화책.
+5. ~~**링크 안정화 (B 완화)** — `pcie_aspm=off` + 링크 속도 강제 하향~~ → **둘 다 불가(2026-07-27)**:
+   제품이 link power management 미지원이라 ASPM 이 없고, 링크는 이미 **2.5GT/s x1**(PCIe 최저)
+   이라 낮출 여지가 없다. 위 "추가로 배제된 것" 참조.
 
 ## 도구 (이 조사 전용, 퍼저와 독립)
 - **`halt_loop_stress.py`** — NVMe 무트래픽 halt/go 루프. 퍼저의 `_read_all_pcs` 와 동일 경로/타이밍
