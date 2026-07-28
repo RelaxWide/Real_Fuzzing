@@ -535,6 +535,8 @@ _PMU_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), _P['pmu_s
 ENABLE_POR        = _PW['enable_por']
 POR_POWEROFF_WAIT = _PW['por_poweroff_wait']
 POR_BOOT_WAIT     = _PW['por_boot_wait']
+# 전원 ON 후 첫 PCIe rescan 까지의 대기. 구버전 config 호환 위해 .get 사용.
+POR_RESCAN_DELAY  = _PW.get('por_rescan_delay', 3.0)
 
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
 # 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
@@ -1179,6 +1181,9 @@ class FuzzConfig:
                                               # (제품별; P9: topology 최상단 root port)
     por_poweroff_wait: float = POR_POWEROFF_WAIT
     por_boot_wait:     float = POR_BOOT_WAIT   # PCIe rescan 후 NVMe 응답 최대 대기 (초)
+    por_rescan_delay:  float = POR_RESCAN_DELAY  # 전원 ON → 첫 rescan 대기 (초). 이 값이
+                                               # 0 이면 link training 전에 rescan 이 돌아
+                                               # 브리지가 '장치 없음' 으로 확정된다.
     boot_sweep_s:      float = BOOT_SWEEP_S    # connect() 직후 boot-phase PC 수집 창 (초, 0=비활성화)
                                                # POR 시 이 시간 내에서 connect() 재시도도 수행
 
@@ -4429,6 +4434,27 @@ class NVMeFuzzer:
         _first_rescan = True
         while time.monotonic() < deadline:
             attempt += 1
+            # 0) 재시도 시 브리지 재초기화 — **이른 rescan 은 파괴적**이기 때문.
+            #    링크가 올라오기 전에 rescan 하면 커널이 브리지를 '아래에 장치 없음' 으로
+            #    열거하며 윈도우를 확정해버리고, 이후 장치가 올라와도 윈도우를 못 키운다
+            #    (bridge window can't assign; no space). 그래서 단순 재시도로는 복구가
+            #    안 된다. 재시도 전에 대상 브리지를 다시 remove 해 깨끗한 상태에서 다시
+            #    열거시킨다 → por_rescan_delay 가 짧아도 자동 복구된다.
+            #    단, EP 가 이미 sysfs 에 보이면(열거는 됐고 /dev 노드만 늦은 경우) 건드리지
+            #    않고 그대로 기다린다.
+            if attempt > 1:
+                _ep_present = bool(self._pcie_bdf) and os.path.exists(
+                    f'/sys/bus/pci/devices/{self._pcie_bdf}')
+                _re_bdf = self._por_remove_target() if not _ep_present else None
+                if _re_bdf:
+                    try:
+                        subprocess.run(
+                            ['bash', '-c', f'echo 1 > /sys/bus/pci/devices/{_re_bdf}/remove'],
+                            timeout=5, capture_output=True)
+                        log.warning(f"[POR] 재시도 {attempt}: 브리지 재초기화 remove {_re_bdf}")
+                    except Exception as e:
+                        log.debug(f"[POR] 재시도 remove 실패(무시): {e}")
+
             # 1) rescan trigger (매 iteration — device 가 늦게 올라와도 잡힘)
             try:
                 with open('/sys/bus/pci/rescan', 'w') as f:
@@ -13459,7 +13485,7 @@ class NVMeFuzzer:
             #   (Thunderbolt/USB4 터널 뒤에 SSD 가 물린 구성에서 특히 치명적. 예전 PC 는
             #    최상단이 평범한 root port 라 이른 rescan 도 견뎠다.)
             #   recovery 경로(_recover 의 '1-d SSD boot 대기')와 동일한 산식을 쓴다.
-            _boot_wait = max(self.config.boot_sweep_s, 5.0)
+            _boot_wait = self.config.por_rescan_delay
             log.warning(f"[POR] SSD boot 대기 {_boot_wait:.1f}초 (rescan 전, link training 대기)...")
             time.sleep(_boot_wait)
             if not _rescan_and_l0():
