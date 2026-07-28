@@ -13501,6 +13501,31 @@ class NVMeFuzzer:
                 log.info(f"[Cleanup] {_logname(target)} 삭제 완료")
             target.mkdir(parents=True, exist_ok=True)
 
+        # v9.x: LLM 브리지 drop-box 도 비운다. 시작 시점에 남아 있는 파일은 **전부 이전 run 의
+        # 것**이라 쓸모가 없다 — rid 가 안 맞아 현재 퍼저는 그 응답을 절대 못 읽고, 남은 요청은
+        # 온라인 서비스가 처리해 LLM 호출만 낭비한다. 게다가 응답 파일은 회수 주체가 없어
+        # (클라이언트가 타임아웃으로 포기한 뒤 서비스가 뒤늦게 쓰면) 영구 잔류한다.
+        # 경로 해석은 rag_bridge_client 와 동일 규칙(RAG_BRIDGE_DIR > <스크립트dir>/rag/bridge).
+        try:
+            _bridge = Path(os.environ.get(
+                'RAG_BRIDGE_DIR', Path(__file__).resolve().parent / 'rag' / 'bridge'))
+            _n = 0
+            for _sub in ('requests', 'responses'):
+                _d = _bridge / _sub
+                if not _d.is_dir():
+                    continue
+                for _f in list(_d.glob('req_*.json')) + list(_d.glob('resp_*.json')) \
+                        + list(_d.glob('*.tmp')):
+                    try:
+                        _f.unlink()
+                        _n += 1
+                    except OSError:
+                        pass
+            if _n:
+                log.warning(f"[Cleanup] LLM 브리지 잔여 파일 {_n}개 삭제 ({_bridge})")
+        except Exception as _e:
+            log.debug(f"[Cleanup] 브리지 정리 건너뜀: {_e}")
+
         self._load_seeds()
 
         # v9.0: LLM 브리지 워커 기동 + (옵션) 초기 시딩 요청 1건. 비활성이면 no-op.
