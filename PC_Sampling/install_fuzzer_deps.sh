@@ -33,7 +33,9 @@ sudo apt-get update
 #                    ※ 리스닝 서비스가 뜬다. 설정은 아래 "남은 수동 단계" 참조
 #                       ([homes] 주석 해제 + smbpasswd -a <계정> 이 필요)
 #   net-tools      : ifconfig/route 등 구식 도구 (요즘 우분투 기본 미설치, ip 로 대체 가능하나 습관상 필요)
-#   openssh-client : 원격 로그 수집/파일 전송
+#   openssh-client : (나가는 쪽) 이 머신에서 원격으로 ssh/scp 할 때
+#   openssh-server : (들어오는 쪽) PuTTY 등으로 이 머신에 접속할 때.
+#                    ※ desktop ISO 는 SSH 서버를 기본 설치하지 않는다 — 없으면 PuTTY 가 붙지 않음
 #   vim            : 기본 에디터
 # 주의: 이 fuzzer 는 graphviz/dot/sfdp 를 쓰지 않는다 (v7.6+ 에서 per-command CFG 제거됨, matplotlib 전용).
 log "Installing required system packages"
@@ -41,7 +43,13 @@ sudo apt-get install -y \
   python3 python3-pip \
   openocd nvme-cli pciutils bolt \
   python3-matplotlib python3-numpy python3-serial \
-  cifs-utils nfs-common samba net-tools openssh-client vim
+  cifs-utils nfs-common samba net-tools openssh-client openssh-server vim
+
+# SSH 서버는 설치만으로 끝내지 않는다 — 리그는 원격 접속이 기본 전제라 활성화까지 해둔다.
+log "Enabling SSH server (PuTTY 등 원격 접속용)"
+sudo systemctl enable --now ssh 2>/dev/null || warn "ssh 서비스 활성화 실패 — 'systemctl status ssh' 확인"
+sudo ufw allow ssh   2>/dev/null || true
+sudo ufw allow samba 2>/dev/null || true
 
 # pmu_4_1.py 가 libgpiod 를 쓸 수도 있어 있으면 추가 (없으면 경고만)
 log "Installing optional GPIO package if available"
@@ -123,6 +131,15 @@ for cmd in python3 nvme lspci setpci openocd; do
 done
 command -v boltctl   >/dev/null 2>&1 || warn "boltctl not found (Thunderbolt 미사용이면 무시)"
 command -v mount.cifs >/dev/null 2>&1 || warn "mount.cifs not found (SMB 네트워크 드라이브 미사용이면 무시)"
+
+# 원격 접속(PuTTY 등) 가능 여부는 리그 운용에 직결되므로 리스닝까지 확인한다.
+log "SSH 서버 리스닝 확인"
+if ss -tln 2>/dev/null | grep -q ':22 '; then
+  echo "sshd listening on :22 — OK"
+  ip -4 -o addr show scope global 2>/dev/null | awk '{print "  접속 주소: " $4}'
+else
+  warn "sshd 가 :22 에서 리스닝하지 않음 — 'sudo systemctl status ssh' 확인. PuTTY 접속 불가 상태."
+fi
 
 # nvme-cli 버전 — fuzzer 가 nvme CLI 출력을 다수 파싱하므로 메이저 버전 변화는 회귀 위험.
 # 1.x(20.04) → 2.x(24.04+) 에서 출력 포맷이 바뀐 이력이 있다.
