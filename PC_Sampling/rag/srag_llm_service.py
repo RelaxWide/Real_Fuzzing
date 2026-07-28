@@ -36,6 +36,9 @@ BRIDGE_DIR = Path(os.environ.get("RAG_BRIDGE_DIR", BRIDGE_DIR))
 _REQ = BRIDGE_DIR / "requests"
 _RESP = BRIDGE_DIR / "responses"
 _POLL = 0.5
+# 유휴 경고 간격(초). 퍼저는 request_cadence(기본 5000 exec) 마다만 요청하므로 수 분 공백은
+# 정상이다 → 기본 15분. 공유가 조용히 끊긴 경우를 잡는 게 목적.
+_IDLE_WARN_SEC = float(os.environ.get("RAG_IDLE_WARN_SEC", "900"))
 
 try:
     _llm_call = getattr(importlib.import_module(LLM_MODULE), LLM_FUNC)
@@ -60,10 +63,48 @@ def _unlink(path: Path):
         pass
 
 
+def _log(msg: str):
+    print(f"[RAG service] {msg}", flush=True)
+
+
 def main():
-    print(f"[RAG service] watching {_REQ}  (LLM={LLM_MODULE}.{LLM_FUNC})", flush=True)
+    _log(f"watching {_REQ}  (LLM={LLM_MODULE}.{LLM_FUNC})")
+    _log(f"유휴 경고 간격 {_IDLE_WARN_SEC:.0f}초 (RAG_IDLE_WARN_SEC 로 조정)")
+    last_ok = time.monotonic()     # 마지막으로 요청을 처리한(또는 폴더가 멀쩡했던) 시각
+    last_warn = 0.0
+    broken = False                 # 감시 폴더 접근 불가 상태인지
     while True:
-        for req in sorted(_REQ.glob("req_*.json")):
+        now = time.monotonic()
+
+        # ── 감시 폴더 건강 확인 ──────────────────────────────────────────────
+        # 중요: Path.glob() 은 폴더가 없어도 예외 없이 **빈 목록**을 돌려준다. 즉 공유가
+        #   끊기거나 마운트가 사라져도 서비스는 "요청이 없다" 와 구분하지 못해 조용히 멈춘
+        #   것처럼 보인다(실제로 그렇게 놓친 사례가 있었다). 그래서 is_dir() 로 명시 확인한다.
+        try:
+            alive = _REQ.is_dir()
+            reqs = sorted(_REQ.glob("req_*.json")) if alive else []
+            err = None
+        except OSError as e:        # 끊긴 네트워크 드라이브 등
+            alive, reqs, err = False, [], e
+
+        if not alive:
+            if not broken or (now - last_warn) >= _IDLE_WARN_SEC:
+                _log(f"⚠ 감시 폴더에 접근할 수 없습니다: {_REQ}")
+                if err:
+                    _log(f"⚠   {err}")
+                _log("⚠   공유 연결이 끊겼거나 경로가 사라졌습니다. "
+                     "드라이브 매핑/네트워크를 확인하세요.")
+                last_warn = now
+            broken = True
+            time.sleep(_POLL)
+            continue
+        if broken:
+            _log(f"✓ 감시 폴더 접근 복구됨: {_REQ}")
+            broken = False
+            last_ok = now
+
+        # ── 요청 처리 ────────────────────────────────────────────────────────
+        for req in reqs:
             try:
                 data = json.loads(req.read_text(encoding="utf-8"))
             except (ValueError, OSError):
@@ -76,8 +117,19 @@ def main():
             _atomic_write(_RESP / f"resp_{rid}.json",
                           json.dumps(out, ensure_ascii=False))
             _unlink(req)
-            print(f"[RAG service] handled {rid}"
-                  f"{' (error)' if out.get('error') else ''}", flush=True)
+            _log(f"handled {rid}{' (error)' if out.get('error') else ''}")
+            last_ok = time.monotonic()
+            last_warn = 0.0
+
+        # ── 유휴 경고 ────────────────────────────────────────────────────────
+        # 폴더는 멀쩡한데 오래 요청이 없는 경우. 퍼저가 안 돌거나, 퍼저 쪽 경로가 여기와
+        # 다른 폴더를 보고 있을 수 있다(양쪽이 서로 다른 물리 폴더면 둘 다 조용하다).
+        now = time.monotonic()
+        if (now - last_ok) >= _IDLE_WARN_SEC and (now - last_warn) >= _IDLE_WARN_SEC:
+            _log(f"⚠ {int((now - last_ok) / 60)}분간 요청 없음 — watching {_REQ}")
+            _log("⚠   퍼저가 안 돌고 있거나, 퍼저 쪽이 다른 폴더를 보고 있을 수 있습니다.")
+            last_warn = now
+
         time.sleep(_POLL)
 
 
