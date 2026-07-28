@@ -27,17 +27,21 @@ sudo apt-get update
 #   bolt           : Thunderbolt(USB4) 장치 authorize/관리 (boltctl)
 #   matplotlib/numpy : graph 산출물 (coverage_growth / firmware_map / csfuzz_dynamics / heatmap)
 #   python3-serial : pmu_4_1.py 가 pyserial 을 쓸 경우 대비 (PMU GPIO 제어)
-#   cifs-utils     : 네트워크 드라이브(SMB/NAS) 마운트 — 결과물 반출·시드 반입
-#   nfs-common     : NFS 공유 마운트
+#   cifs-utils     : (클라이언트) 우분투가 원격 SMB 공유를 마운트할 때
+#   nfs-common     : (클라이언트) NFS 공유 마운트
+#   samba          : (서버) 윈도우 PC 에서 \\우분투IP\<계정> 으로 홈 디렉터리 접근할 때.
+#                    ※ 리스닝 서비스가 뜬다. 설정은 아래 "남은 수동 단계" 참조
+#                       ([homes] 주석 해제 + smbpasswd -a <계정> 이 필요)
 #   net-tools      : ifconfig/route 등 구식 도구 (요즘 우분투 기본 미설치, ip 로 대체 가능하나 습관상 필요)
 #   openssh-client : 원격 로그 수집/파일 전송
+#   vim            : 기본 에디터
 # 주의: 이 fuzzer 는 graphviz/dot/sfdp 를 쓰지 않는다 (v7.6+ 에서 per-command CFG 제거됨, matplotlib 전용).
 log "Installing required system packages"
 sudo apt-get install -y \
   python3 python3-pip \
   openocd nvme-cli pciutils bolt \
   python3-matplotlib python3-numpy python3-serial \
-  cifs-utils nfs-common net-tools openssh-client
+  cifs-utils nfs-common samba net-tools openssh-client vim
 
 # pmu_4_1.py 가 libgpiod 를 쓸 수도 있어 있으면 추가 (없으면 경고만)
 log "Installing optional GPIO package if available"
@@ -154,11 +158,21 @@ Install complete.
        (필요시) boltctl authorize <uuid>
        sudo nvme list ; lspci | grep -i nvme
 
-  4) 네트워크 드라이브(SMB) 마운트 — 필요할 때만:
+  4-A) 우분투가 **클라이언트** (원격 SMB 공유를 마운트) — 필요할 때만:
        sudo mkdir -p /mnt/share
        sudo mount -t cifs //서버/공유 /mnt/share -o username=계정,uid=$(id -u),vers=3.0
-       # 영구 마운트는 /etc/fstab 에 credentials=/etc/samba/creds,_netdev,nofail 로.
-       # ※ nofail 을 반드시 넣을 것 — 없으면 망 장애 시 부팅이 멈춘다.
+       # 영구 마운트는 /etc/fstab 에:
+       #   credentials=/etc/samba/creds,uid=1000,gid=1000,vers=3.0,_netdev,nofail,x-systemd.automount
+       # ※ nofail 필수 — 없으면 망/서버 장애 시 부팅이 멈춘다.
+       # ※ x-systemd.automount 권장 — 부팅을 지연시키지 않고 첫 접근 때 붙는다.
+
+  4-B) 우분투가 **서버** (윈도우에서 \\우분투IP\<계정> 으로 홈 접근) — samba 는 위에서 설치됨:
+       sudo vim /etc/samba/smb.conf
+         → [homes] 섹션 주석 해제 + browseable = yes / read only = no
+       sudo smbpasswd -a <계정>      # ★ 리눅스 비밀번호와 별개. 이걸 빼먹으면 인증 거부됨
+       testparm && sudo systemctl restart smbd && sudo systemctl enable smbd
+       sudo ufw allow samba 2>/dev/null || true
+       # 비밀번호가 짧아 거부되면: sudo pdbedit -P "min password length" -C 1
 
   5) Smoke test:
        sudo python3 pc_sampling_fuzzer_v9.5.py --help
