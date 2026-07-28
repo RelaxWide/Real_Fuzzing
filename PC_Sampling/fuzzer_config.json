@@ -352,7 +352,7 @@
     "_comment_debug": "debug=true → [LLM/raw](원본응답) [LLM/parse](파싱결과) [LLM/item](항목 accept/dup/drop) [LLM/stats](기여도 요약) 단계별 로그. log_responses=true → output/llm_io.jsonl 에 원본 전량 기록. 둘 다 분석/디버깅용 — 실운영은 false. json_retries=응답이 JSON 아니면 교정 리프롬프트 재시도 상한.",
     "enabled": true,
     "fail_limit": 3,
-    "debug": false,
+    "debug": true,
     "json_retries": 2,
     "log_responses": false,
     "module_path": "rag.rag_bridge_client",

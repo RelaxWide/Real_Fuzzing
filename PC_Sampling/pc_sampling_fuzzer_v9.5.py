@@ -219,7 +219,7 @@ RAG_ENERGY_BOOST     = float(_RAG.get('llm_energy_boost', 1.5))
 RAG_RESERVED_POLICY  = str(_RAG.get('reserved_policy', 'reject'))
 RAG_RESULT_STALE     = int(_RAG.get('result_stale_execs', 50000))
 RAG_TASKS            = dict(_RAG.get('tasks', {}))
-RAG_DEBUG            = bool(_RAG.get('debug', False))      # 단계별 [LLM/raw|parse|item|stats] 상세 로그
+RAG_DEBUG            = bool(_RAG.get('debug', True))       # 단계별 [LLM/raw|parse|item|stats] 상세 로그(기본 on)
 RAG_JSON_RETRIES     = int(_RAG.get('json_retries', 2))   # 응답이 JSON 아니면 교정 리프롬프트 재시도 상한
 RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 시퀀스(llm_seq) 전용 부스트
 RAG_TASK_WEIGHTS     = dict(_RAG.get('task_weights', {}))  # task별 가중 라운드로빈(미설정=1:1:1)
