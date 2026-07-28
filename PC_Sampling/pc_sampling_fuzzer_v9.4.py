@@ -5248,33 +5248,19 @@ class NVMeFuzzer:
             #   회 실패하면 이후 RAG 를 끄고 blind/mutation fuzzing 으로 계속(무한 재시도 방지).
             self._llm_fail_streak += 1
             self._llm_archive(res)
-            # 첫 실패에서 곧바로 '어디를 고쳐야 하는지' 를 알려준다. 요청은 request_cadence
-            #   (기본 5000 exec) 마다라 서킷브레이커가 열릴 때까지 기다리면 한참 걸린다.
-            #   log.error 라 굵은 빨강 + 퍼징 루프 중 터미널 필터를 무조건 통과한다.
-            if self._llm_fail_streak == 1:
-                _bd = _rag_bridge_dir()
-                log.error("=" * 78)
-                log.error(f"[LLM] RAG service 호출 실패: {res['error']}")
-                log.error("[LLM] 브리지는 양쪽이 **같은 물리 폴더**를 가리켜야 동작합니다.")
-                log.error(f"[LLM]   퍼징 PC(이 머신) : {_bd}")
-                log.error("[LLM]   LLM PC(윈도우)   : rag/srag_llm_service.py 의 BRIDGE_DIR")
-                log.error("[LLM]                      (또는 환경변수 RAG_BRIDGE_DIR 이 우선)")
-                log.error("[LLM] 확인: 서비스 시작 시 찍히는 \"watching <경로>\" 가 위 경로와")
-                log.error("[LLM]       같은 폴더인지 비교하세요.")
-                log.error("[LLM] 자주 겪는 원인:")
-                log.error("[LLM]   - 매핑 드라이브 문자 변경(Z:→Y: 등) → 호스트명 UNC 권장")
-                log.error("[LLM]   - Samba 공유 미마운트 / 우분투 IP 변경")
-                log.error("[LLM]   - bridge 폴더가 root 소유 → sudo chown -R <계정> .../rag/bridge")
-                log.error("[LLM]   - 온라인 PC 에서 srag_llm_service.py 가 안 떠 있음")
-                log.error("=" * 78)
-            else:
-                log.warning(f"[LLM] 호출 오류 ({self._llm_fail_streak}/{RAG_FAIL_LIMIT}): "
-                            f"{res['error']}")
+            # 실패할 때마다 매번 안내한다(요청은 request_cadence 마다라 자주 안 뜬다).
+            #   log.error 라 굵은 빨강 + 퍼징 루프 중 터미널 필터를 무조건 통과.
+            log.error("=" * 78)
+            log.error(f"[LLM] RAG service 호출 실패 "
+                      f"({self._llm_fail_streak}/{RAG_FAIL_LIMIT}): {res['error']}")
+            log.error("[LLM] 윈도우 PC 의 rag/srag_llm_service.py 에서 BRIDGE_DIR 경로를 확인하세요.")
+            log.error(f"[LLM]   퍼징 PC(이 머신)가 보는 경로: {_rag_bridge_dir()}")
+            log.error("[LLM]   → 이 폴더와 같은 물리 폴더를 가리켜야 합니다.")
+            log.error("=" * 78)
             if RAG_FAIL_LIMIT > 0 and self._llm_fail_streak >= RAG_FAIL_LIMIT:
                 self.llm.enabled = False
-                log.error(f"[LLM] RAG service 호출 {self._llm_fail_streak}회 연속 실패 → 이후 "
-                          f"RAG 비활성화(blind/mutation fuzzing 은 계속). "
-                          f"브리지 경로는 위 안내 참조. 마지막 오류: {res['error']}")
+                log.error(f"[LLM] {self._llm_fail_streak}회 연속 실패 → 이후 RAG 비활성화"
+                          f"(blind/mutation fuzzing 은 계속)")
             return
         self._llm_fail_streak = 0   # 서비스가 응답함(파싱 성패 무관) → 연속 실패 리셋
         if self.executions - res.get('submitted_at', 0) > RAG_RESULT_STALE:
