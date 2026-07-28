@@ -171,20 +171,84 @@ sudo python3 PC_Sampling/kernel_sweep.py --run       # 부팅할 때마다
 
 ## 6단계 — 5.15 로 되돌려 재현 확인 ★ 이게 있어야 확정된다
 
-5.15 로 부팅해서 같은 퍼저를 돌린다.
+왜 필요한가: "6.8 에서 통과"만으로는 그 사이 **다른 것**(케이블 재접속, 온도, 장치 상태)이
+바뀌었을 가능성을 못 배제한다. 같은 날 같은 장비에서 5.15 가 다시 나빠져야 커널이 유일한
+차이임이 증명된다.
 
+> **★ 목표가 바뀌었다(2026-07-27):** 예전엔 "프리즈할 때까지 수 시간 대기"였으나, 6.8 에서
+> **corrected 에러 106 → 0**(하드웨어 `CESta` 로 확인)이 나오면서 **선행지표**가 생겼다.
+> 이제 **몇 분이면 판정**되고 프리즈는 선택적 확증일 뿐이다.
+
+### 6-1. 6.8 에서 미리 챙길 것 (재부팅하면 다시 못 본다)
 ```bash
-sudo reboot     # GRUB 에서 5.15.0-139-generic 선택
-uname -r        # 5.15.0-139-generic 확인
+BDF_ROOT=0000:00:01.1
+BDF_SSD=<SSD BDF>          # lspci -nn | grep -i non-volatile
+
+{ uname -r; cat /proc/cmdline
+  echo "=== root ==="; sudo lspci -vvv -s $BDF_ROOT
+  echo "=== ep ===";   sudo lspci -vvv -s $BDF_SSD
+  echo "=== OSC ===";  journalctl -k -b | grep -i _OSC
+} > ~/pcie_$(uname -r).txt
+```
+
+### 6-2. 5.15 로 부팅
+```bash
+sudo reboot                       # GRUB 에서 5.15.0-139-generic 선택
+uname -r                          # 5.15.0-139-generic
+cat /proc/cmdline                 # pci=noaer 없어야 함
+nvme list; lsusb | grep -i segger
+```
+`pci=noaer` 제거는 GRUB 설정이라 **5.15 에도 자동 적용**된다. 이게 중요하다 — 5.15 에서
+AER 카나리아가 살아나야 비교가 성립한다.
+
+### 6-3. 같은 덤프 + 카운터 초기화
+```bash
+BDF_ROOT=0000:00:01.1; BDF_SSD=<SSD BDF>
+{ uname -r; cat /proc/cmdline
+  echo "=== root ==="; sudo lspci -vvv -s $BDF_ROOT
+  echo "=== ep ===";   sudo lspci -vvv -s $BDF_SSD
+  echo "=== OSC ===";  journalctl -k -b | grep -i _OSC
+} > ~/pcie_$(uname -r).txt
+
+diff ~/pcie_6.8.12-060812-generic.txt ~/pcie_5.15.0-139-generic.txt
+sudo python3 PC_Sampling/pcie_link_probe.py --root $BDF_ROOT --ep $BDF_SSD --once --clear
+```
+**이 diff 가 "두 커널이 이 링크를 어떻게 다르게 세팅했나"의 답이다.** ASPM·링크속도는 이미
+배제됐으므로 `MaxPayload` / `MaxReadReq` / `DevCtl2` / `RootCmd` / `LnkCtl` 줄을 볼 것.
+
+### 6-4. 터미널 1 — 프로브
+```bash
+sudo python3 PC_Sampling/pcie_link_probe.py --root $BDF_ROOT --ep $BDF_SSD \
+    --interval 5 --clear | tee ~/probe_5.15.log
+```
+
+### 6-5. 터미널 2 — 퍼저 (6.8 arm 과 **똑같은** 명령)
+```bash
 cd /home/ssd/gdbfuzz
 sudo .venv/bin/python3 PC_Sampling/pc_sampling_fuzzer_v9.5.py --product P7 2>&1 | tee ~/run_5.15.log
 ```
 
-**48만 이전에 얼면 → 커널이 원인으로 확정.**
+### 6-6. 판정 — `AERcor=` 와 `DevSta=CorrErr` 만 보면 된다
+**예상 시점:** 5.15 에서 106개가 30만 명령쯤에 걸쳐 났다면 **~3000명령당 1개** 꼴 →
+**수천 명령(몇 분)** 안에 첫 에러가 보여야 정상이다.
 
-왜 필요한가: "6.8 에서 통과"만으로는 그 사이 **다른 것**(케이블 재접속, 온도, 장치 상태)이
-바뀌었을 가능성을 못 배제한다. 같은 날 같은 장비에서 5.15 가 다시 얼어야 커널이 유일한
-차이임이 증명된다.
+| 관측 | 판정 |
+|---|---|
+| 몇 분 내 `AERcor` 누적 시작 | **커널 차이 확정.** 프리즈 안 기다려도 됨 |
+| 10만 명령 넘도록 계속 0 | 커널이 아니라 다른 게 바뀐 것 → 6-7 |
+
+**어떤 비트인지가 마지막 갈림길:**
+- **`RxErr`** → 수신기/물리 계층
+- **`BadTLP`/`BadDLLP`** → CRC 실패 = **프로토콜 계층** → **(F) 플로우컨트롤 확정**
+
+### 6-7. 5.15 에서도 0 이 나오면
+가장 곤란한 결과. 커널이 아니라 그 사이 물리적으로 뭔가 바뀐 것(케이블·슬롯·온도·접촉)이고,
+**그동안의 프리즈 재현성 자체가 사라졌다는 뜻**이다. 프리즈가 날 때까지(9만~48만) 돌려보고,
+그래도 안 나면 조사를 원점에서 다시 봐야 한다. 확률은 낮으니 미리 겁먹을 필요는 없다.
+
+### 6-8. 프리즈까지 갈 경우
+- **화면에 마지막으로 찍힌 `exec=` 숫자**를 적어둘 것 (프리즈 시 로그 파일 끝은 유실된다)
+- 재부팅 후 `journalctl -k -b -1 | tail -30`
 
 ---
 
