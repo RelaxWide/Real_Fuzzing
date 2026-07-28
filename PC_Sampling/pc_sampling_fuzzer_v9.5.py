@@ -1431,7 +1431,65 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     logger.warning(f"[CODE] sha={_code_signature()}  cfg={_config_signature()} "
                    f"({os.path.basename(str(_CFG_PATH))})")
 
+    # nvme-cli 버전 가드 — 잘못된 버전이면 시작 시 크게 경고(이후 [Stats] 마다 재알림).
+    _detect_nvme_cli_version()
+    if _NVME_CLI_VER_STR:
+        logger.warning(f"[CODE] nvme-cli={_NVME_CLI_VER_STR}")
+    _nvme_cli_warn(logger)
+
     return logger, log_file
+
+
+# ─── nvme-cli 버전 가드 ────────────────────────────────────────────────────────
+# 이 퍼저는 nvme-cli **1.x** 기준으로 작성됐다(명령 구성 + 출력 파싱 다수).
+# 2.x(libnvme 재작성판)에서는 admin-passthru 가 다른 바이트를 보내는 것으로 관측됐고,
+# 그 결과 펌웨어가 Invalid Opcode(0x1)로 정상 거부하던 명령(예 opcode 0xe5)이 응답 없이
+# timeout 으로 오탐된다(2026-07, 26.04/nvme-cli 2.16 에서 1000 명령 이내 재현).
+# 같은 커널에서 nvme-cli 만 1.16 으로 바꾸면 즉시 정상 동작 → 커널 아닌 도구 문제로 확정.
+_NVME_CLI_VER_STR = ''
+_NVME_CLI_MAJOR   = None      # None = 미탐지(경고 안 함), 1 = 정상, 그 외 = 경고
+
+
+def _detect_nvme_cli_version() -> None:
+    """`nvme version` 을 읽어 major 를 캐시한다. 실패해도 조용히 넘어간다(가드일 뿐)."""
+    global _NVME_CLI_VER_STR, _NVME_CLI_MAJOR
+    try:
+        _r = subprocess.run(['nvme', 'version'], capture_output=True, timeout=5)
+        _out = (_r.stdout + _r.stderr).decode(errors='replace').strip()
+        # 2.x 출력은 "nvme version 2.16" + "libnvme version 1.16.1" 두 줄이다.
+        # 무조건 첫 줄을 쓰면 stdout/stderr 순서에 따라 libnvme 쪽을 major=1 로 오판할 수
+        # 있으므로, 'nvme version' 으로 시작하는 줄을 명시적으로 고른다.
+        _lines = [ln.strip() for ln in _out.splitlines() if ln.strip()]
+        _cand = next((ln for ln in _lines
+                      if re.match(r'^nvme\s+version\s+\d+\.', ln)), None)
+        _NVME_CLI_VER_STR = _cand or (_lines[0] if _lines else '')
+        _m = re.match(r'^nvme\s+version\s+(\d+)\.(\d+)', _NVME_CLI_VER_STR)
+        if _m:
+            _NVME_CLI_MAJOR = int(_m.group(1))
+    except Exception:
+        pass
+
+
+def _nvme_cli_warn(logger, brief: bool = False) -> None:
+    """nvme-cli 가 1.x 가 아니면 경고. log.error 라 굵은 빨강 + 터미널 필터 무조건 통과."""
+    if _NVME_CLI_MAJOR is None or _NVME_CLI_MAJOR == 1:
+        return
+    if brief:
+        logger.error(f"[NVME-CLI] {_NVME_CLI_VER_STR} 사용 중 — 1.x 아님. "
+                     f"opcode 거부가 timeout 으로 오탐될 수 있음. 1.16 설치 권장")
+        return
+    logger.error("=" * 78)
+    logger.error(f"[NVME-CLI] 경고: nvme-cli {_NVME_CLI_MAJOR}.x 감지 — {_NVME_CLI_VER_STR}")
+    logger.error("[NVME-CLI] 이 퍼저는 nvme-cli 1.x 기준이다(명령 구성 + 출력 파싱 다수).")
+    logger.error("[NVME-CLI] 2.x(libnvme)는 admin-passthru 를 다르게 구성해, 펌웨어가")
+    logger.error("[NVME-CLI]   Invalid Opcode(0x1)로 정상 거부하던 명령(예 0xe5)이 응답 없이")
+    logger.error("[NVME-CLI]   timeout 으로 오탐된다. 1000 명령 이내 재현 확인(2026-07).")
+    logger.error("[NVME-CLI] 조치 — nvme-cli 1.16 을 /usr/local 에 설치(기존 것은 지우지 말 것):")
+    logger.error("[NVME-CLI]   tar xf nvme-cli-1.16.tar.gz && cd nvme-cli-1.16")
+    logger.error("[NVME-CLI]   make CFLAGS='-O2 -g -Wno-error' && sudo make install")
+    logger.error("[NVME-CLI]   확인: sudo nvme version  → 1.16 이어야 함")
+    logger.error("[NVME-CLI]   (sudo 는 secure_path 를 쓰므로 /usr/local/sbin 이 앞인지 확인)")
+    logger.error("=" * 78)
 
 
 def _logname(p) -> str:
@@ -12899,6 +12957,8 @@ class NVMeFuzzer:
                  f"exec/s: {window_eps:.1f} | "
                  f"seq_run: {_seq_run}"
                  f"{ps_tag}{state_tag}")
+        # 시작 배너를 놓쳐도 알 수 있게 주기 통계마다 재알림(정상 버전이면 아무것도 안 찍힘).
+        _nvme_cli_warn(log, brief=True)
         if self._sa_loaded:
             sa_parts = []
             if self._sa_total_bbs > 0:
