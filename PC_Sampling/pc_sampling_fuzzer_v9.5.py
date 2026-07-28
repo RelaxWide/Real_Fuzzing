@@ -13597,6 +13597,19 @@ class NVMeFuzzer:
         if _is_halt and self.config.enable_por:
             log.warning("[POR] 침습 halt 샘플러 — device id-ctrl 응답(코어 실행) 확인 후 "
                         "connect (boot sweep 생략)")
+            # SSD boot 대기 — rescan 전에 반드시 필요(2026-07 수정).
+            #   설계상 초기 POR 의 부팅 대기는 boot sweep 이 겸하고 있었는데, 이 halt 분기가
+            #   sweep 을 생략하면서 **대기까지 함께 사라져** 전원 ON 직후 t=0 에 rescan 이
+            #   돌았다. SSD 가 아직 link training 중일 때 rescan 하면 커널이 브리지를
+            #   '아래에 장치 없음' 으로 열거해 윈도우를 확정해버리고, 그 뒤 장치가 올라와도
+            #   윈도우를 못 키워 계속 실패한다:
+            #       bridge window ... can't assign; no space / BAR 0: can't assign
+            #   (Thunderbolt/USB4 터널 뒤에 SSD 가 물린 구성에서 특히 치명적. 예전 PC 는
+            #    최상단이 평범한 root port 라 이른 rescan 도 견뎠다.)
+            #   recovery 경로(_recover 의 '1-d SSD boot 대기')와 동일한 산식을 쓴다.
+            _boot_wait = max(self.config.boot_sweep_s, 5.0)
+            log.warning(f"[POR] SSD boot 대기 {_boot_wait:.1f}초 (rescan 전, link training 대기)...")
+            time.sleep(_boot_wait)
             if not _rescan_and_l0():
                 return
 
