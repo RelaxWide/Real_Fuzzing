@@ -4434,27 +4434,6 @@ class NVMeFuzzer:
         _first_rescan = True
         while time.monotonic() < deadline:
             attempt += 1
-            # 0) 재시도 시 브리지 재초기화 — **이른 rescan 은 파괴적**이기 때문.
-            #    링크가 올라오기 전에 rescan 하면 커널이 브리지를 '아래에 장치 없음' 으로
-            #    열거하며 윈도우를 확정해버리고, 이후 장치가 올라와도 윈도우를 못 키운다
-            #    (bridge window can't assign; no space). 그래서 단순 재시도로는 복구가
-            #    안 된다. 재시도 전에 대상 브리지를 다시 remove 해 깨끗한 상태에서 다시
-            #    열거시킨다 → por_rescan_delay 가 짧아도 자동 복구된다.
-            #    단, EP 가 이미 sysfs 에 보이면(열거는 됐고 /dev 노드만 늦은 경우) 건드리지
-            #    않고 그대로 기다린다.
-            if attempt > 1:
-                _ep_present = bool(self._pcie_bdf) and os.path.exists(
-                    f'/sys/bus/pci/devices/{self._pcie_bdf}')
-                _re_bdf = self._por_remove_target() if not _ep_present else None
-                if _re_bdf:
-                    try:
-                        subprocess.run(
-                            ['bash', '-c', f'echo 1 > /sys/bus/pci/devices/{_re_bdf}/remove'],
-                            timeout=5, capture_output=True)
-                        log.warning(f"[POR] 재시도 {attempt}: 브리지 재초기화 remove {_re_bdf}")
-                    except Exception as e:
-                        log.debug(f"[POR] 재시도 remove 실패(무시): {e}")
-
             # 1) rescan trigger (매 iteration — device 가 늦게 올라와도 잡힘)
             try:
                 with open('/sys/bus/pci/rescan', 'w') as f:
