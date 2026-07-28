@@ -32,6 +32,8 @@ sudo apt-get update
 #   samba          : (서버) 윈도우 PC 에서 \\우분투IP\<계정> 으로 홈 디렉터리 접근할 때.
 #                    ※ 리스닝 서비스가 뜬다. 설정은 아래 "남은 수동 단계" 참조
 #                       ([homes] 주석 해제 + smbpasswd -a <계정> 이 필요)
+#   smbclient      : (진단) 공유 목록 확인용 `smbclient -L`. samba 와 별도 패키지이고
+#                    없어도 공유는 동작하나, 안 붙을 때 원인 파악이 훨씬 빠르다
 #   net-tools      : ifconfig/route 등 구식 도구 (요즘 우분투 기본 미설치, ip 로 대체 가능하나 습관상 필요)
 #   openssh-client : (나가는 쪽) 이 머신에서 원격으로 ssh/scp 할 때
 #   openssh-server : (들어오는 쪽) PuTTY 등으로 이 머신에 접속할 때.
@@ -43,7 +45,7 @@ sudo apt-get install -y \
   python3 python3-pip \
   openocd nvme-cli pciutils bolt \
   python3-matplotlib python3-numpy python3-serial \
-  cifs-utils nfs-common samba net-tools openssh-client openssh-server vim
+  cifs-utils nfs-common samba smbclient net-tools openssh-client openssh-server vim
 
 # SSH 서버는 설치만으로 끝내지 않는다 — 리그는 원격 접속이 기본 전제라 활성화까지 해둔다.
 log "Enabling SSH server (PuTTY 등 원격 접속용)"
