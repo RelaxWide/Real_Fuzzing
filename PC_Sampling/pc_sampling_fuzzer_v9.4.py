@@ -4336,9 +4336,25 @@ class NVMeFuzzer:
     def _power_cycle_ssd(self) -> bool:
         """PMU 보드를 이용한 SSD POR Phase 1: 전원 사이클 + SWD 준비 대기.
 
-        순서: PCIe 제거 → 전원 OFF → 방전 대기 → 전원 ON
+        순서: **전원 OFF → PCIe 제거** → 방전 대기 → 전원 ON
         PCIe rescan / NVMe 확인은 boot sweep 이후 _por_pcie_rescan()에서 수행.
         J-Link SWD는 USB 연결로 PCIe와 독립적 — 전원 ON 직후 접근 가능.
+
+        **전원 OFF 를 PCIe remove 보다 먼저 하는 이유 (2026-07 수정):**
+        살아있는 링크 상태에서 최상단 브리지를 remove 하면, SSD 가 **Thunderbolt/USB4
+        터널 뒤에 물린 구성**에서 터널이 통째로 무너지고 이후 rescan 때 커널이 브리지
+        윈도우를 다시 잡지 못한다:
+            bridge window ... can't assign; no space
+            BAR 0: can't assign; no space
+            probe with driver thunderbolt failed with error -110 → -ENODEV: probe failed
+        → NVMe 가 영영 안 올라와 `_por_pcie_rescan()` 이 por_boot_wait 만료까지 실패.
+        전원을 먼저 끊으면 링크가 이미 내려간 상태라 remove 가 순수 소프트웨어 정리가
+        되고, 전원 ON 후 rescan 에서 자원이 정상 재할당된다.
+        (수동으로 OFF→remove→ON→rescan 하면 되는데 퍼저에서만 실패하던 원인. 코드는
+         그대로였고 OS 만 20.04/5.15 → 26.04/7.0 으로 바뀐 뒤 드러났다.)
+        부수 효과: device 무응답 시 remove sysfs write 가 block 되던 위험도 줄어든다.
+        제품 공용 경로지만, 전원을 끊은 뒤 remove 하는 것은 EP 를 remove 하는 제품
+        (PM9M1/BM9H1)에도 동일하게 안전하므로 분기하지 않는다.
         """
         if not os.path.isfile(self.config.pmu_script):
             log.error(f"[POR] PMU 스크립트 없음: {self.config.pmu_script} — POR 스킵")
@@ -4347,8 +4363,16 @@ class NVMeFuzzer:
         log.warning("[POR] SSD 전원 사이클 시작...")
         self.sampler._stop_worker()   # 샘플링 스레드 정지(POR 중 소켓 경합 방지; 다음 명령에서 재가동)
 
-        # 1. PCIe 장치 제거. nvme_kernel_timeout_sec 가 크게 설정된 상태에서 device 가
-        # 응답 안 하면 sysfs write 영구 block 가능 → subprocess timeout 10초 강제 진행.
+        # 1. 전원 OFF — PCIe remove 보다 **먼저**(위 docstring 참조).
+        _off_cmd = ['python3', self.config.pmu_script, '7', '1']
+        log.warning(f"[POR] CMD: {' '.join(_off_cmd)}")
+        r = subprocess.run(_off_cmd, capture_output=True, timeout=5)
+        log.warning(f"[POR] PowerOffAll rc={r.returncode} "
+                    f"stdout={r.stdout.decode(errors='replace').strip()!r} "
+                    f"stderr={r.stderr.decode(errors='replace').strip()!r}")
+
+        # 2. PCIe 장치 제거 — 전원이 끊겨 링크가 이미 내려간 상태에서 수행.
+        # timeout 10초는 안전망으로 유지(전원 OFF 로 block 위험은 크게 줄었다).
         _rm_bdf = self._por_remove_target()
         if not _rm_bdf:
             log.warning("[POR] PCIe remove 대상 BDF 없음 — remove 건너뜀 (전원 사이클만 수행)")
@@ -4367,21 +4391,16 @@ class NVMeFuzzer:
                                 f"{_r.stderr.decode(errors='replace').strip()} — 무시")
             except subprocess.TimeoutExpired:
                 log.warning(f"[POR] PCIe 장치 제거 10초 timeout — 강제 진행 "
-                            "(전원 사이클이 device 강제 reset)")
+                            "(전원이 이미 OFF 라 device 는 어차피 리셋된다)")
             except Exception as e:
                 log.warning(f"[POR] PCIe 장치 제거 예외: {e} — 무시")
 
-        # 2. 전원 OFF
-        _off_cmd = ['python3', self.config.pmu_script, '7', '1']
-        log.warning(f"[POR] CMD: {' '.join(_off_cmd)}")
-        r = subprocess.run(_off_cmd, capture_output=True, timeout=5)
-        log.warning(f"[POR] PowerOffAll rc={r.returncode} "
-                    f"stdout={r.stdout.decode(errors='replace').strip()!r} "
-                    f"stderr={r.stderr.decode(errors='replace').strip()!r}")
-        log.warning(f"[POR] 전원 OFF — {self.config.por_poweroff_wait:.1f}초 방전 대기...")
+        # 3. 방전 대기 — 전원 OFF 시점부터 흐르므로 remove 에 걸린 시간도 방전에 포함되나,
+        # 보수적으로 여기서 por_poweroff_wait 만큼 추가 대기한다(짧아지지 않게).
+        log.warning(f"[POR] 전원 OFF 상태 — {self.config.por_poweroff_wait:.1f}초 방전 대기...")
         time.sleep(self.config.por_poweroff_wait)
 
-        # 3. 전원 ON + SWD 준비 대기 (PCIe 부팅 대기는 boot sweep 이후로 분리)
+        # 4. 전원 ON + SWD 준비 대기 (PCIe 부팅 대기는 boot sweep 이후로 분리)
         _on_cmd = ['python3', self.config.pmu_script, '4', '1',
                    str(self.config.clkreq_voltage_mv), '0', '12000', '0', '0']
         log.warning(f"[POR] CMD: {' '.join(_on_cmd)}")
