@@ -139,6 +139,7 @@ def main():
     _log(f"watching {_REQ}  (LLM={LLM_MODULE}.{LLM_FUNC})")
     _log(f"유휴 경고 간격 {_IDLE_WARN_SEC:.0f}초 (RAG_IDLE_WARN_SEC 로 조정)")
     last_ok = time.monotonic()     # 마지막으로 요청을 처리한(또는 폴더가 멀쩡했던) 시각
+    _unreadable = {}               # 파일명 -> 연속 읽기 실패 횟수(권한 문제 조기 발견)
     last_warn = 0.0
     broken = False                 # 감시 폴더 접근 불가 상태인지
     while True:
@@ -175,8 +176,20 @@ def main():
         for req in reqs:
             try:
                 data = json.loads(req.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
-                continue   # 아직 쓰는 중 → 다음 라운드 재시도
+            except (ValueError, OSError) as _re:
+                # 대개는 '아직 쓰는 중' 이라 다음 라운드에 성공한다. 하지만 권한 때문에
+                #   영영 못 읽는 경우(퍼저가 root 로 만든 0600 파일 등)에도 같은 경로를 타서,
+                #   예전엔 로그 한 줄 없이 무한히 건너뛰었다 — 서비스가 요청을 '인지조차
+                #   못 하는' 것처럼 보이는 원인. 반복 실패는 알린다.
+                _n = _unreadable.get(req.name, 0) + 1
+                _unreadable[req.name] = _n
+                if _n in (10, 100) or _n % 600 == 0:   # ≈5초 / 50초 / 이후 5분 간격
+                    _log(f"⚠ 요청 파일을 {_n}회 읽지 못했습니다: {req.name}")
+                    _log(f"⚠   {_re}")
+                    _log("⚠   권한 문제일 수 있습니다 — 퍼징 PC 에서: "
+                         "sudo chmod -R 777 <bridge 폴더>")
+                continue
+            _unreadable.pop(req.name, None)
             rid = data.get("id", "?")
             _prompt = data.get("user_prompt") or ""
             # 처리 '시작' 을 먼저 찍는다. 이 서비스는 단일 스레드 동기 루프라 _llm_call 하나가

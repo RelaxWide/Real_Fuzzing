@@ -36,11 +36,24 @@ _REQ.mkdir(parents=True, exist_ok=True)
 _RESP.mkdir(parents=True, exist_ok=True)
 
 
+def _chmod_shared(path: Path):
+    """공유 drop-box 파일은 **다른 계정**(온라인 PC 의 Samba 계정)이 읽고 지워야 한다.
+    퍼저는 sudo 로 돌아 파일이 root 소유로 생기는데, 프로세스 umask 가 빡빡하면 0600 이
+    되어 상대가 못 읽는다. 그 경우 서비스는 목록에는 보이지만 read 에 실패해 **조용히
+    건너뛴다**(로그도 없음) → 요청이 영원히 처리되지 않는다. 그래서 명시적으로 완화한다.
+    """
+    try:
+        os.chmod(path, 0o666)
+    except OSError:
+        pass
+
+
 def _atomic_write(path: Path, text: str):
     """.tmp 로 쓰고 rename → 읽는 쪽이 부분 파일을 보지 않게(같은 폴더 rename = atomic)."""
     tmp = path.parent / (path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+    _chmod_shared(path)
 
 
 def _unlink(path: Path):
