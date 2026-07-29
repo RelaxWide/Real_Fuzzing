@@ -122,7 +122,7 @@ except Exception:
     _pylink = None
 
 # 버전
-FUZZER_VERSION = "9.5.0"
+FUZZER_VERSION = "9.6.0"
 
 # ─────────────────────────────────────────────────────────────────────────
 # USER CONFIGURATION  — 값은 모두 fuzzer_config.json 에서 로드한다 (v8.3).
@@ -222,6 +222,13 @@ RAG_TASKS            = dict(_RAG.get('tasks', {}))
 RAG_DEBUG            = bool(_RAG.get('debug', True))       # 단계별 [LLM/raw|parse|item|stats] 상세 로그(기본 on)
 RAG_JSON_RETRIES     = int(_RAG.get('json_retries', 2))   # 응답이 JSON 아니면 교정 리프롬프트 재시도 상한
 RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 시퀀스(llm_seq) 전용 부스트
+# v9.6: LLM 에너지 부스트 자동조정. 고정 상수(1.5)는 "LLM 계보를 얼마나 밀어줄까" 를 사람이
+#   정하는 값이었다 — LLM 이 실제로 커버리지를 뚫든 말든 항상 같은 배수였다. CSFuzz 의 p 가
+#   reward 로 갱신되듯, 이 배수도 구간별 실측 yield(선택당 새 edge 수)로 갱신한다.
+RAG_BOOST_LR          = float(_RAG.get('boost_lr', 0.3))          # 갱신 학습률
+RAG_BOOST_MIN         = float(_RAG.get('boost_min', 0.5))         # 하한(0 금지 — 아래 주석)
+RAG_BOOST_MAX         = float(_RAG.get('boost_max', 3.0))         # 상한(mutation 고사 방지)
+RAG_BOOST_MIN_SAMPLES = int(_RAG.get('boost_min_samples', 200))   # 양 arm 최소 실행 수
 RAG_TASK_WEIGHTS     = dict(_RAG.get('task_weights', {}))  # task별 가중 라운드로빈(미설정=1:1:1)
 RAG_LOG_RESPONSES    = bool(_RAG.get('log_responses', False))  # LLM 원본 요청/응답을 output/llm_io.jsonl 에 전량 기록
 # v9.5 Phase 0
@@ -3597,6 +3604,13 @@ class NVMeFuzzer:
         self._state_seen: set = set()
         # v9.4: 커버리지 소스별 누적(스택 그래프용). src_tag('origin/form') → {'edge','sc','state'}.
         self._cov_by_src: dict = {}
+        # v9.6: LLM 부스트 자동조정 상태. _llm_boost 는 런타임에 변하는 배수(초기값=기존 상수라
+        #   첫 갱신 전까지 v9.5 와 동작 동일). _boost_exec/_boost_gain 은 **구간** 카운터로,
+        #   각각 origin(llm|mutation)별 실행 수(분모)와 새 edge 수(분자)를 센다.
+        self._llm_boost: float = RAG_ENERGY_BOOST
+        self._boost_exec: dict = {}
+        self._boost_gain: dict = {}
+        self._llm_boost_hist: list = []
         # v9.4: 3축 성장 스냅샷 이력(별도 그래프 파일 coverage_growth_plot.py 가 읽음).
         self._cov_growth_hist: list = []
         # v9.4 ledger(관측 전용, 궤적 불변): LLM 제안↔실행결과 연결 + 주목할만한 실행 outcome 기록.
@@ -5611,6 +5625,11 @@ class NVMeFuzzer:
         """v9.4: 소스별 커버리지 누적(스택 그래프용). axis ∈ {'edge','sc','state'}."""
         d = self._cov_by_src.setdefault(src, {'edge': 0, 'sc': 0, 'state': 0})
         d[axis] = d.get(axis, 0) + n
+        # v9.6: 부스트 자동조정 분자. edge 만 센다 — sc/state 를 섞으면 단위가 달라 가중치를
+        #   사람이 정해야 하고, 그러면 '사람 개입 제거' 라는 목적과 어긋난다.
+        if axis == 'edge':
+            _o = src.split('/')[0]
+            self._boost_gain[_o] = self._boost_gain.get(_o, 0) + n
 
     # ── v9.4 ledger (관측 전용 — 어떤 결정 로직도 이 값을 읽지 않는다) ──────────────
     def _run_id_get(self) -> str:
@@ -5756,10 +5775,12 @@ class NVMeFuzzer:
         시퀀스(llm_seq)는 _calculate_energy 의 /len(commands) 페널티로 선택이 불리하므로
         전용 부스트(RAG_SEQ_ENERGY_BOOST, 기본=일반 부스트)로 상쇄해 실제 탐색되게 한다."""
         sc = str(getattr(seed, 'seed_class', '') or '')
+        # v9.6: 고정 상수가 아니라 실측으로 갱신되는 self._llm_boost 를 쓴다.
+        #   시퀀스는 기존 비율(RAG_SEQ_ENERGY_BOOST/RAG_ENERGY_BOOST)을 유지한 채 함께 움직인다.
         if sc == 'llm_seq':
-            e *= RAG_SEQ_ENERGY_BOOST
+            e *= self._llm_boost * (RAG_SEQ_ENERGY_BOOST / max(RAG_ENERGY_BOOST, 1e-9))
         elif sc.startswith('llm'):
-            e *= RAG_ENERGY_BOOST
+            e *= self._llm_boost
         ls = getattr(seed, 'llm_score', None)
         if ls is not None and ls < 0.3:
             e *= 0.5   # LLM 이 낮게 평가한 시드 비우선화(삭제는 안 함)
@@ -6018,6 +6039,39 @@ class NVMeFuzzer:
         self._csfuzz_c2_rewards.append(1 if _state_reproduced else 0)
         return True
 
+    def _update_llm_boost(self):
+        """v9.6: LLM 에너지 부스트를 구간 실측 yield 로 갱신(CSFuzz p 와 같은 주기·같은 꼴).
+
+        y = (그 origin 이 만든 새 edge 수) / (그 origin 이 실행된 횟수)  ← 기회 정규화
+        r = (y_llm - y_mut) / (y_llm + y_mut)  ∈ [-1, +1]                ← 스케일 불변
+        boost ← clip(boost * (1 + lr*r), MIN, MAX)
+
+        **표본 부족 시 창을 비우지 않는 이유:** boost 가 낮아지면 LLM 시드가 덜 뽑혀 표본이
+        더 안 모인다. 매 구간 리셋하면 '평가할 데이터가 없어 낮은 값에 영구 고착' 되는 내리막
+        나선에 빠진다. 누적시키면 시간이 걸려도 반드시 한 번은 공정하게 평가받는다.
+        같은 이유로 하한(RAG_BOOST_MIN)이 0 이면 안 된다 — 0 이면 영영 안 뽑혀 복구 불가.
+        """
+        e_llm = self._boost_exec.get('llm', 0)
+        e_mut = self._boost_exec.get('mutation', 0)
+        if e_llm < RAG_BOOST_MIN_SAMPLES or e_mut < RAG_BOOST_MIN_SAMPLES:
+            log.info(f"[LLM-boost] 표본 부족 — 갱신 보류, 누적 계속 "
+                     f"(llm={e_llm}, mutation={e_mut}, 필요={RAG_BOOST_MIN_SAMPLES})")
+            return
+        g_llm = self._boost_gain.get('llm', 0)
+        g_mut = self._boost_gain.get('mutation', 0)
+        y_llm, y_mut = g_llm / e_llm, g_mut / e_mut
+        r = (y_llm - y_mut) / (y_llm + y_mut + 1e-12)
+        old = self._llm_boost
+        self._llm_boost = max(RAG_BOOST_MIN,
+                              min(RAG_BOOST_MAX, old * (1.0 + RAG_BOOST_LR * r)))
+        log.warning(f"[LLM-boost] {old:.2f} → {self._llm_boost:.2f}  r={r:+.3f}  "
+                    f"y_llm={y_llm:.6f} y_mut={y_mut:.6f}  "
+                    f"exec={e_llm}/{e_mut}  edge={g_llm}/{g_mut}")
+        self._llm_boost_hist.append(
+            (self.executions, self._llm_boost, y_llm, y_mut, e_llm, e_mut))
+        self._boost_exec.clear()
+        self._boost_gain.clear()
+
     def _update_csfuzz_p(self):
         """CSFuzz §III-C 수식 (4)/(5): 10000회 interval마다 corpus selection 확률 p 갱신.
 
@@ -6082,6 +6136,14 @@ class NVMeFuzzer:
         self.cmd_stats[track_key]["exec"] += 1
 
         self.executions += 1
+
+        # v9.6: 부스트 자동조정 분모 — 발견 여부와 무관하게 **모든 실행**을 origin 별로 센다.
+        #   발견 수만 세면 "많이 뽑혀서 많이 찾은 것" 과 "잘 찾은 것" 을 구분할 수 없다.
+        try:
+            _o = self._cov_src_tag(seed, source, seq_member=seq_member).split('/')[0]
+            self._boost_exec[_o] = self._boost_exec.get(_o, 0) + 1
+        except Exception:
+            pass
 
         # FWCommit 성공 후 예약된 재연결 처리 — 여기(stop_sampling 이후)는 샘플러 스레드가
         # 정지 상태라 안전하다. 코어 리셋으로 끊긴 타겟 디버그를 재확립해 halt 를 살린다.
@@ -6448,6 +6510,7 @@ class NVMeFuzzer:
                 'state_count': len(self._state_seen),
                 'ledger_dropped': self._ledger_dropped,   # ledger/proposal write 유실 누적(0=정상)
                 'by_src': {k: dict(v) for k, v in self._cov_by_src.items()},
+                'llm_boost': round(self._llm_boost, 3),   # v9.6: 자동조정된 부스트 추이
             }
             self._cov_growth_hist.append(_snap_row)
             try:
@@ -6570,6 +6633,8 @@ class NVMeFuzzer:
         if self.executions % 10000 == 0 and self.executions > 0:
             if self.config.state_enabled and self.state_corpus:
                 self._update_csfuzz_p()
+            if self.llm.enabled:
+                self._update_llm_boost()
 
         if (CORPUS_EPOCH_SIZE > 0
                 and self.executions % CORPUS_EPOCH_SIZE == 0
