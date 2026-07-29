@@ -20,6 +20,7 @@ bridge/ (rag/ 가 공유 마운트면 그대로 OK). 마운트 지점이 다르�
 지정 — fuzzer 가 sudo 로 돌면 `sudo -E` 로 env 를 넘긴다.
 """
 import json
+import logging
 import os
 import time
 import uuid
@@ -30,6 +31,9 @@ _BRIDGE = Path(os.environ.get("RAG_BRIDGE_DIR",
 _REQ = _BRIDGE / "requests"
 _RESP = _BRIDGE / "responses"
 _TIMEOUT = float(os.environ.get("RAG_BRIDGE_TIMEOUT", "180"))   # 응답 대기 상한(초)
+# 이 모듈은 fuzzer 의 워커 스레드 안에서 돈다 → fuzzer 루트 로거를 그대로 쓴다.
+# 태그를 '[LLM' 로 시작시켜야 터미널 필터와 llm/ 전용 로그 파일(_LlmOnlyFilter)에 함께 실린다.
+_log = logging.getLogger()
 _POLL = 0.5
 
 _REQ.mkdir(parents=True, exist_ok=True)
@@ -68,10 +72,18 @@ def generate_rag_response(user_prompt: str) -> str:
     fuzzer 는 이 함수를 pass_system_prompt=false 로 부르므로 user_prompt 에는 이미
     (system 지시 + task) 가 합쳐져 온다 — 그대로 온라인 LLM 으로 넘긴다."""
     rid = f"{int(time.time() * 1000)}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-    _atomic_write(_REQ / f"req_{rid}.json",
-                  json.dumps({"id": rid, "user_prompt": user_prompt}, ensure_ascii=False))
+    req = _REQ / f"req_{rid}.json"
+    _atomic_write(req, json.dumps({"id": rid, "user_prompt": user_prompt}, ensure_ascii=False))
+    # 이 줄이 없으면 "요청을 정말 만들었나 / 어디에 만들었나" 를 확인할 방법이 없다.
+    #   서비스가 요청을 못 봤을 때 퍼저·서비스 양쪽 로그가 모두 조용해 진단이 막혔었다.
+    try:
+        _mode = oct(req.stat().st_mode & 0o777)
+        _log.warning(f"[LLM/bridge] 요청 생성: {req}  (프롬프트 {len(user_prompt):,}자, mode={_mode})")
+    except OSError as _e:
+        _log.warning(f"[LLM/bridge] 요청 생성 직후 stat 실패: {req} — {_e}")
+    _t0 = time.monotonic()
     resp = _RESP / f"resp_{rid}.json"
-    deadline = time.monotonic() + _TIMEOUT
+    deadline = _t0 + _TIMEOUT
     while time.monotonic() < deadline:
         if resp.exists():
             try:
@@ -80,9 +92,16 @@ def generate_rag_response(user_prompt: str) -> str:
                 time.sleep(_POLL)   # 아직 쓰는 중이거나 SMB 동기화 전 → 재시도
                 continue
             _unlink(resp)
+            _log.warning(f"[LLM/bridge] 응답 수신: {rid} ({time.monotonic() - _t0:.1f}s)")
             if data.get("error"):
                 raise RuntimeError(f"RAG service error: {data['error']}")
             return data.get("text", "")
         time.sleep(_POLL)
-    _unlink(_REQ / f"req_{rid}.json")   # timeout → 요청 파일 정리
+    # 타임아웃 시 요청 파일이 **아직 남아 있는지**가 결정적 단서다:
+    #   남아 있음 → 서비스가 그 파일을 한 번도 집어가지 못함(가시성/권한/서비스 정지)
+    #   사라짐    → 서비스가 처리는 했는데 응답이 이쪽으로 안 돌아옴(응답 경로 문제)
+    _still = req.exists()
+    _unlink(req)                       # timeout → 요청 파일 정리
+    _log.warning(f"[LLM/bridge] 타임아웃 {_TIMEOUT:.0f}s — 요청파일 잔존={_still} "
+                 f"({'서비스가 집어가지 못함' if _still else '서비스가 가져갔으나 응답 미도달'})")
     raise TimeoutError(f"RAG bridge timeout ({_TIMEOUT:.0f}s) — 온라인 srag_llm_service 확인")
