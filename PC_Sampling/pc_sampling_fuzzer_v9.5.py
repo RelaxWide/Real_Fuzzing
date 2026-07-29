@@ -238,6 +238,10 @@ _ONCS_CMDS = {0: 'Compare', 1: 'WriteUncorrectable', 2: 'DatasetManagement', 3: 
               5: 'Reservations', 6: 'Timestamp', 7: 'Verify', 8: 'Copy'}
 # 심볼 없는 자동생성 함수명(Ghidra FUN_/IDA sub_ 등) — LLM 에 무의미하므로 coverage-gap 에서 제외.
 _AUTONAME_RE = re.compile(r'^(FUN_|sub_|loc_|unk_|nullsub_|j_|switchD_|caseD_|LAB_|DAT_|thunk_FUN_)[0-9a-fA-F]+', re.I)
+# 위 '접두사+hex' 패턴으로 안 걸리는 자동생성/컴파일러 산물. 이름에 아래 키워드가 있으면
+# 심볼이 아니라 디스어셈블러 산물로 보고 LLM 프롬프트에서 제외한다(토큰 낭비 + 무의미).
+# 주의: set_default_mode 같은 진짜 심볼도 함께 걸릴 수 있다 — 프롬프트 축소를 우선한 선택.
+_AUTONAME_KW = re.compile(r'(default|thunk|switch)', re.I)
 # v9.1: 확정 미구현(SC=0x01 Invalid Opcode 지배) 명령 판정/에너지 바닥 — LLM 되먹임 + 스케줄.
 RAG_UNIMPL_MIN_EXEC  = int(_RAG.get('unimpl_min_exec', 5))         # 미구현 확정에 필요한 최소 FW 도달 횟수
 RAG_UNIMPL_RATIO     = float(_RAG.get('unimpl_ratio', 0.9))        # invalid_opcode / reached_fw 임계
@@ -4837,8 +4841,11 @@ class NVMeFuzzer:
                 return ""
             not_entered, partial = self._collect_uncov_funcs()
             # 심볼 없는 자동생성명(FUN_/sub_ 등)은 LLM 에 무의미 → 제외. 실제 심볼명만 전달.
-            named   = [f for f in (not_entered or []) if not _AUTONAME_RE.match(str(f[0]))]
-            named_p = [f for f in (partial or [])     if not _AUTONAME_RE.match(str(f[0]))]
+            def _is_symbol(nm) -> bool:
+                nm = str(nm)
+                return not (_AUTONAME_RE.match(nm) or _AUTONAME_KW.search(nm))
+            named   = [f for f in (not_entered or []) if _is_symbol(f[0])]
+            named_p = [f for f in (partial or [])     if _is_symbol(f[0])]
             lines = []
             for f in named[:RAG_MAX_UNCOV_FUNCS]:
                 lines.append(f"  - {f[0]} (size={f[1]}, NEVER entered)")
@@ -5023,11 +5030,27 @@ class NVMeFuzzer:
         snap = self._state_snap_prev or {}
         if not snap:
             return ""
-        lines = []
+        # 전체 덤프는 프롬프트만 키우고 판단에 도움이 안 된다(안 변한 값은 이미 아는 정보).
+        #   → 직전 전송분 대비 **변한 필드**만 보낸다. 단 FFM 계열처럼 절대 수준이 의미 있는
+        #     지표는 안 변해도 항상 포함해야 LLM 이 "지금 어느 수준인가" 를 판단할 수 있다.
+        #   첫 호출(비교 대상 없음)에는 전체를 보내 기준선을 준다.
+        prev = getattr(self, '_llm_tele_prev', None)
+        lines, changed = [], 0
         for f in self.config.state_fields:
             name = f.get('name')
-            if name in snap:
-                lines.append(f"  {name} = {snap[name]}  [{f.get('desc', '')}]")
+            if name not in snap:
+                continue
+            cur = snap[name]
+            _key = ('ffm' in str(name).lower())          # 항상 포함할 핵심 지표
+            if prev is None or _key or prev.get(name) != cur:
+                _delta = ""
+                if prev is not None and name in prev and prev[name] != cur:
+                    _delta = f"  (was {prev[name]})"
+                    changed += 1
+                lines.append(f"  {name} = {cur}{_delta}  [{f.get('desc', '')}]")
+        self._llm_tele_prev = dict(snap)
+        if prev is not None and changed == 0 and lines:
+            lines.append("  (그 외 필드는 직전 요청 이후 변화 없음 — 생략)")
         return "\n".join(lines)
 
     def _llm_workload_feedback(self) -> str:
@@ -5193,21 +5216,29 @@ class NVMeFuzzer:
         if task == 'corpus_eval':
             # v9.5 Phase 0: 층화 표본 + 풍부한 context(cdw11/data_len/origin/last_status/favored).
             sample = self._corpus_eval_stratified_sample(40)
-            self._llm_eval_targets = {id(s): s for s in sample}
+            # seed_id 에 id(s)(파이썬 객체 주소)를 쓰면 15자리라 프롬프트와 응답 양쪽을
+            #   크게 부풀린다. 이 id 는 **이 요청 1건 안에서만** 유효하면 되므로 표본 내
+            #   짧은 인덱스로 충분하다.
+            self._llm_eval_targets = {i: s for i, s in enumerate(sample)}
             rows = []
-            for s in sample:
+            for _i, s in enumerate(sample):
                 _tk = self._tracking_label(s.cmd, s)
                 _sc_hist = self.cmd_stats.get(_tk, {}).get('sc_hist', {})
                 _sc_top = max(_sc_hist, key=_sc_hist.get) if _sc_hist else None
-                rows.append("  " + json.dumps({
-                    "seed_id": id(s), "command": s.cmd.name,
-                    "cdw10": s.cdw10, "cdw11": s.cdw11,
-                    "data_len": (len(s.data) if s.data is not None else 0),
-                    "new_pcs": s.new_pcs, "exec_count": s.exec_count,
-                    "favored": bool(getattr(s, 'is_favored', False)),
-                    "origin": ('llm' if self._is_llm_seed(s) else 'mutation'),
-                    "last_status": (self._sc_name(_sc_top) if _sc_top is not None else None),
-                }))
+                # 40행 × 전 필드는 프롬프트를 크게 부풀린다 → 기본값(0/False/None)인 필드는
+                #   생략한다. LLM 은 없는 키를 기본값으로 읽으면 되므로 정보 손실이 없다.
+                _row = {"seed_id": _i, "command": s.cmd.name, "cdw10": s.cdw10}
+                for _k, _v in (("cdw11", s.cdw11),
+                               ("data_len", len(s.data) if s.data is not None else 0),
+                               ("new_pcs", s.new_pcs),
+                               ("exec_count", s.exec_count),
+                               ("favored", bool(getattr(s, 'is_favored', False))),
+                               ("last_status", self._sc_name(_sc_top) if _sc_top is not None else None)):
+                    if _v:
+                        _row[_k] = _v
+                if self._is_llm_seed(s):
+                    _row["origin"] = "llm"       # mutation 이 기본 → llm 일 때만 명시
+                rows.append("  " + json.dumps(_row))
             user = ("Current corpus sample (stratified: recent-LLM / recent-new-BB / favored / "
                     "stale / random). Each seed's summary:\n[" + ",\n".join(rows) + "]\n\n"
                     "Judge fuzzing value from: new_pcs (coverage produced), exec_count (effort spent), "

@@ -74,7 +74,13 @@ class SchemaBridge:
         for f in fields:
             s = f"  CDW{f['word']}[{f['hi']}:{f['lo']}] {f['name']} ({f['ftype']})"
             if f["valid"]:
-                s += " valid=" + ",".join(hex(v) for v in f["valid"])
+                # valid 값이 많은 필드(열거형)는 hex 가 줄줄이 이어져 프롬프트를 크게 부풀린다.
+                #   앞 8개만 보여주고 나머지는 개수로 요약 — LLM 은 유효 범위의 '형태' 만 알면
+                #   되므로 전량 나열은 낭비다.
+                _vs = list(f["valid"])
+                s += " valid=" + ",".join(hex(v) for v in _vs[:8])
+                if len(_vs) > 8:
+                    s += f",...(+{len(_vs) - 8})"
             if f["vendor"]:
                 s += f" vendor=0x{f['vendor'][0]:x}-0x{f['vendor'][1]:x}"
             if f["reserved"]:
