@@ -3610,11 +3610,11 @@ class NVMeFuzzer:
         # v9.4: 커버리지 소스별 누적(스택 그래프용). src_tag('origin/form') → {'edge','sc','state'}.
         self._cov_by_src: dict = {}
         # v9.6: LLM 부스트 자동조정 상태. _llm_boost 는 런타임에 변하는 배수(초기값=기존 상수라
-        #   첫 갱신 전까지 v9.5 와 동작 동일). _boost_exec/_boost_gain 은 **구간** 카운터로,
-        #   각각 origin(llm|mutation)별 실행 수(분모)와 새 edge 수(분자)를 센다.
+        #   첫 갱신 전까지 v9.5 와 동작 동일). _boost_sel/_boost_gain 은 **구간** 카운터로,
+        #   각각 origin(llm|mutation)별 **선택 횟수**(분모)와 새 edge 수(분자)를 센다.
         self._llm_boost: float = RAG_ENERGY_BOOST
-        self._boost_exec: dict = {}
-        self._boost_gain: dict = {}
+        self._boost_sel: dict = {}     # origin 별 **선택 횟수**(분모)
+        self._boost_gain: dict = {}    # origin 별 새 edge 수(분자)
         self._llm_boost_hist: list = []
         # v9.4: 3축 성장 스냅샷 이력(별도 그래프 파일 coverage_growth_plot.py 가 읽음).
         self._cov_growth_hist: list = []
@@ -5831,6 +5831,22 @@ class NVMeFuzzer:
         _decay = 2.0 ** (-(_st - STALENESS_GRACE) / STALENESS_K)
         return e * max(STALENESS_FLOOR, _decay)
 
+    def _boost_count_selection(self, seed) -> None:
+        """v9.6: 부스트 자동조정 분모 — 시드가 **선택된 횟수**를 origin 별로 센다.
+
+        명령 실행 수가 아니라 선택 횟수인 이유: 부스트가 조정하는 것은 '이 시드가 뽑힐
+        확률' 이다. 그런데 시퀀스 시드는 한 번 뽑히면 명령이 여러 번 실행되므로, 실행 수로
+        재면 시퀀스가 많은 쪽(=LLM)의 분모만 부풀어 yield 가 부당하게 낮게 나온다.
+        (실측: 부스트가 내려갔는데도 LLM 실행 비중이 16%→65% 로 뒤집히는 현상이 나왔다.)
+        분자(_cov_credit)는 시퀀스 멤버의 발견까지 origin 별로 합산하므로, 분모를 선택
+        횟수로 맞추면 '선택 1회당 얻은 edge' 로 단위가 일치한다.
+        """
+        try:
+            _o = 'llm' if self._is_llm_seed(seed) else 'mutation'
+            self._boost_sel[_o] = self._boost_sel.get(_o, 0) + 1
+        except Exception:
+            pass
+
     def _select_seed(self) -> 'Optional[Union[Seed, SequenceSeed]]':
         """v4: 에너지 기반 가중치 랜덤 선택.
         v7.5+: corpus에 Seed와 SequenceSeed가 혼재하므로 두 타입 모두 반환 가능."""
@@ -5847,6 +5863,7 @@ class NVMeFuzzer:
             seed = random.choice(self.corpus)
             seed.exec_count += 1
             self._last_selected = seed   # v9.2 staleness 귀속용
+            self._boost_count_selection(seed)
             return seed
 
         r = random.uniform(0, total_energy)
@@ -5856,11 +5873,13 @@ class NVMeFuzzer:
             if r <= cumulative:
                 seed.exec_count += 1
                 self._last_selected = seed
+                self._boost_count_selection(seed)
                 return seed
 
         # fallback
         self.corpus[-1].exec_count += 1
         self._last_selected = self.corpus[-1]
+        self._boost_count_selection(self.corpus[-1])
         return self.corpus[-1]
 
     def _epoch_reset_corpus(self):
@@ -6047,7 +6066,7 @@ class NVMeFuzzer:
     def _update_llm_boost(self):
         """v9.6: LLM 에너지 부스트를 구간 실측 yield 로 갱신(CSFuzz p 와 같은 주기·같은 꼴).
 
-        y = (그 origin 이 만든 새 edge 수) / (그 origin 이 실행된 횟수)  ← 기회 정규화
+        y = (그 origin 이 만든 새 edge 수) / (그 origin 이 **선택된** 횟수)  ← 기회 정규화
         r = (y_llm - y_mut) / (y_llm + y_mut)  ∈ [-1, +1]                ← 스케일 불변
         boost ← clip(boost * (1 + lr*r), MIN, MAX)
 
@@ -6056,11 +6075,11 @@ class NVMeFuzzer:
         나선에 빠진다. 누적시키면 시간이 걸려도 반드시 한 번은 공정하게 평가받는다.
         같은 이유로 하한(RAG_BOOST_MIN)이 0 이면 안 된다 — 0 이면 영영 안 뽑혀 복구 불가.
         """
-        e_llm = self._boost_exec.get('llm', 0)
-        e_mut = self._boost_exec.get('mutation', 0)
+        e_llm = self._boost_sel.get('llm', 0)
+        e_mut = self._boost_sel.get('mutation', 0)
         if e_llm < RAG_BOOST_MIN_SAMPLES or e_mut < RAG_BOOST_MIN_SAMPLES:
             log.info(f"[LLM-boost] 표본 부족 — 갱신 보류, 누적 계속 "
-                     f"(llm={e_llm}, mutation={e_mut}, 필요={RAG_BOOST_MIN_SAMPLES})")
+                     f"(선택 llm={e_llm}, mutation={e_mut}, 필요={RAG_BOOST_MIN_SAMPLES})")
             return
         g_llm = self._boost_gain.get('llm', 0)
         g_mut = self._boost_gain.get('mutation', 0)
@@ -6071,10 +6090,10 @@ class NVMeFuzzer:
                               min(RAG_BOOST_MAX, old * (1.0 + RAG_BOOST_LR * r)))
         log.warning(f"[LLM-boost] {old:.2f} → {self._llm_boost:.2f}  r={r:+.3f}  "
                     f"y_llm={y_llm:.6f} y_mut={y_mut:.6f}  "
-                    f"exec={e_llm}/{e_mut}  edge={g_llm}/{g_mut}")
+                    f"sel={e_llm}/{e_mut}  edge={g_llm}/{g_mut}")
         self._llm_boost_hist.append(
             (self.executions, self._llm_boost, y_llm, y_mut, e_llm, e_mut))
-        self._boost_exec.clear()
+        self._boost_sel.clear()
         self._boost_gain.clear()
 
     def _update_csfuzz_p(self):
@@ -6141,14 +6160,6 @@ class NVMeFuzzer:
         self.cmd_stats[track_key]["exec"] += 1
 
         self.executions += 1
-
-        # v9.6: 부스트 자동조정 분모 — 발견 여부와 무관하게 **모든 실행**을 origin 별로 센다.
-        #   발견 수만 세면 "많이 뽑혀서 많이 찾은 것" 과 "잘 찾은 것" 을 구분할 수 없다.
-        try:
-            _o = self._cov_src_tag(seed, source, seq_member=seq_member).split('/')[0]
-            self._boost_exec[_o] = self._boost_exec.get(_o, 0) + 1
-        except Exception:
-            pass
 
         # FWCommit 성공 후 예약된 재연결 처리 — 여기(stop_sampling 이후)는 샘플러 스레드가
         # 정지 상태라 안전하다. 코어 리셋으로 끊긴 타겟 디버그를 재확립해 halt 를 살린다.
