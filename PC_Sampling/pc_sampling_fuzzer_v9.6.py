@@ -11052,6 +11052,37 @@ class NVMeFuzzer:
         else:
             log.warning(f"[DebugTool] RDDump 실패 (rc={rc})")
 
+    def _snapshot_crash_context(self, dest: Path, crash_time: datetime) -> None:
+        """dump 실행 **전에** 로그/dmesg 를 crash 폴더에 선저장한다.
+
+        JLink/UFAS/RDDump 는 수 분이 걸리고 장비 상태에 따라 hang 도 난다. 그 구간에서
+        중단하면 _collect_crash_artifacts 가 영영 실행되지 않아, 예전에는 crash_<ts>/ 에
+        replay 만 남았다. 여기서 미리 넣어두면 dump 를 포기해도 crash 폴더만으로
+        (crash json + replay + fuzzer log + dmesg) 분석이 된다.
+
+        dump 산출물은 아직 존재하지 않으므로 대상이 아니다 — 그건 최종 수집의 몫.
+        dmesg 는 crash 직후 시점이 가장 값지므로 최종본과 파일명을 분리해 둘 다 남긴다.
+        """
+        import shutil
+
+        ts = crash_time.strftime('%Y%m%d_%H%M%S')
+        if self._log_file and os.path.isfile(self._log_file):
+            for h in log.handlers:
+                try:
+                    h.flush()
+                except Exception:
+                    pass
+            try:
+                shutil.copy2(self._log_file, dest / os.path.basename(self._log_file))
+            except Exception as e:
+                log.warning(f"[ARTIFACT] (선저장) 로그 복사 실패: {e}")
+        try:
+            (dest / f"dmesg_{ts}_at_crash.txt").write_text(self._capture_dmesg(lines=200))
+        except Exception as e:
+            log.warning(f"[ARTIFACT] (선저장) dmesg 저장 실패: {e}")
+        log.warning(f"[ARTIFACT] dump 전 선저장 완료 → {_logname(dest)}/ "
+                    f"(crash json / replay / log / dmesg — 여기서 중단해도 분석 가능)")
+
     def _collect_crash_artifacts(self, crash_time: datetime) -> None:
         """JLink/UFAS dump 완료 후 관련 파일을 날짜 폴더에 모아 복사한다.
 
@@ -11622,12 +11653,18 @@ class NVMeFuzzer:
 
     def _save_crash(self, data: bytes, seed: Seed, reason: str = "timeout",
                     stuck_pcs: Optional[List[Tuple[int, ...]]] = None,
-                    dmesg_snapshot: Optional[str] = None):
+                    dmesg_snapshot: Optional[str] = None,
+                    dest_dir: Optional[Path] = None):
         """crash 메타데이터를 .json 1개만 저장.
 
         raw fuzz_data binary 와 별도 .dmesg.txt 는 더 이상 저장하지 않음:
           - 명령 데이터: replay_data_<tag>/data_NNN.bin 에 이미 포함됨
           - dmesg: .json 의 dmesg_snapshot 필드 + dmesg_<ts>.txt (수집 시점) 으로 충분
+
+        dest_dir: 저장 위치. crash 핸들러는 crash_<ts>/ 를 넘겨 **처음부터** 최종
+          폴더에 쓴다(v9.6). 예전에는 crashes_dir 루트에 쓰고 dump 가 다 끝난 뒤
+          _collect_crash_artifacts 가 폴더로 복사했는데, dump 중 중단하면 crash_<ts>/
+          안에 replay 만 남고 json 은 루트에 흩어져 있었다.
         """
         # crash 식별자는 data 만이 아니라 명령 파라미터(cdw/override) 전체로 해시한다.
         # data 가 빈 명령(DeviceSelfTest 등)은 md5(b'') 가 상수라, cdw10 만 다른 별개
@@ -11640,7 +11677,7 @@ class NVMeFuzzer:
                   seed.force_admin, seed.data_len_override)
         input_hash = hashlib.md5(repr(_ident).encode()).hexdigest()[:12]
         filename = f"crash_{seed.cmd.name}_{hex(_actual_opcode)}_{input_hash}"
-        filepath = self.crashes_dir / filename
+        filepath = (dest_dir or self.crashes_dir) / filename
 
         meta = self._seed_meta(seed)
         meta["crash_reason"] = reason
@@ -11860,7 +11897,8 @@ class NVMeFuzzer:
         self.crash_inputs.append((fuzz_data, cmd))
         try:
             self._save_crash(fuzz_data, seed, reason="timeout",
-                             stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot)
+                             stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot,
+                             dest_dir=_crash_dir)
             # 경로(버전 폴더 포함)는 로그에 남기지 않음 — 위치는 OUTPUT_DIR 로 알 수 있음.
             log.error("  Crash 데이터 저장 완료")
         except Exception as _save_exc:
@@ -11874,6 +11912,15 @@ class NVMeFuzzer:
             self._generate_replay_sh(_crash_dir, _replay_tag)
         except Exception as _replay_exc:
             log.warning(f"[REPLAY] replay .sh 생성 실패: {_replay_exc}")
+
+        # 3.55) dump 전 선저장 — 이 아래는 JLink/UFAS/RDDump 로 수 분이 걸리고 hang 도
+        # 난다. 거기서 Ctrl-C 로 중단하면 _collect_crash_artifacts(3.8)가 실행되지 않으므로,
+        # 소실되면 안 되는 로그/dmesg 를 먼저 crash_<ts>/ 에 넣어 둔다. (json/replay 는
+        # 이미 이 폴더 안에 있다.) 최종 수집이 나중에 더 완전한 로그로 덮어쓴다.
+        try:
+            self._snapshot_crash_context(_crash_dir, _crash_time)
+        except Exception as _snap_exc:
+            log.warning(f"[ARTIFACT] dump 전 선저장 예외: {_snap_exc}")
 
         # 3.6) JLink 사용 전 OpenOCD를 항상 종료 — J-Link USB 점유 해제.
         # dump를 스킵하더라도 후속 JLink PC 모니터링 루프가 J-Link에 접근하므로

@@ -176,6 +176,32 @@ boost 가 낮아지면 LLM 시드가 덜 뽑혀 표본이 **더** 안 모인다.
 - **gain 에 sc 포함** — 가중치를 자동으로 정할 방법이 있으면(예: 각 축의 한계 수확 정규화)
   edge+sc 복합 지표로 확장 가능.
 
+## 곁다리 수정 — crash artifact 를 dump 전에 확보
+
+부스트와 무관하지만 v9.6 에서 같이 고쳤다.
+
+**증상.** dump 가 제대로 안 돼서 중단하면 `crashes/crash_<ts>/` 안에 `replay_*.sh` 만 남는다.
+
+**원인.** 저장 순서가 잘못돼 있었다.
+
+| 단계 | 하는 일 | 저장 위치 |
+|---|---|---|
+| 3 | `_save_crash()` | `crashes/` **루트** ← 폴더 밖 |
+| 3.5 | `_generate_replay_sh()` | `crash_<ts>/` |
+| 3.7 | JLink / UFAS / RDDump | 수 분 소요, hang 가능 |
+| 3.8 | `_collect_crash_artifacts()` | 이제서야 json·log·dmesg 를 폴더로 복사 |
+
+dump 구간에서 중단하면 3.8 이 영영 실행되지 않는다. crash json 은 유실된 게 아니라
+`crashes/` 루트에 흩어져 있었고, 로그·dmesg 는 복사 자체가 안 됐다.
+
+**수정.**
+1. `_save_crash(..., dest_dir=)` 추가 — 핸들러가 `crash_<ts>/` 를 넘겨 **처음부터** 최종 폴더에 쓴다.
+2. `_snapshot_crash_context()` 신설 — 3.55 단계로 dump **직전**에 fuzzer 로그와
+   `dmesg_<ts>_at_crash.txt` 를 선복사. crash 직후 dmesg 가 가장 값지므로 최종본과 파일명을 분리해 둘 다 남긴다.
+
+이제 dump 를 포기해도 `crash_<ts>/` 안에 **crash json + replay + log + dmesg** 가 갖춰진다.
+`_collect_crash_artifacts` 는 그대로 두었다 — dump 산출물 수집과 더 완전한 로그 덮어쓰기를 계속 담당한다.
+
 ## 파일
 
 - `pc_sampling_fuzzer_v9.6.py` — v9.5 byte-copy + 위 편집
