@@ -466,6 +466,24 @@ _NS_ATTACH_OPCODE = 0x15
 BLOCK_NS_DELETE   = bool(_ST.get('block_ns_delete', True))
 AUTO_REATTACH_NS  = bool(_ST.get('auto_reattach_ns', True))
 
+# v9.6: 전체 소거(Sanitize/FormatNVM) 발송 가드 — CMD_SCHEMAS 의 valid 만으로는 못 막는다.
+#   opcode 변이는 random.choice(NVME_COMMANDS) 로 *전체* 목록에서 opcode 를 뽑으므로,
+#   self.commands 에 Sanitize/FormatNVM 이 없는 기본 모드에서도 admin 0x84/0x80 이 나간다.
+#   그때 CDW10 은 원본 시드의 (완전 랜덤일 수 있는) 값이라 SANACT/SES 가 소거값이 될 수 있다.
+#
+#   Sanitize SANACT = CDW10[2:0]: 001b=Exit Failure Mode / 010b=Block Erase /
+#     011b=Overwrite / 100b=Crypto Erase / 101b=Exit Media Verification.
+#     소거 액션은 사용자 데이터를 전소시키고, 진행 중 POR 이 겹치면 SSTAT=011b
+#     (Sanitize Operation Failed) 로 래치돼 펌웨어가 미디어를 read-only 로 굳힌다
+#     (SMART critical_warning bit3). 전원 사이클로 안 풀리며 Exit Failure Mode 만이 해제.
+#   FormatNVM SES = CDW10[11:9]: 000b=없음 / 001b=User Data Erase / 010b=Crypto Erase.
+#     중단된 format 은 namespace 를 미정 상태로 남긴다.
+#   소거 경로 커버리지가 필요하면 config strategy.allowed_sanact / allowed_format_ses 를 넓힐 것.
+_SANITIZE_OPCODE   = 0x84
+_FORMAT_OPCODE     = 0x80
+ALLOWED_SANACT     = frozenset(_ST.get('allowed_sanact', [0x01, 0x05]))
+ALLOWED_FORMAT_SES = frozenset(_ST.get('allowed_format_ses', [0x00]))
+
 OPCODE_MUT_PROB        = _MU['opcode']
 NSID_MUT_PROB          = _MU['nsid']
 ADMIN_SWAP_PROB        = _MU['admin_swap']
@@ -9962,6 +9980,32 @@ class NVMeFuzzer:
             self.stats['blocked_ns_delete'] = self.stats.get('blocked_ns_delete', 0) + 1
             return self.RC_SKIP
 
+        # v9.6: Sanitize 소거 액션 차단 — SANACT(CDW10[2:0]) 이 허용값 밖이면 전송하지 않는다.
+        # 전소 + 진행 중 POR 이 겹치면 SSTAT=011b 래치 → 미디어 read-only 영구화(상단 상수 참조).
+        # actual_opcode 기준이라 opcode 변이로 0x84 가 된 경우도 잡힌다.
+        if (passthru_type == "admin-passthru"
+                and actual_opcode == _SANITIZE_OPCODE
+                and (seed.cdw10 & 0x7) not in ALLOWED_SANACT):
+            _sanact = seed.cdw10 & 0x7
+            log.warning(f"[GUARD] Sanitize SANACT={_sanact:03b}b 전송 차단 — 전체 소거/"
+                        f"read-only 래치 방지 (허용 {sorted(ALLOWED_SANACT)}, "
+                        f"cmd={cmd.name} cdw10=0x{seed.cdw10:08x})")
+            self.stats['blocked_sanitize'] = self.stats.get('blocked_sanitize', 0) + 1
+            return self.RC_SKIP
+
+        # v9.6: FormatNVM 소거(SES=CDW10[11:9]) 차단 — 중단된 소거 format 은 namespace 를
+        # 미정 상태로 남긴다. CMD_SCHEMAS 는 SES 비트를 아예 정의하지 않지만(주석 참조)
+        # 자유 CDW 변이/opcode 변이는 그 비트를 세울 수 있으므로 발송 시점에서 막는다.
+        if (passthru_type == "admin-passthru"
+                and actual_opcode == _FORMAT_OPCODE
+                and ((seed.cdw10 >> 9) & 0x7) not in ALLOWED_FORMAT_SES):
+            _ses = (seed.cdw10 >> 9) & 0x7
+            log.warning(f"[GUARD] FormatNVM SES={_ses:03b}b 전송 차단 — 소거 format 방지 "
+                        f"(허용 {sorted(ALLOWED_FORMAT_SES)}, cmd={cmd.name} "
+                        f"cdw10=0x{seed.cdw10:08x})")
+            self.stats['blocked_format_ses'] = self.stats.get('blocked_format_ses', 0) + 1
+            return self.RC_SKIP
+
         # Admin 명령어별 고정 응답 크기
         ADMIN_FIXED_RESPONSE = {
             "Identify": 4096,
@@ -14012,10 +14056,20 @@ class NVMeFuzzer:
             log.warning(f"[Calibration] FormatNVM 완료 (rc={_fmt_rc})")
             _san_cmd = next((c for c in NVME_COMMANDS if c.name == "Sanitize"), None)
             if _san_cmd:
-                log.warning("[Calibration] Sanitize 1회 실행 (SANACT=001, Exit Failure Mode) ...")
-                _san_seed = Seed(data=b'', cmd=_san_cmd, cdw10=0x04)
+                # ★ SANACT = CDW10[2:0]. 001b=Exit Failure Mode / 010b=Block Erase /
+                #   011b=Overwrite / 100b=Crypto Erase.
+                #   v9.6 이전은 cdw10=0x04 (=100b=Crypto Erase) 를 보내면서 주석/로그만
+                #   "SANACT=001 Exit Failure Mode" 라고 적어 뒀다. 즉 --all-commands 실행마다
+                #   실제 전체 소거가 나갔고, 완료 대기도 없어 진행 중에 prefill/POR 이 겹치면
+                #   SSTAT=011b(Sanitize Operation Failed) 로 래치 → 펌웨어가 미디어를 read-only
+                #   로 전환(SMART critical_warning bit3) → 전원 사이클로도 안 풀림.
+                #   Exit Failure Mode(001b)는 소거를 하지 않고 그 래치를 해제하는 명령이라,
+                #   원래 의도(안전한 SANACT)와도 시작 시 상태 정리 목적에도 이게 맞다.
+                log.warning("[Calibration] Sanitize 1회 실행 (SANACT=001b, Exit Failure Mode "
+                            "— 소거 아님, sanitize-failed 래치 해제) ...")
+                _san_seed = Seed(data=b'', cmd=_san_cmd, cdw10=0x01)
                 _san_rc = self._send_nvme_command(b'', _san_seed)
-                log.warning(f"[Calibration] Sanitize 완료 (rc={_san_rc})")
+                log.warning(f"[Calibration] Sanitize(Exit Failure Mode) 전송 완료 (rc={_san_rc})")
             # 메인 루프에서 재실행되지 않도록 제거
             self.commands = [c for c in self.commands if c.name not in ("FormatNVM", "Sanitize")]
             log.info("[Calibration] FormatNVM/Sanitize self.commands에서 제거됨")
