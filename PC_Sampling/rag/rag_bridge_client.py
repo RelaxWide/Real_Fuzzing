@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""오프라인 PC(fuzzer)용 RAG 브리지 클라이언트 — Samba 공유 drop-box 경유로 온라인 LLM 호출.
+"""■ 배치: **오프라인 퍼징 PC** — 리포 안 `PC_Sampling/rag/` 그대로 (fuzzer 가 import).
+   config `rag.module_path="rag.rag_bridge_client"` 가 이 경로를 가리킨다. 옮기지 말 것.
+   짝이 되는 온라인 쪽 파일 = srag_llm_service.py (그건 LLM PC 에 둔다).
+
+오프라인 PC(fuzzer)용 RAG 브리지 클라이언트 — Samba 공유 drop-box 경유로 온라인 LLM 호출.
 
 주의: 이 파일은 LLM 을 직접 부르지 않는 '배달부'다. 실제 LLM 코드(env 설정 + generate_rag
 _response)는 온라인 PC 에 두고 srag_llm_service.py 가 부른다(같은 이름과 헷갈리지 말 것).

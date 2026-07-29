@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""오프라인 PC(fuzzer 쪽)에서 2-PC Samba drop-box 왕복을 단독 점검한다.
+"""■ 배치: **오프라인 퍼징 PC** — 리포 안 `PC_Sampling/rag/` 그대로.
+   rag_bridge_client.py 와 같은 폴더에서 실행한다.
+
+오프라인 PC(fuzzer 쪽)에서 2-PC Samba drop-box 왕복을 단독 점검한다.
 하드웨어·fuzzer 불필요. rag_bridge_client 만으로 요청을 쓰고 응답을 받아 JSON 을 확인.
 
 전제:

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""온라인 PC 용 RAG 브리지 서비스 — Samba 공유 drop-box 를 폴링해 실제 LLM 을 처리한다.
+"""■ 배치: **온라인 LLM PC** — 리포 밖. `srag_llm_guide.py`(실제 LLM 호출 코드)와 **같은 폴더**에 둔다.
+   같은 폴더의 guide 를 import 하므로 둘이 떨어지면 뜨지 않는다.
+   BRIDGE_DIR 은 오프라인 퍼징 PC 의 `PC_Sampling/rag/bridge` 와 **같은 물리 폴더**를
+   가리켜야 한다(Samba 공유). 짝이 되는 오프라인 쪽 파일 = rag_bridge_client.py.
+
+온라인 PC 용 RAG 브리지 서비스 — Samba 공유 drop-box 를 폴링해 실제 LLM 을 처리한다.
 
 오프라인 fuzzer 의 rag_bridge_client.py 가 _BRIDGE/requests/ 에 쓴 요청을 읽어 실제 LLM
 함수(generate_rag_response)를 호출하고 _BRIDGE/responses/ 에 답을 쓴다. 온라인 PC 에서

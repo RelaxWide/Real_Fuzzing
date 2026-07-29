@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""스키마 브리지 — LLM 생성 시드/시퀀스를 fuzzer 발송 기준(CMD_SCHEMAS)으로 검증·보정.
+"""■ 배치: **오프라인 퍼징 PC** — 리포 안 `PC_Sampling/rag/` 그대로 (fuzzer 가 in-process 로 import).
+
+스키마 브리지 — LLM 생성 시드/시퀀스를 fuzzer 발송 기준(CMD_SCHEMAS)으로 검증·보정.
 
 v9.0 fuzzer 는 이 클래스를 in-process 로 쓴다: SchemaBridge.from_dict(_llm_schema_dict())
 — live CMD_SCHEMAS/가드로 dict 를 만들어 넘기므로 **파일 불필요**. 여기서 validate_and_repair

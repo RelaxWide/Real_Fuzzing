@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""dev 전용 mock LLM callable — 하드웨어·사내 LLM 없이 v9.0 LlmBridge 를 테스트하기 위한 것.
+"""■ 배치: **오프라인 퍼징 PC** — 리포 안 `PC_Sampling/rag/` 그대로 (dev 전용).
+   config `rag.module_path` 를 이 파일로 바꿔야만 쓰인다. 실운영에서는 미사용.
+
+dev 전용 mock LLM callable — 하드웨어·사내 LLM 없이 v9.0 LlmBridge 를 테스트하기 위한 것.
 
 사내 LLM 래퍼의 자리표시자다. 실제 환경에서는 config `rag.module_path`/`func_name` 을
 사내 callable(예: `internal_llm.ask`)로 바꾼다. 시그니처는 ChatGPT-API 유사:

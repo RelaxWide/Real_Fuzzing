@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""온라인 PC 에서 실제 LLM(srag_llm_guide.generate_rag_response)이 fuzzer 가 쓸 만한 JSON
+"""■ 배치: **온라인 LLM PC** — 리포 밖. `srag_llm_guide.py` 와 **같은 폴더**에 두고 실행.
+   퍼저에 의존하지 않으므로 온라인 PC 에 리포가 없어도 된다.
+
+온라인 PC 에서 실제 LLM(srag_llm_guide.generate_rag_response)이 fuzzer 가 쓸 만한 JSON
 시드를 내는지 단독 점검한다. srag_llm_guide.py 와 같은 폴더에 두고 실행(인자 불필요):
 
     python3 test_llm.py
