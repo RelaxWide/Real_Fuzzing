@@ -4,6 +4,7 @@
 #@keybinding
 #@menupath
 #@toolbar
+#@runtime Jython
 
 """
 ghidra_export.py - Ghidra Script (Jython compatible)
@@ -30,7 +31,7 @@ from ghidra.program.model.block import BasicBlockModel
 from ghidra.util.task import ConsoleTaskMonitor
 
 # ---- output path -------------------------------------------------------
-OUTPUT_DIR = "/tmp/ghidra_export"
+OUTPUT_DIR = "/home/ssd/ghidra_export"
 # ------------------------------------------------------------------------
 
 if not os.path.exists(OUTPUT_DIR):
