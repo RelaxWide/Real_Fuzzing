@@ -55,6 +55,13 @@ v9.5 까지 LLM 계보 시드는 `seed_class` 만 보고 **항상 ×1.5** 를 �
 | 10000-exec 블록 | `_update_csfuzz_p()` 와 나란히 `_update_llm_boost()` 호출 |
 | `_llm_energy_adjust` | 상수 → `self._llm_boost`. 시퀀스는 기존 비율(`SEQ/ENERGY`)을 유지한 채 함께 이동 |
 | `coverage_growth.jsonl` 스냅샷 | `llm_boost` 필드 추가(추이 시각화) |
+| `RAG_DEBUG_EXEC` (신규 키) | `[LLM/exec]`(시드 선택마다 1줄, 고빈도)를 `RAG_DEBUG` 에서 분리, 기본 off |
+
+### `[LLM/exec]` 를 분리한 이유
+`[LLM/raw|parse|item]` 은 **LLM 요청 1건당**(≈5000 exec 마다)이라 `rag.debug=true` 로 상시
+켜둘 만하다. 그런데 `[LLM/exec]` 는 **시드 선택 1회당** 이라 초당 수십 줄이 되어, 같은
+스위치에 묶여 있으면 debug 를 켜는 순간 터미널이 이 줄로 덮인다. 게다가 v9.6 의
+`[LLM-boost]` 가 `exec=llm/mutation` 집계를 주므로 평소엔 불필요하다.
 
 ### 갱신식
 

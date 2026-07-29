@@ -220,6 +220,11 @@ RAG_RESERVED_POLICY  = str(_RAG.get('reserved_policy', 'reject'))
 RAG_RESULT_STALE     = int(_RAG.get('result_stale_execs', 50000))
 RAG_TASKS            = dict(_RAG.get('tasks', {}))
 RAG_DEBUG            = bool(_RAG.get('debug', True))       # 단계별 [LLM/raw|parse|item|stats] 상세 로그(기본 on)
+# [LLM/exec] 는 알갱이가 다르다 — 위 태그들은 LLM 요청 1건당(≈5000 exec 마다)인데 이건
+#   **시드 선택 1회당** 이라 초당 수십 줄이 된다. 같은 스위치에 묶으면 debug 를 켜는 순간
+#   터미널이 이 줄로 덮인다. v9.6 의 [LLM-boost] 가 exec=llm/mutation 집계를 주므로 평소엔
+#   불필요 → 전용 키로 분리하고 기본 off.
+RAG_DEBUG_EXEC       = bool(_RAG.get('debug_exec', False))  # [LLM/exec] 시드 선택마다 1줄(고빈도)
 RAG_JSON_RETRIES     = int(_RAG.get('json_retries', 2))   # 응답이 JSON 아니면 교정 리프롬프트 재시도 상한
 RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 시퀀스(llm_seq) 전용 부스트
 # v9.6: LLM 에너지 부스트 자동조정. 고정 상수(1.5)는 "LLM 계보를 얼마나 밀어줄까" 를 사람이
@@ -14311,7 +14316,7 @@ class NVMeFuzzer:
                                     and not base_seed.covered_pcs):
                                 base_seed = self._calibrate_seed(base_seed)
                             # ① 가시성: LLM 시드 선택 시 exec/covered_pcs/favored 상태
-                            if (RAG_DEBUG and base_seed is not None
+                            if (RAG_DEBUG_EXEC and base_seed is not None
                                     and self._is_llm_seed(base_seed)):
                                 _cp = len(base_seed.covered_pcs) if getattr(base_seed, 'covered_pcs', None) else 0
                                 if isinstance(base_seed, Seed):
