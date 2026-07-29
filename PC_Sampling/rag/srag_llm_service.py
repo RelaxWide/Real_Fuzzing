@@ -64,7 +64,8 @@ def _unlink(path: Path):
 
 
 def _log(msg: str):
-    print(f"[RAG service] {msg}", flush=True)
+    # 타임스탬프 필수 — 요청 간 공백/처리 지연을 사후에 읽으려면 시각이 있어야 한다.
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [RAG service] {msg}", flush=True)
 
 
 def main():
@@ -110,14 +111,30 @@ def main():
             except (ValueError, OSError):
                 continue   # 아직 쓰는 중 → 다음 라운드 재시도
             rid = data.get("id", "?")
+            _prompt = data.get("user_prompt") or ""
+            # 처리 '시작' 을 먼저 찍는다. 이 서비스는 단일 스레드 동기 루프라 _llm_call 하나가
+            #   오래 걸리면 그동안 폴링이 통째로 멈추고, 그 사이 들어온 요청은 오프라인 쪽이
+            #   180초 뒤 스스로 지워버려 흔적조차 남지 않는다. 완료 시에만 로그하면 '물려 있는
+            #   중' 을 알 방법이 없다.
+            _log(f"→ processing {rid} (task 프롬프트 {len(_prompt):,}자)")
+            _t0 = time.monotonic()
             try:
-                out = {"id": rid, "text": _llm_call(data["user_prompt"])}
+                out = {"id": rid, "text": _llm_call(_prompt)}
             except Exception as e:   # LLM 오류는 응답에 실어 오프라인 쪽이 알게
                 out = {"id": rid, "text": "", "error": str(e)}
+            _el = time.monotonic() - _t0
             _atomic_write(_RESP / f"resp_{rid}.json",
                           json.dumps(out, ensure_ascii=False))
             _unlink(req)
-            _log(f"handled {rid}{' (error)' if out.get('error') else ''}")
+            _log(f"handled {rid} ({_el:.1f}s, 응답 {len(out.get('text') or ''):,}자)"
+                 f"{' (error)' if out.get('error') else ''}")
+            # 오프라인 클라이언트 타임아웃(RAG_BRIDGE_TIMEOUT, 기본 180s)을 넘겼으면 이미
+            #   버려진 응답이다 — 다음 요청들도 줄줄이 타임아웃 날 신호이므로 크게 알린다.
+            if _el >= 180:
+                _log(f"⚠ 처리에 {_el:.0f}초 소요 — 오프라인 기본 타임아웃(180s) 초과. "
+                     f"이 응답은 폐기됐을 가능성이 높습니다.")
+                _log("⚠   프롬프트가 커졌거나 LLM 이 느려졌습니다. "
+                     "RAG_BRIDGE_TIMEOUT 을 올리거나 원인을 확인하세요.")
             last_ok = time.monotonic()
             last_warn = 0.0
 
