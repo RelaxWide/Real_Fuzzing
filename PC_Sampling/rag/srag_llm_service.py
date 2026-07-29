@@ -14,6 +14,7 @@ import importlib
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -41,13 +42,74 @@ _POLL = 0.5
 _IDLE_WARN_SEC = float(os.environ.get("RAG_IDLE_WARN_SEC", "900"))
 
 try:
-    _llm_call = getattr(importlib.import_module(LLM_MODULE), LLM_FUNC)
+    _llm_mod = importlib.import_module(LLM_MODULE)
+    _llm_call = getattr(_llm_mod, LLM_FUNC)
 except Exception as e:
     sys.exit(f"[RAG service] LLM 로드 실패: {LLM_MODULE}.{LLM_FUNC} — {e}\n"
              f"  → 같은 폴더에 {LLM_MODULE}.py 가 있고 {LLM_FUNC}() 가 정의됐는지 확인하세요.")
 
+# LLM 호출 상한(초). 오프라인 클라이언트 타임아웃(RAG_BRIDGE_TIMEOUT, 기본 180s)보다 짧게
+# 잡아야, 매달린 호출을 포기하고 **오류 응답이라도** 제때 돌려줄 수 있다.
+_CALL_TIMEOUT = float(os.environ.get("RAG_CALL_TIMEOUT", "150"))
+
 _REQ.mkdir(parents=True, exist_ok=True)
 _RESP.mkdir(parents=True, exist_ok=True)
+
+
+def _reload_llm():
+    """LLM 모듈을 다시 import 해 모듈 레벨 세션/클라이언트를 새로 만든다(= 재연결).
+
+    유휴 TCP 연결이 방화벽/NAT 에 조용히 끊기면, 모듈 레벨에 살아 있는 requests.Session
+    이나 LLM 클라이언트가 죽은 소켓을 계속 재사용해 응답 없이 매달린다. 모듈을 reload
+    하면 그 객체들이 새로 생성돼 연결이 다시 맺힌다 — guide 파일 내용을 몰라도 통한다.
+    """
+    global _llm_mod, _llm_call
+    _llm_mod = importlib.reload(_llm_mod)
+    _llm_call = getattr(_llm_mod, LLM_FUNC)
+
+
+def _call_once(prompt: str, timeout: float) -> str:
+    """별도 스레드로 호출해 timeout 안에 안 끝나면 포기.
+
+    파이썬은 스레드를 강제 종료할 수 없어 매달린 스레드는 daemon 으로 남는다(프로세스
+    종료 시 정리). 대신 **서비스 루프가 통째로 멈추는 것**을 막는다 — 이게 핵심이다.
+    """
+    box = {}
+
+    def _run():
+        try:
+            box['ok'] = _llm_call(prompt)
+        except Exception as exc:
+            box['err'] = exc
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        raise TimeoutError(f"LLM 호출이 {timeout:.0f}초 안에 끝나지 않음(응답 없음)")
+    if 'err' in box:
+        raise box['err']
+    return box.get('ok', '')
+
+
+def _call_llm_resilient(prompt: str):
+    """호출 → 실패 시 모듈 reload(재연결) → 1회 재시도. (text, error) 반환."""
+    try:
+        return _call_once(prompt, _CALL_TIMEOUT), None
+    except Exception as e1:
+        _log(f"⚠ LLM 호출 실패: {e1}")
+        _log("⚠   연결이 끊긴 것으로 보고 모듈을 다시 로드해 재연결 후 1회 재시도합니다.")
+        try:
+            _reload_llm()
+        except Exception as e_rl:
+            _log(f"⚠   모듈 reload 실패(무시하고 재시도): {e_rl}")
+        try:
+            _text = _call_once(prompt, _CALL_TIMEOUT)
+            _log("✓ 재연결 후 성공")
+            return _text, None
+        except Exception as e2:
+            _log(f"⚠ 재시도도 실패: {e2}")
+            return "", f"{e2} (재연결 재시도 후에도 실패)"
 
 
 def _atomic_write(path: Path, text: str):
@@ -118,10 +180,10 @@ def main():
             #   중' 을 알 방법이 없다.
             _log(f"→ processing {rid} (task 프롬프트 {len(_prompt):,}자)")
             _t0 = time.monotonic()
-            try:
-                out = {"id": rid, "text": _llm_call(_prompt)}
-            except Exception as e:   # LLM 오류는 응답에 실어 오프라인 쪽이 알게
-                out = {"id": rid, "text": "", "error": str(e)}
+            _text, _err = _call_llm_resilient(_prompt)
+            out = {"id": rid, "text": _text}
+            if _err:                 # LLM 오류는 응답에 실어 오프라인 쪽이 알게
+                out["error"] = _err
             _el = time.monotonic() - _t0
             _atomic_write(_RESP / f"resp_{rid}.json",
                           json.dumps(out, ensure_ascii=False))
