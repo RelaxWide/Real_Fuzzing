@@ -129,7 +129,7 @@
     "enable_por": true,
     "por_poweroff_wait": 3.0,
     "por_boot_wait": 30.0,
-    "por_rescan_delay": 8.0
+    "por_rescan_delay": 10.0
   },
   "visualization": {
     "graph_refresh_interval": 5000
