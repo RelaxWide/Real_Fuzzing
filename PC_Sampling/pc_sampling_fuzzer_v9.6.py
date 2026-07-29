@@ -233,7 +233,11 @@ RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 
 RAG_BOOST_LR          = float(_RAG.get('boost_lr', 0.3))          # 갱신 학습률
 RAG_BOOST_MIN         = float(_RAG.get('boost_min', 0.5))         # 하한(0 금지 — 아래 주석)
 RAG_BOOST_MAX         = float(_RAG.get('boost_max', 3.0))         # 상한(mutation 고사 방지)
-RAG_BOOST_MIN_SAMPLES = int(_RAG.get('boost_min_samples', 200))   # 양 arm 최소 실행 수
+RAG_BOOST_MIN_SAMPLES = int(_RAG.get('boost_min_samples', 50))    # 양 arm 최소 **선택** 횟수
+# 최소 총 발견 수. 선택 횟수만으로는 부족하다 — 후반 yield 는 선택당 0.001 수준이라 50번
+#   선택해도 기대 edge 가 0.05 개다. 이때 edge 1개 대 0개면 r=±1 로 튀어 부스트가 근거 없이
+#   크게 흔들린다. '비교할 만한 발견이 실제로 있었나' 를 따로 본다.
+RAG_BOOST_MIN_GAIN    = int(_RAG.get('boost_min_gain', 5))        # 양 arm 합계 최소 edge 수
 RAG_TASK_WEIGHTS     = dict(_RAG.get('task_weights', {}))  # task별 가중 라운드로빈(미설정=1:1:1)
 RAG_LOG_RESPONSES    = bool(_RAG.get('log_responses', False))  # LLM 원본 요청/응답을 output/llm_io.jsonl 에 전량 기록
 # v9.5 Phase 0
@@ -6084,12 +6088,19 @@ class NVMeFuzzer:
         """
         e_llm = self._boost_sel.get('llm', 0)
         e_mut = self._boost_sel.get('mutation', 0)
-        if e_llm < RAG_BOOST_MIN_SAMPLES or e_mut < RAG_BOOST_MIN_SAMPLES:
-            log.info(f"[LLM-boost] 표본 부족 — 갱신 보류, 누적 계속 "
-                     f"(선택 llm={e_llm}, mutation={e_mut}, 필요={RAG_BOOST_MIN_SAMPLES})")
-            return
         g_llm = self._boost_gain.get('llm', 0)
         g_mut = self._boost_gain.get('mutation', 0)
+        # 두 가드 모두 통과해야 갱신한다. 어느 쪽이든 미달이면 **창을 비우지 않고** 누적을
+        #   계속해, 느리더라도 언젠가는 충분한 근거로 한 번 평가하게 한다.
+        if e_llm < RAG_BOOST_MIN_SAMPLES or e_mut < RAG_BOOST_MIN_SAMPLES:
+            log.info(f"[LLM-boost] 선택 표본 부족 — 갱신 보류, 누적 계속 "
+                     f"(선택 llm={e_llm}, mutation={e_mut}, 필요=각 {RAG_BOOST_MIN_SAMPLES})")
+            return
+        if (g_llm + g_mut) < RAG_BOOST_MIN_GAIN:
+            log.info(f"[LLM-boost] 발견 부족 — 갱신 보류, 누적 계속 "
+                     f"(edge {g_llm}+{g_mut}={g_llm + g_mut}, 필요=합계 {RAG_BOOST_MIN_GAIN}). "
+                     f"소수 발견으로 r 이 ±1 로 튀는 것을 막기 위함")
+            return
         y_llm, y_mut = g_llm / e_llm, g_mut / e_mut
         r = (y_llm - y_mut) / (y_llm + y_mut + 1e-12)
         old = self._llm_boost
