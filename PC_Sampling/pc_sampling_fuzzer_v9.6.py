@@ -6099,22 +6099,35 @@ class NVMeFuzzer:
         # 두 가드 모두 통과해야 갱신한다. 어느 쪽이든 미달이면 **창을 비우지 않고** 누적을
         #   계속해, 느리더라도 언젠가는 충분한 근거로 한 번 평가하게 한다.
         if e_llm < RAG_BOOST_MIN_SAMPLES or e_mut < RAG_BOOST_MIN_SAMPLES:
-            log.info(f"[LLM-boost] 실행 표본 부족 — 갱신 보류, 누적 계속 "
-                     f"(실행 llm={e_llm}, mutation={e_mut}, 필요=각 {RAG_BOOST_MIN_SAMPLES})")
+            log.info(f"[LLM-boost] 갱신 보류 — 실행이 아직 적음 "
+                     f"(LLM {e_llm:,}회 / mutation {e_mut:,}회, 각 {RAG_BOOST_MIN_SAMPLES}회 필요). "
+                     f"계속 누적 중")
             return
         if (g_llm + g_mut) < RAG_BOOST_MIN_GAIN:
-            log.info(f"[LLM-boost] 발견 부족 — 갱신 보류, 누적 계속 "
-                     f"(edge {g_llm}+{g_mut}={g_llm + g_mut}, 필요=합계 {RAG_BOOST_MIN_GAIN}). "
-                     f"소수 발견으로 r 이 ±1 로 튀는 것을 막기 위함")
+            log.info(f"[LLM-boost] 갱신 보류 — 발견이 적어 비교 불가 "
+                     f"(새 edge 합계 {g_llm + g_mut}개, {RAG_BOOST_MIN_GAIN}개 필요). 계속 누적 중")
             return
         y_llm, y_mut = g_llm / e_llm, g_mut / e_mut
         r = (y_llm - y_mut) / (y_llm + y_mut + 1e-12)
         old = self._llm_boost
         self._llm_boost = max(RAG_BOOST_MIN,
                               min(RAG_BOOST_MAX, old * (1.0 + RAG_BOOST_LR * r)))
-        log.warning(f"[LLM-boost] {old:.2f} → {self._llm_boost:.2f}  r={r:+.3f}  "
-                    f"y_llm={y_llm:.6f} y_mut={y_mut:.6f}  "
-                    f"exec={e_llm}/{e_mut}  sel={s_llm}/{s_mut}  edge={g_llm}/{g_mut}")
+        # 사람이 바로 읽히게: 소수점 yield(0.010000) 대신 '100명령당 N개', 정규화 r 대신
+        #   'mutation 의 N배 효율', 가중치는 변화율까지. 갱신은 드물게(≥10000 exec) 일어나므로
+        #   3줄을 써서 각 arm 의 예산·성과를 나란히 보여준다.
+        if y_mut > 0:
+            _cmp = f"LLM 효율이 mutation 의 {y_llm / y_mut:.2f}배"
+        elif y_llm > 0:
+            _cmp = "mutation 은 발견 0 — LLM 만 성과"
+        else:
+            _cmp = "양쪽 발견 없음"
+        _pct = (self._llm_boost - old) / old * 100 if old else 0.0
+        log.warning(f"[LLM-boost] 가중치 {old:.2f} → {self._llm_boost:.2f} ({_pct:+.0f}%)  — {_cmp}")
+        for _nm, _e, _s, _g, _y in (("LLM     ", e_llm, s_llm, g_llm, y_llm),
+                                    ("mutation", e_mut, s_mut, g_mut, y_mut)):
+            _avg = (f"평균 {_e / _s:.1f}명령/선택" if _s else "선택 기록 없음")
+            log.warning(f"[LLM-boost]   {_nm} : 명령 {_e:>7,}회(선택 {_s:,}회, {_avg}) "
+                        f"→ 새 edge {_g}개 = 100명령당 {_y * 100:.2f}개")
         self._llm_boost_hist.append(
             (self.executions, self._llm_boost, y_llm, y_mut, e_llm, e_mut))
         self._boost_exec.clear()
