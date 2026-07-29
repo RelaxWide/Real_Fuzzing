@@ -46,6 +46,12 @@ v9.5 까지 LLM 계보 시드는 `seed_class` 만 보고 **항상 ×1.5** 를 �
   (검증: 선택당 성과가 같은 두 arm 이 실행 수 기준으로는 r=-0.714, 선택 기준으로는 r=0.)
 - **gain 은 edge 만.** sc/state 를 섞으면 단위가 달라 가중치를 사람이 정해야 하고, 그러면
   '사람 개입 제거' 라는 이 버전의 목적과 어긋난다.
+- **분자도 `_select_seed()` 를 거친 것만.** `iowl`(LLM io_patterns 워크로드 버스트)과
+  `replay`(c2, CSFuzz p 가 고름)는 corpus 에너지 가중치가 관여하지 않는 경로다. 그런데 둘 다
+  `_account_command` 를 타므로 `llm/iowl`·`llm/replay` 로 **분자에는 잡히는데 `_select_seed` 를
+  안 거쳐 분모는 안 는다** → `y_llm` 이 부풀어 부스트가 근거 없이 올라간다(시퀀스 문제의
+  정반대 왜곡). 더 근본적으로는 **부스트가 제어하지 않는 성과로 부스트를 조정하는 범주 오류**다.
+  → `form ∈ {cmd, seq}` 로 한정해 분자·분모의 모집단을 일치시킨다.
 - **r 을 정규화**(`(y1-y2)/(y1+y2)`)한 이유: 절대 yield 는 런 전반에 걸쳐 크게 변한다(초반 높고
   포화 후 0 에 수렴). 비율은 스케일 불변이라 같은 학습률로 전 구간에서 동작한다.
 
@@ -57,7 +63,7 @@ v9.5 까지 LLM 계보 시드는 `seed_class` 만 보고 **항상 ×1.5** 를 �
 | 상수(`RAG_SEQ_ENERGY_BOOST` 뒤) | `RAG_BOOST_LR`(0.3) / `RAG_BOOST_MIN`(0.5) / `RAG_BOOST_MAX`(3.0) / `RAG_BOOST_MIN_SAMPLES`(200) |
 | 초기화(`_cov_by_src` 옆) | `_llm_boost`(초기값=`RAG_ENERGY_BOOST`), `_boost_exec`, `_boost_gain`, `_llm_boost_hist` |
 | `_select_seed()` 3개 반환 지점 | **분모** — 시드가 **선택된 횟수**를 origin(llm\|mutation)별로 카운트(`_boost_count_selection`) |
-| `_cov_credit` | **분자** — `axis=='edge'` 일 때 `_boost_gain[origin]` 누적(단일 지점이라 모든 edge 크레딧을 빠짐없이 포착) |
+| `_cov_credit` | **분자** — `axis=='edge'` **이면서 form 이 `cmd`\|`seq`** 일 때만 `_boost_gain[origin]` 누적 |
 | `_update_llm_boost()` (신규, `_update_csfuzz_p` 앞) | 갱신식 + 가드 + 로그 + 히스토리 |
 | 10000-exec 블록 | `_update_csfuzz_p()` 와 나란히 `_update_llm_boost()` 호출 |
 | `_llm_energy_adjust` | 상수 → `self._llm_boost`. 시퀀스는 기존 비율(`SEQ/ENERGY`)을 유지한 채 함께 이동 |

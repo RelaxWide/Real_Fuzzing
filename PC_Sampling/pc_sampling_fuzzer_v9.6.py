@@ -5630,11 +5630,18 @@ class NVMeFuzzer:
         """v9.4: 소스별 커버리지 누적(스택 그래프용). axis ∈ {'edge','sc','state'}."""
         d = self._cov_by_src.setdefault(src, {'edge': 0, 'sc': 0, 'state': 0})
         d[axis] = d.get(axis, 0) + n
-        # v9.6: 부스트 자동조정 분자. edge 만 센다 — sc/state 를 섞으면 단위가 달라 가중치를
-        #   사람이 정해야 하고, 그러면 '사람 개입 제거' 라는 목적과 어긋난다.
+        # v9.6: 부스트 자동조정 분자. 두 가지로 한정한다.
+        #   ① edge 만 — sc/state 를 섞으면 단위가 달라 가중치를 사람이 정해야 하고, 그러면
+        #      '사람 개입 제거' 라는 목적과 어긋난다.
+        #   ② form 이 cmd|seq 인 것만 — 즉 **_select_seed() 를 거쳐 뽑힌 것**만 센다.
+        #      iowl(LLM io_patterns 버스트)과 replay(c2, CSFuzz p 가 고름)는 corpus 에너지
+        #      가중치가 관여하지 않는 경로다. 이들은 _select_seed 를 안 거쳐 분모가 안 늘므로,
+        #      분자에만 넣으면 y_llm 이 부풀어 부스트가 근거 없이 올라간다. 더 근본적으로는
+        #      **부스트가 제어하지 않는 성과로 부스트를 조정하는 것**이라 범주 오류다.
         if axis == 'edge':
-            _o = src.split('/')[0]
-            self._boost_gain[_o] = self._boost_gain.get(_o, 0) + n
+            _o, _, _f = src.partition('/')
+            if _f in ('cmd', 'seq'):
+                self._boost_gain[_o] = self._boost_gain.get(_o, 0) + n
 
     # ── v9.4 ledger (관측 전용 — 어떤 결정 로직도 이 값을 읽지 않는다) ──────────────
     def _run_id_get(self) -> str:
