@@ -81,7 +81,7 @@ cJTAG(2선) → ARM DP → AP(여러 개) → APB 버스 → RISC-V Debug Module
 
 ---
 
-## ★★★ 2026-08-08 — **J-Link connect 성공**
+## ★★★ 2026-08-07 — **J-Link connect 성공**
 
 ```
 SetcJTAGInitMode = 0
@@ -114,7 +114,8 @@ connect('RISC-V')
 
 - 첫 `connect()` 는 `Error while halting CPU / Specific core setup failed` 로
   실패하며 **예열 역할**을 한다
-- **두 DM 모두 접근 가능**: `0x81480000`(hcore/CMCore/Fcore0/QCore) / `0x81481000`(Ncore)
+- 두 CoreBase 모두 **J-Link connect 후보로 통과**: `0x81480000`(4코어 공유) / `0x81481000`(Ncore)
+  ⚠ "접근 가능" 이 아니다 — DM register/hart/PC/halt 미검증. 다른 AP·선택 메커니즘을 아직 배제하지 말 것
 - **APB Index 0(APBAP1)로 둘 다 붙는다** → 다른 AP 를 뒤질 이유 없음
 - **핸들을 close 하면 예열이 사라진다.** 하나의 핸들로 반복해야 한다
 
@@ -146,7 +147,10 @@ J-Link 의 connect 도 결국 이걸 하지만 **같은 connect 안의 CPU setup
 → 시도한 해법: `InitTarget()` 에서 전원을 미리 올린다 (`SF_E76_config.JLinkScript`).
   **결과: 실패 — 전원 ACK 안 뜸.** `InitTarget()` 안의 `JLINK_CORESIGHT_*` 호출이
   동작하지 않는다. `SF_E76_addap.JLinkScript` 에서 전부 `0x80000000` 이 나왔던 것과
-  같은 현상으로, **JLinkScript 에서 CoreSight API 를 쓸 수 없다**는 것이 두 번째 확인.
+  같은 현상으로, **현재 사용한 JLinkScript 훅과 호출 순서에서는** `JLINK_CORESIGHT_*` 접근이 동작하지 않았다
+  (훅 시점·DLL 버전·선행 초기화 조건 문제일 수 있어 일반화 금지.
+   `ConfigTargetSettings()` 의 command string 설정과 `InitTarget()` 의 저수준 API 실패는
+   서로 다른 경로이므로 한 결론으로 합치지 않는다).
 
 → **bounded retry 는 임시 workaround 로만 쓴다. 원인 규명은 계속한다.**
 
@@ -235,7 +239,7 @@ halt → PC 읽기 → hart 비교로 확인해야 한다.
 
 ---
 
-## ★★ 2026-08-08 — 원인 규명 (SEGGER 공식 문서)
+## ★★ 2026-08-07 — 원인 규명 (SEGGER 공식 문서)
 
 SEGGER KB **"J-Link RISC-V"** 가 우리 토폴로지를 그대로 문서화하고 있다:
 
@@ -394,19 +398,31 @@ Selecting cJTAG as current target interface.
 
 ## 5. 다음 단계
 
-### 즉시 (오늘)
-1. **실험 A — 전원 사이클 후 4선 스캔** (§3-A). 순서가 핵심: 전원 ON 직후 **J-Link 이 먼저**
-2. 실패 시 **실험 B — J-Link cJTAG connect** (§3-B)
-3. 10핀 핀아웃 대조 (§3-C)
-4. `.bat` → `DO` 체인으로 `Init_FPGA_RISCV.cmm` 실사용 여부 확인
+> **이 문서는 조사 이력이다.** 지금 실행할 명령과 판정 기준은 `README.md` 를 볼 것.
+
+### 완료 (역사)
+
+| | 내용 |
+|---|---|
+| ~~전원 사이클 후 4선 JTAG 스캔~~ | 폐기 — cJTAG 확정 |
+| ~~J-Link cJTAG connect~~ | ✅ 완료 |
+| ~~핀아웃 확인~~ | ✅ TDI/TDO 배선 확인 |
+| ~~DM base / `SYStem.Up` 전 시퀀스 추출~~ | ✅ 커스텀 시퀀스 없음 확인, DM base 확보 |
+| ~~AP 스윕~~ | ✅ APBAP1 로 충분 |
+
+### 지금
+
+**`verify_halt_pc.py` 로 halt → PC → resume 을 안전하게 검증한다.**
+먼저 **Ncore(`0x81481000`)** 로 — 단일 하트라 변수가 적다.
+이게 안 되면 멀티코어 스윕이나 샘플러 통합으로 넘어가지 않는다.
 
 ### 그다음
-3. T32 에서 **DM base 주소**와 **`SYStem.Up` 이전 시퀀스** 추출
-4. OpenOCD cfg 작성 — 기존 `r8_pcsr_jtag.cfg` 골격 재사용 (아래)
-5. `dmstatus` 읽어 Spec 버전·인증 상태·하트 수 확인
 
-### 병행 (크리티컬 패스 아님)
-6. Nexus 트레이스 Class/싱크 조사 (§4)
+1. 첫 connect 실패 원인 (`diagnose_connect.py` D/E/F)
+2. `0x81480000` 네 코어 귀속 — PC fingerprint 로. **PC 가 읽힌다고 코어 이름을
+   붙이지 말 것.** 최소 두 개의 독립 fingerprint 가 일치할 때만 확정.
+3. 내구성 — halt/read/resume 1,000회, close/reopen 반복, POR 복구 반복,
+   NVMe I/O 동시 수행 시 timeout/hang 영향
 
 ---
 
@@ -422,8 +438,10 @@ X.dap dpreg 4 0x50000000    # CSYSPWRUPREQ|CDBGPWRUPREQ (디버그 전원)
 X.dap dpreg 0 0x1e          # sticky error 클리어
 ```
 
-RISC-V DM 레지스터(`dmcontrol` 0x10 / `dmstatus` 0x11 / `command` 0x17 / `data0` 0x04)를
-**APB 주소로 접근**하는 방식이 된다. `target create ... riscv`(표준 DTM 전제)는 안 맞을 수 있다.
+⚠ **주의:** `dmcontrol 0x10`, `dmstatus 0x11` 등은 **DMI register address** 이지
+APB byte offset 이 아니다. `CORESIGHT_SetCoreBaseAddr` 가 가리키는 벤더 DMI aperture 의
+레이아웃과 J-Link 의 변환 방식을 확인하지 않은 채 `base + 0x10` 식으로 읽고 쓰면
+**엉뚱한 장치를 건드릴 수 있다.** 직접 접근은 벤더/T32 자료로 레이아웃을 확보한 뒤에만. `target create ... riscv`(표준 DTM 전제)는 안 맞을 수 있다.
 
 **포팅 가능한 기존 도구:**
 | 도구 | 용도 |
@@ -438,7 +456,7 @@ RISC-V DM 레지스터(`dmcontrol` 0x10 / `dmstatus` 0x11 / `command` 0x17 / `da
 
 | 단계 | 내용 | 상태 |
 |---|---|---|
-| **0a** | **connect** | ✅ **완료** (2026-08-08) |
+| **0a** | **connect** | ✅ **완료** (2026-08-07) |
 | **0b** | halt + `dpc` 읽기 + resume → **halt 샘플러** | ← 지금 여기. `verify_halt_pc.py` |
 | 1 | 임의 주소 메모리 read/write | |
 | 2 | System Bus Access (halt 없는 메모리 접근) | 오버레이 탐지에도 필요 |

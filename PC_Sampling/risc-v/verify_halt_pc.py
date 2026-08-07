@@ -44,15 +44,19 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "2026-08-08.2  halt/PC/resume 검증 + 하트 열거"
+VERSION = "2026-08-07.2  halt/PC/resume 검증 + 하트 열거"
 
 # ── connect_sfe76.py 로 확정된 설정 ──────────────────────────────────
 TIF_CJTAG   = 7
 SPEED_KHZ   = 10000
 CJTAG_MODE  = 0
 APB_INDEX   = 0
-CORE_BASE   = 0x81480000   # ★ hcore/CMCore/Fcore0/QCore DM. NVMe 프론트엔드 후보
-CORE_BASE_N = 0x81481000   # Ncore DM
+# ★ 기본을 Ncore 로 둔다 (feedback §9.4 P0).
+#   0x81480000 은 4코어가 공유해 hart 선택까지 얽히므로 원인 분리가 어렵다.
+#   메커니즘(halt/PC/resume)을 단순한 쪽에서 먼저 검증하고,
+#   그다음 --core-base 0x81480000 으로 목표 코어를 본다.
+CORE_BASE   = 0x81481000   # Ncore DM (단일 하트 추정)
+CORE_BASE_M = 0x81480000   # hcore/CMCore/Fcore0/QCore DM — NVMe 프론트엔드 후보
 
 AP_MAP = [
     ("APBAP1", 0x10000, "APB-AP"),

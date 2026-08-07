@@ -516,3 +516,264 @@ workaround로 사용할 수 있다.
 > 순서가 중요하다는 것을 입증한다. 다만 failed connect, setup 재적용, readiness delay 중 무엇이
 > 필요한지는 추가 분리 실험이 필요하다. `0x81480000`은 유효 연결 후보지만 코어 귀속은
 > halt/PC/hart 검증 전까지 미확정이다.
+
+---
+
+## 9. README / BRINGUP 현재 상황 리뷰
+
+검토 대상:
+
+- `README.md`
+- `BRINGUP_riscv_v10.md`
+
+검토 시점의 정확한 프로젝트 상태는 다음과 같다.
+
+```text
+물리 연결 / cJTAG / ARM DP                  검증 완료
+AP map / CoreBase 수동 설정                 connect 단계에서 사용 가능
+J-Link connect                              동일 handle의 두 번째 시도에서만 성공
+0x81480000 / 0x81481000                     둘 다 connect 성공 후보
+halt / PC 읽기 / resume                     미검증
+실제 코어 및 hart 귀속                     미검증
+반복 reconnect / POR / crash recovery       미검증
+v10 sampler 통합                            시작 전
+```
+
+따라서 현재 위치는 **"transport와 J-Link CPU setup의 일부가 열린 상태"**이지,
+아직 **"RISC-V PC sampler가 동작하는 상태"**는 아니다.
+
+### 9.1 Critical issues
+
+#### 1. README의 실행 안내가 현재 파일 상태와 충돌한다
+
+README 상단 파일 표는 다음과 같이 현재 역할을 비교적 정확히 설명한다.
+
+- `connect_sfe76.py`: 연결 동작
+- `verify_halt_pc.py`: 현재 크리티컬 패스
+- `probe_sfe76_pylink.py`: 초기 진단, 역할 종료
+
+그런데 본문은 다시 `probe_sfe76_pylink.py ← 이걸 먼저 돌린다`고 안내하고,
+이미 폐기된 APSEL 열거와 CoreSight `CIDR0` 판정을 주 절차로 제시한다.
+
+BRINGUP 문서 자체는 뒤에서 다음 가정을 이미 폐기했다.
+
+- `0x81480000 + 0xFF0`의 `CIDR0`로 DMI base를 판정한다.
+- APSEL 번호를 순회해 AP를 찾는다.
+
+새 작업자가 README만 읽으면 완료된 초기 진단을 다시 수행하고, 잘못된 판정 기준으로
+정상 후보를 탈락시킬 수 있다. README 본문은 현재 절차인
+`connect_sfe76.py → verify_halt_pc.py → diagnose_connect.py` 중심으로 교체해야 한다.
+
+#### 2. BRINGUP의 "다음 단계"가 이미 완료된 과거 단계다
+
+BRINGUP §5는 여전히 다음을 즉시 작업으로 지정한다.
+
+1. 전원 사이클 후 4선 JTAG 스캔
+2. J-Link cJTAG connect
+3. 핀아웃 확인
+4. DM base와 `SYStem.Up` 전 시퀀스 추출
+
+하지만 같은 문서의 앞부분에서는 cJTAG, DP 접근, AP map/CoreBase 설정 및 J-Link connect까지
+완료됐다고 선언한다. §3의 열린 질문 A/B/C와 §5는 역사 기록으로 이동하거나 완료 표시해야 한다.
+
+현재의 실제 다음 단계는 **`verify_halt_pc.py`로 halt → PC 확인 → resume을 안전하게 검증하는 것**이다.
+
+#### 3. `connect()` 성공의 의미를 과도하게 확대했다
+
+BRINGUP에는 다음 표현이 있다.
+
+- "두 DM 모두 접근 가능"
+- "APB Index 0으로 둘 다 붙는다 → 다른 AP를 뒤질 이유 없음"
+- 아키텍처 단계 `0a connect`: "완료"
+
+현재 실험이 직접 입증한 것은 두 CoreBase 값에서 J-Link의 `connect('RISC-V')`가 두 번째 시도에
+예외 없이 끝난다는 점이다. 아직 DM register, hart, PC 값, halt/resume이 검증되지 않았다.
+
+따라서 현재는 다음처럼 표현해야 정확하다.
+
+> 두 CoreBase 모두 **J-Link connect 후보로 통과**했다. 동일 AP 설정이 실제 DM과 올바른 코어에
+> 도달하는지는 halt/register/PC fingerprint 검증 전까지 미확정이다.
+
+특히 `0x81480000`을 네 코어가 공유하므로, CoreBase 외에 T32 인스턴스별 AP 경로, hart selection,
+SoC 내부 선택 상태가 더 있을 수 있다. 지금 단계에서 다른 AP나 선택 메커니즘을 완전히 배제하면 안 된다.
+
+#### 4. halt 실패 시 복구 조건이 크리티컬 패스에 명시돼야 한다
+
+문서에 "halt 후 반드시 resume" 원칙은 있지만, `verify_halt_pc.py` 실행의 합격/실패 기준과
+복구 불변조건이 없다. SSD 컨트롤러에서 halt 성공 후 PC read나 Python 예외가 발생하면 코어가
+멈춘 채 남을 수 있다.
+
+최소 요구사항:
+
+```text
+try:
+    halt
+    halted 상태 확인
+    PC/DPC 읽기 및 유효성 검사
+finally:
+    best-effort resume
+    running 상태 재확인
+```
+
+resume 확인이 실패하면 다음 실험을 계속하지 말고 해당 handle을 닫은 뒤 정해진 보드 복구 절차를
+수행해야 한다.
+
+### 9.2 Potential bugs / 과도한 확정
+
+#### 1. "첫 connect는 구조적으로 실패"의 범위를 제한해야 한다
+
+A/B/C 실험으로 확인된 것은 **현재 J-Link DLL/펌웨어, generic `RISC-V` device, 현재 명령 순서와
+보드 상태에서 failed connect가 다음 connect 성공에 필요한 상태 변화를 만든다**는 것이다.
+
+RISC-V나 해당 SoC에서 첫 connect가 원래 반드시 실패하는 것으로 일반화할 수는 없다.
+문서 표현은 다음처럼 제한하는 것이 안전하다.
+
+> 현재 연결 구현과 도구 버전에서는 cold handle의 첫 connect가 일관되게 실패한다.
+
+J-Link 버전, 펌웨어, 전원 사이클 여부, device profile을 로그에 항상 기록해야 재현성이 생긴다.
+
+#### 2. `dmactive`는 좋은 가설이지만 아직 원인으로 확정되지 않았다
+
+A/B/C 결과는 "시간 경과나 setup 반복이 아니라 connect 내부 동작이 필요하다"는 점을 지지한다.
+그러나 그 동작이 `dmcontrol.dmactive` write인지, ARM DP 전원 요청인지, J-Link 내부 캐시/CPU module
+초기화인지는 직접 관측하지 않았다.
+
+`dmactive` 설명은 **유력 가설**로 유지하고, 다음 중 하나가 있어야 확정할 수 있다.
+
+- 첫 connect 전후 DMI/DM register의 실제 변화
+- J-Link 상세 로그에서 해당 write 확인
+- 명시적 `dmactive=1` 후 cold first connect 성공
+
+#### 3. "JLinkScript에서 CoreSight API를 쓸 수 없다"는 결론이 너무 넓다
+
+현재 관측은 특정 스크립트 훅과 현재 DLL에서 호출 결과가 `INT_MIN`이었다는 것이다.
+훅 호출 시점, API 지원 범위, DLL 버전 또는 선행 초기화 조건 문제일 수 있다.
+
+정확한 표현은 다음과 같다.
+
+> 현재 사용한 JLinkScript 훅과 호출 순서에서는 `JLINK_CORESIGHT_*` 접근이 동작하지 않았다.
+
+`ConfigTargetSettings()`의 command string 설정과 `InitTarget()`의 저수준 CoreSight API 실패도
+서로 다른 경로이므로 한 결론으로 합치지 않는 편이 좋다.
+
+#### 4. APB 메모리 접근과 RISC-V DMI register 접근을 동일시하면 안 된다
+
+BRINGUP §6은 `dmcontrol 0x10`, `dmstatus 0x11` 등을 "APB 주소로 접근"한다고 단정한다.
+이 값들은 RISC-V DMI register address이며 일반적인 APB byte offset이라는 뜻이 아니다.
+`CORESIGHT_SetCoreBaseAddr`가 가리키는 vendor DMI aperture의 register layout과 J-Link의 변환 방식을
+확인하지 않은 채 `base + 0x10`처럼 메모리 read/write하면 잘못된 장치를 건드릴 수 있다.
+
+직접 접근은 SoC/T32 설정 또는 SEGGER 문서에서 DMI aperture layout을 확보한 뒤에만 진행해야 한다.
+
+#### 5. 문서 날짜가 현재 실험 순서와 맞지 않는다
+
+BRINGUP의 주요 완료 기록은 `2026-08-08`인데, 이번 검토 및 feedback 후속 실험은
+`2026-08-07`로 기록돼 있다. 실제 실행일인지 예정일/문서 버전일인지 정리하지 않으면 로그와
+결론의 선후관계를 추적하기 어렵다. 날짜를 실제 실험 시각과 commit 기준으로 통일하는 것이 좋다.
+
+### 9.3 Reliability improvements
+
+#### 1. README는 현재 runbook, BRINGUP은 조사 이력으로 역할을 분리한다
+
+권장 구조:
+
+```text
+README.md
+  - 현재 확정 상태
+  - 지금 실행할 명령 1~3개
+  - 성공/실패 판정
+  - 안전 복구
+
+BRINGUP_riscv_v10.md
+  - 실험 이력과 근거
+  - 폐기된 가정
+  - 열린 가설
+  - 다음 실험
+```
+
+README에서는 역할 종료 도구의 상세 실행법을 제거하고 BRINGUP의 역사 섹션으로 링크하는 편이 낫다.
+
+#### 2. 연결 성공을 단계별 gate로 정의한다
+
+```text
+G0: cJTAG/DPIDR/전원 ACK
+G1: bounded retry 안에 J-Link connect
+G2: halt 성공 + halted 확인
+G3: PC/DPC 읽기 성공 + 유효 범위/변화 확인
+G4: resume 성공 + running 확인
+G5: workload 중 반복 샘플링
+G6: close/reopen, POR, crash recovery
+```
+
+현재는 **G1까지만 부분 통과**했다. v10 sampler 착수 조건은 최소 G4, 장시간 퍼징 투입 조건은
+G5와 G6 통과로 두는 것이 안전하다.
+
+#### 3. connect workaround를 명시적으로 계측한다
+
+각 시도에 다음을 남긴다.
+
+- monotonic timestamp와 시도 번호
+- J-Link DLL/firmware/hardware version
+- TIF, speed, AP map, CoreBase, hartsel
+- 첫 실패의 정확한 error code/message
+- connect 소요 시간
+- halt/PC/resume 각 결과
+- handle 재사용 여부와 target power-cycle ID
+
+첫 실패를 정상으로 간주해 숨기면 실제 회귀와 warmup 실패를 구분할 수 없다.
+
+#### 4. 코어 후보별 세션을 완전히 격리한다
+
+`0x81480000`과 `0x81481000`, AP index, hartsel 조합마다 별도 handle과 별도 결과 레코드를 쓴다.
+단, 한 후보 내에서는 warmup 상태를 보존하기 위해 동일 handle에서 bounded connect retry를 수행한다.
+
+### 9.4 Suggested tests / 권장 실행 순서
+
+#### P0 — 지금 바로 할 것
+
+1. **Ncore 후보 `0x81481000` 하나만 선택한다.**
+2. 동일 handle에서 같은 설정으로 connect를 최대 3회 수행한다.
+3. 성공 직후 `verify_halt_pc.py`로 halt 상태를 확인한다.
+4. PC/DPC를 여러 번 읽어 값이 정렬되고 실행 주소 범위에 있는지 본다.
+5. `finally` 경로에서 resume하고 running 상태를 확인한다.
+6. 실제 NVMe workload가 계속 진행되는지 확인한다.
+
+이 단계가 실패하면 멀티코어 스윕이나 sampler 통합으로 넘어가지 않는다.
+
+#### P1 — 첫 connect 원인과 지속 범위 분리
+
+- 성공 후 handle close/reopen, target 전원은 유지하고 1회 connect
+- target POR 후 새 handle에서 1회 connect
+- `SF_E76_config.JLinkScript` 적용 cold session에서 첫 connect 결과 확인
+- generic `RISC-V`와 정확한 device profile 후보 비교
+- connect 전 `RISCV_SetHartSel` 적용 비교
+
+이 결과로 warmup 상태가 DLL, probe, target DM 중 어디에 남는지 좁힌다.
+
+#### P2 — `0x81480000` 네 코어 귀속
+
+- 후보별로 PC fingerprint를 수집한다.
+- 동일 workload에서 PC 변화 패턴을 비교한다.
+- hartsel별 register/PC 차이를 비교한다.
+- T32에서 알려진 각 코어 PC와 교차 검증한다.
+
+PC가 읽힌다는 이유만으로 코어 이름을 붙이지 말고, 최소 두 개의 독립적인 fingerprint가 일치할 때
+귀속을 확정한다.
+
+#### P3 — sampler 투입 전 내구성
+
+- halt/read/resume 1,000회 반복
+- connect close/reopen 반복
+- POR 후 자동 복구 반복
+- 의도적인 PC read 예외에서 resume 보장 확인
+- J-Link timeout과 USB 일시 오류 주입
+- NVMe I/O와 동시 수행하여 timeout/hang/성능 영향 측정
+
+### 9.5 최종 판단
+
+현재 선택한 **pylink + J-Link + 수동 CoreSight AP/DMI 설정 방향은 맞다.** 실제 cJTAG와 ARM DP를
+통과했고, 두 CoreBase 후보에서 반복 가능한 connect 성공 조건도 찾았다.
+
+다만 프로젝트 상태를 "connect 완료"로 닫기에는 이르다. 현재 가장 큰 불확실성은 주소 탐색이 아니라
+**성공한 연결이 실제 코어의 halt/PC/resume까지 안전하게 제어하는가**이다. 따라서 추가 AP sweep이나
+트레이스 조사보다 `verify_halt_pc.py`의 안전한 단일-core 검증을 최우선으로 진행해야 한다.

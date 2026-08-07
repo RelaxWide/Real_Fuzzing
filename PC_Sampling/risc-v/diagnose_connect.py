@@ -39,7 +39,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "2026-08-08.5  첫 connect 실패 근본원인 (D/E/F)"
+VERSION = "2026-08-07.5  첫 connect 실패 근본원인 (D/E/F)"
 
 TIF_CJTAG  = 7
 SPEED_KHZ  = 10000

@@ -1,138 +1,183 @@
 # RISC-V 신제품 (SF-E76) — v10.0 브링업
 
-신제품(SiFive E76 기반 RISC-V SSD 컨트롤러)에 퍼저를 올리기 위한 조사·도구 모음.
+SiFive **E76** 기반 RISC-V SSD 컨트롤러에 퍼저를 올리기 위한 작업.
 
-| 파일 | 내용 |
-|---|---|
-| `BRINGUP_riscv_v10.md` | **조사 노트(살아있는 문서)** — 확정 사실 / 추론 / 열린 질문 |
-| `feedback.md` | 외부 검토 피드백 (방향 검증) |
-| **`connect_sfe76.py`** | **연결 — 동작함.** AP map + DMI base 수동 설정 |
-| **`verify_halt_pc.py`** | **halt / PC / resume 검증** ← v10.0 크리티컬 패스 |
-| **`diagnose_connect.py`** | **첫 connect 실패 근본원인** (D 세션지속성 / E 장치명 / F 하트) |
-| `connect_min.py` | 최소 재현 — 순서 지정(`--order`)으로 위치 vs 주소 분리 |
-| `isolate_warmup.py` | warmup 메커니즘 분리 (A/B/C) — **완료: A만 성공** |
-| `SF_E76_config.JLinkScript` | `ConfigTargetSettings()` 정식 설정 (InitTarget 전원인가는 실패) |
-| `probe_sfe76_pylink.py` | 초기 진단 — DP/전원 확인용 (역할 종료) |
-| `SF_E76_cJTAG_probe.JLinkScript` | 초기 진단 (역할 종료) — JLinkScript 는 CoreSight API 사용 불가 |
-| `SF_E76_addap.JLinkScript` | 위와 같음 (역할 종료) |
+**v10.0 범위 = 샘플러 층 교체.** NVMe 전송·코퍼스·변이·LLM·replay·POR 는
+주소 무관이라 그대로 간다. 기존 `pc_sampling_fuzzer_v9.7.py` 대비 새로 쓸 것은
+`_read_all_pcs()` 한 메서드 수준이다.
 
 ---
 
-## 지금 상황
+## 진행 상황
 
 | 계층 | 상태 |
 |---|---|
 | 물리 (VTref 1.793V, 배선) | ✅ |
-| cJTAG 활성화 @10MHz (TIF=7) | ✅ |
+| cJTAG 활성화 (TIF=7, 10MHz) | ✅ |
 | ARM DP 통신 | ✅ `DP reg0 = 0x6BA0009D` |
 | 디버그 도메인 전원 | ✅ `CTRL/STAT = 0xF0000000` |
-| AP map / DMI base 설정 | ✅ `CORESIGHT_AddAP` + `SetIndexAPBAPToUse` + `SetCoreBaseAddr` |
-| **J-Link connect** | ⚠️ **되지만 2회차에만** — 근본원인 미규명 |
-| **halt / PC / resume** | ⬜ **미검증** ← v10.0 크리티컬 패스 |
+| AP map / DMI base 선언 | ✅ |
+| **J-Link connect** | ⚠️ **되지만 2회차에만** — 근본원인 규명 중 |
+| **halt / PC / resume** | ⬜ **미검증** ← 크리티컬 패스 |
 | 코어 귀속 (어느 코어인가) | ⬜ 미확정 |
+| 반복 reconnect / POR / crash 복구 | ⬜ 미검증 |
+| Nexus 트레이스 | ⬜ 병행 트랙 (크리티컬 패스 아님) |
 
-### 확정된 연결 설정
+### 게이트 — 지금 어디까지 왔나
+
+| | 조건 | 상태 |
+|---|---|---|
+| **G0** | cJTAG / DPIDR / 전원 ACK | ✅ |
+| **G1** | bounded retry 안에 J-Link `connect()` | ⚠️ 부분 (2회차에만) |
+| **G2** | halt 성공 + `halted` 확인 | ⬜ |
+| **G3** | PC/DPC 읽기 + 유효 범위·변화 확인 | ⬜ |
+| **G4** | resume 성공 + running 확인 | ⬜ |
+| **G5** | workload 중 반복 샘플링 | ⬜ |
+| **G6** | close/reopen · POR · crash 복구 | ⬜ |
+
+**v10.0 샘플러 착수 조건 = 최소 G4.**
+**장시간 퍼징 투입 조건 = G5 + G6.**
+
+> ⚠️ **`connect()` 성공은 코어 도달을 뜻하지 않는다.** 지금 입증된 것은
+> "두 CoreBase 값에서 `connect('RISC-V')` 가 2회차에 예외 없이 끝난다" 뿐이다.
+> DM register·hart·PC·halt/resume 은 아직 검증 전이므로 **"두 DM 모두 접근 가능"
+> 같은 표현은 과하다.** 정확히는 **"J-Link connect 후보로 통과했다"** 이다.
+
+---
+
+## 파일
+
+| 파일 | 역할 |
+|---|---|
+| **`sfe76_link.py`** | **연결 계층 — 정식 모듈.** 연결 지식의 단일 출처. 샘플러도 여기를 쓴다 |
+| **`verify_halt_pc.py`** | **halt / PC / resume 검증** ← 지금 할 일 |
+| **`diagnose_connect.py`** | 첫 connect 실패 **근본원인** (D 세션지속성 / E 장치명 / F 하트) |
+| `SF_E76_config.JLinkScript` | `ConfigTargetSettings()` 정식 설정 (미해결 항목 있음) |
+| `BRINGUP_riscv_v10.md` | 조사 노트 (사실 / 추론 / 열린 질문) |
+| `feedback.md` | 외부 검토 피드백 |
+| `backup/` | 역할이 끝난 도구 + **무엇을 밝혀냈는지** 기록 |
+
+---
+
+## 확정된 연결 설정
 
 ```
 SetcJTAGInitMode = 0
-set_tif(7)  # cJTAG      set_speed(10000)   ← 1000kHz 로 낮추면 활성화 실패
-CORESIGHT_AddAP = Index=0 Type=APB-AP Addr=0x10000     (…Index=5 까지)
+set_tif(7)                # cJTAG — pylink enum 에 없어 정수로 지정
+set_speed(10000)          # ★ 1000kHz 로 낮추면 cJTAG 활성화 자체가 실패
+
+CORESIGHT_AddAP = Index=0 Type=APB-AP Addr=0x10000    # APBAP1
+CORESIGHT_AddAP = Index=1 Type=APB-AP Addr=0x20000    # APBAP2
+CORESIGHT_AddAP = Index=2 Type=AXI-AP Addr=0x30000    # AXIAP1
+CORESIGHT_AddAP = Index=3 Type=AHB-AP Addr=0x40000    # AHBAP1
+CORESIGHT_AddAP = Index=4 Type=APB-AP Addr=0x50000    # APBAP3
+CORESIGHT_AddAP = Index=5 Type=APB-AP Addr=0x60000    # APBAP4
+
 CORESIGHT_SetIndexAPBAPToUse = 0
 CORESIGHT_SetCoreBaseAddr    = 0x81480000   # 또는 0x81481000 (Ncore)
-connect('RISC-V')                            # ★ 1회차 실패, 2회차 성공
+
+connect('RISC-V')          # ★ 1회차 실패, 2회차 성공
 ```
 
-**근거:** SEGGER KB 가 "RISC-V 는 ROM table scan 이 없어 hybrid DAP 구성을
-자동 검출할 수 없다" 고 명시한다. 수동 선언이 필수다.
+**근거:** [SEGGER KB — J-Link RISC-V](https://kb.segger.com/J-Link_RISC-V) 가
+`JTAG → SWJ-DP → APB-AP → DMI` 를 공식 지원 토폴로지로 문서화하면서,
+**"RISC-V 는 ROM table scan 이 없어 AP 위치와 DMI 위치를 자동 검출할 수 없다"** 고
+명시한다. 수동 선언이 필수다 — 자동 검출 시도가 전부 실패한 이유가 이것이다.
 
-### ⚠ 지켜야 할 원칙
-
-| | |
-|---|---|
-| **한 handle = 한 설정** | 조합을 섞으면 거짓 성공 또는 전체 실패 (실측 2회) |
-| **첫 connect 는 실패한다** | 재시도 필요. 원인 규명 중 (`diagnose_connect.py`) |
-| **halt 후 반드시 resume** | ★ 코어가 멈춘 채 남으면 SSD 가 hang 한다 |
+**용어 주의:** `CORESIGHT_AddAP` 의 `Index` 는 **J-Link 내부 AP 맵 번호**이지
+하드웨어 APSEL 이 아니다. 실제 위치는 `Addr` 이고, 그게 T32 의 `DP:0xN0000` 이다.
 
 ---
 
-## `probe_sfe76_pylink.py` ← **이걸 먼저 돌린다**
+## ⚠ 지켜야 할 원칙 3개
 
-JLinkScript 판은 **에러 메시지가 없어서** 왜 실패했는지 알 수 없었다(모든 반환이
-`0x80000000` = INT_MIN = API 에러). pylink 는 예외/메시지가 나와 원인이 보인다.
-게다가 **퍼저가 결국 쓰는 API** 라 여기서 확정한 절차를 그대로 샘플러로 옮길 수 있다.
+**1. 한 handle = 한 설정**
+조합을 섞으면 (a) 한 번 붙은 뒤 이후가 전부 **거짓 성공**(24개 중 23개)하거나
+(b) 조합마다 close 로 격리하면 **전부 실패**한다. 실측으로 둘 다 겪었다.
+
+**2. 첫 `connect()` 는 실패한다 — 임시 workaround 중**
+통제 실험 결과 setup 이중 적용도, 대기도 아니고 **connect 시도 자체**가 필요하다.
+bounded retry(3회)로 우회하되 **정상이 아니다.** 퍼저는 POR 복구·크래시 후
+수백 번 재연결하므로 원인을 찾아야 한다 → `diagnose_connect.py`
+
+> 범위 제한: **현재 J-Link DLL/펌웨어, generic `RISC-V` device profile, 현재 명령
+> 순서, 현재 보드 상태**에서 일관되게 관측된 현상이다. RISC-V 나 이 SoC 일반의
+> 성질로 일반화하지 말 것. 재현성을 위해 **DLL/펌웨어 버전·device·전원 사이클 여부**를
+> 항상 로그에 남긴다.
+
+**3. halt 후 반드시 resume — 실패 시 중단**
+코어를 멈춘 채 두면 **SSD 컨트롤러가 멈춰 NVMe 가 hang 한다.**
+
+```
+try:    halt → halted 확인 → PC 읽기·유효성 검사
+finally: best-effort resume → running 재확인
+```
+
+**resume 확인이 실패하면 다음 실험을 계속하지 말고** handle 을 닫은 뒤
+보드 복구 절차(전원 사이클)를 수행한다. `sfe76_link.Link` 가 컨텍스트 매니저
+종료 시 자동 resume 하지만, **성공 여부를 확인하는 것은 호출자 책임**이다.
+
+**4. APB 메모리 접근 ≠ RISC-V DMI 레지스터 접근**
+`dmcontrol 0x10`, `dmstatus 0x11` 등은 **DMI register address** 이지 APB byte
+offset 이 아니다. `CORESIGHT_SetCoreBaseAddr` 가 가리키는 벤더 DMI aperture 의
+레이아웃과 J-Link 의 변환 방식을 확인하기 전에 `base + 0x10` 식으로 메모리를
+읽고 쓰면 **엉뚱한 장치를 건드릴 수 있다.** 직접 접근은 벤더/T32 자료로
+aperture 레이아웃을 확보한 뒤에만.
+
+---
+
+## 실행
 
 ```bash
-# pylink 가 venv 가 아니라 시스템 python3 에 있을 수 있다 — 둘 다 시도
-sudo python3 probe_sfe76_pylink.py
-sudo /home/ssd/gdbfuzz/.venv/bin/python3 probe_sfe76_pylink.py
+# 연결만 확인
+sudo python3 sfe76_link.py
+sudo python3 sfe76_link.py --core-base 0x81481000     # Ncore
 
-sudo python3 probe_sfe76_pylink.py --tif 7        # cJTAG TIF 값 직접 지정
+# 지금 할 일 — halt / PC / resume
+#   ★ 먼저 Ncore(0x81481000) 로 검증한다. 단일 하트라 변수가 적다.
+#     0x81480000 은 4코어 공유라 hart 선택까지 얽혀 원인 분리가 어렵다.
+sudo python3 verify_halt_pc.py --core-base 0x81481000
+sudo python3 verify_halt_pc.py --pc-index <번호> --samples 100
+sudo python3 verify_halt_pc.py --enum-harts
+
+# 첫 connect 실패 원인
+sudo python3 diagnose_connect.py
 ```
 
-### 단계와 판정
-
-| 단계 | 확인 | 실패 시 |
-|---|---|---|
-| **[1]** 지원 TIF 목록 | **cJTAG 를 pylink 로 고를 수 있나** | JLinkScript 경로로 복귀 |
-| [2] set_tif / set_speed | 인터페이스 선택 | — |
-| **[3]** `coresight_configure()` | CoreSight 초기화 | **예외 메시지가 핵심** (JLinkScript 가 여기서 죽었을 것) |
-| **[4]** DPIDR + 전원 인가 | ARM DAP 확정 + 디버그 전원 ACK | DPIDR 무효 → SEGGER / ACK 없음 → 벤더 |
-| [5] AP 열거 | APSEL 0~7 중 실재하는 것 | 전원 또는 AP 매핑 |
-| [6] `0x81480000` | CoreSight ID | `CIDR0` 하위 `0x0D` 면 주소 정확 |
-
-**[1] 이 관문이다.** pylink 가 cJTAG TIF 값을 모르면 이름 없는 TIF 후보를 찍어주니,
-`--tif` 로 바꿔가며 재실행하면 된다.
+> pylink 가 venv 가 아니라 **시스템 `python3`** 에 설치된 경우가 있다. 둘 다 시도할 것.
 
 ---
 
-## `SF_E76_cJTAG_probe.JLinkScript` (보조)
+## 열린 질문
 
-J-Link 의 자동 식별을 거치지 않고, **T32 가 `SYStem.Up` 한 줄로 자동 수행하는
-ARM ADI 표준 절차를 명시적으로** 실행한다. 1차 목표는 연결이 아니라 **진단**이다.
-
-### 실행
-
-```bash
-JLinkExe -if cJTAG -speed 10000 -device <아무 이름> \
-         -JLinkScriptFile SF_E76_cJTAG_probe.JLinkScript
-```
-
-- `-device` 는 식별에 실패해도 무방하다. `InitTarget()` 이 **그보다 먼저** 실행된다.
-- **속도는 10000(10MHz) 고정.** 실측상 1000kHz 로 낮추면 cJTAG 활성화 자체가 실패한다
-  (T32 설정도 "USB 연결 시 10MHz").
-- 다른 디버거(T32 등)가 J-Link 을 점유 중이면 실패한다.
-
-### 무엇을 확인하나
-
-| 단계 | 확인 | 실패 시 의미 |
+| # | 질문 | 확인 방법 |
 |---|---|---|
-| **[2]** DPIDR | 유효한 DP ID 가 읽히나 | cJTAG **스캔 포맷 불일치** → SEGGER 문의 |
-| **[3]** CTRL/STAT | 디버그 전원 ACK 가 서나 | **전원/인증 게이팅** → 벤더 문의 |
-| **[4]** AP 열거 | APSEL 0~7 중 실재하는 AP | AP 매핑 추론 검증 |
-| **[5]** `0x81480000` | CoreSight ID 가 읽히나 | 코어 디버그 주소 검증 |
-
-`CIDR0 = 0x0D` 가 나오면 CoreSight 컴포넌트 확정이고 주소가 맞다는 뜻이다.
-
-### 전부 통과하면
-
-스크립트 마지막의 `return 0;` 을 **`return 1;`** 로 바꾼다.
-J-Link 의 (틀린) 자동 식별을 건너뛰고 스크립트 설정을 그대로 쓰게 된다.
-
-### 값이 안 맞을 때 만질 곳
-
-파일 상단 설정 블록:
-
-| 상수 | 기본 | 언제 바꾸나 |
-|---|---|---|
-| `_COREDEBUG_BASE_A/B` | `0x81480000` / `0x81481000` | T32 `COREDEBUG.Base` 가 다르면 |
-| `_CSW_32BIT` | `0x80000002` | AP 읽기가 전부 0 이면 `0x23000052`, `0x00000002` 시도 |
-| `IRLenDevice=4` | 4 | 체인에 TAP 이 여럿이면 `IRPre/IRPost/DRPre/DRPost` 도 채울 것 |
+| 1 | **첫 connect 가 왜 실패하나** | `diagnose_connect.py`. 유력 가설 = RISC-V DM 의 `dmactive` (쓴 뒤 되읽어 1 될 때까지 기다려야 하는데 J-Link 이 안 기다리는 것으로 의심) |
+| 2 | **halt / PC / resume 이 되나** | `verify_halt_pc.py` ← **v10.0 착수 조건** |
+| 3 | PC 레지스터 인덱스 | `verify_halt_pc.py` 의 `[A]` 단계 |
+| 4 | `0x81480000` 이 **어느 코어**인가 | halt 후 PC/hart 비교. connect 성공만으론 알 수 없다 |
+| 5 | **NVMe 를 처리하는 코어**는? | 벤더 문의 — `hcore` 추정이나 미확인 |
+| 6 | 펌웨어 `.text` 범위 / 오버레이 | 벤더 문의. 커버리지 필터에 필요 |
+| 7 | JLinkScript 판의 첫 connect 는 성공했나 | 전원 ACK 만 확인됐고 connect 결과 미확인 |
 
 ---
 
-## 결과 보고
+## 벤더 질문지
 
-출력 전문을 그대로 남겨두면 된다. **성공보다 실패 지점이 정보가 많다** —
-어느 단계에서 끊기느냐에 따라 다음 행동(SEGGER 문의 / 벤더 문의 / 주소 수정)이 갈린다.
+> 1. **NVMe 명령 처리 펌웨어가 도는 코어**는 `hcore`/`CMCore`/`Fcore0`/`QCore`/`Ncore` 중 무엇입니까?
+> 2. 각 코어의 **Debug Module 주소와 hart 번호**는?
+> 3. 펌웨어 **`.text` 범위**와 **오버레이/코드 뱅킹 사용 여부**는?
+> 4. J-Link 또는 OpenOCD **설정 파일**이 있습니까?
+> 5. Nexus 트레이스의 **Class 등급**과 **싱크(온칩 버퍼 여부)** 는?
 
-미해결로 남은 질문은 `BRINGUP_riscv_v10.md` §3 에 정리돼 있다.
+---
+
+## 알아둘 것
+
+- **오버레이 문제**(ARM 제품에서 미해결로 남은 것)가 이 제품에도 있을 수 있다.
+  코드가 주소를 공유하면 커버리지가 서로 덮어써 **탐색 자체가 망가진다.**
+  `.text` 범위와 함께 반드시 확인할 것.
+- **halt 가 PCIe 를 멈추는지** 조기에 봐야 한다. ARM 제품(P7/P9)에서 호스트
+  프리즈로 몇 달을 태웠다. `halt_loop_stress.py` 를 포팅해 **본격 개발 전에** 확인.
+- **Nexus 트레이스**는 성공하면 부분맹 커버리지와 halt 문제를 한 번에 없앤다.
+  다만 **크리티컬 패스에 두지 말 것.**
