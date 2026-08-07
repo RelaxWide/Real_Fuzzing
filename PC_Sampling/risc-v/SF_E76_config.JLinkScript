@@ -1,17 +1,16 @@
 /*********************************************************************
 *  SF-E76 (RISC-V behind CoreSight DAP) — 정식 연결 설정
 *
-*  SEGGER 공식 RISC-V-behind-DAP 절차를 따른다.
-*  핵심은 **ConfigTargetSettings() 훅**을 쓰는 것이다.
+*  SEGGER 공식 RISC-V-behind-DAP 절차를 따르며, **두 훅을 역할대로 나눠 쓴다.**
 *
-*  왜 InitTarget() 이 아니라 ConfigTargetSettings() 인가:
-*    ConfigTargetSettings() 는 J-Link 의 정상 connect lifecycle 에서
-*    **CPU 자동검출·target 초기화보다 앞서** 호출된다. AP map / CoreBase 같은
-*    DLL 전역 연결 설정을 지정하기 위해 존재하는 훅이다.
-*    pylink 로 connect() 직전에 exec_command 를 넣으면 시점이 늦어,
-*    첫 connect 가 "Error while halting CPU / Specific core setup failed" 로
-*    실패하고 두 번째에야 붙는 현상이 나온다.
-*    → 이 파일의 목적은 **cold session 의 첫 connect 를 성공시키는 것**이다.
+*    ConfigTargetSettings()  AP map / DMI 위치 선언 (DLL 전역 연결 설정)
+*                            CPU 자동검출보다 앞서 호출된다
+*    InitTarget()            디버그 도메인 전원 인가 (저수준 target 초기화)
+*                            ★ 분리 실험 결과 이쪽이 진짜 병목이었다
+*
+*  목적: **cold session 의 첫 connect 를 성공시키는 것.**
+*    지금은 첫 connect 가 "Error while halting CPU / Specific core setup failed"
+*    로 실패하고 두 번째에야 붙는다. 그 우회(bounded retry)를 없애는 게 목표다.
 *
 *  실측으로 확정된 값:
 *    cJTAG (TIF=7), 10MHz            1000kHz 로 낮추면 활성화 실패
@@ -74,15 +73,64 @@ int ConfigTargetSettings(void) {
 
 
 /*********************************************************************
-*  InitTarget — 지금은 비워 둔다.
+*  InitTarget — 디버그 도메인 전원을 **미리** 올린다.
 *
-*  T32 스크립트를 조사한 결과 SYStem.Up 이전에 커스텀 전원/클럭/언락
-*  시퀀스가 **존재하지 않았다**(단순 재시도 루프뿐). 따라서 여기서 할 일이
-*  없다. 나중에 벤더가 별도 초기화를 요구하면 그때 채운다.
+*  ★ 이 블록이 이 파일의 핵심이다.
 *
-*  주의: 여기에 AP map 을 넣으면 안 된다. InitTarget 은 CPU 검출 흐름
-*  안에서 호출돼 시점이 늦다 — 그게 첫 connect 실패의 원인으로 의심된다.
+*  분리 실험(isolate_warmup.py) 결과:
+*      A  setup 1회 -> connect 2회       2회차 성공   ← 이것만 됨
+*      B  setup 2회 -> connect 1회       실패
+*      C  setup -> sleep -> connect      실패
+*
+*  설정을 두 번 넣어도, 기다려도 안 되고 **connect 시도 자체**가 있어야 한다.
+*  즉 "레지스터를 써야 하는 일" 이 빠져 있다는 뜻이고, 그 후보가 ARM DAP 의
+*  디버그 도메인 전원 인가다.
+*
+*  pylink 프로브에서 이미 실측으로 확인한 시퀀스:
+*      CTRL/STAT <- 0x50000000   (CDBGPWRUPREQ | CSYSPWRUPREQ)
+*      CTRL/STAT -> 0xF0000000   ACK 확인
+*
+*  J-Link 의 connect 도 결국 이걸 하지만, 같은 connect 안의 CPU setup 단계보다
+*  **늦게** 하는 것으로 보인다. 그래서 1차는 실패하고 2차가 붙는다.
+*  여기서 미리 올려두면 cold session 의 첫 connect 가 성공할 수 있다.
+*
+*  (기존 ARM 제품의 r8_pcsr_jtag.cfg 에서 손으로 넣던 `dpreg 4 0x50000000` 과
+*   같은 동작이다.)
+*
+*  DP 레지스터 인덱스: 0=DPIDR/ABORT  1=CTRL/STAT  2=SELECT  3=RDBUFF
 *********************************************************************/
 int InitTarget(void) {
+  U32 ctrl;
+  int i;
+
+  JLINK_SYS_Report("[SF-E76] InitTarget: 디버그 도메인 전원 인가 시작");
+
+  // 단일 TAP, IRLen 4 (실측 TotalIRLen=4, IRPrint=0x01 = ARM DAP 서명)
+  JLINK_CORESIGHT_Configure("IRPre=0;DRPre=0;IRPost=0;DRPost=0;IRLenDevice=4");
+
+  // sticky error 클리어 후 전원 요청
+  JLINK_CORESIGHT_WriteDP(0, 0x0000001E);   // ABORT
+  JLINK_CORESIGHT_WriteDP(1, 0x50000000);   // CTRL/STAT: CSYSPWRUPREQ|CDBGPWRUPREQ
+
+  // ACK 대기 — CSYSPWRUPACK(bit31) | CDBGPWRUPACK(bit29) = 0xA0000000
+  i = 0;
+  ctrl = 0;
+  while (i < 20) {
+    JLINK_SYS_Sleep(5);
+    ctrl = JLINK_CORESIGHT_ReadDP(1);
+    if ((ctrl & 0xA0000000) == 0xA0000000) {
+      i = 20;
+    }
+    i = i + 1;
+  }
+
+  JLINK_SYS_Report1("[SF-E76] InitTarget: CTRL/STAT = ", ctrl);
+  if ((ctrl & 0xA0000000) == 0xA0000000) {
+    JLINK_SYS_Report("[SF-E76]   >> 전원 ACK 확인 — 첫 connect 가 성공해야 한다");
+  } else {
+    JLINK_SYS_Report("[SF-E76]   >> 전원 ACK 없음 — 이 경로로는 해결 안 됨");
+    JLINK_SYS_Report("[SF-E76]      (그 경우 동일 handle bounded retry 로 우회)");
+  }
+
   return 0;   // 0 = J-Link 통상 connect 절차를 계속 진행
 }

@@ -126,15 +126,27 @@ connect('RISC-V')
 
 → **샘플러도 connect 를 2회 이상 시도해야 한다.**
 
-#### ⬜ 미분리 — 무엇이 필요한지는 아직 모른다 (feedback.md §8.2)
+#### ✅ 메커니즘 분리 완료 — **실패한 connect 자체가 초기화한다**
 
-각 회차가 `setup → connect` 를 통째로 반복했으므로 셋 중 뭐가 원인인지 못 가렸다:
+`isolate_warmup.py` A/B/C 를 여러 번 반복한 결과:
 
-1. **실패한 connect 자체**가 초기화를 수행한다
-2. **setup 을 두 번 적용**해야 유효해진다
-3. 그냥 **시간이 지나서** DM 이 준비된다
+| 실험 | 결과 | 배제 |
+|---|---|---|
+| **A** setup 1회 → connect 2회 | **2회차 성공** | — |
+| B setup 2회 → connect 1회 | 실패 | setup 이중 적용 아님 |
+| C setup → sleep → connect | 실패 | readiness 지연 아님 |
 
-→ `isolate_warmup.py` 의 A/B/C 실험으로 분리한다.
+**설정을 두 번 넣어도, 기다려도 안 된다. connect 시도 자체가 있어야 한다.**
+→ "레지스터를 써야 하는 일"이 빠진 것이고, 유력 후보는 **ARM DAP 디버그 도메인 전원**이다
+  (`CTRL/STAT ← 0x50000000` → `0xF0000000` ACK. pylink 프로브에서 이미 실측).
+
+J-Link 의 connect 도 결국 이걸 하지만 **같은 connect 안의 CPU setup 단계보다 늦게**
+하는 것으로 보인다. 그래서 1차는 실패하고 2차가 붙는다.
+
+→ **해법: `InitTarget()` 에서 전원을 미리 올린다.** `SF_E76_config.JLinkScript` 참조.
+  (feedback.md §2.1 이 `InitTarget()` 의 용도로 '전원' 을 명시했는데,
+   내가 "T32 에 커스텀 시퀀스 없음" 을 이유로 비워둔 것이 놓친 지점이었다 —
+   이건 벤더 커스텀이 아니라 ARM DAP 표준 절차다)
 
 #### 근본 해법 후보 — `ConfigTargetSettings()`
 
