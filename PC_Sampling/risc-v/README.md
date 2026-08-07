@@ -2,9 +2,17 @@
 
 SiFive **E76** 기반 RISC-V SSD 컨트롤러에 퍼저를 올리기 위한 작업.
 
-**v10.0 범위 = 샘플러 층 교체.** NVMe 전송·코퍼스·변이·LLM·replay·POR 는
-주소 무관이라 그대로 간다. 기존 `pc_sampling_fuzzer_v9.7.py` 대비 새로 쓸 것은
-`_read_all_pcs()` 한 메서드 수준이다.
+> ## ★ 먼저 읽을 것: [`STATUS.md`](STATUS.md)
+>
+> **T32 로 이 제품의 커버리지가 실제로 측정되며, 그 방식은 halt 가 아니다.**
+> 따라서 현재 주 트랙은 **"T32 커버리지 메커니즘 식별"(C0~C6)** 이고,
+> 아래의 halt/PC/resume(G0~G6)는 **보조 트랙**이다.
+> 이 문서의 실행 안내도 대부분 보조 트랙용이다.
+
+**v10.0 범위:** 커버리지 수집 방식이 확정되기 전까지는 **미정**이다.
+halt PC 샘플링이면 샘플러 층 교체만으로 끝나지만(기존 `pc_sampling_fuzzer_v9.7.py`
+대비 `_read_all_pcs()` 수준), instrumentation bitmap 이면 수집 계층 자체가 달라진다.
+NVMe 전송·코퍼스·변이·LLM·replay·POR 는 어느 쪽이든 그대로 간다.
 
 ---
 
@@ -36,8 +44,8 @@ SiFive **E76** 기반 RISC-V SSD 컨트롤러에 퍼저를 올리기 위한 작�
 | **G5** | workload 중 반복 샘플링 | ⬜ |
 | **G6** | close/reopen · POR · crash 복구 | ⬜ |
 
-**v10.0 샘플러 착수 조건 = 최소 G4.**
-**장시간 퍼징 투입 조건 = G5 + G6.**
+**이 게이트는 halt PC 샘플링 대안 트랙의 것이다.** 주 트랙은 `STATUS.md` 의 C0~C6.
+halt 경로를 택하게 될 경우의 착수 조건이 G4, 장시간 투입 조건이 G5+G6 이다.
 
 > ⚠️ **`connect()` 성공은 코어 도달을 뜻하지 않는다 — 실측으로 확인됐다.**
 > `connect()` 는 2회차에 성공하는데 **`halt()` 는 DLL 레벨에서 거부된다.**
@@ -170,8 +178,9 @@ sudo python3 diagnose_connect.py
 
 | # | 질문 | 확인 방법 |
 |---|---|---|
-| 1 | **첫 connect 가 왜 실패하나** | `diagnose_connect.py`. 유력 가설 = RISC-V DM 의 `dmactive` (쓴 뒤 되읽어 1 될 때까지 기다려야 하는데 J-Link 이 안 기다리는 것으로 의심) |
-| 2 | **halt / PC / resume 이 되나** | `verify_halt_pc.py` ← **v10.0 착수 조건** |
+| 0 | **★ T32 는 어떤 메커니즘으로 커버리지를 얻나** | `STATUS.md` P0. **주 트랙** |
+| 1 | 첫 connect 가 왜 실패하나 | `diagnose_connect.py`. 유력 가설 = RISC-V DM 의 `dmactive` (쓴 뒤 되읽어 1 될 때까지 기다려야 하는데 J-Link 이 안 기다리는 것으로 의심) |
+| 2 | halt / PC / resume 이 되나 | `verify_halt_pc.py` — **보조 트랙**. 현재 halt 실패(APB=0 범위) |
 | 3 | PC 레지스터 인덱스 | `verify_halt_pc.py --scan-registers`. **추측 금지** — 이름/T32 교차검증/fingerprint 중 하나로 확정해야 샘플링한다 |
 | 4 | `0x81480000` 이 **어느 코어**인가 | halt 후 PC/hart 비교. connect 성공만으론 알 수 없다 |
 | 5 | **NVMe 를 처리하는 코어**는? | 벤더 문의 — `hcore` 추정이나 미확인 |
@@ -197,5 +206,7 @@ sudo python3 diagnose_connect.py
   `.text` 범위와 함께 반드시 확인할 것.
 - **halt 가 PCIe 를 멈추는지** 조기에 봐야 한다. ARM 제품(P7/P9)에서 호스트
   프리즈로 몇 달을 태웠다. `halt_loop_stress.py` 를 포팅해 **본격 개발 전에** 확인.
-- **Nexus 트레이스**는 성공하면 부분맹 커버리지와 halt 문제를 한 번에 없앤다.
-  다만 **크리티컬 패스에 두지 말 것.**
+- **Nexus 트레이스**는 이제 **병행 트랙이 아니라 주 트랙 후보 중 하나**다.
+  T32 가 트레이스로 커버리지를 얻고 있었다면 그게 재현해야 할 경로다.
+  ⚠ 다만 **외부 streaming trace 라면 J-Trace PRO 가 필요**하고 현재 J-Link Plus 로는
+  불가하다(SEGGER 문서 명시). 온칩 버퍼면 J-Link 로 검토 가능.

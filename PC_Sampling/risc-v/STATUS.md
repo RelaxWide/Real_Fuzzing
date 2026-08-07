@@ -28,7 +28,8 @@
 
 | | 조건 | 상태 |
 |---|---|---|
-| **C0** | T32 에서 RISC-V 커버리지 측정 재현 | ✅ **사용자 확인** |
+| **C0a** | T32 에서 RISC-V 커버리지 **동작 확인** | ✅ 사용자 확인 |
+| **C0b** | 동일 실행을 **재현할 스크립트·로그 보존** | ❌ ← P0 |
 | **C1** | T32 커버리지 **메커니즘 식별** | ❌ ← **지금 할 일** |
 | **C2** | 데이터 경로와 필요한 하드웨어 식별 | ❌ |
 | **C3** | 현재 J-Link(또는 필요한 J-Trace)의 지원 가능성 | ❌ |
@@ -36,7 +37,7 @@
 | **C5** | 동일 workload 로 T32 결과와 교차 검증 | ❌ |
 | **C6** | 퍼저 반복 수집·복구·성능 검증 | ❌ |
 
-**C0 가 ✅ 라는 게 중요하다.** 타깃이 코드 실행 정보를 외부로 낼 수 있다는 것과
+**C0a 가 ✅ 라는 게 중요하다.** 타깃이 코드 실행 정보를 외부로 낼 수 있다는 것과
 T32 가 그 경로를 초기화할 수 있다는 것이 **이미 입증됐다.**
 
 ## run-control 게이트 (보조 트랙 — halt PC sampling 대안)
@@ -45,8 +46,14 @@ T32 가 그 경로를 초기화할 수 있다는 것이 **이미 입증됐다.**
 |---|---|---|
 | G0 | cJTAG / DP / 디버그 전원 ACK | ✅ |
 | G1 | J-Link `connect()` | ⚠️ 2회차에만, 의미 불확실 |
-| G2 | halt + `halted` 확인 | ❌ 전 조합 실패 (POR 후에도) |
+| G2 | halt + `halted` 확인 | ❌ 실패 — **범위 아래 참조** |
 | G3~G6 | PC / resume / 반복 / 복구 | ⬜ |
+
+> **G2 실패의 시험 범위 (오해 방지):**
+> **`APB index = 0` 고정**에서 시험한 `CoreBase × hart` 조합에 한한다.
+> APB index 1/4/5 는 **한 번도 시험하지 않았다**(도구에는 추가돼 있으나 보류 중).
+> POR 1회 후 재시도 포함. 각 조합의 power-cycle ID·DLL/firmware/device profile 은
+> 아직 체계적으로 기록하지 않았다.
 
 이 트랙은 **버리지 않는다.** 용도가 바뀔 뿐이다 — J-Link run-control 지원 여부
 진단, trace 설정에 필요한 core/DM 연결 확인, trace 실패 시 대안, SEGGER 문의용
@@ -81,8 +88,27 @@ streaming trace 가 불가능하다. 따라서 T32 가 커버리지를 얻었다
 2. **온칩 버퍼를 디버그 포트로 드레인**, 또는
 3. **우리가 모르는 별도 트레이스 커넥터를 썼다**
 
-**1·2 는 둘 다 J-Link 로 가능한 방식이다.** 3 이면 그때 장비 문제가 된다.
+**1·2 는 일반 J-Link 로 "검토할 수 있는 후보"** 다. **가능이 확정된 게 아니다** —
+아래를 확인해야 한다:
+
+| instrumentation 이면 | 온칩 버퍼면 |
+|---|---|
+| bitmap 이 **어느 버스/AP** 에서 보이나 | TE·sink base 와 AP 경로 |
+| 실행 중 **non-intrusive read** 가 되나 | 현재 probe 가 그 SoC trace 를 회수하나 |
+| J-Link `connect()` 가 **halt 를 먼저 요구**하나 | raw trace **디코딩 API** 가 있나 |
+| **cache/coherency** — 외부 read 가 최신인가 | program flow 로 재구성되나 |
+| bitmap 갱신이 **atomic** 한가 | |
+
+`RISCV_SetTEBaseAddr` / `RISCV_SetSRAMBaseAddr` 명령의 **존재는 구성 가능성일 뿐**,
+J-Link Plus 가 이 SoC 의 trace 를 회수·디코딩해 커버리지로 준다는 증거가 아니다.
+
+3 이면 장비 문제가 된다.
 → **"T32 는 어느 커넥터를 썼나"가 저비용 고수확 질문이다.**
+
+> ⚠ 10핀 결론은 **현재 확인한 커넥터**에 대한 것이다. T32 측정 때 별도
+> MIPI/MICTOR/벤더 trace 커넥터, 보드 test point, interposer 가 있었을 수 있다.
+> **실제 장비 사진·케이블·probe 모델을 확보하기 전에는 외부 trace 를 낮은
+> 가능성으로 두되 폐기하지 않는다.**
 
 ### 그리고 1번이면 오히려 좋은 소식이다
 
@@ -95,7 +121,23 @@ AFL 식 bitmap 을 그대로 쓸 수 있다. 대신 "양산 이미지 그대로"
 
 ## 다음 할 일
 
-### P0 — 실제 T32 스크립트와 측정 증거 확보 ← **이게 전부다**
+### P0-a — ★ 코드 없이 답할 수 있는 다섯 질문 (제일 먼저)
+
+T32 를 실제로 쓴 사람에게 이것만 물으면 **후보가 대부분 갈린다:**
+
+> 1. 커버리지 측정 때 **일반 debug cable 외에 다른 cable** 이 있었는가?
+> 2. 사용한 **Lauterbach probe 의 정확한 모델**은?
+> 3. 대상 펌웨어가 **양산 이미지인가, 커버리지용 재빌드 이미지인가?**
+> 4. T32 에서 커버리지 시작 시 **누른 메뉴 / 실행한 명령**은?
+> 5. 측정 종료 후 생성된 **파일의 확장자와 이름**은?
+
+**3번이 instrumentation 여부를, 1·2번이 외부 trace 여부를 가른다.**
+
+### P0-b — 실제 T32 스크립트와 측정 증거 확보
+
+**원본을 먼저 보존한다.** 정리하거나 RISC-V 관련 줄만 뽑기 전에 —
+T32 스크립트는 인자와 include 로 실제 주소·코어·trace 설정을 주입하므로
+한 파일만 보면 잘못된 결론이 난다.
 
 `risc-v/t32/` 아래에 보존한다:
 
@@ -109,6 +151,17 @@ AFL 식 bitmap 을 그대로 쓸 수 있다. 대신 "양산 이미지 그대로"
 8. T32 가 읽는 **trace buffer 또는 bitmap 주소**
 
 **이게 없으면 지금 가진 AP/COREDEBUG/Data.Set 조각만으로는 방식을 복원할 수 없다.**
+
+#### 확보 후 기계적으로 검색할 키워드
+
+```
+COVerage / Trace / NEXUS / N-Trace / Analyzer
+SRAM / ATB / Funnel / PIB / Buffer
+Data.Save / Data.dump / memory read / bitmap / counter
+instrument / compiler option / coverage runtime
+```
+명령 이름만 보지 말고 **커버리지 시작 전후의 메모리 쓰기**와
+**export 파일 생성 경로**까지 추적한다.
 
 ### P1 — 스크립트를 두 계층으로 분리
 
@@ -139,12 +192,18 @@ RAM bitmap 을 AP 메모리 접근으로 읽는 방식이라면 **CPU halt 와 �
 2. 보드에 PIB/trace 핀이 실제로 노출·배선됐는지 확인
 3. 일반 J-Link 라면 **소프트웨어 작업을 계속하기 전에 하드웨어 요구사항부터 결정**
 
-### P3 — 저비용 병행 (P0 기다리는 동안)
+### P3 — 저비용 병행 (P0 기다리는 동안) — **상한을 둔다**
+
+> halt 진단이 다시 주 작업이 되지 않도록 제한한다:
+> **Commander 원문 로그 1세트** + **현재판/최신판 동일 조건 1세트 비교**까지.
+> 그 뒤에는 **T32 C1 분석 전까지 CoreBase/hart/APB 확장 금지.**
 
 - **`JLinkExe` 로 직접 halt** — pylink 의 `False` 보다 SEGGER 원문 에러가 자세하다
-- **J-Link 소프트웨어 팩 버전 확인** — 현재 `JLink_V912`. RISC-V 지원이 빠르게
-  바뀌는 영역이라 최신 팩에 이 SoC 가 들어가 있을 수 있다.
-  **단, 업그레이드 전에 현재 상태를 기록**할 것(변수를 한 번에 하나만)
+- **J-Link 소프트웨어 팩 최신판 비교** — 현재 `JLink_V912`.
+  ⚠ **"설치만 하면 해결" 을 기대하지 말 것.** SiFive E76 프로파일이 있어도 이 SSD SoC 의
+  DAP/AP/DM/trace 토폴로지가 표준 E76 보드와 같다는 뜻이 아니다. 목적은 셋으로 한정:
+  (a) RISC-V-behind-DAP / N-Trace 관련 수정 확인 (b) 더 상세한 오류 로그 확보
+  (c) 현재 결과가 구버전 회귀인지 비교. **업그레이드 전에 현재 상태 기록**(변수 하나씩)
 - **벤더 질문** — 이제 커버리지 방식까지 포함해서:
   > 1. 이 제품의 **코드 커버리지 수집 방식**은? (계측 빌드 / 온칩 트레이스 / 기타)
   > 2. 계측이면 **bitmap 주소와 포맷**, 트레이스면 **TE·sink 주소와 AP 경로**
@@ -155,8 +214,24 @@ RAM bitmap 을 AP 메모리 접근으로 읽는 방식이라면 **CPU halt 와 �
 ### 하지 말 것
 
 - **halt/APB/hart 스윕 확대** — T32 방식을 모른 채 후보를 넓히는 건 재현이 아니다
-- `connect()` 성공을 진전으로 기록 — halt 없이는 의미 없다
+- **`connect()` 무예외 종료만으로 성공을 주장하기** — run-control 이든 coverage 든,
+  각 트랙의 **실제 산출물**(halted 상태 / bitmap 변화 / raw trace)을 확인한다.
+  합격 기준은 halt 가 아니라 **선택한 경로의 관측 가능한 산출물**이다
 - 한 프로세스에 여러 조합 섞기 — 두 번 데였다
+
+---
+
+## 결과에 항상 명시할 것 (용어 혼동 방지)
+
+"J-Link 지원" 은 J-Link Plus / J-Trace / J-Link SDK 를 섞어 읽기 쉽다. 그래서:
+
+```
+probe_model      = J-Link Plus | J-Trace PRO RISC-V | (T32 probe 모델)
+host_software    = J-Link Software Pack 버전 | TRACE32 버전
+collection_mode  = memory_bitmap | onchip_trace_buffer | streaming_trace | halt_pc
+```
+
+**현재 우리 장비:** `probe_model = J-Link Plus` (FW V13), `host_software = JLink_V912`
 
 ---
 

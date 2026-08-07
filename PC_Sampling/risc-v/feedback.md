@@ -1276,3 +1276,233 @@ T32에서 실제 코드 커버리지가 된다는 사실 때문에 **제품 자�
 따라서 지금 가장 중요한 작업은 halt/APB/hart 스윕이 아니라 **성공한 T32 커버리지 스크립트를
 확보하여 coverage 데이터 경로를 식별하는 것**이다. 그 결과가 나온 뒤 J-Link halt sampling,
 J-Link 메모리 bitmap 읽기, J-Trace Nexus 중 하나를 주 경로로 선택한다.
+
+---
+
+## 12. 2026-08-07 수정된 STATUS.md 리뷰
+
+### 12.1 Critical issues
+
+#### 1. 새 주 트랙과 게이트 전환은 맞다
+
+수정된 `STATUS.md`는 다음 핵심을 올바르게 반영했다.
+
+- T32에서 RISC-V coverage가 된다는 사실을 C0로 분리했다.
+- halt 실패와 제품의 coverage feasibility 실패를 분리했다.
+- halt/APB/hart 확대 스윕을 보류했다.
+- run-control G0~G6를 주 트랙이 아닌 보조 트랙으로 내렸다.
+- 실제 T32 스크립트와 coverage 데이터 경로 식별을 C1/P0로 올렸다.
+
+이 방향은 이전 STATUS보다 정확하다. 지금의 프로젝트 병목은 `halt()`가 아니라 **T32에서
+성공한 coverage data path를 식별하지 못한 것**이다.
+
+#### 2. “1·2는 둘 다 J-Link로 가능”은 아직 확정할 수 없다
+
+`STATUS.md` 84행의 다음 문장은 과하다.
+
+> instrumentation 메모리 읽기와 온칩 버퍼 드레인은 둘 다 J-Link로 가능하다.
+
+다음처럼 낮춰 써야 한다.
+
+> instrumentation 메모리 읽기와 온칩 버퍼 드레인은 **일반 J-Link로 검토할 수 있는
+> 후보**다. 실제 가능 여부는 메모리 접근 경로, connect 시 halt 동작, trace sink 지원,
+> raw trace 회수·디코딩 API를 확인해야 한다.
+
+instrumentation bitmap도 자동으로 가능한 것이 아니다.
+
+- bitmap이 어느 버스/AP에서 보이는지
+- 실행 중 non-intrusive memory read가 가능한지
+- J-Link `connect()`가 먼저 CPU halt를 요구하는지
+- cache/coherency 때문에 외부 read 값이 최신인지
+- bitmap 업데이트가 atomic한지
+
+를 확인해야 한다.
+
+온칩 SRAM trace buffer는 더 불확실하다. `RISCV_SetTEBaseAddr`와
+`RISCV_SetSRAMBaseAddr` 명령의 존재는 구성 가능성을 보여줄 뿐, 현재 J-Link Plus가 이 SoC의
+trace를 회수하고 program flow로 디코딩하여 coverage로 제공한다는 증거는 아니다.
+
+#### 3. “connect 성공은 halt 없이는 의미 없다”는 새 주 트랙과 충돌한다
+
+`STATUS.md` 158행의 금지 문구는 halt sampler 관점에서는 맞았지만, 새 coverage 주 트랙에서는
+너무 좁다.
+
+instrumentation bitmap 또는 trace buffer 방식이라면 CPU halt가 최종 조건이 아닐 수 있다.
+따라서 다음처럼 바꾸는 편이 정확하다.
+
+> `connect()` 무예외 종료만으로 run-control 또는 coverage data path 성공을 주장하지 않는다.
+> 각 트랙의 실제 산출물(halted state, bitmap 변화, raw trace)을 확인한다.
+
+즉 합격 기준은 모든 경로에서 halt가 아니라 **선택한 경로의 관측 가능한 산출물**이어야 한다.
+
+#### 4. “모든 조합에서 POR 후 halt 실패”의 시험 범위를 명시해야 한다
+
+보조 게이트 G2의 “전 조합 실패(POR 후에도)”는 아래 범위를 기록하지 않으면 나중에 APB
+스윕까지 완료한 것으로 오해할 수 있다.
+
+- 시험한 CoreBase 목록
+- hart 목록과 `None` 포함 여부
+- APB index
+- 각 조합의 POR 여부와 power-cycle ID
+- J-Link DLL/firmware/device profile
+
+기존 시험이 APB index 0 고정이었다면 반드시 **“APB=0에서 시험한 CoreBase × hart 조합”**으로
+한정해서 써야 한다.
+
+### 12.2 Potential bugs
+
+#### 1. C0의 증거 수준을 한 단계 더 구분할 필요가 있다
+
+현재 C0는 “사용자 확인”으로 ✅ 처리했다. 프로젝트 방향을 정하기에는 충분하지만,
+재현 가능한 기술 증거가 저장소에 없는 상태다. 다음 두 상태를 분리하면 좋다.
+
+```text
+C0a  T32 coverage 동작 확인                 ✅ 사용자 확인
+C0b  동일 실행을 재현할 스크립트·로그 보존   ❌ P0
+```
+
+스크립트가 확보되기 전까지 “재현 완료”보다는 “동작 확인, artifact 미보존”이 정확하다.
+
+#### 2. 10핀 커넥터만으로 T32의 trace 경로를 배제하면 안 된다
+
+`STATUS.md`는 현재 10핀 디버그 커넥터에서 병렬 trace 핀이 나올 수 없다는 점을 잘 짚었다.
+다만 이것은 **현재 확인한 커넥터**에 대한 결론이다. T32 측정 때 다음이 있었을 수 있다.
+
+- 별도 MIPI/MICTOR/벤더 trace connector
+- 보드 test point 또는 interposer
+- ATB를 거친 온칩 sink
+- 계측 펌웨어와 RAM bitmap
+
+문서가 이미 “별도 트레이스 커넥터” 가능성을 남겼으므로, 실제 T32 장비 사진·케이블·probe
+모델 확보 전에는 외부 trace를 낮은 가능성으로만 두고 폐기하지 않는 것이 맞다.
+
+#### 3. J-Link 최신판이 문제를 “통째로 해결”할 가능성은 낮춰 표현해야 한다
+
+SiFive E76 device profile이 존재해도 이 SSD SoC의 DAP/AP/DM/trace topology가 표준 E76
+보드와 같다는 뜻은 아니다. 최신판 비교는 해야 하지만 목적은 다음으로 한정한다.
+
+- RISC-V-behind-DAP와 N-Trace 관련 수정 확인
+- 더 상세한 오류 로그 확보
+- 현재 결과가 구버전 회귀인지 비교
+
+새 버전 설치만으로 벤더 SoC의 AP/DM/trace 설정이 자동으로 생긴다고 기대하면 안 된다.
+
+#### 4. README와 BRINGUP이 STATUS와 아직 충돌한다
+
+`STATUS.md`는 방향 전환됐지만 다른 진입 문서에 옛 크리티컬 패스가 남아 있다.
+
+- `README.md` 열린 질문에 `halt/PC/resume = v10.0 착수 조건`이 남아 있음
+- `README.md`는 Nexus를 여전히 “크리티컬 패스에 두지 말 것”이라고 함
+- `BRINGUP_riscv_v10.md`는 `verify_halt_pc.py`를 현재 단계로 표시함
+- BRINGUP은 “0단계만 되면 퍼저가 돈다”며 halt sampler를 기본 결론으로 유지함
+
+작업자가 STATUS가 아니라 README부터 읽으면 다시 halt 트랙으로 돌아갈 수 있다. STATUS의 새
+결론을 README 첫 부분과 BRINGUP 최종 로드맵에 동기화해야 한다. 과거 조사 기록은 삭제하지
+말고 “이전 가정/보조 트랙”으로 표시한다.
+
+### 12.3 Reliability improvements
+
+#### 1. T32 artifact 수집 시 원본을 먼저 보존한다
+
+스크립트를 정리하거나 RISC-V 관련 줄만 복사하기 전에 다음을 원본 그대로 저장한다.
+
+- 실행 entry `.cmm`
+- 모든 `DO`, include, macro 파일
+- 호출한 batch/launcher와 인자
+- T32 버전, 라이선스, probe 모델과 serial
+- 일반 debug cable 외 연결된 모든 cable
+- target build ID, ELF hash, firmware image hash
+- coverage 시작 전부터 export까지의 console log
+
+T32 스크립트는 인자와 include에서 실제 주소·코어·trace 설정을 주입할 수 있으므로 한 파일만
+보면 잘못된 결론을 낼 수 있다.
+
+#### 2. C1 판별용 키워드를 정해 기계적으로 검색한다
+
+원본 확보 후 최소한 다음 계열을 전체 include chain에서 검색한다.
+
+```text
+COVerage / Trace / NEXUS / N-Trace / Analyzer
+SRAM / ATB / Funnel / PIB / Buffer
+Data.Save / Data.dump / memory read / bitmap / counter
+instrument / compiler option / coverage runtime
+```
+
+명령 이름만 보지 말고 커버리지 시작 전후의 메모리 쓰기와 export 파일 생성 경로까지 추적한다.
+
+#### 3. “J-Link”의 범위를 장비명까지 고정한다
+
+앞으로 결과에 최소한 다음을 명시한다.
+
+```text
+probe_model = J-Link Plus | J-Trace PRO RISC-V | TRACE32 probe model
+host_software = J-Link Software Pack version | TRACE32 version
+collection_mode = memory_bitmap | onchip_trace_buffer | streaming_trace | halt_pc
+```
+
+“J-Link 지원”이라는 표현은 J-Link Plus, J-Trace, J-Link SDK를 섞어 읽기 쉽다.
+
+#### 4. 새 STATUS의 P3 병행 실험은 시간 상한을 둔다
+
+P0 artifact를 기다리며 Commander와 최신 DLL을 확인하는 것은 좋다. 다만 halt 진단이 다시
+주 작업이 되지 않도록 다음처럼 제한한다.
+
+- Commander 원문 로그 1세트 확보
+- 현재판/최신판 각 동일 조건 1세트 비교
+- 그 뒤에는 T32 C1 분석 전 추가 CoreBase/hart/APB 확장 금지
+
+### 12.4 Suggested tests
+
+#### P0 — 코드 실행 없이 답할 수 있는 질문
+
+T32를 실제로 사용한 사람에게 먼저 다음 다섯 가지만 확인한다.
+
+1. coverage 측정 때 일반 debug cable 외에 다른 cable이 있었는가?
+2. 사용한 Lauterbach probe의 정확한 모델은 무엇인가?
+3. 대상 펌웨어가 일반 양산 이미지인가, coverage용 재빌드 이미지인가?
+4. T32에서 coverage 시작할 때 누른 메뉴 또는 실행한 명령은 무엇인가?
+5. 측정 종료 후 생성된 파일의 확장자와 이름은 무엇인가?
+
+이 다섯 답만으로 instrumentation, on-chip buffer, external streaming 후보를 상당 부분
+분리할 수 있다.
+
+#### P1 — instrumentation 후보 최소 실험
+
+1. T32로 workload 전/후 bitmap 후보 메모리를 저장한다.
+2. 서로 다른 NVMe 명령 두 개가 서로 다른 bit/counter를 바꾸는지 확인한다.
+3. T32 종료 후 J-Link의 AP memory read로 같은 주소를 읽는다.
+4. CPU를 halt하지 않은 상태와 cache flush 조건을 나눠 비교한다.
+
+#### P2 — trace 후보 최소 실험
+
+1. T32 설정에서 TE, funnel, sink와 buffer base/size를 추출한다.
+2. trace sink가 SRAM, ATB, PIB 중 무엇인지 확정한다.
+3. raw trace 파일이 생성되는지와 포맷을 확인한다.
+4. J-Link Plus가 아니라 J-Trace가 필요한 기능인지 SEGGER에 주소·sink 정보와 함께 문의한다.
+
+#### P3 — 문서 일관성 검사
+
+STATUS 반영 후 다음 문자열을 저장소 전체에서 검색한다.
+
+```text
+v10.0 착수 조건
+지금 할 일
+크리티컬 패스
+Nexus.*병행
+halt.*필수
+```
+
+모든 문장이 `coverage 주 트랙`과 `halt-PC sampling 보조 트랙`을 혼동하지 않는지 확인한다.
+
+### 12.5 최종 판단
+
+수정된 STATUS의 **방향 전환은 맞고, 현재 프로젝트의 대표 문서로 사용할 수 있는 수준에
+가까워졌다.** 다만 다음 네 항목은 바로 고쳐야 한다.
+
+1. “instrumentation/온칩 buffer는 J-Link로 가능”을 **가능 후보**로 낮춘다.
+2. “connect 성공은 halt 없이는 의미 없다”를 **트랙별 실제 산출물 확인**으로 바꾼다.
+3. G2의 “전 조합” 시험 범위를 APB index까지 명시한다.
+4. README와 BRINGUP의 옛 halt 크리티컬 패스를 새 STATUS에 맞춘다.
+
+그 뒤의 실제 P0는 변함없다. **성공한 T32 coverage의 원본 스크립트·include chain·probe와
+cable 정보·측정 로그를 확보하는 것**이다.
