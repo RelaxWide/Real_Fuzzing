@@ -334,6 +334,67 @@ def stage6_mem_adiv6(jl, live):
                 break
 
 
+# SEGGER CoreSight AP 타입 상수 (JLinkScript CORESIGHT_* 와 동일 값으로 추정)
+AP_TYPE = {0: 'CUSTOM', 1: 'AHB', 2: 'APB', 4: 'AXI'}
+
+# T32 이름에서 유추한 등록 계획: (APSEL, 타입값, 이름)
+AP_PLAN = [(1, 2, 'APBAP1'), (2, 2, 'APBAP2'), (3, 4, 'AXIAP1'),
+           (4, 1, 'AHBAP1'), (5, 2, 'APBAP3'), (6, 2, 'APBAP4')]
+
+
+def stage5c_addap(jl):
+    """DLL 에 AP 를 명시 등록한 뒤 재시도.
+
+    STICKY 가 0/256 이라는 것은 'AP 가 없다'는 하드웨어 응답이 아니라
+    **AP 트랜잭션이 발행조차 되지 않았다**는 뜻이다.
+    SEGGER DLL 은 AddAP 로 등록된 AP 만 접근을 허용하는 것으로 보이는데,
+    pylink 는 그 함수를 노출하지 않는다 → raw ctypes 로 직접 호출한다.
+    """
+    head("[5c] AP 명시 등록 후 재시도 (JLINKARM_CORESIGHT_AddAP)")
+
+    fn = None
+    for nm in ('JLINKARM_CORESIGHT_AddAP', 'JLINK_CORESIGHT_AddAP'):
+        try:
+            fn = getattr(jl._dll, nm)
+            print(f"  ✅ DLL 심볼 발견: {nm}")
+            break
+        except AttributeError:
+            print(f"  - {nm} 없음")
+    if fn is None:
+        print("\n  ❌ AddAP 심볼이 DLL 에 없다.")
+        print("     심볼 목록 확인:  nm -D <libjlinkarm.so 경로> | grep -i coresight")
+        print("     → JLinkScript 의 JLINK_CORESIGHT_AddAP() 경로로 가야 한다")
+        return []
+
+    print("\n  등록 시도 (T32 이름에서 타입 유추):")
+    for apsel, typ, name in AP_PLAN:
+        try:
+            r = fn(apsel, typ)
+            print(f"    AddAP({apsel}, {typ}={AP_TYPE.get(typ, '?')})  {name}  → ret={r}")
+        except Exception as e:
+            print(f"    AddAP({apsel}, {typ}) 예외: {e}")
+
+    print("\n  등록 후 IDR 재읽기:")
+    live = []
+    for apsel, typ, name in AP_PLAN:
+        if not dap_select(jl, apsel, 0xF):
+            continue
+        idr = ap_read(jl, 3)
+        st = sticky(jl)
+        if is_err(idr) or idr == 0:
+            print(f"    APSEL {apsel} ({name}): (없음)  raw={hx(idr)}  {sticky_str(st)}")
+            continue
+        t = AP_TYPE.get(idr & 0xF, f"type=0x{idr & 0xF:X}")
+        print(f"    APSEL {apsel} ({name}): IDR={hx(idr)}  {t}   ★")
+        live.append(apsel)
+    if live:
+        print(f"\n  ✅ AddAP 후 AP 발견: {live}")
+        print("     → DLL 이 등록된 AP 만 접근 허용하는 구조였다")
+    else:
+        print("\n  ❌ AddAP 후에도 없음")
+    return live
+
+
 def stage5_aps(jl):
     """ADIv5 APSEL 0~7 열거."""
     head("[5a] AP 열거 — ADIv5 APSEL 방식")
@@ -459,7 +520,12 @@ def main():
         else:
             print("\n  APSEL 방식 실패 → ADIv6 주소 방식으로 재시도")
             live6 = stage5_aps_adiv6(jl)
-            stage6_mem_adiv6(jl, live6)
+            if live6:
+                stage6_mem_adiv6(jl, live6)
+            else:
+                live_c = stage5c_addap(jl)
+                if live_c:
+                    stage6_mem(jl, live_c)
     finally:
         try:
             jl.close()
@@ -481,7 +547,8 @@ def main():
         if n > 200:
             print("     → DP 는 정상 응답. 그 위치에 AP 가 없는 것 (주소/방식 문제)")
         elif n == 0:
-            print("     → AP 접근이 DP 를 안 타고 있다 (pylink API 사용 문제)")
+            print("     → AP 트랜잭션이 발행조차 안 됐다 (하드웨어 응답이 아님)")
+            print("     → DLL 이 AddAP 로 등록된 AP 만 허용하는 구조로 보임 → [5c] 참조")
         else:
             print("     → 혼재. 위 상세 출력 확인 필요")
 
