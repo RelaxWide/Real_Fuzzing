@@ -92,10 +92,17 @@ def try_connect(jl, core_base, label):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--no-warmup', action='store_true',
-                    help='예열(1회차) 없이 본 시도만 — 예열이 정말 필요한지 확인용')
-    ap.add_argument('--base', type=lambda x: int(x, 0), default=TARGET_BASE)
+    ap.add_argument('--order', default=f"0x{WARMUP_BASE:X},0x{TARGET_BASE:X}",
+                    help=("시도할 CoreBase 를 순서대로 콤마 구분. 예:\n"
+                          "  0x81481000                    단독 (예열이 필요한가)\n"
+                          "  0x81481000,0x81480000         순서 뒤집기\n"
+                          "  0x81480000,0x81480000         ★ 같은 주소 두 번\n"
+                          "     -> 2번째가 붙으면 '위치' 문제, 둘 다 실패면 '주소' 문제"))
+    ap.add_argument('--stop-on-success', action='store_true',
+                    help='첫 성공에서 중단 (기본: 목록 끝까지 전부 시도)')
     args = ap.parse_args()
+
+    bases = [int(x, 0) for x in args.order.split(',') if x.strip()]
 
     print(f"\n{'=' * 62}\n SF-E76 최소 재현\n{'=' * 62}")
     print(f"  version: {VERSION}")
@@ -108,34 +115,59 @@ def main():
         sys.exit(f"J-Link open 실패: {e}\n  (다른 프로그램이 점유 중인지 확인)")
     print(f"  J-Link : {jl.product_name} SN={jl.serial_number}")
 
-    ok = False
+    results = []
     try:
-        if not args.no_warmup:
-            w = try_connect(jl, WARMUP_BASE, "1회차 (예열 — 실패해도 정상)")
-            if w:
-                print("\n  참고: 예열 단계가 성공했다. 0x81480000 도 붙는다는 뜻이다.")
-                ok = True
-        if not ok:
-            ok = try_connect(jl, args.base, "2회차 (본 시도)")
+        for i, b in enumerate(bases, 1):
+            r = try_connect(jl, b, f"{i}회차")
+            results.append((i, b, r))
+            if r and args.stop_on_success:
+                break
     finally:
         try:
             jl.close()
         except Exception:
             pass
 
+    print(f"\n{'=' * 62}\n 결과\n{'=' * 62}")
+    for i, b, r in results:
+        print(f"  {i}회차  CoreBase=0x{b:X}  →  {'성공' if r else '실패'}")
+
+    ok = any(r for _, _, r in results)
+
+    # ── 위치 vs 주소 판정 ────────────────────────────────────────────
     print(f"\n{'=' * 62}\n 판정\n{'=' * 62}")
-    if ok:
-        print("  ✅ 재현 성공 → 원인은 스윕 구조다.")
-        print("     스윕을 이 순서(핸들 유지 + 예열 후 본 시도)로 맞춰 고친다.")
+
+    if not results:
+        print("  시도 없음")
+        return
+
+    first_ok = results[0][2]
+    later_ok = any(r for _, _, r in results[1:])
+    same_addr = len({b for _, b, _ in results}) == 1
+
+    if first_ok:
+        print("  ★ 1회차부터 성공 → **예열은 필요 없다.** '첫 connect 는 예열' 가설 무효.")
+        print("     이전에 1회차가 실패했던 건 그 주소(0x81480000) 때문이다.")
+    elif same_addr and len(results) > 1:
+        if later_ok:
+            print(f"  ★ 같은 주소 0x{results[0][1]:X} 인데 1회차 실패 / 이후 성공")
+            print("     → **위치(순서) 문제.** 첫 connect 는 무조건 실패하며 예열 역할을 한다.")
+            print("     → 그 주소 자체는 정상. 샘플러는 connect 를 2회 이상 시도해야 한다.")
+        else:
+            print(f"  ★ 같은 주소 0x{results[0][1]:X} 를 {len(results)}회 시도해 전부 실패")
+            print("     → **그 주소가 실제로 안 되는 것**(순서 무관).")
+            print("     → 해당 코어가 리셋/정지 상태이거나 AP/주소가 다르다.")
+    elif later_ok:
+        print("  1회차 실패 / 이후 성공 — 주소가 서로 달라 원인 분리 불가.")
+        print("  → 같은 주소를 두 번 시도해 확정할 것:")
+        print(f"     sudo python3 connect_min.py --order 0x{results[0][1]:X},0x{results[0][1]:X}")
     else:
-        print("  ❌ 재현 실패 → 코드가 아니라 환경이다.")
-        print("     확인 순서:")
-        print("       1) 타깃(SSD) 전원 사이클 후 즉시 재실행")
-        print("          — cJTAG 는 4선→2선 전환이 상태를 남긴다. 반복 open/close 로")
-        print("            타깃이 어중간한 모드에 갇혔을 수 있다")
-        print("       2) J-Link USB 재연결")
-        print("       3) 다른 프로세스가 J-Link 을 잡고 있는지: ps aux | grep -i jlink")
-        print("       4) nvme list 로 컨트롤러 생존 확인")
+        print("  ❌ 전부 실패 → 코드가 아니라 환경일 수 있다.")
+        print("     1) 타깃(SSD) 전원 사이클 후 즉시 재실행")
+        print("        — cJTAG 는 4선→2선 전환이 타깃에 상태를 남긴다")
+        print("     2) J-Link USB 재연결")
+        print("     3) ps aux | grep -i jlink   (다른 프로세스 점유)")
+        print("     4) nvme list                (컨트롤러 생존)")
 
 
 if __name__ == '__main__':
