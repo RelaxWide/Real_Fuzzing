@@ -15,10 +15,18 @@ connect 는 이미 성공했다(connect_sfe76.py). 이제 v10.0 샘플러의 실
     CORESIGHT_SetCoreBaseAddr    = 0x81481000
     connect('RISC-V')
 
-★ 주의: CoreBaseAddr 이 0x81480000 이 아니라 **0x81481000** 에서 붙었다.
-  T32 에서 이 주소는 'Ncore' 로 보였으나, RISC-V behind DAP 에서
-  CORESIGHT_SetCoreBaseAddr 은 'AP 주소공간 내 DMI 레지스터 위치' 이므로
-  코어별 base 라는 해석 자체가 틀렸을 수 있다. 하트 열거로 확인한다.
+★★ 첫 connect() 는 **구조적으로 실패한다** (실측 확정).
+
+  같은 주소를 두 번 시도한 통제 실험에서:
+      0x81480000 -> 0x81480000     1회차 실패, 2회차 성공
+  주소를 바꿔도 항상 2회차만 성공했다. 즉 "0x81480000 은 연결 안 된다" 는
+  **틀린 결론이었고**, 첫 시도가 실패하는 것은 **위치(순서) 때문**이다.
+  첫 connect 는 `Error while halting CPU / Specific core setup failed` 로
+  실패하면서 예열 역할을 한다.
+
+  → T32 가 SYStem.Up 을 재시도 루프로 감싼 이유가 이것이다.
+  → **두 DM 모두 접근 가능**: 0x81480000(4코어) / 0x81481000(Ncore)
+  → 샘플러도 반드시 connect 를 2회 이상 시도해야 한다.
 
 사용법:
     sudo python3 verify_halt_pc.py
@@ -43,7 +51,8 @@ TIF_CJTAG   = 7
 SPEED_KHZ   = 10000
 CJTAG_MODE  = 0
 APB_INDEX   = 0
-CORE_BASE   = 0x81481000
+CORE_BASE   = 0x81480000   # ★ hcore/CMCore/Fcore0/QCore DM. NVMe 프론트엔드 후보
+CORE_BASE_N = 0x81481000   # Ncore DM
 
 AP_MAP = [
     ("APBAP1", 0x10000, "APB-AP"),
@@ -71,7 +80,7 @@ def ex(jl, cmd):
         return False
 
 
-def connect(jl, core_base, hart=None):
+def _apply(jl, core_base, hart):
     ex(jl, f"SetcJTAGInitMode = {CJTAG_MODE}")
     jl.set_tif(TIF_CJTAG)
     jl.set_speed(SPEED_KHZ)
@@ -81,7 +90,28 @@ def connect(jl, core_base, hart=None):
     ex(jl, f"CORESIGHT_SetCoreBaseAddr = 0x{core_base:X}")
     if hart is not None:
         ex(jl, f"RISCV_SetHartSel = {hart}")
-    jl.connect('RISC-V', speed=SPEED_KHZ)
+
+
+def connect(jl, core_base, hart=None, tries=3):
+    """★ 첫 connect 는 구조적으로 실패한다 — 반드시 재시도한다.
+
+    통제 실험(같은 주소 2회)에서 1회차 실패 / 2회차 성공이 재현됐다.
+    첫 시도가 예열이고, 그 상태를 물려받은 두 번째가 붙는다.
+    핸들을 중간에 close 하면 예열이 사라지므로 **하나의 핸들로** 반복한다.
+    """
+    last = None
+    for t in range(1, tries + 1):
+        _apply(jl, core_base, hart)
+        try:
+            jl.connect('RISC-V', speed=SPEED_KHZ)
+            if t > 1:
+                print(f"  (connect 시도 {t}회차에 성공 — 1회차는 예열)")
+            return t
+        except Exception as e:
+            last = e
+            print(f"  connect 시도 {t}/{tries} 실패: {e}")
+            time.sleep(0.2)
+    raise RuntimeError(f"connect {tries}회 모두 실패: {last}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -173,28 +203,35 @@ def main():
 
     if args.enum_harts:
         head("[H] 하트 열거 — 코어 5개(hcore/CMCore/Fcore0/QCore/Ncore)")
-        for h in range(5):
-            jl = pylink.JLink()
-            try:
-                jl.open()
-                connect(jl, args.core_base, hart=h)
-                st = f"halted={jl.halted()}"
+        # ★ 핸들 하나로 전부 처리한다. 하트마다 close/open 하면 예열이 사라져
+        #   전부 실패한다(스윕에서 실측으로 확인됨).
+        jl = pylink.JLink()
+        try:
+            jl.open()
+        except Exception as e:
+            sys.exit(f"J-Link open 실패: {e}")
+        try:
+            for h in range(5):
+                print(f"\n  ── hart {h} ──")
+                try:
+                    connect(jl, args.core_base, hart=h)
+                except Exception as e:
+                    print(f"    connect 실패: {e}")
+                    continue
                 try:
                     jl.halt()
-                    pcs = [jl.register_read(i) for i in (32, 33)]
-                    st += f"  reg32=0x{pcs[0] & 0xFFFFFFFF:08X} reg33=0x{pcs[1] & 0xFFFFFFFF:08X}"
+                    regs = {i: jl.register_read(i) & 0xFFFFFFFF for i in (32, 33)}
+                    print(f"    halted={jl.halted()}  "
+                          + "  ".join(f"reg{i}=0x{v:08X}" for i, v in regs.items()))
                     jl.restart()
                 except Exception as e:
-                    st += f"  halt/read 실패: {e}"
-                print(f"  hart {h}: connect OK   {st}")
-            except Exception as e:
-                print(f"  hart {h}: {e}")
-            finally:
-                try:
-                    jl.close()
-                except Exception:
-                    pass
-            time.sleep(0.2)
+                    print(f"    halt/read 실패: {e}")
+        finally:
+            try:
+                jl.close()
+            except Exception:
+                pass
+        print("\n  하트별 reg 값이 서로 다르면 → 하트 선택이 실제로 동작하는 것")
         return
 
     jl = pylink.JLink()
