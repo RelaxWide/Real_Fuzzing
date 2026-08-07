@@ -50,11 +50,20 @@ DP_RDBUFF    = 3
 KNOWN_TIF = {0: 'JTAG', 1: 'SWD', 2: 'BDM3', 3: 'FINE',
              4: 'ICSP', 5: 'SPI', 6: 'C2'}
 
-BAD = (None, 0x80000000, 0xFFFFFFFF)   # 의미 없는 반환값
+
+
+def is_err(v):
+    """pylink 가 음수 에러코드를 그대로 반환하는 경우가 있다.
+    DPIDR 은 bit0 이 RAO(항상 1) 이므로 0x80000000 같은 값은 데이터일 수 없다."""
+    return v is None or v < 0 or v in (0x80000000, 0xFFFFFFFF)
 
 
 def hx(v):
-    return "(예외)" if v is None else f"0x{v & 0xFFFFFFFF:08X}"
+    if v is None:
+        return "(예외)"
+    if v < 0:
+        return f"0x{v & 0xFFFFFFFF:08X}  [음수 {v} = API 에러]"
+    return f"0x{v:08X}"
 
 
 def head(t):
@@ -123,13 +132,13 @@ def stage1_tifs(jl, forced):
 
     if forced is not None:
         print(f"  --tif {forced} 로 강제 지정됨")
-        return forced
+        return [forced]
 
     try:
         mask = jl.supported_tifs()
     except Exception as e:
         print(f"  supported_tifs() 예외: {e}  → JTAG(0) 로 진행")
-        return 0
+        return [0]
 
     print(f"  지원 마스크 = 0x{mask:08X}")
     found = []
@@ -143,12 +152,12 @@ def stage1_tifs(jl, forced):
     if unknown:
         print(f"\n  ★ 이름 없는 TIF: {unknown}")
         print("    JLinkExe 의 'si cJTAG' 가 동작했으므로 이 중 하나가 cJTAG 다.")
-        print(f"    → 우선 {unknown[0]} 로 시도. 아니면 --tif 로 바꿔가며 재실행.")
-        return unknown[0]
+        print("    → DPIDR 이 읽힐 때까지 후보를 차례로 시도한다.")
+        return unknown
 
     print("\n  ⚠ 알려진 TIF 밖의 값이 없다 = pylink 로 cJTAG 선택 불가할 수 있음")
     print("    → JLinkScript 경로로 되돌아가야 한다. 일단 JTAG(0) 로 계속 진행.")
-    return 0
+    return [0]
 
 
 def stage2_connect(jl, tif, speed):
@@ -194,8 +203,9 @@ def stage4_dp(jl):
     sub("DPIDR")
     idr = dp_read(jl, DP_IDR_ABORT)
     print(f"  DPIDR = {hx(idr)}")
-    if idr in BAD or idr == 0 or idr == 1:
+    if is_err(idr) or idr in (0, 1) or (idr & 1) == 0:
         print("  ❌ 무효값. DP 와 통신이 안 되고 있다.")
+        print("     (DPIDR 은 bit0 = RAO 라 항상 1. 짝수면 데이터가 아니다)")
         print("     → cJTAG 스캔 포맷 불일치 의심 (T32: NOKEEPER USEOAC). SEGGER 문의 대상.")
         return False
     print("  ✅ 유효한 DPIDR — ARM DAP 확정")
@@ -215,7 +225,7 @@ def stage4_dp(jl):
             break
     print(f"  CTRL/STAT = {hx(ctrl)}")
 
-    if ctrl in BAD:
+    if is_err(ctrl):
         print("  ❌ 읽기 실패")
         return False
     if (ctrl & 0xA0000000) == 0xA0000000:
@@ -236,7 +246,7 @@ def stage5_aps(jl):
         if not dap_select(jl, ap, 0xF):     # IDR = 뱅크 0xF, 인덱스 3
             continue
         idr = ap_read(jl, 3)
-        if idr in BAD or idr == 0:
+        if is_err(idr) or idr == 0:
             print(f"  APSEL {ap}: (없음)   raw={hx(idr)}")
             continue
         t = types.get(idr & 0xF, f"type=0x{idr & 0xF:X}")
@@ -263,7 +273,7 @@ def stage6_mem(jl, live):
                            ("B(Ncore)", COREDEBUG_BASE_B)):
             for csw in CSW_CANDIDATES:
                 cid0 = ap_mem_read32(jl, ap, base + 0xFF0, csw)
-                if cid0 in BAD or cid0 is None:
+                if is_err(cid0):
                     continue
                 dev = ap_mem_read32(jl, ap, base + 0xFCC, csw)
                 print(f"  AP{ap} base={name} CSW={hx(csw)}")
@@ -271,7 +281,7 @@ def stage6_mem(jl, live):
                 print(f"      DEVTYPE(+0xFCC)= {hx(dev)}")
                 if (cid0 & 0xFF) == 0x0D:
                     print("      ✅ CoreSight 컴포넌트 확정 — 주소 정확")
-                    if dev is not None and (dev & 0xFF) == 0x21:
+                    if not is_err(dev) and (dev & 0xFF) == 0x21:
                         print("      ★ DEVTYPE=0x21 → 트레이스 싱크(버퍼)!")
                 break
 
@@ -297,15 +307,25 @@ def main():
         pass
 
     try:
-        tif = stage1_tifs(jl, args.tif)
-        if not stage2_connect(jl, tif, args.speed):
+        candidates = stage1_tifs(jl, args.tif)
+        ok_tif = None
+        for tif in candidates:
+            print(f"\n{'#' * 62}\n#  TIF {tif} 시도\n{'#' * 62}")
+            if not stage2_connect(jl, tif, args.speed):
+                continue
+            if not stage3_coresight(jl):
+                print("  CoreSight 초기화 실패 — 다음 후보로")
+                continue
+            if stage4_dp(jl):
+                ok_tif = tif
+                break
+            print(f"  TIF {tif}: DP 접근 실패 — 다음 후보로")
+
+        if ok_tif is None:
+            print(f"\n  ❌ 모든 TIF 후보 {candidates} 에서 DP 접근 실패")
+            print("     → DPIDR 이 한 번도 안 읽혔다. 아래 판정 가이드 참조")
             return
-        if not stage3_coresight(jl):
-            print("\n  CoreSight 초기화 실패 — 이후 단계는 의미 없음. 위 예외 메시지를 보고할 것.")
-            return
-        if not stage4_dp(jl):
-            print("\n  DP 접근 실패 — [5][6] 건너뜀")
-            return
+        print(f"\n  ✅ TIF {ok_tif} 에서 DP 접근 성공 — 이후 이 값을 쓸 것")
         live = stage5_aps(jl)
         stage6_mem(jl, live)
     finally:
