@@ -19,6 +19,10 @@
 """
 
 import argparse
+
+# 버전 — 실행 즉시 출력한다. "그 수정이 반영된 판인가" 를 눈으로 확인하기 위함.
+PROBE_VERSION = "2026-08-07.5   [1]TIF탐색 [2]set_tif [3]coresight [4]DP+전원 [5a]APSEL [5b]ADIv6주소 [5c]AddAP [6]코어디버그"
+
 RESULT = {}
 import inspect
 import sys
@@ -468,6 +472,8 @@ def main():
     args = ap.parse_args()
 
     head("SF-E76 cJTAG + ARM DAP 진단 (pylink)")
+    print(f"  probe version : {PROBE_VERSION}")
+    print(f"  실행 파일     : {__file__}")
     jl = pylink.JLink()
     try:
         jl.open()
