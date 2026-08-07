@@ -60,6 +60,7 @@ CORE_BASES = [
     ("Ncore", 0x81481000),
 ]
 
+CONNECT_TRIES = 3      # 첫 connect 가 '예열' 이라 최소 2회는 필요하다 (위 attempt() 주석)
 TIF_CJTAG = 7          # 실측으로 확인된 값
 SPEED_KHZ = 10000      # 10MHz. 낮추면 cJTAG 활성화 실패
 
@@ -142,17 +143,27 @@ def attempt(device, cjtag_mode, apb_index, core_base, core_label):
         return None
 
     try:
-        if not setup(jl, cjtag_mode, apb_index, core_base):
-            print("  설정 단계 실패")
-            return None
-        try:
-            jl.connect(device, speed=SPEED_KHZ)
-        except Exception as e:
-            print(f"  connect 실패: {e}")
-            return None
-        info = verify(jl)
-        print(f"  ★★★ connect 성공!  {info}")
-        return info
+        # ★ connect 를 여러 번 시도한다 — 첫 시도가 '예열' 이고 그다음이 진짜다.
+        #
+        #   근거: pylink 프로브에서 성공 조합이 'connect 선행' 이었고, 그때
+        #   connect 자체는 실패했는데도 그 시도가 뭔가를 초기화해서 이후
+        #   DP 접근이 됐다. 이번 스윕에서도 1번째 조합의 실패한 connect 뒤
+        #   2번째가 성공했다. 핸들을 새로 열면 그 예열이 사라진다.
+        #   (T32 가 SYStem.Up 을 재시도 루프로 감싼 것도 같은 이유일 수 있다.)
+        for tryno in range(1, CONNECT_TRIES + 1):
+            if not setup(jl, cjtag_mode, apb_index, core_base):
+                print("  설정 단계 실패")
+                return None
+            try:
+                jl.connect(device, speed=SPEED_KHZ)
+            except Exception as e:
+                print(f"  connect 시도 {tryno}/{CONNECT_TRIES} 실패: {e}")
+                time.sleep(0.2)
+                continue
+            info = verify(jl)
+            print(f"  ★★★ connect 성공! (시도 {tryno})  {info}")
+            return info
+        return None
     finally:
         try:
             jl.close()
@@ -173,7 +184,10 @@ def main():
                     help="첫 성공에서 중단 (기본: 전수 탐색해 전체 맵을 만든다)")
     ap.add_argument('--harts', type=int, default=5,
                     help="각 성공 조합에서 시도할 하트 수 (기본 5)")
+    ap.add_argument('--tries', type=int, default=CONNECT_TRIES,
+                    help=f"조합당 connect 시도 횟수 (기본 {CONNECT_TRIES}. 첫 시도는 예열)")
     args = ap.parse_args()
+    globals()['CONNECT_TRIES'] = args.tries
 
     head("SF-E76 J-Link 연결 — SEGGER hybrid DAP 절차")
     print(f"  version : {PROBE_VERSION}")
