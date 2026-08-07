@@ -81,6 +81,45 @@ cJTAG(2선) → ARM DP → AP(여러 개) → APB 버스 → RISC-V Debug Module
 
 ---
 
+## ★★★ 2026-08-08 — **J-Link connect 성공**
+
+```
+SetcJTAGInitMode = 0
+set_tif(7)            # cJTAG
+set_speed(10000)
+CORESIGHT_AddAP = Index=0 Type=APB-AP Addr=0x10000
+CORESIGHT_AddAP = Index=1 Type=APB-AP Addr=0x20000
+CORESIGHT_AddAP = Index=2 Type=AXI-AP Addr=0x30000
+CORESIGHT_AddAP = Index=3 Type=AHB-AP Addr=0x40000
+CORESIGHT_AddAP = Index=4 Type=APB-AP Addr=0x50000
+CORESIGHT_AddAP = Index=5 Type=APB-AP Addr=0x60000
+CORESIGHT_SetIndexAPBAPToUse = 0        # APBAP1 @0x10000
+CORESIGHT_SetCoreBaseAddr    = 0x81481000
+connect('RISC-V')
+```
+
+**이게 v10.0 의 최대 관문이었다.**
+
+### ★ 주목 — CoreBase 가 `0x81481000` 이다
+
+`0x81480000` 이 아니라 **`0x81481000`** 에서 붙었다. T32 에서 이 주소는 `Ncore` 로
+보였는데, RISC-V behind DAP 에서 `CORESIGHT_SetCoreBaseAddr` 은
+**"AP 주소공간 내 DMI 레지스터 위치"** 이므로 **"코어별 base" 라는 내 해석 자체가
+틀렸을 가능성**이 높다(feedback.md §2.4 가 지적한 그대로).
+
+→ 코어가 5개이므로 **어느 코어/하트에 붙은 것인지, 나머지는 어떻게 접근하는지**가
+   다음 확인 사항. `RISCV_SetHartSel` 로 열거한다.
+
+### 폐기된 가정
+
+- ~~`0x81480000 + 0xFF0` 에서 CoreSight `CIDR0 = 0x0D` 를 확인한다~~
+  → DMI aperture 라면 CoreSight ID 레지스터가 없다. **판정 기준이 틀렸었다.**
+- ~~APSEL 번호로 AP 를 지정한다~~
+  → `CORESIGHT_AddAP` 의 `Index` 는 **J-Link 내부 AP 맵 번호**이고
+    실제 위치는 `Addr`. T32 의 `DP:0xN0000` 은 주소였다.
+
+---
+
 ## ★★ 2026-08-08 — 원인 규명 (SEGGER 공식 문서)
 
 SEGGER KB **"J-Link RISC-V"** 가 우리 토폴로지를 그대로 문서화하고 있다:
@@ -284,7 +323,8 @@ RISC-V DM 레지스터(`dmcontrol` 0x10 / `dmstatus` 0x11 / `command` 0x17 / `da
 
 | 단계 | 내용 | 상태 |
 |---|---|---|
-| **0** | connect + halt + `dpc` 읽기 + resume → **halt 샘플러** | ← v10.0 크리티컬 패스 |
+| **0a** | **connect** | ✅ **완료** (2026-08-08) |
+| **0b** | halt + `dpc` 읽기 + resume → **halt 샘플러** | ← 지금 여기. `verify_halt_pc.py` |
 | 1 | 임의 주소 메모리 read/write | |
 | 2 | System Bus Access (halt 없는 메모리 접근) | 오버레이 탐지에도 필요 |
 | 3 | 트레이스 유닛 레지스터 맵 확보 | |
