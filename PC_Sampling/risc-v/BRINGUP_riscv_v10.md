@@ -126,6 +126,38 @@ connect('RISC-V')
 
 → **샘플러도 connect 를 2회 이상 시도해야 한다.**
 
+#### ⬜ 미분리 — 무엇이 필요한지는 아직 모른다 (feedback.md §8.2)
+
+각 회차가 `setup → connect` 를 통째로 반복했으므로 셋 중 뭐가 원인인지 못 가렸다:
+
+1. **실패한 connect 자체**가 초기화를 수행한다
+2. **setup 을 두 번 적용**해야 유효해진다
+3. 그냥 **시간이 지나서** DM 이 준비된다
+
+→ `isolate_warmup.py` 의 A/B/C 실험으로 분리한다.
+
+#### 근본 해법 후보 — `ConfigTargetSettings()`
+
+pylink `exec_command()` 는 `connect()` **직전**에 설정을 넣는데, SEGGER 정식 절차는
+**`ConfigTargetSettings()` 훅**이다. 이 훅은 **CPU 자동검출보다 앞서** 호출되므로
+cold session 의 첫 connect 를 성공시킬 수 있다.
+→ `SF_E76_config.JLinkScript` (기존 `SF_E76_addap.JLinkScript` 는 `InitTarget()` 을
+  써서 시점이 늦었다 — 그게 첫 connect 실패의 원인으로 의심된다)
+
+#### ⚠ 원칙 — 하나의 handle 에 여러 조합을 섞지 말 것
+
+스윕이 두 번 실패한 이유가 이것이다:
+- 핸들 재사용 → 한 번 연결되면 이후가 전부 거짓 성공(23/24)
+- 조합마다 close → 필요한 초기화까지 사라져 전부 실패
+
+**한 handle = 한 설정.** 조합을 바꾸려면 세션을 새로 시작한다.
+
+#### ⚠ 코어 귀속은 아직 미확정
+
+`connect()` 성공이 **어느 코어에 붙었는지**를 말해주지 않는다.
+`0x81480000` 이 hcore/CMCore/Fcore0/QCore 중 무엇인지는
+halt → PC 읽기 → hart 비교로 확인해야 한다.
+
 ### 폐기된 가정
 
 - ~~`0x81480000 + 0xFF0` 에서 CoreSight `CIDR0 = 0x0D` 를 확인한다~~

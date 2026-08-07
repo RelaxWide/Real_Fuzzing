@@ -1,0 +1,88 @@
+/*********************************************************************
+*  SF-E76 (RISC-V behind CoreSight DAP) — 정식 연결 설정
+*
+*  SEGGER 공식 RISC-V-behind-DAP 절차를 따른다.
+*  핵심은 **ConfigTargetSettings() 훅**을 쓰는 것이다.
+*
+*  왜 InitTarget() 이 아니라 ConfigTargetSettings() 인가:
+*    ConfigTargetSettings() 는 J-Link 의 정상 connect lifecycle 에서
+*    **CPU 자동검출·target 초기화보다 앞서** 호출된다. AP map / CoreBase 같은
+*    DLL 전역 연결 설정을 지정하기 위해 존재하는 훅이다.
+*    pylink 로 connect() 직전에 exec_command 를 넣으면 시점이 늦어,
+*    첫 connect 가 "Error while halting CPU / Specific core setup failed" 로
+*    실패하고 두 번째에야 붙는 현상이 나온다.
+*    → 이 파일의 목적은 **cold session 의 첫 connect 를 성공시키는 것**이다.
+*
+*  실측으로 확정된 값:
+*    cJTAG (TIF=7), 10MHz            1000kHz 로 낮추면 활성화 실패
+*    DP reg0   = 0x6BA0009D
+*    CTRL/STAT = 0xF0000000          디버그 전원 ACK
+*    APB Index 0 (APBAP1 @0x10000) 로 두 DM 모두 접근
+*      0x81480000  hcore/CMCore/Fcore0/QCore  (코어 귀속 미확정)
+*      0x81481000  Ncore
+*
+*  사용법:
+*    JLinkExe -if cJTAG -speed 10000 -device RISC-V \
+*             -JLinkScriptFile SF_E76_config.JLinkScript
+*
+*    pylink 에서:
+*      jl.exec_command('ScriptFile = /path/SF_E76_config.JLinkScript')
+*      jl.connect('RISC-V')
+*
+*  CoreBase 를 바꾸려면 아래 _CORE_BASE 만 수정한다.
+*********************************************************************/
+
+// ── 여기만 바꾸면 된다 ───────────────────────────────────────────────
+__constant U32 _CORE_BASE = 0x81480000;   // DMI 레지스터 위치
+                                          //   0x81480000 = hcore/CMCore/Fcore0/QCore
+                                          //   0x81481000 = Ncore
+__constant U32 _APB_INDEX = 0;            // DMI 가 붙은 AP (AddAP 의 Index)
+
+
+/*********************************************************************
+*  ConfigTargetSettings
+*
+*  J-Link 이 CPU 를 검출하기 **전에** AP 지형과 DMI 위치를 알려준다.
+*  SEGGER KB(J-Link RISC-V): "there is no ROM table scan available for
+*  RISC-V", "cannot auto-detect the AP location or DMI register
+*  positioning in hybrid designs" — 그래서 이 선언이 필수다.
+*********************************************************************/
+int ConfigTargetSettings(void) {
+
+  // cJTAG 활성화 시퀀스. 0=LONG(기본) 1=SHORT 2=WILIOT
+  //   실측상 0 에서 동작. T32 의 CJTAGFLAGS(NOKEEPER USEOAC)와 대응 가능성.
+  JLINK_ExecCommand("SetcJTAGInitMode = 0");
+
+  // ── AP map — T32 SYStem.CONFIG 의 DP:0xN0000 값이 그대로 Addr 이다 ──
+  //   Index 는 J-Link 내부 AP 맵 번호이지 하드웨어 APSEL 이 아니다.
+  JLINK_ExecCommand("CORESIGHT_AddAP = Index=0 Type=APB-AP Addr=0x10000");  // APBAP1
+  JLINK_ExecCommand("CORESIGHT_AddAP = Index=1 Type=APB-AP Addr=0x20000");  // APBAP2
+  JLINK_ExecCommand("CORESIGHT_AddAP = Index=2 Type=AXI-AP Addr=0x30000");  // AXIAP1
+  JLINK_ExecCommand("CORESIGHT_AddAP = Index=3 Type=AHB-AP Addr=0x40000");  // AHBAP1
+  JLINK_ExecCommand("CORESIGHT_AddAP = Index=4 Type=APB-AP Addr=0x50000");  // APBAP3
+  JLINK_ExecCommand("CORESIGHT_AddAP = Index=5 Type=APB-AP Addr=0x60000");  // APBAP4
+
+  // ── RISC-V DMI 가 어느 AP 뒤에, 그 AP 안 어느 주소에 있는지 ──────────
+  JLINK_ExecCommand("CORESIGHT_SetIndexAPBAPToUse = 0");
+  JLINK_ExecCommand("CORESIGHT_SetCoreBaseAddr = 0x81480000");
+
+  JLINK_SYS_Report("[SF-E76] ConfigTargetSettings: AP map + DMI base 선언 완료");
+  JLINK_SYS_Report("[SF-E76]   APBAPToUse=0 (APBAP1 @0x10000)");
+  JLINK_SYS_Report("[SF-E76]   CoreBaseAddr=0x81480000");
+  return 0;
+}
+
+
+/*********************************************************************
+*  InitTarget — 지금은 비워 둔다.
+*
+*  T32 스크립트를 조사한 결과 SYStem.Up 이전에 커스텀 전원/클럭/언락
+*  시퀀스가 **존재하지 않았다**(단순 재시도 루프뿐). 따라서 여기서 할 일이
+*  없다. 나중에 벤더가 별도 초기화를 요구하면 그때 채운다.
+*
+*  주의: 여기에 AP map 을 넣으면 안 된다. InitTarget 은 CPU 검출 흐름
+*  안에서 호출돼 시점이 늦다 — 그게 첫 connect 실패의 원인으로 의심된다.
+*********************************************************************/
+int InitTarget(void) {
+  return 0;   // 0 = J-Link 통상 connect 절차를 계속 진행
+}
