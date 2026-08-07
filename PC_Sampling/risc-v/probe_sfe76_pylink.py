@@ -118,6 +118,31 @@ def ap_write(jl, reg, val):
         return False
 
 
+def sticky(jl):
+    """AP 접근 직후 CTRL/STAT 의 STICKYERR/STICKYORUN 확인.
+
+    'AP 가 0 을 돌려줬다' 와 'AP 접근이 거부됐다' 를 구분한다.
+    STICKYERR 가 서면 그 AP 는 없거나 접근 불가 — 정상적인 '없음' 신호다.
+    """
+    c = dp_read(jl, DP_CTRL_STAT)
+    if is_err(c):
+        return None
+    err = bool(c & 0x00000020)      # STICKYERR
+    orun = bool(c & 0x00000002)     # STICKYORUN
+    if err or orun:
+        dp_write(jl, DP_IDR_ABORT, 0x0000001E)   # 다음 시도를 위해 클리어
+    return (err, orun)
+
+
+def sticky_str(st):
+    if st is None:
+        return "sticky=?"
+    e, o = st
+    if e or o:
+        return f"STICKY{'ERR' if e else ''}{'ORUN' if o else ''} (접근 거부 = AP 없음 신호)"
+    return "sticky 없음 (접근은 됐는데 값이 0)"
+
+
 def dap_select(jl, apsel, bank):
     return dp_write(jl, DP_SELECT, ((apsel & 0xFF) << 24) | ((bank & 0xF) << 4))
 
@@ -267,8 +292,9 @@ def stage5_aps_adiv6(jl):
     live = []
     for name, base in AP_BASES:
         idr = ap_read_at(jl, base, 0xFC)          # AP IDR
+        st = sticky(jl)
         if is_err(idr) or idr == 0:
-            print(f"  {name} @0x{base:05X}: (없음)  raw={hx(idr)}")
+            print(f"  {name} @0x{base:05X}: (없음)  raw={hx(idr)}  {sticky_str(st)}")
             continue
         t = types.get(idr & 0xF, f"type=0x{idr & 0xF:X}")
         print(f"  {name} @0x{base:05X}: IDR={hx(idr)}  {t}")
@@ -307,20 +333,31 @@ def stage6_mem_adiv6(jl, live):
 def stage5_aps(jl):
     """ADIv5 APSEL 0~7 열거."""
     head("[5a] AP 열거 — ADIv5 APSEL 방식")
-    types = {1: 'AMBA AHB', 2: 'AMBA APB', 4: 'AMBA AXI'}
+    types = {1: 'AMBA AHB', 2: 'AMBA APB', 4: 'AMBA AXI', 8: 'AMBA APB4'}
     live = []
-    for ap in range(8):
+    nsticky = 0
+    for ap in range(256):               # APSEL 은 8비트 — 전 범위
         if not dap_select(jl, ap, 0xF):     # IDR = 뱅크 0xF, 인덱스 3
             continue
         idr = ap_read(jl, 3)
+        st = sticky(jl)
         if is_err(idr) or idr == 0:
-            print(f"  APSEL {ap}: (없음)   raw={hx(idr)}")
+            if st is not None and (st[0] or st[1]):
+                nsticky += 1
+            if ap < 8:                      # 앞쪽만 상세 출력
+                print(f"  APSEL {ap}: (없음)  raw={hx(idr)}  {sticky_str(st)}")
             continue
         t = types.get(idr & 0xF, f"type=0x{idr & 0xF:X}")
         print(f"  APSEL {ap}: IDR={hx(idr)}  {t}")
         live.append(ap)
     if not live:
-        print("\n  ❌ 살아있는 AP 없음 → [4] 전원 단계부터 실패한 것")
+        print(f"\n  ❌ APSEL 0~255 전부 없음 (STICKY 발생 {nsticky}/256)")
+        if nsticky > 200:
+            print("     STICKY 가 대부분 → DP 는 정상 응답 중이고 '그 AP 는 없다'는 뜻.")
+            print("     → ADIv5 APSEL 방식이 아닐 가능성. [5b] 주소 방식 확인.")
+        elif nsticky == 0:
+            print("     STICKY 가 하나도 없음 → AP 접근 자체가 DP 를 안 타고 있을 수 있다.")
+            print("     → pylink 의 ap=True 경로 또는 SELECT 쓰기 문제 의심.")
     else:
         print(f"\n  ✅ 살아있는 AP: {live}")
         print("     T32 추론(APBAP1=AP1, APBAP2=AP2, AXIAP1=AP3, AHBAP1=AP4,")
@@ -420,14 +457,17 @@ def main():
         except Exception:
             pass
 
-    head("판정 가이드")
-    print("  [1] cJTAG TIF 못 찾음 → JLinkScript 경로로 복귀")
-    print("  [3] 실패            → pylink API 사용법 문제. 예외 메시지가 핵심")
-    print("  [4] DPIDR 무효      → cJTAG 스캔 포맷 (SEGGER 문의)")
-    print("  [4] 전원 ACK 없음   → 디버그 도메인 게이팅/인증 (벤더 문의)")
-    print("  [5a] APSEL 실패 + [5b] 주소 성공 → ADIv6 확정 (T32 DP:0xN0000 = AP 주소)")
-    print("  [5a][5b] 둘 다 실패 → AP 주소 자체가 다름. 벤더 문의")
-    print("  [6] CIDR0 하위=0x0D → CoreSight 확정, 주소 정확 (다음은 RISC-V DM 탐색)")
+    head("범례 (실제 결과는 위 각 단계의 ✅/❌ 를 볼 것)")
+    print("  * 아래는 '어떤 결과면 무엇을 뜻하는가' 설명이지 이번 실행의 결과가 아니다.")
+    print("  - [1] cJTAG TIF 못 찾음 → JLinkScript 경로로 복귀")
+    print("  - [3] 실패            → pylink API 사용법 문제. 예외 메시지가 핵심")
+    print("  - [4] DPIDR 무효      → cJTAG 스캔 포맷 (SEGGER 문의)")
+    print("  - [4] 전원 ACK 없음   → 디버그 도메인 게이팅/인증 (벤더 문의)")
+    print("  - [5a] APSEL 실패 + [5b] 주소 성공 → ADIv6 확정")
+    print("  - [5a][5b] 둘 다 실패 → STICKY 유무로 갈린다:")
+    print("      STICKY 많음 = DP 정상, 그 위치에 AP 가 없는 것 (주소/번호 문제)")
+    print("      STICKY 없음 = AP 접근이 DP 를 안 타는 것 (API 사용 문제)")
+    print("  - [6] CIDR0 하위=0x0D → CoreSight 확정, 주소 정확")
 
 
 if __name__ == '__main__':
