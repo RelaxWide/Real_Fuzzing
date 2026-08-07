@@ -92,6 +92,23 @@ def _apply(jl, core_base, hart):
         ex(jl, f"RISCV_SetHartSel = {hart}")
 
 
+def safe_resume(jl, why=""):
+    """★ 코어를 halt 한 채로 두면 SSD 컨트롤러가 멈춘 상태로 남는다.
+    NVMe 가 hang 하고 호스트까지 영향을 받을 수 있으므로 어떤 경로로 빠져나가든
+    반드시 resume 을 시도한다 (feedback.md §8.5).
+    """
+    for fn in ('restart', 'go'):
+        try:
+            getattr(jl, fn)()
+            print(f"  [resume] {fn}() 완료 {why}")
+            return True
+        except Exception:
+            continue
+    print(f"  [resume] ⚠ 실패 {why} — 코어가 halt 로 남았을 수 있다. "
+          f"SSD 상태 확인(nvme list) 필요")
+    return False
+
+
 def connect(jl, core_base, hart=None, tries=3):
     """★ 첫 connect 는 구조적으로 실패한다 — 반드시 재시도한다.
 
@@ -168,6 +185,7 @@ def sample_pc(jl, pc_idx, n, settle_ms):
             fails += 1
             if fails <= 3:
                 print(f"    {i}회차 실패: {e}")
+            safe_resume(jl, f"({i}회차 실패 복구)")
         if settle_ms:
             time.sleep(settle_ms / 1000.0)
     dt = time.time() - t0
@@ -226,7 +244,13 @@ def main():
                     jl.restart()
                 except Exception as e:
                     print(f"    halt/read 실패: {e}")
+                    safe_resume(jl, "(hart 루프)")
         finally:
+            try:
+                if jl.halted():
+                    safe_resume(jl, "(종료 전 정리)")
+            except Exception:
+                safe_resume(jl, "(강제)")
             try:
                 jl.close()
             except Exception:
@@ -272,6 +296,12 @@ def main():
     except Exception as e:
         print(f"\n  ❌ 실패: {e}")
     finally:
+        # 어떤 경로로 빠져나가든 코어를 다시 돌려놓는다
+        try:
+            if jl.halted():
+                safe_resume(jl, "(종료 전 정리)")
+        except Exception:
+            safe_resume(jl, "(halted 확인 실패 — 무조건 시도)")
         try:
             jl.close()
         except Exception:

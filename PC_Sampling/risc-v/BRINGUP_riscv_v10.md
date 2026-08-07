@@ -143,7 +143,20 @@ connect('RISC-V')
 J-Link 의 connect 도 결국 이걸 하지만 **같은 connect 안의 CPU setup 단계보다 늦게**
 하는 것으로 보인다. 그래서 1차는 실패하고 2차가 붙는다.
 
-→ **해법: `InitTarget()` 에서 전원을 미리 올린다.** `SF_E76_config.JLinkScript` 참조.
+→ 시도한 해법: `InitTarget()` 에서 전원을 미리 올린다 (`SF_E76_config.JLinkScript`).
+  **결과: 실패 — 전원 ACK 안 뜸.** `InitTarget()` 안의 `JLINK_CORESIGHT_*` 호출이
+  동작하지 않는다. `SF_E76_addap.JLinkScript` 에서 전부 `0x80000000` 이 나왔던 것과
+  같은 현상으로, **JLinkScript 에서 CoreSight API 를 쓸 수 없다**는 것이 두 번째 확인.
+
+→ **채택: bounded retry 를 정식 정책으로.** (feedback.md §8.5)
+  동작이 안정적으로 재현되므로 connect 문제는 여기서 닫고 halt/PC 로 넘어간다.
+
+  | 규칙 | 이유 |
+  |---|---|
+  | 재시도 상한(3회) | 무한 재시도 금지 |
+  | 1회차 실패를 로그·카운터로 남김 | 숨기면 진짜 고장을 못 본다 |
+  | **한 handle = 한 설정** | 조합을 섞으면 거짓 성공/전체 실패 (실측 2회) |
+  | **best-effort resume 보장** | ★ halt 로 남으면 SSD 컨트롤러가 멈춘다 |
   (feedback.md §2.1 이 `InitTarget()` 의 용도로 '전원' 을 명시했는데,
    내가 "T32 에 커스텀 시퀀스 없음" 을 이유로 비워둔 것이 놓친 지점이었다 —
    이건 벤더 커스텀이 아니라 ARM DAP 표준 절차다)
