@@ -116,7 +116,8 @@ connect('RISC-V')
   실패하며 **예열 역할**을 한다
 - 두 CoreBase 모두 **J-Link connect 후보로 통과**: `0x81480000`(4코어 공유) / `0x81481000`(Ncore)
   ⚠ "접근 가능" 이 아니다 — DM register/hart/PC/halt 미검증. 다른 AP·선택 메커니즘을 아직 배제하지 말 것
-- **APB Index 0(APBAP1)로 둘 다 붙는다** → 다른 AP 를 뒤질 이유 없음
+- APB Index 0(APBAP1)로 둘 다 connect 후보 통과. 다만 **다른 AP·선택 메커니즘을
+  배제하지는 않는다** — 코어 귀속이 확정되기 전까지는 열어둔다
 - **핸들을 close 하면 예열이 사라진다.** 하나의 핸들로 반복해야 한다
 
 > **폐기:** "`0x81480000`(hcore 계열)은 연결 실패" 라는 앞선 결론은 **틀렸다.**
@@ -413,7 +414,8 @@ Selecting cJTAG as current target interface.
 ### 지금
 
 **`verify_halt_pc.py` 로 halt → PC → resume 을 안전하게 검증한다.**
-먼저 **Ncore(`0x81481000`)** 로 — 단일 하트라 변수가 적다.
+먼저 **Ncore(`0x81481000`)** 로 — 단일 하트로 **추정**되어 변수가 적을 것으로 보인다
+(하트 수는 아직 확인 전이다).
 이게 안 되면 멀티코어 스윕이나 샘플러 통합으로 넘어가지 않는다.
 
 ### 그다음
@@ -456,8 +458,8 @@ APB byte offset 이 아니다. `CORESIGHT_SetCoreBaseAddr` 가 가리키는 벤�
 
 | 단계 | 내용 | 상태 |
 |---|---|---|
-| **0a** | **connect** | ✅ **완료** (2026-08-07) |
-| **0b** | halt + `dpc` 읽기 + resume → **halt 샘플러** | ← 지금 여기. `verify_halt_pc.py` |
+| **0a** | connect (G1) | ⚠️ **부분** — bounded retry 로만. 원인 미규명 |
+| **0b** | halt + PC + resume (G2~G4) | ⬜ ← 지금 여기. `verify_halt_pc.py` |
 | 1 | 임의 주소 메모리 read/write | |
 | 2 | System Bus Access (halt 없는 메모리 접근) | 오버레이 탐지에도 필요 |
 | 3 | 트레이스 유닛 레지스터 맵 확보 | |

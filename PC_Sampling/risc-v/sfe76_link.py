@@ -1,78 +1,82 @@
 #!/usr/bin/env python3
 """SF-E76 (RISC-V behind CoreSight DAP) — J-Link 연결 계층. **정식 모듈.**
 
-이 파일이 연결 지식의 단일 출처다. 실험 스크립트도, v10.0 샘플러도 여기를 쓴다.
-(이전에는 6개 스크립트가 같은 로직을 각자 복사해 갖고 있었다.)
+연결 지식의 단일 출처. 실험 스크립트도, v10.0 샘플러도 **반드시 여기를 쓴다.**
+raw `jl.halt()` / `jl.restart()` 를 직접 부르지 말 것 — 아래 이유 때문이다.
+
+────────────────────────────────────────────────────────────────────────
+★ checked API 를 쓰는 이유
+────────────────────────────────────────────────────────────────────────
+pylink 의 `halt()` / `restart()` 는 실패나 no-op 상황에서 **예외 대신 False 를
+반환**한다. 반환값을 무시하면:
+
+  - `halted == False` 인데 "halt 성공" 으로 기록 → 실행 중인 코어의 일반
+    레지스터를 PC 로 읽어 **거짓 성공**
+  - resume 실패를 성공으로 기록 → **코어가 멈춘 채 남아 SSD 가 hang**
+
+그래서 이 모듈은 **명령 반환값 + 사후 상태를 모두 확인**하는 API 만 노출한다:
+
+    connect_checked / halt_checked / read_pc / resume_checked
 
 ────────────────────────────────────────────────────────────────────────
 실측으로 확정된 사실
 ────────────────────────────────────────────────────────────────────────
 토폴로지    cJTAG → ARM DP → APB-AP → RISC-V DM(DMI) → hart
-            SEGGER KB(J-Link RISC-V)가 공식 지원하는 hybrid 구성이다.
-            단, **"RISC-V 는 ROM table scan 이 없어 AP 위치와 DMI 위치를
-            자동 검출할 수 없다"** 고 명시 → 수동 선언이 필수.
+            SEGGER KB(J-Link RISC-V)가 공식 지원하는 hybrid 구성.
+            **"RISC-V 는 ROM table scan 이 없어 AP/DMI 위치를 자동 검출할 수
+            없다"** 고 명시 → 수동 선언 필수.
 
-인터페이스  cJTAG, TIF=7, **10MHz**
-            1000kHz 로 낮추면 cJTAG 활성화 자체가 실패한다(TDO 상시 high).
-            T32 설정도 "USB 연결 시 10MHz" 였다.
-
-DP          reg0 = 0x6BA0009D   (PARTNO 0xBA00 = ARM DAP.
-                                 DESIGNER 는 ARM(0x23B) 이 아니다 = 벤더 DAP)
+인터페이스  cJTAG, TIF=7, **10MHz** (1000kHz 로 낮추면 활성화 자체가 실패)
+DP          reg0 = 0x6BA0009D  (PARTNO 0xBA00 = ARM DAP.
+                                DESIGNER 는 ARM(0x23B)이 아님 = 벤더 DAP)
 전원        CTRL/STAT ← 0x50000000 → 0xF0000000 (CSYSPWRUPACK|CDBGPWRUPACK)
-
-AP map      T32 SYStem.CONFIG 의 `DP:0xN0000` 이 그대로 `Addr` 이다.
-            `CORESIGHT_AddAP` 의 `Index` 는 **J-Link 내부 맵 번호**이지
-            하드웨어 APSEL 이 아니다(APSEL 로 착각해 오래 헤맸다).
-
-DMI         APB Index 0 (APBAP1 @0x10000) 로 두 CoreBase 모두
-            **J-Link connect 후보로 통과**했다.
-              0x81480000  hcore/CMCore/Fcore0/QCore   (4코어 공유)
-              0x81481000  Ncore
-            ⚠ "접근 가능" 이 아니다. DM register/hart/PC/halt 는 미검증이라
-              실제로 올바른 코어에 도달하는지는 아직 모른다.
+AP map      T32 의 `DP:0xN0000` 이 그대로 `Addr`.
+            `CORESIGHT_AddAP` 의 `Index` 는 **J-Link 내부 맵 번호**이지 APSEL 아님.
+CoreBase    0x81480000  hcore/CMCore/Fcore0/QCore (4코어 공유)
+            0x81481000  Ncore
+            ⚠ 둘 다 **J-Link connect 후보로 통과**했을 뿐이다.
+              DM register/hart/PC/halt 미검증 — "접근 가능" 이 아니다.
 
 ────────────────────────────────────────────────────────────────────────
 ⚠ 반드시 지킬 것
 ────────────────────────────────────────────────────────────────────────
-1. **한 handle = 한 설정.**
-   조합을 섞으면 (a) 한 번 붙은 뒤 이후가 전부 거짓 성공하거나
-   (b) close 로 격리하면 전부 실패한다. 실측으로 둘 다 겪었다.
+1. **한 handle = 한 설정.** 조합을 섞으면 거짓 성공 또는 전체 실패.
+   후보(CoreBase/hart/device)를 바꾸려면 **프로세스를 새로** 시작한다.
 
 2. **첫 connect() 는 실패한다.** 2회차에 붙는다.
-   통제 실험 결과: setup 이중 적용(B)도, 대기(C)도 아니고
-   **connect 시도 자체**가 필요하다(A). 근본 원인은 규명 중 —
-   유력 **가설**은 RISC-V DM 의 `dmactive` (아직 직접 관측으로 확정된 것은
-   아니다. ARM DP 전원 요청이나 J-Link 내부 CPU module 초기화일 수도 있다).
-   → 현재는 bounded retry 가 **임시 workaround** 다.
+   통제 실험: setup 이중 적용(B)도 대기(C)도 아니고 connect 시도 자체(A)가 필요.
+   유력 **가설**은 RISC-V DM 의 `dmactive` — 직접 관측으로 확정된 것은 아니다
+   (ARM DP 전원 요청이나 J-Link 내부 CPU module 초기화일 수도 있다).
+   범위 제한: **현재 DLL/펌웨어 · generic 'RISC-V' device · 현재 명령 순서 ·
+   현재 보드 상태**에서 관측된 현상. RISC-V 일반의 성질로 일반화하지 말 것.
 
-   범위 제한: 현재 **J-Link DLL/펌웨어 · generic 'RISC-V' device · 현재 명령
-   순서 · 현재 보드 상태**에서 일관되게 관측된 현상이다. RISC-V 나 이 SoC
-   일반의 성질로 일반화하지 말 것.
+3. **halt 후 반드시 resume, 그리고 확인.** resume 확인이 실패하면
+   다음 실험을 진행하지 말고 `recovery_required` 를 호출자에게 알린다.
 
 4. **APB 메모리 접근 ≠ RISC-V DMI 레지스터 접근.**
-   `dmcontrol 0x10`, `dmstatus 0x11` 등은 **DMI register address** 이지
-   APB byte offset 이 아니다. DMI aperture 레이아웃과 J-Link 의 변환 방식을
-   확보하기 전에 `core_base + 0x10` 식으로 메모리를 읽고 쓰면
+   `dmcontrol 0x10` 등은 **DMI register address** 이지 APB byte offset 이 아니다.
+   aperture 레이아웃을 확보하기 전에 `core_base + 0x10` 식으로 읽고 쓰면
    **엉뚱한 장치를 건드릴 수 있다.**
-
-3. **halt 후 반드시 resume.**
-   코어를 멈춘 채 두면 SSD 컨트롤러가 멈춰 NVMe 가 hang 한다.
-   어떤 경로로 빠져나가든 `safe_resume()` 을 부를 것.
 
 ────────────────────────────────────────────────────────────────────────
 사용
 ────────────────────────────────────────────────────────────────────────
-    from sfe76_link import Link, CORE_BASE_MAIN
+    from sfe76_link import Link, CORE_BASE_NCORE, LinkError
 
-    with Link(core_base=CORE_BASE_MAIN) as lk:
-        lk.connect()                 # 재시도 내장
-        lk.jl.halt()
-        pc = lk.jl.register_read(32)
-        lk.resume()
+    lk = Link(core_base=CORE_BASE_NCORE)
+    try:
+        with lk:
+            lk.connect_checked()
+            lk.halt_checked()
+            pc = lk.read_pc(pc_index)      # 확정된 인덱스만
+            lk.resume_checked()
+    except LinkError as e:
+        ...  # e.exit_code 로 어느 게이트인지 구분
+    if lk.recovery_required:
+        ...  # 보드 복구(POR) 필요
 
-단독 실행 시 연결만 확인한다:
-    sudo python3 sfe76_link.py
-    sudo python3 sfe76_link.py --core-base 0x81481000 --hart 1
+단독 실행:
+    sudo python3 sfe76_link.py --core-base 0x81481000
 """
 
 import argparse
@@ -85,7 +89,7 @@ except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square\n"
              "  (venv 가 아니라 시스템 python3 에 있을 수 있다)")
 
-VERSION = "2026-08-07"
+VERSION = "2026-08-07.2  checked API"
 
 # ── 연결 파라미터 (전부 실측값) ──────────────────────────────────────
 TIF_CJTAG   = 7          # cJTAG. pylink enum 에 없어 정수로 지정
@@ -94,8 +98,13 @@ CJTAG_MODE  = 0          # SetcJTAGInitMode: 0=LONG 1=SHORT 2=WILIOT
 DEVICE      = 'RISC-V'
 APB_INDEX   = 0          # DMI 가 붙은 AP (AddAP 의 Index)
 
-CORE_BASE_MAIN = 0x81480000   # hcore/CMCore/Fcore0/QCore DM
-CORE_BASE_N    = 0x81481000   # Ncore DM
+CORE_BASE_MAIN  = 0x81480000   # hcore/CMCore/Fcore0/QCore DM (4코어 공유)
+CORE_BASE_NCORE = 0x81481000   # Ncore DM
+
+CORE_BASE_LABEL = {
+    CORE_BASE_MAIN:  "hcore/CMCore/Fcore0/QCore",
+    CORE_BASE_NCORE: "Ncore",
+}
 
 # T32 SYStem.CONFIG 의 AP 목록 — (이름, CoreSight 주소, J-Link 타입)
 AP_MAP = [
@@ -107,23 +116,45 @@ AP_MAP = [
     ("APBAP4", 0x60000, "APB-AP"),
 ]
 
-CONNECT_TRIES = 3
+CONNECT_TRIES  = 3
+STATE_TIMEOUT  = 2.0     # halt/resume 사후 상태 확인 대기(초)
+
+# ── 종료 코드 — 자동화가 실패를 구분할 수 있게 ──────────────────────
+EXIT_OK           = 0
+EXIT_CONNECT_FAIL = 2
+EXIT_HALT_FAIL    = 3
+EXIT_PC_FAIL      = 4
+EXIT_RESUME_FAIL  = 5    # ★ 보드 복구 필요
+EXIT_INSUFFICIENT = 6
+
+
+class LinkError(RuntimeError):
+    """단계 실패. exit_code 로 어느 게이트에서 깨졌는지 구분한다."""
+
+    def __init__(self, msg, exit_code=EXIT_INSUFFICIENT):
+        super().__init__(msg)
+        self.exit_code = exit_code
 
 
 class Link:
     """J-Link 연결 1개 = 설정 1개. 조합을 섞지 않는다."""
 
-    def __init__(self, core_base=CORE_BASE_MAIN, hart=None,
-                 device=DEVICE, speed=SPEED_KHZ, verbose=True):
+    def __init__(self, core_base=CORE_BASE_NCORE, hart=None, device=DEVICE,
+                 speed=SPEED_KHZ, serial=None, verbose=True):
         self.core_base = core_base
         self.hart = hart
         self.device = device
         self.speed = speed
+        self.serial = serial
         self.verbose = verbose
         self.jl = None
-        self.connect_tries_used = 0
 
-    # ── 컨텍스트 매니저 — 어떤 경로로 나가든 resume + close ───────────
+        # 결과 상태와 복구 상태를 분리한다
+        self.connect_tries_used = 0
+        self.recovery_required = False
+        self.cleanup_error = None
+
+    # ── 컨텍스트 매니저 ──────────────────────────────────────────────
     def __enter__(self):
         self.open()
         return self
@@ -136,14 +167,45 @@ class Link:
         if self.verbose:
             print(msg)
 
+    def meta(self):
+        """결과 레코드에 남길 연결 메타데이터."""
+        m = {
+            'version': VERSION,
+            'device': self.device, 'tif': TIF_CJTAG, 'speed_khz': self.speed,
+            'cjtag_mode': CJTAG_MODE, 'apb_index': APB_INDEX,
+            'core_base': f"0x{self.core_base:X}",
+            'core_base_label': CORE_BASE_LABEL.get(self.core_base, '?'),
+            'hart': self.hart,
+            'connect_tries_used': self.connect_tries_used,
+        }
+        if self.jl is not None:
+            for k, fn in (('probe', lambda: self.jl.product_name),
+                          ('serial', lambda: self.jl.serial_number),
+                          ('firmware', lambda: self.jl.firmware_version)):
+                try:
+                    m[k] = fn()
+                except Exception:
+                    pass
+        return m
+
+    # ── open / 설정 ──────────────────────────────────────────────────
     def open(self):
         self.jl = pylink.JLink()
-        self.jl.open()
+        # 여러 probe 가 붙어 있으면 엉뚱한 보드를 잡는다
+        if self.serial:
+            self.jl.open(serial_no=self.serial)
+        else:
+            self.jl.open()
         self._say(f"  [Link] {self.jl.product_name} SN={self.jl.serial_number}")
         return self
 
-    # ── 설정: connect() 이전에 전부 끝나야 한다 ──────────────────────
     def apply_settings(self):
+        """connect() 이전에 **1회만** 적용한다.
+
+        retry 마다 다시 부르지 않는다 — 같은 Index 로 `CORESIGHT_AddAP` 를
+        반복 등록하면 DLL 버전에 따라 덮어쓰기/중복/오류가 될 수 있고,
+        분리 실험 A(setup 1회 + connect 2회)와도 어긋난다.
+        """
         jl = self.jl
         try:
             jl.exec_command(f"SetcJTAGInitMode = {CJTAG_MODE}")
@@ -160,89 +222,159 @@ class Link:
             self._say(f"  [Link] 설정 실패: {e}")
             return False
 
-    def connect(self, tries=CONNECT_TRIES):
-        """★ 첫 시도는 실패한다(임시 workaround — 원인 규명 중).
+    # ── G1: connect ──────────────────────────────────────────────────
+    def connect_checked(self, tries=CONNECT_TRIES):
+        """설정 1회 + connect bounded retry. 몇 회차에 붙었는지 남긴다."""
+        if not self.apply_settings():
+            raise LinkError("설정 단계 실패", EXIT_CONNECT_FAIL)
 
-        실패를 숨기지 않고 몇 회차에 붙었는지 남긴다. 그 수치가 커지거나
-        매번 달라지면 그 자체가 이상 신호다.
-        """
         last = None
         for t in range(1, tries + 1):
-            if not self.apply_settings():
-                raise RuntimeError("설정 단계 실패")
             try:
                 self.jl.connect(self.device, speed=self.speed)
                 self.connect_tries_used = t
-                if t > 1:
-                    self._say(f"  [Link] connect 성공 (시도 {t}/{tries} — "
-                              f"1회차 실패는 알려진 현상)")
-                else:
-                    self._say("  [Link] connect 성공 (1회차) ★ 예상 밖 — 좋은 신호")
+                note = ("★ 1회차 성공 — 예상 밖(좋은 신호)" if t == 1
+                        else "(1회차 실패는 현재 도구/보드 조건에서 알려진 현상)")
+                self._say(f"  [Link] connect 성공 시도 {t}/{tries} {note}")
                 return t
             except Exception as e:
                 last = e
                 self._say(f"  [Link] connect 시도 {t}/{tries} 실패: {e}")
                 time.sleep(0.2)
-        raise RuntimeError(f"connect {tries}회 모두 실패: {last}")
+        raise LinkError(f"connect {tries}회 모두 실패: {last}", EXIT_CONNECT_FAIL)
 
-    # ── 안전 ─────────────────────────────────────────────────────────
-    def resume(self, why=""):
-        """halt 로 남기지 않는다 — 멈춘 채 두면 SSD 가 hang 한다."""
-        for fn in ('restart', 'go'):
+    # ── 상태 대기 ────────────────────────────────────────────────────
+    def _wait_halted(self, expected, timeout=STATE_TIMEOUT):
+        end = time.time() + timeout
+        last = None
+        while time.time() < end:
             try:
-                getattr(self.jl, fn)()
+                last = bool(self.jl.halted())
+            except Exception as e:
+                last = None
+                self._say(f"  [Link] halted() 예외: {e}")
+            if last is expected:
                 return True
-            except Exception:
-                continue
-        self._say(f"  [Link] ⚠ resume 실패 {why} — 코어가 halt 로 남았을 수 있다. "
-                  f"nvme list 로 확인할 것")
+            time.sleep(0.02)
+        self._say(f"  [Link] 상태 대기 실패: halted={last}, 기대={expected}")
         return False
 
+    # ── G2: halt ─────────────────────────────────────────────────────
+    def halt_checked(self, timeout=STATE_TIMEOUT):
+        """명령 반환값 + 사후 상태를 **둘 다** 확인한다."""
+        try:
+            r = self.jl.halt()
+        except Exception as e:
+            raise LinkError(f"halt() 예외: {e}", EXIT_HALT_FAIL)
+        if r is False:
+            raise LinkError("halt() 가 False 반환 (명령 실패)", EXIT_HALT_FAIL)
+        if not self._wait_halted(True, timeout):
+            raise LinkError("halt 명령은 받아들여졌으나 halted 상태로 진입하지 않음",
+                            EXIT_HALT_FAIL)
+        return True
+
+    # ── G3: PC ───────────────────────────────────────────────────────
+    def read_pc(self, pc_index):
+        """**확정된** 인덱스만 받는다.
+
+        인덱스를 추측해 넘기면 실행 중인 코어의 일반 레지스터를 PC 로 기록해
+        G3 를 거짓 통과한다. 확정 근거는 셋 중 하나여야 한다:
+          - J-Link register name 이 PC/DPC 로 확인됨
+          - T32/벤더 자료로 교차 검증됨
+          - 독립적인 PC fingerprint 실험을 통과한 --pc-index
+        """
+        if pc_index is None:
+            raise LinkError("PC 레지스터 인덱스가 확정되지 않았다", EXIT_PC_FAIL)
+        if not self._wait_halted(True, 0.2):
+            raise LinkError("halt 상태가 아닌데 PC 를 읽으려 함", EXIT_PC_FAIL)
+        try:
+            return self.jl.register_read(pc_index) & 0xFFFFFFFF   # E76 = RV32
+        except Exception as e:
+            raise LinkError(f"register_read({pc_index}) 실패: {e}", EXIT_PC_FAIL)
+
+    # ── G4: resume ───────────────────────────────────────────────────
+    def resume_checked(self, timeout=STATE_TIMEOUT):
+        """실패하면 recovery_required 를 세우고 예외를 던진다."""
+        err = None
+        for fn in ('restart', 'go'):
+            try:
+                r = getattr(self.jl, fn)()
+            except Exception as e:
+                err = f"{fn}() 예외: {e}"
+                continue
+            if r is False:
+                err = f"{fn}() 가 False 반환"
+                continue
+            if self._wait_halted(False, timeout):
+                return True
+            err = f"{fn}() 후에도 halted 상태 유지"
+        self.recovery_required = True
+        raise LinkError(f"resume 실패 — 보드 복구(POR) 필요: {err}", EXIT_RESUME_FAIL)
+
+    # ── 정리 ─────────────────────────────────────────────────────────
     def close(self):
+        """어떤 경로로 나가든 resume 을 시도하고, 실패를 숨기지 않는다."""
         if self.jl is None:
             return
         try:
-            if self.jl.halted():
-                self.resume("(종료 전 정리)")
-        except Exception:
-            self.resume("(halted 확인 불가 — 무조건 시도)")
-        try:
-            self.jl.close()
-        except Exception:
-            pass
-        self.jl = None
-        time.sleep(0.3)
+            try:
+                still_halted = bool(self.jl.halted())
+            except Exception:
+                still_halted = True      # 모르면 시도한다
+            if still_halted:
+                try:
+                    self.resume_checked()
+                    self._say("  [Link] 종료 전 resume 완료")
+                except LinkError as e:
+                    self.cleanup_error = str(e)
+                    self.recovery_required = True
+                    self._say(f"  [Link] ⚠ 종료 전 resume 실패: {e}")
+                    self._say("  [Link] ⚠ 코어가 halt 로 남았다. nvme list 로 확인하고 "
+                              "보드 전원 사이클 필요")
+        finally:
+            try:
+                self.jl.close()
+            except Exception as e:
+                self.cleanup_error = self.cleanup_error or f"close: {e}"
+            self.jl = None
+            time.sleep(0.3)
 
 
 # ══════════════════════════════════════════════════════════════════
-def main():
-    ap = argparse.ArgumentParser(description="연결만 확인한다")
-    ap.add_argument('--core-base', type=lambda x: int(x, 0), default=CORE_BASE_MAIN)
+def add_common_args(ap):
+    ap.add_argument('--core-base', type=lambda x: int(x, 0), default=CORE_BASE_NCORE,
+                    help='기본 0x81481000 (Ncore — 단일 하트로 추정되어 변수가 적다)')
     ap.add_argument('--hart', type=int, default=None)
     ap.add_argument('--device', default=DEVICE)
+    ap.add_argument('--serial', default=None, help='J-Link serial (여러 대 연결 시 필수)')
     ap.add_argument('--tries', type=int, default=CONNECT_TRIES)
+    return ap
+
+
+def main():
+    ap = add_common_args(argparse.ArgumentParser(description="연결만 확인한다"))
     args = ap.parse_args()
 
-    label = {CORE_BASE_MAIN: "hcore/CMCore/Fcore0/QCore",
-             CORE_BASE_N: "Ncore"}.get(args.core_base, "?")
+    label = CORE_BASE_LABEL.get(args.core_base, "?")
     print(f"\n{'=' * 62}\n SF-E76 연결 확인 ({VERSION})\n{'=' * 62}")
     print(f"  CoreBase 0x{args.core_base:X} [{label}]  hart={args.hart}  "
           f"device={args.device!r}")
 
-    with Link(core_base=args.core_base, hart=args.hart, device=args.device) as lk:
-        try:
-            lk.connect(tries=args.tries)
-        except Exception as e:
-            print(f"\n  ❌ {e}")
-            return 1
-        for fn, nm in ((lk.jl.halted, 'halted'), (lk.jl.core_name, 'core_name'),
-                       (lk.jl.core_id, 'core_id')):
-            try:
-                print(f"  {nm:10s} = {fn()}")
-            except Exception:
-                pass
-        print(f"\n  ✅ 연결 성공 (connect 시도 {lk.connect_tries_used}회)")
-    return 0
+    lk = Link(core_base=args.core_base, hart=args.hart, device=args.device,
+              serial=args.serial)
+    rc = EXIT_OK
+    try:
+        with lk:
+            lk.connect_checked(tries=args.tries)
+            print(f"\n  ✅ connect 성공 (시도 {lk.connect_tries_used}회)")
+            print(f"  meta: {lk.meta()}")
+    except LinkError as e:
+        print(f"\n  ❌ {e}")
+        rc = e.exit_code
+    if lk.recovery_required:
+        print("\n  ⚠⚠ 보드 복구 필요 — 전원 사이클 후 nvme list 확인")
+        rc = rc or EXIT_RESUME_FAIL
+    return rc
 
 
 if __name__ == '__main__':

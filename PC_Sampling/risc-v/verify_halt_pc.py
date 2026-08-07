@@ -1,202 +1,132 @@
 #!/usr/bin/env python3
-"""SF-E76 — halt / PC 읽기 / resume 검증 + 하트 열거.
+"""SF-E76 — G2/G3/G4 검증: halt → PC 읽기 → resume.
 
-connect 는 이미 성공했다(connect_sfe76.py). 이제 v10.0 샘플러의 실제 요건을 확인한다:
+v10.0 샘플러 착수 조건이 바로 이것이다. 연결(G1)은 `sfe76_link.Link` 가 담당하고
+이 스크립트는 **상태 전이의 안전성과 PC 유효성**만 본다.
 
-    connect ✅ → halt → dpc(PC) 읽기 → resume
+★ 설계 원칙 (feedback §10)
+  - 연결 로직을 복사하지 않는다. `sfe76_link.Link` 의 checked API 만 쓴다.
+  - `halt()`/`restart()` 의 **반환값과 사후 상태를 강제 검증**한다.
+    pylink 는 실패 시 예외가 아니라 False 를 반환하므로, 무시하면
+    "halted=False 인데 halt 성공" 같은 거짓 성공이 난다.
+  - **PC 인덱스를 추측하지 않는다.** 확정 전에는 샘플링으로 넘어가지 않는다.
+    잘못된 인덱스로 일반 레지스터를 읽으면 G3 를 거짓 통과한다.
+  - 실패는 **종료 코드로 구분**한다 (자동화가 실패를 성공으로 읽지 않게).
+  - **한 실행 = 한 설정.** 여러 hart/CoreBase 를 한 프로세스에서 섞지 않는다.
+    (이전 --enum-harts 는 한 handle 에서 hart 를 바꿔가며 connect 해
+     "한 handle = 한 설정" 원칙을 위반했다 → 제거)
 
-이 넷이 되면 기존 `JLinkHaltSampler` 를 그대로 이식할 수 있고, v10.0 이 돌기 시작한다.
+사용:
+    # 1단계 — PC 레지스터 후보 조사 (샘플링 안 함)
+    sudo python3 verify_halt_pc.py --scan-registers
 
-확정된 연결 설정 (connect_sfe76.py 실측):
-    SetcJTAGInitMode = 0
-    TIF = 7 (cJTAG),  speed = 10000 kHz
-    CORESIGHT_AddAP  Index=0..5  (T32 SYStem.CONFIG 값)
-    CORESIGHT_SetIndexAPBAPToUse = 0        # APBAP1 @ 0x10000
-    CORESIGHT_SetCoreBaseAddr    = 0x81481000
-    connect('RISC-V')
+    # 2단계 — 확정된 인덱스로 검증
+    sudo python3 verify_halt_pc.py --pc-index 32 --samples 100
 
-★★ 첫 connect() 는 **구조적으로 실패한다** (실측 확정).
+    # 다른 코어 (프로세스를 새로 띄운다)
+    sudo python3 verify_halt_pc.py --core-base 0x81480000 --hart 0 --scan-registers
 
-  같은 주소를 두 번 시도한 통제 실험에서:
-      0x81480000 -> 0x81480000     1회차 실패, 2회차 성공
-  주소를 바꿔도 항상 2회차만 성공했다. 즉 "0x81480000 은 연결 안 된다" 는
-  **틀린 결론이었고**, 첫 시도가 실패하는 것은 **위치(순서) 때문**이다.
-  첫 connect 는 `Error while halting CPU / Specific core setup failed` 로
-  실패하면서 예열 역할을 한다.
-
-  → T32 가 SYStem.Up 을 재시도 루프로 감싼 이유가 이것이다.
-  → **두 DM 모두 접근 가능**: 0x81480000(4코어) / 0x81481000(Ncore)
-  → 샘플러도 반드시 connect 를 2회 이상 시도해야 한다.
-
-사용법:
-    sudo python3 verify_halt_pc.py
-    sudo python3 verify_halt_pc.py --samples 50      # PC 샘플 수
-    sudo python3 verify_halt_pc.py --hart 1          # 특정 하트만
-    sudo python3 verify_halt_pc.py --core-base 0x81480000
+종료 코드: 0 정상 / 2 connect / 3 halt / 4 PC / 5 resume(복구필요) / 6 불충분
 """
 
 import argparse
+import json
 import sys
 import time
 
-try:
-    import pylink
-except ImportError:
-    sys.exit("pylink 없음 →  pip3 install pylink-square")
+from sfe76_link import (Link, LinkError, CORE_BASE_LABEL, add_common_args,
+                        EXIT_OK, EXIT_PC_FAIL, EXIT_INSUFFICIENT, EXIT_RESUME_FAIL)
 
-VERSION = "2026-08-07.2  halt/PC/resume 검증 + 하트 열거"
-
-# ── connect_sfe76.py 로 확정된 설정 ──────────────────────────────────
-TIF_CJTAG   = 7
-SPEED_KHZ   = 10000
-CJTAG_MODE  = 0
-APB_INDEX   = 0
-# ★ 기본을 Ncore 로 둔다 (feedback §9.4 P0).
-#   0x81480000 은 4코어가 공유해 hart 선택까지 얽히므로 원인 분리가 어렵다.
-#   메커니즘(halt/PC/resume)을 단순한 쪽에서 먼저 검증하고,
-#   그다음 --core-base 0x81480000 으로 목표 코어를 본다.
-CORE_BASE   = 0x81481000   # Ncore DM (단일 하트 추정)
-CORE_BASE_M = 0x81480000   # hcore/CMCore/Fcore0/QCore DM — NVMe 프론트엔드 후보
-
-AP_MAP = [
-    ("APBAP1", 0x10000, "APB-AP"),
-    ("APBAP2", 0x20000, "APB-AP"),
-    ("AXIAP1", 0x30000, "AXI-AP"),
-    ("AHBAP1", 0x40000, "AHB-AP"),
-    ("APBAP3", 0x50000, "APB-AP"),
-    ("APBAP4", 0x60000, "APB-AP"),
-]
-
-# 펌웨어 .text 추정 범위 — PC 후보를 거르는 용도(아직 미확정이라 넓게 잡는다)
-FW_LO, FW_HI = 0x00000000, 0xFFFFFFFF
+VERSION = "2026-08-07.3  checked G2/G3/G4"
 
 
 def head(t):
     print(f"\n{'=' * 66}\n {t}\n{'=' * 66}")
 
 
-def ex(jl, cmd):
-    try:
-        jl.exec_command(cmd)
-        return True
-    except Exception as e:
-        print(f"    FAIL {cmd} -> {e}")
-        return False
-
-
-def _apply(jl, core_base, hart):
-    ex(jl, f"SetcJTAGInitMode = {CJTAG_MODE}")
-    jl.set_tif(TIF_CJTAG)
-    jl.set_speed(SPEED_KHZ)
-    for i, (n, a, t) in enumerate(AP_MAP):
-        ex(jl, f"CORESIGHT_AddAP = Index={i} Type={t} Addr=0x{a:X}")
-    ex(jl, f"CORESIGHT_SetIndexAPBAPToUse = {APB_INDEX}")
-    ex(jl, f"CORESIGHT_SetCoreBaseAddr = 0x{core_base:X}")
-    if hart is not None:
-        ex(jl, f"RISCV_SetHartSel = {hart}")
-
-
-def safe_resume(jl, why=""):
-    """★ 코어를 halt 한 채로 두면 SSD 컨트롤러가 멈춘 상태로 남는다.
-    NVMe 가 hang 하고 호스트까지 영향을 받을 수 있으므로 어떤 경로로 빠져나가든
-    반드시 resume 을 시도한다 (feedback.md §8.5).
-    """
-    for fn in ('restart', 'go'):
-        try:
-            getattr(jl, fn)()
-            print(f"  [resume] {fn}() 완료 {why}")
-            return True
-        except Exception:
-            continue
-    print(f"  [resume] ⚠ 실패 {why} — 코어가 halt 로 남았을 수 있다. "
-          f"SSD 상태 확인(nvme list) 필요")
-    return False
-
-
-def connect(jl, core_base, hart=None, tries=3):
-    """★ 첫 connect 는 구조적으로 실패한다 — 반드시 재시도한다.
-
-    통제 실험(같은 주소 2회)에서 1회차 실패 / 2회차 성공이 재현됐다.
-    첫 시도가 예열이고, 그 상태를 물려받은 두 번째가 붙는다.
-    핸들을 중간에 close 하면 예열이 사라지므로 **하나의 핸들로** 반복한다.
-    """
-    last = None
-    for t in range(1, tries + 1):
-        _apply(jl, core_base, hart)
-        try:
-            jl.connect('RISC-V', speed=SPEED_KHZ)
-            if t > 1:
-                print(f"  (connect 시도 {t}회차에 성공 — 1회차는 예열)")
-            return t
-        except Exception as e:
-            last = e
-            print(f"  connect 시도 {t}/{tries} 실패: {e}")
-            time.sleep(0.2)
-    raise RuntimeError(f"connect {tries}회 모두 실패: {last}")
-
-
 # ══════════════════════════════════════════════════════════════════
-def find_pc_register(jl):
-    """PC(dpc) 가 몇 번 레지스터인지 실측으로 찾는다.
+def scan_registers(lk, count=48):
+    """PC 후보를 **조사만** 한다. 확정은 사람이 한다.
 
-    ARM 때 jlink_reg_diag.py 로 했던 것과 같은 문제다. RISC-V 는 보통
-    x0~x31 = 0~31 이고 PC 가 그 뒤에 온다. 이름을 주는 API 가 있으면 그걸 쓰고,
-    없으면 '값이 실행마다 변하고 코드 주소처럼 보이는' 인덱스를 찾는다.
+    두 번 halt 해서 값이 변하는 인덱스를 본다. 실행 중인 코어라면 PC 는
+    변하고 대부분의 일반 레지스터는 잘 안 변한다 — 결정적 근거는 아니지만
+    후보를 좁힌다. 최종 확정은 register name / T32 교차검증 / fingerprint 로.
     """
-    head("[A] PC 레지스터 인덱스 탐색")
+    head("[A] PC 레지스터 후보 조사")
 
-    # 1) 이름 목록을 주는 API 가 있으면 그게 제일 확실하다
+    # 1) 이름을 주는 API 가 있으면 그게 가장 확실하다
+    named = {}
     try:
-        names = jl.register_list()
-        print(f"  register_list() → {len(names)}개")
-        for i, nm in enumerate(names[:64]):
+        for idx in lk.jl.register_list():
             try:
-                label = jl.register_name(nm)
+                nm = str(lk.jl.register_name(idx))
             except Exception:
-                label = str(nm)
-            if any(k in str(label).lower() for k in ('pc', 'dpc')):
-                print(f"    ★ index={nm}  name={label}")
+                continue
+            named[idx] = nm
+            if nm.lower() in ('pc', 'dpc'):
+                print(f"  ★ 이름으로 확정 가능: index={idx} name={nm}")
     except Exception as e:
-        print(f"  register_list() 불가: {e}")
+        print(f"  register_list/name 불가: {e}")
 
-    # 2) 실측: halt 상태에서 0~47 을 읽어 값을 본다
-    print("\n  인덱스별 값 (halt 상태):")
-    vals = {}
-    for idx in range(48):
-        try:
-            v = jl.register_read(idx)
-        except Exception:
+    # 2) 두 시점의 값 비교
+    snaps = []
+    for _run in range(2):
+        lk.halt_checked()
+        vals = {}
+        for idx in range(count):
+            try:
+                vals[idx] = lk.jl.register_read(idx) & 0xFFFFFFFF
+            except Exception:
+                pass
+        snaps.append(vals)
+        lk.resume_checked()
+        time.sleep(0.05)
+
+    a, b = snaps
+    common = sorted(set(a) & set(b))
+    changed = [i for i in common if a[i] != b[i]]
+    print(f"\n  두 halt 사이에 값이 변한 인덱스: {changed if changed else '없음'}")
+    print("\n  idx  1차값       2차값       이름")
+    for i in common:
+        if a[i] == 0 and b[i] == 0:
             continue
-        vals[idx] = v
-        if v not in (0, 0xFFFFFFFF):
-            print(f"    [{idx:2d}] = 0x{v & 0xFFFFFFFF:08X}")
-    return vals
+        mark = "  ←변함" if a[i] != b[i] else ""
+        print(f"  [{i:2d}] 0x{a[i]:08X}  0x{b[i]:08X}  {named.get(i, '')}{mark}")
+
+    print("\n  ※ 값이 변하고 코드 주소처럼 보이는 인덱스가 PC 후보다.")
+    print("    **추측으로 진행하지 않는다.** 확정 근거(이름 / T32 교차검증 /")
+    print("    독립 fingerprint)를 갖춘 뒤 --pc-index <번호> 로 재실행할 것.")
+    return changed
 
 
-def sample_pc(jl, pc_idx, n, settle_ms):
-    """halt → PC 읽기 → resume 을 반복. 샘플러의 핵심 루프 그대로."""
-    head(f"[C] PC 샘플링 {n}회  (register index={pc_idx})")
-    pcs = []
-    fails = 0
+def sample_pc(lk, pc_index, n, settle_ms):
+    """halt → PC → resume 반복. 샘플러의 핵심 루프 그대로."""
+    head(f"[C] PC 샘플링 {n}회 (index={pc_index})")
+    pcs, fails = [], 0
     t0 = time.time()
     for i in range(n):
         try:
-            jl.halt()
-            pc = jl.register_read(pc_idx)
-            jl.restart()                    # resume
-            pcs.append(pc & 0xFFFFFFFF)
-        except Exception as e:
+            lk.halt_checked()
+            pcs.append(lk.read_pc(pc_index))
+        except LinkError as e:
             fails += 1
             if fails <= 3:
                 print(f"    {i}회차 실패: {e}")
-            safe_resume(jl, f"({i}회차 실패 복구)")
+        finally:
+            # 어떤 경우에도 코어를 돌려놓는다. 실패하면 즉시 중단한다.
+            try:
+                lk.resume_checked()
+            except LinkError as e:
+                print(f"    ⚠ {i}회차 resume 실패 — 중단: {e}")
+                break
         if settle_ms:
             time.sleep(settle_ms / 1000.0)
     dt = time.time() - t0
 
     uniq = sorted(set(pcs))
-    print(f"\n  성공 {len(pcs)}/{n}   실패 {fails}")
-    print(f"  소요 {dt:.2f}s → {len(pcs) / dt if dt else 0:.1f} 샘플/초")
+    print(f"\n  성공 {len(pcs)}/{n}  실패 {fails}")
+    if dt > 0:
+        print(f"  소요 {dt:.2f}s → {len(pcs) / dt:.1f} 샘플/초")
     print(f"  고유 PC {len(uniq)}개")
     if uniq:
         print(f"  범위 0x{uniq[0]:08X} ~ 0x{uniq[-1]:08X}")
@@ -205,117 +135,99 @@ def sample_pc(jl, pc_idx, n, settle_ms):
     return pcs, uniq
 
 
+# ══════════════════════════════════════════════════════════════════
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--samples', type=int, default=30)
+    ap = add_common_args(argparse.ArgumentParser())
+    ap.add_argument('--scan-registers', action='store_true',
+                    help='PC 후보 조사만 하고 끝낸다 (샘플링 안 함)')
     ap.add_argument('--pc-index', type=int, default=None,
-                    help='PC 레지스터 인덱스 직접 지정 (미지정 시 탐색)')
-    ap.add_argument('--hart', type=int, default=None, help='RISCV_SetHartSel 값')
-    ap.add_argument('--core-base', type=lambda x: int(x, 0), default=CORE_BASE)
+                    help='확정된 PC 레지스터 인덱스. 없으면 샘플링하지 않는다')
+    ap.add_argument('--samples', type=int, default=30)
     ap.add_argument('--settle-ms', type=float, default=0.0,
                     help='resume 후 대기 (ARM 의 go_settle 대응)')
-    ap.add_argument('--enum-harts', action='store_true',
-                    help='하트 0~4 를 각각 붙여보고 결과 비교')
+    ap.add_argument('--json', default=None, help='결과 레코드를 JSONL 로 추가 기록')
     args = ap.parse_args()
 
     head("SF-E76 halt / PC / resume 검증")
-    print(f"  version   : {VERSION}")
-    print(f"  CoreBase  : 0x{args.core_base:X}")
-    print(f"  hart      : {args.hart if args.hart is not None else '(미지정)'}")
+    print(f"  version  : {VERSION}")
+    print(f"  CoreBase : 0x{args.core_base:X} "
+          f"[{CORE_BASE_LABEL.get(args.core_base, '?')}]  hart={args.hart}")
 
-    if args.enum_harts:
-        head("[H] 하트 열거 — 코어 5개(hcore/CMCore/Fcore0/QCore/Ncore)")
-        # ★ 핸들 하나로 전부 처리한다. 하트마다 close/open 하면 예열이 사라져
-        #   전부 실패한다(스윕에서 실측으로 확인됨).
-        jl = pylink.JLink()
-        try:
-            jl.open()
-        except Exception as e:
-            sys.exit(f"J-Link open 실패: {e}")
-        try:
-            for h in range(5):
-                print(f"\n  ── hart {h} ──")
-                try:
-                    connect(jl, args.core_base, hart=h)
-                except Exception as e:
-                    print(f"    connect 실패: {e}")
-                    continue
-                try:
-                    jl.halt()
-                    regs = {i: jl.register_read(i) & 0xFFFFFFFF for i in (32, 33)}
-                    print(f"    halted={jl.halted()}  "
-                          + "  ".join(f"reg{i}=0x{v:08X}" for i, v in regs.items()))
-                    jl.restart()
-                except Exception as e:
-                    print(f"    halt/read 실패: {e}")
-                    safe_resume(jl, "(hart 루프)")
-        finally:
-            try:
-                if jl.halted():
-                    safe_resume(jl, "(종료 전 정리)")
-            except Exception:
-                safe_resume(jl, "(강제)")
-            try:
-                jl.close()
-            except Exception:
-                pass
-        print("\n  하트별 reg 값이 서로 다르면 → 하트 선택이 실제로 동작하는 것")
-        return
-
-    jl = pylink.JLink()
+    rec = {'version': VERSION, 'ts': time.time(),
+           'measurement_status': 'not_started',
+           'target_recovery_status': 'ok'}
+    rc = EXIT_OK
+    lk = Link(core_base=args.core_base, hart=args.hart,
+              device=args.device, serial=args.serial)
     try:
-        jl.open()
-    except Exception as e:
-        sys.exit(f"J-Link open 실패: {e}")
-    print(f"  J-Link    : {jl.product_name} SN={jl.serial_number}")
+        with lk:
+            head("[G1] connect")
+            lk.connect_checked(tries=args.tries)
+            rec['meta'] = lk.meta()
 
-    try:
-        head("[1] connect")
-        connect(jl, args.core_base, hart=args.hart)
-        print("  ✅ connect 성공")
-        try:
-            print(f"     core_name={jl.core_name()}  core_id=0x{jl.core_id():08X}")
-        except Exception:
-            pass
+            head("[G2] halt")
+            lk.halt_checked()
+            print("  ✅ halt 성공 (명령 반환값 + halted 상태 확인)")
 
-        head("[2] halt")
-        jl.halt()
-        print(f"  ✅ halt 성공   halted={jl.halted()}")
+            head("[G4] resume")
+            lk.resume_checked()
+            print("  ✅ resume 성공 (running 상태 확인)")
+            rec['measurement_status'] = 'g2_g4_ok'
 
-        pc_idx = args.pc_index
-        if pc_idx is None:
-            find_pc_register(jl)
-            print("\n  ※ 위 목록에서 PC 로 보이는 인덱스를 골라 --pc-index 로 재실행.")
-            print("     RISC-V 는 보통 x0~x31=0~31, 그 뒤가 pc. 코드 주소처럼 보이고")
-            print("     실행마다 값이 변하는 것이 PC 다.")
-            pc_idx = 32
-            print(f"\n  일단 index={pc_idx} 로 진행")
+            if args.scan_registers:
+                rec['pc_candidates'] = scan_registers(lk)
+                rec['measurement_status'] = 'scan_only'
+            elif args.pc_index is None:
+                head("[G3] 건너뜀")
+                print("  ⚠ PC 인덱스가 확정되지 않았다. 샘플링하지 않는다.")
+                print("     먼저 --scan-registers 로 후보를 조사할 것.")
+                rc = EXIT_PC_FAIL
+                rec['measurement_status'] = 'pc_index_unconfirmed'
+            else:
+                pcs, uniq = sample_pc(lk, args.pc_index, args.samples, args.settle_ms)
+                rec.update(pc_index=args.pc_index, samples=len(pcs),
+                           unique_pcs=len(uniq),
+                           pc_min=(f"0x{uniq[0]:08X}" if uniq else None),
+                           pc_max=(f"0x{uniq[-1]:08X}" if uniq else None))
+                if not uniq:
+                    rc = EXIT_INSUFFICIENT
+                    rec['measurement_status'] = 'no_samples'
+                elif len(uniq) == 1:
+                    print("\n  ⚠ PC 가 한 값에 고정 — 코어가 안 돌거나 잘못된 하트/인덱스")
+                    rc = EXIT_INSUFFICIENT
+                    rec['measurement_status'] = 'pc_constant'
+                else:
+                    rec['measurement_status'] = 'ok'
+    except LinkError as e:
+        print(f"\n  ❌ {e}")
+        rc = e.exit_code
+        rec['measurement_status'] = 'failed'
+        rec['error'] = str(e)
 
-        head("[3] resume")
-        jl.restart()
-        print(f"  ✅ resume 성공   halted={jl.halted()}")
+    # 결과 상태와 복구 상태를 분리한다 — 복구 실패는 다른 결과를 덮는다
+    if lk.recovery_required:
+        rec['target_recovery_status'] = 'failed'
+        rc = EXIT_RESUME_FAIL
+        print("\n  ⚠⚠ 보드 복구 필요 — 코어가 halt 로 남았을 수 있다.")
+        print("      nvme list 로 SSD 확인 후 전원 사이클할 것.")
+        print("      복구 전에는 다음 실험을 진행하지 말 것.")
+    rec['overall_status'] = ('failed_recovery_required' if lk.recovery_required
+                             else ('ok' if rc == EXIT_OK else 'failed'))
+    rec['exit_code'] = rc
 
-        sample_pc(jl, pc_idx, args.samples, args.settle_ms)
+    head("결과")
+    print(f"  measurement_status      = {rec['measurement_status']}")
+    print(f"  target_recovery_status  = {rec['target_recovery_status']}")
+    print(f"  overall_status          = {rec['overall_status']}  (exit {rc})")
+    if rec['measurement_status'] == 'ok':
+        print("\n  ✅ G2/G3/G4 통과 — 기존 JLinkHaltSampler 이식 가능. v10.0 착수 조건 충족")
 
-    except Exception as e:
-        print(f"\n  ❌ 실패: {e}")
-    finally:
-        # 어떤 경로로 빠져나가든 코어를 다시 돌려놓는다
-        try:
-            if jl.halted():
-                safe_resume(jl, "(종료 전 정리)")
-        except Exception:
-            safe_resume(jl, "(halted 확인 실패 — 무조건 시도)")
-        try:
-            jl.close()
-        except Exception:
-            pass
-
-    head("판정")
-    print("  halt/PC/resume 이 모두 되고 PC 가 여러 값으로 흩어지면")
-    print("  → 기존 JLinkHaltSampler 를 그대로 이식할 수 있다 (v10.0 착수 가능)")
-    print("  PC 가 한 값에 고정되면 → 코어가 실제로 안 돌거나 잘못된 하트에 붙은 것")
+    if args.json:
+        with open(args.json, 'a') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        print(f"\n  결과 기록: {args.json}")
+    return rc
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

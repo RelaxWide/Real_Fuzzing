@@ -89,7 +89,7 @@ connect('RISC-V')          # ★ 1회차 실패, 2회차 성공
 
 ---
 
-## ⚠ 지켜야 할 원칙 3개
+## ⚠ 지켜야 할 원칙 4개
 
 **1. 한 handle = 한 설정**
 조합을 섞으면 (a) 한 번 붙은 뒤 이후가 전부 **거짓 성공**(24개 중 23개)하거나
@@ -136,15 +136,22 @@ sudo python3 sfe76_link.py --core-base 0x81481000     # Ncore
 # 지금 할 일 — halt / PC / resume
 #   ★ 먼저 Ncore(0x81481000) 로 검증한다. 단일 하트라 변수가 적다.
 #     0x81480000 은 4코어 공유라 hart 선택까지 얽혀 원인 분리가 어렵다.
-sudo python3 verify_halt_pc.py --core-base 0x81481000
+#   1단계 — PC 레지스터 후보 조사 (샘플링 안 함)
+sudo python3 verify_halt_pc.py --scan-registers
+#   2단계 — 확정된 인덱스로만 (추측 금지)
 sudo python3 verify_halt_pc.py --pc-index <번호> --samples 100
-sudo python3 verify_halt_pc.py --enum-harts
+#   다른 코어는 프로세스를 새로 (한 실행 = 한 설정)
+sudo python3 verify_halt_pc.py --core-base 0x81480000 --hart 0 --scan-registers
 
 # 첫 connect 실패 원인
 sudo python3 diagnose_connect.py
 ```
 
 > pylink 가 venv 가 아니라 **시스템 `python3`** 에 설치된 경우가 있다. 둘 다 시도할 것.
+> J-Link 이 여러 대면 `--serial` 로 지정할 것 (안 하면 엉뚱한 보드를 잡는다).
+
+**종료 코드** — 자동화가 실패를 성공으로 읽지 않게 구분한다:
+`0` 정상 / `2` connect / `3` halt / `4` PC / **`5` resume 실패(보드 복구 필요)** / `6` 불충분
 
 ---
 
@@ -154,7 +161,7 @@ sudo python3 diagnose_connect.py
 |---|---|---|
 | 1 | **첫 connect 가 왜 실패하나** | `diagnose_connect.py`. 유력 가설 = RISC-V DM 의 `dmactive` (쓴 뒤 되읽어 1 될 때까지 기다려야 하는데 J-Link 이 안 기다리는 것으로 의심) |
 | 2 | **halt / PC / resume 이 되나** | `verify_halt_pc.py` ← **v10.0 착수 조건** |
-| 3 | PC 레지스터 인덱스 | `verify_halt_pc.py` 의 `[A]` 단계 |
+| 3 | PC 레지스터 인덱스 | `verify_halt_pc.py --scan-registers`. **추측 금지** — 이름/T32 교차검증/fingerprint 중 하나로 확정해야 샘플링한다 |
 | 4 | `0x81480000` 이 **어느 코어**인가 | halt 후 PC/hart 비교. connect 성공만으론 알 수 없다 |
 | 5 | **NVMe 를 처리하는 코어**는? | 벤더 문의 — `hcore` 추정이나 미확인 |
 | 6 | 펌웨어 `.text` 범위 / 오버레이 | 벤더 문의. 커버리지 필터에 필요 |

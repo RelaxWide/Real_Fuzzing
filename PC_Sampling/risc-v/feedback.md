@@ -777,3 +777,325 @@ PC가 읽힌다는 이유만으로 코어 이름을 붙이지 말고, 최소 두
 다만 프로젝트 상태를 "connect 완료"로 닫기에는 이르다. 현재 가장 큰 불확실성은 주소 탐색이 아니라
 **성공한 연결이 실제 코어의 halt/PC/resume까지 안전하게 제어하는가**이다. 따라서 추가 AP sweep이나
 트레이스 조사보다 `verify_halt_pc.py`의 안전한 단일-core 검증을 최우선으로 진행해야 한다.
+
+---
+
+## 10. 2026-08-07 전체 코드·문서 업데이트 리뷰
+
+검토 대상:
+
+- `README.md`
+- `BRINGUP_riscv_v10.md`
+- `sfe76_link.py`
+- `verify_halt_pc.py`
+- `diagnose_connect.py`
+- `SF_E76_config.JLinkScript`
+- `backup/` 구성과 현재 파일 간 역할 분리
+
+정적 확인 결과 Python 세 파일은 `py_compile`을 통과했고 각 CLI의 `--help`도 정상 동작했다.
+실제 J-Link/타깃 실행은 이 리뷰에서 수행하지 않았다.
+
+전체 구조는 이전보다 좋아졌다. 특히 연결 지식을 `sfe76_link.py`로 모으고, README를 현재 runbook,
+BRINGUP을 조사 이력으로 분리하려는 방향은 맞다. 다만 현재 `verify_halt_pc.py`를 보드에서 실행하기
+전 수정해야 할 안전 및 판정 문제가 남아 있다.
+
+### 10.1 Critical issues
+
+#### 1. halt/resume 성공을 실제로 검증하지 않는다
+
+`verify_halt_pc.py`의 단일 검증 및 반복 샘플링 경로는 다음 반환값을 무시한다.
+
+- `jl.halt()`
+- `jl.restart()`
+- resume 이후 `jl.halted()` 상태
+
+설치된 pylink 2.0.0 기준 `halt()`와 `restart()`는 실패 또는 no-op 상황에서 예외 대신 `False`를
+반환할 수 있다. 현재 코드는 `halted=False`여도 `✅ halt 성공`을 출력할 수 있고, resume 후에도
+코어가 계속 halt 상태인지 강제 검사하지 않는다.
+
+영향:
+
+- 실행 중인 코어에서 일반 레지스터를 PC라고 읽어 거짓 성공 가능
+- resume 실패를 성공으로 기록 가능
+- 코어가 halt 상태로 남은 채 다음 샘플 또는 NVMe 작업 진행 가능
+- README의 G2/G4 판정과 실제 코드 동작 불일치
+
+`sfe76_link.Link.resume()`도 `restart()`가 예외 없이 반환하기만 하면 반환값이 `False`여도 성공으로
+판정한다. README에 적힌 "resume 실패 시 중단 및 POR" 정책이 코드에 구현되지 않았다.
+
+필수 형태:
+
+```python
+if not jl.halt():
+    raise RuntimeError("halt command failed")
+if not wait_until(jl.halted, expected=True, timeout=...):
+    raise RuntimeError("CPU did not enter halted state")
+
+pc = jl.register_read(confirmed_pc_index)
+
+if not jl.restart():
+    raise RuntimeError("resume command failed")
+if not wait_until(jl.halted, expected=False, timeout=...):
+    raise RuntimeError("CPU remained halted")
+```
+
+resume 검증에 실패하면 다음 실험을 막고, 호출자에게 POR 필요 상태를 반환해야 한다.
+
+#### 2. hart 열거가 "한 handle = 한 설정" 원칙을 위반한다
+
+`verify_halt_pc.py --enum-harts`는 한 J-Link handle 안에서 hart 0~4 설정을 바꾸면서 반복해서
+`connect()`한다. 이는 README와 BRINGUP에서 금지한 설정 혼합과 동일하다.
+
+두 번째 hart부터는 다음을 구분할 수 없다.
+
+- 새 `RISCV_SetHartSel`이 실제 반영된 성공
+- 이전 연결 상태를 재사용한 거짓 성공
+- 앞 hart의 failed connect가 뒤 hart를 예열한 순서 효과
+
+이 결과로 hart 귀속을 판단하면 안 된다. hart별로 완전히 격리된 세션을 사용하되, 각 hart 후보
+내부에서는 동일 handle로 동일 설정의 bounded retry만 허용해야 한다.
+
+#### 3. `diagnose_connect.py`의 D/E/F 실험은 현재 구조로 원인을 분리하지 못한다
+
+각 실험은 Python `JLink` 객체와 handle만 새로 만들고 같은 target과 probe를 계속 사용한다.
+
+- D 성공만으로 상태가 target에 남았다고 결론 낼 수 없다. 동일 프로세스의 DLL 전역 상태나 probe
+  firmware 상태가 유지될 수 있고, close 자체가 target 상태를 변경할 수도 있다.
+- E는 앞 device 후보의 failed connect가 target을 예열해 뒤 device 후보를 성공시킬 수 있다.
+- F도 앞 hart 시도가 뒤 hart 후보 결과에 영향을 줄 수 있다.
+- 후보 순서가 고정돼 후보 효과와 실행 순서 효과가 교락된다.
+
+따라서 현재 출력의 다음 판정은 증거보다 강하다.
+
+- "상태가 타깃에 남는다"
+- "장치명이 원인이었다"
+- "특정 hart가 원인이었다"
+
+후보별 별도 프로세스, 동일한 초기 target 상태, 필요 시 POR 또는 명시적 DM reset, 후보 순서
+역전/무작위화가 필요하다.
+
+#### 4. JLinkScript의 설정 상수가 실제 명령에 반영되지 않는다
+
+`SF_E76_config.JLinkScript`는 `_CORE_BASE`만 수정하면 된다고 안내하지만 실제
+`CORESIGHT_SetCoreBaseAddr` command string에는 `0x81480000`이 하드코딩돼 있다.
+
+`_APB_INDEX`도 선언만 되고 실제 command string에서 사용되지 않는다. 따라서 상단 상수를
+`0x81481000`으로 변경해도 실제 연결 대상은 바뀌지 않는다.
+
+상수를 제거하고 실제 command string을 직접 설정하게 하거나, JLinkScript가 지원하는 방식으로
+상수 값을 명령 생성에 확실히 반영해야 한다. 현재처럼 "여기만 바꾸면 된다"는 안내는 위험하다.
+
+#### 5. 검증 실패가 프로세스 종료 코드에 반영되지 않는다
+
+`verify_halt_pc.py`는 connect/halt/read/resume 예외를 출력만 하고 정상 종료한다.
+`--enum-harts`도 일부 또는 전체 hart가 실패해도 성공 exit code로 끝난다.
+
+자동화, CI, sampler bring-up 스크립트는 실패한 실험을 성공으로 인식할 수 있다. 최소한 다음을
+서로 다른 non-zero exit code로 구분하는 것이 좋다.
+
+- connect 실패
+- halt 상태 진입 실패
+- PC register 미확정/read 실패
+- resume/running 복구 실패
+- 결과 불충분
+
+### 10.2 Potential bugs
+
+#### 1. 연결 지식의 단일 출처가 아직 구현되지 않았다
+
+README는 `sfe76_link.py`를 정식 연결 모듈이자 단일 출처로 선언하지만 `verify_halt_pc.py`와
+`diagnose_connect.py`는 다음을 각각 복사해 갖고 있다.
+
+- TIF/speed/CJTAG mode
+- AP map/CoreBase
+- setting 적용
+- connect retry
+- resume/close
+
+그 결과 `verify_halt_pc.py`의 module docstring에는 이미 다음 오래된 설명이 남았다.
+
+- backup으로 이동한 `connect_sfe76.py`가 현재 연결 코드라고 안내
+- 첫 connect 실패를 범위 제한 없이 "구조적"이라고 표현
+- halt/PC가 미검증인데 "두 DM 모두 접근 가능"이라고 표현
+
+실험 스크립트도 `Link`를 사용하게 하고, 실험별 차이만 명시적으로 주입해야 한다.
+
+#### 2. PC register를 못 찾으면 무조건 index 32로 진행한다
+
+`find_pc_register()`가 PC/DPC 이름을 확정하지 못해도 코드가 index 32를 선택해 계속 샘플링한다.
+index 32가 실제 PC가 아니면 일반 register 값을 PC로 기록하고 G3를 거짓 통과할 수 있다.
+
+또한 `FW_LO=0`, `FW_HI=0xFFFFFFFF`는 실질적인 주소 검증이 아니며 현재 sampling 경로에서
+사용되지 않는다.
+
+PC register는 다음 중 하나가 충족될 때만 사용해야 한다.
+
+- J-Link register name이 `PC`/`DPC`로 확인됨
+- T32 또는 벤더 자료로 index를 교차 검증함
+- 사용자가 명시한 `--pc-index`가 독립적인 PC fingerprint 실험을 통과함
+
+E76은 32-bit core이므로 `& 0xFFFFFFFF` 자체는 현재 문제로 보지 않는다. 문제는 register의
+정체와 주소 유효성 검증이다.
+
+#### 3. cleanup 실패가 호출자에게 전달되지 않는다
+
+`Link.close()`는 resume과 close 예외를 대부분 무시한다. 컨텍스트 종료 후 호출자는 코어가
+정상 running 상태인지 알 수 없다.
+
+`resume_failed`, `recovery_required` 같은 상태를 보존하거나, 정상 종료 중 cleanup 실패를 별도
+예외로 전달해야 한다. 원래 예외가 있는 경우에는 cleanup 실패 정보를 잃지 않도록 함께 기록한다.
+
+#### 4. J-Link probe를 명시적으로 선택하지 않는다
+
+모든 스크립트가 인자 없이 `jl.open()`을 호출한다. 여러 probe가 연결된 환경에서는 다른 보드를
+잡을 수 있다. `--serial` 옵션을 제공하고 실제 serial을 결과 레코드의 필수 필드로 남겨야 한다.
+
+#### 5. connect retry마다 전체 AP map을 다시 등록한다
+
+분리 실험 A는 setup 1회 후 connect 2회로 failed connect 자체의 효과를 확인했다. 그런데 정식
+`Link.connect()`는 매 retry마다 AP map과 CoreBase를 다시 적용한다.
+
+현재 실측상 동작할 수는 있지만, 동일 Index에 대한 `CORESIGHT_AddAP` 반복 등록이 DLL 버전에 따라
+덮어쓰기, 중복 또는 오류로 바뀔 수 있다. `apply_settings()` 1회 후 동일 설정의 `connect()`만
+bounded retry하는 형태가 분리 실험과도 정확히 일치한다.
+
+#### 6. 문서에 남은 충돌
+
+- README 제목은 "원칙 3개"지만 실제 항목은 4개다.
+- BRINGUP은 다른 AP/선택 메커니즘을 배제하지 말라고 한 직후 "다른 AP를 뒤질 이유 없음"이라고 한다.
+- BRINGUP에 backup으로 이동한 `connect_sfe76.py` 실행 안내가 남아 있다.
+- README는 G1을 부분 통과로 표시하지만 BRINGUP 아키텍처 표는 connect를 완료 처리한다.
+- Ncore가 단일 hart라는 것은 아직 추정인데 현재 실행 순서의 확정 근거처럼 표현한다.
+- JLinkScript는 `InitTarget()` 전원 ACK가 실패했다는 BRINGUP 결과와 달리 전원 인가를 "진짜 병목"으로
+  서술한다.
+- `sfe76_link.py` module docstring은 `safe_resume()`을 호출하라고 하지만 실제 공개 메서드는
+  `resume()`이다.
+- `sfe76_link.py`의 안전 원칙 번호가 `1, 2, 4, 3` 순서다.
+
+### 10.3 Reliability improvements
+
+#### 1. checked state transition API를 공통 모듈에 둔다
+
+권장 public API:
+
+```text
+Link.connect_checked()
+Link.halt_checked(timeout_s)
+Link.read_pc(confirmed_register)
+Link.resume_checked(timeout_s)
+Link.close(recovery_policy=...)
+```
+
+실험 스크립트는 `jl`의 raw halt/restart를 직접 호출하지 않고 이 API만 사용한다.
+
+#### 2. 연결 및 결과 메타데이터를 구조화한다
+
+각 실행에서 최소 다음을 JSON/JSONL로 남긴다.
+
+- monotonic/wall-clock timestamp
+- target power-cycle ID
+- J-Link serial/product/firmware/DLL version
+- device, TIF, speed, AP map, APB index, CoreBase, hart
+- connect 시도별 error와 소요 시간
+- halt/read/resume 반환값과 사후 상태
+- PC register name/index/value
+- NVMe 생존 확인 결과
+
+#### 3. 결과 상태와 복구 상태를 분리한다
+
+예를 들어 PC read 성공 후 resume 실패는 실험 데이터가 일부 존재해도 전체 실행은 실패다.
+
+```text
+measurement_status = pc_read_ok
+target_recovery_status = failed
+overall_status = failed_recovery_required
+```
+
+복구 실패가 다음 실험에 묻히지 않게 해야 한다.
+
+#### 4. 문서의 확정 수준을 코드와 동일하게 유지한다
+
+현재 정확한 표현:
+
+> 두 CoreBase는 현 설정에서 J-Link connect 후보로 통과했다. 실제 DM/hart/core 귀속 및 안전한
+> halt/PC/resume은 미검증이다.
+
+G2~G4가 통과하기 전에는 "DM 접근 가능", "코어 연결 완료", "sampler 동작"으로 승격하지 않는다.
+
+### 10.4 Suggested tests
+
+#### P0 — 하드웨어 실행 전 mock 테스트
+
+mock J-Link로 다음 경우를 강제한다.
+
+1. `halt()`가 `False` 반환
+2. halt 명령 후 `halted()`가 계속 `False`
+3. `restart()`가 `False` 반환
+4. restart 후 `halted()`가 계속 `True`
+5. PC read 중 예외
+6. resume 중 예외
+7. connect 1회 실패 후 2회 성공
+8. connect 3회 전부 실패
+
+각 경우에 다음을 검사한다.
+
+- 성공 메시지가 잘못 출력되지 않음
+- 다음 샘플이 실행되지 않음
+- cleanup이 항상 시도됨
+- recovery 필요 상태가 보존됨
+- 실패 exit code가 반환됨
+
+#### P1 — 단일 Ncore 안전 검증
+
+코드 수정 후에만 수행한다.
+
+1. `0x81481000` 한 설정만 사용
+2. 동일 handle, setup 1회, bounded connect retry
+3. `halt()` 반환값과 `halted()==True` 확인
+4. 이름 또는 외부 근거로 PC register 확정
+5. PC read 및 정렬/코드 범위 검사
+6. `restart()` 반환값과 `halted()==False` 확인
+7. NVMe workload가 계속 진행되는지 확인
+
+한 단계라도 실패하면 hart 열거와 sampler 통합으로 넘어가지 않는다.
+
+#### P2 — D/E/F 재설계
+
+- 후보별 별도 프로세스 사용
+- target 초기상태를 동일하게 통제
+- 필요 시 후보마다 POR 또는 명시적 debug-domain/DM reset
+- 후보 순서 정방향/역방향 또는 무작위화
+- 각 조건 최소 3회 반복
+- J-Link serial/DLL/firmware와 power-cycle ID 기록
+
+D에서 target/DLL/probe 상태를 분리하려면 다음 대조가 필요하다.
+
+```text
+같은 프로세스 + 새 handle
+새 프로세스 + 같은 probe/target
+probe USB reconnect + target 유지
+target POR + probe 유지
+```
+
+#### P3 — 코어 귀속 및 내구성
+
+P1 통과 후 순서:
+
+1. 격리된 hart별 PC fingerprint
+2. `0x81480000`과 `0x81481000` 비교
+3. T32 PC와 교차 검증
+4. workload 상관관계 확인
+5. halt/read/resume 1,000회
+6. close/reopen 반복
+7. POR/crash recovery 반복
+8. NVMe I/O 동시 수행 시 timeout/hang 영향 측정
+
+### 10.5 최종 판단
+
+현재 가장 먼저 수정할 세 항목:
+
+1. **halt/resume 반환값과 사후 상태를 강제 검증한다.**
+2. **hart/device 진단을 독립 세션과 통제된 target 상태로 격리한다.**
+3. **JLinkScript의 `_CORE_BASE`/`_APB_INDEX` 하드코딩 불일치를 없앤다.**
+
+이 세 가지가 해결되기 전 `verify_halt_pc.py`의 성공 출력은 G2~G4의 증거로 사용하면 안 된다.
