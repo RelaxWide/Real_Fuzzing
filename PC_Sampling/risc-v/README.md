@@ -18,7 +18,8 @@ SiFive **E76** 기반 RISC-V SSD 컨트롤러에 퍼저를 올리기 위한 작�
 | 디버그 도메인 전원 | ✅ `CTRL/STAT = 0xF0000000` |
 | AP map / DMI base 선언 | ✅ |
 | **J-Link connect** | ⚠️ **되지만 2회차에만** — 근본원인 규명 중 |
-| **halt / PC / resume** | ⬜ **미검증** ← 크리티컬 패스 |
+| **halt** | ❌ **실패** — `JLINKARM_Halt()` 가 DLL 레벨에서 거부 |
+| PC / resume | ⬜ halt 가 안 돼 도달 못 함 |
 | 코어 귀속 (어느 코어인가) | ⬜ 미확정 |
 | 반복 reconnect / POR / crash 복구 | ⬜ 미검증 |
 | Nexus 트레이스 | ⬜ 병행 트랙 (크리티컬 패스 아님) |
@@ -29,7 +30,7 @@ SiFive **E76** 기반 RISC-V SSD 컨트롤러에 퍼저를 올리기 위한 작�
 |---|---|---|
 | **G0** | cJTAG / DPIDR / 전원 ACK | ✅ |
 | **G1** | bounded retry 안에 J-Link `connect()` | ⚠️ 부분 (2회차에만) |
-| **G2** | halt 성공 + `halted` 확인 | ⬜ |
+| **G2** | halt 성공 + `halted` 확인 | ❌ **실패** |
 | **G3** | PC/DPC 읽기 + 유효 범위·변화 확인 | ⬜ |
 | **G4** | resume 성공 + running 확인 | ⬜ |
 | **G5** | workload 중 반복 샘플링 | ⬜ |
@@ -38,7 +39,10 @@ SiFive **E76** 기반 RISC-V SSD 컨트롤러에 퍼저를 올리기 위한 작�
 **v10.0 샘플러 착수 조건 = 최소 G4.**
 **장시간 퍼징 투입 조건 = G5 + G6.**
 
-> ⚠️ **`connect()` 성공은 코어 도달을 뜻하지 않는다.** 지금 입증된 것은
+> ⚠️ **`connect()` 성공은 코어 도달을 뜻하지 않는다 — 실측으로 확인됐다.**
+> `connect()` 는 2회차에 성공하는데 **`halt()` 는 DLL 레벨에서 거부된다.**
+> J-Link 의 connect 도 1회차에 "Error while halting CPU" 로 실패하므로,
+> 2회차 "성공" 이 **halt 실패를 눈감고 통과한 것**일 가능성이 있다. 지금 입증된 것은
 > "두 CoreBase 값에서 `connect('RISC-V')` 가 2회차에 예외 없이 끝난다" 뿐이다.
 > DM register·hart·PC·halt/resume 은 아직 검증 전이므로 **"두 DM 모두 접근 가능"
 > 같은 표현은 과하다.** 정확히는 **"J-Link connect 후보로 통과했다"** 이다.
@@ -50,7 +54,8 @@ SiFive **E76** 기반 RISC-V SSD 컨트롤러에 퍼저를 올리기 위한 작�
 | 파일 | 역할 |
 |---|---|
 | **`sfe76_link.py`** | **연결 계층 — 정식 모듈.** 연결 지식의 단일 출처. 샘플러도 여기를 쓴다 |
-| **`verify_halt_pc.py`** | **halt / PC / resume 검증** ← 지금 할 일 |
+| **`find_haltable.py`** | **실제로 halt 되는 (CoreBase, hart) 조합 찾기** ← 지금 할 일 |
+| **`verify_halt_pc.py`** | halt / PC / resume 검증 (halt 되는 조합을 찾은 뒤) |
 | **`diagnose_connect.py`** | 첫 connect 실패 **근본원인** (D 세션지속성 / E 장치명 / F 하트) |
 | `SF_E76_config.JLinkScript` | `ConfigTargetSettings()` 정식 설정 (미해결 항목 있음) |
 | `BRINGUP_riscv_v10.md` | 조사 노트 (사실 / 추론 / 열린 질문) |
@@ -133,7 +138,10 @@ aperture 레이아웃을 확보한 뒤에만.
 sudo python3 sfe76_link.py
 sudo python3 sfe76_link.py --core-base 0x81481000     # Ncore
 
-# 지금 할 일 — halt / PC / resume
+# 지금 할 일 — halt 되는 조합 찾기
+sudo python3 find_haltable.py
+
+# 그다음 — halt / PC / resume
 #   ★ 먼저 Ncore(0x81481000) 로 검증한다. 단일 하트라 변수가 적다.
 #     0x81480000 은 4코어 공유라 hart 선택까지 얽혀 원인 분리가 어렵다.
 #   1단계 — PC 레지스터 후보 조사 (샘플링 안 함)

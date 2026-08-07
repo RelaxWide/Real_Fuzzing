@@ -294,22 +294,34 @@ class Link:
 
     # ── G4: resume ───────────────────────────────────────────────────
     def resume_checked(self, timeout=STATE_TIMEOUT):
-        """실패하면 recovery_required 를 세우고 예외를 던진다."""
-        err = None
-        for fn in ('restart', 'go'):
-            try:
-                r = getattr(self.jl, fn)()
-            except Exception as e:
-                err = f"{fn}() 예외: {e}"
-                continue
-            if r is False:
-                err = f"{fn}() 가 False 반환"
-                continue
-            if self._wait_halted(False, timeout):
-                return True
-            err = f"{fn}() 후에도 halted 상태 유지"
+        """실패하면 recovery_required 를 세우고 예외를 던진다.
+
+        ⚠ pylink 에 `go()` 는 없다. `restart()` 뿐이고, 문서상
+        **"This is a no-op if the CPU isn't halted"** 라 halt 상태가 아니면
+        False 를 반환한다. 따라서 `restart() == False` 자체는 실패가 아니다 —
+        **이미 running 이면 성공**이다. (이걸 실패로 오판해 '보드 복구 필요'
+        거짓 경보를 냈던 적이 있다.)
+        """
+        try:
+            if not self.jl.halted():
+                return True          # 이미 running — 할 일 없음
+        except Exception:
+            pass                     # 확인 불가 → 아래에서 시도
+
+        try:
+            r = self.jl.restart()
+        except Exception as e:
+            self.recovery_required = True
+            raise LinkError(f"restart() 예외: {e}", EXIT_RESUME_FAIL)
+
+        # 반환값이 아니라 **실제 상태**로 판정한다
+        if self._wait_halted(False, timeout):
+            return True
+
         self.recovery_required = True
-        raise LinkError(f"resume 실패 — 보드 복구(POR) 필요: {err}", EXIT_RESUME_FAIL)
+        raise LinkError(
+            f"resume 실패 — 코어가 halted 로 남았다 (restart 반환={r}). "
+            f"보드 복구(POR) 필요", EXIT_RESUME_FAIL)
 
     # ── 정리 ─────────────────────────────────────────────────────────
     def close(self):
@@ -320,7 +332,10 @@ class Link:
             try:
                 still_halted = bool(self.jl.halted())
             except Exception:
-                still_halted = True      # 모르면 시도한다
+                # 확인 불가 시 억지로 resume 하지 않는다. halt 가 애초에
+                # 실패했으면 멈춘 적이 없고, 그때 restart() 는 no-op False 를
+                # 돌려줘 '복구 필요' 거짓 경보를 만든다.
+                still_halted = False
             if still_halted:
                 try:
                     self.resume_checked()
