@@ -1,0 +1,207 @@
+/*********************************************************************
+*  SF-E76 (RISC-V) — cJTAG + ARM DAP 연결 진단 스크립트
+*
+*  목적: J-Link 의 자동 식별을 거치지 않고, T32 가 내부적으로 하는
+*        ARM ADI 표준 절차를 명시적으로 수행해 어느 단계까지 살아있는지 본다.
+*
+*  배경(실측):
+*    - cJTAG 10MHz 에서 TAP 응답 확인: TotalIRLen=4, IRPrint=0x01
+*    - 그런데 IDCODE 가 0x00000001 로 읽히고 J-Link 이 "Unknown device" →
+*      "Assuming RISC-V TAP with DTM setup" 으로 오판 → dtmcs 가 전부 0 →
+*      debug 0.11 / AddrBits 0 같은 무효값 → "CPU could not be halted"
+*    - 실제 토폴로지는 cJTAG → ARM DP → AP → APB → RISC-V DM (T32 설정 기준)
+*    - IRLen=4 + IRPrint=0x01 은 ARM DAP 의 서명 (RISC-V DTM 은 보통 IRLen=5)
+*
+*  이 스크립트는 "연결"이 아니라 "진단"이 1차 목표다.
+*  아래 4단계 각각의 예/아니오가 다음 행동을 결정한다:
+*    1) DPIDR 이 정상값인가       → 아니면 cJTAG 스캔 포맷 문제 (SEGGER 문의)
+*    2) 디버그 전원 ACK 가 서는가 → 아니면 전원/인증 게이팅 (벤더 문의)
+*    3) AP 가 실재하는가          → AP 번호 매핑 검증
+*    4) 코어 디버그 블록이 읽히는가 → 주소 검증
+*
+*  사용법:
+*    JLinkExe -if cJTAG -speed 10000 -device <아무거나> \
+*             -JLinkScriptFile SF_E76_cJTAG_probe.JLinkScript
+*    (device 는 식별에 실패해도 무방 — InitTarget 이 먼저 실행된다)
+*********************************************************************/
+
+/*---------------------------------------------------------------------
+*  설정값 — 실측/T32 스크립트에서 가져온 값. 필요 시 여기만 수정.
+*--------------------------------------------------------------------*/
+// TAP: 단일 TAP, IRLen 4 (실측 TotalIRLen=4)
+//   체인에 다른 TAP 이 있으면 IRPre/IRPost/DRPre/DRPost 를 채울 것.
+//   (T32 스크립트에 IRPRE/IRPOST/DRPRE/DRPOST 가 없었으므로 단일 TAP 으로 가정)
+
+// 코어 디버그 base (T32 SYStem.CONFIG.COREDEBUG.Base, APB 공간)
+//   hcore / CMCore / Fcore0 / QCore : 0x81480000
+//   Ncore                            : 0x81481000
+__constant U32 _COREDEBUG_BASE_A = 0x81480000;
+__constant U32 _COREDEBUG_BASE_B = 0x81481000;
+
+// MEM-AP CSW: 32-bit 접근, 자동증가 off, DbgSwEnable
+//   APB-AP 에서 안 되면 0x23000052 / 0x00000002 도 시도해볼 것.
+__constant U32 _CSW_32BIT = 0x80000002;
+
+/*---------------------------------------------------------------------
+*  DP 레지스터 인덱스 (SEGGER CORESIGHT API 기준)
+*    0 = DPIDR(read) / ABORT(write)
+*    1 = CTRL/STAT
+*    2 = SELECT
+*    3 = RDBUFF
+*  AP 레지스터 인덱스 (현재 SELECT 로 지정된 뱅크 내)
+*    0 = CSW, 1 = TAR, 3 = DRW   (IDR 은 뱅크 0xF 의 인덱스 3)
+*--------------------------------------------------------------------*/
+
+/*********************************************************************
+*  _DapSelect — DP SELECT 로 APSEL + 레지스터 뱅크 지정
+*********************************************************************/
+void _DapSelect(U32 ApSel, U32 Bank) {
+  JLINK_CORESIGHT_WriteDP(2, (ApSel << 24) | ((Bank & 0xF) << 4));
+}
+
+/*********************************************************************
+*  _ApReadIDR — AP 의 IDR(오프셋 0xFC, 뱅크 0xF) 읽기
+*    반환 0 = 그 APSEL 에 AP 가 없음
+*********************************************************************/
+U32 _ApReadIDR(U32 ApSel) {
+  U32 v;
+  _DapSelect(ApSel, 0xF);
+  JLINK_CORESIGHT_ReadAP(3);          // AP 읽기는 파이프라인 → 첫 읽기 버림
+  v = JLINK_CORESIGHT_ReadAP(3);
+  return v;
+}
+
+/*********************************************************************
+*  _ApMemRead32 — MEM-AP 를 통해 32비트 메모리 읽기
+*********************************************************************/
+U32 _ApMemRead32(U32 ApSel, U32 Addr) {
+  U32 v;
+  _DapSelect(ApSel, 0x0);             // 뱅크 0 = CSW/TAR/DRW
+  JLINK_CORESIGHT_WriteAP(0, _CSW_32BIT);   // CSW
+  JLINK_CORESIGHT_WriteAP(1, Addr);         // TAR
+  JLINK_CORESIGHT_ReadAP(3);                // DRW — 첫 읽기 버림
+  v = JLINK_CORESIGHT_ReadAP(3);
+  return v;
+}
+
+/*********************************************************************
+*  InitTarget — J-Link 자동 식별 이전에 호출된다
+*********************************************************************/
+int InitTarget(void) {
+  U32 v;
+  U32 ctrl;
+  U32 idr;
+  U32 ap;
+  U32 base;
+  U32 i;
+  int PowerOk;
+
+  JLINK_SYS_Report("");
+  JLINK_SYS_Report("==================================================");
+  JLINK_SYS_Report(" SF-E76 cJTAG + ARM DAP 진단 시작");
+  JLINK_SYS_Report("==================================================");
+
+  /*-------------------------------------------------------------------
+  * [1] DAP 설정 — 단일 TAP, IRLen 4
+  *-----------------------------------------------------------------*/
+  JLINK_CORESIGHT_Configure("IRPre=0;DRPre=0;IRPost=0;DRPost=0;IRLenDevice=4");
+  JLINK_SYS_Report("[1] CORESIGHT_Configure: IRLenDevice=4, 단일 TAP");
+
+  /*-------------------------------------------------------------------
+  * [2] DPIDR 읽기 — ARM DAP 인지 판정
+  *     정상: 상위에 제조사/파트, 하위에 버전. ARM 이면 흔히 0x?BA0?477 꼴.
+  *     0x00000000 / 0xFFFFFFFF / 0x00000001 → 스캔이 깨진 것
+  *-----------------------------------------------------------------*/
+  v = JLINK_CORESIGHT_ReadDP(0);
+  JLINK_SYS_Report1("[2] DPIDR                    = ", v);
+  if ((v == 0x00000000) || (v == 0xFFFFFFFF) || (v == 0x00000001)) {
+    JLINK_SYS_Report("    >> 무효값. cJTAG 스캔 포맷 불일치 가능성 (SEGGER 문의 대상)");
+    JLINK_SYS_Report("    >> T32 CJTAGFLAGS = NOKEEPER USEOAC — J-Link 활성화 방식과 다를 수 있음");
+  } else {
+    JLINK_SYS_Report("    >> 유효한 DPIDR. ARM DAP 로 확정.");
+  }
+
+  /*-------------------------------------------------------------------
+  * [3] sticky error 클리어 + 디버그 도메인 전원 인가
+  *     ARM DAP 는 CDBGPWRUPREQ|CSYSPWRUPREQ 없이는 AP 접근이 전부 0/에러.
+  *     J-Link 은 이 칩을 RISC-V 로 오판해서 이 절차를 아예 안 탄다.
+  *     (기존 ARM 제품의 r8_pcsr_jtag.cfg 의 dpreg 4 0x50000000 과 동일)
+  *-----------------------------------------------------------------*/
+  JLINK_CORESIGHT_WriteDP(0, 0x0000001E);      // ABORT: sticky 전부 클리어
+  JLINK_CORESIGHT_WriteDP(1, 0x50000000);      // CTRL/STAT: CSYSPWRUPREQ|CDBGPWRUPREQ
+
+  PowerOk = 0;
+  i = 0;
+  while (i < 10) {
+    JLINK_SYS_Sleep(10);
+    ctrl = JLINK_CORESIGHT_ReadDP(1);
+    // ACK 비트: CSYSPWRUPACK(bit31) | CDBGPWRUPACK(bit29) = 0xA0000000
+    if ((ctrl & 0xA0000000) == 0xA0000000) {
+      PowerOk = 1;
+      i = 10;
+    }
+    i = i + 1;
+  }
+  JLINK_SYS_Report1("[3] CTRL/STAT (전원 인가 후) = ", ctrl);
+  if (PowerOk == 1) {
+    JLINK_SYS_Report("    >> 디버그 전원 ACK 확인 (CSYSPWRUPACK|CDBGPWRUPACK)");
+  } else {
+    JLINK_SYS_Report("    >> 전원 ACK 없음. 디버그 도메인 게이팅/인증 의심 (벤더 문의 대상)");
+  }
+  if ((ctrl & 0x000000A0) != 0) {
+    JLINK_SYS_Report("    >> STICKYERR/STICKYORUN 발생 — 접근이 거부되고 있음");
+  }
+
+  /*-------------------------------------------------------------------
+  * [4] AP 열거 — APSEL 0..7 의 IDR 을 읽어 실재 여부와 종류 확인
+  *     T32 설정 추론: DP:0x10000→AP1, 0x20000→AP2, 0x30000→AP3(AXI),
+  *                    0x40000→AP4(AHB), 0x50000→AP5, 0x60000→AP6
+  *     IDR != 0 인 APSEL 이 그 추론과 맞는지 본다.
+  *     IDR[3:0] TYPE: 1=AMBA AHB, 2=AMBA APB, 4=AMBA AXI
+  *-----------------------------------------------------------------*/
+  JLINK_SYS_Report("[4] AP 열거 (APSEL 0..7):");
+  ap = 0;
+  while (ap < 8) {
+    idr = _ApReadIDR(ap);
+    if (idr != 0) {
+      JLINK_SYS_Report1("    APSEL ", ap);
+      JLINK_SYS_Report1("      IDR = ", idr);
+    }
+    ap = ap + 1;
+  }
+  JLINK_SYS_Report("    (아무것도 안 나오면 [3] 전원 단계부터 실패한 것)");
+
+  /*-------------------------------------------------------------------
+  * [5] 코어 디버그 블록 접근 — APBAP 후보로 0x81480000 읽기
+  *     CoreSight 컴포넌트면 ID 레지스터로 자기 정체를 밝힌다:
+  *       +0xFCC DEVTYPE, +0xFE0~0xFEC PIDR, +0xFF0~0xFFC CIDR
+  *     CIDR 서명: 0x0D / 0x?0 / 0x05 / 0xB1
+  *-----------------------------------------------------------------*/
+  JLINK_SYS_Report("[5] 코어 디버그 블록 접근 (APSEL 1,2,5,6 x base A/B):");
+  ap = 1;
+  while (ap < 7) {
+    if ((ap == 1) || (ap == 2) || (ap == 5) || (ap == 6)) {
+      base = _COREDEBUG_BASE_A;
+      v = _ApMemRead32(ap, base + 0xFF0);      // CIDR0
+      JLINK_SYS_Report1("    APSEL ", ap);
+      JLINK_SYS_Report1("      0x81480000+0xFF0 (CIDR0) = ", v);
+      v = _ApMemRead32(ap, base + 0xFCC);      // DEVTYPE
+      JLINK_SYS_Report1("      0x81480000+0xFCC (DEVTYPE)= ", v);
+    }
+    ap = ap + 1;
+  }
+
+  JLINK_SYS_Report("--------------------------------------------------");
+  JLINK_SYS_Report(" 판정 가이드");
+  JLINK_SYS_Report("  [2] 무효 -> cJTAG 스캔 포맷 (SEGGER)");
+  JLINK_SYS_Report("  [3] 실패 -> 디버그 전원/인증 (벤더)");
+  JLINK_SYS_Report("  [4] 공백 -> AP 매핑 또는 전원");
+  JLINK_SYS_Report("  [5] CIDR0=0x0D -> CoreSight 확인, 주소 정확");
+  JLINK_SYS_Report("==================================================");
+  JLINK_SYS_Report("");
+
+  // 0 = J-Link 의 통상 connect 절차를 계속 진행(그 뒤 실패해도 위 진단은 남는다)
+  // 1 = 스크립트가 전부 처리했다고 알리고 자동 식별을 건너뜀
+  //     → [2]~[5] 가 전부 통과하면 1 로 바꿔 시도해볼 것
+  return 0;
+}
