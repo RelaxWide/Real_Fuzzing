@@ -149,6 +149,10 @@ def main():
                     help="cJTAG 활성화 모드 고정 (기본: 0,1,2 전부 시도)")
     ap.add_argument('--apb', type=int, default=None,
                     help="APB-AP 인덱스 고정 (0~5)")
+    ap.add_argument('--first', action='store_true',
+                    help="첫 성공에서 중단 (기본: 전수 탐색해 전체 맵을 만든다)")
+    ap.add_argument('--harts', type=int, default=5,
+                    help="각 성공 조합에서 시도할 하트 수 (기본 5)")
     args = ap.parse_args()
 
     head("SF-E76 J-Link 연결 — SEGGER hybrid DAP 절차")
@@ -173,7 +177,10 @@ def main():
         sys.exit(f"J-Link open 실패: {e}\n  (다른 프로그램이 점유 중인지 확인)")
     print(f"\n  J-Link  : {jl.product_name}  SN={jl.serial_number}")
 
-    found = None
+    # ★ 전수 탐색. 첫 성공에서 멈추면 '다른 코어는 어디 붙어 있나' 를 영영 모른다.
+    #   실제로 0x81480000(hcore/CMCore/Fcore0/QCore)은 APBAP1 하나만 시도하고
+    #   끝나버렸다 — 나머지 AP 뒤에 있을 수 있다.
+    hits = []
     try:
         for cj in cjtag_list:
             for apb in apb_list:
@@ -182,13 +189,12 @@ def main():
                     continue
                 for label, base in CORE_BASES:
                     if attempt(jl, args.device, cj, apb, base, label):
-                        found = (cj, apb, base, label)
-                        break
+                        hits.append((cj, apb, base, label))
+                        if args.first:
+                            raise StopIteration
                     time.sleep(0.2)
-                if found:
-                    break
-            if found:
-                break
+    except StopIteration:
+        pass
     finally:
         try:
             jl.close()
@@ -196,10 +202,16 @@ def main():
             pass
 
     head("결과")
-    if found:
-        cj, apb, base, label = found
+    if hits:
+        print(f"  ★ 연결 성공 조합 {len(hits)}개:\n")
+        for cj, apb, base, label in hits:
+            n, a, t = AP_MAP[apb]
+            print(f"    cJTAG={cj}  APB=Index{apb}({n} @0x{a:X})  "
+                  f"CoreBase=0x{base:X}  [{label}]")
+
+        cj, apb, base, label = hits[0]
         n, a, t = AP_MAP[apb]
-        print("  ★ 연결 성공 — 이 설정을 v10.0 샘플러에 그대로 넣으면 된다:")
+        print("\n  첫 조합 기준 v10.0 샘플러 설정:")
         print(f"      SetcJTAGInitMode = {cj}")
         print(f"      set_tif({TIF_CJTAG})   # cJTAG")
         print(f"      set_speed({SPEED_KHZ})")
@@ -208,6 +220,14 @@ def main():
         print(f"      CORESIGHT_SetIndexAPBAPToUse = {apb}   # {n} @0x{a:X}")
         print(f"      CORESIGHT_SetCoreBaseAddr = 0x{base:X}  # {label}")
         print(f"      connect('{args.device}')")
+
+        # 어느 CoreBase 가 안 붙었는지 명시 — 코어 귀속 판단에 중요
+        got = {b for _, _, b, _ in hits}
+        for label, base in CORE_BASES:
+            if base not in got:
+                print(f"\n  ⚠ CoreBase 0x{base:X} ({label}) 은 **어떤 AP 로도 연결 실패**")
+                print("     → 그 코어들이 리셋/정지 상태이거나, 주소·AP 가 다르다.")
+                print("     NVMe 명령을 처리하는 코어가 여기 있으면 반드시 해결해야 한다.")
     else:
         print("  ✗ 모든 조합 실패.")
         print("\n  다음 확인 사항:")
