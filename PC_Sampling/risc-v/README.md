@@ -53,6 +53,7 @@ SiFive **E76** 기반 RISC-V SSD 컨트롤러에 퍼저를 올리기 위한 작�
 
 | 파일 | 역할 |
 |---|---|
+| **`STATUS.md`** | **한 장짜리 현황 + 다음 할 일** ← 여기부터 |
 | **`sfe76_link.py`** | **연결 계층 — 정식 모듈.** 연결 지식의 단일 출처. 샘플러도 여기를 쓴다 |
 | **`find_haltable.py`** | **실제로 halt 되는 (CoreBase, hart) 조합 찾기** ← 지금 할 일 |
 | **`verify_halt_pc.py`** | halt / PC / resume 검증 (halt 되는 조합을 찾은 뒤) |

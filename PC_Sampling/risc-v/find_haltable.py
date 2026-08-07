@@ -40,11 +40,11 @@ VERSION = "2026-08-07.1"
 
 def run_single(a):
     """자식: 한 조합만 시도하고 JSON 한 줄을 출력한다."""
-    rec = {'core_base': f"0x{a.core_base:X}", 'hart': a.hart,
+    rec = {'core_base': f"0x{a.core_base:X}", 'hart': a.hart, 'apb': a.apb,
            'connect': False, 'halt': False, 'resume': False,
            'tries': None, 'error': None, 'recovery_required': False}
     lk = Link(core_base=a.core_base, hart=a.hart, device=a.device,
-              serial=a.serial, verbose=False)
+              serial=a.serial, verbose=False, apb_index=a.apb)
     try:
         with lk:
             lk.connect_checked(tries=a.tries)
@@ -72,10 +72,10 @@ def run_single(a):
     return EXIT_OK if rec['halt'] else EXIT_HALT_FAIL
 
 
-def spawn(core_base, hart, a):
+def spawn(core_base, hart, apb, a):
     cmd = [sys.executable, os.path.abspath(__file__), '--single',
            '--core-base', hex(core_base), '--device', a.device,
-           '--tries', str(a.tries)]
+           '--apb', str(apb), '--tries', str(a.tries)]
     if hart is not None:
         cmd += ['--hart', str(hart)]
     if a.serial:
@@ -105,6 +105,9 @@ def main():
                     help='타깃 전원 사이클 세대 기록용')
     ap.add_argument('--core-base', type=lambda x: int(x, 0), default=CORE_BASE_NCORE)
     ap.add_argument('--hart', type=int, default=None)
+    ap.add_argument('--apb', type=int, default=0, help='CORESIGHT_SetIndexAPBAPToUse')
+    ap.add_argument('--apbs', default="0,1,4,5",
+                    help='훑을 APB-AP 인덱스. 기본 = AP map 의 APB-AP 4개')
     ap.add_argument('--single', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--json', default=None)
     a = ap.parse_args()
@@ -115,9 +118,12 @@ def main():
     bases = [int(x, 0) for x in a.core_bases.split(',') if x.strip()]
     harts = [None if x.strip().lower() == 'none' else int(x)
              for x in a.harts.split(',') if x.strip()]
+    apbs = [int(x) for x in a.apbs.split(',') if x.strip()]
 
     print(f"\n{'=' * 68}\n halt 되는 (CoreBase, hart) 조합 찾기  v{VERSION}\n{'=' * 68}")
-    print(f"  power_cycle_id={a.power_cycle_id}   조합 {len(bases) * len(harts)}개")
+    print(f"  power_cycle_id={a.power_cycle_id}   "
+          f"조합 {len(bases) * len(harts) * len(apbs)}개 "
+          f"(CoreBase {len(bases)} x hart {len(harts)} x APB {len(apbs)})")
     print("  ※ 조합마다 별도 프로세스. connect 성공은 통과 기준이 아니다 — halt 기준.")
 
     rows = []
@@ -125,26 +131,31 @@ def main():
     for base in bases:
         if stop:
             break
-        for hart in harts:
-            label = f"0x{base:X}[{CORE_BASE_LABEL.get(base, '?')}] hart={hart}"
-            print(f"\n  ── {label}")
-            r = spawn(base, hart, a)
-            rows.append(r)
-            mark = ("HALT OK" if r.get('halt') else
-                    "connect만" if r.get('connect') else "connect 실패")
-            print(f"     {mark}"
-                  + (f"  (connect 시도 {r['tries']}회)" if r.get('tries') else "")
-                  + (f"  resume={'OK' if r.get('resume') else 'NG'}" if r.get('halt') else ""))
-            if r.get('regs'):
-                print(f"     regs: {r['regs']}")
-            if r.get('error'):
-                print(f"     err : {str(r['error'])[:110]}")
-            if r.get('recovery_required'):
-                print("     ⚠⚠ 코어가 halt 로 남았을 수 있다 — 여기서 중단한다.")
-                print("        nvme list 확인 후 전원 사이클, 그다음 재개할 것.")
-                stop = True
+        for apb in apbs:
+            if stop:
                 break
-            time.sleep(0.3)
+            for hart in harts:
+                label = (f"0x{base:X}[{CORE_BASE_LABEL.get(base, '?')}] "
+                         f"APB={apb} hart={hart}")
+                print(f"\n  ── {label}")
+                r = spawn(base, hart, apb, a)
+                rows.append(r)
+                mark = ("HALT OK" if r.get('halt') else
+                        "connect만" if r.get('connect') else "connect 실패")
+                print(f"     {mark}"
+                      + (f"  (connect 시도 {r['tries']}회)" if r.get('tries') else "")
+                      + (f"  resume={'OK' if r.get('resume') else 'NG'}"
+                         if r.get('halt') else ""))
+                if r.get('regs'):
+                    print(f"     regs: {r['regs']}")
+                if r.get('error'):
+                    print(f"     err : {str(r['error'])[:110]}")
+                if r.get('recovery_required'):
+                    print("     ⚠⚠ 코어가 halt 로 남았을 수 있다 — 여기서 중단한다.")
+                    print("        nvme list 확인 후 전원 사이클, 그다음 재개할 것.")
+                    stop = True
+                    break
+                time.sleep(0.3)
 
     print(f"\n{'=' * 68}\n 결과\n{'=' * 68}")
     ok = [r for r in rows if r.get('halt')]
@@ -153,7 +164,8 @@ def main():
     if ok:
         print(f"  ★ halt 성공 조합 {len(ok)}개:")
         for r in ok:
-            print(f"      {r['core_base']} hart={r['hart']}  resume={r.get('resume')}")
+            print(f"      {r['core_base']} APB={r.get('apb')} hart={r['hart']}  "
+                  f"resume={r.get('resume')}")
             if r.get('regs'):
                 print(f"        regs {r['regs']}")
         print("\n  → 이 조합으로 verify_halt_pc.py 를 돌린다:")
@@ -161,6 +173,8 @@ def main():
         print(f"      sudo python3 verify_halt_pc.py --core-base {r['core_base']}"
               + (f" --hart {r['hart']}" if r['hart'] is not None else "")
               + " --scan-registers")
+        if r.get('apb') not in (None, 0):
+            print(f"      (APB index {r['apb']} — sfe76_link.APB_INDEX 도 맞출 것)")
     else:
         print("  ✗ halt 되는 조합 없음.")
         print(f"    connect 만 성공한 조합: {len(conn_only)}개")

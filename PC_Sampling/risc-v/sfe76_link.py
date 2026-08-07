@@ -140,9 +140,10 @@ class Link:
     """J-Link 연결 1개 = 설정 1개. 조합을 섞지 않는다."""
 
     def __init__(self, core_base=CORE_BASE_NCORE, hart=None, device=DEVICE,
-                 speed=SPEED_KHZ, serial=None, verbose=True):
+                 speed=SPEED_KHZ, serial=None, verbose=True, apb_index=APB_INDEX):
         self.core_base = core_base
         self.hart = hart
+        self.apb_index = apb_index
         self.device = device
         self.speed = speed
         self.serial = serial
@@ -172,7 +173,7 @@ class Link:
         m = {
             'version': VERSION,
             'device': self.device, 'tif': TIF_CJTAG, 'speed_khz': self.speed,
-            'cjtag_mode': CJTAG_MODE, 'apb_index': APB_INDEX,
+            'cjtag_mode': CJTAG_MODE, 'apb_index': self.apb_index,
             'core_base': f"0x{self.core_base:X}",
             'core_base_label': CORE_BASE_LABEL.get(self.core_base, '?'),
             'hart': self.hart,
@@ -213,7 +214,7 @@ class Link:
             jl.set_speed(self.speed)
             for i, (_n, addr, typ) in enumerate(AP_MAP):
                 jl.exec_command(f"CORESIGHT_AddAP = Index={i} Type={typ} Addr=0x{addr:X}")
-            jl.exec_command(f"CORESIGHT_SetIndexAPBAPToUse = {APB_INDEX}")
+            jl.exec_command(f"CORESIGHT_SetIndexAPBAPToUse = {self.apb_index}")
             jl.exec_command(f"CORESIGHT_SetCoreBaseAddr = 0x{self.core_base:X}")
             if self.hart is not None:
                 jl.exec_command(f"RISCV_SetHartSel = {self.hart}")
