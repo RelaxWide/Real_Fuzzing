@@ -119,7 +119,14 @@ def verify(jl):
     return "  ".join(info) if info else "(확인 불가)"
 
 
-def attempt(jl, device, cjtag_mode, apb_index, core_base, core_label):
+def attempt(device, cjtag_mode, apb_index, core_base, core_label):
+    """★ 조합마다 J-Link 을 새로 열고 닫는다.
+
+    핸들을 재사용하면 한 번 connect 가 성공한 뒤 DLL 이 연결 상태로 남아
+    **이후 조합이 설정과 무관하게 전부 성공**한다. 실제로 그래서 24개 중
+    23개가 '성공'으로 나왔다(2번째에서 진짜 성공한 뒤 전부 딸려온 것).
+    격리하지 않으면 이 스윕은 아무 정보도 주지 못한다.
+    """
     name, addr, typ = AP_MAP[apb_index]
     print(f"\n{'-' * 66}")
     print(f" cJTAG={cjtag_mode}({CJTAG_MODES[cjtag_mode]})  "
@@ -127,18 +134,31 @@ def attempt(jl, device, cjtag_mode, apb_index, core_base, core_label):
     print(f" CoreBase=0x{core_base:X} ({core_label})  device={device}")
     print(f"{'-' * 66}")
 
-    if not setup(jl, cjtag_mode, apb_index, core_base):
-        print("  설정 단계 실패 — 다음 조합")
-        return False
+    jl = pylink.JLink()
+    try:
+        jl.open()
+    except Exception as e:
+        print(f"  J-Link open 실패: {e}")
+        return None
 
     try:
-        jl.connect(device, speed=SPEED_KHZ)
-    except Exception as e:
-        print(f"  connect 실패: {e}")
-        return False
-
-    print(f"  ★★★ connect 성공!  {verify(jl)}")
-    return True
+        if not setup(jl, cjtag_mode, apb_index, core_base):
+            print("  설정 단계 실패")
+            return None
+        try:
+            jl.connect(device, speed=SPEED_KHZ)
+        except Exception as e:
+            print(f"  connect 실패: {e}")
+            return None
+        info = verify(jl)
+        print(f"  ★★★ connect 성공!  {info}")
+        return info
+    finally:
+        try:
+            jl.close()
+        except Exception:
+            pass
+        time.sleep(0.3)      # DLL 이 핸들을 완전히 놓을 시간
 
 
 def main():
@@ -170,13 +190,6 @@ def main():
     cjtag_list = [args.cjtag] if args.cjtag is not None else [0, 1, 2]
     apb_list = [args.apb] if args.apb is not None else range(len(AP_MAP))
 
-    jl = pylink.JLink()
-    try:
-        jl.open()
-    except Exception as e:
-        sys.exit(f"J-Link open 실패: {e}\n  (다른 프로그램이 점유 중인지 확인)")
-    print(f"\n  J-Link  : {jl.product_name}  SN={jl.serial_number}")
-
     # ★ 전수 탐색. 첫 성공에서 멈추면 '다른 코어는 어디 붙어 있나' 를 영영 모른다.
     #   실제로 0x81480000(hcore/CMCore/Fcore0/QCore)은 APBAP1 하나만 시도하고
     #   끝나버렸다 — 나머지 AP 뒤에 있을 수 있다.
@@ -188,30 +201,44 @@ def main():
                 if AP_MAP[apb][2] != "APB-AP":
                     continue
                 for label, base in CORE_BASES:
-                    if attempt(jl, args.device, cj, apb, base, label):
-                        hits.append((cj, apb, base, label))
+                    info = attempt(args.device, cj, apb, base, label)
+                    if info is not None:
+                        hits.append((cj, apb, base, label, info))
                         if args.first:
                             raise StopIteration
-                    time.sleep(0.2)
     except StopIteration:
         pass
-    finally:
-        try:
-            jl.close()
-        except Exception:
-            pass
 
     head("결과")
     if hits:
-        print(f"  ★ 연결 성공 조합 {len(hits)}개:\n")
-        for cj, apb, base, label in hits:
-            n, a, t = AP_MAP[apb]
-            print(f"    cJTAG={cj}  APB=Index{apb}({n} @0x{a:X})  "
-                  f"CoreBase=0x{base:X}  [{label}]")
+        print(f"  ★ 연결 성공 조합 {len(hits)}개 (조합마다 J-Link 재연결 = 독립 결과)\n")
+        by_base = {}
+        for cj, apb, base, label, info in hits:
+            by_base.setdefault(base, []).append((cj, apb, label, info))
 
-        cj, apb, base, label = hits[0]
+        for label, base in CORE_BASES:
+            rows = by_base.get(base, [])
+            print(f"  CoreBase 0x{base:X}  [{label}]  — 성공 {len(rows)}개")
+            for cj, apb, _l, info in rows:
+                n, a, t = AP_MAP[apb]
+                print(f"      cJTAG={cj}  APB=Index{apb}({n} @0x{a:X})   {info}")
+            if not rows:
+                print("      ✗ 어떤 조합으로도 연결 실패")
+            print()
+
+        # ★ 샘플러 설정은 '원하는 코어' 기준으로 고른다.
+        #   hcore 계열(0x81480000)이 NVMe 프론트엔드일 가능성이 높으므로 우선.
+        pick = None
+        for label, base in CORE_BASES:
+            if by_base.get(base):
+                cj, apb, _l, _i = by_base[base][0]
+                pick = (cj, apb, base, label)
+                if base == 0x81480000:      # 선호 대상이면 즉시 확정
+                    break
+        cj, apb, base, label = pick
         n, a, t = AP_MAP[apb]
-        print("\n  첫 조합 기준 v10.0 샘플러 설정:")
+        print(f"  선택: CoreBase=0x{base:X} [{label}]  (--apb/--cjtag 로 다른 조합 지정 가능)")
+        print("\n  v10.0 샘플러 설정:")
         print(f"      SetcJTAGInitMode = {cj}")
         print(f"      set_tif({TIF_CJTAG})   # cJTAG")
         print(f"      set_speed({SPEED_KHZ})")
@@ -222,7 +249,7 @@ def main():
         print(f"      connect('{args.device}')")
 
         # 어느 CoreBase 가 안 붙었는지 명시 — 코어 귀속 판단에 중요
-        got = {b for _, _, b, _ in hits}
+        got = {h[2] for h in hits}
         for label, base in CORE_BASES:
             if base not in got:
                 print(f"\n  ⚠ CoreBase 0x{base:X} ({label}) 은 **어떤 AP 로도 연결 실패**")
