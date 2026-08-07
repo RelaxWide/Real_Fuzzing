@@ -176,23 +176,28 @@ def stage2_connect(jl, tif, speed):
     return True
 
 
-def stage3_coresight(jl):
-    head("[3] CoreSight 초기화")
+def stage3_coresight(jl, tif_init):
+    """CoreSight 초기화.
+
+    perform_tif_init=True 는 인터페이스를 재초기화하는데, 그게 **cJTAG 활성화
+    상태를 날릴 수 있다**(2선 모드 → 4선 복귀). 스캔은 도는데 데이터가 전부 0 인
+    지금 증상과 부합해서 False 도 시도한다.
+    """
+    head(f"[3] CoreSight 초기화 (perform_tif_init={tif_init})")
     try:
         sig = inspect.signature(jl.coresight_configure)
         print(f"  coresight_configure{sig}")
     except Exception:
         pass
 
-    # 단일 TAP, IRLen=4 (실측 TotalIRLen=4)
-    for kwargs in ({'ir_pre': 0, 'dr_pre': 0, 'ir_post': 0, 'dr_post': 0, 'ir_len': 4},
-                   {}):
+    base = {'ir_pre': 0, 'dr_pre': 0, 'ir_post': 0, 'dr_post': 0, 'ir_len': 4}
+    for kwargs in (dict(base, perform_tif_init=tif_init), base, {}):
         try:
             jl.coresight_configure(**kwargs)
             print(f"  ✅ coresight_configure({kwargs or '기본값'}) 성공")
             return True
         except Exception as e:
-            print(f"  ❌ coresight_configure({kwargs or '기본값'}) 실패: {e}")
+            print(f"  ❌ coresight_configure(...) 실패: {e}")
     return False
 
 
@@ -290,6 +295,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--tif', type=int, default=None, help='TIF 값 직접 지정 (cJTAG 후보)')
     ap.add_argument('--speed', type=int, default=10000, help='kHz (기본 10000 — 낮추면 cJTAG 실패)')
+    ap.add_argument('--device', default='RISC-V', help='connect() 시도용 장치명 (실패해도 무방)')
     args = ap.parse_args()
 
     head("SF-E76 cJTAG + ARM DAP 진단 (pylink)")
@@ -308,24 +314,37 @@ def main():
 
     try:
         candidates = stage1_tifs(jl, args.tif)
-        ok_tif = None
+        ok = None
+        # (TIF, perform_tif_init, connect 선행) 조합을 훑는다
         for tif in candidates:
-            print(f"\n{'#' * 62}\n#  TIF {tif} 시도\n{'#' * 62}")
-            if not stage2_connect(jl, tif, args.speed):
-                continue
-            if not stage3_coresight(jl):
-                print("  CoreSight 초기화 실패 — 다음 후보로")
-                continue
-            if stage4_dp(jl):
-                ok_tif = tif
+            for tif_init in (True, False):
+                for do_conn in (False, True):
+                    tag = f"TIF={tif} tif_init={tif_init} connect={do_conn}"
+                    print(f"\n{'#' * 62}\n#  {tag}\n{'#' * 62}")
+                    if not stage2_connect(jl, tif, args.speed):
+                        continue
+                    if do_conn:
+                        try:
+                            jl.connect(args.device)
+                            print(f"  ✅ connect('{args.device}') 성공")
+                        except Exception as e:
+                            print(f"  ⚠ connect('{args.device}') 실패(무시하고 진행): {e}")
+                    if not stage3_coresight(jl, tif_init):
+                        continue
+                    if stage4_dp(jl):
+                        ok = tag
+                        break
+                    print(f"  {tag}: DP 접근 실패")
+                if ok:
+                    break
+            if ok:
                 break
-            print(f"  TIF {tif}: DP 접근 실패 — 다음 후보로")
 
-        if ok_tif is None:
-            print(f"\n  ❌ 모든 TIF 후보 {candidates} 에서 DP 접근 실패")
-            print("     → DPIDR 이 한 번도 안 읽혔다. 아래 판정 가이드 참조")
+        if ok is None:
+            print(f"\n  ❌ 모든 조합에서 DP 접근 실패 (후보 TIF {candidates})")
+            print("     → DPIDR 이 한 번도 안 읽혔다. SEGGER 문의 단계.")
             return
-        print(f"\n  ✅ TIF {ok_tif} 에서 DP 접근 성공 — 이후 이 값을 쓸 것")
+        print(f"\n  ✅ 성공 조합: {ok}")
         live = stage5_aps(jl)
         stage6_mem(jl, live)
     finally:
