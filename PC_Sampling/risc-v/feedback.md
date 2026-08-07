@@ -1099,3 +1099,180 @@ P1 통과 후 순서:
 3. **JLinkScript의 `_CORE_BASE`/`_APB_INDEX` 하드코딩 불일치를 없앤다.**
 
 이 세 가지가 해결되기 전 `verify_halt_pc.py`의 성공 출력은 G2~G4의 증거로 사용하면 안 된다.
+
+---
+
+## 11. 2026-08-07 추가 검토 — T32 커버리지는 확인됐고 halt 방식은 아님
+
+### 11.1 새로 확인된 전제
+
+사용자가 다음 사실을 확인했다.
+
+- 기존 ARM 제품에서 사용하던 T32 커버리지 스크립트를 RISC-V 제품용으로 수정했다.
+- 그 스크립트로 이 RISC-V 제품의 코드 커버리지가 실제로 측정되는 것을 확인했다.
+- 해당 방식은 반복적인 `halt → PC read → resume` 방식이 아니다.
+- 다만 현재 저장소에는 실제 T32 PRACTICE/CMM 스크립트가 없고, 정확한 수집 방식도 아직 식별되지 않았다.
+
+이 사실은 feasibility 판단을 크게 바꾼다. 타깃이 코드 실행 정보를 외부로 제공할 수 있다는
+점과, T32가 그 경로를 실제로 초기화할 수 있다는 점은 이미 입증됐다. 이제 핵심 질문은
+"J-Link로 halt가 되는가"가 아니라 다음이다.
+
+> T32가 어느 하드웨어/펌웨어 메커니즘으로 커버리지를 얻고 있으며, 그 메커니즘을 현재
+> J-Link 하드웨어와 SEGGER 소프트웨어가 지원하는가?
+
+### 11.2 현재 STATUS의 방향은 수정해야 한다
+
+현재 `STATUS.md`는 아래 흐름을 크리티컬 패스로 둔다.
+
+```text
+connect → halt → PC read → resume → 반복 PC sampling
+```
+
+이 흐름은 기존 `JLinkHaltSampler`를 가장 적은 코드 변경으로 재사용하는 대안으로는 유효하다.
+그러나 T32에서 확인된 실제 커버리지 방식이 halt가 아니라는 사실을 반영하면, 이것을 유일한
+주 경로 또는 v10.0 착수 조건으로 두는 것은 맞지 않다.
+
+특히 다음 표현은 현 상태와 맞지 않는다.
+
+- `v10.0 샘플러 착수 조건 = G4(halt/PC/resume)`
+- `find_haltable.py`가 지금 할 일
+- Nexus trace는 크리티컬 패스가 아닌 병행 트랙
+- `halt()` 실패가 곧 코드 커버리지 경로의 실패
+
+`halt()` 실패는 **J-Link CPU run-control 연결이 완성되지 않았다는 증거**다. 그러나 T32
+커버리지가 trace나 instrumentation 기반이라면, halt 기반 PC sampling의 실패와 전체
+커버리지 feasibility는 동일한 문제가 아니다.
+
+따라서 당분간 `find_haltable.py`의 CoreBase × hart × APB 전체 스윕은 보류한다. 정확한 T32
+방식을 모른 채 halt 후보를 넓히는 것은 T32에서 성공한 경로를 재현하는 작업이 아니다.
+
+### 11.3 먼저 구분해야 할 커버리지 방식
+
+T32 스크립트와 실행 로그에서 아래 중 어느 방식인지 판별한다.
+
+| T32 방식 | 확인할 흔적 | SEGGER 쪽 후보 | 현재 판단 |
+|---|---|---|---|
+| 펌웨어 instrumentation bitmap | 계측 빌드, RAM bitmap/counter, 메모리 dump/read | J-Link 메모리 주기 읽기 | **가능성 높음.** CPU halt가 불필요할 수 있음 |
+| 온칩 Nexus/N-Trace SRAM buffer | Nexus/Trace Encoder, SRAM sink, trace buffer 설정 | `RISCV_SetTEBaseAddr`, `RISCV_SetSRAMBaseAddr`, trace source 설정 | **가능성 있음.** 정확한 TE/sink/AP 주소 필요 |
+| ATB를 통한 온칩 trace sink | Nexus/N-Trace, ATB/funnel 설정 | `RISCV_UseNexusViaATB`, `RISCV_SetATBBaseAddr`, `RISCV_SetTFBaseAddr` | **가능성 있음.** SoC trace 토폴로지 필요 |
+| 외부 핀 streaming trace | TRACE32 trace probe/포트, PIB, 연속 program flow | **J-Trace PRO RISC-V** + trace 핀 | 일반 J-Link만으로는 불가 |
+| 디버거 내부의 다른 sampling/profiling | 주기적 샘플, snooper/profiler 명령 | 동일 기능 또는 별도 SDK 구현 | 스크립트 확인 전 판단 불가 |
+
+SEGGER 문서는 streaming trace 기반 code coverage에 **J-Trace PRO가 필요하고 일반 J-Link
+모델에서는 지원하지 않는다**고 명시한다. 따라서 "J-Link로 한다"가 일반 J-Link probe를
+뜻하는지, J-Link 소프트웨어/DLL 생태계와 J-Trace 하드웨어까지 포함하는지 구분해야 한다.
+
+공식 근거:
+
+- SEGGER J-Link/J-Trace User Guide — streaming trace code coverage에는 J-Trace PRO 필요:
+  https://kb.segger.com/UM08001_J-Link_/_J-Trace_User_Guide
+- J-Trace PRO RISC-V — RISC-V live code coverage와 SiFive E-series trace 지원:
+  https://www.segger.com/products/debug-probes/j-trace/models/j-trace-pro-risc-v/
+- SEGGER command strings — RISC-V TE, SRAM/ATB/PIB/funnel sink 설정 명령:
+  https://kb.segger.com/J-Link_command_strings
+- Lauterbach — SiFive RISC-V Nexus program/data trace 지원:
+  https://repo.lauterbach.com/news_514.html
+
+`RISCV_SetTEBaseAddr` 명령이 존재한다는 사실만으로 현재 J-Link probe에서 코드 커버리지가
+된다고 결론 내리면 안 된다. trace encoder뿐 아니라 sink 종류, trace 데이터 회수 경로,
+probe 모델, 핀 배선, 디코더 지원이 모두 맞아야 한다.
+
+### 11.4 새 크리티컬 패스
+
+#### P0 — 실제 T32 스크립트와 측정 증거 확보
+
+다음 파일과 정보를 `risc-v/` 아래에 보존한다.
+
+1. 실제 실행한 `.cmm`/PRACTICE 스크립트 전체와 `DO`/include 체인
+2. 실행한 T32 제품 및 trace probe 모델
+3. 커버리지 시작·정지·저장에 사용한 명령 로그
+4. T32 trace/coverage 설정 창의 설정값 또는 텍스트 export
+5. coverage 결과 예시와 대상 ELF/심볼/빌드 정보
+6. 타깃 펌웨어가 coverage instrumentation 빌드인지 일반 빌드인지
+7. 디버그 커넥터 외 별도 trace 케이블/포트를 사용했는지
+8. T32가 읽는 trace buffer 또는 bitmap의 주소
+
+이 파일이 없으면 현재 문서의 AP/COREDEBUG/Data.Set 일부만으로 수집 방식을 복원할 수 없다.
+
+#### P1 — T32 스크립트에서 두 계층을 분리
+
+스크립트를 다음 두 덩어리로 나눠 분석한다.
+
+```text
+[A] debug/control 연결
+    cJTAG activation, DP/AP, reset, unlock, DM/hart/core selection
+
+[B] coverage data path
+    instrumentation memory 또는 trace encoder → funnel/sink → probe/host
+```
+
+현재 작업은 [A]의 일부를 J-Link로 옮기면서 halt를 합격 기준으로 삼았다. 새 목표에서는
+[B]를 먼저 식별해야 하며, [B]가 요구하는 만큼만 [A]를 구현한다. 예를 들어 RAM bitmap을
+AP 메모리 접근으로 읽는 방식이면 CPU halt와 RISC-V register access가 필수 조건이 아닐 수 있다.
+
+#### P2 — 메커니즘별 최소 증명
+
+instrumentation 방식이면:
+
+1. J-Link로 bitmap 주소를 read-only로 읽는다.
+2. 서로 다른 두 workload에서 bitmap 변화가 달라지는지 확인한다.
+3. T32 결과와 동일 빌드·동일 workload로 교차 검증한다.
+
+온칩 trace buffer 방식이면:
+
+1. T32에서 TE와 sink base, AP 경로, buffer 범위를 추출한다.
+2. 최신 J-Link/J-Trace에서 해당 SiFive trace 규격 지원 여부를 확인한다.
+3. 짧은 workload 한 번의 raw trace를 회수하고 T32 결과와 비교한다.
+
+외부 streaming trace 방식이면:
+
+1. 현재 probe가 일반 J-Link인지 J-Trace PRO RISC-V인지 확인한다.
+2. 보드에 필요한 PIB/trace 핀이 실제로 노출·배선됐는지 확인한다.
+3. 일반 J-Link라면 소프트웨어 작업을 계속하기 전에 하드웨어 요구사항부터 결정한다.
+
+#### P3 — J-Link CPU connect/halt는 보조 트랙으로 축소
+
+`sfe76_link.py`, `diagnose_connect.py`, `verify_halt_pc.py`, `find_haltable.py`는 버리지 않는다.
+이 도구들은 다음 용도로 남긴다.
+
+- J-Link run-control 지원 여부 진단
+- trace 설정에 필요한 core/DM 연결 확인
+- trace 실패 시 사용할 통계적 PC sampling 대안 검토
+- SEGGER 문의용 재현 로그 생성
+
+그러나 T32 커버리지 메커니즘이 확인되기 전에는 halt 성공을 v10.0의 단일 착수 조건으로
+사용하지 않는다.
+
+### 11.5 STATUS.md에 반영해야 할 새 게이트
+
+권장 게이트는 다음과 같다.
+
+| 게이트 | 조건 | 현재 상태 |
+|---|---|---|
+| C0 | T32에서 RISC-V coverage 측정 재현 | ✅ 사용자 확인 |
+| C1 | T32 coverage 메커니즘 식별 | ❌ 스크립트/로그 미확보 |
+| C2 | coverage 데이터 경로와 필요한 하드웨어 식별 | ❌ |
+| C3 | 현재 J-Link 또는 필요한 J-Trace의 지원 가능성 확인 | ❌ |
+| C4 | J-Link 계열로 raw coverage/trace/bitmap 1회 회수 | ❌ |
+| C5 | T32 결과와 동일 workload 교차 검증 | ❌ |
+| C6 | 퍼저 반복 수집·복구·성능 검증 | ❌ |
+
+기존 G0~G6 run-control 게이트는 삭제할 필요는 없지만 `halt-PC sampling 대안 트랙`으로
+이름을 바꾸는 것이 맞다.
+
+### 11.6 최종 판단
+
+T32에서 실제 코드 커버리지가 된다는 사실 때문에 **제품 자체의 coverage feasibility는 이미
+상당 부분 입증됐다.** J-Link 계열로 옮길 가능성도 이전보다 높게 평가할 수 있다.
+
+다만 현재는 T32가 무슨 방식으로 데이터를 얻는지 모르므로, 일반 J-Link만으로 가능한지까지는
+판단할 수 없다.
+
+- instrumentation 또는 온칩 SRAM trace sink라면 현재 J-Link로 구현할 가능성이 있다.
+- 외부 streaming Nexus trace라면 일반 J-Link가 아니라 J-Trace PRO RISC-V가 필요할 가능성이 높다.
+- 타깃 전용 trace 초기화나 multiple-DM 선택을 SEGGER가 지원하지 않으면 벤더/SEGGER의 device
+  support 또는 전용 JLinkScript가 필요하다.
+
+따라서 지금 가장 중요한 작업은 halt/APB/hart 스윕이 아니라 **성공한 T32 커버리지 스크립트를
+확보하여 coverage 데이터 경로를 식별하는 것**이다. 그 결과가 나온 뒤 J-Link halt sampling,
+J-Link 메모리 bitmap 읽기, J-Trace Nexus 중 하나를 주 경로로 선택한다.

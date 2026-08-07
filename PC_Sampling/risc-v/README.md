@@ -55,7 +55,7 @@ SiFive **E76** 기반 RISC-V SSD 컨트롤러에 퍼저를 올리기 위한 작�
 |---|---|
 | **`STATUS.md`** | **한 장짜리 현황 + 다음 할 일** ← 여기부터 |
 | **`sfe76_link.py`** | **연결 계층 — 정식 모듈.** 연결 지식의 단일 출처. 샘플러도 여기를 쓴다 |
-| **`find_haltable.py`** | **실제로 halt 되는 (CoreBase, hart) 조합 찾기** ← 지금 할 일 |
+| `find_haltable.py` | halt 되는 (CoreBase, hart, APB) 조합 찾기 — **보조 트랙** |
 | **`verify_halt_pc.py`** | halt / PC / resume 검증 (halt 되는 조합을 찾은 뒤) |
 | **`diagnose_connect.py`** | 첫 connect 실패 **근본원인** (D 세션지속성 / E 장치명 / F 하트) |
 | `SF_E76_config.JLinkScript` | `ConfigTargetSettings()` 정식 설정 (미해결 항목 있음) |
@@ -139,10 +139,12 @@ aperture 레이아웃을 확보한 뒤에만.
 sudo python3 sfe76_link.py
 sudo python3 sfe76_link.py --core-base 0x81481000     # Ncore
 
-# 지금 할 일 — halt 되는 조합 찾기
+# ⚠ halt 트랙은 보류 중이다 (STATUS.md 참조).
+#   T32 커버리지가 halt 방식이 아님이 확인돼, 먼저 T32 메커니즘을 식별한다.
+#   아래는 보조 트랙(run-control 진단)용.
 sudo python3 find_haltable.py
 
-# 그다음 — halt / PC / resume
+# halt / PC / resume
 #   ★ 먼저 Ncore(0x81481000) 로 검증한다. 단일 하트라 변수가 적다.
 #     0x81480000 은 4코어 공유라 hart 선택까지 얽혀 원인 분리가 어렵다.
 #   1단계 — PC 레지스터 후보 조사 (샘플링 안 함)
