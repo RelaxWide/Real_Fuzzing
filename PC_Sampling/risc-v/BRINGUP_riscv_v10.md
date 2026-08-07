@@ -83,6 +83,24 @@ cJTAG(2선) → ARM DP → AP(여러 개) → APB 버스 → RISC-V Debug Module
 
 ## 2. 지금까지의 실측
 
+### ★ 2026-08-07 — DP 접근 성공
+
+```
+성공 조합: TIF=7, perform_tif_init=True, connect() 선행(실패해도 무방)
+  DPIDR     = 0x6BA0009D     ← 유효. PARTNO 0xBA00 = ARM DAP
+  CTRL/STAT = 0xF0000000     ← CSYSPWRUPACK|CDBGPWRUPACK
+```
+
+**ARM DAP 토폴로지 실측 확정. 디버그 전원 인가 성공.**
+
+주의: `connect('RISC-V')` 는 `Error while halting CPU / Specific core setup failed`
+로 **실패**하지만, 그 시도가 뭔가를 초기화하므로 **호출은 해야 한다**(무시하고 진행).
+
+**남은 문제:** APSEL 0~7 열거가 전부 `0x00000000`.
+→ T32 의 `APBAP1.Base DP:0x10000` 을 글자 그대로 **AP 주소**로 읽으면
+   **ADIv6**(APSEL 폐지, 주소 기반 AP 지정)이라는 뜻이 된다. 그렇다면 APSEL
+   순회는 원리적으로 아무것도 못 찾는 게 맞다. → 주소 방식으로 재시도 중.
+
 ### J-Link 전기적 상태 — **정상**
 ```
 VTref   = 1.793V        ← 타깃 급전 정상 (1.8V 계열)

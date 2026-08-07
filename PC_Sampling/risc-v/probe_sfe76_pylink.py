@@ -40,6 +40,12 @@ COREDEBUG_BASE_B = 0x81481000   # Ncore
 # MEM-AP CSW: 32bit 접근 + DbgSwEnable. 전부 0 이면 다른 값도 시도해볼 것.
 CSW_CANDIDATES = [0x80000002, 0x23000052, 0x00000002]
 
+# T32 SYStem.CONFIG 의 AP base — "DP:0x10000" 을 글자 그대로 DP 주소로 해석(ADIv6)
+#   APBAP1=0x10000 APBAP2=0x20000 AXIAP1=0x30000 AHBAP1=0x40000
+#   APBAP3=0x50000 APBAP4=0x60000
+AP_BASES = [("APBAP1", 0x10000), ("APBAP2", 0x20000), ("AXIAP1", 0x30000),
+            ("AHBAP1", 0x40000), ("APBAP3", 0x50000), ("APBAP4", 0x60000)]
+
 # DP 레지스터 인덱스
 DP_IDR_ABORT = 0
 DP_CTRL_STAT = 1
@@ -242,9 +248,65 @@ def stage4_dp(jl):
     return True
 
 
+def ap_read_at(jl, ap_addr, offset):
+    """ADIv6 방식 — AP 를 '주소'로 지정해 레지스터를 읽는다.
+
+    ADIv6 는 ADIv5 의 APSEL(8비트 선택자)를 버리고 AP 를 시스템 주소로 지정한다.
+    T32 의 `APBAP1.Base DP:0x10000` 표기가 바로 이 주소다.
+    SELECT[31:4] = ADDR[31:4] 를 쓰고, 레지스터는 offset 의 A[3:2] 로 고른다.
+    """
+    if not dp_write(jl, DP_SELECT, (ap_addr + offset) & 0xFFFFFFF0):
+        return None
+    return ap_read(jl, (offset >> 2) & 0x3)
+
+
+def stage5_aps_adiv6(jl):
+    """ADIv6 주소 기반 AP 접근 — T32 base 값을 그대로 사용."""
+    head("[5b] AP 접근 — ADIv6 주소 방식 (T32 base 값 사용)")
+    types = {1: 'AMBA AHB', 2: 'AMBA APB', 4: 'AMBA AXI', 8: 'AMBA APB4'}
+    live = []
+    for name, base in AP_BASES:
+        idr = ap_read_at(jl, base, 0xFC)          # AP IDR
+        if is_err(idr) or idr == 0:
+            print(f"  {name} @0x{base:05X}: (없음)  raw={hx(idr)}")
+            continue
+        t = types.get(idr & 0xF, f"type=0x{idr & 0xF:X}")
+        print(f"  {name} @0x{base:05X}: IDR={hx(idr)}  {t}")
+        live.append((name, base))
+    if live:
+        print(f"\n  ✅ ADIv6 주소 방식으로 AP 발견: {[n for n, _ in live]}")
+        print("     → T32 의 DP:0xN0000 은 APSEL 이 아니라 AP 주소였다")
+    else:
+        print("\n  ❌ 주소 방식으로도 AP 없음")
+    return live
+
+
+def stage6_mem_adiv6(jl, live):
+    """ADIv6 AP 를 통해 코어 디버그 블록 읽기."""
+    head("[6b] 코어 디버그 블록 (ADIv6 경로)")
+    if not live:
+        print("  살아있는 AP 가 없어 건너뜀")
+        return
+    for name, base in live:
+        for lbl, addr in (("A(hcore 등)", COREDEBUG_BASE_A), ("B(Ncore)", COREDEBUG_BASE_B)):
+            for csw in CSW_CANDIDATES:
+                if is_err(ap_read_at(jl, base, 0x00)):     # CSW 읽기 확인
+                    continue
+                dp_write(jl, DP_SELECT, (base + 0x00) & 0xFFFFFFF0)
+                ap_write(jl, 0, csw)                        # CSW
+                dp_write(jl, DP_SELECT, (base + 0x04) & 0xFFFFFFF0)
+                ap_write(jl, 1, addr)                       # TAR
+                dp_write(jl, DP_SELECT, (base + 0x0C) & 0xFFFFFFF0)
+                cid0 = ap_read(jl, 3)                       # DRW
+                if is_err(cid0):
+                    continue
+                print(f"  {name} base={lbl} CSW={hx(csw)}  CIDR0(+0xFF0) 영역 = {hx(cid0)}")
+                break
+
+
 def stage5_aps(jl):
-    """APSEL 0~7 열거. T32 추론(DP:0xN0000 → AP N) 검증."""
-    head("[5] AP 열거 (APSEL 0~7)")
+    """ADIv5 APSEL 0~7 열거."""
+    head("[5a] AP 열거 — ADIv5 APSEL 방식")
     types = {1: 'AMBA AHB', 2: 'AMBA APB', 4: 'AMBA AXI'}
     live = []
     for ap in range(8):
@@ -346,7 +408,12 @@ def main():
             return
         print(f"\n  ✅ 성공 조합: {ok}")
         live = stage5_aps(jl)
-        stage6_mem(jl, live)
+        if live:
+            stage6_mem(jl, live)
+        else:
+            print("\n  APSEL 방식 실패 → ADIv6 주소 방식으로 재시도")
+            live6 = stage5_aps_adiv6(jl)
+            stage6_mem_adiv6(jl, live6)
     finally:
         try:
             jl.close()
@@ -358,7 +425,8 @@ def main():
     print("  [3] 실패            → pylink API 사용법 문제. 예외 메시지가 핵심")
     print("  [4] DPIDR 무효      → cJTAG 스캔 포맷 (SEGGER 문의)")
     print("  [4] 전원 ACK 없음   → 디버그 도메인 게이팅/인증 (벤더 문의)")
-    print("  [5] AP 없음         → 전원 또는 AP 매핑")
+    print("  [5a] APSEL 실패 + [5b] 주소 성공 → ADIv6 확정 (T32 DP:0xN0000 = AP 주소)")
+    print("  [5a][5b] 둘 다 실패 → AP 주소 자체가 다름. 벤더 문의")
     print("  [6] CIDR0 하위=0x0D → CoreSight 확정, 주소 정확 (다음은 RISC-V DM 탐색)")
 
 
