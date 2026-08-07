@@ -81,6 +81,43 @@ cJTAG(2선) → ARM DP → AP(여러 개) → APB 버스 → RISC-V Debug Module
 
 ---
 
+## ★★ 2026-08-08 — 원인 규명 (SEGGER 공식 문서)
+
+SEGGER KB **"J-Link RISC-V"** 가 우리 토폴로지를 그대로 문서화하고 있다:
+
+> 지원 토폴로지: `JTAG/SWD → SWJ-DP → APB-AP → DMI registers`
+> **"there is no ROM table scan available for RISC-V"**
+> **"J-Link cannot auto-detect the AP location or DMI register positioning in hybrid designs"**
+
+**→ J-Link 은 이 구성을 자동 검출할 수 없다. 반드시 수동으로 알려줘야 한다.**
+
+지금까지 APSEL 스윕·ADIv6 주소·AddAP 가 전부 실패한 이유가 이것이다.
+**우리 코드 문제가 아니라, 애초에 자동 검출이 불가능한 구성**이었다.
+
+### 필요한 설정 (J-Link Command Strings)
+
+| 명령 | 뜻 |
+|---|---|
+| `CORESIGHT_AddAP = Index=<i> Type=<T> Addr=<base>` | AP 등록. **Index 는 J-Link 내부 번호이지 하드웨어 APSEL 이 아니다.** `Addr` 이 실제 CoreSight 주소 → T32 의 `DP:0x10000` 과 대응 |
+| `CORESIGHT_SetIndexAPBAPToUse = <i>` | DMI 가 붙은 APB-AP 지정 |
+| `CORESIGHT_SetCoreBaseAddr = <addr>` | **AP 주소공간 내 DMI 레지스터 위치** → T32 `COREDEBUG.Base` |
+| `SetcJTAGInitMode = <0\|1\|2>` | cJTAG 활성화 시퀀스 변형 (0=LONG 기본, 1=SHORT, 2=WILIOT) |
+| `RISCV_SetHartSel = <n>` | 멀티하트 선택 (코어 5개) |
+| `RISCV_SetTEBaseAddr = <addr> [APIndex=..]` | **RISC-V 트레이스 인코더** — 나중에 쓸 것 |
+
+pylink 는 `exec_command()` 로 이 문자열들을 그대로 낼 수 있다.
+(DLL 심볼 `AddAP` 가 없었던 것과 별개 경로다.)
+
+**★ `SetcJTAGInitMode`** — T32 의 `CJTAGFLAGS NOKEEPER USEOAC` 와 대응될 수 있는
+활성화 시퀀스 선택지. J-Link 기본(LONG)이 안 맞을 가능성이 있어 0/1/2 전부 시도한다.
+
+**★ `RISCV_SetTEBaseAddr` 의 존재 = J-Link 이 RISC-V 트레이스를 지원한다는 뜻.**
+halt 샘플러가 돌기 시작한 뒤 트레이스 트랙을 열 때 결정적 단서.
+
+→ 실행: `connect_sfe76.py`
+
+---
+
 ## 2. 지금까지의 실측
 
 ### ★ 2026-08-07 — DP 접근 성공
