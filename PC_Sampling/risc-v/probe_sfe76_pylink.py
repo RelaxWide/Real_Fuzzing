@@ -19,6 +19,7 @@
 """
 
 import argparse
+RESULT = {}
 import inspect
 import sys
 import time
@@ -244,6 +245,7 @@ def stage4_dp(jl):
         print("     (DPIDR 은 bit0 = RAO 라 항상 1. 짝수면 데이터가 아니다)")
         print("     → cJTAG 스캔 포맷 불일치 의심 (T32: NOKEEPER USEOAC). SEGGER 문의 대상.")
         return False
+    RESULT['dpidr'] = idr
     print("  ✅ 유효한 DPIDR — ARM DAP 확정")
     print(f"     DESIGNER=0x{(idr >> 12) & 0xFFF:03X}  PARTNO=0x{(idr >> 20) & 0xFF:02X}"
           f"  VERSION={(idr >> 12) & 0xF}")
@@ -264,10 +266,12 @@ def stage4_dp(jl):
     if is_err(ctrl):
         print("  ❌ 읽기 실패")
         return False
+    RESULT['ctrl'] = ctrl
     if (ctrl & 0xA0000000) == 0xA0000000:
+        RESULT['pwr_ack'] = True
         print("  ✅ 디버그 전원 ACK (CSYSPWRUPACK|CDBGPWRUPACK)")
     else:
-        print("  ❌ 전원 ACK 없음 → 디버그 도메인 게이팅/인증 의심. 벤더 문의 대상.")
+        print("  ✗ 이 조합에서는 전원 ACK 없음 (다른 조합이 남아 있으면 계속 시도한다)")
     if ctrl & 0x000000A0:
         print("  ⚠ STICKYERR/STICKYORUN — 접근이 거부되고 있다")
     return True
@@ -344,6 +348,8 @@ def stage5_aps(jl):
         if is_err(idr) or idr == 0:
             if st is not None and (st[0] or st[1]):
                 nsticky += 1
+            if ap and ap % 64 == 0:
+                print(f"    ... APSEL {ap}/255 진행 중 (STICKY 누적 {nsticky})")
             if ap < 8:                      # 앞쪽만 상세 출력
                 print(f"  APSEL {ap}: (없음)  raw={hx(idr)}  {sticky_str(st)}")
             continue
@@ -351,7 +357,10 @@ def stage5_aps(jl):
         print(f"  APSEL {ap}: IDR={hx(idr)}  {t}")
         live.append(ap)
     if not live:
-        print(f"\n  ❌ APSEL 0~255 전부 없음 (STICKY 발생 {nsticky}/256)")
+        RESULT['apsel_sticky'] = nsticky
+        print(f"\n  {'*' * 56}")
+        print(f"  ★ APSEL 0~255 전부 없음 — STICKY 발생 {nsticky}/256")
+        print(f"  {'*' * 56}")
         if nsticky > 200:
             print("     STICKY 가 대부분 → DP 는 정상 응답 중이고 '그 AP 는 없다'는 뜻.")
             print("     → ADIv5 APSEL 방식이 아닐 가능성. [5b] 주소 방식 확인.")
@@ -457,8 +466,26 @@ def main():
         except Exception:
             pass
 
-    head("범례 (실제 결과는 위 각 단계의 ✅/❌ 를 볼 것)")
-    print("  * 아래는 '어떤 결과면 무엇을 뜻하는가' 설명이지 이번 실행의 결과가 아니다.")
+    head("이번 실행의 실측 결과")
+    if 'dpidr' in RESULT:
+        print(f"  DPIDR      = {hx(RESULT['dpidr'])}   ✅ DP 통신 성공")
+    else:
+        print("  DPIDR      = 읽기 실패            ❌")
+    if RESULT.get('pwr_ack'):
+        print(f"  CTRL/STAT  = {hx(RESULT['ctrl'])}   ✅ 디버그 전원 ACK")
+    elif 'ctrl' in RESULT:
+        print(f"  CTRL/STAT  = {hx(RESULT['ctrl'])}   ❌ 전원 ACK 없음")
+    if 'apsel_sticky' in RESULT:
+        n = RESULT['apsel_sticky']
+        print(f"  APSEL 0~255: AP 없음, STICKY {n}/256")
+        if n > 200:
+            print("     → DP 는 정상 응답. 그 위치에 AP 가 없는 것 (주소/방식 문제)")
+        elif n == 0:
+            print("     → AP 접근이 DP 를 안 타고 있다 (pylink API 사용 문제)")
+        else:
+            print("     → 혼재. 위 상세 출력 확인 필요")
+
+    head("범례 (위 '실측 결과' 와 별개 — 해석 참고용)")
     print("  - [1] cJTAG TIF 못 찾음 → JLinkScript 경로로 복귀")
     print("  - [3] 실패            → pylink API 사용법 문제. 예외 메시지가 핵심")
     print("  - [4] DPIDR 무효      → cJTAG 스캔 포맷 (SEGGER 문의)")
