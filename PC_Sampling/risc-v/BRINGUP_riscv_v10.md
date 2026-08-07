@@ -148,8 +148,13 @@ J-Link 의 connect 도 결국 이걸 하지만 **같은 connect 안의 CPU setup
   동작하지 않는다. `SF_E76_addap.JLinkScript` 에서 전부 `0x80000000` 이 나왔던 것과
   같은 현상으로, **JLinkScript 에서 CoreSight API 를 쓸 수 없다**는 것이 두 번째 확인.
 
-→ **채택: bounded retry 를 정식 정책으로.** (feedback.md §8.5)
-  동작이 안정적으로 재현되므로 connect 문제는 여기서 닫고 halt/PC 로 넘어간다.
+→ **bounded retry 는 임시 workaround 로만 쓴다. 원인 규명은 계속한다.**
+
+  재시도로 붙는 것은 정상이 아니고, 이 프로젝트에선 특히 위험하다 —
+  **퍼저는 POR 복구·크래시 후 수백 번 재연결**한다. 매번 첫 시도가 실패하는 걸
+  전제로 두면 운영 리스크이고, J-Link 펌웨어/소프트웨어가 바뀌면 깨질 수 있다.
+
+  임시 정책 규칙 (feedback.md §8.5):
 
   | 규칙 | 이유 |
   |---|---|
@@ -157,6 +162,43 @@ J-Link 의 connect 도 결국 이걸 하지만 **같은 connect 안의 CPU setup
   | 1회차 실패를 로그·카운터로 남김 | 숨기면 진짜 고장을 못 본다 |
   | **한 handle = 한 설정** | 조합을 섞으면 거짓 성공/전체 실패 (실측 2회) |
   | **best-effort resume 보장** | ★ halt 로 남으면 SSD 컨트롤러가 멈춘다 |
+
+#### ★ 유력 가설 — RISC-V DM 의 `dmactive`
+
+RISC-V Debug Spec 상 **`dmcontrol.dmactive` 를 1 로 쓴 뒤 되읽어 1이 될 때까지
+기다려야** DM 이 리셋에서 깨어난다. J-Link 이 `dmactive=1` 을 쓰고 **기다리지 않고
+바로 `haltreq`** 를 하면 정확히 관측된 에러가 난다:
+
+```
+Error while halting CPU  ->  Specific core setup failed
+```
+
+2차 connect 때는 이미 `dmactive=1` 이라 성공한다.
+
+**이 가설이 A/B/C 를 전부 설명한다:**
+
+| 실험 | 결과 | dmactive 로 설명 |
+|---|---|---|
+| B setup 2회 | 실패 | setup 은 DM 을 안 건드린다 |
+| C sleep | 실패 | **레지스터를 써야** 하는 일이라 시간으론 안 됨 |
+| A connect 2회 | 성공 | 1차가 `dmactive=1` 을 쓴다 |
+
+#### 남은 실험 — `diagnose_connect.py`
+
+| | 실험 | 성공 시 의미 |
+|---|---|---|
+| **D** | 성공 후 close/reopen → **1회** connect | 성공 = 상태가 **타깃**에 남음(dmactive 지지). 퍼저는 세션당 1회만 예열하면 됨 |
+| **E** | 장치명 후보별 1회 connect | 성공 = 제네릭 `RISC-V` 프로파일이 원인. **가장 깨끗한 해결** |
+| **F** | `RISCV_SetHartSel` 을 connect 前에 | 성공 = 기본 하트가 halt 불가였던 것 |
+
+**D 가 특히 실용적으로 중요하다** — 재연결마다 예열이 필요한지, 전원 사이클당 1회면
+되는지가 갈린다. 퍼저 운영 설계가 여기서 달라진다.
+
+#### ⬜ 미확인 — JLinkScript 의 첫 connect 는 성공했나?
+
+`SF_E76_config.JLinkScript` 실행 시 **전원 ACK 는 안 떴다.** 그러나
+**`connect()` 자체의 성공 여부는 확인되지 않았다.** ACK 와 무관하게 첫 connect 가
+붙었다면 `ConfigTargetSettings()` 의 AP map 선언만으로 해결된 것이므로 반드시 확인할 것.
   (feedback.md §2.1 이 `InitTarget()` 의 용도로 '전원' 을 명시했는데,
    내가 "T32 에 커스텀 시퀀스 없음" 을 이유로 비워둔 것이 놓친 지점이었다 —
    이건 벤더 커스텀이 아니라 ARM DAP 표준 절차다)

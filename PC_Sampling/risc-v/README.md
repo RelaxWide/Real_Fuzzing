@@ -5,24 +5,53 @@
 | 파일 | 내용 |
 |---|---|
 | `BRINGUP_riscv_v10.md` | **조사 노트(살아있는 문서)** — 확정 사실 / 추론 / 열린 질문 |
-| `probe_sfe76_pylink.py` | **연결 진단 (주력)** — 에러 메시지가 보여 빠르게 수렴 |
-| `SF_E76_cJTAG_probe.JLinkScript` | 연결 진단 (보조) — 1차 실행에서 모든 CoreSight 호출이 `0x80000000`(API 에러) 반환 |
+| `feedback.md` | 외부 검토 피드백 (방향 검증) |
+| **`connect_sfe76.py`** | **연결 — 동작함.** AP map + DMI base 수동 설정 |
+| **`verify_halt_pc.py`** | **halt / PC / resume 검증** ← v10.0 크리티컬 패스 |
+| **`diagnose_connect.py`** | **첫 connect 실패 근본원인** (D 세션지속성 / E 장치명 / F 하트) |
+| `connect_min.py` | 최소 재현 — 순서 지정(`--order`)으로 위치 vs 주소 분리 |
+| `isolate_warmup.py` | warmup 메커니즘 분리 (A/B/C) — **완료: A만 성공** |
+| `SF_E76_config.JLinkScript` | `ConfigTargetSettings()` 정식 설정 (InitTarget 전원인가는 실패) |
+| `probe_sfe76_pylink.py` | 초기 진단 — DP/전원 확인용 (역할 종료) |
+| `SF_E76_cJTAG_probe.JLinkScript` | 초기 진단 (역할 종료) — JLinkScript 는 CoreSight API 사용 불가 |
+| `SF_E76_addap.JLinkScript` | 위와 같음 (역할 종료) |
 
 ---
 
-## 지금 상황 한 줄
-
-**cJTAG 활성화까지는 성공했고(TAP 응답 확인), 그 위 계층에서 막혀 있다.**
-J-Link 이 이 칩을 몰라 "RISC-V DTM" 으로 오판하는데, 실제 토폴로지는
-`cJTAG → ARM DP → AP → APB → RISC-V DM` 이라 엉뚱한 곳을 두드리고 있다.
+## 지금 상황
 
 | 계층 | 상태 |
 |---|---|
 | 물리 (VTref 1.793V, 배선) | ✅ |
-| cJTAG 활성화 @10MHz | ✅ `TotalIRLen=4, IRPrint=0x01` |
-| 장치 식별 | ❌ `Id: 0x00000001 — Unknown device` |
-| ARM DAP 절차 (전원·AP) | ❌ **J-Link 이 수행하지 않음** ← 진단 대상 |
-| RISC-V DM 접근 | ⬜ 미도달 |
+| cJTAG 활성화 @10MHz (TIF=7) | ✅ |
+| ARM DP 통신 | ✅ `DP reg0 = 0x6BA0009D` |
+| 디버그 도메인 전원 | ✅ `CTRL/STAT = 0xF0000000` |
+| AP map / DMI base 설정 | ✅ `CORESIGHT_AddAP` + `SetIndexAPBAPToUse` + `SetCoreBaseAddr` |
+| **J-Link connect** | ⚠️ **되지만 2회차에만** — 근본원인 미규명 |
+| **halt / PC / resume** | ⬜ **미검증** ← v10.0 크리티컬 패스 |
+| 코어 귀속 (어느 코어인가) | ⬜ 미확정 |
+
+### 확정된 연결 설정
+
+```
+SetcJTAGInitMode = 0
+set_tif(7)  # cJTAG      set_speed(10000)   ← 1000kHz 로 낮추면 활성화 실패
+CORESIGHT_AddAP = Index=0 Type=APB-AP Addr=0x10000     (…Index=5 까지)
+CORESIGHT_SetIndexAPBAPToUse = 0
+CORESIGHT_SetCoreBaseAddr    = 0x81480000   # 또는 0x81481000 (Ncore)
+connect('RISC-V')                            # ★ 1회차 실패, 2회차 성공
+```
+
+**근거:** SEGGER KB 가 "RISC-V 는 ROM table scan 이 없어 hybrid DAP 구성을
+자동 검출할 수 없다" 고 명시한다. 수동 선언이 필수다.
+
+### ⚠ 지켜야 할 원칙
+
+| | |
+|---|---|
+| **한 handle = 한 설정** | 조합을 섞으면 거짓 성공 또는 전체 실패 (실측 2회) |
+| **첫 connect 는 실패한다** | 재시도 필요. 원인 규명 중 (`diagnose_connect.py`) |
+| **halt 후 반드시 resume** | ★ 코어가 멈춘 채 남으면 SSD 가 hang 한다 |
 
 ---
 
