@@ -219,9 +219,10 @@ probe_trace_regs.py  [A] connect+memory_read32, [B] CoreSight AP 직접 → 모�
 | 파일 | 목적 | 상태 |
 |---|---|---|
 | `sfe76_link.py` | **연결 계층 정식 모듈.** checked API(`connect_checked`/`halt_checked`/`read_pc`/`resume_checked`) | 사용 중 |
-| **`probe_dap.py`** | **DP 계층만** — DPIDR / 전원 ACK / **AP 등록 개수(0·1·6) 비교** | ← **다음 실행** |
-| `probe_trace_regs.py` | 트레이스 레지스터에 MEM-AP 로 닿는지 | 실패 (위 주의 참조) |
-| `probe_dm.py` | DM aperture 직접 읽기 + `dmstatus` 디코드 | 실패 |
+| **`probe_ap_raw.py`** | **DP→AP 직접.** AP 실재(IDR) / TAR 되읽기 / DM 읽기 | ← **다음 실행** |
+| `probe_dap.py` | DP 계층 — DPIDR / 전원 ACK / AP 개수 비교 | 역할 완료 (G0 통과) |
+| `probe_trace_regs.py` | 트레이스 레지스터에 MEM-AP 로 닿는지 | 실패 (증거 약함) |
+| `probe_dm.py` | ~~DM aperture 읽기~~ | **설계 결함 — 순환.** `probe_ap_raw.py` 로 대체 |
 | `verify_halt_pc.py` | halt/PC/resume (**보조 트랙**) | halt 실패로 막힘 |
 | `diagnose_connect.py` | 첫 connect 실패 원인 (후보별 프로세스 격리) | 보조 |
 | `backup/` | 역할 끝난 도구 + 각각이 밝혀낸 것 | 참고 |
@@ -304,7 +305,44 @@ probe_trace_regs.py  [A] connect+memory_read32, [B] CoreSight AP 직접 → 모�
 
 ## 6. 다음 할 일
 
-### P0 — 지금: DM aperture (§3.5 방식으로)
+### ⚠ `probe_dm.py` 결과는 무효다 (2026-08-10)
+
+```
+유효 세션 확보됨(DAP 전원 ACK) → 그런데 전 레지스터 읽기 실패
+```
+**이건 DM 에 대한 증거가 아니다.** `memory_read32` 는 J-Link 의 **CPU 컨텍스트**를
+거치고, CPU 컨텍스트는 **DM 이 active 여야** 생긴다. 우리가 알고 싶은 게 바로 DM
+상태이므로 **순환**이다 — 물어볼 수 없는 질문을 물었다.
+→ 가설 B 판정에 이 결과를 쓰지 말 것. `probe_ap_raw.py` 로 대체.
+
+### P0 — 지금: AP 직접 접근 (`probe_ap_raw.py`)
+
+```bash
+sudo python3 probe_ap_raw.py --dm 0x81480000 --sessions 3
+```
+
+**DP → AP 레지스터를 직접 두드린다. 코어도 DM 도 거치지 않는다.**
+ADIv6(DPv3) 이므로 AP 를 주소로 고르고, MEM-AP 레지스터는 뱅크 위쪽에 있다:
+
+```
+AP_base + 0xD00 CSW   +0xD04 TAR   +0xD0C DRW   +0xDFC IDR
+DP SELECT 에 레지스터 주소 상위비트를 넣고, A[3:2] 로 워드를 고른다
+  SELECT = AP_base+0xD00 → idx0=CSW idx1=TAR idx3=DRW   (고전 CTRL/ADDR/DATA 와 일치)
+  SELECT = AP_base+0xDF0 → idx3=IDR
+```
+
+세 가지를 순서대로 답한다:
+
+| | 보는 것 | 의미 |
+|---|---|---|
+| **[1]** | 각 AP 의 **IDR** | ★ **선언한 AP 6개 중 어느 것이 실재하는가.** 지금까지 하나도 확인 못 했다 |
+| **[2]** | **TAR 되읽기** | 쓴 값이 그대로 읽히면 **AP 접근 경로가 살아 있다** — "우리 코드로는 원래 안 된다" 는 오랜 불확실성 종료 |
+| **[3]** | TAR=`0x81480040` → **DRW** | dmcontrol/dmstatus. `version`=2·3 이면 **aperture 확정(가설 B 종료)**, `authenticated` 로 가설 A 즉시 판정 |
+
+**[1] 과 [2] 가 서로를 검증한다:** IDR 이 다 0인데 TAR 되읽기가 되면
+→ IDR 오프셋만 틀린 것이고 AP 는 쓸 수 있다. 둘 다 실패면 AP 주소 해석이 틀린 것이다.
+
+### P0' — (참고) 원래 계획이던 DM aperture
 
 **연결 안정성 규명은 건너뛴다.** 원칙 4 — 퍼저에는 문제가 안 되고,
 `require_power` 게이트가 노이즈를 이미 제거한다. 지금 필요한 건 DM 이다.

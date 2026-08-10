@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """SF-E76 — DM 이 dmactive 로 안 깨어나는 이유를 가른다.
 
+⚠⚠ **이 도구는 설계 결함이 있다. `probe_ap_raw.py` 를 쓸 것.** (2026-08-10)
+
+    여기서 쓰는 `memory_read32` 는 J-Link 의 **CPU 컨텍스트**를 거친다.
+    CPU 컨텍스트는 **DM 이 active 여야** 생긴다. 그런데 우리가 알고 싶은 게
+    바로 DM 상태다 — **순환이다.**
+
+    실측: 유효 세션(DAP 전원 ACK 확인)에서도 **전 레지스터 읽기 실패.**
+    이 결과는 "DM 이 없다/틀렸다" 는 증거가 **아니다.** 물어볼 수 없는
+    질문을 물었을 뿐이다. 가설 B 판정에 이 결과를 쓰지 말 것.
+
+    → `probe_ap_raw.py` 는 DP→AP 레지스터를 직접 두드려 코어를 우회한다.
+
+
 증상: J-Link 이 "Timeout waiting for debug module to become active".
       DPIDR / AP map / CoreBase 는 인식되는데 DM 이 active 로 응답하지 않는다.
 

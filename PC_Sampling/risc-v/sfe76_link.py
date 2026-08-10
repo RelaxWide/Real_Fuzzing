@@ -448,7 +448,7 @@ def add_common_args(ap):
     ap.add_argument('--tries', type=int, default=CONNECT_TRIES)
     ap.add_argument('--ap-count', type=int, default=None,
                     help='등록할 AP 개수 (1=APBAP1 만). 기본은 AP_MAP 전부(6). '
-                         'probe_dap 에서 1개일 때만 DAP 전원이 ACK 됐다')
+                         '개수는 전원 ACK 에 영향이 없음이 확인됐다(가설 E 반증) — 재현용')
     return ap
 
 
