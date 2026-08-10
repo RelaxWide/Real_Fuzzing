@@ -367,7 +367,49 @@ AP 들이다. **IDR 값이 6개 다 같으면 SELECT 가 AP 를 전환하지 못
 → 그 주소가 그 AP 에서 **디코드되지 않는다**는 뜻일 가능성이 크다.
 `0x81480000` 은 T32 스크립트 해석에서 온 **추정**이었음을 상기할 것.
 
-### P0 — 지금: ROM 테이블로 **진짜 주소 맵**을 받는다
+### ⚠ ROM 테이블은 **처음부터 없는 기능**이었다 (2026-08-10)
+
+SEGGER 공식 문서 *J-Link RISC-V — "RISC-V behind a CoreSight DAP"* 가 못박는다:
+
+> * **There is no ROM table scan available for RISC-V**
+> * J-Link cannot auto-detect **behind which AP** the RISC-V can be found
+> * J-Link cannot auto-detect **where in the AP address space** the DMI registers are
+> * the user needs to **manually specify** where to find the RISC-V core
+
+"ROM 테이블 없음" 은 버그가 아니라 **사양**이다. 그 길은 애초에 길이 아니었다.
+
+### ★★ 그리고 SEGGER 예제가 결정적이다
+
+```c
+CORESIGHT_SetIndexAPBAPToUse = 1
+CORESIGHT_SetCoreBaseAddr    = 0x0   // "Address in AP address space
+                                     //  where DMI registers can be found"
+```
+
+**`0x0` 이다.** 우리가 쓰던 `0x81480000` 은 T32 의 **APB 버스 주소**이고,
+J-Link 이 요구하는 건 **AP 주소공간 내 오프셋**이다. **같다는 보장이 없다.**
+→ `dmactive` 타임아웃의 가장 그럴듯한 설명이며, 지금까지 한 번도 의심하지 않았다.
+
+### P0 — 지금: DM **위치**를 찾는다 (`find_dm.py`)
+
+DMI 프로토콜은 J-Link 이 이미 안다. 우리가 구현할 게 아니다.
+할 일은 **어디인지 알려주는 것**뿐이고, 판정은 J-Link 에게 맡긴다.
+
+```bash
+sudo python3 find_dm.py --devices     # [A] 가장 싼 것부터
+sudo python3 find_dm.py --sweep       # [B] 안 되면 전수
+```
+
+**오라클:** 전원 ACK(세션 유효) + connect + **`halted()` 동작**.
+`halted()` 는 **DM 이 살아야만** 되고 **비침습**이다(halt 하지 않는다).
+
+- **[A] 장치명 모드** — AP 맵을 **수동 지정하지 않고** `E76`/`E76-MC`/`E76ARTY` 를 준다.
+  SEGGER: *"If a specific device is selected, J-Link usually has a compiled-in
+  script which already specifies the parameters"* → **우리가 손으로 넣던 걸
+  J-Link 이 대신 해준다.** 한 번도 깨끗하게 시도한 적이 없다.
+- **[B] 전수** — APB-AP 인덱스 × CoreBase(**`0x0` 을 맨 앞에**) 전수.
+
+### (참고) 폐기 — ROM 테이블로 주소 맵 받기
 
 ```bash
 sudo python3 probe_ap_raw.py --dm 0x81480000 --sessions 3
