@@ -69,6 +69,7 @@ AP_IDX_CSW, AP_IDX_TAR, AP_IDX_DRW = 0, 1, 3
 # ADIv6 MEM-AP 레지스터의 AP 공간 내 오프셋
 OFF_CSW, OFF_TAR, OFF_DRW = 0xD00, 0xD04, 0xD0C
 OFF_BASE, OFF_IDR = 0xDF8, 0xDFC
+OFF_CFG = 0xDF4
 
 # RISC-V DMI 레지스터 (aperture = base + (addr << 2) 로 추정)
 DM_REGS = [(0x10, 'dmcontrol'), (0x11, 'dmstatus'), (0x12, 'hartinfo'),
@@ -258,6 +259,43 @@ def walk_rom(dap, name, base, max_entries=64):
     return found
 
 
+def decode_csw(v):
+    """★ MEM-AP CSW — **디버그 접근 제어(secure JTAG)를 가르는 레지스터.**
+
+    SiFive Insight 의 "Multilayered Debug Access Control" 은 fuse / 32비트
+    패스워드 / PKI 로 TAP 을 잠근다. 그게 걸려 있으면 **AP 는 열거되지만
+    버스 포트가 죽는다** — 정확히 우리 증상이다(IDR 은 읽히고 메모리는 전부 실패).
+
+    핵심 비트:
+      bit6  DeviceEn   0이면 **이 AP 의 버스 포트가 하드웨어로 꺼져 있다.**
+                       소프트웨어로 되돌릴 방법이 없다. → 잠금 또는 버스 미전원
+      bit23 SDeviceEn  (SPIDEN) 보안 접근 허용 여부
+      bit31 DbgSwEnable
+      bit7  TrInProg   전송 진행 중 (1로 멈춰 있으면 앞 트랜잭션이 안 끝난 것)
+    """
+    if v is None:
+        return "읽기 실패"
+    if v == 0x80000000:
+        return f"{hx(v)}  ← API 에러 센티널"
+    dev = bool(v & (1 << 6))
+    parts = [
+        f"DeviceEn={int(dev)}" + ("  ★★ 0 = 버스 포트 꺼짐" if not dev else ""),
+        f"SDeviceEn/SPIDEN={int(bool(v & (1 << 23)))}",
+        f"DbgSwEnable={int(bool(v & (1 << 31)))}",
+        f"TrInProg={int(bool(v & (1 << 7)))}",
+        f"Prot=0x{(v >> 24) & 0x7F:02X}",
+        f"AddrInc={(v >> 4) & 3}", f"Size={v & 7}",
+    ]
+    return f"{hx(v)}  " + "  ".join(parts)
+
+
+def decode_cfg(v):
+    if v is None or v == 0x80000000:
+        return "읽기 실패"
+    return (f"{hx(v)}  BE={v & 1}  LargeAddr(64bit TAR)={(v >> 1) & 1}  "
+            f"LargeData={(v >> 2) & 1}")
+
+
 def is_error(v):
     """J-Link API 에러 센티널. 값이 아니다.
 
@@ -299,14 +337,21 @@ def enumerate_aps(dap):
     print(f"\n{'=' * 66}\n [1] AP 실재 확인 — IDR 읽기\n{'=' * 66}")
     print("  선언한 AP 6개 중 실재가 확인된 건 지금까지 하나도 없었다.")
     real = []
+    dev_en = {}
     for name, base, typ in AP_MAP:
         dap.clear_sticky()
         idr = dap.ap_read(base, OFF_IDR, retry=2)
         print(f"\n  {name:7s} @ 0x{base:05X}  (선언 타입 {typ})")
         print(f"      IDR = {decode_idr(idr, typ)}")
+        csw = dap.ap_read(base, OFF_CSW, retry=2)
+        print(f"      CSW = {decode_csw(csw)}")
+        print(f"      CFG = {decode_cfg(dap.ap_read(base, OFF_CFG, retry=2))}")
+        if csw is not None and not is_error(csw) and not (csw & (1 << 6)):
+            print("            ⚠ DeviceEn=0 → 이 AP 로는 메모리 접근이 **원천 불가**")
         if not is_error(idr):
             real.append((name, base, idr))
-    return real
+        dev_en[name] = (None if is_error(csw) else bool(csw & (1 << 6)))
+    return real, dev_en
 
 
 def probe_ap_path(dap, name, base):
@@ -403,7 +448,8 @@ def read_addrs(dap, aps, addrs):
 def one_session(a):
     lk = Link(core_base=a.core_base, hart=a.hart, device=a.device,
               serial=a.serial, ap_count=getattr(a, 'ap_count', None))
-    out = {'valid': False, 'real_aps': [], 'dm': {}, 'rom': {}, 'addr_hits': {}}
+    out = {'valid': False, 'real_aps': [], 'dm': {}, 'rom': {},
+           'addr_hits': {}, 'device_en': {}}
     try:
         with lk:
             try:
@@ -414,7 +460,8 @@ def one_session(a):
             out['valid'] = True
             dap = Dap(lk.jl)
 
-            real = enumerate_aps(dap)
+            real, dev_en = enumerate_aps(dap)
+            out['device_en'] = dev_en
             out['real_aps'] = [(n, b, i) for n, b, i in real]
 
             print(f"\n{'=' * 66}\n [2] AP 접근 경로 확인 — TAR 되읽기\n{'=' * 66}")
@@ -520,6 +567,27 @@ def main():
         print("\n  → **DM 없이 트레이스 파이프라인을 세울 수 있다.** 블로커 우회.")
         print("     이 AP 를 RISCV_Set*BaseAddr 의 APIndex 로 쓰거나,")
         print("     raw AP 접근으로 ETB 드레인을 직접 구현한다.")
+
+    de = {}
+    for r in valid:
+        for n, v in (r.get('device_en') or {}).items():
+            de.setdefault(n, []).append(v)
+    if de:
+        print(f"\n{'=' * 66}\n ★ CSW.DeviceEn — 디버그 접근 제어(secure JTAG) 판정\n{'=' * 66}")
+        for n, vs in de.items():
+            print(f"    {n:7s} DeviceEn = {vs}")
+        flat = [v for vs in de.values() for v in vs if v is not None]
+        if flat and not any(flat):
+            print("\n  ★★ **전 AP DeviceEn=0.** 버스 포트가 하드웨어로 꺼져 있다.")
+            print("     소프트웨어로 되돌릴 수 없다. 원인은 둘 중 하나다:")
+            print("       (a) SiFive Insight 의 디버그 접근 제어(퓨즈/패스워드/PKI) 잠금")
+            print("       (b) 해당 버스 도메인에 전원/클럭이 안 들어와 있음")
+            print("     → 우리 코드로 더 할 수 있는 게 없다. ASK.md 로 넘어간다.")
+        elif flat and all(flat):
+            print("\n  ✅ DeviceEn=1 — AP 버스 포트는 **열려 있다.**")
+            print("     잠금이 아니다. 실패 원인은 주소/코드 쪽이다.")
+        elif flat:
+            print("\n  ⚠ AP 마다 다르다 → DeviceEn=1 인 AP 로만 진행할 것.")
 
     print(f"\n{'=' * 66}\n 다음\n{'=' * 66}")
     if solid:

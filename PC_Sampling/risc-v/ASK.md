@@ -124,7 +124,17 @@ INTERCOM.execute ... sys.config.coredebug.base &core_base
 > 3. DM 이 두 개(`0x81480000`, `0x81481000`)로 보이는데, **각각 어느 AP 뒤**입니까?
 > 4. DM 에 **별도의 전원/클럭 인에이블**이 필요합니까?
 >    (ARM DAP 의 `CDBGPWRUPREQ` 와 별개로)
-> 5. 디버그 접근에 **인증/잠금**(SiFive Insight 의 fuse/password/PKI)이 걸려 있습니까?
+> 5. ★ **디버그 접근 제어가 걸려 있습니까?** SiFive Insight 문서의
+>    *"Multilayered Debug Access Control — fused permanent disable pins,
+>    32-bit password barriers, or public-key cryptographic authentication"* 말입니다.
+>    - 이 양산/평가 파트에 **퓨즈나 패스워드가 설정되어 있습니까?**
+>    - 있다면 **해제 절차와 값**은 무엇입니까?
+>    - T32 는 그 해제를 **어디서** 합니까? (우리가 받은 스크립트에는 없습니다)
+>    - 증상: DP·DAP 전원·AP 열거·AP 레지스터 읽기는 전부 정상인데
+>      **메모리 트랜잭션이 전 AP·전 주소에서 실패**하고 `dmactive` 가 안 올라옵니다.
+> 5b. 트레이스 블록(`0xFD000000`, `0xFD180000`)은 **SBA 전용**입니까,
+>    아니면 **AXI-AP 로도 접근 가능**합니까? (SBA 는 DM 을 거치므로 우리가 막힙니다)
+> 5c. 그 버스 도메인에 **별도 클럭/전원 인에이블**이 필요합니까?
 > 6. T32 가 `SYStem.Option.DAPSYSPWRUPREQ OFF` 로 설정된 이유가 있습니까?
 > 7. **트레이스 인에이블 설정**은 어느 스크립트에 있습니까?
 >    (`NexusTracedatadump.cmm` 에는 **끄는 것만** 있습니다. TE 켜기,

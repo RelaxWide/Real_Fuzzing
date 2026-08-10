@@ -200,7 +200,7 @@ DMI 위치까지는 인식(DPIDR / AP map / CoreBase). **DM 이 active 로 응�
 | **G** | **connect 자체가 불안정 — 설정을 고정해도 결과가 갈린다** | ★★ **확정.** 단발 성공률 6/12 (아래) |
 | ~~E~~ | ~~AP 6개 등록이 J-Link 열거를 깨뜨림~~ | **반증됨.** 1개 3/6 = 6개 3/6 |
 | ~~F~~ | ~~`CSYSPWRUPREQ` 를 이 칩이 ACK 안 함~~ | **반증됨.** `CSYSPWRUPACK` 이 실제로 떴다 |
-| A | 디버그 인증/잠금 | **약함.** Spec p30: 미인증에서도 `dmactive` 는 읽기·쓰기 가능해야 한다 |
+| **A** | **디버그 접근 제어(secure JTAG) 잠금** | ★★ **재승격.** 아래 §2.5 — 증상 프로파일이 맞는다 |
 | **B** | **DM 주소 `0x81480000` 이 틀렸거나 다른 AP 뒤에 있다** | ★★ **최유력으로 승격.** AP 는 6개 다 실재·접근 가능한데 이 주소만 안 읽힌다 |
 | C | DM 전원/클럭 게이팅 | 미검증 — 전원 ACK 가 뜬 조건에서 DM 을 다시 봐야 한다 |
 | D | 잘못된 DM | **해소.** hart 0~3 이 전부 `0x81480000`, Ncore 는 대상 아님 |
@@ -257,6 +257,60 @@ probe_trace_regs.py  [A] connect+memory_read32, [B] CoreSight AP 직접 → 모�
 > 인지 "우리 코드가 원래 안 된다" 인지 **구분되지 않는다.**
 
 ---
+
+## 2.5 ★ secure JTAG 가설 재검토 (2026-08-10, 문서 재독)
+
+**SiFive 공식 문서에 이 기능이 실제로 있다** (`SiFive_Trace_and_Debug.md`):
+
+> **Multilayered Debug Access Control**: Enforces strict TAP security through
+> **fused permanent disable pins**, **32-bit password barriers**, or
+> **public-key cryptographic authentication**.
+
+세 방식을 증상과 대조하면:
+
+| 방식 | 우리 증상과 맞나 |
+|---|---|
+| 퓨즈 영구 비활성 | **배제.** TAP 자체가 죽는다 — 우리는 DPIDR 을 읽는다 |
+| **32비트 패스워드 / PKI** | **가능.** DM 을 잠그면 `dmactive` 실패가 그대로 설명된다 |
+| AP 버스 포트 게이팅 | **가장 잘 맞는다** — AP 는 열거되는데 메모리만 전부 실패 |
+
+**증상 프로파일이 정확히 "인증 게이트" 모양이다:**
+```
+DP 통신 ✅   DAP 전원 ✅   AP 열거·IDR ✅   AP 레지스터 읽기 ✅
+────────────────────────────────────────────────────────
+메모리 트랜잭션 ❌ (전 AP, 전 주소)      DM dmactive ❌
+```
+**"디버그 하드웨어는 다 보이는데 아무것도 못 만진다"** — 잠금의 전형이다.
+
+### 이걸 가르는 단 하나의 측정: `CSW.DeviceEn`
+
+MEM-AP `CSW`(AP+0xD00)의 **bit6 `DeviceEn`** 은 그 AP 의 **버스 포트가 켜져
+있는지**를 하드웨어가 알려주는 읽기 전용 비트다. bit23 `SDeviceEn`(SPIDEN)은
+보안 접근 허용 여부다.
+
+| DeviceEn | 결론 |
+|---|---|
+| **0 (전 AP)** | ★ 버스 포트가 **하드웨어로 꺼져 있다.** 소프트웨어로 못 연다 → **잠금이거나 버스 미전원.** 우리 코드로 할 게 없다 |
+| **1** | 포트는 열려 있다 → **잠금이 아니다.** 실패는 주소/코드 문제 |
+
+**우리는 `mem_read32` 안에서 CSW 를 읽고도 값을 버려 왔다.** 브링업 내내
+가장 결정적인 비트를 안 본 셈이다. 이제 열거 단계에서 `CSW`/`CFG` 를
+디코드해 찍는다.
+
+### 덤으로 정정된 것
+
+이전 로그의 `RISC-V debug: 0.11, AddrBits: 0` 은 J-Link 이 이 TAP 을
+**직접 RISC-V DTM 으로 오인**했을 때 나온 값이다. `AddrBits=0` 은 DMI 주소
+비트가 없다는 뜻이라 애초에 정상 DTM 이 아니다.
+→ **이 칩의 디버그 스펙 버전이 0.11 이라는 근거로 쓰면 안 된다.**
+
+### 그리고 SEGGER 문서가 확인해 주는 것
+
+> Memory access: via **System Bus Access (SBA)** / via **progbuf (CPU)** / via **abstract command**
+
+셋 다 **DM 을 거친다.** 즉 **J-Link 의 RISC-V 메모리 접근은 AXI-AP 를 쓰지 않는다.**
+AXI-AP 우회가 된다 해도 J-Link 의 정규 경로로는 못 쓰고, **raw AP 접근으로
+트레이스 레지스터를 직접 두드리는 방식**으로만 쓸 수 있다.
 
 ## 3. 도구
 
