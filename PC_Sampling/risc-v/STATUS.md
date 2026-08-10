@@ -5,6 +5,37 @@
 
 ---
 
+## ★★ 2026-08-10 — 실패 지점이 `dmactive` 로 특정됐다
+
+J-Link 을 **V9.12 → V9.66** 으로 올린 뒤 halt 재시험:
+
+```
+Timeout waiting for debug module to become active
+```
+
+**DMI 위치까지는 도달한다**(DPIDR / AP map / CoreBase 전부 인식).
+그런데 `dmcontrol.dmactive` 를 1 로 쓰고 폴링해도 **DM 이 active 로 응답하지 않는다.**
+
+### 이게 가르는 것
+
+| 후보 | 내용 | 확인 방법 |
+|---|---|---|
+| **A 디버그 인증/잠금** | SiFive Insight 의 password/fuse/PKI 접근 제어. **SSD 양산품이면 개연성 높음** | `dmstatus.authenticated` |
+| **B aperture 주소·매핑 오류** | `CoreBase` 는 T32 해석에서 왔다. 쓰기가 엉뚱한 곳에 떨어지면 dmactive 는 영영 1 이 안 된다 | `dmstatus.version` 이 유효한가 |
+| **C DM 전원/클럭 게이팅** | ARM DAP 디버그 전원과 **별개 도메인** | 벤더 |
+| **D 잘못된 DM** | DM 이 둘인데 **J-Link 은 하나만 지원**(SEGGER 명시 한계) | `nextdm` |
+
+→ **`probe_dm.py`** 가 DM aperture 를 직접 읽어 A/B 를 가른다.
+
+### ★ 버전 업그레이드로 해소된 것
+
+`MemTypeToUse` 의 **DMI 접근은 V9.56+, SBA 접근은 V9.62+** 가 필요하다
+(`RISCV_Set*BaseAddr` 문서 명시). **V9.12 에서는 Core access(=halt 필요)뿐**이었다.
+V9.66 으로 올려 이 제약은 사라졌다 — 이제 `MemTypeToUse=1/2` 로 **halt 없이**
+트레이스 레지스터에 접근할 길이 열려 있다. **단 DM 이 active 여야 한다.**
+
+---
+
 ## ★ 방향 전환 (feedback §11)
 
 **T32 로 이 제품의 코드 커버리지가 실제로 측정된다. 그리고 그 방식은
