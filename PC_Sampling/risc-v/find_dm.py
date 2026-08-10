@@ -78,7 +78,7 @@ def head(t):
 def run_one(a):
     rec = {'device': a.device, 'ap_index': a.ap_index, 'core_base': a.core_base,
            'manual_ap': a.manual_ap, 'power': False, 'connect': False,
-           'dm_alive': False, 'error': None}
+           'dm_alive': False, 'error': None, 'ap_syntax': None, 'exec_rc': None}
     jl = pylink.JLink()
     try:
         jl.open()
@@ -87,10 +87,22 @@ def run_one(a):
         jl.set_speed(SPEED_KHZ)
 
         if a.manual_ap:
+            # ★ SEGGER 문서 두 개가 파라미터 이름을 다르게 쓴다.
+            #   command_strings: Addr=<BaseAddr>      ← 우리가 내내 쓴 것
+            #   J-Link RISC-V  : BaseAddr=0x00002000
+            #   틀린 이름이 **에러 없이 무시**되면 AP 주소가 0 으로 남고
+            #   J-Link 내부 AP 맵이 깨진다 → 정확히 dmactive 타임아웃.
+            #   우리 IDR 성공은 **우리가 직접 쓴 SELECT** 로 얻은 것이라
+            #   J-Link 이 AddAP 를 받아들였다는 증거가 **아니다.**
+            kw = 'BaseAddr' if a.ap_syntax == 'baseaddr' else 'Addr'
+            rc = []
             for i, (_n, addr, typ) in enumerate(AP_MAP):
-                jl.exec_command(f"CORESIGHT_AddAP = Index={i} Type={typ} Addr=0x{addr:X}")
-            jl.exec_command(f"CORESIGHT_SetIndexAPBAPToUse = {a.ap_index}")
-            jl.exec_command(f"CORESIGHT_SetCoreBaseAddr = 0x{a.core_base:X}")
+                rc.append(jl.exec_command(
+                    f"CORESIGHT_AddAP = Index={i} Type={typ} {kw}=0x{addr:X}"))
+            rc.append(jl.exec_command(f"CORESIGHT_SetIndexAPBAPToUse = {a.ap_index}"))
+            rc.append(jl.exec_command(f"CORESIGHT_SetCoreBaseAddr = 0x{a.core_base:X}"))
+            rec['ap_syntax'] = kw
+            rec['exec_rc'] = rc
 
         for t in range(1, a.tries + 1):
             try:
@@ -130,10 +142,11 @@ def run_one(a):
     return EXIT_OK if rec['dm_alive'] else EXIT_INSUFFICIENT
 
 
-def spawn(device, ap_index, core_base, manual_ap, tries):
+def spawn(device, ap_index, core_base, manual_ap, tries, ap_syntax='addr'):
     cmd = [sys.executable, os.path.abspath(__file__), '--single',
            '--device', str(device), '--ap-index', str(ap_index),
-           '--core-base', hex(core_base), '--tries', str(tries)]
+           '--core-base', hex(core_base), '--tries', str(tries),
+           '--ap-syntax', ap_syntax]
     if manual_ap:
         cmd.append('--manual-ap')
     try:
@@ -183,14 +196,20 @@ def mode_sweep(a):
     print("  SEGGER 예제의 CoreBase 는 0x0 이다. 우리가 쓰던 0x81480000 은")
     print("  T32 의 **APB 버스 주소**이고, J-Link 이 원하는 건 **AP 주소공간 오프셋**이다.")
     print("  같다는 보장이 없으므로 0x0 을 포함해 전수로 본다.\n")
+    total = len(a.syntaxes) * len(a.ap_indexes) * len(CORE_BASES)
+    print(f"  총 {total}개 조합 (문법 {a.syntaxes} × AP {a.ap_indexes} × "
+          f"CoreBase {len(CORE_BASES)}개). 조합마다 별도 프로세스.\n")
     hits = []
-    for ap_i in a.ap_indexes:
-        for cb in CORE_BASES:
-            r = spawn(a.device, ap_i, cb, True, a.tries)
-            show(f"AP idx={ap_i} ({AP_MAP[ap_i][0]})  CoreBase=0x{cb:08X}", r)
-            if r.get('dm_alive'):
-                hits.append((ap_i, cb))
-            time.sleep(0.3)
+    for syn in a.syntaxes:
+        print(f"\n  ┌─ AddAP 문법: {syn}=")
+        for ap_i in a.ap_indexes:
+            for cb in CORE_BASES:
+                r = spawn(a.device, ap_i, cb, True, a.tries, syn)
+                show(f"[{syn}] AP idx={ap_i} ({AP_MAP[ap_i][0]})  "
+                     f"CoreBase=0x{cb:08X}", r)
+                if r.get('dm_alive'):
+                    hits.append((syn, ap_i, cb))
+                time.sleep(0.3)
     return hits
 
 
@@ -207,12 +226,17 @@ def main():
     ap.add_argument('--core-base', type=lambda x: int(x, 0), default=0,
                     help=argparse.SUPPRESS)
     ap.add_argument('--manual-ap', action='store_true', help=argparse.SUPPRESS)
+    ap.add_argument('--ap-syntax', choices=['addr', 'baseaddr'], default='addr',
+                    help="CORESIGHT_AddAP 파라미터 이름. SEGGER 문서 두 개가 다르다")
+    ap.add_argument('--syntaxes', default='addr,baseaddr',
+                    help='전수 모드에서 시험할 AddAP 문법 (콤마)')
     a = ap.parse_args()
 
     if a.single:
         return run_one(a)
 
     a.ap_indexes = [int(x) for x in a.ap_indexes.split(',')]
+    a.syntaxes = [x.strip() for x in a.syntaxes.split(',') if x.strip()]
     head(f"DM 위치 탐색 — J-Link 을 오라클로 (v{VERSION})")
     print("  판정: 전원 ACK(세션 유효) + connect + **halted() 동작(=DM 살아있음)**")
     print("  halted() 는 비침습이다. halt 하지 않는다.")
@@ -225,8 +249,8 @@ def main():
         print(f"  ★★ 장치명만으로 DM 이 살아났다: {found_dev}")
         print("     → AP 맵 수동 지정을 버리고 이 장치명을 쓴다. 브링업의 블로커 해소.")
     if hits:
-        print(f"  ★★ 동작한 (AP 인덱스, CoreBase): {hits}")
-        print("     → sfe76_link 의 APB_INDEX / CORE_BASE 를 이 값으로 고정한다.")
+        print(f"  ★★ 동작한 (AddAP 문법, AP 인덱스, CoreBase): {hits}")
+        print("     → sfe76_link 의 AddAP 문법 / APB_INDEX / CORE_BASE 를 이 값으로 고정한다.")
     if not found_dev and not hits:
         print("  ❌ 어느 조합도 DM 을 깨우지 못했다.")
         print()
