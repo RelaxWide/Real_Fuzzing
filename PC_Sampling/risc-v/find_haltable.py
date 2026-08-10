@@ -106,6 +106,8 @@ def main():
                     help='타깃 전원 사이클 세대 기록용')
     ap.add_argument('--core-base', type=lambda x: int(x, 0), default=CORE_BASE_NCORE)
     ap.add_argument('--hart', type=int, default=None)
+    ap.add_argument('--ap-count', type=int, default=None,
+                    help='등록할 AP 개수 (1=APBAP1 만). 기본은 AP_MAP 전부')
     ap.add_argument('--apb', type=int, default=0, help='CORESIGHT_SetIndexAPBAPToUse')
     ap.add_argument('--apbs', default="0,1,4,5",
                     help='훑을 APB-AP 인덱스. 기본 = AP map 의 APB-AP 4개')

@@ -153,38 +153,50 @@ DMI 위치까지는 인식(DPIDR / AP map / CoreBase). **DM 이 active 로 응�
 
 | | 가설 | 상태 |
 |---|---|---|
-| **E** | **AP 6개 등록이 J-Link 열거를 깨뜨림** | ★★ **최유력.** AP 1개일 때만 전원 ACK (아래) |
+| **G** | **connect 자체가 불안정 — 설정을 고정해도 결과가 갈린다** | ★★ **확정.** 단발 성공률 6/12 (아래) |
+| ~~E~~ | ~~AP 6개 등록이 J-Link 열거를 깨뜨림~~ | **반증됨.** 1개 3/6 = 6개 3/6 |
 | ~~F~~ | ~~`CSYSPWRUPREQ` 를 이 칩이 ACK 안 함~~ | **반증됨.** `CSYSPWRUPACK` 이 실제로 떴다 |
 | A | 디버그 인증/잠금 | **약함.** Spec p30: 미인증에서도 `dmactive` 는 읽기·쓰기 가능해야 한다 |
 | B | DMI aperture 주소·매핑 오류 | **약해짐.** `APB:0x81480000` 확정 + `<<2` stride 추론 확보 |
 | C | DM 전원/클럭 게이팅 | 미검증 — 전원 ACK 가 뜬 조건에서 DM 을 다시 봐야 한다 |
 | D | 잘못된 DM | **해소.** hart 0~3 이 전부 `0x81480000`, Ncore 는 대상 아님 |
 
-### ★ `probe_dap.py` 1차 결과 (2026-08-10)
+### ★ `probe_dap.py` 결과 (2026-08-10)
 
+**1차 — 조합 스윕 (`(0,F) (1,F) (6,F) (1,T) (6,T)`)**
 ```
-CDBGPWRUPACK 뜬 조합 : [(1, True)]      ← (AP 등록 1개, connect 함)
+CDBGPWRUPACK 뜬 조합 : [(1, True)]
 CSYSPWRUPACK 뜬 조합 : [(1, True)]
 ```
-시험한 조합: `(0,F) (1,F) (6,F) (1,T) (6,T)`
 
-**세 가지가 한 번에 나왔다.**
+**2차 — 순서 통제 (`--ap-count-test --reps 3`, connect 단발)**
+```
+시행순서:  1  2  3  4  5  6  7  8  9 10 11 12
+AP 개수 :  1  6  6  1  1  6  6  1  1  6  6  1
+결과    :  O  X  O  X  O  O  O  X  O  X  X  X
 
-1. **✅ G0 통과 — DAP 전원은 인가된다.** 그것도 **디버그·시스템 둘 다 ACK.**
-   `Failed to power-up DAP` 는 칩의 한계가 아니라 **조건 문제**다.
-2. **가설 F 반증.** `CSYSPWRUPACK` 이 실제로 떴다. T32 가 `DAPSYSPWRUPREQ OFF` 인
-   이유는 다른 데 있다(멀티세션에서 마스터 하나만 요청하려는 `Slave` 정책으로 보인다).
-   → **P1 의 JLinkScript 작업은 불필요해졌다.**
-3. **`connect` 없이는 ACK 가 하나도 없었다** (`(0,F) (1,F) (6,F)` 전부 실패).
-   pre-connect DP 쓰기는 효력이 없다 — cJTAG 활성화가 `connect` 안에서 일어난다는 뜻.
-   → DP 계층을 connect 이전에 손보는 접근 자체가 성립하지 않는다.
+AP 1개 : 3/6      AP 6개 : 3/6
+```
 
-**그리고 AP 6개(`(6,T)`)는 실패하고 1개(`(1,T)`)는 성공했다** — 유일한 차이가
-실재하지 않는 AP 5개의 등록이다. 가설 E 와 정확히 일치한다.
+**여기서 확정된 것 (좋은 소식과 나쁜 소식이 하나씩)**
 
-> ⚠ **아직 확정 아님 — 순서 교락.** `(1,T)` 가 `(6,T)` 보다 **먼저** 실행됐고,
-> 이 프로젝트는 같은 함정에 두 번 당했다(`backup/README.md` 함정 #2).
-> `--ap-count-test` 로 정방향·역방향을 돌려 가른 뒤에 결론낸다.
+1. **✅ G0 통과 — DAP 전원은 인가된다. 디버그·시스템 둘 다 ACK.**
+   `Failed to power-up DAP` 는 칩의 한계가 아니다.
+2. **가설 F 반증.** `CSYSPWRUPACK` 이 실제로 떴다. T32 의 `DAPSYSPWRUPREQ OFF` 는
+   전원 능력 문제가 아니라 멀티세션 `Slave` 정책 때문으로 보인다.
+   → JLinkScript 로 전원 요청을 끄려던 계획 폐기.
+3. **가설 E 반증.** 1개와 6개의 성공률이 **정확히 같다**(3/6). AP 6개는 무해하다.
+   1차의 `[(1, True)]` 는 **순서 교락에 의한 착시**였다 — 통제 실험이 잡아냈다.
+4. **`connect` 없이는 ACK 가 하나도 없었다.** cJTAG 활성화가 `connect` 안에서
+   일어난다는 뜻 → **DP 계층을 connect 이전에 손보는 접근은 성립하지 않는다.**
+5. ★ **가설 G — 내부 대조가 결정적이다.**
+   같은 설정(AP 1개)이 시행 1·5·9 에서 **3/3 성공**, 시행 4·8·12 에서 **0/3 실패**.
+   **설정을 고정했는데 결과가 갈린다** ⇒ 원인은 설정이 아니라 **연결의 상태 의존성**.
+
+> 이것이 예전부터 "첫 connect 는 실패한다" 로 관찰되던 현상의 정체다.
+> 이제 **DP 전원 계층에서 측정된 수치**(단발 6/12)로 잡혔다.
+> ⚠ `probe_dap` 의 connect 는 **단발**이었다. 실사용 경로(`connect_checked`)는
+> 원래 3회 재시도한다 — 재시도로 덮이는지가 다음 질문이다.
 
 ### 시험 결과 (2026-08-10)
 
@@ -222,7 +234,9 @@ probe_trace_regs.py  [A] connect+memory_read32, [B] CoreSight AP 직접 → 모�
 
 1. **한 handle = 한 설정.** 조합을 섞으면 (a) 한 번 붙은 뒤 전부 거짓 성공(24개 중 23개)
    또는 (b) 조합마다 close 하면 전부 실패. **둘 다 실측으로 겪었다.**
-2. **첫 `connect()` 는 실패한다** (현재 도구/보드 조건 한정). bounded retry 3회는 **임시 우회**.
+2. **`connect()` 는 상태 의존적으로 실패한다** — 단발 성공률 **6/12** 로 측정됨(2026-08-10).
+   같은 설정이 시행 위치에 따라 3/3 · 0/3 으로 갈린다. bounded retry 3회는 **임시 우회**.
+   ⇒ **성공/실패 1회로 결론내지 말 것.** 어떤 비교든 반복 + 순서 통제가 필수다.
 3. **halt 후 반드시 resume + 확인.** 단, **halt 가 애초에 실패했으면 resume 실패는 거짓 경보**다
    (`restart()` 는 halt 상태가 아니면 no-op 으로 False 반환).
 4. **APB 메모리 접근 ≠ RISC-V DMI 레지스터 접근.** `dmcontrol 0x10` 은 DMI 주소이지
@@ -243,38 +257,41 @@ probe_trace_regs.py  [A] connect+memory_read32, [B] CoreSight AP 직접 → 모�
 | halt/PC/resume 이 v10.0 착수 조건 | 틀림 — **T32 커버리지는 halt 방식이 아니다** |
 | JLinkScript 경로는 **불가능** | **틀림 — 사용법 오류였다.** ① `InitTarget()` 은 JTAG 체인과 전역 `CPU` 를 수동 지정해야 하는데 안 했다 → 스캔 깨짐 ② `JLINK_CORESIGHT_Configure()` 를 먼저 안 불러서 나머지가 전부 `0x80000000` ③ `PerformTIFInit=0` 으로 cJTAG 를 지킬 수 있다. **P1 에서 부활** |
 | DPIDR = `0x6BA0009D` | 구버전/깨진 경로의 값. **실제는 `0x11013913`** |
+| AP 6개 등록이 방해 (가설 E) | **틀림** — 순서 통제하니 1개 3/6 = 6개 3/6. **또 순서 교락이었다** |
+| `CSYSPWRUPACK` 을 칩이 안 준다 (가설 F) | **틀림** — 실제로 떴다. `attach.cmm` 의 `DAPSYSPWRUPREQ OFF` 는 `Slave` 정책 |
 
 ---
 
 ## 6. 다음 할 일
 
-### P0 — 지금: AP 개수 효과를 **순서 통제**로 확정
+### P0 — 지금: 재시도가 불안정성을 덮는가 (가설 G)
 
 ```bash
-sudo python3 probe_dap.py --ap-count-test --reps 3
+sudo python3 probe_dap.py --ap-count-test --reps 3 --tries 3
 ```
-`(AP 1개, connect)` 와 `(AP 6개, connect)` 를 **정방향·역방향 × 3회** 돌린다.
+방금과 **똑같은 실험에 connect 재시도만 3회**로 켠다. 단일 변수 비교다.
 
-| 결과 | 결론 |
-|---|---|
-| 두 방향 모두 1개만 성공 | ★★ **가설 E 확정** → AP map 을 APBAP1 하나로 줄인다 |
-| 방향에 따라 갈림 | 순서 효과. AP 개수는 원인이 아니다 (전에 두 번 속은 패턴) |
-| 둘 다 성공한 적 있음 | 1차 실패는 "첫 connect 는 실패한다" 습성 |
+| 결과 | 결론 | 다음 |
+|---|---|---|
+| 12/12 성공 | ★★ **재시도가 답.** 전원 문제는 운영상 해결 | 바로 P1 로 |
+| 여전히 갈림 | 재시도로 못 덮는 상태 의존성이 따로 있다 | 전원 사이클 세대별로 묶어 재측정 |
 
-### P1 — 전원이 서는 조건에서 DM 을 다시 본다
+**AP 개수는 이제 변수가 아니다** — 6개 그대로 둔다. `--ap-count` 는 전 도구에
+남겨 두되(재현·비교용) 기본값은 `AP_MAP` 전부다.
 
-**전원 ACK 가 뜬 조건은 `AP 1개 + connect` 다.** 지금까지의 DM/트레이스 시험은
-전부 **AP 6개**로 돌렸다 — 즉 **전원이 안 선 상태에서 측정한 것**이고,
-그 실패들은 증거로서 무효다. `--ap-count 1` 로 전부 다시 돌린다.
+### P1 — DM 을 다시 본다 (전원이 선 조건에서)
+
+지금까지의 DM/트레이스 실패는 전원 인가 여부를 **모르는 상태**에서 잰 것이다.
+이제 성공/실패를 `CDBGPWRUPACK` 으로 판별할 수 있으니 재측정이 유효해졌다.
 
 ```bash
-sudo python3 probe_dm.py         --ap-count 1 --core-base 0x81480000 --hart 0 --shifts 2
-sudo python3 probe_trace_regs.py --ap-count 1 --core-base 0x81480000 --hart 0
+sudo python3 probe_dm.py --core-base 0x81480000 --hart 0 --shifts 2 --tries 3
 ```
-`probe_dm.py` 는 `0x81480040`(dmcontrol) / `0x81480044`(dmstatus) 를 읽는다.
-`dmstatus.version` 이 2·3 이면 **aperture 확정** → 가설 B 종료.
+`0x81480040`(dmcontrol) / `0x81480044`(dmstatus) 를 읽는다.
+`dmstatus.version` 이 2·3 이면 **aperture 확정** → 가설 B 종료,
+`authenticated` 비트로 가설 A 도 즉시 갈린다.
 
-> ~~P1 JLinkScript 로 `CSYSPWRUPREQ` 끄기~~ → **불필요.** 가설 F 가 반증됐다.
+> ~~JLinkScript 로 `CSYSPWRUPREQ` 끄기~~ → **불필요.** 가설 F 반증.
 > (다만 "JLinkScript 는 불가능" 이라는 결론 자체는 §5 대로 여전히 틀렸다 —
 >  나중에 필요해지면 `PerformTIFInit=0` + 체인 수동지정으로 살릴 수 있다.)
 

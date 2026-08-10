@@ -140,9 +140,15 @@ def valid_dpidr(v):
     return v is not None and v > 0 and (v & 1) == 1 and v not in (1, 0xFFFFFFFF)
 
 
-def attempt(nap, do_connect, device):
-    """AP 를 nap 개 등록하고 DP 전원을 확인한다."""
-    label = f"AP 등록 {nap}개 / connect={'O' if do_connect else 'X'}"
+def attempt(nap, do_connect, device, tries=1):
+    """AP 를 nap 개 등록하고 DP 전원을 확인한다.
+
+    tries: connect 재시도 횟수. **1 은 단발 측정용**이다.
+      2026-08-10 통제 실험에서 단발 성공률이 3/6 으로 나왔고, 같은 설정(AP 1개)이
+      시행 위치에 따라 3/3 · 0/3 으로 갈렸다 → 설정이 아니라 **연결 자체가 불안정**.
+      실사용 경로(`Link.connect_checked`)는 원래 3회 재시도한다.
+    """
+    label = f"AP 등록 {nap}개 / connect={'O' if do_connect else 'X'} / tries={tries}"
     print(f"\n{'-' * 66}\n {label}\n{'-' * 66}")
 
     jl = pylink.JLink()
@@ -161,12 +167,20 @@ def attempt(nap, do_connect, device):
             jl.exec_command(f"CORESIGHT_SetIndexAPBAPToUse = {min(APB_INDEX, nap - 1)}")
             jl.exec_command(f"CORESIGHT_SetCoreBaseAddr = 0x{CORE_BASE_NCORE:X}")
 
+        conn_ok, conn_tries = None, 0
         if do_connect:
-            try:
-                jl.connect(device, speed=SPEED_KHZ)
-                print("  connect 성공")
-            except Exception as e:
-                print(f"  connect 실패: {str(e)[:90]}")
+            for t in range(1, tries + 1):
+                conn_tries = t
+                try:
+                    jl.connect(device, speed=SPEED_KHZ)
+                    conn_ok = True
+                    print(f"  connect 성공 ({t}회차)")
+                    break
+                except Exception as e:
+                    conn_ok = False
+                    print(f"  connect 실패 ({t}/{tries}): {str(e)[:80]}")
+                    if t < tries:
+                        time.sleep(0.3)
 
         # CoreSight 계층 준비 — 단일 TAP, IRLen 4
         #   ★ perform_tif_init=False 를 **먼저** 쓴다.
@@ -203,6 +217,7 @@ def attempt(nap, do_connect, device):
             ok, ctrl, dbg, sysa = try_power(jl, label, req, want)
             pwr[label] = {'ok': ok, 'ctrl': ctrl, 'dbg_ack': dbg, 'sys_ack': sysa}
         return {'dpidr': idr, 'pwr': pwr,
+                'connect_ok': conn_ok, 'connect_tries': conn_tries,
                 'ack': any(p['ok'] for p in pwr.values()),
                 'dbg_ack': any(p['dbg_ack'] for p in pwr.values()),
                 'sys_ack': any(p['sys_ack'] for p in pwr.values())}
@@ -214,45 +229,61 @@ def attempt(nap, do_connect, device):
         time.sleep(0.4)
 
 
-def ap_count_test(device, reps):
-    """★ AP 등록 개수 1 vs 6 — **순서를 통제해서** 가른다.
+def ap_count_test(device, reps, tries):
+    """AP 등록 개수 1 vs 6 — **순서를 통제해서** 가른다.
 
-    2026-08-10 1차 결과: (AP 1개, connect) 만 전원 ACK, (AP 6개, connect) 는 실패.
-    그런데 1개가 **먼저** 실행됐다. 이 프로젝트는 같은 순서 교락에 두 번 당했다
-    (backup/README 함정 #2). 그래서 정방향·역방향을 모두 돌린다.
+    ── 2026-08-10 결과 (tries=1, reps=3) ─────────────────────────────
+      AP 1개 : 3/6      AP 6개 : 3/6      → **AP 개수는 원인이 아니다**
+      같은 설정(AP 1개)이 rep 내 위치에 따라 3/3 · 0/3 으로 갈렸다
+      = 설정을 고정해도 결과가 갈린다 → **연결 자체가 불안정한 것**
 
-    판정:
-      두 방향 모두 1개만 성공  → **AP 개수가 원인.** AP map 을 줄인다
-      방향에 따라 갈림         → 순서 효과. AP 개수는 원인이 아니다
-      두 방향 모두 둘 다 성공  → 1차 실패는 우연(첫 connect 실패 습성)
+    그래서 이 실험의 목적이 바뀌었다. 이제 보는 것은 **재시도가 답인가**다.
+    `--tries 3` 으로 돌려 성공률이 올라가면 전원 문제는 운영상 해결된 것이고,
+    안 올라가면 재시도로 못 덮는 상태 의존성이 따로 있는 것이다.
     """
-    print(f"\n{'=' * 66}\n [AP 개수 통제 실험] 1 vs 6, 정방향·역방향 × {reps}회\n{'=' * 66}")
+    print(f"\n{'=' * 66}\n [AP 개수 통제 실험] 1 vs 6, 정방향·역방향 × {reps}회, "
+          f"connect tries={tries}\n{'=' * 66}")
     res = {1: [], 6: []}
+    log = []                       # (시행번호, nap, rep내위치, 성공)
+    n = 0
     for rep in range(reps):
         for label, seq in (("정방향 1→6", [1, 6]), ("역방향 6→1", [6, 1])):
             print(f"\n### rep {rep + 1} / {label}")
             for nap in seq:
-                r = attempt(nap, True, device)
+                n += 1
+                r = attempt(nap, True, device, tries=tries)
                 ok = bool(r and r.get('dbg_ack'))
                 res[nap].append(ok)
+                log.append((n, nap, ok, (r or {}).get('connect_tries')))
 
     print(f"\n{'=' * 66}\n [AP 개수 통제 실험] 판정\n{'=' * 66}")
-    for nap in (1, 6):
-        v = res[nap]
-        print(f"  AP {nap}개 : {sum(v)}/{len(v)} 성공   {v}")
+    print("  시행 순서대로:")
+    for n_, nap, ok, ct in log:
+        print(f"    {n_:2d}회  AP{nap}개  {'성공' if ok else '실패'}"
+              f"{f'  (connect {ct}회차)' if ct else ''}")
+
     one, six = res[1], res[6]
-    if all(one) and not any(six):
-        print("\n  ★★ **AP 개수가 원인이다.** 순서와 무관하게 1개만 성공.")
-        print("     → 실재하지 않는 AP 5개 등록이 J-Link 의 DAP 열거를 깨뜨린다.")
-        print("     → 모든 도구를 --ap-count 1 로 돌린다. AP_MAP 을 APBAP1 로 줄인다.")
-    elif any(one) and any(six):
-        print("\n  둘 다 성공한 적이 있다 → AP 개수는 원인이 아니다.")
-        print("     실패는 '첫 connect 는 실패한다' 는 기존 습성으로 설명된다.")
-    elif not any(one) and not any(six):
-        print("\n  둘 다 전부 실패 → 조건이 달라졌다. 타깃 전원 사이클 후 재실행.")
+    print(f"\n  AP 1개 : {sum(one)}/{len(one)}   {one}")
+    print(f"  AP 6개 : {sum(six)}/{len(six)}   {six}")
+
+    if sum(one) == sum(six):
+        print("\n  ★ **AP 개수는 원인이 아니다** — 성공률이 같다.")
+    elif all(one) and not any(six):
+        print("\n  ★★ AP 개수가 원인. AP map 을 APBAP1 하나로 줄인다.")
     else:
-        print("\n  ⚠ 결과가 섞였다 — 반복이 부족하다. --reps 를 늘려 재실행할 것.")
-    return EXIT_OK if any(one) or any(six) else EXIT_INSUFFICIENT
+        print(f"\n  성공률이 다르다({sum(one)} vs {sum(six)}) — 반복을 늘려 재확인할 것.")
+
+    total = sum(one) + sum(six)
+    print(f"\n  전체 성공률 {total}/{len(one) + len(six)}  (connect tries={tries})")
+    if tries == 1 and total < len(one) + len(six):
+        print("     → **`--tries 3` 으로 다시 돌려볼 것.** 재시도로 덮이는지가 핵심이다.")
+    elif tries > 1 and total == len(one) + len(six):
+        print("     ★★ 재시도하면 100% → **전원 문제는 운영상 해결.**")
+        print("        AP 는 6개 그대로 두고 다음 단계(DM)로 간다.")
+    elif tries > 1:
+        print("     ⚠ 재시도해도 못 덮는다 → 재시도 밖의 상태 의존성이 있다.")
+        print("        타깃 전원 사이클 세대별로 묶어서 재측정할 것.")
+    return EXIT_OK if total else EXIT_INSUFFICIENT
 
 
 def main():
@@ -261,12 +292,16 @@ def main():
     ap.add_argument('--no-connect', action='store_true',
                     help='connect 를 아예 하지 않고 DP 만 본다')
     ap.add_argument('--ap-count-test', action='store_true',
-                    help='AP 1개 vs 6개를 순서 통제해서 비교한다 (1차 결과 확인용)')
+                    help='AP 1개 vs 6개를 순서 통제해서 비교한다')
+    ap.add_argument('--ap-count', type=int, default=None,
+                    help='단발 모드에서 등록할 AP 개수를 이 값 하나로 고정한다')
     ap.add_argument('--reps', type=int, default=3)
+    ap.add_argument('--tries', type=int, default=1,
+                    help='connect 재시도 횟수 (기본 1 = 단발 측정)')
     a = ap.parse_args()
 
     if a.ap_count_test:
-        return ap_count_test(a.device, a.reps)
+        return ap_count_test(a.device, a.reps, a.tries)
 
     print(f"\n{'=' * 66}")
     print(f" DAP 전원 인가 확인 — 가장 아래 층만 (v{VERSION})")
@@ -274,13 +309,16 @@ def main():
     print("  'Failed to power-up DAP' 가 진짜인지, AP 등록이 방해가 되는지 가른다.")
     print("  connect / AP 접근 / DM 은 건드리지 않는다.")
 
-    combos = [(0, False), (1, False), (len(AP_MAP), False)]
-    if not a.no_connect:
-        combos += [(1, True), (len(AP_MAP), True)]
+    if a.ap_count is not None:
+        combos = [(a.ap_count, False)] + ([] if a.no_connect else [(a.ap_count, True)])
+    else:
+        combos = [(0, False), (1, False), (len(AP_MAP), False)]
+        if not a.no_connect:
+            combos += [(1, True), (len(AP_MAP), True)]
 
     res = []
     for nap, conn in combos:
-        r = attempt(nap, conn, a.device)
+        r = attempt(nap, conn, a.device, tries=a.tries)
         res.append((nap, conn, r))
 
     print(f"\n{'=' * 66}\n 판정\n{'=' * 66}")
