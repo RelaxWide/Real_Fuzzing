@@ -214,12 +214,59 @@ def attempt(nap, do_connect, device):
         time.sleep(0.4)
 
 
+def ap_count_test(device, reps):
+    """★ AP 등록 개수 1 vs 6 — **순서를 통제해서** 가른다.
+
+    2026-08-10 1차 결과: (AP 1개, connect) 만 전원 ACK, (AP 6개, connect) 는 실패.
+    그런데 1개가 **먼저** 실행됐다. 이 프로젝트는 같은 순서 교락에 두 번 당했다
+    (backup/README 함정 #2). 그래서 정방향·역방향을 모두 돌린다.
+
+    판정:
+      두 방향 모두 1개만 성공  → **AP 개수가 원인.** AP map 을 줄인다
+      방향에 따라 갈림         → 순서 효과. AP 개수는 원인이 아니다
+      두 방향 모두 둘 다 성공  → 1차 실패는 우연(첫 connect 실패 습성)
+    """
+    print(f"\n{'=' * 66}\n [AP 개수 통제 실험] 1 vs 6, 정방향·역방향 × {reps}회\n{'=' * 66}")
+    res = {1: [], 6: []}
+    for rep in range(reps):
+        for label, seq in (("정방향 1→6", [1, 6]), ("역방향 6→1", [6, 1])):
+            print(f"\n### rep {rep + 1} / {label}")
+            for nap in seq:
+                r = attempt(nap, True, device)
+                ok = bool(r and r.get('dbg_ack'))
+                res[nap].append(ok)
+
+    print(f"\n{'=' * 66}\n [AP 개수 통제 실험] 판정\n{'=' * 66}")
+    for nap in (1, 6):
+        v = res[nap]
+        print(f"  AP {nap}개 : {sum(v)}/{len(v)} 성공   {v}")
+    one, six = res[1], res[6]
+    if all(one) and not any(six):
+        print("\n  ★★ **AP 개수가 원인이다.** 순서와 무관하게 1개만 성공.")
+        print("     → 실재하지 않는 AP 5개 등록이 J-Link 의 DAP 열거를 깨뜨린다.")
+        print("     → 모든 도구를 --ap-count 1 로 돌린다. AP_MAP 을 APBAP1 로 줄인다.")
+    elif any(one) and any(six):
+        print("\n  둘 다 성공한 적이 있다 → AP 개수는 원인이 아니다.")
+        print("     실패는 '첫 connect 는 실패한다' 는 기존 습성으로 설명된다.")
+    elif not any(one) and not any(six):
+        print("\n  둘 다 전부 실패 → 조건이 달라졌다. 타깃 전원 사이클 후 재실행.")
+    else:
+        print("\n  ⚠ 결과가 섞였다 — 반복이 부족하다. --reps 를 늘려 재실행할 것.")
+    return EXIT_OK if any(one) or any(six) else EXIT_INSUFFICIENT
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--device', default=DEVICE)
     ap.add_argument('--no-connect', action='store_true',
                     help='connect 를 아예 하지 않고 DP 만 본다')
+    ap.add_argument('--ap-count-test', action='store_true',
+                    help='AP 1개 vs 6개를 순서 통제해서 비교한다 (1차 결과 확인용)')
+    ap.add_argument('--reps', type=int, default=3)
     a = ap.parse_args()
+
+    if a.ap_count_test:
+        return ap_count_test(a.device, a.reps)
 
     print(f"\n{'=' * 66}")
     print(f" DAP 전원 인가 확인 — 가장 아래 층만 (v{VERSION})")

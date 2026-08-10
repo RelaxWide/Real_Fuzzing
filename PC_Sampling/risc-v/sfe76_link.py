@@ -161,10 +161,15 @@ class Link:
     """J-Link 연결 1개 = 설정 1개. 조합을 섞지 않는다."""
 
     def __init__(self, core_base=CORE_BASE_NCORE, hart=None, device=DEVICE,
-                 speed=SPEED_KHZ, serial=None, verbose=True, apb_index=APB_INDEX):
+                 speed=SPEED_KHZ, serial=None, verbose=True, apb_index=APB_INDEX,
+                 ap_count=None):
         self.core_base = core_base
         self.hart = hart
         self.apb_index = apb_index
+        # ★ 등록할 AP 개수. 2026-08-10 probe_dap 결과, AP 1개일 때만 DAP 전원이
+        #   ACK 됐다(6개는 실패). 실재가 확인된 AP 는 APBAP1 하나뿐이므로
+        #   **없는 AP 를 등록하는 것이 해가 될 수 있다.** None = AP_MAP 전부.
+        self.ap_count = len(AP_MAP) if ap_count is None else max(1, min(ap_count, len(AP_MAP)))
         self.device = device
         self.speed = speed
         self.serial = serial
@@ -233,9 +238,10 @@ class Link:
             jl.exec_command(f"SetcJTAGInitMode = {CJTAG_MODE}")
             jl.set_tif(TIF_CJTAG)
             jl.set_speed(self.speed)
-            for i, (_n, addr, typ) in enumerate(AP_MAP):
+            for i, (_n, addr, typ) in enumerate(AP_MAP[:self.ap_count]):
                 jl.exec_command(f"CORESIGHT_AddAP = Index={i} Type={typ} Addr=0x{addr:X}")
-            jl.exec_command(f"CORESIGHT_SetIndexAPBAPToUse = {self.apb_index}")
+            jl.exec_command(
+                f"CORESIGHT_SetIndexAPBAPToUse = {min(self.apb_index, self.ap_count - 1)}")
             jl.exec_command(f"CORESIGHT_SetCoreBaseAddr = 0x{self.core_base:X}")
             if self.hart is not None:
                 jl.exec_command(f"RISCV_SetHartSel = {self.hart}")
@@ -385,6 +391,9 @@ def add_common_args(ap):
     ap.add_argument('--device', default=DEVICE)
     ap.add_argument('--serial', default=None, help='J-Link serial (여러 대 연결 시 필수)')
     ap.add_argument('--tries', type=int, default=CONNECT_TRIES)
+    ap.add_argument('--ap-count', type=int, default=None,
+                    help='등록할 AP 개수 (1=APBAP1 만). 기본은 AP_MAP 전부(6). '
+                         'probe_dap 에서 1개일 때만 DAP 전원이 ACK 됐다')
     return ap
 
 

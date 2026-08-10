@@ -127,7 +127,8 @@ def main():
     print(f"  device={a.device!r}  CoreBase=0x{a.core_base:X} "
           f"[{CORE_BASE_LABEL.get(a.core_base, '?')}]  hart={a.hart}")
 
-    lk = Link(core_base=a.core_base, hart=a.hart, device=a.device, serial=a.serial)
+    lk = Link(core_base=a.core_base, hart=a.hart, device=a.device, serial=a.serial,
+              ap_count=a.ap_count)
     ok = None
     try:
         with lk:

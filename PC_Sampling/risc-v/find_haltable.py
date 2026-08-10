@@ -44,7 +44,8 @@ def run_single(a):
            'connect': False, 'halt': False, 'resume': False,
            'tries': None, 'error': None, 'recovery_required': False}
     lk = Link(core_base=a.core_base, hart=a.hart, device=a.device,
-              serial=a.serial, verbose=False, apb_index=a.apb)
+              serial=a.serial, verbose=False, apb_index=a.apb,
+              ap_count=a.ap_count)
     try:
         with lk:
             lk.connect_checked(tries=a.tries)

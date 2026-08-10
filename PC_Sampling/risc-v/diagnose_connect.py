@@ -52,7 +52,7 @@ def run_single(args):
            'core_base': f"0x{args.core_base:X}", 'ok': False,
            'tries_used': None, 'error': None}
     lk = Link(core_base=args.core_base, hart=args.hart, device=args.device,
-              serial=args.serial, verbose=False)
+              serial=args.serial, verbose=False, ap_count=args.ap_count)
     try:
         with lk:
             lk.connect_checked(tries=args.tries)
@@ -65,11 +65,13 @@ def run_single(args):
     return EXIT_OK if rec['ok'] else EXIT_CONNECT_FAIL
 
 
-def spawn(device, hart, core_base, serial, tries):
+def spawn(device, hart, core_base, serial, tries, ap_count=None):
     """후보 하나를 **별도 프로세스**에서 시도한다."""
     cmd = [sys.executable, os.path.abspath(__file__), '--single',
            '--device', str(device), '--core-base', hex(core_base),
            '--tries', str(tries)]
+    if ap_count is not None:
+        cmd += ['--ap-count', str(ap_count)]
     if hart is not None:
         cmd += ['--hart', str(hart)]
     if serial:
@@ -97,14 +99,14 @@ def show(tag, r):
 def exp_d(a):
     head("[D] 세션 지속성 — 상태가 타깃에 남나, DLL/probe 에 남나")
     print("  1단계: 별도 프로세스에서 정상 절차(retry 포함)로 성공시킨다")
-    r1 = spawn(a.device, a.hart, a.core_base, a.serial, a.tries)
+    r1 = spawn(a.device, a.hart, a.core_base, a.serial, a.tries, a.ap_count)
     show("1단계", r1)
     if not r1.get('ok'):
         print("  → 1단계 실패로 D 판정 불가")
         return None
 
     print("\n  2단계: **새 프로세스**에서 connect 를 1회만 시도")
-    r2 = spawn(a.device, a.hart, a.core_base, a.serial, 1)
+    r2 = spawn(a.device, a.hart, a.core_base, a.serial, 1, a.ap_count)
     show("2단계(1회 제한)", r2)
     return r2.get('ok')
 
@@ -115,7 +117,7 @@ def exp_e(a, devices):
     for label, seq in (("정방향", devices), ("역방향", list(reversed(devices)))):
         print(f"\n  ── {label} ──")
         for dev in seq:
-            r = spawn(dev, a.hart, a.core_base, a.serial, 1)   # 1회 제한이 핵심
+            r = spawn(dev, a.hart, a.core_base, a.serial, 1, a.ap_count)   # 1회 제한이 핵심
             show(f"{dev!r}", r)
             res.setdefault(dev, []).append(bool(r.get('ok')))
             time.sleep(0.3)
@@ -128,7 +130,7 @@ def exp_f(a, nharts=5):
     for label, seq in (("정방향", range(nharts)), ("역방향", reversed(range(nharts)))):
         print(f"\n  ── {label} ──")
         for h in seq:
-            r = spawn(a.device, h, a.core_base, a.serial, 1)
+            r = spawn(a.device, h, a.core_base, a.serial, 1, a.ap_count)
             show(f"hart {h}", r)
             res.setdefault(h, []).append(bool(r.get('ok')))
             time.sleep(0.3)

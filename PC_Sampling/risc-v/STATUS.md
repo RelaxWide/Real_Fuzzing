@@ -153,12 +153,38 @@ DMI 위치까지는 인식(DPIDR / AP map / CoreBase). **DM 이 active 로 응�
 
 | | 가설 | 상태 |
 |---|---|---|
-| **F** | **J-Link 이 `CSYSPWRUPREQ` 도 요청·대기 → 이 칩은 ACK 안 줌** | ★★ **최유력 (신규).** `attach.cmm` 이 `DAPSYSPWRUPREQ OFF` 를 명시 |
+| **E** | **AP 6개 등록이 J-Link 열거를 깨뜨림** | ★★ **최유력.** AP 1개일 때만 전원 ACK (아래) |
+| ~~F~~ | ~~`CSYSPWRUPREQ` 를 이 칩이 ACK 안 함~~ | **반증됨.** `CSYSPWRUPACK` 이 실제로 떴다 |
 | A | 디버그 인증/잠금 | **약함.** Spec p30: 미인증에서도 `dmactive` 는 읽기·쓰기 가능해야 한다 |
 | B | DMI aperture 주소·매핑 오류 | **약해짐.** `APB:0x81480000` 확정 + `<<2` stride 추론 확보 |
-| C | DM 전원/클럭 게이팅 | F 에 흡수 — 같은 현상의 다른 이름일 수 있다 |
+| C | DM 전원/클럭 게이팅 | 미검증 — 전원 ACK 가 뜬 조건에서 DM 을 다시 봐야 한다 |
 | D | 잘못된 DM | **해소.** hart 0~3 이 전부 `0x81480000`, Ncore 는 대상 아님 |
-| E | AP 6개 등록이 J-Link 열거를 깨뜨림 | 미검증 — `probe_dap.py` 가 F 와 함께 가른다 |
+
+### ★ `probe_dap.py` 1차 결과 (2026-08-10)
+
+```
+CDBGPWRUPACK 뜬 조합 : [(1, True)]      ← (AP 등록 1개, connect 함)
+CSYSPWRUPACK 뜬 조합 : [(1, True)]
+```
+시험한 조합: `(0,F) (1,F) (6,F) (1,T) (6,T)`
+
+**세 가지가 한 번에 나왔다.**
+
+1. **✅ G0 통과 — DAP 전원은 인가된다.** 그것도 **디버그·시스템 둘 다 ACK.**
+   `Failed to power-up DAP` 는 칩의 한계가 아니라 **조건 문제**다.
+2. **가설 F 반증.** `CSYSPWRUPACK` 이 실제로 떴다. T32 가 `DAPSYSPWRUPREQ OFF` 인
+   이유는 다른 데 있다(멀티세션에서 마스터 하나만 요청하려는 `Slave` 정책으로 보인다).
+   → **P1 의 JLinkScript 작업은 불필요해졌다.**
+3. **`connect` 없이는 ACK 가 하나도 없었다** (`(0,F) (1,F) (6,F)` 전부 실패).
+   pre-connect DP 쓰기는 효력이 없다 — cJTAG 활성화가 `connect` 안에서 일어난다는 뜻.
+   → DP 계층을 connect 이전에 손보는 접근 자체가 성립하지 않는다.
+
+**그리고 AP 6개(`(6,T)`)는 실패하고 1개(`(1,T)`)는 성공했다** — 유일한 차이가
+실재하지 않는 AP 5개의 등록이다. 가설 E 와 정확히 일치한다.
+
+> ⚠ **아직 확정 아님 — 순서 교락.** `(1,T)` 가 `(6,T)` 보다 **먼저** 실행됐고,
+> 이 프로젝트는 같은 함정에 두 번 당했다(`backup/README.md` 함정 #2).
+> `--ap-count-test` 로 정방향·역방향을 돌려 가른 뒤에 결론낸다.
 
 ### 시험 결과 (2026-08-10)
 
@@ -222,54 +248,35 @@ probe_trace_regs.py  [A] connect+memory_read32, [B] CoreSight AP 직접 → 모�
 
 ## 6. 다음 할 일
 
-### P0 — 지금  ★ `probe_dap.py` 갱신됨 (2026-08-10.2)
+### P0 — 지금: AP 개수 효과를 **순서 통제**로 확정
 
-**`sudo python3 probe_dap.py`**
-
-이제 **전원 요청을 두 갈래로 나눠** 시험하고 ACK 비트를 따로 읽는다:
-
+```bash
+sudo python3 probe_dap.py --ap-count-test --reps 3
 ```
-DBG only : CTRL/STAT = 0x10000000   (CDBGPWRUPREQ)        ← T32 방식
-BOTH     : CTRL/STAT = 0x50000000   (CDBG + CSYSPWRUPREQ) ← J-Link 기본
-bit28 CDBGPWRUPREQ  bit29 CDBGPWRUPACK  bit30 CSYSPWRUPREQ  bit31 CSYSPWRUPACK
+`(AP 1개, connect)` 와 `(AP 6개, connect)` 를 **정방향·역방향 × 3회** 돌린다.
+
+| 결과 | 결론 |
+|---|---|
+| 두 방향 모두 1개만 성공 | ★★ **가설 E 확정** → AP map 을 APBAP1 하나로 줄인다 |
+| 방향에 따라 갈림 | 순서 효과. AP 개수는 원인이 아니다 (전에 두 번 속은 패턴) |
+| 둘 다 성공한 적 있음 | 1차 실패는 "첫 connect 는 실패한다" 습성 |
+
+### P1 — 전원이 서는 조건에서 DM 을 다시 본다
+
+**전원 ACK 가 뜬 조건은 `AP 1개 + connect` 다.** 지금까지의 DM/트레이스 시험은
+전부 **AP 6개**로 돌렸다 — 즉 **전원이 안 선 상태에서 측정한 것**이고,
+그 실패들은 증거로서 무효다. `--ap-count 1` 로 전부 다시 돌린다.
+
+```bash
+sudo python3 probe_dm.py         --ap-count 1 --core-base 0x81480000 --hart 0 --shifts 2
+sudo python3 probe_trace_regs.py --ap-count 1 --core-base 0x81480000 --hart 0
 ```
-동시에 AP 등록 0 / 1 / 6개도 비교한다(가설 E). `coresight_configure` 는
-**`perform_tif_init=False` 를 먼저** 쓴다 — 기본값이 내보내는 JTAG 스위칭
-시퀀스가 cJTAG 를 깨뜨리는 것으로 보이기 때문(§5 참조).
+`probe_dm.py` 는 `0x81480040`(dmcontrol) / `0x81480044`(dmstatus) 를 읽는다.
+`dmstatus.version` 이 2·3 이면 **aperture 확정** → 가설 B 종료.
 
-| 결과 | 결론 | 다음 |
-|---|---|---|
-| **DBG ACK O / SYS ACK X** | ★★ **가설 F 확정** | `CSYSPWRUPREQ` 없는 connect 경로 (P1) |
-| 둘 다 ACK | 전원은 원인 아님 | `probe_dm.py --shifts 2` 로 DM aperture |
-| DBG ACK 도 X | 전원 인가가 진짜 블로커 | T32 초기화 시퀀스 확보 |
-| AP 0개만 ACK | 가설 E | AP map 을 줄인다 |
-| DPIDR 무효 | cJTAG 계층 회귀 | 타깃 전원 사이클부터 |
-
-### P1 — 가설 F 가 맞을 때: `CSYSPWRUPREQ` 없이 붙는 경로
-
-J-Link **명령 문자열에는 전원 요청을 끄는 옵션이 없다**(전체 목록 확인함).
-남은 길은 **JLinkScript `InitTarget()`** 에서 DP CTRL/STAT 를 직접 쓰는 것이다.
-
-이전에 JLinkScript 를 폐기한 이유가 **이제 설명된다**(SEGGER 문서 확인):
-- `InitTarget()` 은 *"JTAG 체인을 이 함수 안에서 수동으로 전부 지정해야 하고,
-  전역 `CPU` 도 반드시 설정해야 한다"* — 안 했으니 스캔이 깨진 것(`IRPrint=0x..0000`)
-- `JLINK_CORESIGHT_*` 가 전부 `0x80000000` 이던 것도 설명된다 —
-  **`JLINK_CORESIGHT_Configure()` 를 먼저 불러야** 다른 CORESIGHT 함수가 동작한다
-- 그리고 그 `Configure()` 에 **`PerformTIFInit=0`** 파라미터가 있다
-  = *"완료 후 스위칭 시퀀스를 내보내지 마라"* ← **cJTAG 를 지키는 스위치**
-
-즉 폐기 사유가 전부 **우리 쪽 사용법 오류**였고, 셋 다 고칠 수 있다.
-
-```c
-int InitTarget(void) {
-  JLINK_CORESIGHT_Configure("IRPre=0;DRPre=0;IRPost=0;DRPost=0;"
-                            "IRLenDevice=4;PerformTIFInit=0;");
-  JLINK_CORESIGHT_WriteDP(JLINK_CORESIGHT_DP_REG_CTRL_STAT, 0x10000000); // DBG only
-  // CDBGPWRUPACK(bit29) 폴링 후 CPU 전역 설정하고 리턴
-}
-```
-> ⚠ J-Link 이 그 뒤 자기 connect 에서 `CSYSPWRUPREQ` 를 **다시 세울 수도** 있다.
-> P0 결과가 F 를 확정한 뒤에 착수한다. 확정 전엔 만들지 않는다.
+> ~~P1 JLinkScript 로 `CSYSPWRUPREQ` 끄기~~ → **불필요.** 가설 F 가 반증됐다.
+> (다만 "JLinkScript 는 불가능" 이라는 결론 자체는 §5 대로 여전히 틀렸다 —
+>  나중에 필요해지면 `PerformTIFInit=0` + 체인 수동지정으로 살릴 수 있다.)
 
 ### P2 — T32 스크립트에서 아직 못 얻은 것 (많이 줄었다)
 
@@ -322,7 +329,7 @@ int InitTarget(void) {
 
 | 주 트랙 (커버리지) | | 보조 트랙 (halt PC 샘플링) | |
 |---|---|---|---|
-| C0a T32 동작 확인 | ✅ | G0 cJTAG/DP/전원 | ⚠️ (DAP 전원 재확인 필요) |
+| C0a T32 동작 확인 | ✅ | **G0 cJTAG/DP/전원** | ✅ **통과** (AP 1개 + connect, 양쪽 ACK) |
 | C0b 재현 artifact 보존 | 🔶 덤프 스크립트만 | G1 connect | ⚠️ 조건부 |
 | **C1 메커니즘 식별** | ✅ **완료** | G2 halt | ❌ |
 | C2 데이터 경로·하드웨어 | ✅ 온칩 ETB, 핀 불필요 | G3~G6 | ⬜ |

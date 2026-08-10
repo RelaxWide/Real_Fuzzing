@@ -151,7 +151,8 @@ def main():
     if not a.read_data:
         print("  (+0x24 data 는 읽기 포인터를 전진시키므로 제외. --read-data 로 포함)")
 
-    lk = Link(core_base=a.core_base, hart=a.hart, device=a.device, serial=a.serial)
+    lk = Link(core_base=a.core_base, hart=a.hart, device=a.device, serial=a.serial,
+              ap_count=a.ap_count)
     good = []
     try:
         with lk:

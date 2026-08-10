@@ -158,7 +158,7 @@ def main():
            'target_recovery_status': 'ok'}
     rc = EXIT_OK
     lk = Link(core_base=args.core_base, hart=args.hart,
-              device=args.device, serial=args.serial)
+              device=args.device, serial=args.serial, ap_count=args.ap_count)
     try:
         with lk:
             head("[G1] connect")
