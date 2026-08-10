@@ -180,6 +180,9 @@ class Link:
         self.connect_tries_used = 0
         self.recovery_required = False
         self.cleanup_error = None
+        # 세션 유효성 — connect 성공과 별개다 (dap_power 참조)
+        self.dap_power_ok = None
+        self.ctrl_stat = None
 
     # ── 컨텍스트 매니저 ──────────────────────────────────────────────
     def __enter__(self):
@@ -203,7 +206,10 @@ class Link:
             'core_base': f"0x{self.core_base:X}",
             'core_base_label': CORE_BASE_LABEL.get(self.core_base, '?'),
             'hart': self.hart,
+            'ap_count': self.ap_count,
             'connect_tries_used': self.connect_tries_used,
+            'dap_power_ok': self.dap_power_ok,
+            'ctrl_stat': (None if self.ctrl_stat is None else f"0x{self.ctrl_stat:08X}"),
         }
         if self.jl is not None:
             for k, fn in (('probe', lambda: self.jl.product_name),
@@ -251,8 +257,42 @@ class Link:
             return False
 
     # ── G1: connect ──────────────────────────────────────────────────
-    def connect_checked(self, tries=CONNECT_TRIES):
-        """설정 1회 + connect bounded retry. 몇 회차에 붙었는지 남긴다."""
+    # ── 세션 유효성 판정 ─────────────────────────────────────────────
+    def dap_power(self):
+        """DP CTRL/STAT 를 읽어 (CDBGPWRUPACK, CSYSPWRUPACK) 를 돌려준다.
+
+        **왜 필요한가.** connect() 가 예외 없이 끝나도 DAP 전원이 안 선 세션이
+        있다(2026-08-10: 단발 성공률 6/12). 그 세션에서 잰 값은 측정 실패가
+        아니라 **무효**다. 둘을 섞으면 노이즈를 데이터로 오독하게 된다.
+        모든 측정은 이 게이트를 통과한 세션 안에서만 유효하다.
+        """
+        try:
+            self.jl.coresight_configure(ir_pre=0, dr_pre=0, ir_post=0, dr_post=0,
+                                        ir_len=4, perform_tif_init=False)
+        except Exception:
+            try:
+                self.jl.coresight_configure()
+            except Exception as e:
+                self._say(f"  [Link] coresight_configure 실패: {e}")
+                return (None, None)
+        try:
+            v = self.jl.coresight_read(1, ap=False)      # DP CTRL/STAT
+        except Exception as e:
+            self._say(f"  [Link] CTRL/STAT 읽기 실패: {e}")
+            return (None, None)
+        if v is None or v < 0:
+            return (None, None)
+        self.ctrl_stat = v
+        return (bool(v & (1 << 29)), bool(v & (1 << 31)))
+
+    def connect_checked(self, tries=CONNECT_TRIES, require_power=True):
+        """설정 1회 + connect bounded retry.
+
+        require_power=True 면 **connect 성공만으로 만족하지 않고** DAP 전원
+        ACK 까지 확인하고, 안 서면 그 시도를 실패로 보고 다시 붙는다.
+        연결이 상태 의존적으로 불안정하므로(가설 G) 이게 유일하게 믿을 만한
+        성공 판정이다. 몇 회차에 붙었는지 남긴다.
+        """
         if not self.apply_settings():
             raise LinkError("설정 단계 실패", EXIT_CONNECT_FAIL)
 
@@ -260,16 +300,31 @@ class Link:
         for t in range(1, tries + 1):
             try:
                 self.jl.connect(self.device, speed=self.speed)
-                self.connect_tries_used = t
-                note = ("★ 1회차 성공 — 예상 밖(좋은 신호)" if t == 1
-                        else "(1회차 실패는 현재 도구/보드 조건에서 알려진 현상)")
-                self._say(f"  [Link] connect 성공 시도 {t}/{tries} {note}")
-                return t
             except Exception as e:
                 last = e
                 self._say(f"  [Link] connect 시도 {t}/{tries} 실패: {e}")
                 time.sleep(0.2)
-        raise LinkError(f"connect {tries}회 모두 실패: {last}", EXIT_CONNECT_FAIL)
+                continue
+
+            if not require_power:
+                self.connect_tries_used = t
+                self._say(f"  [Link] connect 성공 시도 {t}/{tries} (전원 미확인)")
+                return t
+
+            dbg, sysa = self.dap_power()
+            self.dap_power_ok = bool(dbg)
+            if dbg:
+                self.connect_tries_used = t
+                self._say(f"  [Link] ✅ 세션 유효 — 시도 {t}/{tries}, "
+                          f"CDBGPWRUPACK=1 CSYSPWRUPACK={int(bool(sysa))}"
+                          + (f" CTRL/STAT=0x{self.ctrl_stat:08X}"
+                             if self.ctrl_stat is not None else ""))
+                return t
+            last = "connect 는 됐으나 DAP 전원 ACK 없음 (무효 세션)"
+            self._say(f"  [Link] 시도 {t}/{tries}: {last} — 재시도")
+            time.sleep(0.3)
+
+        raise LinkError(f"유효 세션 확보 실패 ({tries}회): {last}", EXIT_CONNECT_FAIL)
 
     # ── 상태 대기 ────────────────────────────────────────────────────
     def _wait_halted(self, expected, timeout=STATE_TIMEOUT):

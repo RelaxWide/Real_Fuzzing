@@ -21,16 +21,28 @@ RISC-V Debug Spec: `dmcontrol.dmactive` 를 1 로 쓴 뒤 **되읽어 1 이 될 
 DM 레지스터는 DMI 주소이므로 aperture 안에서 보통 `base + (dmi_addr << 2)` 다.
 stride 가 다를 수 있어 <<2 와 <<0 을 모두 시도한다.
 
+★ 불안정한 연결 위에서 어떻게 판단하는가 (2026-08-10)
+
+  connect 는 상태 의존적으로 실패한다(가설 G, 단발 성공률 6/12). 그래서
+  **1회 실행의 성패는 증거가 아니다.** 이 도구는 두 가지로 대응한다:
+
+    1) 세션 유효성 게이트 — connect 성공만으로 안 믿고 **DAP 전원 ACK**
+       (`CDBGPWRUPACK`)를 확인한다. 전원이 안 선 세션의 값은 '측정 실패'가
+       아니라 **무효**이고, 집계에서 아예 뺀다.
+    2) 독립 세션 반복 — `--sessions N` 회 붙었다 떼며 반복하고,
+       **모든 유효 세션에서 같게 나온 값만** 실측으로 인정한다.
+       세션마다 달라지는 값은 노이즈다.
+
 사용:
-    sudo python3 probe_dm.py
-    sudo python3 probe_dm.py --core-base 0x81480000
-    sudo python3 probe_dm.py --device E76        # SEGGER 지원 목록에 E76 있음
+    sudo python3 probe_dm.py --core-base 0x81480000 --hart 0 --sessions 5
+    sudo python3 probe_dm.py --shifts 2 --sessions 10      # 확신이 필요할 때
 """
 
 import argparse
 import sys
+import time
 
-from sfe76_link import (Link, LinkError, CORE_BASE_MAIN, CORE_BASE_NCORE,
+from sfe76_link import (Link, LinkError,
                         CORE_BASE_LABEL, add_common_args, EXIT_OK, EXIT_INSUFFICIENT)
 
 VERSION = "2026-08-10.1"
@@ -116,51 +128,89 @@ def verdict(vals, tag):
     return False
 
 
+def one_session(a, base, shifts):
+    """세션 하나 = 프로세스 내 1회 연결. **유효 세션에서만** 값을 돌려준다.
+
+    반환: (valid, {(base,shift): {reg: value}})
+      valid=False 면 그 세션의 값은 **무효**다 — 실패로 세지 않는다.
+    """
+    lk = Link(core_base=a.core_base, hart=a.hart, device=a.device, serial=a.serial,
+              ap_count=a.ap_count, verbose=True)
+    out = {}
+    try:
+        with lk:
+            try:
+                lk.connect_checked(tries=a.tries, require_power=True)
+            except LinkError as e:
+                print(f"    세션 무효: {e}")
+                return False, out
+            for sh in shifts:
+                out[(base, sh)] = scan_aperture(lk, base, sh)
+    except Exception as e:
+        print(f"    세션 예외: {e}")
+        return False, out
+    return True, out
+
+
 def main():
     ap = add_common_args(argparse.ArgumentParser())
     ap.add_argument('--shifts', default="2,0", help='시도할 매핑 stride (콤마)')
-    ap.add_argument('--both-bases', action='store_true',
-                    help='CoreBase 두 후보 모두 (프로세스는 하나 — 진단 전용)')
+    ap.add_argument('--sessions', type=int, default=5,
+                    help='독립 세션 반복 횟수. 연결이 불안정하므로 1회로 판단하지 않는다')
     a = ap.parse_args()
 
-    print(f"\n{'=' * 66}\n DM aperture 직접 읽기 — dmactive 실패 원인 분리 (v{VERSION})\n{'=' * 66}")
+    shifts = [int(x) for x in a.shifts.split(',')]
+    print(f"\n{'=' * 66}\n DM aperture 직접 읽기 (v{VERSION})\n{'=' * 66}")
     print(f"  device={a.device!r}  CoreBase=0x{a.core_base:X} "
           f"[{CORE_BASE_LABEL.get(a.core_base, '?')}]  hart={a.hart}")
+    print(f"  독립 세션 {a.sessions}회 — **DAP 전원 ACK 로 유효성을 검증한 세션만** 집계한다.")
+    print("  연결이 상태 의존적으로 불안정하므로(가설 G) 1회 결과는 증거가 아니다.")
 
-    lk = Link(core_base=a.core_base, hart=a.hart, device=a.device, serial=a.serial,
-              ap_count=a.ap_count)
+    valid, sessions = 0, []
+    for i in range(a.sessions):
+        print(f"\n{'-' * 66}\n 세션 {i + 1}/{a.sessions}\n{'-' * 66}")
+        vok, vals = one_session(a, a.core_base, shifts)
+        if vok:
+            valid += 1
+            sessions.append(vals)
+        time.sleep(0.5)
+
+    print(f"\n{'=' * 66}\n 집계 — 유효 세션 {valid}/{a.sessions}\n{'=' * 66}")
+    if not valid:
+        print("  ❌ 유효 세션이 하나도 없다. 값을 해석하지 말 것.")
+        print("     타깃 전원 사이클 후 재실행, 그래도 0 이면 연결 계층부터 회귀.")
+        return EXIT_INSUFFICIENT
+
+    # 같은 값이 독립 세션에서 반복되면 실측, 한 번만 나오면 노이즈다
     ok = None
-    try:
-        with lk:
-            print("\n  connect 시도 (dmactive 타임아웃으로 실패해도 계속 진행한다 —")
-            print("  실패한 connect 가 DAP 를 설정해 두면 메모리 읽기가 될 수 있다)")
-            try:
-                lk.connect_checked(tries=a.tries)
-                print("  connect 성공")
-            except LinkError as e:
-                print(f"  connect 실패(예상됨): {e}")
+    for sh in shifts:
+        key = (a.core_base, sh)
+        print(f"\n  ── base=0x{a.core_base:X}  stride <<{sh}")
+        agreed = {}
+        for _, nm in DM_REGS:
+            seen = [s[key].get(nm) for s in sessions if key in s]
+            uniq = {}
+            for v in seen:
+                uniq[v] = uniq.get(v, 0) + 1
+            top, cnt = max(uniq.items(), key=lambda kv: kv[1]) if uniq else (None, 0)
+            mark = "✅ 일치" if cnt == valid else f"⚠ {cnt}/{valid} 만 일치"
+            shown = "읽기 실패" if top is None else f"0x{top:08X}"
+            print(f"     {nm:11s} = {shown:12s} {mark}"
+                  + ("" if len(uniq) <= 1 else f"   (관측값 {len(uniq)}종)"))
+            agreed[nm] = top if cnt == valid else None
+        r = verdict(agreed, f"0x{a.core_base:X} <<{sh}  (전 세션 일치값만)")
+        ok = ok or r
 
-            bases = [a.core_base]
-            if a.both_bases:
-                bases = [CORE_BASE_NCORE, CORE_BASE_MAIN]
-            for b in bases:
-                for sh in [int(x) for x in a.shifts.split(',')]:
-                    vals = scan_aperture(lk, b, sh)
-                    r = verdict(vals, f"0x{b:X} <<{sh}")
-                    ok = ok or r
-    except Exception as e:
-        print(f"\n  예외: {e}")
-
-    print(f"\n{'=' * 66}\n 다음\n{'=' * 66}")
+    print(f"\n{'=' * 66}\n 판단 기준\n{'=' * 66}")
+    print("  · **전 세션 일치값만** 실측으로 인정한다. 세션마다 다른 값은 노이즈다.")
+    print("  · 유효 세션이 적으면(<3) 결론 내지 말고 --sessions 를 늘린다.")
     if ok:
-        print("  aperture 가 맞는 조합이 있었다 → dmstatus 비트로 원인 확정.")
-        print("  authenticated=0 이면 벤더 해제 절차가 선행 조건이다.")
+        print("\n  aperture 가 맞다 → dmstatus 비트로 원인 확정. 가설 B 종료.")
     else:
-        print("  어느 조합에서도 유효한 dmstatus 를 못 읽었다.")
-        print("  1) --core-base 를 바꿔 재시도 (0x81480000 / 0x81481000)")
-        print("  2) --device E76  (SEGGER 지원 목록에 E76/E76-MC/E76ARTY 있음)")
-        print("  3) 메모리 읽기 경로 자체가 막힌 것일 수 있다 —")
-        print("     그 경우 T32 의 DMI/aperture 설정을 확보하는 게 유일한 길이다")
+        print("\n  유효 세션에서도 dmstatus 가 안 나온다 →")
+        print("  1) --shifts 를 넓히거나 --core-base 를 바꿔 재시도")
+        print("  2) 메모리 읽기 경로 자체가 막힌 것일 수 있다 —")
+        print("     그 경우 T32 의 DMI/aperture 설정 확보가 유일한 길이다")
     return EXIT_OK if ok else EXIT_INSUFFICIENT
 
 
