@@ -67,7 +67,8 @@ DP_ABORT, DP_CTRL_STAT, DP_SELECT, DP_RDBUF = 0, 1, 2, 3
 AP_IDX_CSW, AP_IDX_TAR, AP_IDX_DRW = 0, 1, 3
 
 # ADIv6 MEM-AP 레지스터의 AP 공간 내 오프셋
-OFF_CSW, OFF_TAR, OFF_DRW, OFF_IDR = 0xD00, 0xD04, 0xD0C, 0xDFC
+OFF_CSW, OFF_TAR, OFF_DRW = 0xD00, 0xD04, 0xD0C
+OFF_BASE, OFF_IDR = 0xDF8, 0xDFC
 
 # RISC-V DMI 레지스터 (aperture = base + (addr << 2) 로 추정)
 DM_REGS = [(0x10, 'dmcontrol'), (0x11, 'dmstatus'), (0x12, 'hartinfo'),
@@ -111,35 +112,64 @@ class Dap:
             return False
 
     def select(self, addr):
-        """DP SELECT 에 AP 레지스터 주소의 상위 비트를 넣는다 (ADIv6)."""
+        """DP SELECT 에 AP 레지스터 주소의 상위 비트를 넣는다 (ADIv6).
+
+        ★ SELECT 를 바꾼 직후의 **첫 트랜잭션은 버린다**(priming).
+          DAP 의 AP 접근은 파이프라인이라 컨텍스트가 바뀐 직후 한 박자가
+          비어 있을 수 있다. 실측에서 **매번 첫 번째로 시험한 AP 만 실패**했다
+          (APBAP1 0/3, 0/3 인데 나머지는 2~3/3) — AP 의 성질이 아니라
+          '첫 트랜잭션' 의 성질이다. 이 프로젝트에서 세 번째로 만난 순서 함정.
+        """
         val = addr & 0xFFFFFFF0
         if self._select != val:
             if not self.dp_write(DP_SELECT, val):
                 return False
             self._select = val
+            try:                       # priming — 반환값은 쓰지 않는다
+                self.jl.coresight_read(AP_IDX_CSW, ap=True)
+            except Exception:
+                pass
         return True
 
-    def ap_read(self, ap_base, off):
-        if not self.select(ap_base + off):
-            return None
-        try:
-            v = self.jl.coresight_read((off >> 2) & 0x3, ap=True)
-            return None if (v is None or v < 0) else (v & 0xFFFFFFFF)
-        except Exception:
-            return None
+    def ap_read(self, ap_base, off, retry=1):
+        for _ in range(retry + 1):
+            if not self.select(ap_base + off):
+                return None
+            try:
+                v = self.jl.coresight_read((off >> 2) & 0x3, ap=True)
+                if v is not None and v >= 0:
+                    return v & 0xFFFFFFFF
+            except Exception:
+                pass
+            self.clear_sticky()
+        return None
 
-    def ap_write(self, ap_base, off, val):
-        if not self.select(ap_base + off):
-            return False
-        try:
-            self.jl.coresight_write((off >> 2) & 0x3, val & 0xFFFFFFFF, ap=True)
-            return True
-        except Exception:
-            return False
+    def ap_write(self, ap_base, off, val, retry=1):
+        for _ in range(retry + 1):
+            if not self.select(ap_base + off):
+                return False
+            try:
+                self.jl.coresight_write((off >> 2) & 0x3, val & 0xFFFFFFFF, ap=True)
+                return True
+            except Exception:
+                pass
+            self.clear_sticky()
+        return False
 
     def clear_sticky(self):
         self.dp_write(DP_ABORT, 0x0000001E)
         self._select = None          # ABORT 후 SELECT 는 다시 쓴다
+
+    def sticky(self):
+        """CTRL/STAT 의 에러 비트를 문자열로. 실패 원인을 가른다."""
+        v = self.dp_read(DP_CTRL_STAT)
+        if v is None:
+            return "CTRL/STAT 읽기 실패"
+        bits = [nm for m, nm in ((1 << 7, 'STICKYERR'), (1 << 5, 'STICKYORUN'),
+                                 (1 << 4, 'TRNMODE'), (1 << 1, 'STICKYCMP'))
+                if v & m]
+        pw = ('DBGACK' if v & (1 << 29) else 'DBG없음')
+        return f"CTRL/STAT={hx(v)} {pw} " + (" ".join(bits) if bits else "에러비트 없음")
 
     # ── MEM-AP 를 통한 32비트 메모리 읽기 ────────────────────────────
     def mem_read32(self, ap_base, addr):
@@ -157,6 +187,55 @@ class Dap:
             self._say(f"      TAR 되읽기 불일치: 쓴값={hx(addr)} 읽은값={hx(back)}")
             return None
         return self.ap_read(ap_base, OFF_DRW)
+
+
+def walk_rom(dap, name, base, max_entries=64):
+    """AP 의 **BASE(0xDF8) → ROM 테이블**을 걸어 실제 주소 맵을 얻는다.
+
+    ★ 왜 이게 중요한가. 지금까지 DM 주소 `0x81480000` 은 **T32 스크립트 해석에서
+      온 추정**이었고, 그걸 전제로 읽다 실패했다. ROM 테이블은 **칩이 스스로
+      알려주는 목록**이다 — 추정이 아니라 실측이다. 여기서 나온 주소로
+      DM 과 트레이스 블록(0xFD000000/0xFD180000)의 실재를 대조할 수 있다.
+    """
+    print(f"\n  ── {name} ROM 테이블")
+    b = dap.ap_read(base, OFF_BASE)
+    if b is None:
+        print(f"     BASE 읽기 실패   ({dap.sticky()})")
+        return []
+    print(f"     BASE = {hx(b)}", end="")
+    if b == 0xFFFFFFFF or not (b & 1):
+        print("  → ROM 테이블 없음 (legacy 또는 미구현)")
+        return []
+    rom = b & 0xFFFFF000
+    print(f"  → ROM @0x{rom:08X}")
+
+    found = []
+    for i in range(max_entries):
+        e = dap.mem_read32(base, rom + i * 4)
+        if e is None:
+            print(f"     엔트리 {i} 읽기 실패 — 중단   ({dap.sticky()})")
+            break
+        if e == 0:                       # 목록의 끝
+            break
+        if not (e & 1):                  # present=0 → 빈 슬롯
+            continue
+        off = e & 0xFFFFF000
+        if off & 0x80000000:             # 음수 오프셋
+            off -= 1 << 32
+        comp = (rom + off) & 0xFFFFFFFF
+        cid1 = dap.mem_read32(base, comp + 0xFF4)
+        klass = ((cid1 >> 4) & 0xF) if cid1 is not None else None
+        kind = {0x1: 'ROM 테이블', 0x9: 'CoreSight 컴포넌트',
+                0xE: '비-CoreSight'}.get(klass, f'class={klass}')
+        pid0 = dap.mem_read32(base, comp + 0xFE0)
+        pid1 = dap.mem_read32(base, comp + 0xFE4)
+        part = (((pid1 & 0xF) << 8) | (pid0 & 0xFF)) if None not in (pid0, pid1) else None
+        print(f"     [{i:2d}] 0x{comp:08X}  {kind}"
+              + (f"  part=0x{part:03X}" if part is not None else ""))
+        found.append((comp, klass, part))
+    if not found:
+        print("     엔트리 없음")
+    return found
 
 
 def decode_idr(v):
@@ -205,7 +284,8 @@ def read_dm(dap, name, base, dm_base, shift=2):
         dap.clear_sticky()
         v = dap.mem_read32(base, dm_base + (addr << shift))
         vals[nm] = v
-        print(f"     {nm:11s} @0x{dm_base + (addr << shift):08X} = {hx(v)}")
+        note = "" if v is not None else f"   ({dap.sticky()})"
+        print(f"     {nm:11s} @0x{dm_base + (addr << shift):08X} = {hx(v)}{note}")
     return vals
 
 
@@ -237,7 +317,7 @@ def verdict_dm(vals):
 def one_session(a):
     lk = Link(core_base=a.core_base, hart=a.hart, device=a.device,
               serial=a.serial, ap_count=getattr(a, 'ap_count', None))
-    out = {'valid': False, 'real_aps': [], 'dm': {}}
+    out = {'valid': False, 'real_aps': [], 'dm': {}, 'rom': {}}
     try:
         with lk:
             try:
@@ -262,8 +342,16 @@ def one_session(a):
                     usable.append((n, b))
             out['usable_aps'] = usable
 
+            if usable and not a.no_rom:
+                print(f"\n{'=' * 66}\n [3] ROM 테이블 — 칩이 알려주는 진짜 주소 맵"
+                      f"\n{'=' * 66}")
+                print("  DM 주소 0x81480000 은 T32 스크립트 해석에서 온 **추정**이다.")
+                print("  ROM 테이블은 추정이 아니라 칩이 스스로 알려주는 목록이다.")
+                for n, b in usable:
+                    out['rom'][n] = walk_rom(dap, n, b)
+
             if a.dm and usable:
-                print(f"\n{'=' * 66}\n [3] DM 읽기\n{'=' * 66}")
+                print(f"\n{'=' * 66}\n [4] DM 읽기 (추정 주소 0x{a.dm:X})\n{'=' * 66}")
                 for n, b in usable:
                     vals = read_dm(dap, n, b, a.dm, a.shift)
                     out['dm'][n] = vals
@@ -282,6 +370,7 @@ def main():
     ap.add_argument('--shift', type=int, default=2, help='DMI stride (기본 2 = <<2)')
     ap.add_argument('--sessions', type=int, default=3,
                     help='독립 세션 반복. 전 세션 일치값만 인정한다')
+    ap.add_argument('--no-rom', action='store_true', help='ROM 테이블 워크 생략')
     a = ap.parse_args()
 
     print(f"\n{'=' * 66}\n AP 직접 접근 — 코어/DM 을 거치지 않는다 (v{VERSION})\n{'=' * 66}")
@@ -304,14 +393,27 @@ def main():
     # 전 유효 세션에서 일관되게 실재로 나온 AP 만 인정한다
     names = [n for n, _, _ in AP_MAP]
     print("\n  AP 실재 (전 세션 일치한 것만 ✅):")
-    solid = []
+    solid, idr_seen = [], {}
     for n in names:
         cnt = sum(1 for r in valid if any(x[0] == n for x in r['real_aps']))
         use = sum(1 for r in valid if any(x[0] == n for x in r.get('usable_aps', [])))
+        vs = {x[2] for r in valid for x in r['real_aps'] if x[0] == n}
+        idr_seen[n] = vs
         mark = "✅" if cnt == len(valid) else ("⚠" if cnt else "  ")
-        print(f"    {mark} {n:7s} IDR 실재 {cnt}/{len(valid)}   TAR 경로 {use}/{len(valid)}")
+        shown = ", ".join(hx(v) for v in sorted(vs)) if vs else "-"
+        print(f"    {mark} {n:7s} IDR 실재 {cnt}/{len(valid)}  "
+              f"TAR 경로 {use}/{len(valid)}   IDR={shown}")
         if cnt == len(valid):
             solid.append(n)
+
+    # ★ 6개 AP 의 IDR 이 전부 같으면 SELECT 가 AP 를 바꾸지 못하고 있는 것이다
+    allv = {v for vs in idr_seen.values() for v in vs}
+    if len(solid) == len(names) and len(allv) == 1:
+        print(f"\n  ⚠⚠ **6개 AP 의 IDR 이 전부 동일**({hx(next(iter(allv)))}).")
+        print("     실재 6개가 아니라 **SELECT 가 AP 를 전환하지 못하는 것**일 가능성이 크다.")
+        print("     → 같은 AP(또는 stale 값)를 여섯 번 읽고 있다. 주소 해석을 의심할 것.")
+    elif len(allv) > 1:
+        print(f"\n  ✅ IDR 값이 서로 다르다({len(allv)}종) → **SELECT 가 실제로 AP 를 전환한다.**")
 
     print(f"\n{'=' * 66}\n 다음\n{'=' * 66}")
     if solid:
