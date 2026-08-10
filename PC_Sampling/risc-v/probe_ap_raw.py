@@ -95,6 +95,7 @@ class Dap:
         self.jl = jl
         self.verbose = verbose
         self._select = None
+        self.last = {}
 
     def _say(self, m):
         if self.verbose:
@@ -176,18 +177,34 @@ class Dap:
 
     # ── MEM-AP 를 통한 32비트 메모리 읽기 ────────────────────────────
     def mem_read32(self, ap_base, addr):
+        """실패하면 **왜 실패했는지**를 self.last 에 남긴다."""
+        self.last = {}
         csw = self.ap_read(ap_base, OFF_CSW)
-        if csw is None:
+        self.last['csw'] = csw
+        # ★ 버그였다: CSW 가 에러 센티널(0x80000000)이어도 그대로 가공해
+        #   CSW 에 써 넣고 있었다 → AP 를 우리 손으로 망가뜨린다.
+        if is_error(csw):
+            self.last['why'] = f"CSW 읽기 실패/에러값 {hx(csw)} — 쓰지 않고 중단"
             return None
         # Size=2(word), AddrInc=off. 나머지 비트(Prot/SPIDEN 등)는 보존한다.
-        new_csw = (csw & ~0x37) | 0x02
-        if not self.ap_write(ap_base, OFF_CSW, new_csw):
+        if not self.ap_write(ap_base, OFF_CSW, (csw & ~0x37) | 0x02):
+            self.last['why'] = "CSW 쓰기 실패"
             return None
         if not self.ap_write(ap_base, OFF_TAR, addr):
+            self.last['why'] = "TAR 쓰기 실패"
             return None
         back = self.ap_read(ap_base, OFF_TAR)
+        self.last['tar_back'] = back
         if back is None or back != (addr & 0xFFFFFFFF):
-            self._say(f"      TAR 되읽기 불일치: 쓴값={hx(addr)} 읽은값={hx(back)}")
+            # ★ 되읽기 값이 정보다. 상위 비트가 잘려 있으면 그 AP 의
+            #   주소 디코드 폭이 좁다는 뜻 — 그 주소는 그 AP 로 못 간다.
+            self.last['why'] = f"TAR 불일치 쓴값={hx(addr)} 읽은값={hx(back)}"
+            if back is not None and not is_error(back):
+                lost = (addr ^ back) & 0xFFFFFFFF
+                self.last['why'] += f"  (달라진 비트 {hx(lost)})"
+                if back == (addr & back):
+                    width = max((back | 1).bit_length(), 1)
+                    self.last['why'] += f" → 주소가 잘렸다. 유효폭 약 {width}비트"
             return None
         return self.ap_read(ap_base, OFF_DRW)
 
@@ -372,8 +389,12 @@ def read_addrs(dap, aps, addrs):
             dap.clear_sticky()
             v = dap.mem_read32(b, addr)
             ok = v is not None and v not in (0xFFFFFFFF,)
-            note = "" if v is not None else f"  ({dap.sticky()})"
-            print(f"      {n:7s} = {hx(v)}{note}" + ("   ★ 읽힘" if ok else ""))
+            if v is None:
+                why = dap.last.get('why', '?')
+                print(f"      {n:7s} = 실패   {why}")
+                print(f"                {dap.sticky()}")
+            else:
+                print(f"      {n:7s} = {hx(v)}" + ("   ★ 읽힘" if ok else ""))
             if ok:
                 hits.setdefault(n, []).append((addr, v))
     return hits
