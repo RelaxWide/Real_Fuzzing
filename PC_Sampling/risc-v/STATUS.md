@@ -99,6 +99,50 @@ ELSE
 `CSYSPWRUPREQ` 를 **둘 다 요청하고 둘 다 ACK 될 때까지 기다린다.**
 이 칩이 `CSYSPWRUPACK` 을 안 준다면 → 그대로 **`Failed to power-up DAP`** 다.
 
+### 1.2c ★★★ 트레이스 토폴로지 확정 (`ViewNexusTracedump.cmm` 실물)
+
+```
+SYStem.CONFIG.NEXUS.Type SiFive                       ; NTRACE
+SYStem.CONFIG.NEXUS.Base SB:0xFD000000 SB:0xFD001000
+                         SB:0xFD002000 SB:0xFD003000  ; TraceEncoders ← **4개**
+SYStem.CONFIG.RVFUNNEL1.Base SB:0xFD180000
+SYStem.CONFIG.RVFUNNEL1.SourcePortNumber percore
+SYStem.CONFIG.RVFUNNEL.TraceSource NEXUS.0 0 NEXUS.1 1 NEXUS.2 2 NEXUS.3 3
+SYStem.CONFIG.RVSRAMTRACEsink1.Base SB:0xFD180000
+SYStem.CONFIG.RVSRAMTraceSink1.TraceSource RVFUNNEL1
+la.import.etb *   /   la.list
+```
+
+**얻은 것:**
+
+| | |
+|---|---|
+| **TE 가 코어마다 하나씩 4개** | `0xFD000000/1000/2000/3000` — 간격 `0x1000` |
+| **NEXUS.n ↔ hart n** | `hcore=hart0` → **TE = `0xFD000000`** (§1.2 의 hart 표와 일치) |
+| **Funnel** | `0xFD180000`, 포트번호 = 코어 인덱스 |
+| **Sink 는 ARM ETB 가 아니라 RISC-V *SRAM trace sink*** | 주소가 funnel 과 **같다** (`0xFD180000`) |
+| **접근 클래스가 전부 `SB:`** | = System Bus = **RISC-V SBA** (DM 의 일부) |
+
+**★ J-Link 명령이 1:1로 대응한다** — 이 구조를 그대로 옮길 수 있다:
+```
+RISCV_SetTEBaseAddr   = 0xFD000000   MemTypeToUse=2(SBA)   ← hart 별
+RISCV_SetTFBaseAddr   = 0xFD180000   MemTypeToUse=2
+RISCV_SetSRAMBaseAddr = 0xFD180000   MemTypeToUse=2
+RISCV_SetHartSel      = 0
+```
+`SYStem.CONFIG.NEXUS.Type SiFive` = SEGGER 의 **SiFive N-Trace** 지원과 같은 것.
+→ **커버리지 수집 계층의 설계 불확실성이 거의 사라졌다.**
+
+### ★★ 이것이 여는 우회로
+
+트레이스 블록은 `SB:` = **SBA** 로 접근한다. SBA 는 **DM 의 일부**라 우리가 막힌
+지점에 걸린다. **그런데 AXI-AP 는 시스템 메모리로 가는 독립 경로다.**
+같은 버스 주소 `0xFD000000` 을 **AXI-AP 로 읽을 수 있으면 DM 이 아예 필요 없다.**
+
+- AP 레지스터 접근은 **이미 동작 확인됨**(IDR 6/6, TAR 되읽기)
+- 이전 `probe_trace_regs.py` 의 실패는 priming 버그와 AP 미확인 상태에서의 측정
+  → **증거로서 무효.** 다시 재야 한다.
+
 ### 1.3 ★ T32 커버리지 메커니즘 (`NexusTracedatadump.cmm` 실물)
 
 ```
@@ -390,7 +434,26 @@ CORESIGHT_SetCoreBaseAddr    = 0x0   // "Address in AP address space
 J-Link 이 요구하는 건 **AP 주소공간 내 오프셋**이다. **같다는 보장이 없다.**
 → `dmactive` 타임아웃의 가장 그럴듯한 설명이며, 지금까지 한 번도 의심하지 않았다.
 
-### P0 — 지금: DM **위치**를 찾는다 (`find_dm.py`)
+### ★★ P0 — 지금: **DM 우회** 시도 (블로커를 안 풀고 넘어간다)
+
+```bash
+sudo python3 probe_ap_raw.py --addrs trace --no-rom --sessions 3
+```
+
+`0xFD000000`(TE0~3), `0xFD180000`(funnel/sink), `+0x1C`/`+0x20`(포인터)를
+**6개 AP 전부로** 읽는다. AP 접근은 이미 동작이 확인돼 있다.
+
+| 결과 | 의미 |
+|---|---|
+| **AXI-AP 또는 AHB-AP 로 읽힘** | ★★★ **DM 이 필요 없다.** 그 AP 로 트레이스 파이프라인을 세운다 — 블로커 우회 |
+| APB-AP 로만 읽힘 | 그것도 충분하다. 같은 AP 로 진행 |
+| 전부 `STICKYERR` | 그 주소가 어느 AP 에서도 디코드 안 됨 → SBA(=DM) 말고는 길이 없다 |
+| 전부 `0xFFFFFFFF` | 버스는 응답하는데 블록이 꺼져 있음 → 클럭/전원 인에이블 필요 |
+
+**이게 성공하면 `find_dm.py` 는 안 돌려도 된다.** 우리 목표는 halt 가 아니라
+트레이스이고, T32 도 halt 를 안 쓴다(`sys.cpuaccess DENIED`).
+
+### P0' — 위가 실패할 때: DM **위치**를 찾는다 (`find_dm.py`)
 
 DMI 프로토콜은 J-Link 이 이미 안다. 우리가 구현할 게 아니다.
 할 일은 **어디인지 알려주는 것**뿐이고, 판정은 J-Link 에게 맡긴다.

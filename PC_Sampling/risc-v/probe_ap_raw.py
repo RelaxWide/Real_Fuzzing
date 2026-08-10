@@ -341,10 +341,48 @@ def verdict_dm(vals):
     return False
 
 
+# T32 ViewNexusTracedump.cmm 실물에서 온 트레이스 블록 주소
+TRACE_ADDRS = [
+    (0xFD000000, 'NEXUS.0 TE  (hcore/hart0)'),
+    (0xFD001000, 'NEXUS.1 TE  (CMCore/hart1)'),
+    (0xFD002000, 'NEXUS.2 TE  (FCore/hart2)'),
+    (0xFD003000, 'NEXUS.3 TE  (QCore/hart3)'),
+    (0xFD180000, 'RVFUNNEL1 / RVSRAMTRACEsink1'),
+    (0xFD18001C, '  +0x1C write ptr (bit0=wrap)'),
+    (0xFD180020, '  +0x20 read ptr'),
+]
+
+
+def read_addrs(dap, aps, addrs):
+    """임의 절대주소를 **모든 AP 로** 읽어 어느 AP 가 그 주소를 디코드하는지 본다.
+
+    ★ 왜 결정적인가. T32 는 트레이스 블록에 `SB:` (System Bus = RISC-V SBA)로
+      접근한다. SBA 는 **DM 의 일부**라 DM 이 필요하다 — 우리가 막힌 지점이다.
+      그런데 AXI-AP 는 시스템 메모리로 가는 **독립 경로**다. 같은 버스 주소를
+      AXI-AP 로 읽을 수 있으면 **DM 없이 트레이스 파이프라인을 세울 수 있다.**
+      그러면 지금 블로커를 통째로 우회한다.
+    """
+    print(f"\n{'=' * 66}\n [T] 트레이스 블록 — 모든 AP 로 시도 (DM 우회 가능성)\n{'=' * 66}")
+    print("  T32 는 SB:(=SBA, DM 필요)로 접근한다. AXI/AHB-AP 는 독립 경로다.")
+    print("  하나라도 읽히면 **DM 블로커를 우회**할 수 있다.\n")
+    hits = {}
+    for addr, label in addrs:
+        print(f"  0x{addr:08X}  {label}")
+        for n, b in aps:
+            dap.clear_sticky()
+            v = dap.mem_read32(b, addr)
+            ok = v is not None and v not in (0xFFFFFFFF,)
+            note = "" if v is not None else f"  ({dap.sticky()})"
+            print(f"      {n:7s} = {hx(v)}{note}" + ("   ★ 읽힘" if ok else ""))
+            if ok:
+                hits.setdefault(n, []).append((addr, v))
+    return hits
+
+
 def one_session(a):
     lk = Link(core_base=a.core_base, hart=a.hart, device=a.device,
               serial=a.serial, ap_count=getattr(a, 'ap_count', None))
-    out = {'valid': False, 'real_aps': [], 'dm': {}, 'rom': {}}
+    out = {'valid': False, 'real_aps': [], 'dm': {}, 'rom': {}, 'addr_hits': {}}
     try:
         with lk:
             try:
@@ -377,6 +415,11 @@ def one_session(a):
                 for n, b in usable:
                     out['rom'][n] = walk_rom(dap, n, b)
 
+            if a.addrs and usable:
+                lst = (TRACE_ADDRS if a.addrs.strip() == 'trace'
+                       else [(int(x, 0), '') for x in a.addrs.split(',') if x.strip()])
+                out['addr_hits'] = read_addrs(dap, usable, lst)
+
             if a.dm and usable:
                 print(f"\n{'=' * 66}\n [4] DM 읽기 (추정 주소 0x{a.dm:X})\n{'=' * 66}")
                 for n, b in usable:
@@ -398,6 +441,9 @@ def main():
     ap.add_argument('--sessions', type=int, default=3,
                     help='독립 세션 반복. 전 세션 일치값만 인정한다')
     ap.add_argument('--no-rom', action='store_true', help='ROM 테이블 워크 생략')
+    ap.add_argument('--addrs', default=None,
+                    help='임의 절대주소를 **모든 AP 로** 읽는다 (콤마). '
+                         "예: 'trace' 프리셋 또는 0xFD000000,0xFD180000")
     a = ap.parse_args()
 
     print(f"\n{'=' * 66}\n AP 직접 접근 — 코어/DM 을 거치지 않는다 (v{VERSION})\n{'=' * 66}")
@@ -441,6 +487,18 @@ def main():
         print("     → 같은 AP(또는 stale 값)를 여섯 번 읽고 있다. 주소 해석을 의심할 것.")
     elif len(allv) > 1:
         print(f"\n  ✅ IDR 값이 서로 다르다({len(allv)}종) → **SELECT 가 실제로 AP 를 전환한다.**")
+
+    th = {}
+    for r in valid:
+        for n, lst in (r.get('addr_hits') or {}).items():
+            th.setdefault(n, set()).update(a_ for a_, _v in lst)
+    if th:
+        print(f"\n{'=' * 66}\n ★★ 트레이스 블록에 닿은 AP\n{'=' * 66}")
+        for n, addrs in th.items():
+            print(f"    {n}: " + ", ".join(f"0x{x:08X}" for x in sorted(addrs)))
+        print("\n  → **DM 없이 트레이스 파이프라인을 세울 수 있다.** 블로커 우회.")
+        print("     이 AP 를 RISCV_Set*BaseAddr 의 APIndex 로 쓰거나,")
+        print("     raw AP 접근으로 ETB 드레인을 직접 구현한다.")
 
     print(f"\n{'=' * 66}\n 다음\n{'=' * 66}")
     if solid:
