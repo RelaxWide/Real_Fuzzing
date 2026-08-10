@@ -80,6 +80,9 @@ AP_CLASS = {0x0: '없음/JTAG-AP', 0x8: 'MEM-AP'}
 AP_TYPE = {0x1: 'AHB3', 0x2: 'APB2/APB3', 0x4: 'AXI3/AXI4',
            0x5: 'AHB5', 0x6: 'APB4/APB5', 0x7: 'AXI5', 0x8: 'AHB5-hprot'}
 
+# T32 가 선언한 AP 타입 → IDR.TYPE 으로 나와야 하는 값
+DECLARED_TYPE = {'APB-AP': (0x2, 0x6), 'AHB-AP': (0x1, 0x5, 0x8), 'AXI-AP': (0x4, 0x7)}
+
 
 def hx(v):
     return "실패" if v is None else f"0x{v & 0xFFFFFFFF:08X}"
@@ -238,17 +241,41 @@ def walk_rom(dap, name, base, max_entries=64):
     return found
 
 
-def decode_idr(v):
+def is_error(v):
+    """J-Link API 에러 센티널. 값이 아니다.
+
+    `0x80000000` 은 DLL 이 돌려주는 에러 코드다(브링업 초기부터 반복 관측).
+    간헐적으로 뒤쪽 AP 에 붙는다 — **AP 가 없다는 뜻이 아니다.**
+    """
+    return v is None or v in (0x80000000, 0xFFFFFFFF, 0)
+
+
+def decode_idr(v, declared=None):
+    """IDR 디코드 + **선언 타입과 교차검증.**
+
+    IDR 의 TYPE 은 우리가 넣은 적 없는 값이다. 그게 T32 선언과 맞으면
+    그 AP 는 실재하고 주소도 맞다 — 우연이나 stale 로는 안 맞는다.
+    """
     if v is None:
         return "읽기 실패"
+    if v == 0x80000000:
+        return f"{hx(v)}  ← API 에러 센티널 (값 아님. 재시도로 사라짐)"
     if v in (0, 0xFFFFFFFF):
-        return f"{hx(v)}  ← **AP 없음** (선언만 되어 있고 실재하지 않는다)"
-    cls = (v >> 13) & 0xF
-    typ = v & 0xF
-    rev = (v >> 28) & 0xF
-    desg = (v >> 17) & 0x7FF
-    return (f"{hx(v)}  ✅ **실재**  class={cls:#x}({AP_CLASS.get(cls, '?')})  "
-            f"type={typ:#x}({AP_TYPE.get(typ, '?')})  DESIGNER={desg:#05x}  rev={rev}")
+        return f"{hx(v)}  ← **AP 없음**"
+    cls, typ = (v >> 13) & 0xF, v & 0xF
+    rev, desg = (v >> 28) & 0xF, (v >> 17) & 0x7FF
+    who = 'SiFive' if desg == 0x489 else '?'
+    s = (f"{hx(v)}  ✅ class={cls:#x}({AP_CLASS.get(cls, '?')})  "
+         f"type={typ:#x}({AP_TYPE.get(typ, '?')})  DESIGNER={desg:#05x}({who})  rev={rev}")
+    if declared:
+        want = DECLARED_TYPE.get(declared)
+        if want is None:
+            pass
+        elif typ in want:
+            s += f"   ★ 선언({declared})과 일치"
+        else:
+            s += f"   ⚠ 선언은 {declared} 인데 type={typ:#x}"
+    return s
 
 
 def enumerate_aps(dap):
@@ -257,10 +284,10 @@ def enumerate_aps(dap):
     real = []
     for name, base, typ in AP_MAP:
         dap.clear_sticky()
-        idr = dap.ap_read(base, OFF_IDR)
+        idr = dap.ap_read(base, OFF_IDR, retry=2)
         print(f"\n  {name:7s} @ 0x{base:05X}  (선언 타입 {typ})")
-        print(f"      IDR = {decode_idr(idr)}")
-        if idr not in (None, 0, 0xFFFFFFFF):
+        print(f"      IDR = {decode_idr(idr, typ)}")
+        if not is_error(idr):
             real.append((name, base, idr))
     return real
 
