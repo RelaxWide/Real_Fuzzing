@@ -106,6 +106,27 @@ CORE_BASE_LABEL = {
     CORE_BASE_NCORE: "Ncore",
 }
 
+# ★ hart 매핑 — attach.cmm 실물에서 확정 (추측 아님)
+#     SYS.CONFIG CORE <core_idx>. <chip_idx>.
+#     SYS.CONFIG HARTINDEX 0. 1. 2. 3.      ← core_idx 순서대로의 hart 번호
+#   즉 CORE_BASE_MAIN 하나의 DM 에 **하트가 4개** 달려 있고,
+#   Ncore 만 chip 2 = 별도 DM(CORE_BASE_NCORE) 의 hart 0 이다.
+#   → hart 를 0..4 로 넘겨짚을 필요가 없다. 아래가 전부다.
+CORE_HART = {
+    'hcore':  (CORE_BASE_MAIN,  0),   # CORE 1. 1.  ← NVMe 펌웨어 유력
+    'cmcore': (CORE_BASE_MAIN,  1),   # CORE 2. 1.
+    'fcore':  (CORE_BASE_MAIN,  2),   # CORE 3. 1.
+    'qcore':  (CORE_BASE_MAIN,  3),   # CORE 4. 1.
+    'ncore':  (CORE_BASE_NCORE, 0),   # CORE 1. 2.  ← 코드 맵에서 제외되는 코어
+}
+
+# DMI 레지스터의 APB aperture 매핑 (강한 추론, 미검증)
+#   두 DM base 의 간격이 0x1000 = 4KB → DMI 주소 1024개 × 4바이트.
+#   ⇒ APB 주소 = CoreBase + (dmi_addr << 2)
+#   예: dmcontrol(0x10) → 0x81480040,  dmstatus(0x11) → 0x81480044
+DMI_STRIDE_SHIFT = 2
+DM_APERTURE_SIZE = 0x1000
+
 # T32 SYStem.CONFIG 의 AP 목록 — (이름, CoreSight 주소, J-Link 타입)
 AP_MAP = [
     ("APBAP1", 0x10000, "APB-AP"),

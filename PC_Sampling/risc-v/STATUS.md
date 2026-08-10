@@ -47,17 +47,57 @@ connect('RISC-V')
 
 **JLinkScriptFile 경로는 폐기** — cJTAG 스캔을 깨뜨린다(`IRPrint=0x..0000`).
 
-### 1.2 코어 / DM
+### 1.2 코어 / DM / hart  ← `attach.cmm` 로 **확정** (2026-08-10)
 
-| 코어 | DM (COREDEBUG.Base) | 코드 영역 |
-|---|---|---|
-| hcore / CMCore / Fcore0 / QCore | `0x81480000` | **`0x0 ~ 0x21BFFF`** (≈2.2MB) |
-| Ncore | `0x81481000` | 위 매핑에서 **제외** — 다른 코드/메모리 |
+| 코어 | T32 `CORE <core>. <chip>.` | DM (`COREDEBUG.Base`) | **hart** | 코드 영역 |
+|---|---|---|---|---|
+| hcore | `1. 1.` | `0x81480000` | **0** | `0x0 ~ 0x21BFFF` |
+| CMCore | `2. 1.` | `0x81480000` | **1** | 〃 |
+| FCore | `3. 1.` | `0x81480000` | **2** | 〃 |
+| QCore | `4. 1.` | `0x81480000` | **3** | 〃 |
+| Ncore | `1. 2.` | `0x81481000` | **0** | **제외** — 별도 코드/메모리 |
 
-코드 영역 근거: `attach.cmm` 의 `MAP.BOnchip 0x0++0x21BFFF` (= 쓰기 불가 영역 선언).
+근거: `SYS.CONFIG HARTINDEX 0. 1. 2. 3.` + `SYS.CONFIG CoreNumber 4.`
+→ **DM 하나에 하트 4개.** Ncore 만 chip 2 = 별도 DM 의 hart 0.
+
+**얻은 것 3가지:**
+1. **hart 를 넘겨짚지 않아도 된다.** 0~3 이 전부고, `hcore = hart 0`.
+2. **DM 은 하나만 쓰면 된다** → SEGGER 의 "Multiple DM not supported" 한계에 안 걸린다.
+   Ncore 는 코드 맵에서도 제외돼 있으니 커버리지 대상이 아니다.
+3. `&core_base=**APB:**0x81480000` — CoreBase 가 **APB 주소공간** 값임이 명시됐다.
+   → `SetIndexAPBAPToUse=0` + `SetCoreBaseAddr=0x81480000` 구조는 **맞다**.
+
+**DMI aperture 추론 (강함, 미검증):** 두 DM base 간격이 `0x1000` = 4KB
+= DMI 주소 1024개 × 4바이트 ⇒ **APB 주소 = CoreBase + (dmi_addr << 2)**
+`dmcontrol(0x10)` → `0x81480040`, `dmstatus(0x11)` → `0x81480044`, `sbcs(0x38)` → `0x814800E0`
+(`sfe76_link.DMI_STRIDE_SHIFT` / `probe_dm.py --shifts 2`)
+
+코드 영역 근거: `MAP.BOnchip 0x0++0x21BFFF` (쓰기 불가 영역 선언).
 → **커버리지 필터 · 디코더 디스어셈블리 범위 · Ghidra 로딩 base 로 그대로 쓴다.**
 
-⚠ SEGGER 명시 한계: **"Multiple debug modules (DM) are not supported"** — J-Link 은 DM 하나만.
+### 1.2b ★★ T32 의 접근 정책 (`attach.cmm`) — 우리 블로커의 정답 후보
+
+```
+sys.memaccess SB            메모리 접근은 System Bus(SBA)로
+sys.cpuaccess DENIED        ★ CPU 를 통한 접근 금지 = halt 기반 접근을 아예 안 씀
+sys.option resetmode.ndmrst 리셋은 핀이 아니라 ndmreset
+sys.m prepare               ★ SYStem.Mode Prepare — 코어를 건드리지 않고 DP 만 세움
+
+IF (HCORE)                          ← 마스터 세션 하나만 전원을 요청
+    sys.CONFIG.Slave off
+    SYStem.Option.DAPSYSPWRUPREQ OFF   ★★ CSYSPWRUPREQ 를 **안 쓴다**
+    SYStem.Option.DAPDBGPWRUPREQ ON    ★★ CDBGPWRUPREQ 만 쓴다
+ELSE
+    sys.CONFIG.Slave on
+```
+
+`cpuaccess DENIED` + `memaccess SB` + `sys.m prepare` 는 **§1.3 의 무-halt 커버리지 수집과
+완전히 일치**한다 — 계획의 전제가 또 한 번 독립적으로 확인됐다.
+
+**그리고 `DAPSYSPWRUPREQ OFF` 가 핵심이다.** 기본값이 ON 인 옵션을 굳이 OFF 로
+적어 뒀다는 건 **켜면 안 되기 때문**이다. J-Link 은 기본적으로 `CDBGPWRUPREQ` 와
+`CSYSPWRUPREQ` 를 **둘 다 요청하고 둘 다 ACK 될 때까지 기다린다.**
+이 칩이 `CSYSPWRUPACK` 을 안 준다면 → 그대로 **`Failed to power-up DAP`** 다.
 
 ### 1.3 ★ T32 커버리지 메커니즘 (`NexusTracedatadump.cmm` 실물)
 
@@ -113,11 +153,12 @@ DMI 위치까지는 인식(DPIDR / AP map / CoreBase). **DM 이 active 로 응�
 
 | | 가설 | 상태 |
 |---|---|---|
-| A | 디버그 인증/잠금 | **약함.** Spec p30: 미인증 상태에서도 `dmactive` 는 읽기·쓰기 가능해야 한다 |
-| B | DMI aperture 주소·매핑 오류 | **유력.** CoreBase 는 T32 해석에서 온 추정 |
-| C | DM 전원/클럭 게이팅 (ARM DAP 전원과 별개) | 유력 |
-| D | 잘못된 DM (둘 중) | 가능 |
-| **E** | **AP 6개 등록이 J-Link 열거를 깨뜨림** | **미검증** ← `probe_dap.py` |
+| **F** | **J-Link 이 `CSYSPWRUPREQ` 도 요청·대기 → 이 칩은 ACK 안 줌** | ★★ **최유력 (신규).** `attach.cmm` 이 `DAPSYSPWRUPREQ OFF` 를 명시 |
+| A | 디버그 인증/잠금 | **약함.** Spec p30: 미인증에서도 `dmactive` 는 읽기·쓰기 가능해야 한다 |
+| B | DMI aperture 주소·매핑 오류 | **약해짐.** `APB:0x81480000` 확정 + `<<2` stride 추론 확보 |
+| C | DM 전원/클럭 게이팅 | F 에 흡수 — 같은 현상의 다른 이름일 수 있다 |
+| D | 잘못된 DM | **해소.** hart 0~3 이 전부 `0x81480000`, Ncore 는 대상 아님 |
+| E | AP 6개 등록이 J-Link 열거를 깨뜨림 | 미검증 — `probe_dap.py` 가 F 와 함께 가른다 |
 
 ### 시험 결과 (2026-08-10)
 
@@ -174,42 +215,79 @@ probe_trace_regs.py  [A] connect+memory_read32, [B] CoreSight AP 직접 → 모�
 | 두 DM 모두 접근 가능 | 과함 — connect 후보 통과일 뿐 |
 | resume 실패 → 보드 복구 필요 | 거짓 경보 — halt 가 안 돼 멈춘 적이 없었다 |
 | halt/PC/resume 이 v10.0 착수 조건 | 틀림 — **T32 커버리지는 halt 방식이 아니다** |
-| ~~JLinkScript 로 CoreSight API 사용~~ | 현재 훅·호출 순서에서 동작 안 함. **cJTAG 스캔도 깨뜨림** |
+| JLinkScript 경로는 **불가능** | **틀림 — 사용법 오류였다.** ① `InitTarget()` 은 JTAG 체인과 전역 `CPU` 를 수동 지정해야 하는데 안 했다 → 스캔 깨짐 ② `JLINK_CORESIGHT_Configure()` 를 먼저 안 불러서 나머지가 전부 `0x80000000` ③ `PerformTIFInit=0` 으로 cJTAG 를 지킬 수 있다. **P1 에서 부활** |
 | DPIDR = `0x6BA0009D` | 구버전/깨진 경로의 값. **실제는 `0x11013913`** |
 
 ---
 
 ## 6. 다음 할 일
 
-### P0 — 지금
+### P0 — 지금  ★ `probe_dap.py` 갱신됨 (2026-08-10.2)
 
 **`sudo python3 probe_dap.py`**
-DP 계층만 본다. **AP 를 6개 등록하는 것이 방해인지**(가설 E)를 가른다.
-6개 중 실재가 확인된 AP 는 **하나도 없다.**
 
-| 결과 | 다음 |
-|---|---|
-| AP 0개는 ACK, 6개는 실패 | **AP map 을 줄인다** — 정보 없이 고칠 수 있는 경우 |
-| DPIDR 유효 + ACK 없음 | 전원 인가가 진짜 블로커 → T32 초기화가 답 |
-| ACK 성공 | 문제는 그 위(AP 주소 / DM) |
-| DPIDR 무효 | cJTAG 계층 회귀 → 타깃 전원 사이클부터 |
+이제 **전원 요청을 두 갈래로 나눠** 시험하고 ACK 비트를 따로 읽는다:
 
-### P1 — T32 `attach.cmm` 에서 확보 (확인된 것 제외)
+```
+DBG only : CTRL/STAT = 0x10000000   (CDBGPWRUPREQ)        ← T32 방식
+BOTH     : CTRL/STAT = 0x50000000   (CDBG + CSYSPWRUPREQ) ← J-Link 기본
+bit28 CDBGPWRUPREQ  bit29 CDBGPWRUPACK  bit30 CSYSPWRUPREQ  bit31 CSYSPWRUPACK
+```
+동시에 AP 등록 0 / 1 / 6개도 비교한다(가설 E). `coresight_configure` 는
+**`perform_tif_init=False` 를 먼저** 쓴다 — 기본값이 내보내는 JTAG 스위칭
+시퀀스가 cJTAG 를 깨뜨리는 것으로 보이기 때문(§5 참조).
 
-- ~~`SYStem.Up` 직전 시퀀스~~ → **확인 완료: `DynUTLoad.cmm` 의 재시도 루프뿐, 커스텀 없음**
-- **`SYStem.CONFIG` 전부** — 특히 `DMI` / `DEBUGMODULE` / `DMBASE` 항목.
-  **`COREDEBUG.Base` 말고 별도 DM 지정이 있으면 우리 CoreBase 가 틀린 것**
-- **SBA / ESB 활성화 설정** — T32 는 SBA 를 쓰는데 그 전제 조건이 어딘가에 있다
-- **TE 켜기·필터 설정** — 덤프 스크립트에는 **끄기만** 있다. 다른 파일에 있을 것
-  (`TECTRL` 전체 비트, **BTM vs HTM**, **주소 범위 필터** ← 32KB 엔 거의 필수, sync 주기)
+| 결과 | 결론 | 다음 |
+|---|---|---|
+| **DBG ACK O / SYS ACK X** | ★★ **가설 F 확정** | `CSYSPWRUPREQ` 없는 connect 경로 (P1) |
+| 둘 다 ACK | 전원은 원인 아님 | `probe_dm.py --shifts 2` 로 DM aperture |
+| DBG ACK 도 X | 전원 인가가 진짜 블로커 | T32 초기화 시퀀스 확보 |
+| AP 0개만 ACK | 가설 E | AP map 을 줄인다 |
+| DPIDR 무효 | cJTAG 계층 회귀 | 타깃 전원 사이클부터 |
 
-### P2 — 벤더 질문 (아주 짧아졌다)
+### P1 — 가설 F 가 맞을 때: `CSYSPWRUPREQ` 없이 붙는 경로
 
-> 1. **RISC-V DM 의 DMI aperture base** 와, DMI 레지스터가 그 안에서 어떻게 매핑되는지(stride)
-> 2. **DM 전원/클럭에 별도 인에이블이 필요한지** (ARM DAP `CDBGPWRUPREQ` 와 별개인지)
-> 3. DM 이 둘인데 **어느 것이 유효하고 각각 어느 AP 뒤**인지
-> 4. **펌웨어 이미지 + 심볼(ELF)** — 디코더의 하드 의존성
-> 5. NVMe 명령을 처리하는 코어는? (`hcore` 추정)
+J-Link **명령 문자열에는 전원 요청을 끄는 옵션이 없다**(전체 목록 확인함).
+남은 길은 **JLinkScript `InitTarget()`** 에서 DP CTRL/STAT 를 직접 쓰는 것이다.
+
+이전에 JLinkScript 를 폐기한 이유가 **이제 설명된다**(SEGGER 문서 확인):
+- `InitTarget()` 은 *"JTAG 체인을 이 함수 안에서 수동으로 전부 지정해야 하고,
+  전역 `CPU` 도 반드시 설정해야 한다"* — 안 했으니 스캔이 깨진 것(`IRPrint=0x..0000`)
+- `JLINK_CORESIGHT_*` 가 전부 `0x80000000` 이던 것도 설명된다 —
+  **`JLINK_CORESIGHT_Configure()` 를 먼저 불러야** 다른 CORESIGHT 함수가 동작한다
+- 그리고 그 `Configure()` 에 **`PerformTIFInit=0`** 파라미터가 있다
+  = *"완료 후 스위칭 시퀀스를 내보내지 마라"* ← **cJTAG 를 지키는 스위치**
+
+즉 폐기 사유가 전부 **우리 쪽 사용법 오류**였고, 셋 다 고칠 수 있다.
+
+```c
+int InitTarget(void) {
+  JLINK_CORESIGHT_Configure("IRPre=0;DRPre=0;IRPost=0;DRPost=0;"
+                            "IRLenDevice=4;PerformTIFInit=0;");
+  JLINK_CORESIGHT_WriteDP(JLINK_CORESIGHT_DP_REG_CTRL_STAT, 0x10000000); // DBG only
+  // CDBGPWRUPACK(bit29) 폴링 후 CPU 전역 설정하고 리턴
+}
+```
+> ⚠ J-Link 이 그 뒤 자기 connect 에서 `CSYSPWRUPREQ` 를 **다시 세울 수도** 있다.
+> P0 결과가 F 를 확정한 뒤에 착수한다. 확정 전엔 만들지 않는다.
+
+### P2 — T32 스크립트에서 아직 못 얻은 것 (많이 줄었다)
+
+- ~~`SYStem.Up` 직전 시퀀스~~ → **확인 완료**: `DynUTLoad.cmm` 의 재시도 루프뿐
+- ~~`SYStem.CONFIG` / DM 지정 / 코어·hart 매핑~~ → **확인 완료** (§1.2)
+- ~~SBA·ESB 접근 정책~~ → **확인 완료** (§1.2b)
+- **남은 하나 — TE 켜기·필터 설정.** 덤프 스크립트에는 **끄기만** 있다.
+  다른 `.cmm` 에 있을 것: `TECTRL` 전체 비트, **BTM vs HTM**,
+  **주소 범위 필터**(32KB 버퍼엔 거의 필수), sync 주기
+  → 찾을 키워드: `TECTRL`, `0xFD000000`, `PER.Set`, `teEnable`, `teInstrumentation`
+
+### P3 — 벤더 질문 (2개로 줄었다)
+
+> 1. **`CSYSPWRUPACK` 을 이 SoC 가 반환하지 않는 것이 맞는지** (T32 가 `DAPSYSPWRUPREQ OFF` 인 이유)
+> 2. **펌웨어 이미지 + 심볼(ELF)** — 디코더의 하드 의존성
+>
+> *해소됨:* ~~DMI aperture~~(§1.2 추론) · ~~어느 DM 인지~~(hart 0~3 = `0x81480000`)
+> · ~~NVMe 담당 코어~~(`hcore` = hart 0 로 좁혀짐)
 
 ### P3 — 커버리지 파이프라인 (블로커 해소 후)
 
