@@ -59,6 +59,27 @@ TE enable, 전체 `TECTRL` 비트 레이아웃, **BTM vs HTM**, **주소 범위 
 
 → `NexusTrace*` 형제 파일 / 상위 호출 스크립트를 찾을 것.
 
+### 시험 결과 (2026-08-10) — 트레이스 레지스터에 못 닿았다
+
+```
+1차 : "Failed to power-up DAP" → connect 1회차 성공 → [A][B] 모두 실패
+E76 : connect 1차 "Could not find supported CPU" 실패 → 2차 성공 → [A][B] 실패
+```
+
+**해석 시 주의 — `[B]` 실패는 증거가 약하다.**
+CoreSight AP 직접 접근은 **우리 코드로 한 번도 성공한 적이 없다**(예전에도 전부
+`0x80000000`/0). 그러니 이번 실패가 "트레이스 블록이 MEM-AP 에 없다" 인지
+"우리 CoreSight 코드가 원래 안 된다" 인지 **구분되지 않는다.**
+
+**★ 진짜 단서: "Failed to power-up DAP"**
+이게 사실이면 AP 접근이 전부 실패하는 게 당연하고 `dmactive` 타임아웃도 같은
+원인으로 설명된다(DM 은 AP 뒤에 있다). 그런데 **예전엔 `CTRL/STAT=0xF0000000`
+(전원 ACK)이 떴었다**(V9.12 시절). 회귀인지 조건 차이인지 가려야 한다.
+
+→ **`probe_dap.py`** — DP 계층만 본다. connect/AP/DM 을 건드리지 않고
+  ① DPIDR ② 전원 ACK ③ **AP 등록 개수(0/1/6)에 따른 차이** 를 비교한다.
+  ③이 중요하다: **존재하지 않는 AP 6개를 등록하는 것이 J-Link 열거를 깨뜨릴 수 있다.**
+
 ### 다음 시험 — `probe_trace_regs.py`
 
 > **`0xFD000000` / `0xFD180000` 을 MEM-AP 로 직접 읽을 수 있는가?**
