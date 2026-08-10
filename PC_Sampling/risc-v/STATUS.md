@@ -5,6 +5,68 @@
 
 ---
 
+## ★★★ 2026-08-10 — T32 커버리지 방식이 확인됐다 (`NexusTracedatadump.cmm`)
+
+실제 T32 스크립트 확보. **C1(메커니즘 식별) 해결.**
+
+| | 값 |
+|---|---|
+| **TE control** | `ESB:0xFD000000` (bit1 = enable) |
+| **TF control / ETB base** | `ESB:0xFD180000` — **둘이 같은 주소** |
+| write ptr | `ETB+0x1C` (**bit0 = wrap 플래그**) |
+| read ptr | `ETB+0x20` |
+| data | `ETB+0x24` (**읽을 때마다 자동 증가**) |
+| 버퍼 | **32KB** (`0x7FFF`) |
+| 출력 | `Data.SAVE.Binary` → `.bin` (원시 Nexus 바이트) |
+
+### ★ `ESB:` 가 세 가지를 확정한다
+
+TRACE32 접근 클래스: **`E` = 실행 중 접근(비침습)**, **`SB` = System Bus (SBA)**.
+스크립트 어디에도 **halt 가 없다.**
+
+1. **SBA 가 이 칩에 구현돼 있다** (SiFive Insight 에서 optional 인데 존재)
+2. **커버리지 수집에 halt 가 불필요하다** — 트레이스 계획의 핵심 전제 확인
+3. ★ **DM 은 정상 동작한다.** SBA 는 DM 의 일부다. T32 가 SBA 를 쓴다는 것은
+   **우리 `dmactive` 실패가 칩 한계가 아니라 우리 설정 문제**라는 뜻이다
+
+### ★ J-Link 의 N-Trace 지원이 필요 없을 수도 있다
+
+스크립트는 **순수한 레지스터 읽기/쓰기**다:
+
+```
+TECTRL bit1 클리어 → TFCTRL bit1 클리어 → write ptr 로 wrap 판정
+→ read ptr 설정 → data 레지스터 반복 읽기(자동 증가) → 파일로 저장
+```
+
+**J-Link 에 필요한 건 "그 주소에 32비트 read/write" 하나뿐이다.**
+
+### 퍼저 구조가 여기서 정해진다
+
+**32KB 버퍼 + TE 를 껐다 켜는 구조**는 명령 단위 커버리지에 딱 맞는다:
+
+```
+TE enable → NVMe 명령 1개 → TE disable → 드레인 → 디코드 → 그 명령의 커버리지
+```
+
+명령 하나당 32KB 면 충분하다. **halt 가 없으니 ARM 제품의 호스트 프리즈 문제가
+원천적으로 없고, 부분맹(halt under-sampling)도 사라진다.**
+
+### 아직 없는 것
+
+이 스크립트는 TE 를 **끄기만** 한다. **켜고 설정하는 부분이 다른 파일에 있다:**
+TE enable, 전체 `TECTRL` 비트 레이아웃, **BTM vs HTM**, **주소 범위 필터**
+(32KB 에는 거의 필수), sync 주기, TF 설정.
+
+→ `NexusTrace*` 형제 파일 / 상위 호출 스크립트를 찾을 것.
+
+### 다음 시험 — `probe_trace_regs.py`
+
+> **`0xFD000000` / `0xFD180000` 을 MEM-AP 로 직접 읽을 수 있는가?**
+> 되면 **DM 을 우회**하고 커버리지 경로가 즉시 열린다.
+> 안 되면 SBA 가 유일 경로이므로 **`dmactive` 를 먼저 푸는 것이 선행 조건**으로 확정.
+
+---
+
 ## ★★ 2026-08-10 — 실패 지점이 `dmactive` 로 특정됐다
 
 J-Link 을 **V9.12 → V9.66** 으로 올린 뒤 halt 재시험:
