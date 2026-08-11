@@ -5,6 +5,142 @@
 > 목적: 현재 접근 방향이 맞는지 검토하고, 다음 작업자가 바로 이어서 판단할 수 있도록
 > 실측 사실과 권장 순서를 분리해 기록한다.
 
+## 최우선 정정 — 2026-08-11: `0x6BA0009D` 세션은 유효 DPIDR 세션이 아니다
+
+> 이 절이 아래의 모든 DPIDR·AXI·APBAP3·자력 탐색 종료 판단보다 우선한다.
+> 최신 `standalone.py`가 아키텍처상 무효인 DPIDR를 유효 세션으로 통과시켰다.
+> 따라서 그 세션에서 새로 얻은 AXI/APBAP3/alias/default-line 결과를 근거로
+> "자력 탐색 종료"를 선언할 수 없다.
+
+### 1. Critical issues
+
+#### DP API 반환값을 물리 TAP IDCODE로 잘못 재해석했다
+
+`standalone.py`는 다음 경로로 값을 읽는다.
+
+```python
+dpidr = d.dpr(0)
+# dpr(0) → jl.coresight_read(0, ap=False)
+```
+
+`pylink.JLink.coresight_read(..., ap=False)`는 문서와 구현상 Debug Port register를
+읽는 API다. 따라서 여기서 읽은 register 0 값은 TAP IDCODE가 아니라
+**DPIDR(Debug Port Identification Register)** 로 검증해야 한다.
+
+Arm ADIv6 공식 명세 `IHI 0074`, §B2.2.6에 따르면 DPIDR의 필드는 다음과 같다.
+
+```text
+REVISION bits[31:28]
+PARTNO   bits[27:20]
+VERSION  bits[15:12]   유효값 1=DPv1, 2=DPv2, 3=DPv3
+DESIGNER bits[11:1]
+bit0     RAO
+```
+
+명세는 JTAG-DP가 별도의 IDCODE instruction/scan-chain을 구현하며, **TAP IDCODE와
+DPIDR 값이 같을 필요가 없다**고도 명시한다.
+
+공식 문서:
+`https://documentation-service.arm.com/static/5f8ff91cf86e16515cdbfdf0`
+
+두 값을 DPIDR로 대조하면:
+
+| 값 | VERSION | DESIGNER | 판정 |
+|---|---:|---:|---|
+| `0x11013913` | **3** | **`0x489` SiFive** | 아키텍처상 유효한 DPv3 후보 |
+| `0x6BA0009D` | **0** | `0x04E` | VERSION 0은 reserved → **유효 DPIDR 아님** |
+
+`0x6BA0009D`를 JTAG IDCODE 형식으로 억지 해석해도 manufacturer는 `0x04E`이며
+Arm의 `0x23B`가 아니다. `PARTNO=0xBA00`만 보고 Arm CoreSight TAP이라고
+확정할 수도 없다. 물리 TAP IDCODE는 별도의 raw IDCODE scan으로 확인해야 한다.
+
+#### 현재 DPIDR 유효성 게이트가 너무 약하다
+
+현재 코드는 다음만 검사한다.
+
+```python
+out['dpidr_ok'] = (dpidr is not None and (dpidr & 1) == 1
+                   and dpidr not in (0x00000001, 0xFFFFFFFF))
+```
+
+즉 bit0이 1인 임의의 홀수를 유효 DPIDR로 받아들인다. 그 결과 VERSION=0인
+`0x6BA0009D`가 통과했다. 최소한 다음 검사가 필요하다.
+
+```python
+version = (dpidr >> 12) & 0xF
+dpidr_ok = dpidr is not None and (dpidr & 1) == 1 and version in (1, 2, 3)
+```
+
+이번 타깃의 재검증 동안에는 더 엄격하게 `dpidr == 0x11013913`과 AP IDR 6개
+기대값 일치를 함께 요구하는 것이 안전하다.
+
+### 2. Potential bugs / 무효화되는 최신 결론
+
+`0x6BA0009D`를 유효 세션으로 받아 얻은 다음 주장은 모두 확정에서 내리고,
+`0x11013913` 또는 다른 아키텍처상 유효한 DPIDR 세션에서 재측정한다.
+
+- AXI 다섯 주소 `0xC81024/28/2C/40/44`가 모두 0이고 오류 없음
+- 36회 MEM-AP 전송이 전부 정상
+- APBAP3 앞 16바이트에 유효한 레지스터 블록이 있음
+- APBAP3의 주소 디코드 폭이 4KB임
+- `0x81592158`이 의미 있는 포인터 후보임
+- APBAP1 응답이 128비트 default-slave line임
+- APBAP1/2가 32비트 주소를 전부 디코드함
+- 이 결과들을 근거로 한 "자력 탐색 종료 조건 도달"
+
+추가 코드 문제도 남아 있다.
+
+- `standalone.py::mem32()`는 DRW 값이 존재하면 DP 오류 여부와 무관하게
+  `stage='ok'`를 기록한다.
+- alias 측정은 각 주소 전송에 오류가 섞여도 값 일치만으로 폭을 판정할 수 있다.
+- `probe_rom_dm.py`의 확정 판정은 아직 `csw_unusable`, `csw_write_fail`,
+  `tar_write_fail`, CSW readback 불일치, ABORT 후 오류 미해제를 모두 차단하지 않는다.
+- `0x00000001/0xEAFFFFFE` lane 패턴은 default-slave와 일치하는 강한 정황일 수
+  있지만, 유효 세션에서 재현하고 SoC 응답 규칙과 대조하기 전에는 "정체 확정"이
+  아니라 관측된 반복 패턴으로 기록한다.
+
+### 3. Reliability improvements / 아직 남은 자력 조사
+
+1. DPIDR 게이트를 VERSION 기반으로 수정하고, 이번 타깃에서는 우선
+   `0x11013913` exact match와 AP IDR 6개 일치를 세션 유효 조건에 넣는다.
+2. 다음 두 수동 TAP 선언값을 각각 독립 3세션으로 비교한다.
+
+```bash
+sudo python3 standalone.py --tapid 0x11013913 --sessions 3 --json tap_11013913.json
+sudo python3 standalone.py --tapid 0x5BA00477 --sessions 3 --json tap_5ba00477.json
+```
+
+3. 유효 DPIDR 세션에서만 다음을 다시 측정한다.
+   - AXI `0xC81024/28/2C/40/44`
+   - APBAP3 앞 16바이트와 alias
+   - APBAP1 `0x81480000` 주변의 lane 패턴
+4. 유효한 DPv3 경로를 복구하면 아직 읽지 않은 architectural discovery register인
+   `DPIDR1`, `BASEPTR0`, `BASEPTR1`을 read-only로 확인한다. 이 값들은 ADIv6
+   루트 디버그 구성 주소를 제공할 수 있으며, 현재 문서에는 시험 이력이 없다.
+5. 물리 TAP ID가 필요하면 DP register 반환값을 재명명하지 말고 JTAG/cJTAG의
+   IDCODE instruction을 사용하는 별도 raw scan으로 확인한다.
+
+### 4. Suggested tests와 진짜 종료 조건
+
+단위 테스트:
+
+- `0x6BA0009D`는 VERSION=0이므로 반드시 거부
+- `0x11013913`은 VERSION=3으로 통과
+- sticky error가 있으면 `stage='ok'` 금지
+- CSW/TAR write 또는 readback 실패가 있으면 값 해석 금지
+- alias 후보 중 한 전송이라도 오류이면 width 판정 금지
+
+자력 탐색 종료는 다음을 **모두** 만족한 뒤에만 선언한다.
+
+1. 아키텍처상 유효한 DPIDR 세션 3회와 AP IDR 6개 일치
+2. 엄격한 전송 판정을 적용한 뒤에도 AXI 다섯 주소가 동일하게 0
+3. DPv3 `DPIDR1/BASEPTR0/1` 경로에서 추가 토폴로지를 얻지 못함
+4. APB ROM이 여전히 도달 불가능한 DM 후보만 가리킴
+5. T32 실측값과 SoC 레지스터 사양을 확보할 수 없음
+
+현재는 이 조건을 충족하지 않았다. 다음 작업은 더 넓은 주소 스윕이 아니라
+**DPIDR 유효성 게이트를 수정하고 최신 결과 전체를 유효 세션에서 재검증하는 것**이다.
+
 ## 최신 추가 피드백 — 2026-08-11: T32 조사는 소진, AXI 시험 주소를 바로잡아야 한다
 
 > 이 절이 아래의 AXI/reset 관련 과거 판단보다 우선한다. 추가로 확인한 T32

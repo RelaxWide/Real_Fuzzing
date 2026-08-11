@@ -41,7 +41,27 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.11  axi 프리셋 (T32 판정 주소)"
+VERSION = "standalone 2026-08-11.12  DPIDR VERSION 게이트 + ADIv6 discovery"
+
+# ★★ 게이트가 너무 약했다 (feedback). bit0 홀수만 보다가 VERSION=0 인
+#   0x6BA0009D 를 유효 세션으로 통과시켰다.
+#   ADIv6 IHI0074 §B2.2.6: DPIDR.VERSION = bits[15:12], 유효값 1/2/3.
+#     0x6BA0009D → VERSION 0 (reserved) → **무효**
+#     0x11013913 → VERSION 3 (DPv3), DESIGNER 0x489 SiFive → 유효
+#   그리고 coresight_read(0, ap=False) 는 **DP 레지스터**를 읽는다.
+#   TAP IDCODE 가 아니므로 그렇게 재해석하면 안 된다.
+EXPECT_DPIDR = 0x11013913          # 이 타깃에서 기대하는 값
+EXPECT_AP_IDR = {0x10000: 0x09130006, 0x20000: 0x09130006, 0x30000: 0x09130004,
+                 0x40000: 0x09130001, 0x50000: 0x09130006, 0x60000: 0x09130006}
+
+
+def dpidr_valid(v, strict=True):
+    """ADIv6 DPIDR 유효성. strict 면 이 타깃의 기대값까지 요구한다."""
+    if v is None or (v & 1) != 1:
+        return False
+    if ((v >> 12) & 0xF) not in (1, 2, 3):       # VERSION
+        return False
+    return (v == EXPECT_DPIDR) if strict else True
 
 # ★ T32 가 코어 enable 판정에 **실제로 읽는** AXI 주소 (CMM 실물, feedback):
 #     0xC81024  FCore  enable bit0                (AttachPrepare.cmm)
@@ -225,8 +245,49 @@ class Dap:
             return None, {'stage': 'tar_mismatch', 'tar_back': hx(back),
                           'before': before, 'after': decode_ctrl(self.dpr(DP_CTRL))}
         v = self.apr(base, OFF_DRW)
-        return v, {'stage': 'ok' if v is not None else 'drw_fail',
-                   'before': before, 'after': decode_ctrl(self.dpr(DP_CTRL))}
+        after = decode_ctrl(self.dpr(DP_CTRL))
+        err = any(after.get(k) for k in ('STICKYERR', 'WDATAERR', 'STICKYORUN'))
+        # ★ 오류가 있으면 값이 있어도 'ok' 가 아니다
+        stage = 'dp_error' if err else ('ok' if v is not None else 'drw_fail')
+        return (None if err else v), {'stage': stage, 'dp_error': err,
+                                      'before': before, 'after': after}
+
+
+def discover(d):
+    """★ ADIv6 **architectural discovery 레지스터**. 한 번도 안 읽었다.
+
+    ADIv6 는 DP SELECT 의 **DPBANKSEL**(bits[3:0])로 DP 주소 0x0 에서
+    서로 다른 레지스터를 노출한다:
+
+        bank 0 → DPIDR      (지금까지 읽던 것)
+        bank 1 → DPIDR1     ASIZE=bits[6:0] (주소 폭), ERRMODE=bit7
+        bank 2 → BASEPTR0   bit0=VALID, bits[31:12]=루트 ROM 주소 하위
+        bank 3 → BASEPTR1   루트 ROM 주소 상위 32비트
+
+    **BASEPTR 가 곧 "디버그 구성의 루트가 어디인가" 다.**
+    우리는 그동안 그 주소를 T32 스크립트에서 추측해 왔는데,
+    ADIv6 에서는 **하드웨어가 직접 알려준다.** 시험 이력이 없다.
+    """
+    out = {}
+    sel0 = 0
+    for bank, name in ((0, 'DPIDR'), (1, 'DPIDR1'),
+                       (2, 'BASEPTR0'), (3, 'BASEPTR1')):
+        d.dpw(DP_SELECT, (sel0 & ~0xF) | bank)
+        out[name] = d.dpr(0)
+    d.dpw(DP_SELECT, sel0)          # bank 0 으로 복구
+    d.sel = None
+
+    r = {'raw': {k: hx(v) for k, v in out.items()}}
+    d1 = out.get('DPIDR1')
+    if d1 is not None:
+        r['ASIZE'] = d1 & 0x7F
+        r['ERRMODE'] = bool(d1 & 0x80)
+    b0, b1 = out.get('BASEPTR0'), out.get('BASEPTR1')
+    if b0 is not None:
+        r['BASE_VALID'] = bool(b0 & 1)
+        lo = b0 & 0xFFFFF000
+        r['BASEPTR'] = (f"0x{(b1 or 0):08X}{lo:08X}" if b1 else f"0x{lo:08X}")
+    return r
 
 
 def alias_probe(jl, d, base, name):
@@ -238,8 +299,12 @@ def alias_probe(jl, d, base, name):
     csw = d.apr(base, OFF_CSW)
     if csw is None:
         return {'ap': name, 'width': None, 'note': 'CSW 못 읽음'}
-    r0, _ = d.mem32(base, 0x0, csw)
-    r4, _ = d.mem32(base, 0x4, csw)
+    r0, m0 = d.mem32(base, 0x0, csw)
+    r4, m4 = d.mem32(base, 0x4, csw)
+    if m0.get('dp_error') or m4.get('dp_error'):
+        d.apw(base, OFF_CSW, csw)
+        return {'ap': name, 'width': None, 'undecidable': True,
+                'note': '기준 전송에 DP 오류 — 폭 판정 금지'}
     if r0 is None:
         return {'ap': name, 'width': None, 'note': '0x0 못 읽음'}
     # ★ 기준점이 서로 달라야 wrap 판정이 성립한다
@@ -249,16 +314,25 @@ def alias_probe(jl, d, base, name):
                 'undecidable': True,
                 'note': '0x0 과 0x4 가 같은 값 — 기준점이 구별 안 됨'}
     width, matches = None, []
+    err_seen = False
     for n in range(12, 32):
-        a0, _ = d.mem32(base, 1 << n, csw)
+        a0, ma = d.mem32(base, 1 << n, csw)
+        if ma.get('dp_error'):
+            err_seen = True
         if a0 != r0:
             continue
-        a4, _ = d.mem32(base, (1 << n) + 4, csw)
+        a4, mb = d.mem32(base, (1 << n) + 4, csw)
+        if mb.get('dp_error'):
+            err_seen = True
         if a4 == r4:
             matches.append(n)
             if width is None:
                 width = n
     d.apw(base, OFF_CSW, csw)
+    if err_seen:
+        return {'ap': name, 'width': None, 'undecidable': True,
+                'ref0': hx(r0), 'ref4': hx(r4),
+                'note': '전송 중 DP 오류 — 폭 판정 금지'}
     return {'ap': name, 'width': width, 'ref0': hx(r0), 'ref4': hx(r4),
             'matches': matches}
 
@@ -322,8 +396,8 @@ def session(a, idx):
         out['DPIDR'] = hx(dpidr)
         # ★ DPIDR 이 무효면 그 세션의 AP 값은 **전부 무효**다.
         #   bit0 은 RAO 이므로 짝수이거나 0/0xFFFFFFFF 면 데이터가 아니다.
-        out['dpidr_ok'] = (dpidr is not None and (dpidr & 1) == 1
-                           and dpidr not in (0x00000001, 0xFFFFFFFF))
+        out['dpidr_ok'] = dpidr_valid(dpidr, strict=not a.loose)
+        out['dpidr_version'] = (None if dpidr is None else (dpidr >> 12) & 0xF)
         d.dpw(DP_ABORT, 0x1E)
         d.dpw(DP_CTRL, 0x50000000)
         for _ in range(30):
@@ -333,6 +407,10 @@ def session(a, idx):
                 break
         out['CTRL'] = decode_ctrl(d.dpr(DP_CTRL))
         out['ok'] = bool(out['CTRL'].get('CDBGACK')) and out['dpidr_ok']
+
+        if getattr(a, 'discover', False):
+            out['discover'] = discover(d)
+            return out
 
         if getattr(a, 'alias', False):
             out['alias'] = [alias_probe(jl, d, b, n) for n, b, _t in AP_MAP]
@@ -377,6 +455,10 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--discover', action='store_true',
+                    help='★ ADIv6 DPIDR1 / BASEPTR0 / BASEPTR1 을 읽는다 (미시도)')
+    ap.add_argument('--loose', action='store_true',
+                    help='DPIDR 기대값 일치를 요구하지 않는다 (VERSION 검사만)')
     ap.add_argument('--alias', action='store_true',
                     help='★ AP 마다 주소 디코드 폭을 잰다 (2^N 이 0 과 같아지는 지점)')
     ap.add_argument('--ap', default=None,
@@ -431,6 +513,19 @@ def main():
                     errs[k] = errs.get(k, 0) + 1
 
     print(f"\n---8<---")
+    if getattr(a, 'discover', False):
+        print(f"ok={len(ok)}/{a.sessions} DPIDR={(last or {}).get('DPIDR')} "
+              f"ver={(last or {}).get('dpidr_version')}")
+        dv = (last or {}).get('discover') or {}
+        for k, v in (dv.get('raw') or {}).items():
+            print(f"{k}={v}")
+        if 'ASIZE' in dv:
+            print(f"ASIZE={dv['ASIZE']} ERRMODE={dv['ERRMODE']}")
+        if 'BASE_VALID' in dv:
+            print(f"BASE_VALID={dv['BASE_VALID']} BASEPTR={dv.get('BASEPTR')}")
+        print("---8<---")
+        return 0 if ok else 6
+
     if getattr(a, 'alias', False):
         print(f"ok={len(ok)}/{a.sessions} DPIDR={(last or {}).get('DPIDR')}")
         for r in ((last or {}).get('alias') or []):
