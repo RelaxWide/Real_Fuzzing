@@ -65,6 +65,8 @@ Timeout waiting for debug module to become active     (dmcontrol.dmactive 안 �
 | MEM-AP 로 `0x81480000` 직접 읽기 (TAR/DRW) | **6개 AP 전부 무응답 상수** (`0xEAFFFFFE`/`0xEAFFFFFC`/`0`) |
 | MEM-AP 로 AP 주소공간 `0x0` 읽기 | ★ `APBAP1=0x81480003`, `APBAP2=0x81481003` (ROM 엔트리) |
 | MEM-AP 로 트레이스 블록 `0xFD......` 읽기 | 전 AP 무응답 상수 — **MEM-AP 로는 안 보인다** |
+| 주소 디코드 폭 확인 (wrap 탐지, `2^12`~`2^31`) | **wrap 없음** — aliasing 아님 |
+| 디버그 전원 사이클 (`CDBGPWRUPREQ` OFF → 500ms → ON) | 값 변화 없음 |
 | AP `BASE`(0xDF8) → ROM 테이블 | SEGGER 문서상 **RISC-V 는 ROM 스캔 미지원** |
 | `JLinkScriptFile` 경로 | cJTAG 스캔이 깨짐 (`IRPrint=0x..0000`) |
 
@@ -75,6 +77,26 @@ INTERCOM.execute ... sys.config.coredebug.base &core_base
 ```
 → **T32 의 APB 버스 주소**이지, J-Link 이 요구하는 *"address in AP address space"*
 와 같다는 보장이 없다. (SEGGER 예제는 `SetCoreBaseAddr = 0x0`)
+
+## 3.5 ★ 결정적 관측 — MEM-AP 읽기가 `0x0`/`0x4` 에서만 동작한다
+
+APBAP1 으로 여러 주소를 32비트 읽은 결과입니다.
+
+| 주소 | 값 |
+|---|---|
+| `0x00000000` | `0x81480003` |
+| `0x00000004` | `0x00000000` |
+| `0x00100000`, `0xFD000000`, `0xFD180000`, `0x81480000` … | 전부 `0x00000001` |
+| `0x0021BFFC`, `0xFD18001C`, `0x81480044`, `0x81480FFC` | 전부 `0xEAFFFFFE` |
+
+**`0x0` 과 `0x4` 만 서로 다른 값을 주고, 나머지는 주소가 아니라 32바이트 정렬
+여부만 보고 두 상수 중 하나로 떨어집니다.** TAR 되읽기는 항상 일치하고,
+`CSW.DeviceEn=1`, DP 전원 ACK 도 정상입니다. wrap 탐지로 주소 디코드 폭도
+확인했는데 `2^12`~`2^31` 어디서도 wrap 이 없어 aliasing 도 아닙니다.
+
+> **질문:** 이 상태를 어떻게 해석해야 합니까? MEM-AP 는 열거되고 CSW/TAR 도
+> 정상 동작하는데 **DRW 만 실제 버스 응답을 못 받는 것**으로 보입니다.
+> `Prot`/`Type`/`SDeviceEn` 조합, 또는 별도의 인에이블이 필요합니까?
 
 ## 4. SEGGER 지원에 보낼 질문
 
