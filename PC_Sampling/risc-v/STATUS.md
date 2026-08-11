@@ -147,6 +147,53 @@ J-Link       Plus, FW V13 / 소프트웨어 **V9.66** (V9.12 → 업그레이드
 > CoreSight 컴포넌트면 `0xFF0..0xFFC` = `0D 10 05 B1`.
 > → `--rom` 추가 (`.20`).
 
+> ### ★★★★ 실측 (`--rom`) — **ROM 테이블은 진짜다**
+>
+> ```
+> APBAP1  CID=0D9005B1  ent = 81480003, 0, 0, 0
+> APBAP2  CID=0D9005B1  ent = 81481003, 0, 0, 0
+> AXIAP1  CID=00000000       ent = 0,0,0,0
+> AHBAP1  CID=FCFCFCFC       ent = EAFFFFFC ×4
+> APBAP3  CID=00000000       ent = 40700, 10, 81592158, 2C3   (PRESENT=0 → ROM 아님)
+> APBAP4  CID=FEFEFEFE       ent = EAFFFFFE ×4
+> ```
+>
+> ⚠ 내 판정 기준이 틀렸다. CIDR1 은 **상위 니블이 컴포넌트 클래스**이고 하위
+> 니블만 preamble 이다. `0x10` 만 받으면 클래스 1(레거시 ROM)만 통과한다.
+> `0D9005B1` = 클래스 **9** = ADIv6 CoreSight 클래스 → **유효**.
+> (ADIv6 의 ROM 테이블이 바로 Class 9 ROM Table 이다)
+>
+> **확정:**
+> - APBAP1/2 의 BASE 에 **진짜 CoreSight 컴포넌트**가 있다
+> - `ent[0]` 은 PRESENT=1 FORMAT=1 인 **정상 ROM 엔트리**이고 가리키는 곳이
+>   `attach.cmm` 의 두 DM 주소와 정확히 일치한다
+> - `ent[1..3]=0` → 테이블 끝. **AP 당 컴포넌트 하나**뿐이다
+> - AXIAP1 / AHBAP1 / APBAP3 / APBAP4 에는 CoreSight 컴포넌트가 없다
+>
+> ### ★★★★★ "DM version 14" 의 정체가 풀렸다
+>
+> ```
+> 0xEAFFFFFE & 0xF = 0xE = 14
+> ```
+> J-Link 의 `Unsupported or invalid DM version 14 detected` 는
+> **default slave 라인의 하위 니블**이다. J-Link 은 dmstatus 를 읽어 응답 없는
+> 버스의 기본값을 받았다. **설정 문제가 아니라 부재다.**
+> ⇒ "DM 버전을 못 알아본다" 로 세운 모든 가설(DMI stride, hartsel, CoreBase,
+> device 이름)은 **전부 무관하다.** 그 자리에 아무것도 없다.
+>
+> ### 남은 갈림길
+>
+> ROM 엔트리 오프셋은 **ROM 베이스 상대**(ADIv5/v6, bits[31:12], 부호 있음)인데
+> 우리는 BASE 를 안 본 채 리터럴 `0x81480000` 만 읽어왔다.
+> `--dm` (`.21`) 이 세 후보를 전부 dmcontrol/dmstatus 자리에서 확인한다:
+> 리터럴 / ROM+부호없음 / ROM+부호있음.
+>
+> - **`DM_LIVE`** → DM 을 APB-AP 로 직접 몰 수 있다. J-Link connect 불필요.
+>   DM → SBA → `0xFD180000` 트레이스 버퍼로 곧장 간다
+> - **`DM_ABSENT`** → 주소 문제가 아니다. DM 이 **리셋/클럭 게이트 뒤**에 있다.
+>   T32 의 `Reset Release` 서브루틴(`AXI:0xC81040/0xC81044` **쓰기**)이 그걸 한다.
+>   ⚠ 쓰기는 실기 NVMe 장치에 대한 것이므로 **사용자 명시 승인 없이는 안 한다**
+
 **동작하는 설정 (pylink + exec_command, connect 前 주입):**
 ```
 SetcJTAGInitMode = 0

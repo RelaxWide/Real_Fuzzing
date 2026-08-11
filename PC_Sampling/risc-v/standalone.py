@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.20  --rom: BASE 전체 + ROM 테이블 CIDR 판독"
+VERSION = "standalone 2026-08-11.21  --dm: ROM 이 가리키는 곳에 DM 이 실재하나"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -535,7 +535,77 @@ def replay(a):
 #       0xFF0..0xFFC = 0x0D, 0x10, 0x05, 0xB1 (preamble)
 #     맞으면 ROM 테이블이 실재하고 엔트리를 믿어도 된다.
 #     아니면 0x81480003 은 우연히 그렇게 생긴 버스 값일 뿐이다.
-CID_OK = (0x0D, 0x10, 0x05, 0xB1)
+# ⚠ 판정 기준이 틀렸었다. CIDR1 의 **상위 니블은 컴포넌트 클래스**이고
+#   하위 니블만 preamble(0x0)이다. 0x10 만 받으면 클래스 1(레거시 ROM)만 통과한다.
+#   실측 `0D9005B1` = 클래스 **9** = ADIv6 CoreSight 클래스 → **유효**.
+#   (ADIv6 의 ROM 테이블이 바로 Class 9 ROM Table 이다)
+CID_PREAMBLE = (0x0D, 0x00, 0x05, 0xB1)     # CIDR1 은 하위 니블만 본다
+
+
+def cid_ok(cid):
+    if len(cid) != 4 or any(c is None for c in cid):
+        return False, None
+    if cid[0] != 0x0D or cid[2] != 0x05 or cid[3] != 0xB1:
+        return False, None
+    if (cid[1] & 0x0F) != 0x00:
+        return False, None
+    return True, (cid[1] >> 4) & 0xF        # 컴포넌트 클래스
+
+
+# ★★★ --dm : ROM 엔트리가 가리키는 곳에 **DM 이 실제로 응답하나.**
+#
+#   실측으로 여기까지 왔다:
+#     · APBAP1/2 의 BASE 에 진짜 CoreSight 컴포넌트 (CID=0D9005B1, 클래스 9)
+#     · ent[0] = 0x81480003 / 0x81481003 — PRESENT=1 FORMAT=1 인 정상 ROM 엔트리
+#       가리키는 곳이 attach.cmm 의 두 DM 주소와 정확히 일치
+#     · ent[1..3] = 0 → 테이블 끝. AP 당 컴포넌트 **하나**뿐이다
+#
+#   ★ 그런데 J-Link 의 "Unsupported or invalid DM version 14" 가 풀렸다:
+#       0xEAFFFFFE & 0xF = 0xE = 14
+#     = **default slave 라인의 하위 니블**이다. J-Link 은 dmstatus 를 읽어
+#     응답 없는 버스의 기본값을 받은 것이다. 설정 문제가 아니라 **부재**다.
+#
+#   ⇒ 남은 질문 하나: 우리가 DM 을 **엉뚱한 주소**에서 찾고 있었나?
+#     ROM 엔트리 오프셋은 ROM 베이스 상대이고(ADIv5/v6 에서 bits[31:12], 부호 있음),
+#     우리는 BASE 를 안 본 채 리터럴 0x81480000 만 읽었다.
+#     세 후보를 전부 dmcontrol/dmstatus 자리에서 확인한다.
+DM_REGS = [(0x10, 'dmcontrol'), (0x11, 'dmstatus'), (0x38, 'sbcs')]
+
+
+def dm_probe(d):
+    out = []
+    for name, apbase, _t in AP_MAP:
+        if not name.startswith('APBAP'):
+            continue
+        b = d.apr(apbase, OFF_BASE)
+        if b is None or b == 0xFFFFFFFF:
+            continue
+        rb = b & 0xFFFFF000
+        csw = d.apr(apbase, OFF_CSW)
+        e0, _ = d.mem32(apbase, rb, csw)
+        if not e0 or not (e0 & 1):              # PRESENT 아니면 볼 것 없다
+            continue
+        off_u = e0 & 0xFFFFF000
+        off_s = off_u - (1 << 32) if off_u & 0x80000000 else off_u
+        cands = [('리터럴', off_u),
+                 ('ROM+부호없음', (rb + off_u) & 0xFFFFFFFF),
+                 ('ROM+부호있음', (rb + off_s) & 0xFFFFFFFF)]
+        seen = set()
+        for label, addr in cands:
+            if addr in seen:
+                continue
+            seen.add(addr)
+            r = {'ap': name, 'how': label, 'addr': f"0x{addr:08X}", 'regs': {}}
+            for dmi, rn in DM_REGS:
+                v, _ = d.mem32(apbase, addr + (dmi << 2), csw)
+                r['regs'][rn] = hx(v)
+                if rn == 'dmstatus':
+                    r['ver'] = None if v is None else v & 0xF
+                    r['default'] = is_default_line(addr + (dmi << 2), v)
+            out.append(r)
+        if csw is not None:
+            d.apw(apbase, OFF_CSW, csw)
+    return out
 
 
 def rom_probe(d):
@@ -557,7 +627,8 @@ def rom_probe(d):
             v, _ = d.mem32(apbase, rb + off, csw)
             cid.append(None if v is None else v & 0xFF)
         r['CID'] = "".join('--' if c is None else f"{c:02X}" for c in cid)
-        r['CID_OK'] = tuple(cid) == CID_OK
+        ok, cls = cid_ok(cid)
+        r['CID_OK'], r['class'] = ok, cls
         v, _ = d.mem32(apbase, rb + 0xFCC, csw)
         r['MEMTYPE'] = hx(v)
         ent = []
@@ -660,6 +731,10 @@ def session(a, idx):
                 out['discover'] = discover(d)
             return out
 
+        if getattr(a, 'dm', False):
+            out['dm'] = dm_probe(d)
+            return out
+
         if getattr(a, 'rom', False):
             out['rom'] = rom_probe(d)
             return out
@@ -708,6 +783,8 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--dm', action='store_true',
+                    help='★ ROM 엔트리가 가리키는 곳에 DM 이 실재하나 (주소 후보 3종)')
     ap.add_argument('--rom', action='store_true',
                     help='★ AP 별 BASE **전체** + 그곳의 CoreSight ROM 테이블 판독')
     ap.add_argument('--replay', action='store_true',
@@ -780,6 +857,32 @@ def main():
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
 
+    if a.dm:
+        print(f"\n{'=' * 70}\n [DM] ROM 이 가리키는 곳에 DM 이 응답하나\n{'=' * 70}")
+        print("  dmstatus.version 유효값: 2(0.13) 또는 3(1.0).")
+        print("  14(0xE) 가 나오면 그건 default slave 라인 0xEAFFFFFE 다 — 부재.\n")
+        r0 = session(a, 0)
+        if not r0.get('ok'):
+            print("---8<---")
+            print(f"무효 세션 (AP일치={r0.get('ap_match')}/6) — 다시 실행")
+            print("---8<---")
+            return 6
+        print("---8<---")
+        live = []
+        for r in r0.get('dm', []):
+            g = r['regs']
+            v = r.get('ver')
+            mark = ('★DM살아있음' if v in (2, 3) else
+                    '(default라인)' if r.get('default') else '')
+            print(f"{r['ap']} {r['how']:12s} {r['addr']} "
+                  f"dmcontrol={g['dmcontrol']} dmstatus={g['dmstatus']} "
+                  f"ver={v} sbcs={g['sbcs']} {mark}")
+            if v in (2, 3):
+                live.append(r)
+        print("VERDICT:", f"DM_LIVE ({live[0]['addr']})" if live else "DM_ABSENT")
+        print("---8<---")
+        return 0 if live else 6
+
     if a.rom:
         print(f"\n{'=' * 70}\n [ROM] BASE 전체 + ROM 테이블 CIDR\n{'=' * 70}")
         print("  CIDR 이 0D1005B1 이면 진짜 CoreSight ROM → 엔트리를 믿어도 된다.")
@@ -797,7 +900,7 @@ def main():
                 continue
             print(f"{r['ap']} BASE={r['BASE']} P={int(r['P'])} rom={r['rom']} "
                   f"CID={r['CID']}{' ★진짜' if r['CID_OK'] else ''} "
-                  f"MEMTYPE={r['MEMTYPE']} ent={','.join(r['ent'])}")
+                  f"class={r.get('class')} ent={','.join(r['ent'])}")
         good = [r for r in r0.get('rom', []) if r.get('CID_OK')]
         print("VERDICT:", f"ROM_FOUND ({len(good)}개 AP)" if good else "NO_CORESIGHT_ROM")
         print("---8<---")
