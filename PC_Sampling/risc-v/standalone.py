@@ -41,7 +41,14 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.1"
+VERSION = "standalone 2026-08-11.2"
+
+# ★ 결과를 **손으로 옮겨 적는** 환경이다. 그래서 기본 출력을 3줄로 줄인다.
+#   전체가 필요하면 --full, 파일이 필요하면 --json.
+#   지금 판단에 실제로 필요한 것은 셋뿐이다:
+#     ① STICKYERR 가 뜨는가 (비트 수정 후 재측정의 핵심)
+#     ② 전송이 어느 단계에서 끝나는가
+#     ③ AP 별로 읽은 값이 **몇 종류**인가 (1종 = 변화 없음)
 
 TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE = 7, 10000, 1, 'E76'
 CHAIN_TAP_ID = 0x5BA00477
@@ -248,6 +255,8 @@ def main():
     ap.add_argument('--sessions', type=int, default=3)
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--full', action='store_true',
+                    help='AP 별 상세까지 전부 출력 (기본은 3줄 요약)')
     ap.add_argument('--version', action='store_true')
     a = ap.parse_args()
     if a.version:
@@ -263,29 +272,38 @@ def main():
     runs = [session(a, i) for i in range(a.sessions)]
     ok = [r for r in runs if r.get('ok')]
 
-    print(f"\n---8<--- STANDALONE ---")
-    print(f"v={VERSION}  ok={len(ok)}/{a.sessions}")
-    if runs and runs[-1].get('probe'):
-        print(runs[-1]['probe'])
-    for r in runs:
-        print(f"s{r['session']}: connect={r.get('connect')} DPIDR={r.get('DPIDR')} "
-              f"CTRL={(r.get('CTRL') or {}).get('raw')} "
-              f"CDBGACK={(r.get('CTRL') or {}).get('CDBGACK')}")
     last = ok[-1] if ok else (runs[-1] if runs else None)
+    stages, errs = {}, {}
     if last:
-        for n, apd in (last.get('aps') or {}).items():
-            print(f"{n} IDR={apd['IDR']} CSW={apd['CSW']} CFG={apd['CFG']} "
-                  f"BASE={apd['BASE']} DevEn={apd.get('DeviceEn')} Prot={apd.get('Prot')}")
-            print(f"   {apd['reads']}")
-        stages, errs = {}, {}
         for e in last.get('log', []):
             stages[e['stage']] = stages.get(e['stage'], 0) + 1
             for k in ('STICKYERR', 'WDATAERR', 'STICKYORUN'):
                 if (e.get('after') or {}).get(k):
                     errs[k] = errs.get(k, 0) + 1
-        print(f"stages={stages}")
-        print(f"DP오류(STICKYERR=bit5 수정본)={errs or '없음'}")
-    print("---8<-------------------")
+
+    print(f"\n---8<---")
+    print(f"ok={len(ok)}/{a.sessions} DPIDR={(last or {}).get('DPIDR')} "
+          f"CTRL={((last or {}).get('CTRL') or {}).get('raw')}")
+    print("ERR " + (" ".join(f"{k}={v}" for k, v in sorted(errs.items()))
+                    if errs else "없음")
+          + "  stages=" + ",".join(f"{k}:{v}" for k, v in sorted(stages.items())))
+    # AP 별로 **읽은 값의 종류 수**만 낸다 — 1종이면 변화 없음
+    parts = []
+    for n, apd in ((last or {}).get('aps') or {}).items():
+        u = len(set(apd['reads'].values()))
+        parts.append(f"{n}:B={apd['BASE'][-1]}/u{u}")
+    print(" ".join(parts))
+    print("---8<---")
+
+    if a.full and last:
+        print(f"\n{'=' * 70}\n 상세\n{'=' * 70}")
+        if last.get('probe'):
+            print(f"  {last['probe']}")
+        for n, apd in (last.get('aps') or {}).items():
+            print(f"  {n} IDR={apd['IDR']} CSW={apd['CSW']} CFG={apd['CFG']} "
+                  f"BASE={apd['BASE']} DevEn={apd.get('DeviceEn')} Prot={apd.get('Prot')}")
+            for k, v in apd['reads'].items():
+                print(f"      {k} = {v}")
 
     if a.json:
         with open(a.json, 'w') as f:
