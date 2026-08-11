@@ -41,7 +41,15 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.5"
+VERSION = "standalone 2026-08-11.6  dmi 프리셋"
+
+# ★ APBAP3 앞 4워드에 내용이 있다 (유효 세션, DPIDR=0x6BA0009D):
+#     0x00=0x00040700  0x04=0x00000010  0x08=0x81592158  0x0C=0x000002C3
+#     0x10~0x1C = 0
+#   0x08 은 0x81xxxxxx 대역 — DM base(0x81480000/0x81481000)와 같은 계열이다.
+#   여기가 **DMI aperture** 라면(stride 4) dmstatus 는 바이트 0x44 다.
+#   우리는 0x0~0x1C 만 봤고 **그 자리를 아직 안 봤다.**
+#   → 'dmi' 프리셋으로 스펙상 의미 있는 오프셋만 골라 읽는다.
 
 # ★ 결과를 **손으로 옮겨 적는** 환경이다. 그래서 기본 출력을 3줄로 줄인다.
 #   전체가 필요하면 --full, 파일이 필요하면 --json.
@@ -64,6 +72,12 @@ CHAIN_TAP_ID = 0x5BA00477         # J-Link 에 선언하는 값
 AP_MAP = [("APBAP1", 0x10000, "APB-AP"), ("APBAP2", 0x20000, "APB-AP"),
           ("AXIAP1", 0x30000, "AXI-AP"), ("AHBAP1", 0x40000, "AHB-AP"),
           ("APBAP3", 0x50000, "APB-AP"), ("APBAP4", 0x60000, "APB-AP")]
+
+# RISC-V Debug Spec DMI 레지스터 (주소, 이름). 바이트 오프셋 = 주소 << 2
+DMI_REGS = [(0x10, 'dmcontrol'), (0x11, 'dmstatus'), (0x12, 'hartinfo'),
+            (0x16, 'abstractcs'), (0x17, 'command'), (0x1D, 'nextdm'),
+            (0x38, 'sbcs'), (0x04, 'data0')]
+DM_VER = {0: '없음', 1: '0.11', 2: '★0.13', 3: '★1.0'}
 
 DP_ABORT, DP_CTRL, DP_SELECT = 0, 1, 2
 OFF_CSW, OFF_TAR, OFF_DRW = 0xD00, 0xD04, 0xD0C
@@ -266,7 +280,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--device', default=DEVICE)
     ap.add_argument('--sessions', type=int, default=3)
-    ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044")
+    ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
+                    help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
     ap.add_argument('--ap', default=None,
                     help='이 AP 하나만 읽는다 (예: APBAP3). 기본은 6개 전부')
@@ -279,7 +294,13 @@ def main():
     if a.version:
         print(VERSION)
         return 0
-    a.addrs = [int(x, 0) for x in a.addrs.split(',') if x.strip()]
+    if a.addrs.strip() == 'dmi':
+        # RISC-V Debug Spec 의 DMI 주소 × stride 4
+        a.addrs = [d * 4 for d, _n in DMI_REGS]
+        a.dmi_mode = True
+    else:
+        a.addrs = [int(x, 0) for x in a.addrs.split(',') if x.strip()]
+        a.dmi_mode = False
     global CHAIN_TAP_ID, AP_MAP
     if a.tapid is not None:
         CHAIN_TAP_ID = a.tapid
@@ -326,7 +347,17 @@ def main():
     for n, apd in ((last or {}).get('aps') or {}).items():
         vs = sorted(set(apd['reads'].values()))
         if len(vs) > 1:
-            if len(AP_MAP) == 1:      # AP 하나만 볼 땐 주소별로 낸다
+            if getattr(a, 'dmi_mode', False):
+                names = {d * 4: nm for d, nm in DMI_REGS}
+                print(" ".join(
+                    f"{names.get(int(k, 16), k)}={v}"
+                    for k, v in apd['reads'].items()))
+                ds = apd['reads'].get(f"0x{0x11 * 4:08X}")
+                if ds and ds != '----':
+                    ver = int(ds, 16) & 0xF
+                    print(f"  dmstatus version={ver} ({DM_VER.get(ver, '무효')})"
+                          + ("   ★★★ DM 을 찾았다" if ver in (2, 3) else ""))
+            elif len(AP_MAP) == 1:      # AP 하나만 볼 땐 주소별로 낸다
                 print(" ".join(f"{k.replace('0x', '')}={v}"
                                 for k, v in apd['reads'].items()))
             else:
