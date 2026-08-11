@@ -21,6 +21,9 @@
 
 - 정상 `AttachOnly` 경로는 reset-release 루틴을 호출하지 않는다.
 - 해당 경로에는 AXI/APB target register write가 없다.
+- 전체 검색에서 `SYStem.Up`은 `DynUTLoad.cmm`에서만 발견됐고, 실제
+  `AttachOnly → Attach.cmm` 경로에서는 발견되지 않았다. 따라서 다른 제품·기능
+  경로의 `SYStem.Up`을 정상 attach의 선행 동작으로 사용하면 안 된다.
 - `Attach.cmm`에는 다음 주소 정의가 있지만, 정의 자체는 실제 쓰기의 증거가 아니다.
 
 ```cmm
@@ -43,7 +46,11 @@ T32가 실제 코어 enable 판정에 읽는 주소가 추가로 확인됐다.
 F/CM/QCore: CKG_RST=DATA.LONG(AXI:0x00C81040)
             코어 ID * 4 만큼 shift 후 bit 0 검사
 NCore:      CKG_RST=DATA.LONG(AXI:0x00C81044)
-공통:       bEnable=CKG_RST & 0x1
+HCore:      bEnable=1
+공통:       IF nCheckCOREID!=HCOREID
+                bEnable=CKG_RST & 0x1
+            IF bEnable==1
+                EnabledCoreBitmap |= bEnable << nCheckCOREID
 ```
 
 `AttachPrepare.cmm`의 `CHECK_CORE_ENABLE`:
@@ -52,6 +59,10 @@ NCore:      CKG_RST=DATA.LONG(AXI:0x00C81044)
 FCore:  CKG_RST=DATA.LONG(AXI:0x00C81024)   ; bit 0
 NCore:  CKG_RST=DATA.LONG(AXI:0x00C81028)   ; NCore0 bit 0, NCore1 bit 16
 CMCore: CKG_RST=DATA.LONG(AXI:0x00C8102C)   ; bit 0
+판정:   IF Core_ID==NCORE1ID
+            bEnable=(CKG_RST & 0x10000) >> 16
+        ELSE
+            bEnable=CKG_RST & 0x1
 ```
 
 `0xC81030` 사용은 없고, `0xC81024/28/2C`에 대한 `DATA.SET`도 발견되지 않았다.

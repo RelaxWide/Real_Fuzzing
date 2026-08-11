@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.3"
+VERSION = "standalone 2026-08-11.4"
 
 # ★ 결과를 **손으로 옮겨 적는** 환경이다. 그래서 기본 출력을 3줄로 줄인다.
 #   전체가 필요하면 --full, 파일이 필요하면 --json.
@@ -259,6 +259,8 @@ def main():
     ap.add_argument('--sessions', type=int, default=3)
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--ap', default=None,
+                    help='이 AP 하나만 읽는다 (예: APBAP3). 기본은 6개 전부')
     ap.add_argument('--tapid', type=lambda x: int(x, 0), default=None,
                     help='선언할 TAP IDCODE (기본: 실측값 0x6BA0009D)')
     ap.add_argument('--full', action='store_true',
@@ -269,13 +271,19 @@ def main():
         print(VERSION)
         return 0
     a.addrs = [int(x, 0) for x in a.addrs.split(',') if x.strip()]
-    global CHAIN_TAP_ID
+    global CHAIN_TAP_ID, AP_MAP
     if a.tapid is not None:
         CHAIN_TAP_ID = a.tapid
+    if a.ap:
+        names = [n for n, _b, _t in AP_MAP]
+        if a.ap not in names:
+            sys.exit(f"--ap 는 {names} 중 하나여야 한다")
+        AP_MAP = [x for x in AP_MAP if x[0] == a.ap]
 
     print(f"\n{'=' * 70}\n {VERSION}   ★ 단일 파일 · 읽기 전용\n{'=' * 70}")
     print(f"  device={a.device}  cJTAG mode={CJTAG_MODE}  {SPEED_KHZ}kHz")
     print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
+    print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
 
     runs = [session(a, i) for i in range(a.sessions)]
@@ -305,7 +313,11 @@ def main():
     for n, apd in ((last or {}).get('aps') or {}).items():
         vs = sorted(set(apd['reads'].values()))
         if len(vs) > 1:
-            print(f"{n}= " + ",".join(vs))
+            if len(AP_MAP) == 1:      # AP 하나만 볼 땐 주소별로 낸다
+                print(" ".join(f"{k.replace('0x', '')}={v}"
+                                for k, v in apd['reads'].items()))
+            else:
+                print(f"{n}= " + ",".join(vs))
     print("---8<---")
 
     if a.full and last:
