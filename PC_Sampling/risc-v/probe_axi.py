@@ -42,7 +42,14 @@ import time
 from sfe76_link import (require_api, Link, LinkError, AP_MAP,
                         add_common_args, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.28  연속 구간 덤프"
+VERSION = "2026-08-11.29  판정 문구 완화 (관측만 진술)"
+
+# ⚠ 판정 이름이 **원인을 단정**하고 있었다 (feedback 지적).
+#   같은 값이 나오는 원인은 여러 가지다: default slave / RAZ·security /
+#   reset·clock gate / reserved register / 실제로 같은 값.
+#   ⇒ 판정은 **관측만** 진술하고 원인은 미확정으로 남긴다.
+#     UNIFORM        → LOW_VARIATION
+#     PROT_NO_EFFECT → PROT_TESTED_NO_CHANGE
 
 # ★ Prot 은 원인이 아니었다(PROT_NO_EFFECT). 그리고 전송은 66/66 정상이다.
 #   ⇒ 읽은 값들은 진짜 데이터다. 그런데 우리는 그 영역을 **띄엄띄엄 몇 개만**
@@ -214,14 +221,16 @@ def window(a):
 
     print(f"\nv={VERSION.split()[0]}")
     print(f"고유값={len(uniq)} 구간={len(runs)}")
-    print("VERDICT:", "STRUCTURED" if len(uniq) > 2 else "UNIFORM")
+    print("VERDICT:", "STRUCTURED" if len(uniq) > 2 else "LOW_VARIATION")
     if len(uniq) > 2:
         print("  ★★★ **자리마다 값이 다르다 — 레지스터가 있다.**")
         print("     '아무것도 없다' 는 결론이 틀렸다. 배치를 우리가 몰랐던 것이다.")
         print("     구간 경계가 레지스터 경계를 알려준다.")
     else:
-        print("  전 구간이 사실상 같은 값 → 이 영역은 비어 있다.")
-        print("  다른 base 를 보거나(--win-base), 이 AP 가 아닌 것이다.")
+        print("  전 구간이 사실상 같은 값이다. **원인은 미확정이다** —")
+        print("  default slave / RAZ·security / reset·clock gate / reserved /")
+        print("  실제로 같은 값, 어느 것이든 이 모양이 된다.")
+        print("  '비어 있다' 고 단정하지 말 것. 다른 base·AP 도 볼 것.")
     return EXIT_OK
 
 
@@ -265,14 +274,16 @@ def prot_sweep(a, addrs):
         return EXIT_INSUFFICIENT
 
     print(f"\nv={VERSION.split()[0]}")
-    print("VERDICT:", "PROT_FOUND" if hits else "PROT_NO_EFFECT")
+    print("VERDICT:", "PROT_FOUND" if hits else "PROT_TESTED_NO_CHANGE")
     if hits:
         p = hits[0][0]
         print(f"  ★★★ Prot={'orig' if p is None else f'0x{p:02X}'} 에서 값이 나온다.")
         print("     접근 권한이 원인이었다. 이 Prot 으로 다른 도구도 맞춘다.")
     else:
-        print("  Prot 을 바꿔도 전부 같다 → 권한 문제가 아니다.")
-        print("  그 주소들이 이 AP 의 주소공간에 실제로 없다는 뜻에 가깝다.")
+        print("  시험한 Prot 후보가 결과를 바꾸지 않았다. **그뿐이다.**")
+        print("  ⚠ '권한 문제가 아니다' 는 결론은 성립하지 않는다 —")
+        print("     SDeviceEn / AP Type·Mode / firewall / debug authentication /")
+        print("     power·isolation 이 남아 있다.")
     return EXIT_OK if hits else EXIT_INSUFFICIENT
 
 
@@ -355,14 +366,17 @@ def main():
               + (f"   {label}" if label and not a.brief else ""))
 
     print(f"live={nlive}/{len(addrs)}")
-    print("VERDICT:", "AXI_READABLE" if nlive else "AXI_ALL_DEAD")
+    print("VERDICT:", "AXI_READABLE" if nlive else "AXI_NO_NONZERO")
     if nlive:
         print("  ★★★ **AXI-AP 로 실제 값이 읽힌다.**")
         print("     ⇒ 'AP 너머는 전부 죽어 있다' 는 결론이 틀렸다 — APB 만 죽어 있었다.")
         print("     ⇒ 리셋 컨트롤러 값으로 코어 리셋 상태를 판정할 수 있다.")
         print("     ⚠ 쓰기는 별도 판단이 필요하다. 동작 중인 SSD 를 리셋할 수 있다.")
     else:
-        print("  AXI 로도 전부 죽은 값 → APB 와 같은 상태. 가설을 다시 봐야 한다.")
+        print("  AXI 로 읽은 값이 전부 0/상수다. **원인은 미확정이다.**")
+        print("  ⚠ 이 레지스터들은 **write-only / self-clearing / 정상값 0** 일 수도 있다.")
+        print("     → T32 에서 값이 확인된 **read-only AXI 주소**를 positive control 로")
+        print("       하나 확보해야 경로 자체를 검증할 수 있다.")
     return EXIT_OK if nlive else EXIT_INSUFFICIENT
 
 

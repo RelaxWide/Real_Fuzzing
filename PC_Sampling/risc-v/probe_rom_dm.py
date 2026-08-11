@@ -63,7 +63,13 @@ import time
 from sfe76_link import (require_api, Link, LinkError, AP_MAP,
                         add_common_args, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.26  AXI 포함, 전송 단계 진단"
+VERSION = "2026-08-11.29  STICKYERR 비트 수정"
+
+# ★★ 치명적 버그였다 (feedback 2026-08-11 최신 리뷰 §1).
+#   `1 << 5 + 2` 는 파이썬 우선순위상 `1 << (5+2)` = `1 << 7` 이다.
+#   그래서 STICKYERR 와 WDATAERR 가 **같은 비트를 검사**했고,
+#   STICKYERR(bit5)는 한 번도 검사된 적이 없다.
+#   ⇒ "66회 전송 전부 DP 오류 없음" 은 **확정 사실로 쓸 수 없다.** 재측정한다.
 
 # ★ 이 도구는 만들어 놓고 **한 번도 안 돌렸다.** 지금 필요한 게 정확히 이것이다.
 #   APB 도 AXI 도 모든 주소가 버스 기본값으로 나온다. 그런데 우리는
@@ -124,10 +130,12 @@ class Probe:
         v = self.dp_r(DP_CTRL_STAT)
         if v is None:
             return {'ctrl': None}
-        return {'ctrl': f"0x{v:08X}",
-                'STICKYERR': bool(v & (1 << 5 + 2)), 'STICKYORUN': bool(v & (1 << 1)),
-                'WDATAERR': bool(v & (1 << 7)), 'READOK': bool(v & (1 << 6)),
-                'DBGACK': bool(v & (1 << 29))}
+        return {'ctrl': f"0x{v:08X}", 'raw': v,
+                'STICKYORUN': bool(v & (1 << 1)),     # bit1
+                'STICKYERR':  bool(v & (1 << 5)),     # ★ bit5 — 이전엔 bit7 을 봤다
+                'READOK':     bool(v & (1 << 6)),     # bit6
+                'WDATAERR':   bool(v & (1 << 7)),     # bit7
+                'DBGACK':     bool(v & (1 << 29))}
 
     def abort(self):
         ok = self.dp_w(DP_ABORT, 0x0000001E)
@@ -225,8 +233,10 @@ def run_session(a, idx):
                     ap['DeviceEn'] = bool(csw & (1 << 6))
                     ap['SDeviceEn'] = bool(csw & (1 << 23))
                     ap['Prot'] = f"0x{(csw >> 24) & 0x7F:02X}"
-                    ap['Type'] = csw & 0xF
                     ap['TrInProg'] = bool(csw & (1 << 7))
+                    # ⚠ 'Type' 은 뺐다 — CSW 하위비트를 Size 로도 해석하는 코드와
+                    #   충돌한다. ADIv6 CSW 필드를 공식 문서로 대조하기 전엔
+                    #   AP Type 판정 근거로 쓰지 않는다.
 
                 ap['rom'] = {}
                 for off in ROM_ADDRS:

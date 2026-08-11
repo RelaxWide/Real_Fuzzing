@@ -5,6 +5,109 @@
 > 목적: 현재 접근 방향이 맞는지 검토하고, 다음 작업자가 바로 이어서 판단할 수 있도록
 > 실측 사실과 권장 순서를 분리해 기록한다.
 
+## 최신 리뷰 — 2026-08-11: manual chain 문제는 진전됐지만 DM 연결은 아직 미해결
+
+> 이 절이 아래의 과거 판단보다 우선한다. manual chain 선언 위치와
+> `JTAG_AllowTAPReset` 문제는 바로잡혔고, 잘못된 DTM 자동 인식도 사라졌다.
+> 그러나 현재 증거는 J-Link가 유효한 RISC-V Debug Module에 연결됐다는 뜻이
+> 아니다. 자체 조사를 종료하기 전에 측정 코드의 오류 판정부터 바로잡아야 한다.
+
+### 1. Critical issues
+
+#### `probe_rom_dm.py`가 STICKYERR 비트를 잘못 검사한다
+
+현재 `err()`에는 다음 코드가 있다.
+
+```python
+'STICKYERR': bool(v & (1 << 5 + 2)),
+'WDATAERR':  bool(v & (1 << 7)),
+```
+
+파이썬에서 `1 << 5 + 2`는 `1 << (5 + 2)`, 즉 `1 << 7`이다. 따라서
+`STICKYERR`와 `WDATAERR`가 같은 비트를 검사한다. STICKYERR는 DP CTRL/STAT의
+bit 5이므로 다음과 같이 고쳐야 한다.
+
+```python
+'STICKYERR': bool(v & (1 << 5)),
+```
+
+이 오류를 고치고 다시 측정하기 전에는 STATUS의 "66회 전송 모두 DP 오류 없음"을
+확정 사실로 사용하면 안 된다. 수정 후 최소 3개 독립 세션에서 각 전송 전후의 raw
+CTRL/STAT 값도 JSON에 남겨 재현성을 확인해야 한다.
+
+#### 아직 유효한 DM을 읽었다고 볼 수 없다
+
+`CoreBase=0x81480000`에서 얻은 low nibble `0xE`는 유효한 Debug Module version이
+아니다. 현재 확인된 것은 **J-Link가 후보 주소 접근을 시도했다**는 데까지다.
+"J-Link가 DM을 읽었다"거나 주소가 맞다고 표현하면 증거보다 강한 결론이 된다.
+
+### 2. Potential bugs / 과도한 해석
+
+- `probe_axi.py`는 고유값이 2개 이하이면 `UNIFORM`으로 판정한 뒤 "영역이 비어
+  있다"고 출력한다. 균일한 값은 default slave, RAZ/security, reset·clock gate,
+  reserved register 또는 실제 동일값일 수도 있다. 판정명은 `LOW_VARIATION`처럼
+  관측만 나타내고, 원인은 미확정으로 남겨야 한다.
+- `PROT_NO_EFFECT`는 시험한 CSW.Prot 후보가 결과를 바꾸지 않았다는 뜻뿐이다.
+  `SDeviceEn`, AP Type/Mode, firewall, debug authentication, power/isolation 등이
+  남으므로 "권한 문제가 아니다"라고 결론 내리면 안 된다.
+- `probe_rom_dm.py`의 `Type = csw & 0xF`는 같은 하위 비트를 Size로도 해석하는
+  코드와 충돌한다. ADIv6 CSW 필드 정의를 공식 문서와 대조하기 전까지 AP Type
+  판정 근거로 쓰지 않는다.
+- 수동 TAP ID가 로그에 나타난 것은 J-Link가 선언한 체인을 받아들였다는 뜻이다.
+  그것만으로 실리콘에서 TAP ID를 실제 검출했다고 간주하면 안 된다. 물리 계층의
+  근거는 별도의 raw DPIDR/AP 응답과 구분해 기록한다.
+- `SYStem.DOWN/UP`은 T32 디버거 상태 전환이며, 그 자체가 하드웨어 reset 실행의
+  증거는 아니다. `resetmode.ndmrst`도 reset 방법 설정이지 해당 경로가 실제
+  수행됐다는 증거가 아니다.
+
+### 3. Reliability improvements / 다음 조사 순서
+
+1. `probe_rom_dm.py`의 STICKYERR 디코더를 수정하고 3회 재측정한다. 각 세션에서
+   raw CTRL/STAT, ABORT 전후 값과 주소별 결과를 보존한다.
+2. AXI `0xC81040/0xC81044`가 0이라는 사실만으로 AXI-AP가 죽었다고 판단하지
+   않는다. 이 레지스터는 write-only, self-clearing 또는 정상값 0일 수 있다.
+   T32에서 읽었을 때 기대값이 알려진 **안전한 read-only AXI 주소**를 하나 찾아
+   positive control로 사용한다.
+3. T32 파일에서는 무제한으로 전부 해체하지 말고 아래 사실만 제한적으로 찾는다.
+   - reset-release 레이블을 호출하는 `GOSUB`/`DO` 경로
+   - 정상 `AttachOnly` 또는 HCore `SYS.UP` 경로가 그 루틴을 실행하는지
+   - T32의 `AXI:`가 `AXIAP1.Base DP:0x30000`에 매핑된다는 설정
+   - 정상 타깃에서 값이 확인된 `Data.Long`/`Data.Dump AXI:` 읽기 주소
+4. reset-release 루틴이 정상 attach에서 호출되지 않고 복구/수동 메뉴에만
+   존재한다면 reset 미해제 가설의 우선순위를 낮춘다.
+5. 오류 디코더 수정 후에도 필요하면 APB component 후보의 4 KiB 범위만 제한해
+   read-only 스캔한다. broad scan과 reset-control write는 하지 않는다.
+
+실제 장치는 NVMe로 보이는 상태이므로 `0xC81040/0xC81044` 등 reset-control 후보에
+대한 쓰기는 사용자의 명시적 승인, 복구 절차 및 데이터 손실 허용 조건 없이는
+수행하지 않는다.
+
+### 4. Suggested tests
+
+- `err()` 단위 테스트: CTRL/STAT bit 5만 세운 값에서 STICKYERR만 `True`, bit 7만
+  세운 값에서 WDATAERR만 `True`인지 확인한다.
+- raw 결과 재현성: 독립 J-Link 세션 3회에서 DPIDR, AP IDR/BASE, CTRL/STAT를
+  비교하고 첫 시도/두 번째 시도의 차이도 보존한다.
+- AXI positive control: T32에서 정상적으로 읽히고 예상값이 알려진 read-only
+  주소를 동일 AP 설정의 Python으로 읽어 경로 자체를 검증한다.
+- 판정 문구 테스트: 동일값 결과가 `empty`, `dead`, `permission ruled out` 같은
+  확정 원인으로 출력되지 않는지 확인한다.
+- T32 경로 테스트: `AttachOnly -> Attach.cmm -> HCore SYS.UP`의 호출 그래프와
+  reset-release 루틴의 연결 여부를 문서화한다.
+
+### 현재 결론
+
+manual chain 구성 문제를 해결하고 DTM 오인식을 제거한 것은 실질적인 진전이다.
+APB ROM table과 raw DP/AP 응답도 유용한 증거다. 하지만 현재 작업은 **유효한 DM
+응답을 얻지 못해 operationally blocked** 상태이며, 코드 커버리지 수집은 아직
+실행 가능 상태가 아니다. 그렇다고 자체 조사가 완전히 소진된 것도 아니다.
+
+우선 STICKYERR 오류 수정, AXI positive control, T32 정상 attach의 reset-release
+호출 여부까지 확인한다. 이후에도 결과가 같고 SoC 설계 문서나 담당자 접점이 없다면
+그 시점에는 DM 위치·reset/clock/security 조건에 관한 내부 설계 정보가 필요하다고
+판정하는 것이 타당하다. J-Link 기반 Nexus trace coverage의 개념적 가능성은 남아
+있지만, 현재는 연결 선행조건을 충족하지 못했다.
+
 ## 최우선 정정 — 2026-08-11: manual JTAG chain 시험은 소진되지 않았다
 
 > 이 절이 아래의 모든 과거 판단보다 우선한다. "SEGGER 문의 외에는 더 할 수
