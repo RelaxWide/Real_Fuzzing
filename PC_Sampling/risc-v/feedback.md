@@ -5,6 +5,130 @@
 > 목적: 현재 접근 방향이 맞는지 검토하고, 다음 작업자가 바로 이어서 판단할 수 있도록
 > 실측 사실과 권장 순서를 분리해 기록한다.
 
+## 최신 추가 피드백 — 2026-08-11: T32 조사는 소진, AXI 시험 주소를 바로잡아야 한다
+
+> 이 절이 아래의 AXI/reset 관련 과거 판단보다 우선한다. 추가로 확인한 T32
+> 스크립트에는 정상 attach가 호출하는 reset-release나 unlock 쓰기 시퀀스가 없다.
+> 대신 기존 J-Link AXI 시험이 T32가 실제 판정에 사용하는 핵심 주소를 빠뜨렸다는
+> 사실이 확인됐다. 따라서 CMM을 더 넓게 조사하지 말고, 측정 주소와 판정기를
+> 바로잡아 한 번의 제한된 read-only 시험으로 다음 방향을 가른다.
+
+### 1. Critical issues
+
+#### 정상 attach가 reset-release를 호출한다는 근거가 없다
+
+확인 결과:
+
+- 정상 `AttachOnly` 경로는 reset-release 루틴을 호출하지 않는다.
+- 해당 경로에는 AXI/APB target register write가 없다.
+- `Attach.cmm`에는 다음 주소 정의가 있지만, 정의 자체는 실제 쓰기의 증거가 아니다.
+
+```cmm
+&LldCLKRST_MPCORE_Addr=0x00C81040
+&LldCLKRST_NCORE_Addr=0x00C81044
+```
+
+따라서 `0xC81040/44`에 T32의 reset-release 값을 J-Link로 따라 쓰는 방향은
+근거가 없고 위험하다. 현재 동작 중인 SSD에 대한 reset-control write 금지는
+그대로 유지한다. reset/clock 가설은 완전히 배제되지는 않지만, 정상 attach 호출
+증거가 없으므로 최우선 가설에서 내린다.
+
+#### 기존 AXI `live 0/10` 시험은 결정적이지 않다
+
+T32가 실제 코어 enable 판정에 읽는 주소가 추가로 확인됐다.
+
+`AllCoreAnalysis.cmm`의 `SET_CORE_ENABLE_BITMAP`:
+
+```cmm
+F/CM/QCore: CKG_RST=DATA.LONG(AXI:0x00C81040)
+            코어 ID * 4 만큼 shift 후 bit 0 검사
+NCore:      CKG_RST=DATA.LONG(AXI:0x00C81044)
+공통:       bEnable=CKG_RST & 0x1
+```
+
+`AttachPrepare.cmm`의 `CHECK_CORE_ENABLE`:
+
+```cmm
+FCore:  CKG_RST=DATA.LONG(AXI:0x00C81024)   ; bit 0
+NCore:  CKG_RST=DATA.LONG(AXI:0x00C81028)   ; NCore0 bit 0, NCore1 bit 16
+CMCore: CKG_RST=DATA.LONG(AXI:0x00C8102C)   ; bit 0
+```
+
+`0xC81030` 사용은 없고, `0xC81024/28/2C`에 대한 `DATA.SET`도 발견되지 않았다.
+이 세 주소는 CMM에서 상태 판정용으로 읽히는 가장 좋은 read-only 후보이다.
+
+그런데 현재 `probe_axi.py`는 `0xC81020`, `0xC81030` 등 주변 주소는 읽으면서
+정작 `0xC81024`, `0xC81028`, `0xC8102C`는 읽지 않았다. 따라서 기존 결과만으로
+"AXI-AP 전체가 죽었다"거나 "그 버스에 닿지 않는다"고 결론 내리면 안 된다.
+
+### 2. Potential bugs / 해석 한계
+
+- `0xC81040/44`는 `DATA.LONG()`으로 실제 읽히므로 단순 write-only라고 볼 수 없다.
+  다만 보조 코어가 disabled라면 정상값도 0일 수 있으므로, J-Link가 0을 읽었다는
+  사실만으로 AXI 성공 또는 실패를 가를 수 없다.
+- `0xC81024/28/2C`도 enable된 코어가 무엇인지 모르면 값 0의 의미가 모호하다.
+  HCore는 T32 코드가 AXI를 읽지 않고 무조건 enabled로 처리하므로 positive
+  control로 사용할 수 없다.
+- 두 루틴의 주소 차이는 값의 모순이 아니다. 하나는 MPCore/NCore의 집계된
+  clock/reset bitmap을, 다른 하나는 코어별 enable 상태를 보는 구조일 수 있다.
+  정확한 레지스터 의미는 SoC 사양 없이 더 단정하지 않는다.
+- `AttachPrepare.cmm`은 `PrepareDump+Attach` 경로에서 `Attach.cmm`보다 먼저
+  실행된다. 따라서 T32가 CPU attach 전에 AXI 상태 읽기를 사용하도록 작성된
+  것은 맞지만, 실제 타깃에서 어떤 값을 얻었는지는 CMM만으로 알 수 없다.
+
+### 3. Reliability improvements / 다음 한 번의 작업
+
+T32 CMM 추가 조사는 여기서 종료한다. 현재 제공된 스크립트에서 J-Link로 옮길
+별도의 reset-release, unlock 또는 target-register 초기화 시퀀스는 확인되지 않았다.
+숨은 선행 동작이 있다면 TRACE32 SF-E76 CPU 드라이버 내부이거나 SoC 설계 정보에
+있는 내용이다.
+
+다음 코드 작업은 새 스위퍼를 만드는 것이 아니라 아래 두 진단기를 정정하는 것이다.
+
+1. `probe_rom_dm.py`가 STICKYERR/WDATAERR/STICKYORUN, TAR mismatch,
+   DRW failure를 실제 verdict에 반영하도록 한다. 오류가 있으면 `stage=ok` 및
+   `ROM_CONFIRMED_*` 판정을 금지한다.
+2. `probe_axi.py`의 우선 주소를 다음 다섯 개로 한정한다.
+
+```text
+0xC81024  FCore enable bit 0
+0xC81028  NCore0 bit 0 / NCore1 bit 16
+0xC8102C  CMCore enable bit 0
+0xC81040  MPCore clock/reset bitmap
+0xC81044  NCore clock/reset bitmap
+```
+
+3. target MMIO에는 쓰지 않고 DP/AP의 CSW/TAR/ABORT만 사용하는 read-only
+   3세션 시험을 수행한다. raw CTRL/STAT과 주소별 값을 JSON에 보존한다.
+
+### 4. Suggested tests와 결과 해석
+
+| 결과 | 해석과 다음 단계 |
+|---|---|
+| STICKYERR/WDATAERR 발생 | J-Link AXI MEM-AP 전송 절차 또는 접근 속성 문제. 값 해석을 중단하고 AP 전송 코드부터 수정 |
+| `0x24/28/2C`에서 의미 있는 nonzero/서로 다른 값 | AXI-AP 경로는 살아 있음. reset-release 추종을 중단하고 APB DM 영역의 mapping/security/reset 조건으로 이동 |
+| 다섯 주소가 모두 0이고 DP/AP 오류 없음 | 정상 disabled 값인지 RAZ/security인지 구분 불가. CMM으로 더 못 좁힘. SoC 레지스터 사양 또는 실제 T32 측정값 필요 |
+| `0x40/44`만 의미 있는 값 | AXI 전송은 동작하며 상태/제어 레지스터 배치 해석이 다른 것. 실제 enable bit와 대조 |
+| 세션 간 값 또는 오류 상태 불일치 | 확정 판정 금지. 세션 유효성 및 연결 상태 의존성부터 재검토 |
+
+단위 테스트에서는 sticky error가 포함된 전송이 `ok`나 `ROM_CONFIRMED_*`로
+분류되지 않는지, TAR mismatch와 ABORT 후 오류 미해제가 확정 판정을 막는지
+검증한다.
+
+### 현재 결론
+
+이번 T32 정보만으로 J-Link 연결이 해결되는 것은 아니다. 실질적으로 얻은 것은
+두 가지다.
+
+1. 정상 attach가 reset-release 쓰기를 수행한다는 근거가 없어 위험한 reset write를
+   따라 할 이유가 사라졌다.
+2. 기존 AXI 실패 시험이 T32의 실제 판정 주소를 누락했으므로 결정적이지 않았고,
+   다시 읽어야 할 정확한 주소 다섯 개가 정해졌다.
+
+이 제한 시험까지 모두 0·무오류라면 더 많은 CMM 검색이나 주소 스윕으로 해결할
+단계가 아니다. 그때 필요한 것은 `0xC81024/28/2C/40/44`의 설계상 정상값,
+AXI-AP 접근 속성, debug firewall/authentication 및 DM reset/clock 조건이다.
+
 ## 최신 리뷰 — 2026-08-11: manual chain 문제는 진전됐지만 DM 연결은 아직 미해결
 
 > 이 절이 아래의 과거 판단보다 우선한다. manual chain 선언 위치와

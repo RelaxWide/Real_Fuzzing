@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.2"
+VERSION = "standalone 2026-08-11.3"
 
 # ★ 결과를 **손으로 옮겨 적는** 환경이다. 그래서 기본 출력을 3줄로 줄인다.
 #   전체가 필요하면 --full, 파일이 필요하면 --json.
@@ -51,7 +51,11 @@ VERSION = "standalone 2026-08-11.2"
 #     ③ AP 별로 읽은 값이 **몇 종류**인가 (1종 = 변화 없음)
 
 TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE = 7, 10000, 1, 'E76'
-CHAIN_TAP_ID = 0x5BA00477
+# ★ 실측으로 읽은 이 칩의 TAP IDCODE. part=0xBA00 = ARM CoreSight DAP 계열.
+#   자동 검출이 읽던 0x00000001 은 스캔 실패였지 칩의 값이 아니었다.
+#   (0x11013913 은 DPIDR 레지스터로 다른 것이다 — 둘 다 참일 수 있다)
+REAL_TAP_ID = 0x6BA0009D
+CHAIN_TAP_ID = REAL_TAP_ID
 
 AP_MAP = [("APBAP1", 0x10000, "APB-AP"), ("APBAP2", 0x20000, "APB-AP"),
           ("AXIAP1", 0x30000, "AXI-AP"), ("AHBAP1", 0x40000, "AHB-AP"),
@@ -255,6 +259,8 @@ def main():
     ap.add_argument('--sessions', type=int, default=3)
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--tapid', type=lambda x: int(x, 0), default=None,
+                    help='선언할 TAP IDCODE (기본: 실측값 0x6BA0009D)')
     ap.add_argument('--full', action='store_true',
                     help='AP 별 상세까지 전부 출력 (기본은 3줄 요약)')
     ap.add_argument('--version', action='store_true')
@@ -263,6 +269,9 @@ def main():
         print(VERSION)
         return 0
     a.addrs = [int(x, 0) for x in a.addrs.split(',') if x.strip()]
+    global CHAIN_TAP_ID
+    if a.tapid is not None:
+        CHAIN_TAP_ID = a.tapid
 
     print(f"\n{'=' * 70}\n {VERSION}   ★ 단일 파일 · 읽기 전용\n{'=' * 70}")
     print(f"  device={a.device}  cJTAG mode={CJTAG_MODE}  {SPEED_KHZ}kHz")
@@ -293,6 +302,10 @@ def main():
         u = len(set(apd['reads'].values()))
         parts.append(f"{n}:B={apd['BASE'][-1]}/u{u}")
     print(" ".join(parts))
+    for n, apd in ((last or {}).get('aps') or {}).items():
+        vs = sorted(set(apd['reads'].values()))
+        if len(vs) > 1:
+            print(f"{n}= " + ",".join(vs))
     print("---8<---")
 
     if a.full and last:
