@@ -436,6 +436,41 @@ CONTROL_ADDRS = [
     (0x0021BFFC, '[양성대조] 펌웨어 코드 끝 (0x21BFFF)'),
 ]
 
+# ★★ DM 후보 영역 — 2026-08-11 실측에서 나온 ROM 엔트리가 가리키는 곳
+#   APBAP1 @0x0 = 0x81480003, APBAP2 @0x0 = 0x81481003.
+#   bit0=present, bit1=32비트 포맷, 상위 20비트 = 컴포넌트 오프셋
+#   → 각 APB-AP 의 주소공간 0 번지에 **ROM 테이블**이 있고, 그 첫 엔트리가
+#     T32 의 COREDEBUG.Base 를 정확히 가리킨다. 우연일 수 없다.
+#   여기서는 그 컴포넌트를 직접 읽어 **정말 거기 있는지** 확인한다.
+DM_PROBE_BASE = 0x81480000
+DM_ADDRS = [
+    (DM_PROBE_BASE + 0xFF0, 'CIDR0  기대 0x0D'),
+    (DM_PROBE_BASE + 0xFF4, 'CIDR1  기대 하위니블 0x0'),
+    (DM_PROBE_BASE + 0xFF8, 'CIDR2  기대 0x05'),
+    (DM_PROBE_BASE + 0xFFC, 'CIDR3  기대 0xB1'),
+    (DM_PROBE_BASE + 0xFE0, 'PIDR0'),
+    (DM_PROBE_BASE + 0xFE4, 'PIDR1'),
+    (DM_PROBE_BASE + 0x040, 'dmcontrol?  (dmi 0x10 << 2)'),
+    (DM_PROBE_BASE + 0x044, 'dmstatus?   (dmi 0x11 << 2)'),
+    (DM_PROBE_BASE + 0x0E0, 'sbcs?       (dmi 0x38 << 2)'),
+    (DM_PROBE_BASE + 0x010, 'dmcontrol?  (stride 1)'),
+    (DM_PROBE_BASE + 0x011, 'dmstatus?   (stride 1)'),
+    (DM_PROBE_BASE + 0x000, '컴포넌트 base'),
+]
+
+
+def check_cidr(vals):
+    """CoreSight 컴포넌트면 CIDR 이 0x0D / 0x_0 / 0x05 / 0xB1 이다."""
+    g = [vals.get(DM_PROBE_BASE + o) for o in (0xFF0, 0xFF4, 0xFF8, 0xFFC)]
+    if any(v is None for v in g):
+        return None
+    ok = ((g[0] & 0xFF) == 0x0D and (g[1] & 0x0F) == 0x00
+          and (g[2] & 0xFF) == 0x05 and (g[3] & 0xFF) == 0xB1)
+    klass = (g[1] >> 4) & 0xF
+    return {'ok': ok, 'class': klass,
+            'raw': [f"0x{v:08X}" for v in g]}
+
+
 # T32 ViewNexusTracedump.cmm 실물에서 온 트레이스 블록 주소
 TRACE_ADDRS = [
     (0xFD000000, 'NEXUS.0 TE  (hcore/hart0)'),
@@ -631,6 +666,12 @@ def one_session(a):
                     lst = CONTROL_ADDRS + TRACE_ADDRS   # 양성 대조를 **먼저**
                 elif k == 'fw':
                     lst = CONTROL_ADDRS
+                elif k == 'dm':
+                    lst = DM_ADDRS
+                elif k == 'rom':
+                    lst = [(0x0, 'ROM 엔트리0'), (0x4, 'ROM 엔트리1'),
+                           (0x8, 'ROM 엔트리2'), (0xC, 'ROM 엔트리3'),
+                           (0xFF0, 'ROM CIDR0'), (0xFFC, 'ROM CIDR3')]
                 else:
                     lst = [(int(x, 0), '') for x in a.addrs.split(',') if x.strip()]
                 out['addr_res'] = read_addrs(dap, usable, lst)
