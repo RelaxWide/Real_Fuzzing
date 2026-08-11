@@ -49,7 +49,7 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.19  manual chain v2 (AllowTAPReset 정정)"
+VERSION = "2026-08-11.20  v2 진단 출력"
 
 # ★★ 치명적 정정 (feedback 2026-08-11 최우선 절)
 #   JTAG_AllowTAPReset 을 **반대로** 썼다. SEGGER 공식 정의:
@@ -218,8 +218,16 @@ def run_one(a):
     except Exception as e:
         rec['error'] = str(e)[:120]
     finally:
-        rec['script_ran'] = any(MARKER in l for l in logs)
+        blob = "\n".join(logs)
+        low = blob.lower()
+        rec['script_ran'] = MARKER in blob
         rec['log_lines'] = len(logs)
+        # ★ 진단 3종 — 이것만 보면 다음 수가 정해진다
+        rec['chain_detect'] = ('chain detection' in low)   # 자동 검출이 아직 도는가
+        import re as _re
+        m = _re.search(r'Id:\s*(0x[0-9A-Fa-f]{8})', blob)
+        rec['idcode'] = m.group(1) if m else None
+        rec['dtm'] = ('jtag-dtm' in low or 'dtm setup' in low)
         try:
             jl.close()
         except Exception:
@@ -276,31 +284,39 @@ def v2(a):
 
     out = []
     for form in forms:
-        ok = tgt = ran = 0
+        ok = tgt = ran = cd = dtm = 0
         errs, ids = set(), set()
         for _ in range(a.reps):
             r = spawn('BaseAddr', 0, 0x0, 'E76', 0, a.tries, CHAIN_TAP_ID, form)
             ran += bool(r.get('script_ran'))
             ok += bool(r.get('connect'))
             tgt += (r.get('target_connected') is True)
+            cd += bool(r.get('chain_detect'))
+            dtm += bool(r.get('dtm'))
+            if r.get('idcode'):
+                ids.add(r['idcode'])
             if r.get('error'):
-                errs.add(str(r['error'])[:60])
-            for l in (r.get('loglines') or []):
-                ids.add(l[:70])
+                errs.add(str(r['error'])[:70])
             time.sleep(0.3)
-        out.append((form, ran, ok, tgt))
-        print(f"  [{form:10s}] script실행={ran}/{a.reps}  connect={ok}/{a.reps}  "
+        errs, ids = sorted(errs), sorted(ids)
+        out.append((form, ran, ok, tgt, cd, dtm, errs, ids))
+        print(f"  [{form:10s}] script={ran}/{a.reps} connect={ok}/{a.reps} "
               f"**target={tgt}/{a.reps}**")
-        for e in sorted(errs)[:2]:
-            print(f"      {e}")
-        for l in sorted(ids)[:3]:
-            print(f"      log: {l}")
+        print(f"      자동검출 여전히 돎 = {cd}/{a.reps}"
+              f"   DTM오인 = {dtm}/{a.reps}   로그 IDCODE = {ids or '없음'}")
+        for e in errs[:2]:
+            print(f"      err: {e}")
 
     print(f"\nv={VERSION.split()[0]}  reps={a.reps}")
-    for form, ran, ok, tgt in out:
-        print(f"form={form} script={ran}/{a.reps} connect={ok}/{a.reps} target={tgt}/{a.reps}")
-    hit = [f for f, _r, _o, t in out if t > 0]
-    noscript = all(r == 0 for _f, r, _o, _t in out)
+    for form, ran, ok, tgt, cd, dtm, errs, ids in out:
+        print(f"form={form} script={ran}/{a.reps} connect={ok}/{a.reps} "
+              f"target={tgt}/{a.reps} autodetect={cd}/{a.reps} dtm={dtm}/{a.reps} "
+              f"id={','.join(ids) or '-'}")
+        if errs:
+            print(f"  err[{form}]: {errs[0]}")
+    hit = [f for f, _r, _o, t, *_ in out if t > 0]
+    noscript = all(r == 0 for _f, r, *_ in out)
+    still_auto = any(row[4] > 0 for row in out)
     print("VERDICT:", "TARGET_CONNECTED" if hit else
           ("SCRIPT_NOT_LOADED" if noscript else "STILL_NO_TARGET"))
     if hit:
@@ -309,7 +325,11 @@ def v2(a):
         print("  스크립트가 안 돌았다 — 전역 이름이 거부됐을 수 있다. 로그 확인.")
     else:
         print("  스크립트는 돌았는데 여전히 타깃 미연결.")
-        print("  → 이제서야 '손잡이를 다 돌렸다' 고 말할 수 있다. ASK.md 로.")
+        if still_auto:
+            print("  ⚠ **자동 검출이 아직 돈다** — AllowTAPReset=1 이 안 먹었다는 뜻이다.")
+            print("     전역 이름/훅 위치를 다시 봐야 한다. 아직 끝이 아니다.")
+        else:
+            print("  ✅ 자동 검출은 꺼졌다. 그 위에서 실패한다 → err 문구가 다음 단서.")
     return EXIT_OK if hit else EXIT_INSUFFICIENT
 
 
