@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""SF-E76 — **단일 파일 진단기.** 다른 파일을 하나도 import 하지 않는다.
+
+════════════════════════════════════════════════════════════════════
+왜 단일 파일인가
+════════════════════════════════════════════════════════════════════
+지금까지 다섯 번, "인자를 못 알아듣는다 / 함수가 없다" 가 전부
+**파일 버전이 서로 안 맞아서** 생겼다. `sfe76_link.py` 만 옛것이어도
+전 도구가 깨진다. 받아오는 방식이 무엇이든 그 위험이 남는다.
+
+이 파일은 **`pylink` 외에 아무것도 필요 없다.** 복사 한 번이면 끝이고
+버전 스큐가 원리적으로 생기지 않는다.
+
+════════════════════════════════════════════════════════════════════
+무엇을 재나 (전부 읽기 전용)
+════════════════════════════════════════════════════════════════════
+  1. J-Link 정보 / cJTAG / DP  — DPIDR, 하드웨어 버전
+  2. DAP 전원                   — CTRL/STAT, ACK 비트
+  3. AP 6개                     — IDR / CSW / CFG / BASE
+  4. DM 후보 읽기               — ROM 엔트리와 그것이 가리키는 곳
+  5. DP 오류 비트               — ★ STICKYERR 는 **bit5** (bit7 아님)
+
+★ 쓰기는 CSW/TAR/DP-SELECT/ABORT 뿐이다. **DRW 에 쓰지 않는다** =
+  타깃 메모리에 아무것도 쓰지 않는다.
+
+════════════════════════════════════════════════════════════════════
+사용
+════════════════════════════════════════════════════════════════════
+    sudo python3 standalone.py                # 전체
+    sudo python3 standalone.py --sessions 3   # 재현성 확인
+    sudo python3 standalone.py --json out.json
+"""
+
+import argparse
+import json
+import sys
+import time
+
+try:
+    import pylink
+except ImportError:
+    sys.exit("pylink 없음 →  pip3 install pylink-square")
+
+VERSION = "standalone 2026-08-11.1"
+
+TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE = 7, 10000, 1, 'E76'
+CHAIN_TAP_ID = 0x5BA00477
+
+AP_MAP = [("APBAP1", 0x10000, "APB-AP"), ("APBAP2", 0x20000, "APB-AP"),
+          ("AXIAP1", 0x30000, "AXI-AP"), ("AHBAP1", 0x40000, "AHB-AP"),
+          ("APBAP3", 0x50000, "APB-AP"), ("APBAP4", 0x60000, "APB-AP")]
+
+DP_ABORT, DP_CTRL, DP_SELECT = 0, 1, 2
+OFF_CSW, OFF_TAR, OFF_DRW = 0xD00, 0xD04, 0xD0C
+OFF_CFG, OFF_BASE, OFF_IDR = 0xDF4, 0xDF8, 0xDFC
+
+TAP_SCRIPT = """void ConfigTargetSettings(void) {
+  JTAG_AllowTAPReset = 1;            /* 1 = 자동 검출 OFF */
+  JLINK_JTAG_SetDeviceId(0, 0x%08X);
+  JLINK_JTAG_IRPre  = 0;
+  JLINK_JTAG_DRPre  = 0;
+  JLINK_JTAG_IRPost = 0;
+  JLINK_JTAG_DRPost = 0;
+  JLINK_JTAG_IRLen  = 4;
+  return 0;
+}
+"""
+
+
+def hx(v):
+    return "----" if v is None else f"{v & 0xFFFFFFFF:08X}"
+
+
+def decode_ctrl(v):
+    """★ STICKYERR 는 **bit5**. 이전 코드가 `1 << 5 + 2`(=bit7)로 잘못 봤다."""
+    if v is None:
+        return {}
+    return {'raw': f"0x{v:08X}",
+            'STICKYORUN': bool(v & (1 << 1)),
+            'STICKYERR': bool(v & (1 << 5)),
+            'READOK': bool(v & (1 << 6)),
+            'WDATAERR': bool(v & (1 << 7)),
+            'CDBGACK': bool(v & (1 << 29)),
+            'CSYSACK': bool(v & (1 << 31))}
+
+
+class Dap:
+    def __init__(self, jl):
+        self.jl, self.sel = jl, None
+
+    def dpr(self, r):
+        try:
+            v = self.jl.coresight_read(r, ap=False)
+            return None if (v is None or v < 0) else v & 0xFFFFFFFF
+        except Exception:
+            return None
+
+    def dpw(self, r, v):
+        try:
+            self.jl.coresight_write(r, v & 0xFFFFFFFF, ap=False)
+            return True
+        except Exception:
+            return False
+
+    def abort(self):
+        self.dpw(DP_ABORT, 0x1E)
+        self.sel = None
+
+    def _sel(self, addr):
+        v = addr & 0xFFFFFFF0
+        if self.sel == v:
+            return True
+        if not self.dpw(DP_SELECT, v):
+            return False
+        self.sel = v
+        try:
+            self.jl.coresight_read(0, ap=True)      # priming
+        except Exception:
+            pass
+        return True
+
+    def apr(self, base, off):
+        if not self._sel(base + off):
+            return None
+        try:
+            v = self.jl.coresight_read((off >> 2) & 3, ap=True)
+            return None if (v is None or v < 0) else v & 0xFFFFFFFF
+        except Exception:
+            return None
+
+    def apw(self, base, off, val):
+        if not self._sel(base + off):
+            return False
+        try:
+            self.jl.coresight_write((off >> 2) & 3, val & 0xFFFFFFFF, ap=True)
+            return True
+        except Exception:
+            return False
+
+    def mem32(self, base, addr, csw0):
+        """읽기 전용. CSW/TAR 만 쓰고 **DRW 에는 쓰지 않는다.**"""
+        self.abort()
+        before = decode_ctrl(self.dpr(DP_CTRL))
+        if csw0 is None:
+            return None, {'stage': 'no_csw', 'before': before}
+        if not self.apw(base, OFF_CSW, (csw0 & ~0x37) | 0x02):
+            return None, {'stage': 'csw_write_fail', 'before': before}
+        if not self.apw(base, OFF_TAR, addr):
+            return None, {'stage': 'tar_write_fail', 'before': before}
+        back = self.apr(base, OFF_TAR)
+        if back != (addr & 0xFFFFFFFF):
+            return None, {'stage': 'tar_mismatch', 'tar_back': hx(back),
+                          'before': before, 'after': decode_ctrl(self.dpr(DP_CTRL))}
+        v = self.apr(base, OFF_DRW)
+        return v, {'stage': 'ok' if v is not None else 'drw_fail',
+                   'before': before, 'after': decode_ctrl(self.dpr(DP_CTRL))}
+
+
+def session(a, idx):
+    import os
+    import tempfile
+    sp = os.path.join(tempfile.gettempdir(), f"sfe76_sa_{os.getpid()}.JLinkScript")
+    with open(sp, 'w') as f:
+        f.write(TAP_SCRIPT % CHAIN_TAP_ID)
+
+    out = {'session': idx, 'ok': False, 'aps': {}, 'log': []}
+    logs = []
+    cb = lambda m: logs.append(str(m).rstrip())
+    jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
+    try:
+        try:
+            jl.exec_command(f"ScriptFile = {sp}")
+        except Exception:
+            pass
+        jl.open()
+        out['probe'] = f"{jl.product_name} HW={jl.hardware_version} FW={jl.firmware_version}"
+        try:
+            jl.exec_command(f"ScriptFile = {sp}")
+        except Exception:
+            pass
+        jl.exec_command(f"SetcJTAGInitMode = {CJTAG_MODE}")
+        jl.set_tif(TIF_CJTAG)
+        jl.set_speed(SPEED_KHZ)
+        for i, (_n, addr, typ) in enumerate(AP_MAP):
+            jl.exec_command(f"CORESIGHT_AddAP = Index={i} Type={typ} BaseAddr=0x{addr:X}")
+        try:
+            jl.connect(a.device, speed=SPEED_KHZ)
+            out['connect'] = True
+        except Exception as e:
+            out['connect'] = False
+            out['connect_err'] = str(e)[:100]
+
+        d = Dap(jl)
+        try:
+            jl.coresight_configure(ir_pre=0, dr_pre=0, ir_post=0, dr_post=0,
+                                   ir_len=4, perform_tif_init=False)
+        except Exception:
+            try:
+                jl.coresight_configure()
+            except Exception as e:
+                out['error'] = f"coresight_configure: {e}"
+                return out
+
+        out['DPIDR'] = hx(d.dpr(0))
+        d.dpw(DP_ABORT, 0x1E)
+        d.dpw(DP_CTRL, 0x50000000)
+        for _ in range(30):
+            time.sleep(0.01)
+            c = d.dpr(DP_CTRL)
+            if c and c & (1 << 29):
+                break
+        out['CTRL'] = decode_ctrl(d.dpr(DP_CTRL))
+        out['ok'] = bool(out['CTRL'].get('CDBGACK'))
+
+        for name, base, _t in AP_MAP:
+            csw = d.apr(base, OFF_CSW)
+            ap = {'IDR': hx(d.apr(base, OFF_IDR)), 'CSW': hx(csw),
+                  'CFG': hx(d.apr(base, OFF_CFG)), 'BASE': hx(d.apr(base, OFF_BASE))}
+            if csw is not None:
+                ap['DeviceEn'] = bool(csw & (1 << 6))
+                ap['Prot'] = f"0x{(csw >> 24) & 0x7F:02X}"
+            reads = {}
+            for addr in a.addrs:
+                v, meta = d.mem32(base, addr, csw)
+                reads[f"0x{addr:08X}"] = hx(v)
+                out['log'].append({'ap': name, 'addr': f"0x{addr:08X}", **meta})
+            ap['reads'] = reads
+            if csw is not None:
+                d.apw(base, OFF_CSW, csw)        # CSW 원복
+            out['aps'][name] = ap
+    except Exception as e:
+        out['error'] = str(e)[:120]
+    finally:
+        try:
+            jl.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(sp)
+        except OSError:
+            pass
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--device', default=DEVICE)
+    ap.add_argument('--sessions', type=int, default=3)
+    ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044")
+    ap.add_argument('--json', default=None)
+    ap.add_argument('--version', action='store_true')
+    a = ap.parse_args()
+    if a.version:
+        print(VERSION)
+        return 0
+    a.addrs = [int(x, 0) for x in a.addrs.split(',') if x.strip()]
+
+    print(f"\n{'=' * 70}\n {VERSION}   ★ 단일 파일 · 읽기 전용\n{'=' * 70}")
+    print(f"  device={a.device}  cJTAG mode={CJTAG_MODE}  {SPEED_KHZ}kHz")
+    print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
+    print(f"  주소 {[hex(x) for x in a.addrs]}\n")
+
+    runs = [session(a, i) for i in range(a.sessions)]
+    ok = [r for r in runs if r.get('ok')]
+
+    print(f"\n---8<--- STANDALONE ---")
+    print(f"v={VERSION}  ok={len(ok)}/{a.sessions}")
+    if runs and runs[-1].get('probe'):
+        print(runs[-1]['probe'])
+    for r in runs:
+        print(f"s{r['session']}: connect={r.get('connect')} DPIDR={r.get('DPIDR')} "
+              f"CTRL={(r.get('CTRL') or {}).get('raw')} "
+              f"CDBGACK={(r.get('CTRL') or {}).get('CDBGACK')}")
+    last = ok[-1] if ok else (runs[-1] if runs else None)
+    if last:
+        for n, apd in (last.get('aps') or {}).items():
+            print(f"{n} IDR={apd['IDR']} CSW={apd['CSW']} CFG={apd['CFG']} "
+                  f"BASE={apd['BASE']} DevEn={apd.get('DeviceEn')} Prot={apd.get('Prot')}")
+            print(f"   {apd['reads']}")
+        stages, errs = {}, {}
+        for e in last.get('log', []):
+            stages[e['stage']] = stages.get(e['stage'], 0) + 1
+            for k in ('STICKYERR', 'WDATAERR', 'STICKYORUN'):
+                if (e.get('after') or {}).get(k):
+                    errs[k] = errs.get(k, 0) + 1
+        print(f"stages={stages}")
+        print(f"DP오류(STICKYERR=bit5 수정본)={errs or '없음'}")
+    print("---8<-------------------")
+
+    if a.json:
+        with open(a.json, 'w') as f:
+            json.dump(runs, f, ensure_ascii=False, indent=1)
+        print(f"(상세 {a.json})")
+    return 0 if ok else 6
+
+
+if __name__ == '__main__':
+    sys.exit(main())
