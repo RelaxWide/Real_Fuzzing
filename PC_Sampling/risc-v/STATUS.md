@@ -757,31 +757,48 @@ SEGGER 예제값이 맞았고, **`0x81480000` 은 AP 주소공간 값이 아니�
 
 이제 남은 건 **connect 는 되는데 `halted()` 가 예외**라는 것 하나다.
 
-### P0 — `--focus` : DM 이 **어디까지** 사는지 가른다
+### ⚠ 그런데 **같은 조합이 실행마다 결과가 다르다**
+
+```
+1회차  AP=0 hart=0 connect=0 / hart=2,3 connect=1, halted=ERR "Target is not connected."
+2회차  AP=0 hart=0,1 이 connect=1 로 바뀜
+공통    halted / core_id 는 항상 None 아니면 ERR
+```
+
+**그러면 지금 데이터는 신호가 아니라 잡음이다** — §3.5 원칙 3 그대로다.
+`try_jlinkscript` 는 조합당 1회만 재고 반복도 유효성 게이트도 없었다.
+**우리가 세운 원칙을 우리 도구가 안 지켰다.**
+
+### ★ 그리고 `"Target is not connected"` 가 결정적이다
+
+`connect()` 가 예외 없이 끝났는데 그 직후 호출이 이 예외를 던진다.
+pylink 의 `halted()` 는 **`@connection_required`** 라서
+**`jl.connected()` 가 `False` 면** 이 문구를 던진다.
+
+⇒ **connect 직후 세션이 죽는다.** DM 문제 이전에 **연결 유지**가 안 되는 것이다.
+지금까지 "connect 성공" 을 세어 온 게 전부 이 위에서 이뤄졌다.
+
+### P0 — 반복 측정 + **세션 생존 확인**
 
 ```bash
-sudo python3 try_jlinkscript.py --focus
+sudo python3 try_jlinkscript.py --focus --reps 3
 ```
 
-`CoreBase=0x0` × AP{0,1} × **hart{0,1,2,3}** 를 돌면서, connect 뒤에
-**단계별로** 캔다 — `halted()` 만 보면 '실패' 로만 남고 왜인지 모른다:
+조합마다 3회 반복하고, connect 직후 **`connected` / `target_connected`** 를
+따로 기록한다. 비율로만 판단한다.
 
 ```
-halted()          DM 이 살아야 된다
-core_id()         J-Link 이 코어를 식별했는가
-core_name()       무엇으로 봤는가 (RV32?)
-register_read(0)  레지스터 접근이 되는가
-로그에서 dmcontrol / hart / CoreSight 줄
+AP=0 hart=0  connect=2/3  connected=0/3  target_connected=0/3  halted=0/3
 ```
 
-`hart` 를 훑는 이유: `attach.cmm` 상 hcore=hart0 이지만, J-Link 의
-`RISCV_SetHartSel` 이 언제 적용되는지는 미확인이다.
+| VERDICT | 의미 | 다음 |
+|---|---|---|
+| `DM_REACHED` | ★★★ 끝 | 정본 스크립트 굳히기 |
+| `SESSION_ALIVE_NO_DM` | 세션은 사는데 DM 만 안 산다 | DM 변수(hart/CoreBase) 재개 |
+| **`SESSION_DIES_AFTER_CONNECT`** | **연결 유지가 안 된다** | **DM 이 아니라 물리/속도 계층** — 속도 낮추기, 타깃 전원 사이클 |
 
-| 결과 | 다음 |
-|---|---|
-| 어떤 hart 에서 `halted=False/True` | ★★★ **DM 도달.** 정본 스크립트를 그 값으로 굳힌다 |
-| 전부 `ERR ...` | 그 **예외 문구**가 다음 단서 (`dmstatus` 인지 `dmcontrol` 인지) |
-| `core_name` 이 나옴 | 코어 식별까지는 됐다는 뜻 — DM 일부는 산다 |
+`connected=0/3` 이 전 조합에서 나오면 **DM 관련 변수를 더 훑는 건 의미가 없다.**
+그 위 계층부터 고쳐야 한다.
 
 ### (참고) 이전 `CONNECT_ONLY` 판정 — 무효
 

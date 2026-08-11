@@ -49,7 +49,7 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.14  focus 모드"
+VERSION = "2026-08-11.15  반복 + 연결상태 검증"
 
 # ★ TAP ID 를 선언하면 JTAG-DTM 오인이 사라진다(실측: DTM오인아님 0/9 → 78/90).
 #   ⚠ 다만 "유효 IDCODE" 자체는 **우리가 선언한 값을 되돌려받은 것**일 수 있다.
@@ -150,6 +150,16 @@ def run_one(a):
                 time.sleep(0.25)
 
         rec['script_ran'] = any(MARKER in l for l in logs)
+        # ★ connect() 가 예외 없이 끝나도 세션이 살아 있다는 뜻이 아니다.
+        #   halted() 는 @connection_required 라서 jl.connected() 가 False 면
+        #   "Target is not connected" 를 던진다 — 그게 지금 보이는 증상이다.
+        for nm, fn in (('connected', lambda: bool(jl.connected())),
+                       ('target_connected', lambda: bool(jl.target_connected()))):
+            try:
+                rec[nm] = fn()
+            except Exception as e:
+                rec[nm] = f"ERR {str(e)[:40]}"
+
         if rec['connect']:
             # ★ connect 성공 뒤 DM 이 **어디까지** 사는지 단계별로 캔다.
             #   halted() 만 보면 '실패' 로만 남고 왜인지 모른다.
@@ -204,36 +214,63 @@ def spawn(syntax, apidx, base, device, hart, tries, devid):
 
 
 def focus(a):
-    """connect 가 되는 조합만 깊이 판다. **왜 DM 이 안 사는지**를 본다."""
-    print(f"\n{'=' * 68}\n [FOCUS] CoreBase=0x0 × AP{{0,1}} × hart{{0..3}}\n{'=' * 68}")
-    print("  connect 는 되는데 halted() 가 예외다. 그 예외 문구와")
-    print("  core_id / core_name / reg0 로 **DM 이 어디까지 사는지** 가른다.\n")
-    rows = []
+    """connect 되는 조합을 **반복 측정**한다.
+
+    ★ 같은 조합이 실행마다 결과가 달랐다. 그러면 1회 결과는 신호가 아니다
+      (STATUS §3.5 원칙 3). 조합마다 `--reps` 회 반복해 **비율**로 본다.
+
+    ★ 그리고 `connect()` 무예외 종료 ≠ 세션 살아있음. `halted()` 는
+      `@connection_required` 라 `connected()` 가 False 면
+      "Target is not connected" 를 던진다 — 지금 보이는 게 정확히 그것이다.
+      그래서 connect 직후 `connected` / `target_connected` 를 따로 기록한다.
+    """
+    print(f"\n{'=' * 68}\n [FOCUS] CoreBase=0x0 × AP{{0,1}} × hart{{0..3}} × {a.reps}회"
+          f"\n{'=' * 68}")
+    print("  같은 조합이 실행마다 달랐다 → 비율로 본다. 1회 결과는 신호가 아니다.")
+    print("  connect 무예외 ≠ 세션 살아있음. connected/target_connected 를 따로 본다.\n")
+
+    agg = {}
     for apidx in (0, 1):
         for hart in (0, 1, 2, 3):
-            r = spawn('BaseAddr', apidx, 0x0, 'E76', hart, a.tries, DEVIDS[0])
-            r['hart'] = hart
-            rows.append(r)
-            p = r.get('probe') or {}
-            print(f"  AP={apidx} hart={hart}  connect={int(bool(r.get('connect')))}"
-                  f"  halted={p.get('halted')}")
-            for k in ('core_id', 'core_name', 'reg0'):
-                if k in p:
-                    print(f"      {k:10s}= {p[k]}")
-            for l in (r.get('loglines') or [])[:4]:
-                print(f"      log: {l[:96]}")
-            if not r.get('connect') and r.get('error'):
-                print(f"      err: {str(r['error'])[:96]}")
-            time.sleep(0.3)
+            k = (apidx, hart)
+            agg[k] = {'connect': 0, 'connected': 0, 'tconn': 0, 'halted': 0,
+                      'n': 0, 'errs': set()}
+            for _ in range(a.reps):
+                r = spawn('BaseAddr', apidx, 0x0, 'E76', hart, a.tries, DEVIDS[0])
+                g = agg[k]
+                g['n'] += 1
+                g['connect'] += bool(r.get('connect'))
+                g['connected'] += (r.get('connected') is True)
+                g['tconn'] += (r.get('target_connected') is True)
+                p = r.get('probe') or {}
+                h = p.get('halted')
+                if isinstance(h, bool):
+                    g['halted'] += 1
+                elif isinstance(h, str):
+                    g['errs'].add(h[:50])
+                if r.get('error'):
+                    g['errs'].add(str(r['error'])[:50])
+                time.sleep(0.25)
+            g = agg[k]
+            print(f"  AP={apidx} hart={hart}  connect={g['connect']}/{g['n']}"
+                  f"  connected={g['connected']}/{g['n']}"
+                  f"  target_connected={g['tconn']}/{g['n']}"
+                  f"  halted={g['halted']}/{g['n']}")
+            for e in sorted(g['errs'])[:2]:
+                print(f"      {e}")
 
-    ok = [r for r in rows if r.get('dm_alive')]
-    print(f"\nv={VERSION.split()[0]}  focus 조합={len(rows)}")
-    for r in rows:
-        p = r.get('probe') or {}
-        print(f"AP={r['ap']} hart={r['hart']} connect={int(bool(r.get('connect')))} "
-              f"halted={p.get('halted')} core_id={p.get('core_id')}")
-    print("VERDICT:", "DM_REACHED" if ok else "CONNECT_ONLY")
-    return EXIT_OK if ok else EXIT_INSUFFICIENT
+    print(f"\nv={VERSION.split()[0]}  reps={a.reps}")
+    for (apidx, hart), g in sorted(agg.items()):
+        print(f"AP={apidx} hart={hart} conn={g['connect']}/{g['n']} "
+              f"alive={g['connected']}/{g['n']} halted={g['halted']}/{g['n']}")
+    best = [k for k, g in agg.items() if g['halted'] > 0]
+    alive = [k for k, g in agg.items() if g['connected'] > 0]
+    print("VERDICT:", "DM_REACHED" if best else
+          ("SESSION_ALIVE_NO_DM" if alive else "SESSION_DIES_AFTER_CONNECT"))
+    if not alive:
+        print("  → connect 직후 세션이 죽는다. DM 이전에 **연결 유지**가 문제다.")
+        print("     속도(10MHz)를 낮춰 재시도, 타깃 전원 사이클 후 재측정.")
+    return EXIT_OK if best else EXIT_INSUFFICIENT
 
 
 def main():
@@ -241,6 +278,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--brief', action='store_true')
     ap.add_argument('--only-syntax', choices=SYNTAXES)
+    ap.add_argument('--reps', type=int, default=3,
+                    help='focus 모드에서 조합마다 반복할 횟수')
     ap.add_argument('--focus', action='store_true',
                     help='★ connect 되는 조합(CoreBase=0x0)만 깊이 판다 — hart 도 훑는다')
     ap.add_argument('--devices', default=",".join(DEVICES))
