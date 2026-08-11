@@ -41,7 +41,14 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.8  --alias 디코드 폭 측정"
+VERSION = "standalone 2026-08-11.9  alias 판정불가 구분"
+
+# ⚠ wrap 테스트의 허점을 막는다.
+#   그 AP 가 **모든 주소에서 같은 값**을 주면 2^N 도 당연히 0 과 같다.
+#   그러면 wrap 이 아닌데도 width 가 잡힌다 — 실제로 AXIAP1(전부 0),
+#   AHBAP1(전부 0xEAFFFFFC), APBAP4(전부 0xEAFFFFFE)가 그렇게 나왔다.
+#   ⇒ `ref0 == ref4` 면 **판정불가**로 표시한다. 기준점이 구별되지 않으면
+#     wrap 을 판정할 수 없다.
 
 # ★★ APBAP3 에서 aliasing 을 확인했다:
 #     오프셋 0x00000000 = 0x00040700   ==   오프셋 0x81592000 = 0x00040700
@@ -207,6 +214,12 @@ def alias_probe(jl, d, base, name):
     r4, _ = d.mem32(base, 0x4, csw)
     if r0 is None:
         return {'ap': name, 'width': None, 'note': '0x0 못 읽음'}
+    # ★ 기준점이 서로 달라야 wrap 판정이 성립한다
+    if r0 == r4:
+        d.apw(base, OFF_CSW, csw)
+        return {'ap': name, 'width': None, 'ref0': hx(r0), 'ref4': hx(r4),
+                'undecidable': True,
+                'note': '0x0 과 0x4 가 같은 값 — 기준점이 구별 안 됨'}
     width, matches = None, []
     for n in range(12, 32):
         a0, _ = d.mem32(base, 1 << n, csw)
@@ -376,9 +389,14 @@ def main():
         print(f"ok={len(ok)}/{a.sessions} DPIDR={(last or {}).get('DPIDR')}")
         for r in ((last or {}).get('alias') or []):
             w = r.get('width')
+            if r.get('undecidable'):
+                print(f"{r['ap']} 판정불가 (0x0==0x4={r.get('ref0')}) "
+                      f"— 균일해서 wrap 을 가릴 수 없다")
+                continue
             sz = (f"{(1 << w) // 1024}KB" if w and w < 22 else
-                  f"{(1 << w) // 1024 // 1024}MB" if w else "wrap없음")
-            print(f"{r['ap']} width={w if w else '-'} ({sz}) ref0={r.get('ref0')}")
+                  f"{(1 << w) // 1024 // 1024}MB" if w else "wrap없음(32비트 전부)")
+            print(f"{r['ap']} width={w if w else '-'} ({sz}) "
+                  f"ref0={r.get('ref0')} ref4={r.get('ref4')}")
         print("---8<---")
         return 0 if ok else 6
 
