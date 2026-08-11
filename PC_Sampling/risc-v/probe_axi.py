@@ -42,7 +42,21 @@ import time
 from sfe76_link import (require_api, Link, LinkError, AP_MAP,
                         add_common_args, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.25  AXI 읽기 전용"
+VERSION = "2026-08-11.27  Prot 스윕"
+
+# ★ probe_rom_dm 결과가 해석을 바꿨다:
+#     전송단계 ok:66, DP 오류비트 없음, TrInProg=False
+#   → 66번 전송이 전부 **정상 완료**됐다. 즉 0/0xEAFFFFFE 는 버스 기본값이
+#     아니라 **진짜 읽은 데이터**다. 버스는 응답하고 있다.
+#
+# ★ 그리고 AP 마다 CSW.Prot 이 다르다:
+#     APB Prot=0x00      AXI Prot=0x30
+#   AXI 는 AxPROT/AxCACHE 가 접근 권한을 결정하고, 권한이 안 맞으면
+#   **에러 없이 0 을 돌려준다(RAZ)** — AXI 가 전부 0 인 것과 정확히 맞는다.
+#   ⇒ Prot 을 바꿔가며 같은 주소를 읽어본다. 이건 읽기만 하므로 안전하다.
+PROT_CANDIDATES = [None,        # 현재 값 그대로
+                   0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70,
+                   0x23, 0x33, 0x43, 0x63]
 
 OFF_CSW, OFF_TAR, OFF_DRW, OFF_IDR = 0xD00, 0xD04, 0xD0C, 0xDFC
 DP_ABORT, DP_SELECT = 0, 2
@@ -121,11 +135,15 @@ class Rd:
             pass
         self.sel = None
 
-    def read32(self, addr):
+    def read32(self, addr, prot=None):
+        """prot 을 주면 CSW 의 Prot 필드(bits 30:24)를 바꿔서 읽는다."""
         self.abort()
         if self.csw0 is None or self.csw0 == SUSPECT:
             return None
-        if not self._w(OFF_CSW, (self.csw0 & ~0x37) | 0x02):
+        csw = (self.csw0 & ~0x37) | 0x02
+        if prot is not None:
+            csw = (csw & ~(0x7F << 24)) | ((prot & 0x7F) << 24)
+        if not self._w(OFF_CSW, csw):
             return None
         if not self._w(OFF_TAR, addr):        # TAR 은 주소 레지스터 — 데이터 쓰기 아님
             return None
@@ -136,6 +154,57 @@ class Rd:
     def restore(self):
         if self.csw0 is not None and self.csw0 != SUSPECT:
             self._w(OFF_CSW, self.csw0)
+
+
+def prot_sweep(a, addrs):
+    """★ CSW.Prot 를 바꿔가며 읽는다. **읽기만 하므로 안전하다.**
+
+    AXI 는 AxPROT/AxCACHE 로 접근 권한이 정해지고, 권한이 안 맞으면
+    에러 없이 0 을 돌려준다(RAZ). 지금 AXI 가 전부 0 이고 오류비트도
+    없는 것이 정확히 그 모양이다. Prot 을 바꾸면 값이 달라질 수 있다.
+    """
+    lk = Link(device=a.device, serial=a.serial, verbose=False)
+    base = dict((n, b) for n, b, _t in AP_MAP)[a.ap_name]
+    print(f"\n{'=' * 68}\n [PROT] {a.ap_name} 에서 CSW.Prot 을 바꿔가며 읽기"
+          f"\n{'=' * 68}")
+    print("  AXI 는 권한이 안 맞으면 에러 없이 0 을 준다(RAZ). 그래서 Prot 을 훑는다.")
+    print("  ★ 읽기만 한다 — CSW/TAR 외에는 아무것도 쓰지 않는다.\n")
+    try:
+        with lk:
+            try:
+                lk.open_dap(tries=a.tries)
+            except LinkError as e:
+                print(f"  세션 무효: {e}")
+                return EXIT_INSUFFICIENT
+            r = Rd(lk.jl, base)
+            print(f"  {a.ap_name} IDR={hx(r._r(OFF_IDR))}  CSW원본={hx(r.csw0)}"
+                  f"  (Prot=0x{((r.csw0 or 0) >> 24) & 0x7F:02X})\n")
+            hdr = "  Prot  " + "  ".join(f"0x{ad:08X}" for ad, _l in addrs[:6])
+            print(hdr)
+            hits = []
+            for p in PROT_CANDIDATES:
+                vals = [r.read32(ad, p) for ad, _l in addrs[:6]]
+                tag = "orig" if p is None else f"0x{p:02X}"
+                line = f"  {tag:5s} " + "  ".join(f"{hx(v):>10s}" for v in vals)
+                if any(live(v) for v in vals):
+                    line += "   ★ live"
+                    hits.append((p, vals))
+                print(line)
+            r.restore()
+    except Exception as e:
+        print(f"  예외: {e}")
+        return EXIT_INSUFFICIENT
+
+    print(f"\nv={VERSION.split()[0]}")
+    print("VERDICT:", "PROT_FOUND" if hits else "PROT_NO_EFFECT")
+    if hits:
+        p = hits[0][0]
+        print(f"  ★★★ Prot={'orig' if p is None else f'0x{p:02X}'} 에서 값이 나온다.")
+        print("     접근 권한이 원인이었다. 이 Prot 으로 다른 도구도 맞춘다.")
+    else:
+        print("  Prot 을 바꿔도 전부 같다 → 권한 문제가 아니다.")
+        print("  그 주소들이 이 AP 의 주소공간에 실제로 없다는 뜻에 가깝다.")
+    return EXIT_OK if hits else EXIT_INSUFFICIENT
 
 
 def one_session(a, addrs):
@@ -168,6 +237,8 @@ def main():
                     choices=[n for n, _b, _t in AP_MAP])
     ap.add_argument('--addrs', default=None, help='콤마 구분 주소 (기본: 리셋 블록)')
     ap.add_argument('--sessions', type=int, default=3)
+    ap.add_argument('--prot-sweep', action='store_true',
+                    help='★ CSW.Prot 를 바꿔가며 같은 주소를 읽는다 (읽기 전용)')
     ap.add_argument('--brief', action='store_true')
     ap.add_argument('--version', action='store_true')
     a = ap.parse_args()
@@ -183,6 +254,9 @@ def main():
         print(f"  AP = {a.ap_name}   주소 {len(addrs)}개   세션 {a.sessions}회")
         print("  T32 리셋 해제가 AXI: 클래스를 쓴다 — 우리는 AXI-AP 를 써본 적이 없다.")
         print("  ⚠ **쓰기는 하지 않는다.** 동작 중인 SSD 를 리셋할 위험이 있다.\n")
+
+    if a.prot_sweep:
+        return prot_sweep(a, addrs)
 
     runs = [one_session(a, addrs) for _ in range(a.sessions)]
     for _ in range(0):
