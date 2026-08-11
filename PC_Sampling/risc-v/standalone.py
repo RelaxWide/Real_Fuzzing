@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.23  --prepare: 전원요청을 **처음부터** + connect 생략"
+VERSION = "standalone 2026-08-11.25  J-Link 이 자기 혼자 건 CTRL/STAT 을 먼저 본다"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -760,9 +760,14 @@ def session(a, idx):
                 out['connect_err'] = str(e)[:100]
 
         d = Dap(jl)
+        # ⚠ 버그였다. connect 를 빼면 cJTAG 인터페이스를 초기화하는 게 아무것도
+        #   없다. perform_tif_init=False 인 채로 --no-connect 를 돌리면 모든 읽기가
+        #   실패해 None 이 된다 — 결과가 아니라 시험이 안 일어난 것이다.
+        #   connect 가 없을 때는 여기서 TIF 를 초기화해야 한다.
+        tif_init = bool(getattr(a, 'no_connect', False))
         try:
             jl.coresight_configure(ir_pre=0, dr_pre=0, ir_post=0, dr_post=0,
-                                   ir_len=4, perform_tif_init=False)
+                                   ir_len=4, perform_tif_init=tif_init)
         except Exception:
             try:
                 jl.coresight_configure()
@@ -780,6 +785,14 @@ def session(a, idx):
         #   즉 **전원 요청 조합과 그 시점**이 디버그 포트 성립을 좌우한다.
         #   지금까지 우리는 여기서 무조건 0x50000000(둘 다)을 걸었고,
         #   --pwr 은 그 뒤에 바꿨다 — 순서가 반대였다.
+        # ★★ 한 번도 안 본 것: **J-Link 이 자기 혼자 무엇을 걸어놨나.**
+        #   우리는 항상 여기서 즉시 CTRL/STAT 을 덮어써 버렸다. 그래서
+        #   "우리가 SYS 를 안 걸면 된다" 는 가정을 검증한 적이 없다.
+        #   J-Link 의 DAP 기동(connect / coresight_configure)이 이미
+        #   CSYSPWRUPREQ 를 걸어놨다면, 우리가 뒤에 지우는 것은 T32 의
+        #   "처음부터 안 건다" 와 **다른 것**이다.
+        out['CTRL0'] = decode_ctrl(d.dpr(DP_CTRL))
+
         pwrreq = getattr(a, 'pwrreq', 0x50000000)
         out['pwrreq'] = f"0x{pwrreq:08X}"
         d.dpw(DP_ABORT, 0x1E)
@@ -965,7 +978,8 @@ def main():
                 ver = None
                 if st and st != '----':
                     ver = int(st, 16) & 0xF
-                print(f"{rl:8s} {cl:11s} CTRL={(r.get('CTRL') or {}).get('raw')} "
+                print(f"{rl:8s} {cl:11s} 최초CTRL={(r.get('CTRL0') or {}).get('raw')} "
+                      f"→{(r.get('CTRL') or {}).get('raw')} "
                       f"AP={r.get('ap_match')}/6 dmstatus={st} ver={ver}"
                       + ("  *DM살아있음" if ver in (2, 3) else ""))
                 if ver in (2, 3):

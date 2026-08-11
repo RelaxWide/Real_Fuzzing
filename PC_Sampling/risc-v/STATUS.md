@@ -255,6 +255,37 @@ J-Link       Plus, FW V13 / 소프트웨어 **V9.66** (V9.12 → 업그레이드
 > ⇒ `--prepare` (`.23`): 전원요청을 **처음부터** DBG 만 걸고, `connect` 유무를
 > 교차한다 (2×2). 여전히 **DP CTRL/STAT 쓰기뿐**이고 타깃 버스엔 안 쓴다.
 
+> ### ⚠ 실측 (`--prepare` 1차) — **두 줄은 결과가 아니라 버그였다**
+>
+> ```
+> DBG만    connect없음   dmstatus=None
+> DBG만    connect함     dmstatus=EAFFFFFE ver=14
+> DBG+SYS  connect없음   dmstatus=None
+> DBG+SYS  connect함     dmstatus=EAFFFFFE ver=14
+> ```
+>
+> `connect없음` 두 줄의 `None` 은 **읽기 자체가 안 일어난 것**이다.
+> `coresight_configure(perform_tif_init=False)` 로 두고 `connect` 를 빼면
+> **cJTAG 인터페이스를 초기화하는 게 아무것도 없다.** 시험이 성립하지 않았다.
+> → `.24` 에서 `no_connect` 일 때 `perform_tif_init=True` 로 수정.
+>
+> ### ❌❌ 철회 — "전원 요청 순서" 를 **우리는 적용할 수 없었다**
+>
+> T32 의 `DAPSYSPWRUPREQ OFF` 는 **T32 자신의 디버그 포트 기동 절차가 소비하는
+> 정책**이다. 반면 우리는 J-Link 이 이미 자기 방식으로 DAP 를 올린 **뒤에**
+> CTRL/STAT 을 덮어쓴다. 나중에 지우는 것은 **처음부터 안 거는 것과 다르다** —
+> 그 사이에 이미 걸렸다 풀린 것이다.
+> ⇒ `--pwr`(`.22`) 도 `--prepare`(`.23`) 도 이 점에서 **T32 순서의 재현이 아니다.**
+>
+> 그런데 **J-Link 이 자기 혼자 무엇을 걸어놨는지 한 번도 안 봤다.**
+> 매 세션 즉시 덮어써 버렸기 때문이다. `.25` 가 우리 쓰기 **전에**
+> CTRL/STAT 을 먼저 읽어 기록한다 (`최초CTRL`).
+>
+> | 최초CTRL | 뜻 | 다음 |
+> |---|---|---|
+> | `CSYSPWRUPREQ` 이미 1 | J-Link 이 스스로 건다. 뒤에 지워도 소용없다 | **JLinkScript `InitTarget()`** 로 기동 절차 자체를 우리가 가져와야 한다 |
+> | `CSYSPWRUPREQ` 0 | 애초에 안 건다 | **순서 가설 자체가 무효.** 리셋 해제로 간다 |
+
 **동작하는 설정 (pylink + exec_command, connect 前 주입):**
 ```
 SetcJTAGInitMode = 0
