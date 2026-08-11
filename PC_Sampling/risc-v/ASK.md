@@ -62,7 +62,9 @@ Timeout waiting for debug module to become active     (dmcontrol.dmactive 안 �
 | `SetCoreBaseAddr` = `0x81480000` / `0x81481000` × APB-AP 인덱스 일부 | 전부 실패 (**전수 스윕은 아직 미실행**) |
 | 장치명 `E76` / `E76-MC` / `RISC-V` (AP 맵 수동지정 없이) | `Could not find supported CPU` |
 | 장치명 `E76ARTY` | `Target is not connected` |
-| MEM-AP 로 `0x81480000` 직접 읽기 (TAR/DRW) | DRW 읽기 실패 |
+| MEM-AP 로 `0x81480000` 직접 읽기 (TAR/DRW) | **6개 AP 전부 무응답 상수** (`0xEAFFFFFE`/`0xEAFFFFFC`/`0`) |
+| MEM-AP 로 AP 주소공간 `0x0` 읽기 | ★ `APBAP1=0x81480003`, `APBAP2=0x81481003` (ROM 엔트리) |
+| MEM-AP 로 트레이스 블록 `0xFD......` 읽기 | 전 AP 무응답 상수 — **MEM-AP 로는 안 보인다** |
 | AP `BASE`(0xDF8) → ROM 테이블 | SEGGER 문서상 **RISC-V 는 ROM 스캔 미지원** |
 | `JLinkScriptFile` 경로 | cJTAG 스캔이 깨짐 (`IRPrint=0x..0000`) |
 
@@ -115,10 +117,19 @@ INTERCOM.execute ... sys.config.coredebug.base &core_base
 
 ## 5. 벤더/설계팀(또는 T32 스크립트 작성자)에 보낼 질문
 
-> 1. **RISC-V Debug Module 의 DMI 레지스터가 어느 AP 뒤에 있고, 그 AP 의
->    주소공간 기준으로 어느 오프셋에 있습니까?**
->    (T32 는 `COREDEBUG.Base APB:0x81480000` 을 쓰는데, 이건 APB 버스 주소로
->    보입니다. AP 주소공간 기준 오프셋이 따로 필요합니다.)
+> 1. ★ **핵심 질문.** MEM-AP 주소공간 `0x0` 을 읽으면 이렇게 나옵니다:
+>    ```
+>    APBAP1(DP:0x10000) @0x0 = 0x81480003
+>    APBAP2(DP:0x20000) @0x0 = 0x81481003
+>    ```
+>    CoreSight ROM 엔트리 인코딩(bit0=present, bit1=32bit, 상위20비트=오프셋)이고,
+>    가리키는 `0x81480000` / `0x81481000` 이 T32 의 `COREDEBUG.Base` 와 정확히
+>    일치합니다. **그런데 그 `0x81480000` 은 어느 MEM-AP 로도 읽히지 않습니다**
+>    (CIDR3 자리에 `0xEAFFFFFE` 같은 무응답 상수만 나옵니다).
+>
+>    → 이 주소는 **AP 주소공간 기준입니까, 아니면 SoC 의 APB 버스 주소입니까?**
+>      AP 주소공간 기준으로 DMI 레지스터에 닿으려면 어느 AP 의 **어느 오프셋**을
+>      써야 합니까? (`CORESIGHT_SetCoreBaseAddr` 에 넣을 값입니다)
 > 2. DMI 레지스터가 그 창 안에서 어떤 간격으로 매핑됩니까?
 >    (`dmcontrol`=DMI 0x10 이 `base+0x40` 인지, 즉 `dmi_addr << 2` 인지)
 > 3. DM 이 두 개(`0x81480000`, `0x81481000`)로 보이는데, **각각 어느 AP 뒤**입니까?
