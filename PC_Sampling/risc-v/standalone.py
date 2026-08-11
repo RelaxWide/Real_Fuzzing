@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.6  dmi 프리셋"
+VERSION = "standalone 2026-08-11.7  u1 도 값을 찍는다"
 
 # ★ APBAP3 앞 4워드에 내용이 있다 (유효 세션, DPIDR=0x6BA0009D):
 #     0x00=0x00040700  0x04=0x00000010  0x08=0x81592158  0x0C=0x000002C3
@@ -346,22 +346,28 @@ def main():
     print(" ".join(parts))
     for n, apd in ((last or {}).get('aps') or {}).items():
         vs = sorted(set(apd['reads'].values()))
-        if len(vs) > 1:
+        if len(vs) == 1:
+            # ★ 전부 같아도 **그 값이 무엇인지**는 찍는다. 이전엔 생략해서
+            #   "u1 만 나오고 끝" 이 됐다 — 정보를 버리고 있었다.
+            print(f"{n}= 전부 {vs[0]}")
+        else:
             if getattr(a, 'dmi_mode', False):
                 names = {d * 4: nm for d, nm in DMI_REGS}
                 print(" ".join(
                     f"{names.get(int(k, 16), k)}={v}"
                     for k, v in apd['reads'].items()))
-                ds = apd['reads'].get(f"0x{0x11 * 4:08X}")
-                if ds and ds != '----':
-                    ver = int(ds, 16) & 0xF
-                    print(f"  dmstatus version={ver} ({DM_VER.get(ver, '무효')})"
-                          + ("   ★★★ DM 을 찾았다" if ver in (2, 3) else ""))
             elif len(AP_MAP) == 1:      # AP 하나만 볼 땐 주소별로 낸다
                 print(" ".join(f"{k.replace('0x', '')}={v}"
                                 for k, v in apd['reads'].items()))
             else:
                 print(f"{n}= " + ",".join(vs))
+        # dmi 모드면 값이 몇 종이든 dmstatus 를 해석한다
+        if getattr(a, 'dmi_mode', False):
+            ds = apd['reads'].get(f"0x{0x11 * 4:08X}")
+            if ds and ds != '----':
+                ver = int(ds, 16) & 0xF
+                print(f"  dmstatus={ds} version={ver} ({DM_VER.get(ver, '무효')})"
+                      + ("   ★★★ DM 을 찾았다" if ver in (2, 3) else ""))
     print("---8<---")
 
     if a.full and last:

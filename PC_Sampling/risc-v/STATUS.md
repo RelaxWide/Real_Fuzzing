@@ -1242,7 +1242,37 @@ dmcontrol=........ dmstatus=00000CA2 hartinfo=........ ...
 | **2 (0.13) / 3 (1.0)** | ★★★ **DM 을 찾았다.** `CoreBase` = APBAP3, AP index **4** |
 | 그 외 | 여기도 아니다 → `APBAP1/2/4` 에 같은 프리셋을 적용 |
 
-**다른 AP 에도 같은 한 줄로 시험할 수 있다** — `--ap APBAP1` 등.
+### ❌ 결과 — `APBAP3` 의 DMI 자리는 **전부 같은 값** (`u1`)
+
+`0x40`~`0xE0` 8곳이 전부 동일. **DMI aperture 가 아니다**(적어도 base 0 · stride 4 로는).
+
+> ⚠ 출력 버그도 하나 나왔다 — `u1` 이면 값 줄을 아예 안 찍고 있었다.
+> "전부 같다" 와 "그 값이 무엇인가" 는 다른 정보인데 후자를 버렸다. 고쳤다.
+
+**그런데 이 결과가 `APBAP3` 를 배제하진 않는다.** 정리하면:
+
+```
+0x00~0x0C   내용 있음 (4워드, u4)     ← 0x08 = 0x81592158
+0x10~0x1C   0
+0x40~0xE0   전부 같은 값
+```
+**16바이트짜리 작은 레지스터 블록**으로 보인다. 그 뒤는 비어 있다.
+`0x81592158` 이 **다른 곳을 가리키는 포인터**일 가능성이 남는다 —
+`0x81xxxxxx` 대역은 DM base 들과 같은 계열이다.
+
+### P0 — 두 갈래를 한 번에
+
+```bash
+sudo python3 standalone.py --ap APBAP1 --addrs dmi     # ① 다른 AP 로 DMI 시험
+sudo python3 standalone.py --ap APBAP2 --addrs dmi
+sudo python3 standalone.py --ap APBAP4 --addrs dmi
+```
+①은 **`dmstatus` 한 줄**로 끝난다. AP 하나당 명령 하나.
+
+```bash
+sudo python3 standalone.py --ap APBAP3 --addrs 0x81592158,0x8159215C,0x81592000,0x81592004
+```
+②는 **`0x81592158` 이 가리키는 곳**을 본다. 포인터라면 거기에 내용이 있다.
 
 ### P0 — 진짜 TAP ID 로 다시, 그리고 `APBAP3` 를 판다
 
