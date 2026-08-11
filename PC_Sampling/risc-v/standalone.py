@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.16  --link 물리계층 (속도 스윕)"
+VERSION = "standalone 2026-08-11.17  게이트를 DPIDR → AP IDR 일치로 교체"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -58,11 +58,13 @@ VERSION = "standalone 2026-08-11.16  --link 물리계층 (속도 스윕)"
 # ⚠ 그리고 **타깃 상태 자체가 변했을 수 있다.** 긴 세션 동안 CSW 를 여러 번
 #   쓰고 connect 를 수없이 시도했다. **전원 사이클 후 재시도가 먼저다.**
 
-# ★ 유효 DPIDR(0x11013913)이 나왔던 브링업 초기와 지금의 차이:
+# ★ (철회) 아래 '브링업 초기에 유효 DPIDR 이 나왔다'는 전제는 근거가 없다.
+#   그래도 조합 스윕 자체는 유효하다 — 합격 기준만 AP IDR 일치로 바꿨다.
+#   브링업 초기와 지금의 설정 차이:
 #     TAP 선언 스크립트   그때 없음        → 지금 항상 적용
 #     SetcJTAGInitMode   그때 0 (LONG)    → 지금 1 (SHORT)
 #     device             그때 RISC-V      → 지금 E76
-#   앞의 둘은 "개선" 이라고 생각하고 넣은 것인데 **유효 DPIDR 을 잃은 시점과
+#   앞의 둘은 "개선" 이라고 생각하고 넣은 것인데 **AP 접근을 잃은 시점과
 #   겹친다.** 스크립트 유무 × 모드 0/1 을 훑어 그 조건을 되찾는다.
 
 # ⚠ discovery 가 두 가지를 안 지켰다 (실측에서 드러남):
@@ -79,9 +81,40 @@ VERSION = "standalone 2026-08-11.16  --link 물리계층 (속도 스윕)"
 #     0x11013913 → VERSION 3 (DPv3), DESIGNER 0x489 SiFive → 유효
 #   그리고 coresight_read(0, ap=False) 는 **DP 레지스터**를 읽는다.
 #   TAP IDCODE 가 아니므로 그렇게 재해석하면 안 된다.
-EXPECT_DPIDR = 0x11013913          # 이 타깃에서 기대하는 값
+
+# ★★★ 2026-08-11 철회 — 게이트를 DPIDR 에서 떼어낸다.
+#   `0x11013913` 의 출처를 저장소 이력 전체에서 추적한 결과:
+#     · 측정 로그 / JSON / raw 출력 어디에도 **없다**
+#     · 최초 등장이 4a6edd9 의 **코드 주석 안 전제문**이다
+#     · 그 위로는 git 이전 세션의 인수인계 산문뿐이다
+#   즉 이 값은 관측 기록이 아니라 전제로 들어와 상수로 굳은 것이고,
+#   사용자도 본 적이 없다고 한다. **재현 시도(--recover/--link)의 합격
+#   기준을 이 값에 걸어둔 것 자체가 오류**였고 두 결과 다 무효다.
+#
+#   대신 우리가 실제로 검증할 수 있고 실제로 필요한 능력으로 건다:
+#   **AP IDR 일치.** 6개 AP 의 IDR 이 T32 선언 타입(APB/AXI/AHB)과 맞는 것은
+#   우연으로 나올 수 없고(32bit × 6), AP 트랜잭션이 성립한다는 직접 증거다.
+#   DPIDR 은 이제 **관측 기록**일 뿐 합격/불합격을 가르지 않는다.
+EXPECT_DPIDR = 0x11013913          # 출처 불명 — 게이트 아님, 표시용으로만 둔다
 EXPECT_AP_IDR = {0x10000: 0x09130006, 0x20000: 0x09130006, 0x30000: 0x09130004,
                  0x40000: 0x09130001, 0x50000: 0x09130006, 0x60000: 0x09130006}
+AP_GATE_MIN = 4                    # 6개 중 몇 개가 맞아야 유효 세션으로 보는가
+
+
+def ap_idr_match(d):
+    """6개 AP 의 IDR 을 읽어 기대값과 대조한다. (일치수, {base: 값}) 반환.
+
+    이것이 세션 유효성 게이트다. AP 주소공간에 트랜잭션이 실제로 도달해
+    **주소마다 다른 알려진 값**이 돌아와야만 성립한다 — 링크가 죽어 있으면
+    0xFFFFFFFF / 0x80000000 / 전부 동일값이 되어 통과할 수 없다.
+    """
+    idrs, hit = {}, 0
+    for base in EXPECT_AP_IDR:
+        v = d.apr(base, OFF_IDR)
+        idrs[base] = v
+        if v is not None and v == EXPECT_AP_IDR[base]:
+            hit += 1
+    return hit, idrs
 
 
 def classify_dpidr(v):
@@ -463,10 +496,7 @@ def session(a, idx):
                 return out
 
         dpidr = d.dpr(0)
-        out['DPIDR'] = hx(dpidr)
-        # ★ DPIDR 이 무효면 그 세션의 AP 값은 **전부 무효**다.
-        #   bit0 은 RAO 이므로 짝수이거나 0/0xFFFFFFFF 면 데이터가 아니다.
-        out['dpidr_ok'] = dpidr_valid(dpidr, strict=not a.loose)
+        out['DPIDR'] = hx(dpidr)          # ★ 관측 기록일 뿐 — 게이트가 아니다
         out['dpidr_version'] = (None if dpidr is None else (dpidr >> 12) & 0xF)
         d.dpw(DP_ABORT, 0x1E)
         d.dpw(DP_CTRL, 0x50000000)
@@ -476,14 +506,20 @@ def session(a, idx):
             if c and c & (1 << 29):
                 break
         out['CTRL'] = decode_ctrl(d.dpr(DP_CTRL))
-        out['ok'] = bool(out['CTRL'].get('CDBGACK')) and out['dpidr_ok']
+
+        # ★ 세션 유효성 게이트 = DAP 전원 ACK + AP IDR 일치 (DPIDR 아님)
+        hit, idrs = ap_idr_match(d)
+        out['ap_match'] = hit
+        out['ap_idrs'] = {f"0x{b:X}": hx(v) for b, v in idrs.items()}
+        need = 1 if a.loose else AP_GATE_MIN
+        out['ok'] = bool(out['CTRL'].get('CDBGACK')) and hit >= need
 
         if getattr(a, 'discover', False):
             # ★ 세션이 무효면 discovery 를 시도조차 하지 않는다
-            if not out['dpidr_ok']:
+            if not out['ok']:
                 out['discover'] = {'skipped': True,
-                                   'why': f"세션 무효 (DPIDR={out['DPIDR']}, "
-                                          f"VERSION={out['dpidr_version']})"}
+                                   'why': f"세션 무효 (AP IDR 일치 {hit}/6, "
+                                          f"기준 {need})"}
             else:
                 out['discover'] = discover(d)
             return out
@@ -536,7 +572,7 @@ def main():
                     help='★ 물리 계층 — 원래 설정 고정 후 cJTAG 모드 × 속도 스윕')
     ap.add_argument('--speeds', default="10000,4000,2000,1000,500")
     ap.add_argument('--recover', action='store_true',
-                    help='★ 유효 DPIDR 조건을 찾는다 — 스크립트 유무 × cJTAG 모드')
+                    help='★ AP IDR 이 맞는 조건을 찾는다 — 스크립트 유무 × cJTAG 모드')
     ap.add_argument('--no-tap-script', action='store_true',
                     help='TAP 선언 스크립트를 깔지 않는다 (브링업 초기 조건)')
     ap.add_argument('--cjtag-mode', type=int, default=CJTAG_MODE)
@@ -547,7 +583,7 @@ def main():
     ap.add_argument('--discover', action='store_true',
                     help='★ ADIv6 DPIDR1 / BASEPTR0 / BASEPTR1 을 읽는다 (미시도)')
     ap.add_argument('--loose', action='store_true',
-                    help='DPIDR 기대값 일치를 요구하지 않는다 (VERSION 검사만)')
+                    help='AP IDR 게이트를 1/6 로 완화한다 (기본 %d/6)' % AP_GATE_MIN)
     ap.add_argument('--alias', action='store_true',
                     help='★ AP 마다 주소 디코드 폭을 잰다 (2^N 이 0 과 같아지는 지점)')
     ap.add_argument('--ap', default=None,
@@ -592,7 +628,7 @@ def main():
     if a.link:
         print(f"\n{'=' * 70}\n [LINK] 물리 계층 — 속도를 낮춰본다"
               f"\n{'=' * 70}")
-        print("  DPIDR 이 실행마다 FFFFFFFF / 6BA0009D / 80000000 로 흔들린다.")
+        print("  AP IDR 이 실행마다 몇 개씩 맞았다 안 맞았다 한다.")
         print("  설정이 원인이면 조합마다 일관돼야 한다 → **링크 불안정** 신호다.")
         print("  지금껏 10MHz 만 썼다. 낮춰본다.")
         print("  ⚠ 타깃 전원 사이클을 먼저 하는 것을 권한다.\n")
@@ -604,26 +640,26 @@ def main():
             for spd in speeds:
                 a.cjtag_mode = mode
                 a.speed = spd
-                got = [session(a, i).get('DPIDR') for i in range(min(a.sessions, 3))]
-                hit = sum(1 for g in got if g == f"{EXPECT_DPIDR:08X}")
-                kinds = sorted({classify_dpidr(int(g, 16) if g and g != '----' else None)
-                                for g in got})
-                print(f"mode={mode} {spd:>5d}kHz  {','.join(g or '-' for g in got)}"
-                      + (f"  ★ 유효 {hit}/{len(got)}" if hit else f"  [{kinds[0]}]"))
+                rs = [session(a, i) for i in range(min(a.sessions, 3))]
+                got = [r.get('ap_match', 0) for r in rs]
+                hit = sum(1 for g in got if g >= AP_GATE_MIN)
+                print(f"mode={mode} {spd:>5d}kHz  AP일치 "
+                      + "/".join(str(g) for g in got) + " (of 6)"
+                      + (f"  ★ 통과 {hit}/{len(got)}" if hit else ""))
                 if hit and not found:
                     found = f"mode={mode} {spd}kHz"
                 time.sleep(0.3)
         print("VERDICT:", f"FOUND ({found})" if found else "LINK_UNSTABLE")
         if not found:
-            print("  어느 속도에서도 유효 DPIDR 이 안 나온다.")
+            print(f"  어느 속도에서도 AP IDR 이 {AP_GATE_MIN}개 이상 안 맞는다.")
             print("  → 타깃 전원 사이클 / cJTAG 배선·풀업 / 프로브 케이블 순으로 본다.")
         print("---8<---")
         return 0 if found else 6
 
     if a.recover:
-        print(f"\n{'=' * 70}\n [RECOVER] 유효 DPIDR(0x{EXPECT_DPIDR:08X}) 조건 탐색"
+        print(f"\n{'=' * 70}\n [RECOVER] AP IDR 일치({AP_GATE_MIN}/6 이상) 조건 탐색"
               f"\n{'=' * 70}")
-        print("  브링업 초기에 이 값이 나왔다. 그 뒤 바뀐 것을 전부 되돌려 본다:")
+        print("  브링업 이후 바뀐 것을 전부 되돌려 본다:")
         print("    TAP 스크립트 유무 × cJTAG 모드 0/1 × 명령셋 full/min × device")
         print("    (full = SetIndexAPBAPToUse/SetCoreBaseAddr/SetHartSel 포함)")
         print("  ⚠ 그 전에 **타깃 전원 사이클**을 권한다 — 긴 세션 동안 상태가")
@@ -639,16 +675,14 @@ def main():
                 got = []
                 for i in range(min(a.sessions, 2)):
                     r = session(a, i)
-                    got.append(r.get('DPIDR'))
+                    got.append(r.get('ap_match', 0))
                     time.sleep(0.25)
-                hit = sum(1 for g in got if g == f"{EXPECT_DPIDR:08X}")
+                hit = sum(1 for g in got if g >= AP_GATE_MIN)
                 tag = (f"script={'X' if no_script else 'O'} mode={mode} "
                        f"cmds={'full' if full else 'min'} dev={dev}")
-                # 유효값이 없으면 서로 다른 결과만 요약해 전사량을 줄인다
-                uniq = ",".join(sorted({g or '-' for g in got}))
-                print(f"{tag}  DPIDR={uniq}"
-                      + (f"   ★ 유효 {hit}/{len(got)}" if hit else ""))
-                if len({g for g in got}) > 1:
+                print(f"{tag}  AP일치={'/'.join(str(g) for g in got)}"
+                      + (f"   ★ 통과 {hit}/{len(got)}" if hit else ""))
+                if len(set(got)) > 1:
                     print("      ⚠ 같은 조합에서 값이 흔들린다 — 링크 불안정")
                 if hit and best is None:
                     best = tag
@@ -675,7 +709,7 @@ def main():
         dv = (last or {}).get('discover') or {}
         if dv.get('skipped'):
             print(f"DISCOVERY 건너뜀 — {dv['why']}")
-            print("★ 유효 DPIDR 세션(0x11013913)부터 확보해야 한다.")
+            print(f"★ AP IDR 이 {AP_GATE_MIN}/6 이상 맞는 세션부터 확보해야 한다.")
         else:
             for k, v in (dv.get('raw') or {}).items():
                 print(f"{k}={v}")
@@ -704,11 +738,14 @@ def main():
         print("---8<---")
         return 0 if ok else 6
 
-    bad = [r for r in runs if not r.get('dpidr_ok')]
+    bad = [r for r in runs if not r.get('ok')]
     if bad:
-        print(f"\n⚠⚠ DPIDR 무효 세션 {len(bad)}/{a.sessions} — "
-              f"그 세션의 AP 값은 **전부 무효**다. 해석하지 말 것.")
-    print(f"ok={len(ok)}/{a.sessions} DPIDR={(last or {}).get('DPIDR')} "
+        print(f"\n⚠⚠ 무효 세션 {len(bad)}/{a.sessions} (AP IDR 일치 "
+              + "/".join(str(r.get('ap_match', 0)) for r in bad)
+              + f", 기준 {1 if a.loose else AP_GATE_MIN}/6) — "
+              "그 세션의 값은 **전부 무효**다. 해석하지 말 것.")
+    print(f"ok={len(ok)}/{a.sessions} AP일치={(last or {}).get('ap_match')}/6 "
+          f"DPIDR={(last or {}).get('DPIDR')} "
           f"CTRL={((last or {}).get('CTRL') or {}).get('raw')}")
     print("ERR " + (" ".join(f"{k}={v}" for k, v in sorted(errs.items()))
                     if errs else "없음")
