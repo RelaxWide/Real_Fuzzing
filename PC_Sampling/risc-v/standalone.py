@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.30  TAR 대조 철회 + 확정게이트 6/6 (feedback)"
+VERSION = "standalone 2026-08-11.31  --p0: feedback P0 글자 그대로 + DOWN/500ms/UP"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -227,7 +227,11 @@ def is_default_line(addr, val):
 #     · --recover 스윕: 유효 IDCODE 는 **mode=1 device=E76** 에서 나왔다
 #   ⇒ device 는 'E76' 으로 되돌린다.
 #   (지금 하는 raw DAP 작업엔 영향이 없지만, 기본값이 실측과 어긋나면 안 된다)
-TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE = 7, 10000, 0, 'E76'
+# ❌ .19 에서 mode 를 0 으로 바꾼 것도 폐기된 --replay 추론이었다.
+#   feedback §5: CJTAGFLAGS **USEOAC** 는 J-Link 의 SiFive/RISC-V short
+#   activation 과 방향이 일치한다 → SetcJTAGInitMode = **1**.
+#   사용자 실측(유효 IDCODE 는 mode=1 device=E76)과도 맞는다.
+TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE = 7, 10000, 1, 'E76'
 # ★ **선언값과 읽은 값을 구분한다.** 실측:
 #     선언 0x5BA00477 (알려진 ARM DAP) → DPIDR 읽기 = 0x6BA0009D   ← 유효
 #     선언 0x6BA0009D (읽은 값 그대로) → DPIDR 읽기 = 0xFFFFFFFF   ← 무효
@@ -694,6 +698,119 @@ SCAN_ADDRS = [0x0, 0x1000, 0x2000, 0x10000, 0x100000, 0x1000000,
 TAR_PATTERNS = [0xC8104000, 0x00C81040, 0xDEADBEE0, 0x12345670, 0x00000000]
 
 
+
+# ★★★ --p0 : feedback §5/§6 이 지정한 P0 를 **글자 그대로**.
+#
+#   내가 못 지킨 것들 (전부 .19 의 폐기된 --replay 추론에서 나왔다):
+#       SetcJTAGInitMode   1  ←  0 으로 바꿔놨다.  USEOAC 와 방향이 맞는 건 1이다
+#       CoreBase           0x0 ← 0x81481000 으로 바꿔놨다.  첫 성공 전엔 0x0 다
+#       TAP 선언 스크립트    항상 ← 기본 off 로 바꿔놨다
+#       성공 오라클         target_connected() == True  ← AP IDR 로 대신하고 있었다
+#
+#   ★ 그리고 **아예 안 해본 것**: HCore 시퀀스의 마지막 단계.
+#       Slave OFF / DAPSYSPWRUPREQ OFF / DAPDBGPWRUPREQ ON
+#       SYStem.Mode Prepare
+#       SYStem.DOWN → WAIT 500ms → SYStem.UP      ← 여기
+#     나는 Prepare 에서 멈추고 "T32 는 CPU 에 안 붙는다" 고 결론냈다. 틀렸다.
+#
+#   ⚠ feedback §6 이 성공 신호가 **아니라고** 명시한 것들:
+#       connect() 무예외 종료 / connected()==True(USB만) /
+#       수동 입력 ID 가 로그에 출력 / DTM 오인 문구가 사라짐
+#     유일한 1차 오라클은 target_connected() == True 다.
+#
+#   ⚠ 그리고 속도를 낮추지 않는다. missing-KEEPER workaround 는 OScan1 에서
+#     **500kHz 초과**를 요구한다 — 이전 --link 의 500k 스윕은 지침 위반이었다.
+P0_SCRIPT = """// SFE76_MANUAL_CHAIN_V2  (feedback \\u00a75 \\uc815\\ubcf8)
+void ConfigTargetSettings(void) {
+  JLINK_SYS_Report("SFE76_MANUAL_CHAIN_V2");
+  JTAG_AllowTAPReset = 1;          // 1 = \\uc790\\ub3d9\\uac80\\ucd9c OFF
+  JLINK_JTAG_SetDeviceId(0, 0x%08X);
+  JLINK_JTAG_IRPre  = 0;
+  JLINK_JTAG_DRPre  = 0;
+  JLINK_JTAG_IRPost = 0;
+  JLINK_JTAG_DRPost = 0;
+  JLINK_JTAG_IRLen  = 4;
+%s
+  JLINK_ExecCommand("CORESIGHT_SetIndexAPBAPToUse = 0");
+  JLINK_ExecCommand("CORESIGHT_SetCoreBaseAddr = 0x0");
+  JLINK_ExecCommand("RISCV_SetHartSel = 0");
+}
+"""
+
+
+def p0_script_text():
+    aps = "\n".join(
+        '  JLINK_ExecCommand("CORESIGHT_AddAP = Index=%d Type=%s BaseAddr=0x%08X");'
+        % (i, t, addr) for i, (_n, addr, t) in enumerate(AP_MAP))
+    return P0_SCRIPT % (CHAIN_TAP_ID, aps)
+
+
+def p0_run(a, do_downup):
+    """feedback P0 한 조건. do_downup 이면 DOWN -> 500ms -> UP 을 재현한다."""
+    import os
+    import tempfile
+    sp = os.path.join(tempfile.gettempdir(), f"sfe76_p0_{os.getpid()}.JLinkScript")
+    with open(sp, 'w') as f:
+        f.write(p0_script_text())
+    logs = []
+    cb = lambda m: logs.append(str(m).rstrip())
+    r = {'downup': do_downup, 'stages': []}
+    jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
+    try:
+        jl.exec_command(f"ScriptFile = {sp}")
+        jl.open()
+        jl.exec_command(f"ScriptFile = {sp}")
+        jl.exec_command("SetcJTAGInitMode = 1")      # ★ USEOAC 와 방향 일치
+        jl.set_tif(TIF_CJTAG)
+        jl.set_speed(10000)                          # ★ 낮추지 않는다
+
+        def attempt(tag):
+            try:
+                jl.connect('E76', speed=10000)
+                err = None
+            except Exception as e:
+                err = str(e)[:70]
+            tc = False
+            try:
+                tc = bool(jl.target_connected())     # ★ 유일한 1차 오라클
+            except Exception:
+                pass
+            r['stages'].append({'tag': tag, 'target_connected': tc, 'err': err})
+            return tc
+
+        ok = attempt('UP')
+        if do_downup and not ok:
+            # SYStem.DOWN -> WAIT 500ms -> SYStem.UP
+            try:
+                jl.close()
+            except Exception:
+                pass
+            time.sleep(0.5)
+            jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
+            jl.exec_command(f"ScriptFile = {sp}")
+            jl.open()
+            jl.exec_command(f"ScriptFile = {sp}")
+            jl.exec_command("SetcJTAGInitMode = 1")
+            jl.set_tif(TIF_CJTAG)
+            jl.set_speed(10000)
+            ok = attempt('DOWN->500ms->UP')
+        r['ok'] = ok
+    except Exception as e:
+        r['fatal'] = str(e)[:110]
+    finally:
+        try:
+            jl.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(sp)
+        except OSError:
+            pass
+    r['log_hits'] = [l for l in logs
+                     if 'SFE76_MANUAL_CHAIN_V2' in l or 'Id:' in l or 'DM ' in l
+                     or 'version' in l.lower()][:4]
+    return r
+
 def axi_health(d):
     out = {'aps': []}
     for name, apbase, _t in AP_MAP:
@@ -1073,6 +1190,8 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--p0', action='store_true',
+                    help='* feedback §5/§6 P0 글자 그대로. 오라클=target_connected()')
     ap.add_argument('--explore', action='store_true',
                     help='세션 게이트를 %d/6 으로 완화. 탐색 전용 — 결론 근거로 쓰지 말 것'
                          % AP_GATE_EXPLORE)
@@ -1102,16 +1221,20 @@ def main():
     ap.add_argument('--speeds', default="10000,4000,2000,1000,500")
     ap.add_argument('--recover', action='store_true',
                     help='★ AP IDR 이 맞는 조건을 찾는다 — 스크립트 유무 × cJTAG 모드')
+    # ❌ .19 에서 기본 off 로 바꾼 것도 같은 폐기 추론. feedback §5 의 정본
+    #   ConfigTargetSettings 는 manual chain 을 **항상** 포함한다.
     ap.add_argument('--tap-script', dest='no_tap_script', action='store_false',
-                    default=True,
-                    help='TAP 선언 스크립트를 깐다 (기본은 안 깖 — 검증된 설정)')
+                    default=False,
+                    help='TAP 선언 스크립트를 깐다 (기본값 — feedback §5)')
     ap.add_argument('--no-tap-script', dest='no_tap_script', action='store_true',
                     help='TAP 선언 스크립트를 깔지 않는다 (브링업 초기 조건)')
     ap.add_argument('--cjtag-mode', type=int, default=CJTAG_MODE)
     ap.add_argument('--min-cmds', dest='full_cmds', action='store_false',
                     help='SetIndexAPBAPToUse/SetCoreBaseAddr/SetHartSel 을 보내지 않는다')
     ap.add_argument('--apidx', type=int, default=0)
-    ap.add_argument('--corebase', type=lambda x: int(x, 0), default=0x81481000)
+    # ❌ .19 의 0x81481000 도 같은 폐기 추론. feedback §5/§6: 첫 성공 전에는
+    #   CoreBase = 0x0 이고, 성공한 뒤에야 0x81480000/APBAP2 와 비교한다.
+    ap.add_argument('--corebase', type=lambda x: int(x, 0), default=0x0)
     ap.add_argument('--discover', action='store_true',
                     help='★ ADIv6 DPIDR1 / BASEPTR0 / BASEPTR1 을 읽는다 (미시도)')
     ap.add_argument('--loose', action='store_true',
@@ -1162,6 +1285,28 @@ def main():
     print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
+
+    if a.p0:
+        print(f"\n{'=' * 70}\n [P0] feedback §5/§6 을 글자 그대로\n{'=' * 70}")
+        print("  device=E76 / cJTAG / 10MHz / SetcJTAGInitMode=1 / hart=0")
+        print("  APB-AP index=0 / CoreBase=0x0 / manual chain (AllowTAPReset=1)")
+        print("  ★ 유일한 성공 오라클 = target_connected() == True")
+        print("    (connect 무예외 / connected() / 로그의 ID / DTM 문구 소실은")
+        print("     전부 성공 신호가 **아니다** - feedback §6)")
+        print("  ★ 2회차는 SYStem.DOWN -> WAIT 500ms -> SYStem.UP 재현.")
+        print("    HCore 시퀀스의 마지막 단계인데 한 번도 안 해봤다.\n")
+        print("---8<---")
+        r = p0_run(a, do_downup=True)
+        if 'fatal' in r:
+            print("FATAL", r['fatal'])
+        for st in r.get('stages', []):
+            print(f"{st['tag']:16s} target_connected={st['target_connected']}"
+                  + (f"  err={st['err']}" if st['err'] else "  (무예외)"))
+        for l in r.get('log_hits', []):
+            print("  log:", l[:90])
+        print("VERDICT:", "TARGET_CONNECTED" if r.get('ok') else "NOT_CONNECTED")
+        print("---8<---")
+        return 0 if r.get('ok') else 6
 
     if a.axi:
         print(f"\n{'=' * 70}\n [AXI] AXI-AP 가 데이터를 전달하나\n{'=' * 70}")

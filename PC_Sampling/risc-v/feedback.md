@@ -5,6 +5,143 @@
 > 목적: 현재 접근 방향이 맞는지 검토하고, 다음 작업자가 바로 이어서 판단할 수 있도록
 > 실측 사실과 권장 순서를 분리해 기록한다.
 
+## 최우선 전제 추가 — 2026-08-11: T32 CMM은 ARM 원본을 RISC-V로 포팅한 코드다
+
+> 이 절이 아래의 모든 T32 스크립트 해석보다 우선한다. 현재 CMM은 처음부터
+> SF-E76 전용으로 작성된 것이 아니라 기존 ARM 코어 제품용 스크립트를 RISC-V에
+> 맞게 수정한 것이다. ARM 원본과의 직접 diff는 확보하기 어렵다. 따라서 CMM에
+> 존재한다는 이유만으로 각 명령을 RISC-V attach 필수조건으로 간주하지 않는다.
+
+### 1. Critical issues
+
+#### 파일 존재와 RISC-V 실행 요구사항을 구분해야 한다
+
+정상 RISC-V `AttachOnly` 호출 경로에서 실행되지 않는 루틴은, 내용이 타깃
+레지스터를 다루더라도 정상 attach의 선행조건으로 사용할 수 없다. 특히 다음은
+ARM 원본의 복구·덤프·분석 골격 또는 공용 SoC 코드가 남은 것일 수 있다.
+
+```text
+Reset Release / Halt Release 서브루틴
+AllCoreAnalysis.cmm
+AttachPrepare.cmm의 clock/reset 판정
+AXI:0xC81024/28/2C/40/44 접근
+MD:0x0 ← 0x6F
+```
+
+실제로 정상 `AttachOnly`는 reset-release를 호출하지 않고 target register write도
+수행하지 않는다. 따라서 다음 추론은 금지한다.
+
+```text
+CMM에 reset-release 코드가 존재
+→ SF-E76 DM attach 전에 reset-release가 필요
+→ J-Link로 0xC81040/44를 따라 써야 함
+```
+
+#### `SYStem.Mode Prepare`와 DAP power policy도 출처가 미확정이다
+
+다음 블록은 정상 실행 경로에 있으므로 **실행된다는 사실**은 강하다.
+
+```cmm
+sys.CONFIG.Slave off
+SYStem.Option.DAPSYSPWRUPREQ OFF
+SYStem.Option.DAPDBGPWRUPREQ ON
+sys.m prepare
+```
+
+하지만 이것이 RISC-V 포팅 때 새로 추가된 것인지, ARM 원본에서 그대로 유지된
+공통 DAP 초기화 정책인지는 알 수 없다. 따라서 J-Link 실패의 원인으로 확정하지
+않고 다음 두 사실만 기록한다.
+
+1. T32 정상 경로는 이 순서로 실행된다.
+2. J-Link 시험은 같은 초기 순서를 정확히 재현하지 못했다.
+
+`Prepare` 내부의 SF-E76 CPU driver 동작도 CMM에서 보이지 않으므로, 이 블록만으로
+숨은 reset/authentication sequence를 추론하지 않는다.
+
+### 2. Potential bugs / 신뢰도 등급
+
+원본 diff가 없으므로 **명시성 + 실제 호출 + 하드웨어 교차검증**으로 CMM 정보를
+등급화한다.
+
+#### 높은 신뢰도 — RISC-V 고유이며 다른 증거와 일치
+
+```cmm
+sys.cpu SF-E76
+sys.config.coredebug.base APB:0x81480000 / 0x81481000
+SYS.CONFIG HARTINDEX 0. 1. 2. 3.
+sys.memaccess SB
+sys.cpuaccess DENIED
+SYS.CONFIG.NEXUS.Type SiFive
+```
+
+이 정보는 SF-E76 이름, RISC-V hart, DM SBA, SiFive Nexus를 직접 지정하며 ROM
+엔트리·T32 trace 스크립트와도 교차검증된다. DM 위치, hart 구성, 무-halt SBA
+접근 및 legacy Nexus topology의 근거로 계속 사용한다.
+
+#### 중간 신뢰도 — SoC 공통일 수 있으나 실측과 일치
+
+```cmm
+DEBUGPORTTYPE CJTAG
+CJTAGFLAGS NOKEEPER USEOAC
+APBAP1/2, AXIAP1, AHBAP1, APBAP3/4 Base
+```
+
+특히 AP map은 J-Link raw AP IDR 6/6과 일치하므로 ARM에서 계승됐더라도 현재
+실리콘에서 유효하다. 반면 `NOKEEPER USEOAC`와 동일한 효과가 J-Link 설정으로
+재현됐는지는 별도 문제다.
+
+#### 낮은 신뢰도 — 호출되지 않거나 ARM 잔존 가능
+
+```text
+별도 reset/halt release 루틴
+덤프·분석 전용 core-enable 판정
+0xC810xx 값을 정상 attach 선행조건으로 해석하는 주장
+ARM Cortex-R 계열 흔적이 남은 HW_INIT/공용 스크립트
+```
+
+이 정보는 주소 후보와 복구 기능의 존재를 알려줄 뿐, J-Link 정상 attach 절차의
+근거로 사용하지 않는다.
+
+### 3. Reliability improvements / diff 없이 판정하는 방법
+
+ARM 원본 diff를 구할 수 없어도 조사를 계속할 수 있다. 각 CMM 사실에 다음 세
+질문을 적용한다.
+
+1. **실제 RISC-V 시작 경로에서 호출되는가?**
+   `T32_Start_RISCV.bat → T32_Startup_RISCV.cmm → main.cmm → AttachOnly`를 기준으로 한다.
+2. **RISC-V 고유 표지가 있는가?**
+   `SF-E76`, `HARTINDEX`, `COREDEBUG.Base`, `memaccess SB`, `NEXUS.Type SiFive`처럼
+   아키텍처가 명시된 설정을 우선한다.
+3. **실측과 독립적으로 일치하는가?**
+   AP IDR, ROM `ARCHID`, ROM entry, 실제 trace 주소 등 하드웨어 결과와 맞는지 본다.
+
+세 조건 중 하나도 만족하지 않는 코드는 정상 attach 설계 근거에서 제외한다.
+호출은 되지만 RISC-V 고유성이 없는 설정은 `공통 초기화 후보`로만 유지한다.
+
+### 4. Suggested tests와 현재 방향
+
+| 정보 | 현재 사용 방법 |
+|---|---|
+| DM base/hart/SBA/Nexus | J-Link 구성과 향후 trace pipeline에 직접 사용 |
+| AP map/cJTAG | 하드웨어 실측과 일치하므로 사용 |
+| DAP power/Prepare | T32와 J-Link의 순서 차이 후보로 유지, 원인 확정 금지 |
+| AXI core-enable reads | read-only 상태 후보로만 사용, target positive control 아님 |
+| reset-release/MD write | 정상 attach 근거에서 제외, 실기 쓰기 금지 |
+
+따라서 현재의 핵심 블로커 표현은 다음이어야 한다.
+
+```text
+T32의 RISC-V 고유 설정으로 DM base/hart/SBA 경로는 확인됐다.
+J-Link에서는 DAP/AP/ROM까지 접근되지만 DM이 응답하지 않는다.
+ARM 원본에서 계승됐을 수 있는 reset/AXI 복구 코드는 원인 또는 해결책으로
+확정할 수 없다.
+```
+
+원본 diff 부재는 reset write를 시도할 이유가 아니라, **불확실한 공통 코드를
+해결 절차에서 제외할 이유**다. 다음 안전한 과제는 실제 AXI target positive
+control, T32 `Prepare`의 공개적으로 재현 가능한 부분, SoC DM power/security
+조건을 확인하는 것이다.
+
 ## 최신 종합 재검토 — 2026-08-11: AP/ROM은 유효, 원인은 아직 미확정
 
 > 이 절이 아래의 모든 과거 피드백보다 우선한다. 최신 STATUS와 코드를 다시

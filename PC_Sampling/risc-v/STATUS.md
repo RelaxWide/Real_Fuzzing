@@ -118,6 +118,41 @@ Prot 8종에서 ROM 양성대조가 유지된 것은 *"시험한 Prot 변경이 
 ⚠ AP IDR 6/6 은 **그 시점의 AP 경로가 재현됐다는 증거**이지, cJTAG 링크가 모든
 조건에서 안정적이라는 일반 증명이 아니다.
 
+### ❌❌❌ 정정 — feedback 이 지정한 P0 를 **지키지 않고 있었다**
+
+`.19` 에서 바꾼 기본값 셋이 **전부 폐기된 `--replay` 추론**에서 나왔다.
+`device` 만 지적받아 고쳤고 나머지는 재검토를 안 했다.
+
+| 항목 | feedback P0 (§5) | 내가 쓰던 값 |
+|---|---|---|
+| `SetcJTAGInitMode` | **1** (`CJTAGFLAGS USEOAC` 와 방향 일치) | `0` ← `.19` |
+| `CoreBase` | **`0x0`** (첫 성공 뒤에야 `0x81480000` 비교) | `0x81481000` ← `.19` |
+| TAP 선언 스크립트 | `ConfigTargetSettings` 에 **항상** | 기본 off ← `.19` |
+| device | `E76` | `E76` (`.26` 에서 복구) |
+| 성공 오라클 | **`target_connected() == True`** | AP IDR 6/6 |
+
+feedback §6 은 다음이 성공 신호가 **아니라고** 명시한다: `connect()` 무예외 종료 /
+`connected()==True`(USB만) / 수동 입력 ID 가 로그에 출력 / DTM 오인 문구 소실.
+
+그리고 이전 `--link` 의 **500kHz 스윕은 지침 위반**이었다 — missing-KEEPER
+workaround 는 OScan1 에서 **500kHz 초과**를 요구한다.
+
+### ❌❌❌ 정정 — `sys.m prepare` 가 끝이 아니다
+
+HCore 전체 시퀀스 (feedback §2):
+```
+Slave OFF / DAPSYSPWRUPREQ OFF / DAPDBGPWRUPREQ ON
+SYStem.Mode Prepare
+SYStem.DOWN → WAIT 500ms → SYStem.UP        ← 한 번도 안 해봤다
+```
+나는 `Prepare` 에서 멈추고 *"T32 는 CPU 에 안 붙는다"* 고 결론냈다. **틀렸다.**
+
+그리고 `SYStem.Option.ResetMode.NDMRST` — T32 가 쓰는 리셋은 **DM 을 통한
+ndmreset** 이지 AXI 레지스터 쓰기가 아니다. `0xC81040` 경로는 애초에 T32 의
+정상 attach 가 하는 일이 아니다. (쓰기 비승인의 근거가 하나 더 늘었다)
+
+→ `--p0` (`.31`) 이 위 표를 전부 지키고 `DOWN → 500ms → UP` 까지 재현한다.
+
 ### 쓰기는 승인하지 않는다
 
 `AXI:0xC81040/44` reset-control write 와 `MD:0x0 ← 0x6F` 는 **정상 attach 에
