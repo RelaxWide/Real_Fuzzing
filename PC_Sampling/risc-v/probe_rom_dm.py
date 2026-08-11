@@ -63,7 +63,11 @@ import time
 from sfe76_link import (require_api, Link, LinkError, AP_MAP,
                         add_common_args, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.29  STICKYERR 비트 수정"
+VERSION = "2026-08-11.30  오류를 판정에 반영"
+
+# ★ 오류가 있는데도 stage='ok' / ROM_CONFIRMED_* 로 갈 수 있었다 (feedback 지적).
+#   STICKYERR / WDATAERR / STICKYORUN, TAR mismatch, DRW 실패, ABORT 후에도
+#   오류가 안 풀리는 경우 — 어느 하나라도 있으면 **확정 판정을 금지**한다.
 
 # ★★ 치명적 버그였다 (feedback 2026-08-11 최신 리뷰 §1).
 #   `1 << 5 + 2` 는 파이썬 우선순위상 `1 << (5+2)` = `1 << 7` 이다.
@@ -200,7 +204,12 @@ class Probe:
         rec['drw'] = hx(v)
         rec['after'] = self.err()
         rec['abort_clears'] = self.abort()
-        rec['stage'] = 'ok' if v is not None else 'drw_fail'
+        af = rec.get('after') or {}
+        has_err = any(af.get(k) for k in ('STICKYERR', 'WDATAERR', 'STICKYORUN'))
+        rec['dp_error'] = has_err
+        # ★ 오류가 있으면 'ok' 로 분류하지 않는다
+        rec['stage'] = ('dp_error' if has_err else
+                        'ok' if v is not None else 'drw_fail')
         rec['dead_pattern'] = (v in DEAD) if v is not None else None
         self.log.append(rec)
         return v, rec
@@ -263,10 +272,20 @@ def run_session(a, idx):
 
 
 def judge(sessions):
-    """여섯 갈래 판정. **유효 세션 3회 미만이면 결론 금지.**"""
+    """여섯 갈래 판정. **유효 세션 3회 미만이면 결론 금지.**
+
+    ★ 그리고 전송 오류가 하나라도 있으면 **확정 판정을 금지**한다.
+      오류가 섞인 값을 근거로 ROM_CONFIRMED_* 를 내면 안 된다.
+    """
     valid = [s for s in sessions if s.get('valid')]
     if len(valid) < 3:
         return 'INSUFFICIENT_VALID_SESSIONS', {}
+
+    bad = [r for s in valid for r in s.get('log', [])
+           if r.get('dp_error') or r.get('stage') in ('tar_mismatch', 'drw_fail')]
+    if bad:
+        return 'TRANSFER_ERRORS_PRESENT', {'bad': len(bad),
+                                           'stages': sorted({r['stage'] for r in bad})}
 
     ev = {}
     for name in TARGET_APS:
@@ -374,6 +393,9 @@ def main():
                 "  전송은 되는데 특정 영역만 거부된다 → Prot/Type/SDeviceEn 조합 시험",
             'ROM_ENTRY_LIKE_NOT_CONFIRMED':
                 "  ROM 처럼 보이나 확정 불가 → BASE/PIDR/CIDR 과 상대 오프셋 재확인",
+            'TRANSFER_ERRORS_PRESENT':
+                "  ★ 전송 오류가 섞여 있다. **값 해석 금지.**\n"
+                "     AP 전송 코드부터 고치고 재측정한다.",
         }.get(verdict, ""))
     return EXIT_OK if verdict.startswith('ROM_CONFIRMED') else EXIT_INSUFFICIENT
 

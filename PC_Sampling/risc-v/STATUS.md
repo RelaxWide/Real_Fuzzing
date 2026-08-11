@@ -1017,7 +1017,57 @@ Could not find supported CPU.
 **connect 성공보다 훨씬 예민하고 빠른 오라클**이다.
 연결이 끝까지 안 가도 **그 숫자만 보면 주소가 맞는지 안다.**
 
-### ★★★ 새 가설 — **리셋이 안 풀린 것**. 지금까지의 증거를 전부 설명한다
+### ⬇ 리셋 가설을 **최우선에서 내린다** (feedback 2026-08-11)
+
+T32 스크립트 확인 결과:
+- **정상 `AttachOnly` 경로는 reset-release 루틴을 호출하지 않는다.**
+- 그 경로에 AXI/APB target register **write 가 없다.**
+- `SYStem.Up` 은 `DynUTLoad.cmm` 에서만 나오고 `AttachOnly → Attach.cmm` 에는 없다.
+  다른 경로의 `SYStem.Up` 을 정상 attach 의 선행 동작으로 쓰면 안 된다.
+- `Attach.cmm` 의 `&LldCLKRST_MPCORE_Addr=0x00C81040` 은 **주소 정의**일 뿐
+  쓰기의 증거가 아니다.
+
+⇒ **`0xC81040/44` 에 T32 값을 따라 쓰는 방향은 근거가 없고 위험하다.**
+동작 중인 SSD 에 대한 reset-control write 금지는 그대로 유지한다.
+리셋/클럭 가설이 완전히 배제된 건 아니지만 **최우선에서는 내린다.**
+
+### ★ 그리고 내 AXI 시험에 구멍이 있었다
+
+T32 가 **코어 enable 판정에 실제로 읽는** 주소:
+
+| 주소 | 의미 | 출처 |
+|---|---|---|
+| `0xC81024` | FCore enable bit0 | `AttachPrepare.cmm` |
+| `0xC81028` | NCore0 bit0 / NCore1 bit16 | `AttachPrepare.cmm` |
+| `0xC8102C` | CMCore enable bit0 | `AttachPrepare.cmm` |
+| `0xC81040` | MPCore clock/reset bitmap | `AllCoreAnalysis.cmm` |
+| `0xC81044` | NCore clock/reset bitmap | `AllCoreAnalysis.cmm` |
+
+**`probe_axi.py` 는 `0xC81020` 과 `0xC81030` 은 읽으면서 그 사이
+`0x24`/`0x28`/`0x2C` 를 건너뛰었다.**
+⇒ **"AXI 전부 0" 결과는 결정적이지 않았다.**
+그리고 `0x40/44` 는 T32 가 `DATA.LONG` 으로 **읽는다** — write-only 가 아니다.
+
+### P0 — `axi` 프리셋으로 다섯 주소만 다시 읽는다
+
+```bash
+sudo python3 standalone.py --ap AXIAP1 --addrs axi --sessions 3
+```
+읽기 전용이고 주소마다 이름이 붙어 나온다.
+
+| 결과 | 다음 |
+|---|---|
+| `STICKYERR`/`WDATAERR` 발생 | **값 해석 중단.** AP 전송 코드부터 |
+| `0x24/28/2C` 에 nonzero·서로 다른 값 | ★ **AXI 경로는 살아 있다.** reset 추종 중단, APB DM 의 mapping/security 로 |
+| 다섯 개 전부 0 · 무오류 | 정상 disabled 인지 RAZ/security 인지 **구분 불가** → SoC 레지스터 사양 필요 |
+| `0x40/44` 만 의미 있는 값 | AXI 전송은 동작. 레지스터 배치 해석이 다른 것 |
+| 세션 간 불일치 | **확정 금지.** 세션 유효성부터 |
+
+> `probe_rom_dm.py` 도 고쳤다 — `STICKYERR`/`WDATAERR`/`STICKYORUN`,
+> TAR mismatch, DRW 실패가 있으면 `stage=ok` 와 `ROM_CONFIRMED_*` 를
+> **금지**하고 `TRANSFER_ERRORS_PRESENT` 를 낸다. 네 시나리오로 검증했다.
+
+### (참고) 리셋 가설 — 최우선에서 내렸다
 
 T32 CMM 에 코어별 **`Reset Release` / `Halt Release`** 서브루틴이 있다
 (`ALL MPCore Reset Release`, `All MPCore Halt Release`, `Ncore Reset Release` …).

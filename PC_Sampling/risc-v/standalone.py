@@ -41,7 +41,20 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.10  default-line 판별"
+VERSION = "standalone 2026-08-11.11  axi 프리셋 (T32 판정 주소)"
+
+# ★ T32 가 코어 enable 판정에 **실제로 읽는** AXI 주소 (CMM 실물, feedback):
+#     0xC81024  FCore  enable bit0                (AttachPrepare.cmm)
+#     0xC81028  NCore0 bit0 / NCore1 bit16        (AttachPrepare.cmm)
+#     0xC8102C  CMCore enable bit0                (AttachPrepare.cmm)
+#     0xC81040  MPCore clock/reset bitmap         (AllCoreAnalysis.cmm)
+#     0xC81044  NCore  clock/reset bitmap         (AllCoreAnalysis.cmm)
+#   이전 시험은 0xC81020 과 0xC81030 은 읽으면서 **그 사이 0x24/28/2C 를
+#   건너뛰었다.** ⇒ "AXI 전부 0" 결과는 결정적이지 않았다.
+#   그리고 0x40/44 는 T32 가 DATA.LONG 으로 **읽는다** — write-only 가 아니다.
+AXI_T32_ADDRS = [(0xC81024, 'FCore  en bit0'), (0xC81028, 'NCore0 b0/NCore1 b16'),
+                 (0xC8102C, 'CMCore en bit0'), (0xC81040, 'MPCore clk/rst'),
+                 (0xC81044, 'NCore  clk/rst')]
 
 # ★★ 인터커넥트의 **default slave 라인**을 식별한다.
 #   실측 14/14 로 확인: 응답이 주소가 아니라 **16바이트 정렬**만 따라간다.
@@ -377,10 +390,16 @@ def main():
     if a.version:
         print(VERSION)
         return 0
-    if a.addrs.strip() == 'dmi':
+    if a.addrs.strip() == 'axi':
+        a.addrs = [x for x, _n in AXI_T32_ADDRS]
+        a.dmi_mode = False
+        a.axi_mode = False
+        a.axi_mode = True
+    elif a.addrs.strip() == 'dmi':
         # RISC-V Debug Spec 의 DMI 주소 × stride 4
         a.addrs = [d * 4 for d, _n in DMI_REGS]
         a.dmi_mode = True
+        a.axi_mode = False
     else:
         a.addrs = [int(x, 0) for x in a.addrs.split(',') if x.strip()]
         a.dmi_mode = False
@@ -448,7 +467,12 @@ def main():
         if un:
             print(f"{n}: {un}/{len(apd['reads'])} 이 **default slave 라인** "
                   f"= 미매핑 (데이터 아님)")
-        if len(vs) == 1:
+        if getattr(a, 'axi_mode', False) and len(vs) == 1:
+            nm = {x: n for x, n in AXI_T32_ADDRS}
+            for x, _n in AXI_T32_ADDRS:
+                print(f"  0x{x:08X} {nm[x]:22s} = "
+                      f"{apd['reads'].get(f'0x{x:08X}')}")
+        elif len(vs) == 1:
             # ★ 전부 같아도 **그 값이 무엇인지**는 찍는다. 이전엔 생략해서
             #   "u1 만 나오고 끝" 이 됐다 — 정보를 버리고 있었다.
             print(f"{n}= 전부 {vs[0]}")
@@ -458,6 +482,11 @@ def main():
                 print(" ".join(
                     f"{names.get(int(k, 16), k)}={v}"
                     for k, v in apd['reads'].items()))
+            elif getattr(a, 'axi_mode', False):
+                nm = {x: n for x, n in AXI_T32_ADDRS}
+                for x, _n in AXI_T32_ADDRS:
+                    v = apd['reads'].get(f"0x{x:08X}")
+                    print(f"  0x{x:08X} {nm[x]:22s} = {v}")
             elif len(AP_MAP) == 1:      # AP 하나만 볼 땐 주소별로 낸다
                 print(" ".join(f"{k.replace('0x', '')}={v}"
                                 for k, v in apd['reads'].items()))
