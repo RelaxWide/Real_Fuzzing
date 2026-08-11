@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.25  J-Link 이 자기 혼자 건 CTRL/STAT 을 먼저 본다"
+VERSION = "standalone 2026-08-11.26  device 기본값 E76 으로 복귀 (실측 근거)"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -213,8 +213,18 @@ def is_default_line(addr, val):
 
 # ★★ 2026-08-11 --replay 실측: AP IDR **6/6 일치**, DPIDR=6BA0009D, CTRL=F0000000.
 #   ⇒ DAP·AP 계층은 완전히 정상이다. 기본값을 그 검증된 조합으로 맞춘다.
-#     cJTAG mode 0 / device 'RISC-V' / CoreBase 0x81481000 / TAP 스크립트 없음
-TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE = 7, 10000, 0, 'RISC-V'
+#     cJTAG mode 0 / CoreBase 0x81481000 / TAP 스크립트 없음
+#
+# ⚠ 그런데 `.19` 에서 device 까지 'RISC-V' 로 바꾼 것은 **잘못된 추론**이었다.
+#   근거로 삼은 --replay 는 **connect=X 로 둘 다 실패**했다. AP 6/6 은 raw DAP
+#   접근에서 나온 것이고 그건 device 이름과 무관하다 — replay 는 device 선택에
+#   대해 아무것도 증명하지 않았는데 "검증된 조합" 으로 싸잡았다.
+#   실측은 반대를 말한다:
+#     · 사용자: "RISC-V 로 하면 connect 가 제대로 안 되고 E76 으로 해야 된다"
+#     · --recover 스윕: 유효 IDCODE 는 **mode=1 device=E76** 에서 나왔다
+#   ⇒ device 는 'E76' 으로 되돌린다.
+#   (지금 하는 raw DAP 작업엔 영향이 없지만, 기본값이 실측과 어긋나면 안 된다)
+TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE = 7, 10000, 0, 'E76'
 # ★ **선언값과 읽은 값을 구분한다.** 실측:
 #     선언 0x5BA00477 (알려진 ARM DAP) → DPIDR 읽기 = 0x6BA0009D   ← 유효
 #     선언 0x6BA0009D (읽은 값 그대로) → DPIDR 읽기 = 0xFFFFFFFF   ← 무효
@@ -484,7 +494,9 @@ def replay(a):
             r = {'attempt': attempt, 'corebase': f"0x{cb_addr:08X}"}
             jl.exec_command(f"CORESIGHT_SetCoreBaseAddr = 0x{cb_addr:X}")
             try:
-                jl.connect('RISC-V', speed=10000)   # ★ device 는 RISC-V
+                # ★ replay 는 f45f0ca 기록의 **글자 그대로의 재생**이므로
+                #   여기만 'RISC-V' 를 유지한다. 다른 모드의 기본값은 E76 이다.
+                jl.connect('RISC-V', speed=10000)
                 r['connect'] = True
             except Exception as e:
                 r['connect'] = False

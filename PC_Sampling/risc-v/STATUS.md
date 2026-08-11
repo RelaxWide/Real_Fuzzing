@@ -116,7 +116,15 @@ J-Link       Plus, FW V13 / 소프트웨어 **V9.66** (V9.12 → 업그레이드
 > T32 가 `SB:`(DM 의 SBA)로 가는 건 T32 의 사정이지 유일한 경로라는 뜻이 아니다.
 >
 > `--addrs trace` 프리셋 추가 (`.19`). 기본값도 검증된 조합으로 교체:
-> `cJTAG mode 0 / device RISC-V / CoreBase 0x81481000 / TAP 스크립트 없음`.
+> `cJTAG mode 0 / CoreBase 0x81481000 / TAP 스크립트 없음`.
+>
+> ❌ **정정 (`.26`)** — 이때 `device` 까지 `RISC-V` 로 바꾼 것은 잘못된 추론이었다.
+> 근거로 삼은 `--replay` 는 **`connect=X` 로 둘 다 실패**했다. AP 6/6 은 raw DAP
+> 접근에서 나온 것이고 device 이름과 무관하다 — replay 는 device 선택에 대해
+> 아무것도 증명하지 않았는데 "검증된 조합" 으로 싸잡았다. 실측은 반대다:
+> 사용자 관측(`RISC-V` 는 connect 안 됨, `E76` 이어야 함)과 `--recover` 스윕
+> (유효 IDCODE 는 **mode=1 device=E76**). ⇒ `DEVICE = 'E76'` 으로 복귀.
+> (`--replay` 만 기록의 글자 그대로의 재생이므로 `RISC-V` 유지)
 
 > ### ❌ 실측 (`--addrs trace`, 유효 세션 6/6) — **트레이스 블록은 AP 로 안 닿는다**
 >
