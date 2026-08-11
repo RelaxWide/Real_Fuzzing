@@ -49,7 +49,18 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.16  DM 스윕 (alive 게이트)"
+VERSION = "2026-08-11.17  게이트 정정 (target_connected)"
+
+# ★ 게이트를 잘못 걸었었다. pylink 정의:
+#     connected()        = self.opened() and JLINKARM_EMU_IsConnected()
+#                          → **J-Link 프로브(USB)가 꽂혔는가.** 타깃과 무관하다
+#     target_connected() = self.connected() and JLINKARM_IsConnected()
+#                          → **타깃에 붙었는가.** 이게 우리가 원하는 것
+#   그리고 pylink 의 @connection_required 는
+#     if not self.target_connected(): raise "Target is not connected."
+#   즉 halted() 가 그 예외를 던진다는 건 **target_connected() 가 False** 라는 뜻이다.
+#   `connected` 로 게이트하면 USB 만 확인하는 셈이라 늘 통과한다 —
+#   그래서 SESSION_ALIVE_NO_DM 이 나왔다. 잘못된 판정이었다.
 
 # ★ TAP ID 를 선언하면 JTAG-DTM 오인이 사라진다(실측: DTM오인아님 0/9 → 78/90).
 #   ⚠ 다만 "유효 IDCODE" 자체는 **우리가 선언한 값을 되돌려받은 것**일 수 있다.
@@ -244,8 +255,8 @@ def dmsweep(a):
                 for _ in range(a.reps):
                     r = spawn('BaseAddr', apidx, base, 'E76', hart, a.tries, DEVIDS[0])
                     n += 1
-                    if r.get('connected') is not True:
-                        continue                      # ← 무효. 실패로 세지 않는다
+                    if r.get('target_connected') is not True:
+                        continue          # ← 무효(타깃 미연결). 실패로 세지 않는다
                     alive += 1
                     p = r.get('probe') or {}
                     if isinstance(p.get('halted'), bool):
@@ -256,18 +267,19 @@ def dmsweep(a):
                 if alive:
                     rows.append((base, apidx, hart, alive, n, halted, errs))
                     print(f"  base=0x{base:<7X} AP={apidx} hart={hart}  "
-                          f"alive={alive}/{n}  halted={halted}/{alive}"
+                          f"target={alive}/{n}  halted={halted}/{alive}"
                           + ("   ★★ DM" if halted else ""))
                     for e in sorted(errs)[:1]:
                         print(f"      {e}")
 
     print(f"\nv={VERSION.split()[0]}  reps={a.reps}")
     if not rows:
-        print("유효 시행이 있는 조합 없음 — 세션이 안정적으로 살지 않는다")
-        print("VERDICT: NO_VALID_SESSION")
+        print("**target_connected 가 한 번도 True 가 아니다.**")
+        print("연결이 타깃까지 도달하지 못한다 — DM 이전 계층의 문제다.")
+        print("VERDICT: TARGET_NEVER_CONNECTED")
         return EXIT_INSUFFICIENT
     for base, apidx, hart, alive, n, halted, _e in rows:
-        print(f"base=0x{base:X} AP={apidx} hart={hart} alive={alive}/{n} halted={halted}")
+        print(f"base=0x{base:X} AP={apidx} hart={hart} target={alive}/{n} halted={halted}")
     hit = [r for r in rows if r[5] > 0]
     print("VERDICT:", "DM_REACHED" if hit else "ALIVE_BUT_NO_DM")
     if not hit:
@@ -303,8 +315,8 @@ def focus(a):
                 g = agg[k]
                 g['n'] += 1
                 g['connect'] += bool(r.get('connect'))
-                g['connected'] += (r.get('connected') is True)
-                g['tconn'] += (r.get('target_connected') is True)
+                g['connected'] += (r.get('connected') is True)     # USB 프로브
+                g['tconn'] += (r.get('target_connected') is True)  # ★ 타깃
                 p = r.get('probe') or {}
                 h = p.get('halted')
                 if isinstance(h, bool):
@@ -325,9 +337,9 @@ def focus(a):
     print(f"\nv={VERSION.split()[0]}  reps={a.reps}")
     for (apidx, hart), g in sorted(agg.items()):
         print(f"AP={apidx} hart={hart} conn={g['connect']}/{g['n']} "
-              f"alive={g['connected']}/{g['n']} halted={g['halted']}/{g['n']}")
+              f"target={g['tconn']}/{g['n']} halted={g['halted']}/{g['n']}")
     best = [k for k, g in agg.items() if g['halted'] > 0]
-    alive = [k for k, g in agg.items() if g['connected'] > 0]
+    alive = [k for k, g in agg.items() if g['tconn'] > 0]   # ★ USB 아니라 타깃
     print("VERDICT:", "DM_REACHED" if best else
           ("SESSION_ALIVE_NO_DM" if alive else "SESSION_DIES_AFTER_CONNECT"))
     if not alive:
