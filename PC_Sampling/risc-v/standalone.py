@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.4"
+VERSION = "standalone 2026-08-11.5"
 
 # ★ 결과를 **손으로 옮겨 적는** 환경이다. 그래서 기본 출력을 3줄로 줄인다.
 #   전체가 필요하면 --full, 파일이 필요하면 --json.
@@ -51,11 +51,15 @@ VERSION = "standalone 2026-08-11.4"
 #     ③ AP 별로 읽은 값이 **몇 종류**인가 (1종 = 변화 없음)
 
 TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE = 7, 10000, 1, 'E76'
-# ★ 실측으로 읽은 이 칩의 TAP IDCODE. part=0xBA00 = ARM CoreSight DAP 계열.
-#   자동 검출이 읽던 0x00000001 은 스캔 실패였지 칩의 값이 아니었다.
-#   (0x11013913 은 DPIDR 레지스터로 다른 것이다 — 둘 다 참일 수 있다)
-REAL_TAP_ID = 0x6BA0009D
-CHAIN_TAP_ID = REAL_TAP_ID
+# ★ **선언값과 읽은 값을 구분한다.** 실측:
+#     선언 0x5BA00477 (알려진 ARM DAP) → DPIDR 읽기 = 0x6BA0009D   ← 유효
+#     선언 0x6BA0009D (읽은 값 그대로) → DPIDR 읽기 = 0xFFFFFFFF   ← 무효
+#   J-Link 은 **선언된 ID 로 어떤 프로토콜로 말할지**를 정한다. 0x5BA00477 은
+#   알려진 CoreSight DAP 이라 ARM DAP 경로를 타고, 0x6BA0009D 는 모르는 ID 라
+#   다른 처리로 빠져 스캔이 깨진다.
+#   ⇒ **선언은 0x5BA00477**, 그 상태에서 읽히는 0x6BA0009D 가 실리콘의 IDCODE.
+OBSERVED_TAP_ID = 0x6BA0009D      # 실리콘에서 읽은 값 (선언용 아님)
+CHAIN_TAP_ID = 0x5BA00477         # J-Link 에 선언하는 값
 
 AP_MAP = [("APBAP1", 0x10000, "APB-AP"), ("APBAP2", 0x20000, "APB-AP"),
           ("AXIAP1", 0x30000, "AXI-AP"), ("AHBAP1", 0x40000, "AHB-AP"),
@@ -212,7 +216,12 @@ def session(a, idx):
                 out['error'] = f"coresight_configure: {e}"
                 return out
 
-        out['DPIDR'] = hx(d.dpr(0))
+        dpidr = d.dpr(0)
+        out['DPIDR'] = hx(dpidr)
+        # ★ DPIDR 이 무효면 그 세션의 AP 값은 **전부 무효**다.
+        #   bit0 은 RAO 이므로 짝수이거나 0/0xFFFFFFFF 면 데이터가 아니다.
+        out['dpidr_ok'] = (dpidr is not None and (dpidr & 1) == 1
+                           and dpidr not in (0x00000001, 0xFFFFFFFF))
         d.dpw(DP_ABORT, 0x1E)
         d.dpw(DP_CTRL, 0x50000000)
         for _ in range(30):
@@ -221,7 +230,7 @@ def session(a, idx):
             if c and c & (1 << 29):
                 break
         out['CTRL'] = decode_ctrl(d.dpr(DP_CTRL))
-        out['ok'] = bool(out['CTRL'].get('CDBGACK'))
+        out['ok'] = bool(out['CTRL'].get('CDBGACK')) and out['dpidr_ok']
 
         for name, base, _t in AP_MAP:
             csw = d.apr(base, OFF_CSW)
@@ -299,6 +308,10 @@ def main():
                     errs[k] = errs.get(k, 0) + 1
 
     print(f"\n---8<---")
+    bad = [r for r in runs if not r.get('dpidr_ok')]
+    if bad:
+        print(f"\n⚠⚠ DPIDR 무효 세션 {len(bad)}/{a.sessions} — "
+              f"그 세션의 AP 값은 **전부 무효**다. 해석하지 말 것.")
     print(f"ok={len(ok)}/{a.sessions} DPIDR={(last or {}).get('DPIDR')} "
           f"CTRL={((last or {}).get('CTRL') or {}).get('raw')}")
     print("ERR " + (" ".join(f"{k}={v}" for k, v in sorted(errs.items()))
