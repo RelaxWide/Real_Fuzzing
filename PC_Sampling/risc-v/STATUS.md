@@ -1016,40 +1016,52 @@ Could not find supported CPU.
 **connect 성공보다 훨씬 예민하고 빠른 오라클**이다.
 연결이 끝까지 안 가도 **그 숫자만 보면 주소가 맞는지 안다.**
 
-### P0 — DM version 오라클로 **AP × CoreBase** 를 훑는다
+### ★★★ 새 가설 — **리셋이 안 풀린 것**. 지금까지의 증거를 전부 설명한다
+
+T32 CMM 에 코어별 **`Reset Release` / `Halt Release`** 서브루틴이 있다
+(`ALL MPCore Reset Release`, `All MPCore Halt Release`, `Ncore Reset Release` …).
+**설계가 그걸 요구한다는 뜻이다.** 그리고 우리는 리셋을 푸는 동작을
+**한 번도 한 적이 없다.**
+
+| 관측 | 상태 | 리셋 가설로의 설명 |
+|---|---|---|
+| DP 통신 / DPIDR | 정상 | DP 는 **항상-켜짐 디버그 전원 도메인** |
+| DAP 전원 양쪽 ACK | 정상 | 같은 도메인 |
+| AP 6개 IDR 6/6 일치 | 정상 | AP 레지스터도 그 도메인 |
+| **APB 너머 메모리** | **전부 버스 기본값** | ★ 그 버스/서브시스템이 리셋이면 정확히 이렇다 |
+| **DM `dmstatus`** | `0xEAFFFFFE` → version 14 | ★ 같은 이유 |
+| **트레이스 `0xFD......`** | 전부 기본값 | ★ 같은 이유 |
+
+**"디버그 링크는 살아 있는데 그 너머가 통째로 죽어 있다"** — 리셋 미해제가
+이 그림을 그대로 만든다. 주소를 아무리 바꿔도 전부 `version 14` 였던 것도
+이걸로 설명된다: **주소 문제가 아니라 그 버스가 응답을 안 하는 것.**
+
+**추가 정황:** T32 는 `sys.option resetmode.ndmrst` 를 쓰고,
+HCore 는 `SYStem.DOWN → 500ms → SYStem.UP` 을 한다. 둘 다 리셋 제어다.
+
+### P0 — `Reset Release` 서브루틴의 **실제 레지스터 접근**을 확보한다
+
+`T32_SEARCH.md` 의 우선순위를 이걸로 바꾼다. 그 서브루틴 안의 다음 줄들:
+
+```
+Data.Set  <접근클래스>:<주소>  %<폭>  <값>      ← 이게 핵심
+PER.Set   ...
+```
+
+필요한 것: **접근 클래스(`APB:`/`AHB:`/`SB:`/`DAP:`), 주소, 쓰는 값, 순서.**
+`GOSUB`/`Data.Set` 이 들어간 줄만 있으면 된다.
+
+**이게 있으면 우리가 J-Link 으로 그대로 재현할 수 있다** — 리셋 해제는
+DM 이 아니라 **일반 버스 레지스터 쓰기**일 가능성이 높고, 그건 우리가
+접근 가능한 AP 로 할 수 있다.
+
+### P0.1 — 그 전에 AP 격자는 한 번 돌려둔다
 
 ```bash
-sudo ./dmver.sh
+git pull && sudo ./dmver.sh            # ← --aps 를 받는 새 버전
 ```
-
-**CoreBase 후보를 훑어도 전부 `version 14` 였다.** 그런데 그 측정은
-**AP 를 index 0(APBAP1) 하나로 고정**한 것이다. APB-AP 는 **네 개**(0,1,4,5)고
-AHB-AP(3)도 있다. **주소를 더 찍기 전에 AP 를 바꿔봐야 한다.**
-
-`dmver.sh` 가 이제 **AP × base 격자**를 훑는다. AP 타입에 맞는 셀렉터를
-자동으로 고른다(0/1/4/5→`SetIndexAPBAPToUse`, 3→`SetIndexAHBAPToUse`).
-
-```
-AP  base         DMver  spec
-0(APB) 0x81480000   14     UNSUPPORTED
-1(APB) 0x81480000   2      ...            <<<< 유효 DM. 여기다
-```
-
-| version | |
-|---|---|
-| **2 / 3** | ★★★ **그 AP·base 가 답이다** |
-| 14 | `0xEAFFFFFE`(버스 기본값)를 읽음 = 아님 |
-| `-` | version 보고 없음 = 읽기 전 실패 |
-
-넓히는 순서:
-```bash
-sudo ./dmver.sh --aps 3                                    # AHB-AP
-sudo ./dmver.sh --bases 0x81490000,0x81400000,0x0          # base 확대
-```
-
-**여기서도 안 나오면 DM 위치는 실측으로 못 찾는다** → `ASK.md`.
-다만 그때의 질문은 지금까지와 격이 다르다: *"AP 셀렉터 4종 × CoreBase N종을
-DM version 오라클로 훑었고 전부 14(=버스 기본값)였다"* 는 구체적 증거가 붙는다.
+AP 를 index 0 하나로 고정한 채 주소만 훑었다. AP 4종 × base 2종 = 8조합.
+**리셋 가설이 맞다면 여기서도 전부 14 가 나올 것이다** — 그것도 가설의 검증이다.
 
 ### 교훈 — 세 번 반복된 것
 
