@@ -1,6 +1,6 @@
 # SF-E76 브링업 — 현황 (자립 문서)
 
-> 2026-08-10. **이 문서 하나로 이어받을 수 있게 쓴다.**
+> 2026-08-11. **이 문서 하나로 이어받을 수 있게 쓴다.**
 > 상세 이력 `BRINGUP_riscv_v10.md` / 외부 검토 `feedback.md` / 실행법 `README.md`
 
 ---
@@ -133,7 +133,7 @@ RISCV_SetHartSel      = 0
 `SYStem.CONFIG.NEXUS.Type SiFive` = SEGGER 의 **SiFive N-Trace** 지원과 같은 것.
 → **커버리지 수집 계층의 설계 불확실성이 거의 사라졌다.**
 
-### ★★ 이것이 여는 우회로
+### 1.2c-1 ★★ 이것이 여는 우회로
 
 트레이스 블록은 `SB:` = **SBA** 로 접근한다. SBA 는 **DM 의 일부**라 우리가 막힌
 지점에 걸린다. **그런데 AXI-AP 는 시스템 메모리로 가는 독립 경로다.**
@@ -142,6 +142,31 @@ RISCV_SetHartSel      = 0
 - AP 레지스터 접근은 **이미 동작 확인됨**(IDR 6/6, TAR 되읽기)
 - 이전 `probe_trace_regs.py` 의 실패는 priming 버그와 AP 미확인 상태에서의 측정
   → **증거로서 무효.** 다시 재야 한다.
+
+### 1.2d ★★★ AP 맵 확정 — IDR 실측 (2026-08-10)
+
+| T32 선언 | IDR | CLASS | TYPE | 판정 |
+|---|---|---|---|---|
+| APBAP1 `@0x10000` APB-AP | `0x09130006` | 8 MEM-AP | 6 = APB4/5 | ✅ |
+| APBAP2 `@0x20000` APB-AP | `0x09130006` | 8 MEM-AP | 6 = APB4/5 | ✅ |
+| AXIAP1 `@0x30000` AXI-AP | `0x09130004` | 8 MEM-AP | **4 = AXI3/4** | ✅ |
+| AHBAP1 `@0x40000` AHB-AP | `0x09130001` | 8 MEM-AP | **1 = AHB3** | ✅ |
+| APBAP3 `@0x50000` APB-AP | `0x09130006` | 8 MEM-AP | 6 = APB4/5 | ✅ |
+| APBAP4 `@0x60000` APB-AP | `0x09130006` | 8 MEM-AP | 6 = APB4/5 | ✅ |
+
+**전 AP DESIGNER = `0x489` = SiFive — DPIDR 의 DESIGNER 와 동일.**
+
+**이건 우연일 수 없다.** IDR 의 TYPE 은 우리가 넣은 적 없는 값인데
+**T32 선언과 6개 전부 일치**한다(APB→6, AXI→4, AHB→1). stale 값이나 착시라면
+AXI 자리에서 4가, AHB 자리에서 1이 나올 이유가 없다. 따라서:
+
+1. **AP 주소(`0x10000`~`0x60000`)가 맞다.** ADIv6 주소 지정 해석이 옳았다.
+2. **`SELECT` 가 AP 를 실제로 전환한다.** 6개가 서로 다른 값을 준다.
+3. **6개 AP 가 전부 실재한다.** 브링업 내내 미확인이던 항목이 닫혔다.
+4. **AP 접근 경로가 완전히 살아 있다.** DP → SELECT → AP 읽기가 동작한다.
+
+> `0x80000000` 이 간헐적으로 뒤쪽 AP 에 붙는 건 **J-Link API 에러 센티널**이지
+> 값이 아니다. 재시도로 사라진다. `is_error()` 로 걸러 실재 집계에서 뺐다.
 
 ### 1.3 ★ T32 커버리지 메커니즘 (`NexusTracedatadump.cmm` 실물)
 
@@ -342,13 +367,16 @@ AXI-AP 우회가 된다 해도 J-Link 의 정규 경로로는 못 쓰고, **raw 
 
 | 파일 | 목적 | 상태 |
 |---|---|---|
-| `sfe76_link.py` | **연결 계층 정식 모듈.** checked API(`connect_checked`/`halt_checked`/`read_pc`/`resume_checked`) | 사용 중 |
-| **`probe_ap_raw.py`** | **DP→AP 직접.** AP 실재(IDR) / TAR 되읽기 / DM 읽기 | ← **다음 실행** |
+| `sfe76_link.py` | **연결 계층 정식 모듈.** `open_dap`(전원만 요구) / `dap_power` / `connect_checked` / `halt_checked` | 사용 중 |
+| **`probe_ap_raw.py`** | **DP→AP 직접.** IDR·**CSW.DeviceEn**·TAR 되읽기·임의주소(`--addrs trace`) | ← **다음 실행** |
+| `find_dm.py` | DM 위치 탐색. `--devices`(배제됨) / `--sweep`(문법×AP×CoreBase 48조합) | `--sweep` 미실행 |
 | `probe_dap.py` | DP 계층 — DPIDR / 전원 ACK / AP 개수 비교 | 역할 완료 (G0 통과) |
-| `probe_trace_regs.py` | 트레이스 레지스터에 MEM-AP 로 닿는지 | 실패 (증거 약함) |
-| `probe_dm.py` | ~~DM aperture 읽기~~ | **설계 결함 — 순환.** `probe_ap_raw.py` 로 대체 |
+| `probe_trace_regs.py` | 트레이스 레지스터에 MEM-AP 로 닿는지 | 결과 **무효** (§6) |
+| `probe_dm.py` | ~~DM aperture 읽기~~ | **설계 결함(순환).** `probe_ap_raw` 로 대체 |
 | `verify_halt_pc.py` | halt/PC/resume (**보조 트랙**) | halt 실패로 막힘 |
-| `diagnose_connect.py` | 첫 connect 실패 원인 (후보별 프로세스 격리) | 보조 |
+| `diagnose_connect.py` / `find_haltable.py` | 연결 원인 분리 (프로세스 격리) | 보조 |
+| **`ASK.md`** | **벤더/SEGGER 질문서.** 그대로 잘라 보내면 됨 | ← **P0 와 동시 발송 권장** |
+| **`T32_SEARCH.md`** | T32 스크립트에서 찾을 것 우선순위 | 진행 중 |
 | `backup/` | 역할 끝난 도구 + 각각이 밝혀낸 것 | 참고 |
 
 **종료 코드:** 0 정상 / 2 connect / 3 halt / 4 PC / **5 resume 실패(보드 복구 필요)** / 6 불충분
@@ -427,232 +455,100 @@ AXI-AP 우회가 된다 해도 J-Link 의 정규 경로로는 못 쓰고, **raw 
 
 ---
 
-## 6. 다음 할 일
+## 6. 시험 이력 — 무엇이 닫혔고 무엇이 무효인가
 
-### ⚠ `probe_dm.py` 결과는 무효다 (2026-08-10)
+> **결과를 "실패" 로만 적지 않는다.** 닫힌 것 / 반증된 것 / **증거로서 무효인 것**을
+> 구분한다. 무효를 실패로 세다가 가설 E·F 를 둘 다 잘못 세웠다.
 
-```
-유효 세션 확보됨(DAP 전원 ACK) → 그런데 전 레지스터 읽기 실패
-```
-**이건 DM 에 대한 증거가 아니다.** `memory_read32` 는 J-Link 의 **CPU 컨텍스트**를
-거치고, CPU 컨텍스트는 **DM 이 active 여야** 생긴다. 우리가 알고 싶은 게 바로 DM
-상태이므로 **순환**이다 — 물어볼 수 없는 질문을 물었다.
-→ 가설 B 판정에 이 결과를 쓰지 말 것. `probe_ap_raw.py` 로 대체.
-
-### ★★★ AP 맵 확정 — IDR 실측 (2026-08-10)
-
-| T32 선언 | IDR | CLASS | TYPE | 판정 |
-|---|---|---|---|---|
-| APBAP1 `@0x10000` APB-AP | `0x09130006` | 8 MEM-AP | 6 = APB4/5 | ✅ |
-| APBAP2 `@0x20000` APB-AP | `0x09130006` | 8 MEM-AP | 6 = APB4/5 | ✅ |
-| AXIAP1 `@0x30000` AXI-AP | `0x09130004` | 8 MEM-AP | **4 = AXI3/4** | ✅ |
-| AHBAP1 `@0x40000` AHB-AP | `0x09130001` | 8 MEM-AP | **1 = AHB3** | ✅ |
-| APBAP3 `@0x50000` APB-AP | `0x09130006` | 8 MEM-AP | 6 = APB4/5 | ✅ |
-| APBAP4 `@0x60000` APB-AP | `0x09130006` | 8 MEM-AP | 6 = APB4/5 | ✅ |
-
-**전 AP DESIGNER = `0x489` = SiFive — DPIDR 의 DESIGNER 와 동일.**
-
-**이건 우연일 수 없다.** IDR 의 TYPE 은 우리가 넣은 적 없는 값인데
-**T32 선언과 6개 전부 일치**한다(APB→6, AXI→4, AHB→1). stale 값이나 착시라면
-AXI 자리에서 4가, AHB 자리에서 1이 나올 이유가 없다. 따라서:
-
-1. **AP 주소(`0x10000`~`0x60000`)가 맞다.** ADIv6 주소 지정 해석이 옳았다.
-2. **`SELECT` 가 AP 를 실제로 전환한다.** 6개가 서로 다른 값을 준다.
-3. **6개 AP 가 전부 실재한다.** 브링업 내내 미확인이던 항목이 닫혔다.
-4. **AP 접근 경로가 완전히 살아 있다.** DP → SELECT → AP 읽기가 동작한다.
-
-> `0x80000000` 이 간헐적으로 뒤쪽 AP 에 붙는 건 **J-Link API 에러 센티널**이지
-> 값이 아니다. 재시도로 사라진다. `is_error()` 로 걸러 실재 집계에서 뺐다.
-
-### `probe_ap_raw.py` 1차 결과 (2026-08-10)
-
-```
-[1] IDR 실재   6개 AP 전부 3/3
-[2] TAR 되읽기 0/3  0/3  2/3  2/3  2/3  2/3      (실행 A)
-               0/3  3/3  3/3  3/3  3/3  3/3      (실행 B)
-[3] DM 읽기    전부 실패
-```
-
-**[2] 는 또 순서 함정이다 — 네 번째.** 두 실행 모두 **첫 번째로 시험한 AP
-(APBAP1)만 0/3**, 나머지는 2~3/3. AP 의 성질이 아니라 **첫 트랜잭션의 성질**이다.
-DAP 의 AP 접근은 파이프라인이라 SELECT 를 바꾼 직후 한 박자가 빈다.
-→ `select()` 에 **priming(버리는 읽기)** + 실패 시 1회 재시도를 넣었다.
-
-**그래도 [2] 가 대부분 성공한다는 건 큰 진전이다.**
-쓴 값이 그대로 돌아온다 = **AP 로 가는 경로가 살아 있다.**
-"우리 코드로는 AP 접근이 원래 안 된다" 는 오랜 불확실성이 끝났고,
-`probe_trace_regs.py` 의 `[B]` 실패도 이제 다시 봐야 한다.
-
-**[1] 은 아직 못 믿는다.** 6개가 전부 실재로 나왔는데, 실재가 확인된 적이 없던
-AP 들이다. **IDR 값이 6개 다 같으면 SELECT 가 AP 를 전환하지 못하는 것**이고,
-같은 값을 여섯 번 읽은 셈이다. 집계에 IDR 값을 찍게 해서 이걸 가른다.
-
-**[3] 실패의 의미:** TAR/CSW 쓰기는 되는데 DRW 읽기가 안 된다
-→ 그 주소가 그 AP 에서 **디코드되지 않는다**는 뜻일 가능성이 크다.
-`0x81480000` 은 T32 스크립트 해석에서 온 **추정**이었음을 상기할 것.
-
-### ⚠ ROM 테이블은 **처음부터 없는 기능**이었다 (2026-08-10)
-
-SEGGER 공식 문서 *J-Link RISC-V — "RISC-V behind a CoreSight DAP"* 가 못박는다:
-
-> * **There is no ROM table scan available for RISC-V**
-> * J-Link cannot auto-detect **behind which AP** the RISC-V can be found
-> * J-Link cannot auto-detect **where in the AP address space** the DMI registers are
-> * the user needs to **manually specify** where to find the RISC-V core
-
-"ROM 테이블 없음" 은 버그가 아니라 **사양**이다. 그 길은 애초에 길이 아니었다.
-
-### ★★ 그리고 SEGGER 예제가 결정적이다
-
-```c
-CORESIGHT_SetIndexAPBAPToUse = 1
-CORESIGHT_SetCoreBaseAddr    = 0x0   // "Address in AP address space
-                                     //  where DMI registers can be found"
-```
-
-**`0x0` 이다.** 우리가 쓰던 `0x81480000` 은 T32 의 **APB 버스 주소**이고,
-J-Link 이 요구하는 건 **AP 주소공간 내 오프셋**이다. **같다는 보장이 없다.**
-→ `dmactive` 타임아웃의 가장 그럴듯한 설명이며, 지금까지 한 번도 의심하지 않았다.
-
-### ★★ P0 — 지금: **DM 우회** 시도 (블로커를 안 풀고 넘어간다)
-
-```bash
-sudo python3 probe_ap_raw.py --addrs trace --no-rom --sessions 3
-```
-
-`0xFD000000`(TE0~3), `0xFD180000`(funnel/sink), `+0x1C`/`+0x20`(포인터)를
-**6개 AP 전부로** 읽는다. AP 접근은 이미 동작이 확인돼 있다.
-
-| 결과 | 의미 |
-|---|---|
-| **AXI-AP 또는 AHB-AP 로 읽힘** | ★★★ **DM 이 필요 없다.** 그 AP 로 트레이스 파이프라인을 세운다 — 블로커 우회 |
-| APB-AP 로만 읽힘 | 그것도 충분하다. 같은 AP 로 진행 |
-| 전부 `STICKYERR` | 그 주소가 어느 AP 에서도 디코드 안 됨 → SBA(=DM) 말고는 길이 없다 |
-| 전부 `0xFFFFFFFF` | 버스는 응답하는데 블록이 꺼져 있음 → 클럭/전원 인에이블 필요 |
-
-**이게 성공하면 `find_dm.py` 는 안 돌려도 된다.** 우리 목표는 halt 가 아니라
-트레이스이고, T32 도 halt 를 안 쓴다(`sys.cpuaccess DENIED`).
-
-### P0' — 위가 실패할 때: DM **위치**를 찾는다 (`find_dm.py`)
-
-DMI 프로토콜은 J-Link 이 이미 안다. 우리가 구현할 게 아니다.
-할 일은 **어디인지 알려주는 것**뿐이고, 판정은 J-Link 에게 맡긴다.
-
-```bash
-sudo python3 find_dm.py --devices     # [A] 가장 싼 것부터
-sudo python3 find_dm.py --sweep       # [B] 안 되면 전수
-```
-
-**오라클:** 전원 ACK(세션 유효) + connect + **`halted()` 동작**.
-`halted()` 는 **DM 이 살아야만** 되고 **비침습**이다(halt 하지 않는다).
-
-- **[A] 장치명 모드** — AP 맵을 **수동 지정하지 않고** `E76`/`E76-MC`/`E76ARTY` 를 준다.
-  SEGGER: *"If a specific device is selected, J-Link usually has a compiled-in
-  script which already specifies the parameters"* → **우리가 손으로 넣던 걸
-  J-Link 이 대신 해준다.** 한 번도 깨끗하게 시도한 적이 없다.
-- **[B] 전수** — APB-AP 인덱스 × CoreBase(**`0x0` 을 맨 앞에**) 전수.
-
-### (참고) 폐기 — ROM 테이블로 주소 맵 받기
-
-```bash
-sudo python3 probe_ap_raw.py --dm 0x81480000 --sessions 3
-```
-
-AP 가 살아 있음이 확인됐으니 **추정을 그만두고 칩에게 직접 묻는다.**
-각 AP 의 `BASE`(0xDF8) → ROM 테이블을 걸어 실재 컴포넌트 주소를 나열한다.
-여기서 나온 주소로 DM 과 트레이스 블록(`0xFD000000`/`0xFD180000`)을 대조한다.
-
-| 보는 것 | 의미 |
-|---|---|
-| **IDR 값이 서로 다른가** | 같으면 SELECT 가 AP 를 전환 못 하는 것 |
-| **ROM 엔트리 주소 목록** | ★ 추정이 아닌 **실측 주소 맵**. `0x8148xxxx` 가 나오는지 |
-| **DM 읽기 실패 시 sticky** | `STICKYERR` = 주소가 디코드 안 됨 / 없음 = API 문제 |
-
-### (참고) AP 직접 접근의 구조
-
-```bash
-sudo python3 probe_ap_raw.py --dm 0x81480000 --sessions 3
-```
-
-**DP → AP 레지스터를 직접 두드린다. 코어도 DM 도 거치지 않는다.**
-ADIv6(DPv3) 이므로 AP 를 주소로 고르고, MEM-AP 레지스터는 뱅크 위쪽에 있다:
-
-```
-AP_base + 0xD00 CSW   +0xD04 TAR   +0xD0C DRW   +0xDFC IDR
-DP SELECT 에 레지스터 주소 상위비트를 넣고, A[3:2] 로 워드를 고른다
-  SELECT = AP_base+0xD00 → idx0=CSW idx1=TAR idx3=DRW   (고전 CTRL/ADDR/DATA 와 일치)
-  SELECT = AP_base+0xDF0 → idx3=IDR
-```
-
-세 가지를 순서대로 답한다:
-
-| | 보는 것 | 의미 |
+| 시험 | 결과 | 지위 |
 |---|---|---|
-| **[1]** | 각 AP 의 **IDR** | ★ **선언한 AP 6개 중 어느 것이 실재하는가.** 지금까지 하나도 확인 못 했다 |
-| **[2]** | **TAR 되읽기** | 쓴 값이 그대로 읽히면 **AP 접근 경로가 살아 있다** — "우리 코드로는 원래 안 된다" 는 오랜 불확실성 종료 |
-| **[3]** | TAR=`0x81480040` → **DRW** | dmcontrol/dmstatus. `version`=2·3 이면 **aperture 확정(가설 B 종료)**, `authenticated` 로 가설 A 즉시 판정 |
+| cJTAG / DPIDR | `0x11013913` | ✅ **확정** |
+| DAP 전원 | CDBG·CSYS **둘 다 ACK** | ✅ **확정** (§2) |
+| AP 6개 IDR | T32 선언과 **6/6 일치** | ✅ **확정** (§1.2d) |
+| AP 레지스터 R/W | 동작 (TAR 되읽기) | ✅ **확정** |
+| AP 등록 개수 1 vs 6 | 3/6 = 3/6 | ✅ **가설 E 반증** |
+| `CSYSPWRUPACK` 미반환 | ACK 실제로 뜸 | ✅ **가설 F 반증** |
+| `probe_dm.py` DM 읽기 | 전부 실패 | ⛔ **무효** — `memory_read32` 는 CPU 컨텍스트 경유 = 순환 |
+| ROM 테이블 워크 | "테이블 없음" | ⛔ **무효** — SEGGER: RISC-V 는 ROM 스캔 **미지원** |
+| `probe_trace_regs.py` `[B]` | 실패 | ⛔ **무효** — priming 버그 + AP 미확인 상태 |
+| 트레이스 주소(`0xFD......`) 읽기 | 전 AP 실패, TAR 불일치 | ⛔ **무효** — CSW 검증 누락 버그로 AP 를 우리가 망가뜨림 |
+| `find_dm --devices` | `Could not find supported CPU` | ✅ **배제** — 커스텀 SoC 라 J-Link 내장 E76 스크립트가 맞을 리 없다 |
+| `find_dm --sweep` | **미실행** | ⬜ |
+| **`CSW.DeviceEn`** | **미측정** | ⬜ ← **여기가 다음** |
 
-**[1] 과 [2] 가 서로를 검증한다:** IDR 이 다 0인데 TAR 되읽기가 되면
-→ IDR 오프셋만 틀린 것이고 AP 는 쓸 수 있다. 둘 다 실패면 AP 주소 해석이 틀린 것이다.
+### 남은 단 하나의 증상
 
-### P0' — (참고) 원래 계획이던 DM aperture
+```
+DP ✅   DAP 전원 ✅   AP 열거·IDR ✅   AP 레지스터 R/W ✅
+──────────────────────────────────────────────────────
+메모리 트랜잭션 ❌ (전 AP·전 주소)        DM dmactive ❌
+```
 
-**연결 안정성 규명은 건너뛴다.** 원칙 4 — 퍼저에는 문제가 안 되고,
-`require_power` 게이트가 노이즈를 이미 제거한다. 지금 필요한 건 DM 이다.
+---
+
+## 6.1 다음 할 일
+
+### P0 — `CSW.DeviceEn` 측정 (§2.5)
 
 ```bash
-sudo python3 probe_dm.py --core-base 0x81480000 --hart 0 --sessions 5 --tries 5
+sudo python3 probe_ap_raw.py --no-rom --sessions 3
 ```
-독립 세션 5회, 각 세션은 `CDBGPWRUPACK` 으로 유효성을 검증하고,
-**전 세션 일치값만** 인정한다. `0x81480040`(dmcontrol) / `0x81480044`(dmstatus).
 
-| 전 세션 일치한 `dmstatus` | 결론 |
-|---|---|
-| `version` = 2 또는 3 | ★ **aperture 확정** → 가설 B 종료. `authenticated` 로 A 도 갈림 |
-| `0x00000000` / `0xFFFFFFFF` | 여기가 aperture 가 아니다 → `--shifts` / `--core-base` 확대 |
-| 읽기 실패 | 메모리 경로 자체가 막힘 → T32 의 DMI 설정 확보가 유일한 길 |
-| **유효 세션 < 3** | **결론 내지 말 것.** `--sessions` 를 늘린다 |
-
-> `--ap-count` 는 전 도구에 남겨 뒀지만(재현·비교용) **기본값 6개를 쓴다.**
-> 가설 E 가 반증됐으므로 변수가 아니다.
-
-> ~~JLinkScript 로 `CSYSPWRUPREQ` 끄기~~ → **불필요.** 가설 F 반증.
-> (다만 "JLinkScript 는 불가능" 이라는 결론 자체는 §5 대로 여전히 틀렸다 —
->  나중에 필요해지면 `PerformTIFInit=0` + 체인 수동지정으로 살릴 수 있다.)
-
-### P2 — T32 스크립트에서 아직 못 얻은 것 (많이 줄었다)
-
-- ~~`SYStem.Up` 직전 시퀀스~~ → **확인 완료**: `DynUTLoad.cmm` 의 재시도 루프뿐
-- ~~`SYStem.CONFIG` / DM 지정 / 코어·hart 매핑~~ → **확인 완료** (§1.2)
-- ~~SBA·ESB 접근 정책~~ → **확인 완료** (§1.2b)
-- **남은 하나 — TE 켜기·필터 설정.** 덤프 스크립트에는 **끄기만** 있다.
-  다른 `.cmm` 에 있을 것: `TECTRL` 전체 비트, **BTM vs HTM**,
-  **주소 범위 필터**(32KB 버퍼엔 거의 필수), sync 주기
-  → 찾을 키워드: `TECTRL`, `0xFD000000`, `PER.Set`, `teEnable`, `teInstrumentation`
-
-### P3 — 벤더 질문 (2개로 줄었다)
-
-> 1. **`CSYSPWRUPACK` 을 이 SoC 가 반환하지 않는 것이 맞는지** (T32 가 `DAPSYSPWRUPREQ OFF` 인 이유)
-> 2. **펌웨어 이미지 + 심볼(ELF)** — 디코더의 하드 의존성
->
-> *해소됨:* ~~DMI aperture~~(§1.2 추론) · ~~어느 DM 인지~~(hart 0~3 = `0x81480000`)
-> · ~~NVMe 담당 코어~~(`hcore` = hart 0 로 좁혀짐)
-
-### P3 — 커버리지 파이프라인 (블로커 해소 후)
+`connect` 가 실패해도 진행된다(§2.5 의 `open_dap`). AP 마다 이 줄만 보면 된다:
 
 ```
-1. ETB 포인터 로직 구현      T32 스크립트와 동일 순서. J-Link 은 32비트 read/write 만
+CSW = 0x........  DeviceEn=?  SDeviceEn/SPIDEN=?  DbgSwEnable=?  TrInProg=?
+```
+
+| 결과 | 결론 | 다음 |
+|---|---|---|
+| **전 AP `DeviceEn=0`** | 버스 포트가 **하드웨어로** 꺼짐 — 소프트웨어로 못 연다 | **P2 로 직행.** 잠금 또는 버스 미전원 |
+| `DeviceEn=1` | **잠금이 아니다.** 실패는 주소/코드 | P1 |
+| AP 마다 다름 | `DeviceEn=1` 인 AP 로만 진행 | P1 |
+| 전원 ACK 조차 없음 | 세션 무효 | 타깃 전원 사이클 후 1회만 재시도 |
+
+### P1 — `DeviceEn=1` 일 때만: DM 위치 전수
+
+```bash
+sudo python3 find_dm.py --sweep
+```
+`AddAP` 문법(`Addr=` / `BaseAddr=`) × APB-AP 4개 × CoreBase 6개 = **48 조합**.
+오라클은 `halted()`(DM 이 살아야만 동작, 비침습).
+CoreBase 후보에 **`0x0` 이 맨 앞**에 있다 — SEGGER 예제가 `0x0` 이다.
+
+### P2 — 질문서 발송 (`ASK.md`)
+
+**`DeviceEn=0` 이면 P1 을 건너뛰고 바로 여기로 온다.** 그건 실패가 아니라 결론이다.
+
+- **§4 SEGGER** — `SetCoreBaseAddr` 이 AP 주소공간 오프셋인가 / `Addr=` vs `BaseAddr=`
+  / DMI 트랜잭션 로깅 방법 / cJTAG+DAP 지원 여부
+- **§5 벤더** — DMI 오프셋·stride, DM↔AP 대응, **디버그 접근 제어(퓨즈/패스워드/PKI)
+  설정 여부와 해제 절차**, 트레이스 블록이 SBA 전용인지, TE 인에이블 설정, **펌웨어 ELF**
+
+> **P0 실행과 동시에 보내는 게 낫다.** 답을 기다리는 동안 결과가 나오는 구조.
+
+### P3 — T32 스크립트 추가 확보 (`T32_SEARCH.md`)
+
+우선순위: `ACCESSPORT` → `AP:0x` / `DAP:0x` → `Data.LOAD` → `Trace.METHOD`/`COVerage`
+→ `TECTRL`. 1번 하나만 나와도 P1 스윕 범위가 확 줄어든다.
+
+### P4 — 커버리지 파이프라인 (블로커 해소 후)
+
+```
+1. TE/ETB 포인터 로직        T32 스크립트와 동일 순서. 32비트 R/W 만 필요
 2. raw Nexus 바이트 덤프     .bin
 3. 디코더                    Nexus 메시지 + 디스어셈블리 → PC 시퀀스
 4. PC → BB/함수 매핑         ★ 기존 퍼저에 이미 있음 (Ghidra RISC-V export 만 새로)
 5. 집계/시각화               ★ 이미 있음 (BB%, func%, firmware_map)
 ```
 
-**디코더 공수 줄이는 법:**
+**설계 불확실성은 §1.2c 로 거의 사라졌다.** J-Link 명령이 T32 구성과 1:1 대응한다.
+
+**디코더 공수 줄이는 법**
 - SiFive 공개 디코더 확인 (GitHub `sifive/`)
-- **T32 를 정답지로** — 같은 workload 의 raw `.bin` + T32 디코드 결과를 대조하며 개발
-- **단계적** — Sync/간접분기 메시지는 **실제 주소를 그대로 담는다.** 디스어셈블리 없이
-  뽑아 **부분 커버리지로 퍼저를 먼저 띄우고**, 완전 디코더로 나중에 교체
+- **T32 를 정답지로** — 같은 workload 의 raw `.bin` 과 T32 디코드 결과를 대조
+- **단계적** — Sync/간접분기 메시지는 **실제 주소를 그대로 담는다.** 디스어셈블리
+  없이 뽑아 **부분 커버리지로 퍼저를 먼저 띄우고**, 완전 디코더로 나중에 교체
 
 ### 커버리지 매핑에 필요한 것 (확인됨)
 
@@ -664,18 +560,33 @@ sudo python3 probe_dm.py --core-base 0x81480000 --hart 0 --sessions 5 --tries 5
 | + DWARF | + 소스 파일/라인 |
 
 **소스만으로는 안 된다** — 칩에 올라간 **그 바이너리**가 필요하고, 빌드가 다르면 주소가 밀린다.
-
 ---
 
 ## 7. 게이트
 
-| 주 트랙 (커버리지) | | 보조 트랙 (halt PC 샘플링) | |
+| 주 트랙 (커버리지 = 목표) | | 보조 트랙 (halt PC 샘플링) | |
 |---|---|---|---|
-| C0a T32 동작 확인 | ✅ | **G0 cJTAG/DP/전원** | ✅ **통과** (AP 1개 + connect, 양쪽 ACK) |
-| C0b 재현 artifact 보존 | 🔶 덤프 스크립트만 | G1 connect | ⚠️ 조건부 |
-| **C1 메커니즘 식별** | ✅ **완료** | G2 halt | ❌ |
-| C2 데이터 경로·하드웨어 | ✅ 온칩 ETB, 핀 불필요 | G3~G6 | ⬜ |
-| **C3 J-Link 지원 가능성** | 🔶 명령은 있음, **접근 미확인** | | |
-| **C4 raw 1회 회수** | ❌ ← **여기서 막힘** | | |
+| C0a T32 동작 확인 | ✅ | **G0 cJTAG / DP / DAP 전원** | ✅ **통과** (양쪽 ACK) |
+| C0b 재현 artifact 보존 | 🔶 덤프·설정 스크립트 확보 | G1 connect (CPU 인식) | ❌ `Could not find supported CPU` |
+| **C1 메커니즘 식별** | ✅ **완료** (§1.3) | G2 halt | ❌ |
+| **C1b 트레이스 토폴로지** | ✅ **완료** (§1.2c) — TE×4 / funnel / SRAM sink | G3~G6 | ⬜ |
+| C2 데이터 경로·하드웨어 | ✅ 온칩 sink, 핀 트레이스 불필요 | | |
+| **C2b AP 맵 실재 확인** | ✅ **완료** (§1.2d) — IDR 6/6 일치 | | |
+| **C3 J-Link 명령 대응** | ✅ `RISCV_Set*BaseAddr` 이 1:1 대응 | | |
+| **C3b 메모리 트랜잭션** | ❌ ← **여기서 막힘.** 전 AP·전 주소 실패 | | |
+| **C3c `CSW.DeviceEn` 판정** | ⬜ ← **다음 측정.** 잠금인지 아닌지가 여기서 갈린다 | | |
+| C4 raw 트레이스 1회 회수 | ⬜ | | |
 | C5 T32 결과와 교차 검증 | ⬜ | | |
 | C6 퍼저 반복·복구·성능 | ⬜ | | |
+
+**보조 트랙은 목표가 아니다.** T32 도 halt 를 쓰지 않는다(`sys.cpuaccess DENIED`).
+G1/G2 실패는 주 트랙의 블로커가 **아니다** — 다만 C3b 와 원인을 공유할 수 있다.
+
+---
+
+## 8. 한 줄 요약
+
+**디버그 하드웨어는 전부 보이는데(DP·전원·AP 6개·AP 레지스터) 메모리 트랜잭션만
+전부 실패한다.** 다음 한 번의 측정(`CSW.DeviceEn`)이 **"디버그 접근 제어로 잠긴
+것"** 과 **"우리 주소/코드 문제"** 를 가른다. 전자면 `ASK.md` 로 넘어가고,
+후자면 `find_dm.py --sweep` 으로 DM 위치를 전수 탐색한다.
