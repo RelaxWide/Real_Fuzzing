@@ -49,7 +49,23 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.23  전체 로그 덤프"
+VERSION = "2026-08-11.24  DM version 오라클"
+
+# ★★ 훨씬 나은 오라클을 찾았다.
+#   CoreBase=0x81480000 으로 돌리니 로그가 이렇게 나온다:
+#       RISC-V Debug Spec. Version: UNSUPPORTED
+#       Unsupported or invalid DM version 14 detected.
+#   J-Link 이 **dmstatus 를 읽고 version 필드를 디코드**한 것이다.
+#   이전 "Timeout waiting for debug module" 은 읽지도 못했다는 뜻이었다.
+#
+#   version 14 = 0xE. 유효값은 0/1/2/3 뿐이고, 0xE 는 하위 니블이 E 인 값에서
+#   나온다 — 우리가 이미 '읽은 값 아님' 지문으로 등록한 0xEAFFFFFE 가 그렇다.
+#   ⇒ 그 주소는 디코드 안 된다. DM 은 거기가 아니다.
+#
+#   ★ 하지만 이제 **connect 성공보다 훨씬 나은 오라클**이 생겼다:
+#     CoreBase 를 훑으며 **version 이 2(0.13) 나 3(1.0) 으로 나오는 지점**을 찾는다.
+#     연결이 끝까지 안 가도 version 만 보면 맞는 주소인지 알 수 있다.
+RE_DMVER = None
 
 # ★ TAP 계층을 넘은 뒤 아직 안 돌린 변수 둘. 둘 다 문서 근거가 있다.
 #
@@ -241,6 +257,11 @@ def run_one(a):
         m = _re.search(r'Id:\s*(0x[0-9A-Fa-f]{8})', blob)
         rec['idcode'] = m.group(1) if m else None
         rec['dtm'] = ('jtag-dtm' in low or 'dtm setup' in low)
+        # ★ DM version 오라클 — connect 성공보다 훨씬 낫다
+        m2 = _re.search(r'DM version (\d+)', blob)
+        rec['dm_version'] = int(m2.group(1)) if m2 else None
+        m3 = _re.search(r'Debug Spec\. Version:\s*(\S+)', blob)
+        rec['spec_version'] = m3.group(1) if m3 else None
         try:
             jl.close()
         except Exception:
@@ -273,6 +294,66 @@ def spawn(syntax, apidx, base, device, hart, tries, devid, form='JLINK_JTAG',
 
 
 DM_BASES = [0x0, 0x1000, 0x2000, 0x4000, 0x10000, 0x20000]
+
+
+DMVER_BASES = [0x81480000, 0x81481000,
+               0x81480040, 0x81480100, 0x81480800,
+               0x81482000, 0x81484000, 0x81488000, 0x81490000,
+               0x814A0000, 0x81400000, 0x81500000, 0x80000000, 0x0]
+
+DM_VER_NAME = {0: '없음', 1: '0.11', 2: '0.13', 3: '1.0'}
+
+
+def dmver(a):
+    """★ **DM version 을 오라클로** CoreBase 를 훑는다.
+
+    J-Link 이 dmstatus 를 읽고 version 을 디코드해 로그에 찍는다:
+        "Unsupported or invalid DM version 14 detected."
+    connect 가 끝까지 안 가도 **이 숫자만 보면 그 주소가 맞는지 안다.**
+    지금까지 쓰던 connect/target_connected 보다 훨씬 예민하고 빠르다.
+
+    version 2(0.13) 또는 3(1.0) 이 나오는 CoreBase 가 정답이다.
+    14(=0xE)는 버스 기본값 `0xEAFFFFFE` 를 읽었다는 뜻이라 그 주소는 아니다.
+    """
+    bases = a.dmver_bases or DMVER_BASES
+    print(f"\n{'=' * 68}\n [DMVER] DM version 을 오라클로 CoreBase 훑기\n{'=' * 68}")
+    print("  J-Link 이 dmstatus 를 읽고 version 을 로그에 찍는다.")
+    print("  유효: 2(0.13) / 3(1.0).   14 = 0xEAFFFFFE 를 읽음 = 그 주소 아님.")
+    print(f"  AP={a.log_ap} ({a.log_sel})  device={a.log_dev}  후보 {len(bases)}개\n")
+    selcmd = dict(SELECTORS)[a.log_sel]
+    rows = []
+    for base in bases:
+        r = spawn('BaseAddr', a.log_ap, base, a.log_dev, a.hart, 1,
+                  CHAIN_TAP_ID, 'JLINK_JTAG', selcmd)
+        v = r.get('dm_version')
+        rows.append((base, v, r.get('spec_version'), bool(r.get('target_connected'))))
+        mark = ""
+        if v in (2, 3):
+            mark = f"   ★★ 유효 DM ({DM_VER_NAME[v]})"
+        elif v is None:
+            mark = "   (version 보고 없음 — 읽기 전에 실패)"
+        print(f"  base=0x{base:08X}  DM version = {v if v is not None else '-':<4}"
+              f"  spec={r.get('spec_version') or '-':<12}"
+              f"  target={int(bool(r.get('target_connected')))}{mark}")
+        time.sleep(0.3)
+
+    print(f"\nv={VERSION.split()[0]}")
+    for base, v, sp, tgt in rows:
+        print(f"base=0x{base:08X} ver={v} spec={sp} target={int(tgt)}")
+    hit = [r for r in rows if r[1] in (2, 3)]
+    saw = [r for r in rows if r[1] is not None]
+    print("VERDICT:", "DM_FOUND" if hit else
+          ("DM_READ_BUT_INVALID" if saw else "NO_DM_READ"))
+    if hit:
+        print(f"  ★★★ base=0x{hit[0][0]:08X} 에서 DM version {hit[0][1]} "
+              f"({DM_VER_NAME[hit[0][1]]}). **여기가 DM 이다.**")
+        print("     정본 스크립트의 CoreBase 를 이 값으로 굳힌다.")
+    elif saw:
+        print("  DM 을 읽기는 하는데 전부 무효 version 이다.")
+        print("  → 후보 주소를 넓히거나(--dmver-bases), AP 인덱스를 바꿔 재시도.")
+    else:
+        print("  version 보고가 하나도 없다 — 읽기 전 단계에서 실패한다.")
+    return EXIT_OK if hit else EXIT_INSUFFICIENT
 
 
 def dumplog(a):
@@ -614,6 +695,10 @@ def main():
     ap.add_argument('--only-syntax', choices=SYNTAXES)
     ap.add_argument('--reps', type=int, default=3,
                     help='focus 모드에서 조합마다 반복할 횟수')
+    ap.add_argument('--dmver', action='store_true',
+                    help='★ DM version 을 오라클로 CoreBase 를 훑는다')
+    ap.add_argument('--dmver-bases', default=None,
+                    help='콤마 구분 CoreBase 후보 (미지정이면 기본 목록)')
     ap.add_argument('--dumplog', action='store_true',
                     help='★ J-Link 전체 로그를 파일로 덤프하고 진단 구간을 출력')
     ap.add_argument('--logfile', default=None)
@@ -660,6 +745,10 @@ def main():
     a.aps = [int(x) for x in a.aps.split(',') if x.strip()]
     a.harts = [int(x) for x in a.harts.split(',') if x.strip()]
     a.cpu_devices = [x.strip() for x in a.cpu_devices.split(',') if x.strip()]
+    a.dmver_bases = ([int(x, 0) for x in a.dmver_bases.split(',') if x.strip()]
+                     if a.dmver_bases else None)
+    if a.dmver:
+        return dmver(a)
     if a.dumplog:
         return dumplog(a)
     if a.cpusweep:

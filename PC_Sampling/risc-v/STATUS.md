@@ -985,47 +985,55 @@ DP/AP **레지스터** 값은 교차검증됐지만(IDR 6/6 일치),
 
 ### ⚠ 정정 — `CoreBase = 0x0` 은 근거가 약했다
 
-**`0x0` 을 쓰게 된 근거 셋이 전부 약하거나 무효다:**
-
 | 근거 | 실제 |
 |---|---|
-| SEGGER 예제값이 `0x0` | 그건 **그쪽 예제 칩**에서 DMI 가 AP 오프셋 0 에 있다는 뜻이다. 우리 칩 값이 아니다 |
-| "`0x0` 일 때만 connect 성공" | **이미 무효 처리한 측정.** TAP 이 깨진 상태였고 `target_connected=False` 인 거짓 신호였다 |
-| "`0x81480000` 은 T32 의 APB **버스** 주소이지 AP 주소공간이 아니다" | **내 추론이고, 틀렸을 가능성이 크다** |
+| SEGGER 예제값이 `0x0` | 그건 **그쪽 예제 칩** 값이다 |
+| "`0x0` 일 때만 connect 성공" | **이미 무효 처리한 측정** (TAP 깨짐, 거짓 신호) |
+| "`0x81480000` 은 APB **버스** 주소이지 AP 주소공간이 아니다" | **내 추론이고 틀렸다** |
 
-**세 번째가 핵심이다.** MEM-AP 의 TAR 은 **그 버스의 주소**다. 즉 APB-AP 의
-"주소공간" 이 곧 **APB 버스 주소공간**이다. → T32 의 `APB:0x81480000` 은
-**그대로 AP 주소 `0x81480000`** 이어야 맞다.
+**MEM-AP 의 TAR 은 그 버스의 주소다.** APB-AP 의 "주소공간" 이 곧 APB 버스
+주소공간이므로, T32 의 `APB:0x81480000` 은 **그대로 AP 주소**여야 맞다.
 
-**⇒ 실제 근거가 있는 값은 `0x81480000` 이다** — 이 실리콘에서 **동작하는**
-T32 가 쓰는 값. 정본 스크립트와 도구 기본값을 되돌렸다.
-(`CORE_BASES` 에는 `0x81481000`(Ncore)도 넣었다)
+### ★★★ 2026-08-11 — J-Link 이 **DM 을 읽었다.** 훨씬 나은 오라클을 얻었다
 
-### P0 — 정상 TAP 위에서 raw 측정을 다시 한다
-
-```bash
-./check_env.sh                       # API_LEVEL 5 확인
-sudo python3 probe_ap_raw.py --addrs dm --no-rom --brief --sessions 3
+`CoreBase=0x81480000` 으로 재실행한 로그:
+```
+Core base addr: 0x81480000 (user configured)
+RISC-V Debug Spec. Version: UNSUPPORTED
+Unsupported or invalid DM version 14 detected.
+Could not find supported CPU.
 ```
 
-그리고 **근거 있는 CoreBase 로 connect 를 다시** 본다:
+**J-Link 이 `dmstatus` 를 읽고 version 필드를 디코드했다.**
+이전 `Timeout waiting for debug module` 은 **읽지도 못했다**는 뜻이었다.
+계층이 또 하나 열렸다.
+
+`version 14 = 0xE` — 유효값은 0/1/2/3 뿐이다. 하위 니블이 `E` 인 값,
+즉 우리가 이미 "읽은 값 아님" 지문으로 등록한 **`0xEAFFFFFE`** 를 읽은 것이다.
+⇒ **그 주소는 디코드되지 않는다. DM 은 `0x81480000` 이 아니다.**
+
+**★★ 그런데 이게 결정적으로 좋다.** `DM version N detected` 는
+**connect 성공보다 훨씬 예민하고 빠른 오라클**이다.
+연결이 끝까지 안 가도 **그 숫자만 보면 주소가 맞는지 안다.**
+
+### P0 — `--dmver` : DM version 으로 CoreBase 를 훑는다
+
 ```bash
-sudo python3 try_jlinkscript.py --dumplog --log-base 0x81480000
-sudo python3 try_jlinkscript.py --dumplog --log-base 0x81481000   # Ncore
+sudo python3 try_jlinkscript.py --dmver
 ```
-로그에 `Core base addr: 0x81480000 (user configured)` 가 찍히고 그 뒤가
-어떻게 되는지가 답이다. **`0x0` 으로 본 결과는 다시 볼 필요가 있다.**
 
-**같은 도구, 다른 전제.** 이전 결과와 비교하면 TAP 수정의 효과가 바로 보인다:
+후보 14개를 훑고 로그의 `DM version` 을 파싱한다.
 
-| 이전(TAP 깨짐) | 지금 기대 |
+| version | 의미 |
 |---|---|
-| `0x0/0x4` 외 전부 정렬만 보는 상수 | 주소마다 다른 값이 나오면 **그때 결과가 유효** |
-| 트레이스 블록 무응답 | 읽히면 **DM 우회 경로가 되살아난다** |
-| `dmstatus` 후보 무응답 | `version`=2·3 이면 **DM 위치 확정** |
+| **2 (0.13) / 3 (1.0)** | ★★★ **여기가 DM 이다.** CoreBase 확정 |
+| 14 | `0xEAFFFFFE` 를 읽음 = 그 주소 아님 |
+| 보고 없음 | 읽기 전 단계에서 실패 |
 
-DM 위치가 raw 로 잡히면 그 값을 `CORESIGHT_SetCoreBaseAddr` 에 넣는 것으로
-`try_jlinkscript` 쪽도 같이 풀린다. **두 경로가 같은 답을 공유한다.**
+안 나오면 후보를 넓힌다 — `--dmver-bases 0x81480000,0x81482000,...`
+또는 AP 를 바꾼다 — `--log-ap 1` / `--log-sel AHB --log-ap 3`.
+
+**`version 2/3` 이 나오는 순간 브링업의 블로커가 끝난다.**
 
 ### 교훈 — 세 번 반복된 것
 
