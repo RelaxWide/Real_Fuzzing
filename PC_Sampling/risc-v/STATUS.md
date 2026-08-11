@@ -1016,24 +1016,40 @@ Could not find supported CPU.
 **connect 성공보다 훨씬 예민하고 빠른 오라클**이다.
 연결이 끝까지 안 가도 **그 숫자만 보면 주소가 맞는지 안다.**
 
-### P0 — `--dmver` : DM version 으로 CoreBase 를 훑는다
+### P0 — DM version 오라클로 **AP × CoreBase** 를 훑는다
 
 ```bash
-sudo python3 try_jlinkscript.py --dmver
+sudo ./dmver.sh
 ```
 
-후보 14개를 훑고 로그의 `DM version` 을 파싱한다.
+**CoreBase 후보를 훑어도 전부 `version 14` 였다.** 그런데 그 측정은
+**AP 를 index 0(APBAP1) 하나로 고정**한 것이다. APB-AP 는 **네 개**(0,1,4,5)고
+AHB-AP(3)도 있다. **주소를 더 찍기 전에 AP 를 바꿔봐야 한다.**
 
-| version | 의미 |
+`dmver.sh` 가 이제 **AP × base 격자**를 훑는다. AP 타입에 맞는 셀렉터를
+자동으로 고른다(0/1/4/5→`SetIndexAPBAPToUse`, 3→`SetIndexAHBAPToUse`).
+
+```
+AP  base         DMver  spec
+0(APB) 0x81480000   14     UNSUPPORTED
+1(APB) 0x81480000   2      ...            <<<< 유효 DM. 여기다
+```
+
+| version | |
 |---|---|
-| **2 (0.13) / 3 (1.0)** | ★★★ **여기가 DM 이다.** CoreBase 확정 |
-| 14 | `0xEAFFFFFE` 를 읽음 = 그 주소 아님 |
-| 보고 없음 | 읽기 전 단계에서 실패 |
+| **2 / 3** | ★★★ **그 AP·base 가 답이다** |
+| 14 | `0xEAFFFFFE`(버스 기본값)를 읽음 = 아님 |
+| `-` | version 보고 없음 = 읽기 전 실패 |
 
-안 나오면 후보를 넓힌다 — `--dmver-bases 0x81480000,0x81482000,...`
-또는 AP 를 바꾼다 — `--log-ap 1` / `--log-sel AHB --log-ap 3`.
+넓히는 순서:
+```bash
+sudo ./dmver.sh --aps 3                                    # AHB-AP
+sudo ./dmver.sh --bases 0x81490000,0x81400000,0x0          # base 확대
+```
 
-**`version 2/3` 이 나오는 순간 브링업의 블로커가 끝난다.**
+**여기서도 안 나오면 DM 위치는 실측으로 못 찾는다** → `ASK.md`.
+다만 그때의 질문은 지금까지와 격이 다르다: *"AP 셀렉터 4종 × CoreBase N종을
+DM version 오라클로 훑었고 전부 14(=버스 기본값)였다"* 는 구체적 증거가 붙는다.
 
 ### 교훈 — 세 번 반복된 것
 
