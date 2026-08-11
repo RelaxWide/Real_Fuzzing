@@ -59,7 +59,7 @@ import time
 from sfe76_link import (require_api, Link, LinkError, AP_MAP, add_common_args,
                         EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.4  report_dm / paste block / usable 진단"
+VERSION = "2026-08-11.5  brief / version"
 
 # DP 레지스터 인덱스
 DP_ABORT, DP_CTRL_STAT, DP_SELECT, DP_RDBUF = 0, 1, 2, 3
@@ -814,11 +814,17 @@ def main():
     ap.add_argument('--no-alias', action='store_true', help='AP alias 검사 생략')
     ap.add_argument('--brief', action='store_true',
                     help='★ 결과를 **한 줄**로만 낸다 (손으로 옮겨 적을 때)')
+    ap.add_argument('--version', action='store_true',
+                    help='이 파일의 버전만 찍고 끝낸다 (구버전인지 확인용)')
     ap.add_argument('--addrs', default=None,
                     help="임의 절대주소를 **모든 AP 로** 읽는다. "
                          "'fw'=펌웨어 코드(양성 대조만), 'trace'=양성대조+트레이스 블록, "
                          "또는 콤마 구분 주소")
     a = ap.parse_args()
+
+    if a.version:
+        print(f"probe_ap_raw {VERSION}")
+        return EXIT_OK
 
     if not a.brief:
         print(f"\n{'=' * 66}\n AP 직접 접근 — 코어/DM 을 거치지 않는다 (v{VERSION})\n{'=' * 66}")
@@ -953,7 +959,7 @@ def main():
                            if len({v for v, _e in obs}) == 1 else None), False)
                      for ad, obs in m.items()}
         parts, best = brief_line(st) if st else ([], None)
-        print(f"\nvalid={len(valid)}/{a.sessions}")
+        print(f"\nv={VERSION.split()[0]}  valid={len(valid)}/{a.sessions}")
         for p_ in parts:
             print(p_)
         print("VERDICT:", (f"DM 도달 {best}" if best else "미도달"))
