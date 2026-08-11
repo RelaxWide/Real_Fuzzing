@@ -118,6 +118,35 @@ J-Link       Plus, FW V13 / 소프트웨어 **V9.66** (V9.12 → 업그레이드
 > `--addrs trace` 프리셋 추가 (`.19`). 기본값도 검증된 조합으로 교체:
 > `cJTAG mode 0 / device RISC-V / CoreBase 0x81481000 / TAP 스크립트 없음`.
 
+> ### ❌ 실측 (`--addrs trace`, 유효 세션 6/6) — **트레이스 블록은 AP 로 안 닿는다**
+>
+> | AP | 결과 | 해석 |
+> |---|---|---|
+> | APBAP1 | `00000001`/`EAFFFFFE`, **6/6 미매핑** | default slave 라인 그대로 |
+> | APBAP2 | 전부 `EAFFFFFE` | 균일 — 데이터 아님 |
+> | AXIAP1 | 전부 `00000000` | 균일 — 데이터 아님 |
+> | AHBAP1 | 전부 `EAFFFFFC` | 균일 — 데이터 아님 |
+> | APBAP3 | `00000000`/`00040700` | **alias 접힘** (width=12). `00040700` 은 오프셋 0 의 값 |
+> | APBAP4 | 전부 `EAFFFFFE` | 균일 — 데이터 아님 |
+>
+> ⇒ `0xFD000000` / `0xFD180000` 은 **어느 AP 버스에도 없다.** T32 의 `SB:` 는
+> DM 의 System Bus Access 이고, 그 주소공간은 hart 쪽이지 AP 쪽이 아니다.
+> **"AP 로 DM 을 우회한다" 는 이 주소로는 성립하지 않는다.**
+>
+> ### ★ 그런데 값 하나가 default slave 가 아니다
+>
+> ```
+> APBAP1  오프셋 0x0 = 0x81480003        APBAP2  오프셋 0x0 = 0x81481003
+> ```
+> 균일값도 default 라인도 아닌 **진짜 데이터**이고, 형태가 정확히
+> **CoreSight ROM 엔트리**다 — `bits[31:12]`=오프셋, `bit1`=FORMAT, `bit0`=PRESENT.
+> 가리키는 곳이 `0x81480000` / `0x81481000` = `attach.cmm` 의 **두 DM 주소와 정확히 일치**한다.
+>
+> 우연일 수 없어 보이지만, **지금까지 BASE 를 마지막 니블만 찍었다**(`B=3`).
+> ROM 테이블이 실제로 어디 있는지 한 번도 안 봤다. 가르는 건 CIDR 하나다:
+> CoreSight 컴포넌트면 `0xFF0..0xFFC` = `0D 10 05 B1`.
+> → `--rom` 추가 (`.20`).
+
 **동작하는 설정 (pylink + exec_command, connect 前 주입):**
 ```
 SetcJTAGInitMode = 0

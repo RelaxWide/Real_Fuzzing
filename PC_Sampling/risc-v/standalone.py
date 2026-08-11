@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.19  기본값을 검증된 replay 설정으로 + trace 프리셋"
+VERSION = "standalone 2026-08-11.20  --rom: BASE 전체 + ROM 테이블 CIDR 판독"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -520,6 +520,56 @@ def replay(a):
     return out
 
 
+
+# ★★★ --rom : BASE 레지스터 **전체**를 읽고 ROM 테이블을 실제로 판독한다.
+#
+#   지금까지 BASE 를 **마지막 니블만** 찍었다(B=3 / B=2). 그래서 ROM 테이블이
+#   **어디 있는지** 한 번도 안 봤다. ADIv6 BASE[31:12] 가 그 주소다.
+#
+#   그리고 APBAP1 오프셋 0 에서 나온 0x81480003 은 default-slave 도 균일값도
+#   아닌 **진짜 데이터**이고, 형태가 정확히 CoreSight ROM 엔트리다:
+#       bits[31:12] = 오프셋 0x81480,  bit1 = FORMAT,  bit0 = PRESENT
+#   APBAP2 는 0x81481003 — attach.cmm 의 두 DM 주소와 정확히 일치한다.
+#
+#   ⇒ 진짜인지 가르는 건 **CIDR** 하나다. CoreSight 컴포넌트면
+#       0xFF0..0xFFC = 0x0D, 0x10, 0x05, 0xB1 (preamble)
+#     맞으면 ROM 테이블이 실재하고 엔트리를 믿어도 된다.
+#     아니면 0x81480003 은 우연히 그렇게 생긴 버스 값일 뿐이다.
+CID_OK = (0x0D, 0x10, 0x05, 0xB1)
+
+
+def rom_probe(d):
+    out = []
+    for name, apbase, _t in AP_MAP:
+        r = {'ap': name}
+        b = d.apr(apbase, OFF_BASE)
+        r['BASE'] = hx(b)
+        if b is None or b == 0xFFFFFFFF:
+            out.append(r)
+            continue
+        r['P'] = bool(b & 1)                 # Debug entry Present
+        r['FMT'] = bool(b & 2)               # 1 = ADIv5+ 포맷
+        rb = b & 0xFFFFF000
+        r['rom'] = f"0x{rb:08X}"
+        csw = d.apr(apbase, OFF_CSW)
+        cid = []
+        for off in (0xFF0, 0xFF4, 0xFF8, 0xFFC):
+            v, _ = d.mem32(apbase, rb + off, csw)
+            cid.append(None if v is None else v & 0xFF)
+        r['CID'] = "".join('--' if c is None else f"{c:02X}" for c in cid)
+        r['CID_OK'] = tuple(cid) == CID_OK
+        v, _ = d.mem32(apbase, rb + 0xFCC, csw)
+        r['MEMTYPE'] = hx(v)
+        ent = []
+        for i in range(4):
+            v, _ = d.mem32(apbase, rb + i * 4, csw)
+            ent.append(hx(v))
+        r['ent'] = ent
+        if csw is not None:
+            d.apw(apbase, OFF_CSW, csw)
+        out.append(r)
+    return out
+
 def session(a, idx):
     import os
     import tempfile
@@ -610,6 +660,10 @@ def session(a, idx):
                 out['discover'] = discover(d)
             return out
 
+        if getattr(a, 'rom', False):
+            out['rom'] = rom_probe(d)
+            return out
+
         if getattr(a, 'alias', False):
             out['alias'] = [alias_probe(jl, d, b, n) for n, b, _t in AP_MAP]
             return out
@@ -654,6 +708,8 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--rom', action='store_true',
+                    help='★ AP 별 BASE **전체** + 그곳의 CoreSight ROM 테이블 판독')
     ap.add_argument('--replay', action='store_true',
                     help='★ f45f0ca 가 기록한 실제 성공 설정을 글자 그대로 재생'
                          ' (mode=0, CoreBase 0x81480000→0x81481000, device RISC-V,'
@@ -723,6 +779,29 @@ def main():
     print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
+
+    if a.rom:
+        print(f"\n{'=' * 70}\n [ROM] BASE 전체 + ROM 테이블 CIDR\n{'=' * 70}")
+        print("  CIDR 이 0D1005B1 이면 진짜 CoreSight ROM → 엔트리를 믿어도 된다.")
+        print("  아니면 0x81480003 은 우연히 그렇게 생긴 버스 값일 뿐이다.\n")
+        r0 = session(a, 0)
+        if not r0.get('ok'):
+            print("---8<---")
+            print(f"무효 세션 (AP일치={r0.get('ap_match')}/6) — 다시 실행")
+            print("---8<---")
+            return 6
+        print("---8<---")
+        for r in r0.get('rom', []):
+            if 'rom' not in r:
+                print(f"{r['ap']} BASE={r['BASE']} (읽기 실패)")
+                continue
+            print(f"{r['ap']} BASE={r['BASE']} P={int(r['P'])} rom={r['rom']} "
+                  f"CID={r['CID']}{' ★진짜' if r['CID_OK'] else ''} "
+                  f"MEMTYPE={r['MEMTYPE']} ent={','.join(r['ent'])}")
+        good = [r for r in r0.get('rom', []) if r.get('CID_OK')]
+        print("VERDICT:", f"ROM_FOUND ({len(good)}개 AP)" if good else "NO_CORESIGHT_ROM")
+        print("---8<---")
+        return 0 if good else 6
 
     if a.replay:
         print(f"\n{'=' * 70}\n [REPLAY] f45f0ca 가 기록한 성공 설정 재생"
