@@ -951,28 +951,56 @@ AP 셀렉터도 device 도 아니다. **조합 훑기는 여기서 멈춘다.**
 | **CPU 탐지** | ❌ `Could not find supported CPU` |
 | RISC-V DM | ⬜ 도달 못 함 |
 
-### P0 — **J-Link 자신의 전체 로그를 읽는다** (한 번도 안 했다)
+### ★★★ 2026-08-11 — 로그가 **설정 반영을 전부 확인**해줬다
 
-```bash
-sudo python3 try_jlinkscript.py --dumplog
+```
+AP[0] (APB-AP) specified by user as debug AP
+AP[0]~AP[5] = 0x10000 ~ 0x60000
+Core base addr: 0x00000000 (user configured)
+Timeout while waiting for debug module to become active
+Could not find supported CPU
 ```
 
-지금까지 로그에서 **패턴 몇 개만** 정규식으로 골라 봤다
-(`Id:`, `JTAG-DTM`, `chain detection`). 그런데 실패가
-`Could not find supported CPU` 로 바뀐 지금 필요한 건
-**J-Link 이 어떤 AP 를 어떻게 두드렸고 무엇을 읽었는지**다.
-그건 로그 본문에만 있고 **우리는 그걸 통째로 본 적이 없다.**
+| | |
+|---|---|
+| AP 셀렉터 | ✅ 우리 것을 쓴다 |
+| AP 맵 6개 | ✅ 우리 주소를 쓴다 |
+| CoreBase | ✅ 우리 값을 쓴다 (`user configured`) |
+| **DM** | ❌ 그 위치에서 `dmactive` 가 안 올라온다 |
 
-`SetLogVerbose=1` + `EnableRemarks=1` 로 받아 `jlink_connect.log` 에 전부 저장하고,
-화면에는 **DAP/AP/CPU 탐지 구간만** 추려서 낸다(마지막 40줄).
+**설정 전달 경로는 완전히 열렸다.** 실패 문구가 브링업 최초의 그것으로
+돌아왔지만 **의미가 다르다** — 그때는 TAP 이 깨진 채였고 지금은 아니다.
+남은 건 **"DM 이 AP 주소공간 어디에 있는가"** 하나다.
 
-조합은 인자로 바꾼다: `--log-sel APB|AHB --log-ap N --log-dev E76 --log-base 0x0`
+### ★ 그런데 이것 때문에 raw 측정을 다시 해야 한다
 
-**볼 것:** J-Link 이 **우리가 준 AP 맵을 실제로 쓰는지**, 아니면 무시하고
-다른 걸 두드리는지. 그게 다음 수를 정한다.
+지금까지의 raw MEM-AP 결과 —
+`0x0/0x4 만 응답` · `0x0 → 0x81480003` · `트레이스 블록 무응답` —
+는 전부 **TAP 이 깨진 상태에서 잰 것**이다.
+DP/AP **레지스터** 값은 교차검증됐지만(IDR 6/6 일치),
+**메모리 트랜잭션까지 유효했다는 보장이 없다.**
 
-> 이 로그 파일은 **SEGGER 지원에 그대로 첨부할 자료**이기도 하다.
-> 어느 쪽으로 가든 헛일이 아니다.
+⇒ `sfe76_link` 가 raw 경로에서도 **TAP 수동 선언 스크립트를 깔도록** 고쳤다
+(`API_LEVEL 5`). 이제 raw 도구들이 **정상 TAP 위에서** 돈다.
+
+### P0 — 정상 TAP 위에서 raw 측정을 다시 한다
+
+```bash
+./check_env.sh                       # API_LEVEL 5 확인
+sudo python3 probe_ap_raw.py --addrs dm --no-rom --brief --sessions 3
+sudo python3 probe_ap_raw.py --addrs fw --no-rom --brief --sessions 3
+```
+
+**같은 도구, 다른 전제.** 이전 결과와 비교하면 TAP 수정의 효과가 바로 보인다:
+
+| 이전(TAP 깨짐) | 지금 기대 |
+|---|---|
+| `0x0/0x4` 외 전부 정렬만 보는 상수 | 주소마다 다른 값이 나오면 **그때 결과가 유효** |
+| 트레이스 블록 무응답 | 읽히면 **DM 우회 경로가 되살아난다** |
+| `dmstatus` 후보 무응답 | `version`=2·3 이면 **DM 위치 확정** |
+
+DM 위치가 raw 로 잡히면 그 값을 `CORESIGHT_SetCoreBaseAddr` 에 넣는 것으로
+`try_jlinkscript` 쪽도 같이 풀린다. **두 경로가 같은 답을 공유한다.**
 
 ### 교훈 — 세 번 반복된 것
 

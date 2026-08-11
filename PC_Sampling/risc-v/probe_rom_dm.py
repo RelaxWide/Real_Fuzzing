@@ -279,7 +279,7 @@ def judge(sessions):
 
 
 def main():
-    require_api(3, "probe_rom_dm.py")
+    require_api(5, "probe_rom_dm.py")
     ap = add_common_args(argparse.ArgumentParser())
     ap.add_argument('--sessions', type=int, default=3)
     ap.add_argument('--brief', action='store_true', help='한 줄 판정만')

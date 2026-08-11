@@ -80,6 +80,7 @@ CoreBase    0x81480000  hcore/CMCore/Fcore0/QCore (4코어 공유)
 """
 
 import argparse
+import os
 import sys
 import time
 
@@ -89,17 +90,18 @@ except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square\n"
              "  (venv 가 아니라 시스템 python3 에 있을 수 있다)")
 
-VERSION = "2026-08-11.2  cJTAG short-form + device E76"
+VERSION = "2026-08-11.3  TAP 수동 선언 스크립트 적용"
 
 # ★ 파일 버전 스큐 감지용. 기능을 추가할 때마다 올린다.
 #   도구들이 시작할 때 이 값을 확인해서, 오래된 sfe76_link.py 를 쓰면
 #   AttributeError 대신 **무엇을 해야 하는지** 알려준다.
 #   실제로 두 번 겪었다: --ap-count 없음, open_dap 없음. 둘 다 pull 누락.
-API_LEVEL = 4
+API_LEVEL = 5
 #   1: checked API (connect_checked/halt_checked/read_pc/resume_checked)
 #   2: + ap_count, CORE_HART, DMI_STRIDE_SHIFT, add_common_args --ap-count
 #   3: + open_dap(전원만 요구), dap_power(전원 직접 요청)
 #   4: CJTAG_MODE 0→1 (SiFive 는 short-form), DEVICE 'RISC-V'→'E76'
+#   5: TAP 수동 선언 JLinkScript 를 raw 경로에도 적용
 
 
 def require_api(level, tool=""):
@@ -160,6 +162,36 @@ CORE_HART = {
 DMI_STRIDE_SHIFT = 2
 DM_APERTURE_SIZE = 0x1000
 
+# ★ TAP 수동 선언 — raw 경로에도 적용한다 (2026-08-11)
+#   J-Link 의 자동 체인 검출이 Id=0x00000001 을 읽어 TAP 을 오인한다.
+#   ConfigTargetSettings() 에서 체인을 선언하면 로그 IDCODE 가 선언값이 되고
+#   JTAG-DTM 오인이 사라진다(실측).
+#   ⚠ 지금까지의 raw MEM-AP 측정은 **이 수정 이전**에 잰 것이다.
+#     DP/AP 레지스터 값은 교차검증됐지만(IDR 6/6) 메모리 트랜잭션까지
+#     유효했다는 보장이 없다 → 이 스크립트를 깔고 다시 재야 한다.
+CHAIN_TAP_ID = 0x5BA00477
+TAP_SCRIPT = """/* 자동 생성 — sfe76_link */
+void ConfigTargetSettings(void) {
+  JTAG_AllowTAPReset = 1;          /* 1 = 자동 검출 OFF */
+  JLINK_JTAG_SetDeviceId(0, 0x%08X);
+  JLINK_JTAG_IRPre  = 0;
+  JLINK_JTAG_DRPre  = 0;
+  JLINK_JTAG_IRPost = 0;
+  JLINK_JTAG_DRPost = 0;
+  JLINK_JTAG_IRLen  = 4;
+  return 0;
+}
+"""
+
+
+def write_tap_script(tapid=CHAIN_TAP_ID):
+    import tempfile
+    p = os.path.join(tempfile.gettempdir(), f"sfe76_tap_{os.getpid()}.JLinkScript")
+    with open(p, 'w') as f:
+        f.write(TAP_SCRIPT % tapid)
+    return p
+
+
 # T32 SYStem.CONFIG 의 AP 목록 — (이름, CoreSight 주소, J-Link 타입)
 AP_MAP = [
     ("APBAP1", 0x10000, "APB-AP"),
@@ -216,6 +248,7 @@ class Link:
         # 세션 유효성 — connect 성공과 별개다 (dap_power 참조)
         self.dap_power_ok = None
         self.ctrl_stat = None
+        self._tap_path = None
 
     # ── 컨텍스트 매니저 ──────────────────────────────────────────────
     def __enter__(self):
@@ -255,13 +288,27 @@ class Link:
         return m
 
     # ── open / 설정 ──────────────────────────────────────────────────
-    def open(self):
+    def open(self, tap_script=True):
         self.jl = pylink.JLink()
+        # ★ TAP 수동 선언을 open 전후 양쪽에서 지정한다 (어느 쪽이 먹는지 불확실)
+        self._tap_path = write_tap_script() if tap_script else None
+        if self._tap_path:
+            try:
+                self.jl.exec_command(f"ScriptFile = {self._tap_path}")
+            except Exception:
+                pass
         # 여러 probe 가 붙어 있으면 엉뚱한 보드를 잡는다
         if self.serial:
             self.jl.open(serial_no=self.serial)
         else:
             self.jl.open()
+        if self._tap_path:
+            try:
+                self.jl.exec_command(f"ScriptFile = {self._tap_path}")
+                self._say(f"  [Link] TAP 수동 선언 스크립트 적용 "
+                          f"(TAP ID=0x{CHAIN_TAP_ID:08X})")
+            except Exception as e:
+                self._say(f"  [Link] ScriptFile 지정 실패: {str(e)[:60]}")
         self._say(f"  [Link] {self.jl.product_name} SN={self.jl.serial_number}")
         return self
 
@@ -529,6 +576,12 @@ class Link:
             except Exception as e:
                 self.cleanup_error = self.cleanup_error or f"close: {e}"
             self.jl = None
+            if self._tap_path:
+                try:
+                    os.unlink(self._tap_path)
+                except OSError:
+                    pass
+                self._tap_path = None
             time.sleep(0.3)
 
 

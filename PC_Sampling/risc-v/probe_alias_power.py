@@ -248,7 +248,7 @@ def one_session(a, i):
 
 
 def main():
-    require_api(3, "probe_alias_power.py")
+    require_api(5, "probe_alias_power.py")
     ap = add_common_args(argparse.ArgumentParser())
     ap.add_argument('--only', choices=['A', 'B'], help='A=aliasing  B=전원 사이클')
     ap.add_argument('--sessions', type=int, default=3)

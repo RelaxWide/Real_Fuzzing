@@ -858,7 +858,7 @@ def one_session(a):
 
 
 def main():
-    require_api(3, "probe_ap_raw.py")
+    require_api(5, "probe_ap_raw.py")
     ap = add_common_args(argparse.ArgumentParser())
     ap.add_argument('--dm', type=lambda x: int(x, 0), default=None,
                     help='DM base (예: 0x81480000). 주면 AP 를 통해 DM 을 읽는다')
