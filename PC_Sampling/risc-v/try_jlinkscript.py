@@ -49,7 +49,20 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.21  선언 반영 확인 → DM 변수로"
+VERSION = "2026-08-11.22  AP 셀렉터/device 스윕"
+
+# ★ TAP 계층을 넘은 뒤 아직 안 돌린 변수 둘. 둘 다 문서 근거가 있다.
+#
+#  ① AP 셀렉터 — SEGGER RISC-V 예제 주석 원문:
+#       "If RISC-V is behind an APB-AP, use CORESIGHT_SetIndexAPBAPToUse
+#        If RISC-V is behind an AHB-AP, use CORESIGHT_SetIndexAHBAPToUse"
+#     우리는 **APB 만** 써 왔다. AHB-AP(index 3, 0x40000)도 실재가 확인돼 있다.
+#
+#  ② device — "RISC-V 는 안 되고 E76 이어야 한다" 는 관측은 **TAP 이 깨진
+#     상태**에서 나온 것이다. TAP 이 정상인 지금은 다시 봐야 한다.
+SELECTORS = [('APB', 'CORESIGHT_SetIndexAPBAPToUse'),
+             ('AHB', 'CORESIGHT_SetIndexAHBAPToUse')]
+CPU_DEVICES = ['E76', 'RISC-V', 'E76-MC']
 
 # ★★ 치명적 정정 (feedback 2026-08-11 최우선 절)
 #   JTAG_AllowTAPReset 을 **반대로** 썼다. SEGGER 공식 정의:
@@ -106,7 +119,7 @@ void ConfigTargetSettings(void) {{
 
   /* ── AP 맵과 DMI 위치 ────────────────────────────────────────── */
 {aps}
-  JLINK_ExecCommand("CORESIGHT_SetIndexAPBAPToUse = {apidx}");
+  JLINK_ExecCommand("{selcmd} = {apidx}");
   JLINK_ExecCommand("CORESIGHT_SetCoreBaseAddr = 0x{corebase:X}");
   JLINK_ExecCommand("RISCV_SetHartSel = {hart}");
   return 0;
@@ -132,7 +145,7 @@ CHAIN_FORMS = {
 
 
 def gen_script(path, syntax, apidx, corebase, hart, devid=CHAIN_TAP_ID,
-               form='JLINK_JTAG'):
+               form='JLINK_JTAG', selcmd='CORESIGHT_SetIndexAPBAPToUse'):
     aps = "\n".join(
         f'  JLINK_ExecCommand("CORESIGHT_AddAP = Index={i} Type={t} '
         f'{syntax}=0x{addr:08X}");'
@@ -140,7 +153,7 @@ def gen_script(path, syntax, apidx, corebase, hart, devid=CHAIN_TAP_ID,
     with open(path, 'w') as f:
         f.write(TEMPLATE.format(
             marker=MARKER, aps=aps, apidx=apidx, corebase=corebase, hart=hart,
-            chain=CHAIN_FORMS[form].format(tapid=devid)))
+            chain=CHAIN_FORMS[form].format(tapid=devid), selcmd=selcmd))
     return path
 
 
@@ -152,7 +165,7 @@ def run_one(a):
            'dm_alive': False, 'error': None, 'script_ran': None}
     sp = os.path.join(tempfile.gettempdir(), f"sfe76_{os.getpid()}.JLinkScript")
     gen_script(sp, a.syntax, a.ap_index, a.core_base, a.hart, a.devid,
-               a.form_arg)
+               a.form_arg, a.selcmd)
     logs = []
     cb = lambda m: logs.append(str(m))
     jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
@@ -240,11 +253,13 @@ def run_one(a):
     return EXIT_OK if rec['dm_alive'] else EXIT_INSUFFICIENT
 
 
-def spawn(syntax, apidx, base, device, hart, tries, devid, form='JLINK_JTAG'):
+def spawn(syntax, apidx, base, device, hart, tries, devid, form='JLINK_JTAG',
+          selcmd='CORESIGHT_SetIndexAPBAPToUse'):
     cmd = [sys.executable, os.path.abspath(__file__), '--single',
            '--syntax', syntax, '--ap-index', str(apidx),
            '--core-base', hex(base), '--device', device, '--devid', hex(devid),
-           '--hart', str(hart), '--tries', str(tries), '--form-arg', form]
+           '--hart', str(hart), '--tries', str(tries), '--form-arg', form,
+           '--selcmd', selcmd]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=180).stdout
     except subprocess.TimeoutExpired:
@@ -258,6 +273,59 @@ def spawn(syntax, apidx, base, device, hart, tries, devid, form='JLINK_JTAG'):
 
 
 DM_BASES = [0x0, 0x1000, 0x2000, 0x4000, 0x10000, 0x20000]
+
+
+def cpusweep(a):
+    """★ TAP 계층을 넘은 뒤 남은 두 변수: **AP 셀렉터**와 **device**.
+
+    실패 문구가 `Could not find supported CPU` 다 — DAP 는 탔는데 그 뒤에서
+    코어를 못 찾는다. 그 단계에 영향을 주는 문서화된 변수가 둘 남았다:
+
+      ① APB-AP 용 셀렉터만 써 왔다. AHB-AP 용 셀렉터가 따로 있다
+         (SEGGER 예제 주석이 명시). AHB-AP 도 실재가 확인돼 있다(index 3).
+      ② "RISC-V 는 안 되고 E76" 이라는 관측은 **TAP 이 깨진 상태**의 것이다.
+         지금은 조건이 다르므로 다시 본다.
+
+    CoreBase 는 `0x0`(SEGGER 예제값) 고정, hart 0 고정.
+    셀렉터에 맞춰 AP 인덱스도 바꾼다 — APB 는 0, AHB 는 3(0x40000).
+    """
+    print(f"\n{'=' * 68}\n [CPU] AP 셀렉터 × device\n{'=' * 68}")
+    print("  실패 문구가 'Could not find supported CPU' — DAP 는 탔는데 코어를 못 찾는다.")
+    print("  APB 셀렉터만 써 왔다. AHB 셀렉터가 따로 있다(SEGGER 예제 주석).")
+    print("  'RISC-V 는 안 된다' 는 관측은 TAP 이 깨진 상태의 것이라 재확인한다.\n")
+    rows = []
+    for sel, selcmd in SELECTORS:
+        apidx = 0 if sel == 'APB' else 3          # APBAP1 / AHBAP1
+        for dev in a.cpu_devices:
+            tgt = conn = 0
+            errs = set()
+            for _ in range(a.reps):
+                r = spawn('BaseAddr', apidx, 0x0, dev, 0, a.tries,
+                          CHAIN_TAP_ID, 'JLINK_JTAG', selcmd)
+                conn += bool(r.get('connect'))
+                tgt += (r.get('target_connected') is True)
+                if r.get('error'):
+                    errs.add(str(r['error'])[:60])
+                time.sleep(0.25)
+            rows.append((sel, apidx, dev, conn, tgt, sorted(errs)))
+            print(f"  {sel}(AP={apidx}) dev={dev:8s} connect={conn}/{a.reps} "
+                  f"**target={tgt}/{a.reps}**"
+                  + ("   ★★" if tgt else ""))
+            for e in sorted(errs)[:1]:
+                print(f"      {e}")
+
+    print(f"\nv={VERSION.split()[0]}  reps={a.reps}")
+    for sel, apidx, dev, conn, tgt, errs in rows:
+        print(f"sel={sel} ap={apidx} dev={dev} connect={conn}/{a.reps} "
+              f"target={tgt}/{a.reps}" + (f" err={errs[0]}" if errs else ""))
+    hit = [r for r in rows if r[4] > 0]
+    print("VERDICT:", "TARGET_CONNECTED" if hit else "STILL_NO_TARGET")
+    if hit:
+        sel, apidx, dev, _c, _t, _e = hit[0]
+        print(f"  ★★★ sel={sel} AP={apidx} device={dev} 에서 붙었다. 정본을 이걸로 굳힌다.")
+    else:
+        print("  둘 다 아니다 → 남은 건 TAP ID 후보 교체(--devid) 와 hart/CoreBase 확대.")
+    return EXIT_OK if hit else EXIT_INSUFFICIENT
 
 
 def v2(a):
@@ -473,6 +541,9 @@ def main():
     ap.add_argument('--only-syntax', choices=SYNTAXES)
     ap.add_argument('--reps', type=int, default=3,
                     help='focus 모드에서 조합마다 반복할 횟수')
+    ap.add_argument('--cpusweep', action='store_true',
+                    help='★ AP 셀렉터(APB/AHB) × device. TAP 통과 후 남은 두 변수')
+    ap.add_argument('--cpu-devices', default=",".join(CPU_DEVICES))
     ap.add_argument('--v2', action='store_true',
                     help='★ 공식형 최소 manual-chain 1조건 시험 (feedback P0)')
     ap.add_argument('--form', default=None, choices=list(CHAIN_FORMS),
@@ -495,6 +566,8 @@ def main():
                     help=argparse.SUPPRESS)
     ap.add_argument('--device', default='E76', help=argparse.SUPPRESS)
     ap.add_argument('--form-arg', default='JLINK_JTAG', help=argparse.SUPPRESS)
+    ap.add_argument('--selcmd', default='CORESIGHT_SetIndexAPBAPToUse',
+                    help=argparse.SUPPRESS)
     ap.add_argument('--devid', type=lambda x: int(x, 0), default=CHAIN_TAP_ID,
                     help=argparse.SUPPRESS)
     a = ap.parse_args()
@@ -506,6 +579,9 @@ def main():
 
     a.aps = [int(x) for x in a.aps.split(',') if x.strip()]
     a.harts = [int(x) for x in a.harts.split(',') if x.strip()]
+    a.cpu_devices = [x.strip() for x in a.cpu_devices.split(',') if x.strip()]
+    if a.cpusweep:
+        return cpusweep(a)
     if a.v2:
         return v2(a)
     if a.dmsweep:

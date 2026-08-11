@@ -927,20 +927,35 @@ DAP 는 탔는데 **그 뒤에서 RISC-V 코어를 못 찾는다.**
 ⇒ **이제서야** `SetIndexAPBAPToUse` / `SetCoreBaseAddr` / hart 가 의미를 갖는다.
 그동안 이 변수들을 훑어도 소용없던 건 TAP 계층에서 막혀 있었기 때문이다.
 
-### P0 — `--dmsweep` : AP × CoreBase (이번엔 유효한 실험이다)
+### ❌ `--dmsweep` → `TARGET_NEVER_CONNECTED`
+
+`CoreBase × AP` 를 훑어도 안 붙는다. 실패 문구는 여전히
+**`Could not find supported CPU`** — DAP 는 탔는데 **그 뒤에서 코어를 못 찾는다.**
+
+### P0 — 아직 안 돌린 변수 **둘**. 문서 근거가 있다
 
 ```bash
-sudo python3 try_jlinkscript.py --dmsweep --reps 3
+sudo python3 try_jlinkscript.py --cpusweep --reps 3
 ```
-`CoreBase {0x0, 0x1000, 0x2000, 0x4000, 0x10000, 0x20000}` × AP `{0,1}` × hart `0`.
-조합마다 3회 반복, **`target_connected=False` 인 시행은 버린다.**
-필요하면 `--aps 0,1,4,5 --harts 0,1,2,3` 으로 넓힌다.
+
+**① AP 셀렉터** — SEGGER RISC-V 예제 주석 원문:
+> *"If RISC-V is behind an **APB-AP**, use `CORESIGHT_SetIndexAPBAPToUse`
+>  If RISC-V is behind an **AHB-AP**, use `CORESIGHT_SetIndexAHBAPToUse`"*
+
+**우리는 APB 셀렉터만 써 왔다.** AHB-AP(index 3, `0x40000`)도 IDR 로 실재가
+확인돼 있고 TYPE=1(AHB3)로 T32 선언과 일치한다. **한 번도 안 써봤다.**
+
+**② device** — *"`RISC-V` 는 안 되고 `E76` 이어야 한다"* 는 관측은
+**TAP 이 깨진 상태**에서 나온 것이다. 지금은 조건이 다르므로 **다시 본다.**
+(이 프로젝트에서 무효 조건의 관측을 그대로 들고 간 적이 여러 번 있다)
+
+셀렉터 2 × device 3 = 6 조합. `CoreBase=0x0`, hart 0 고정.
+셀렉터에 맞춰 AP 인덱스도 바꾼다 — APB→0, AHB→3.
 
 | VERDICT | 다음 |
 |---|---|
-| `DM_REACHED` | ★★★ 정본 스크립트 굳히고 트레이스 레지스터로 |
-| `ALIVE_BUT_NO_DM` | CoreBase 후보 확대 / `RISCV_UseNexusLegacyMode` |
-| `TARGET_NEVER_CONNECTED` | AP·CoreBase 로는 안 됨 → TAP ID 후보를 바꿔 재시험 |
+| `TARGET_CONNECTED` | ★★★ 그 조합으로 정본 굳히고 **DM·트레이스로** |
+| `STILL_NO_TARGET` | TAP ID 후보 교체(`--devid`) + hart/CoreBase 확대 |
 
 ### 교훈 — 세 번 반복된 것
 
