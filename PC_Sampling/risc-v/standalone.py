@@ -41,7 +41,22 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.9  alias 판정불가 구분"
+VERSION = "standalone 2026-08-11.10  default-line 판별"
+
+# ★★ 인터커넥트의 **default slave 라인**을 식별한다.
+#   실측 14/14 로 확인: 응답이 주소가 아니라 **16바이트 정렬**만 따라간다.
+#       16B 정렬 → 0x00000001,  아니면 → 0xEAFFFFFE
+#   이는 버스가 128비트 한 줄을 고정값으로 돌려주고 우리가 lane 을 집는 것이다:
+#       00000001 EAFFFFFE EAFFFFFE EAFFFFFE
+#   ⇒ 그런 값은 **데이터가 아니라 미매핑 응답**이다. 이제 자동으로 표시한다.
+DEFAULT_LINE = [0x00000001, 0xEAFFFFFE, 0xEAFFFFFE, 0xEAFFFFFE]
+
+
+def is_default_line(addr, val):
+    """그 주소에서 default slave 라인이 나온 것인가."""
+    if val is None:
+        return False
+    return val == DEFAULT_LINE[(addr % 16) // 4]
 
 # ⚠ wrap 테스트의 허점을 막는다.
 #   그 AP 가 **모든 주소에서 같은 값**을 주면 2^N 도 당연히 0 과 같다.
@@ -235,6 +250,16 @@ def alias_probe(jl, d, base, name):
             'matches': matches}
 
 
+def _val_of(reads, addr):
+    v = reads.get(f"0x{addr:08X}")
+    if v in (None, '----'):
+        return None
+    try:
+        return int(v, 16)
+    except ValueError:
+        return None
+
+
 def session(a, idx):
     import os
     import tempfile
@@ -313,6 +338,8 @@ def session(a, idx):
                 reads[f"0x{addr:08X}"] = hx(v)
                 out['log'].append({'ap': name, 'addr': f"0x{addr:08X}", **meta})
             ap['reads'] = reads
+            ap['unmapped'] = sum(1 for x in a.addrs
+                                 if is_default_line(x, _val_of(reads, x)))
             if csw is not None:
                 d.apw(base, OFF_CSW, csw)        # CSW 원복
             out['aps'][name] = ap
@@ -417,6 +444,10 @@ def main():
     print(" ".join(parts))
     for n, apd in ((last or {}).get('aps') or {}).items():
         vs = sorted(set(apd['reads'].values()))
+        un = apd.get('unmapped')
+        if un:
+            print(f"{n}: {un}/{len(apd['reads'])} 이 **default slave 라인** "
+                  f"= 미매핑 (데이터 아님)")
         if len(vs) == 1:
             # ★ 전부 같아도 **그 값이 무엇인지**는 찍는다. 이전엔 생략해서
             #   "u1 만 나오고 끝" 이 됐다 — 정보를 버리고 있었다.
