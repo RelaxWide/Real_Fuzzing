@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.18  --replay: 기록된 성공 설정 그대로 재생"
+VERSION = "standalone 2026-08-11.19  기본값을 검증된 replay 설정으로 + trace 프리셋"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -156,6 +156,15 @@ AXI_T32_ADDRS = [(0xC81024, 'FCore  en bit0'), (0xC81028, 'NCore0 b0/NCore1 b16'
                  (0xC8102C, 'CMCore en bit0'), (0xC81040, 'MPCore clk/rst'),
                  (0xC81044, 'NCore  clk/rst')]
 
+# ★ 트레이스 블록 (ViewNexusTracedump.cmm 실물).
+#   NEXUS.Type SiFive / TE n at SB:0xFD00n000 / funnel·sink at SB:0xFD180000
+#   sink 포인터는 legacy SiFive 오프셋: +0x1C write(bit0=wrap) +0x20 read +0x24 data
+#   ★ T32 는 SB:(=System Bus, DM 의 SBA)로 간다. 우리가 AP 로 직접 닿으면
+#     **DM 이 필요 없어진다** — connect 실패가 블로커가 아니게 된다.
+TRACE_ADDRS = [(0xFD000000, 'TE0 ctrl (bit1=enable)'), (0xFD001000, 'TE1 ctrl'),
+               (0xFD180000, 'funnel/sink ctrl'), (0xFD18001C, 'sink write ptr'),
+               (0xFD180020, 'sink read ptr'), (0xFD180FF0, 'sink CIDR0 (=0x0D?)')]
+
 # ★★ 인터커넥트의 **default slave 라인**을 식별한다.
 #   실측 14/14 로 확인: 응답이 주소가 아니라 **16바이트 정렬**만 따라간다.
 #       16B 정렬 → 0x00000001,  아니면 → 0xEAFFFFFE
@@ -202,7 +211,10 @@ def is_default_line(addr, val):
 #     ② 전송이 어느 단계에서 끝나는가
 #     ③ AP 별로 읽은 값이 **몇 종류**인가 (1종 = 변화 없음)
 
-TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE = 7, 10000, 1, 'E76'
+# ★★ 2026-08-11 --replay 실측: AP IDR **6/6 일치**, DPIDR=6BA0009D, CTRL=F0000000.
+#   ⇒ DAP·AP 계층은 완전히 정상이다. 기본값을 그 검증된 조합으로 맞춘다.
+#     cJTAG mode 0 / device 'RISC-V' / CoreBase 0x81481000 / TAP 스크립트 없음
+TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE = 7, 10000, 0, 'RISC-V'
 # ★ **선언값과 읽은 값을 구분한다.** 실측:
 #     선언 0x5BA00477 (알려진 ARM DAP) → DPIDR 읽기 = 0x6BA0009D   ← 유효
 #     선언 0x6BA0009D (읽은 값 그대로) → DPIDR 읽기 = 0xFFFFFFFF   ← 무효
@@ -651,13 +663,16 @@ def main():
     ap.add_argument('--speeds', default="10000,4000,2000,1000,500")
     ap.add_argument('--recover', action='store_true',
                     help='★ AP IDR 이 맞는 조건을 찾는다 — 스크립트 유무 × cJTAG 모드')
-    ap.add_argument('--no-tap-script', action='store_true',
+    ap.add_argument('--tap-script', dest='no_tap_script', action='store_false',
+                    default=True,
+                    help='TAP 선언 스크립트를 깐다 (기본은 안 깖 — 검증된 설정)')
+    ap.add_argument('--no-tap-script', dest='no_tap_script', action='store_true',
                     help='TAP 선언 스크립트를 깔지 않는다 (브링업 초기 조건)')
     ap.add_argument('--cjtag-mode', type=int, default=CJTAG_MODE)
     ap.add_argument('--min-cmds', dest='full_cmds', action='store_false',
                     help='SetIndexAPBAPToUse/SetCoreBaseAddr/SetHartSel 을 보내지 않는다')
     ap.add_argument('--apidx', type=int, default=0)
-    ap.add_argument('--corebase', type=lambda x: int(x, 0), default=0x81480000)
+    ap.add_argument('--corebase', type=lambda x: int(x, 0), default=0x81481000)
     ap.add_argument('--discover', action='store_true',
                     help='★ ADIv6 DPIDR1 / BASEPTR0 / BASEPTR1 을 읽는다 (미시도)')
     ap.add_argument('--loose', action='store_true',
@@ -680,6 +695,12 @@ def main():
         a.dmi_mode = False
         a.axi_mode = False
         a.axi_mode = True
+    elif a.addrs.strip() == 'trace':
+        # ViewNexusTracedump.cmm 의 트레이스 토폴로지. AP 가 여기 닿으면
+        # **DM 을 완전히 우회**해서 커버리지를 뽑을 수 있다 — 그게 목표다.
+        a.addrs = [x for x, _n in TRACE_ADDRS]
+        a.dmi_mode = False
+        a.axi_mode = False
     elif a.addrs.strip() == 'dmi':
         # RISC-V Debug Spec 의 DMI 주소 × stride 4
         a.addrs = [d * 4 for d, _n in DMI_REGS]
