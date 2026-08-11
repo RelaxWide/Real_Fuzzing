@@ -676,7 +676,45 @@ feedback 의 판정 어휘로는 **`MEM_AP_TRANSFER_BROKEN`** 에 해당한다.
 > `0x81480003` / `0x81481003` 이 DM base 와 일치하는 것은 여전히 사실이지만,
 > 그것이 ROM 테이블인지는 **확정하지 못했다**(`ROM_ENTRY_LIKE_NOT_CONFIRMED`).
 
-### P0 — **J-Link 네이티브 경로.** JLinkScript 는 우리가 만든다
+### ⚠ 2026-08-11 — `CONNECT_ONLY` 인데, **더 이상한 게 있다**
+
+```
+connect 성공=24   DM 살아있음=0
+connect 만 된 조합: ('Addr',0,'0x0') ('Addr',0,'0x81480000') ('Addr',0,'0x81481000')
+                    ('Addr',1,'0x0') ('Addr',1,'0x81480000') ('Addr',1,'0x81481000') …
+VERDICT: CONNECT_ONLY
+```
+
+**24 조합이 전부 connect 성공**했고 **`CoreBase` 가 `0x0` 이든 `0x81480000` 이든
+결과가 똑같다.** 설정이 결과에 영향을 못 주고 있다는 뜻이다.
+
+⇒ **스크립트가 실제로 로드·실행됐는지부터 증명해야 한다.**
+그게 아니라면 24/24 는 스크립트와 무관한 결과이고, 조합 비교 자체가 무의미하다.
+(또한 예전에 connect 는 불안정했는데 갑자기 24/24 인 것도 같은 의심을 키운다.)
+
+### P0 — **스크립트가 실행됐는지 먼저 증명한다**
+
+```bash
+sudo python3 try_jlinkscript.py --brief
+```
+
+`ConfigTargetSettings()` 안에 마커를 넣었다:
+```c
+JLINK_SYS_Report("SFE76_SCRIPT_RAN");   // 호스트 출력 — 통신 금지 규칙에 안 걸린다
+```
+pylink 의 `JLink(log=, detailed_log=, error=, warn=)` 콜백으로 DLL 로그를 받아
+**이 문자열이 실제로 나오는지** 본다.
+
+| 출력 | 의미 | 다음 |
+|---|---|---|
+| `script실행=0/N` → `SCRIPT_NOT_LOADED` | ★ **설정이 반영된 적이 없다.** 지금까지의 조합 비교가 전부 무의미 | `ScriptFile` 지정 방식부터. `JLinkExe -jlinkscriptfile` 로 교차확인 |
+| `script실행=N/N` + `CONNECT_ONLY` | 설정은 먹었는데 DM 이 안 산다 | hart / `RISCV_UseNexusLegacyMode` / device 변수 추가 |
+| `DM_REACHED` | ★★ 끝 | 그 조합으로 굳힌다 |
+
+> **교훈:** "설정을 바꿨는데 결과가 안 변한다" 는 **설정이 안 먹었다는 신호**로
+> 먼저 읽어야 한다. 이 프로젝트에서 같은 종류의 실수를 반복했다.
+
+### P0.1 — (이전) J-Link 네이티브 경로 설명
 
 ```bash
 sudo python3 try_jlinkscript.py --brief

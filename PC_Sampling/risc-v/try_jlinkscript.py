@@ -49,15 +49,20 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.9  JLinkScript native"
+VERSION = "2026-08-11.10  script-ran 검증"
 
 SYNTAXES = ['BaseAddr', 'Addr']
 AP_INDEXES = [0, 1, 4, 5]                      # APB 타입 AP
 CORE_BASES = [0x81480000, 0x0, 0x81481000]
 DEVICES = ['RISC-V']
 
+MARKER = "SFE76_SCRIPT_RAN"
+
 TEMPLATE = """/* 자동 생성 — try_jlinkscript.py */
 void ConfigTargetSettings(void) {{
+  // ★ 이 줄이 J-Link 로그에 보이면 스크립트가 **실제로 로드·실행**된 것이다.
+  //    JLINK_SYS_Report 는 호스트 측 출력이라 "타깃 통신" 금지 규칙에 걸리지 않는다.
+  JLINK_SYS_Report("{marker}");
 {aps}
   JLINK_ExecCommand("CORESIGHT_SetIndexAPBAPToUse = {apidx}");
   JLINK_ExecCommand("CORESIGHT_SetCoreBaseAddr = 0x{corebase:X}");
@@ -73,7 +78,8 @@ def gen_script(path, syntax, apidx, corebase, hart):
         f'{syntax}=0x{addr:08X}");'
         for i, (_n, addr, t) in enumerate(AP_MAP))
     with open(path, 'w') as f:
-        f.write(TEMPLATE.format(aps=aps, apidx=apidx, corebase=corebase, hart=hart))
+        f.write(TEMPLATE.format(marker=MARKER, aps=aps, apidx=apidx,
+                                corebase=corebase, hart=hart))
     return path
 
 
@@ -82,11 +88,19 @@ def run_one(a):
     """자식 프로세스 — 조합 하나만."""
     rec = {'syntax': a.syntax, 'ap': a.ap_index, 'base': f"0x{a.core_base:X}",
            'device': a.device, 'script_ok': None, 'connect': False,
-           'dm_alive': False, 'error': None}
+           'dm_alive': False, 'error': None, 'script_ran': None}
     sp = os.path.join(tempfile.gettempdir(), f"sfe76_{os.getpid()}.JLinkScript")
     gen_script(sp, a.syntax, a.ap_index, a.core_base, a.hart)
-    jl = pylink.JLink()
+    logs = []
+    cb = lambda m: logs.append(str(m))
+    jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
     try:
+        # ScriptFile 은 open 전에도 먹을 수 있다 — 양쪽 다 시도한다
+        try:
+            jl.exec_command(f"ScriptFile = {sp}")
+            rec['script_set_preopen'] = True
+        except Exception:
+            rec['script_set_preopen'] = False
         jl.open()
         jl.exec_command(f"SetcJTAGInitMode = {CJTAG_MODE}")
         jl.set_tif(TIF_CJTAG)
@@ -109,6 +123,7 @@ def run_one(a):
                 rec['error'] = str(e)[:120]
                 time.sleep(0.25)
 
+        rec['script_ran'] = any(MARKER in l for l in logs)
         if rec['connect']:
             try:                                   # DM 이 살아야만 되는 호출
                 rec['halted'] = bool(jl.halted())
@@ -118,6 +133,8 @@ def run_one(a):
     except Exception as e:
         rec['error'] = str(e)[:120]
     finally:
+        rec['script_ran'] = any(MARKER in l for l in logs)
+        rec['log_lines'] = len(logs)
         try:
             jl.close()
         except Exception:
@@ -199,8 +216,14 @@ def main():
                     time.sleep(0.2)
 
     print(f"\nv={VERSION.split()[0]}  조합={len(rows)}")
+    ran = [r for r in rows if r.get('script_ran')]
     conn = [r for r in rows if r.get('connect')]
-    print(f"connect성공={len(conn)}  DM살아있음={len(hits)}")
+    print(f"script실행={len(ran)}/{len(rows)}  connect성공={len(conn)}  "
+          f"DM살아있음={len(hits)}")
+    if not ran:
+        print("★★ **스크립트가 한 번도 실행되지 않았다.** 설정이 반영될 리가 없다.")
+        print("   → connect 24/24 성공은 스크립트와 무관한 결과였다.")
+        print("   → ScriptFile 지정 방식부터 고쳐야 한다 (JLinkExe -jlinkscriptfile 로 교차확인).")
     for r in hits:
         print(f"HIT syntax={r['syntax']} ap={r['ap']} base={r['base']} dev={r['device']}")
     if not hits and conn:
@@ -208,7 +231,8 @@ def main():
         u = sorted({(r['syntax'], r['ap'], r['base']) for r in conn})[:6]
         print("connect만 된 조합:", u)
     print("VERDICT:", "DM_REACHED" if hits else
-          ("CONNECT_ONLY" if conn else "NO_CONNECT"))
+          ("SCRIPT_NOT_LOADED" if not ran else
+           "CONNECT_ONLY" if conn else "NO_CONNECT"))
     return EXIT_OK if hits else EXIT_INSUFFICIENT
 
 
