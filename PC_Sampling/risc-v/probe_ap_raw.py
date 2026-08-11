@@ -585,6 +585,76 @@ def print_verdict_addrs(v, ctrl_addrs, trace_addrs, valid_sessions):
     print("     · 트레이스를 **실제로 받아낼 수 있는지** — wrap/overflow 미검증")
 
 
+def decode_dmstatus_v(v):
+    if v is None:
+        return None
+    ver = v & 0xF
+    names = {0: '없음', 1: '0.11', 2: '0.13', 3: '1.0'}
+    if ver not in (2, 3):
+        return {'ok': False, 'ver': ver, 'txt': f"version={ver}({names.get(ver, '?')}) → DM 아님"}
+    bits = [n for b, n in ((7, 'authenticated'), (9, 'allhalted'), (11, 'allrunning'),
+                           (13, 'allunavail'), (15, 'allnonexistent')) if v & (1 << b)]
+    return {'ok': True, 'ver': ver,
+            'txt': f"version={ver}({names[ver]})  " + "  ".join(bits)}
+
+
+def report_dm(stable):
+    """★ `--addrs dm` 전용 판정. **원시값이 아니라 결론을 찍는다.**
+
+    지금까지는 값만 나열해서 사람이 손으로 디코드해야 했다. 여기서
+    (1) CoreSight 컴포넌트인지 (2) DMI stride 가 뭔지 (3) DM 에 닿았는지를
+    **직접 판정**하고, 맨 끝에 **붙여넣기용 한 덩어리**를 출력한다.
+    """
+    bar = '=' * 70
+    print(f"\n{bar}\n ★★★ DM 판정 (ROM 엔트리가 가리킨 0x{DM_PROBE_BASE:08X})\n{bar}")
+    lines = []
+    verdict = "미도달"
+    for ap, vals in stable.items():
+        v = {a: x for a, (x, _e) in vals.items()}
+        cid = check_cidr(v)
+        if cid is None:
+            continue
+        klass = {1: 'ROM 테이블', 9: 'CoreSight 컴포넌트'}.get(cid['class'],
+                                                            f"class={cid['class']}")
+        print(f"\n  [{ap}]")
+        print(f"    CIDR = {' '.join(cid['raw'])}"
+              f"   → {'✅ CoreSight 서명 일치' if cid['ok'] else '❌ 서명 불일치'}"
+              f"   {klass if cid['ok'] else ''}")
+        p0, p1 = v.get(DM_PROBE_BASE + 0xFE0), v.get(DM_PROBE_BASE + 0xFE4)
+        if p0 is not None and p1 is not None:
+            part = ((p1 & 0xF) << 8) | (p0 & 0xFF)
+            print(f"    PIDR = {hx(p0)} {hx(p1)}   part=0x{part:03X}")
+        lines.append(f"{ap} CIDR={' '.join(cid['raw'])} ok={cid['ok']} class={cid['class']}")
+
+        for tag, dc, ds in (("stride<<2", DM_PROBE_BASE + 0x040, DM_PROBE_BASE + 0x044),
+                            ("stride 1 ", DM_PROBE_BASE + 0x010, DM_PROBE_BASE + 0x011)):
+            d = decode_dmstatus_v(v.get(ds))
+            print(f"    {tag}: dmcontrol={hx(v.get(dc))}  dmstatus={hx(v.get(ds))}"
+                  + (f"   → {d['txt']}" if d else ""))
+            lines.append(f"{ap} {tag} dmcontrol={hx(v.get(dc))} dmstatus={hx(v.get(ds))}"
+                         + (f" {d['txt']}" if d else ""))
+            if d and d['ok']:
+                verdict = f"★★ DM 도달 — {ap}, {tag.strip()}"
+
+    print(f"\n{bar}\n 결론: {verdict}\n{bar}")
+    if verdict == "미도달":
+        print("  유효한 dmstatus(version 2 또는 3)가 없다.")
+        print("  · CIDR 서명이 맞았다면 컴포넌트는 거기 있고 **DMI 매핑이 다른 것**이다")
+        print("  · CIDR 도 안 맞으면 이 AP 로는 그 주소가 안 보이는 것이다")
+    else:
+        print("  → 이 값으로 J-Link 을 설정한다:")
+        print("      CORESIGHT_SetIndexAPBAPToUse = 0")
+        print(f"      CORESIGHT_SetCoreBaseAddr    = 0x{DM_PROBE_BASE:08X}")
+        print("      RISCV_SetHartSel             = 0")
+
+    print(f"\n{bar}\n 📋 아래 블록을 그대로 복사해서 주면 된다\n{bar}")
+    print("---8<--- DM PROBE ---")
+    for l in lines:
+        print(l)
+    print(f"VERDICT: {verdict}")
+    print("---8<---------------")
+
+
 def alias_check(dap, aps):
     """★ 6개 AP 가 **정말 독립인가**, 아니면 같은 AP 의 alias 인가.
 
@@ -768,8 +838,12 @@ def main():
                 stable[n][ad] = ((vs.pop() if len(vs) == 1 else None), er)
         ca = [x for x in lst if x[0] in {a_ for a_, _l in CONTROL_ADDRS}]
         ta = [x for x in lst if x[0] in {a_ for a_, _l in TRACE_ADDRS}]
-        v = verdict_addrs(stable, ca, ta, len(valid))
-        print_verdict_addrs(v, ca, ta, len(valid))
+        dm_set = {a_ for a_, _l in DM_ADDRS}
+        if lst and {a_ for a_, _l in lst} & dm_set:
+            report_dm(stable)          # ★ --addrs dm 전용 판정
+        else:
+            v = verdict_addrs(stable, ca, ta, len(valid))
+            print_verdict_addrs(v, ca, ta, len(valid))
 
     al = [r['alias']['alias'] for r in valid if r.get('alias')]
     if al:
