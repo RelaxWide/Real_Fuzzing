@@ -49,7 +49,24 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.17  게이트 정정 (target_connected)"
+VERSION = "2026-08-11.19  manual chain v2 (AllowTAPReset 정정)"
+
+# ★★ 치명적 정정 (feedback 2026-08-11 최우선 절)
+#   JTAG_AllowTAPReset 을 **반대로** 썼다. SEGGER 공식 정의:
+#       0 = Auto-detection is **enabled**
+#       1 = Auto-detection is **disabled**
+#   우리는 0 을 쓰면서 주석에 "자동 검출 끔" 이라고 달았다.
+#   ⇒ 지금까지의 모든 "수동 체인" 시험은 자동 검출을 **켜 둔 채** 돌았다.
+#     로그에 계속 `Id: 0x00000001` 이 나온 게 당연하다 — 우리가 선언한 TAP ID 를
+#     자동 검출이 다시 덮었을 수 있다.
+#   ⇒ "cJTAG 손잡이를 전부 돌렸다 / 소프트웨어로 더 할 게 없다" 판정을 **철회**한다.
+#
+#   그리고 훅도 틀렸다. manual chain 은 SEGGER 최신 예제대로
+#   **ConfigTargetSettings()** 에 넣는다. InitTarget() 은 전역 CPU 설정을
+#   요구하는데 RISC-V 용 CPU 상수가 존재하지 않는다 — 만족시킬 수 없는 조건이었다.
+CHAIN_TAP_ID = 0x5BA00477     # SEGGER manual-chain 예제의 알려진 CoreSight DAP ID
+                              # (실제 실리콘 ID 주장이 아니라, DLL 이 이 TAP 을
+                              #  CoreSight DAP 으로 고르게 하는 선언값이다)
 
 # ★ 게이트를 잘못 걸었었다. pylink 정의:
 #     connected()        = self.opened() and JLINKARM_EMU_IsConnected()
@@ -74,32 +91,20 @@ DEVICES = ['E76']            # ★ 'RISC-V' 는 connect 자체가 안 된다(실
 
 MARKER = "SFE76_SCRIPT_RAN"
 
-TEMPLATE = """/* 자동 생성 — try_jlinkscript.py */
-
-/* ── ① 체인 선언 ─────────────────────────────────────────────────
-   자동 검출이 Id=0x00000001 을 읽어 TAP 을 못 알아본다. 그러면 SEGGER 규칙
-   "IRLen=4 + 알려진 CoreSight DAP TAP → RISC-V behind DAP" 를 못 타고
-   JTAG-DTM 으로 오인한다. 그래서 **직접 선언**한다.
-   문서: InitTarget 을 구현하면 "JTAG chain has to be specified manually".
-   (전역 CPU 는 설정하지 않는다 — 상수 목록에 RISC-V 가 없다. device 로 대신한다) */
-int InitTarget(void) {{
-  JLINK_SYS_Report("{marker}_INIT");
-  JTAG_AllowTAPReset = 0;
-  JTAG_IRPre  = 0;
-  JTAG_DRPre  = 0;
-  JTAG_IRPost = 0;
-  JTAG_DRPost = 0;
-  JTAG_IRLen  = 4;
-  JLINK_JTAG_SetDeviceId(0, 0x{devid:08X});
-  return 0;
-}}
-
-/* ── ② AP 맵과 DMI 위치 ──────────────────────────────────────────
-   타깃 통신이 금지된 훅이라 스캔을 깨뜨리지 않는다. */
+TEMPLATE = """/* 자동 생성 — try_jlinkscript.py  (manual chain v2) */
 void ConfigTargetSettings(void) {{
-  // ★ 이 줄이 J-Link 로그에 보이면 스크립트가 **실제로 로드·실행**된 것이다.
-  //    JLINK_SYS_Report 는 호스트 측 출력이라 "타깃 통신" 금지 규칙에 걸리지 않는다.
   JLINK_SYS_Report("{marker}");
+
+  /* ── 자동 체인 검출을 **끈다** ─────────────────────────────────
+     0 = Auto-detection is enabled / 1 = Auto-detection is disabled
+     지금까지 0 을 쓰면서 "끔" 이라고 착각했다. 그래서 우리가 선언한 TAP 을
+     자동 검출이 덮고 Id=0x00000001 을 계속 읽었다. */
+  JTAG_AllowTAPReset = 1;
+
+  /* ── 체인 수동 선언 ──────────────────────────────────────────── */
+  {chain}
+
+  /* ── AP 맵과 DMI 위치 ────────────────────────────────────────── */
 {aps}
   JLINK_ExecCommand("CORESIGHT_SetIndexAPBAPToUse = {apidx}");
   JLINK_ExecCommand("CORESIGHT_SetCoreBaseAddr = 0x{corebase:X}");
@@ -108,15 +113,34 @@ void ConfigTargetSettings(void) {{
 }}
 """
 
+# 전역 이름 두 갈래. 최신 공식 예제는 JLINK_JTAG_*, 구 매뉴얼은 JTAG_*.
+# V9.66 에서 alias 인지 확실치 않으므로 **둘 다 시험한다.**
+CHAIN_FORMS = {
+    'JLINK_JTAG': """JLINK_JTAG_SetDeviceId(0, 0x{tapid:08X});
+  JLINK_JTAG_IRPre  = 0;
+  JLINK_JTAG_DRPre  = 0;
+  JLINK_JTAG_IRPost = 0;
+  JLINK_JTAG_DRPost = 0;
+  JLINK_JTAG_IRLen  = 4;""",
+    'JTAG': """JLINK_JTAG_SetDeviceId(0, 0x{tapid:08X});
+  JTAG_IRPre  = 0;
+  JTAG_DRPre  = 0;
+  JTAG_IRPost = 0;
+  JTAG_DRPost = 0;
+  JTAG_IRLen  = 4;""",
+}
 
-def gen_script(path, syntax, apidx, corebase, hart, devid=DEVIDS[0]):
+
+def gen_script(path, syntax, apidx, corebase, hart, devid=CHAIN_TAP_ID,
+               form='JLINK_JTAG'):
     aps = "\n".join(
         f'  JLINK_ExecCommand("CORESIGHT_AddAP = Index={i} Type={t} '
         f'{syntax}=0x{addr:08X}");'
         for i, (_n, addr, t) in enumerate(AP_MAP))
     with open(path, 'w') as f:
-        f.write(TEMPLATE.format(marker=MARKER, aps=aps, apidx=apidx,
-                                corebase=corebase, hart=hart, devid=devid))
+        f.write(TEMPLATE.format(
+            marker=MARKER, aps=aps, apidx=apidx, corebase=corebase, hart=hart,
+            chain=CHAIN_FORMS[form].format(tapid=devid)))
     return path
 
 
@@ -127,7 +151,8 @@ def run_one(a):
            'device': a.device, 'script_ok': None, 'connect': False,
            'dm_alive': False, 'error': None, 'script_ran': None}
     sp = os.path.join(tempfile.gettempdir(), f"sfe76_{os.getpid()}.JLinkScript")
-    gen_script(sp, a.syntax, a.ap_index, a.core_base, a.hart, a.devid)
+    gen_script(sp, a.syntax, a.ap_index, a.core_base, a.hart, a.devid,
+               a.form_arg)
     logs = []
     cb = lambda m: logs.append(str(m))
     jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
@@ -207,11 +232,11 @@ def run_one(a):
     return EXIT_OK if rec['dm_alive'] else EXIT_INSUFFICIENT
 
 
-def spawn(syntax, apidx, base, device, hart, tries, devid):
+def spawn(syntax, apidx, base, device, hart, tries, devid, form='JLINK_JTAG'):
     cmd = [sys.executable, os.path.abspath(__file__), '--single',
            '--syntax', syntax, '--ap-index', str(apidx),
            '--core-base', hex(base), '--device', device, '--devid', hex(devid),
-           '--hart', str(hart), '--tries', str(tries)]
+           '--hart', str(hart), '--tries', str(tries), '--form-arg', form]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=180).stdout
     except subprocess.TimeoutExpired:
@@ -225,6 +250,67 @@ def spawn(syntax, apidx, base, device, hart, tries, devid):
 
 
 DM_BASES = [0x0, 0x1000, 0x2000, 0x4000, 0x10000, 0x20000]
+
+
+def v2(a):
+    """★ 공식형 최소 manual-chain 시험. **변수를 넓히지 않는다.**
+
+    feedback 이 지정한 단일 조건:
+        device E76 / cJTAG / 10MHz / SetcJTAGInitMode=1 / hart 0 /
+        APB-AP index 0 / CoreBase 0x0 / 오라클 target_connected()
+
+    앞선 실패의 원인 두 개를 고친 뒤의 첫 시험이다:
+      ① JTAG_AllowTAPReset 을 0(=자동검출 켬) 으로 쓰고 있었다 → 1 로 정정
+      ② manual chain 을 InitTarget() 에 넣었다 → ConfigTargetSettings() 로 이동
+         (InitTarget 은 전역 CPU 설정을 요구하는데 RISC-V 상수가 없다)
+
+    체인 전역 이름은 `JLINK_JTAG_*`(최신 예제) 와 `JTAG_*`(구 매뉴얼) 를
+    **둘 다** 시험한다 — V9.66 에서 alias 인지 확실치 않다.
+    """
+    forms = [a.form] if a.form else list(CHAIN_FORMS)
+    print(f"\n{'=' * 68}\n [v2] 공식형 최소 manual-chain — 1조건\n{'=' * 68}")
+    print("  device=E76  cJTAG  10MHz  cJTAGInitMode=1  hart=0  AP=0  CoreBase=0x0")
+    print(f"  TAP ID=0x{CHAIN_TAP_ID:08X}   체인 전역 이름: {forms}")
+    print("  ★ AllowTAPReset=1 (자동 검출 OFF) — 이전엔 0 을 쓰면서 껐다고 착각했다")
+    print(f"  반복 {a.reps}회. 오라클은 target_connected().\n")
+
+    out = []
+    for form in forms:
+        ok = tgt = ran = 0
+        errs, ids = set(), set()
+        for _ in range(a.reps):
+            r = spawn('BaseAddr', 0, 0x0, 'E76', 0, a.tries, CHAIN_TAP_ID, form)
+            ran += bool(r.get('script_ran'))
+            ok += bool(r.get('connect'))
+            tgt += (r.get('target_connected') is True)
+            if r.get('error'):
+                errs.add(str(r['error'])[:60])
+            for l in (r.get('loglines') or []):
+                ids.add(l[:70])
+            time.sleep(0.3)
+        out.append((form, ran, ok, tgt))
+        print(f"  [{form:10s}] script실행={ran}/{a.reps}  connect={ok}/{a.reps}  "
+              f"**target={tgt}/{a.reps}**")
+        for e in sorted(errs)[:2]:
+            print(f"      {e}")
+        for l in sorted(ids)[:3]:
+            print(f"      log: {l}")
+
+    print(f"\nv={VERSION.split()[0]}  reps={a.reps}")
+    for form, ran, ok, tgt in out:
+        print(f"form={form} script={ran}/{a.reps} connect={ok}/{a.reps} target={tgt}/{a.reps}")
+    hit = [f for f, _r, _o, t in out if t > 0]
+    noscript = all(r == 0 for _f, r, _o, _t in out)
+    print("VERDICT:", "TARGET_CONNECTED" if hit else
+          ("SCRIPT_NOT_LOADED" if noscript else "STILL_NO_TARGET"))
+    if hit:
+        print(f"  ★★★ form={hit[0]} 에서 **타깃에 붙었다.** 정본 스크립트를 이걸로 굳힌다.")
+    elif noscript:
+        print("  스크립트가 안 돌았다 — 전역 이름이 거부됐을 수 있다. 로그 확인.")
+    else:
+        print("  스크립트는 돌았는데 여전히 타깃 미연결.")
+        print("  → 이제서야 '손잡이를 다 돌렸다' 고 말할 수 있다. ASK.md 로.")
+    return EXIT_OK if hit else EXIT_INSUFFICIENT
 
 
 def dmsweep(a):
@@ -355,6 +441,10 @@ def main():
     ap.add_argument('--only-syntax', choices=SYNTAXES)
     ap.add_argument('--reps', type=int, default=3,
                     help='focus 모드에서 조합마다 반복할 횟수')
+    ap.add_argument('--v2', action='store_true',
+                    help='★ 공식형 최소 manual-chain 1조건 시험 (feedback P0)')
+    ap.add_argument('--form', default=None, choices=list(CHAIN_FORMS),
+                    help='체인 전역 이름. 미지정이면 둘 다 시험')
     ap.add_argument('--dmsweep', action='store_true',
                     help='★ 살아있는 세션에서만 CoreBase×AP×hart 를 훑는다')
     ap.add_argument('--aps', default="0,1", help='dmsweep AP 인덱스')
@@ -372,7 +462,8 @@ def main():
     ap.add_argument('--core-base', type=lambda x: int(x, 0), default=0x81480000,
                     help=argparse.SUPPRESS)
     ap.add_argument('--device', default='E76', help=argparse.SUPPRESS)
-    ap.add_argument('--devid', type=lambda x: int(x, 0), default=DEVIDS[0],
+    ap.add_argument('--form-arg', default='JLINK_JTAG', help=argparse.SUPPRESS)
+    ap.add_argument('--devid', type=lambda x: int(x, 0), default=CHAIN_TAP_ID,
                     help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.version:
@@ -383,6 +474,8 @@ def main():
 
     a.aps = [int(x) for x in a.aps.split(',') if x.strip()]
     a.harts = [int(x) for x in a.harts.split(',') if x.strip()]
+    if a.v2:
+        return v2(a)
     if a.dmsweep:
         return dmsweep(a)
     if a.focus:

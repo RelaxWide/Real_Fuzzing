@@ -5,6 +5,255 @@
 > 목적: 현재 접근 방향이 맞는지 검토하고, 다음 작업자가 바로 이어서 판단할 수 있도록
 > 실측 사실과 권장 순서를 분리해 기록한다.
 
+## 최우선 정정 — 2026-08-11: manual JTAG chain 시험은 소진되지 않았다
+
+> 이 절이 아래의 모든 과거 판단보다 우선한다. "SEGGER 문의 외에는 더 할 수
+> 없다"는 결론은 틀렸다. 공식 SEGGER 문서를 다시 대조한 결과, 현재 manual-chain
+> 코드가 자동 체인 검출을 끈다고 생각하면서 실제로는 계속 켜고 있었다.
+
+### 1. Critical issue — `JTAG_AllowTAPReset` 값을 반대로 사용했다
+
+현재 다음 파일은 모두 같은 설정을 쓴다.
+
+- `probe_cjtag_mode.py`
+- `try_jlinkscript.py`
+- `SF_E76_riscv.JLinkScript`
+
+```c
+JTAG_AllowTAPReset = 0;  // 기존 주석: 자동 검출 끔
+```
+
+그러나 SEGGER `Using J-Link Script Files`의 공식 정의는 다음과 같다.
+
+```text
+0 = Auto-detection is enabled
+1 = Auto-detection is disabled
+```
+
+즉 지금까지 `0`으로 실행한 모든 "수동 체인" 시험은 J-Link 자동 체인 검출을
+비활성화하지 않았다. 로그에서 계속 아래가 나온 것은 자연스럽다.
+
+```text
+JTAG chain detection found 1 devices: #0 Id: 0x00000001, IRLen: 04
+```
+
+수동으로 넣은 TAP ID가 로그에 보였더라도, 이후 자동 검출이 다시 수행돼
+`0x00000001`을 읽고 설정을 덮었을 수 있다. 따라서 STATUS의 "cJTAG 단계에 대해
+노출된 손잡이를 전부 돌렸다"와 "소프트웨어로 더 할 것이 없다"는 판정을 철회한다.
+
+새 기본값은 다음이다.
+
+```c
+JTAG_AllowTAPReset = 1;  // 자동 체인 검출 비활성화
+```
+
+### 2. Critical issue — manual chain을 잘못된 훅에 넣었다
+
+현재 코드는 manual chain 선언을 `InitTarget()`에 넣었다. SEGGER 문서는
+`InitTarget()`을 구현할 때 다음을 요구한다.
+
+1. JTAG chain과 선택 TAP을 전부 수동 지정
+2. 전역 `CPU`를 반드시 설정
+3. `MEM_*` API 사용 금지
+
+그런데 공식 전역 `CPU` 상수 목록에는 RISC-V용 상수가 없고, 현재 스크립트도
+`CPU`를 설정하지 않는다. device를 `E76`으로 넘긴 것이 이 요구사항을 자동으로
+대체한다고 보장할 근거가 없다.
+
+SEGGER의 최신 `Manual setup of JTAG chain` 예제는 manual chain 설정을
+`ConfigTargetSettings()`에 넣으라고 권장한다.
+
+```c
+void ConfigTargetSettings(void) {
+  JLINK_JTAG_SetDeviceId(...);
+  JLINK_JTAG_IRPre  = ...;
+  JLINK_JTAG_DRPre  = ...;
+  JLINK_JTAG_IRPost = ...;
+  JLINK_JTAG_DRPost = ...;
+  JLINK_JTAG_IRLen  = ...;
+}
+```
+
+따라서 다음 시험에서는 `InitTarget()`을 제거한다.
+
+```text
+ConfigTargetSettings
+  ├─ manual JTAG/cJTAG chain 선언
+  ├─ CoreSight AP map 선언
+  ├─ 사용할 APB-AP 선택
+  ├─ DMI/CoreBase 설정
+  └─ hart 0 설정
+
+InitTarget 없음
+```
+
+`ConfigTargetSettings()`의 target-communication 금지와 모순되지 않는다.
+`JLINK_JTAG_SetDeviceId` 및 chain global 설정은 SEGGER가 바로 그 훅에서 사용한
+공식 예제다.
+
+### 3. Potential issue — chain global 이름도 공식 최신 예제에 맞춘다
+
+현재 코드는 다음 이름을 사용한다.
+
+```c
+JTAG_IRPre
+JTAG_DRPre
+JTAG_IRPost
+JTAG_DRPost
+JTAG_IRLen
+```
+
+최신 manual-chain 예제는 다음을 사용한다.
+
+```c
+JLINK_JTAG_IRPre
+JLINK_JTAG_DRPre
+JLINK_JTAG_IRPost
+JLINK_JTAG_DRPost
+JLINK_JTAG_IRLen
+```
+
+일반 매뉴얼에는 예전 이름도 남아 있으므로 V9.66에서 alias일 수 있다. 그러나 새
+정본은 최신 공식 예제의 `JLINK_JTAG_*` 이름을 먼저 사용한다. 컴파일러가 거부할
+때만 구형 이름을 비교한다.
+
+### 4. T32 CMM으로 해결된 부분과 해결할 수 없는 부분
+
+T32 스크립트 조사는 헛된 작업이 아니었다. 이미 J-Link 설정에 필요한 타깃 구조를
+다음처럼 확정했다.
+
+```text
+CJTAGFLAGS NOKEEPER USEOAC
+HCore만 DAP master
+HCore SYStem.DOWN → WAIT 500ms → SYStem.UP
+AP 6개 주소와 타입
+main DM / NCore DM 분리
+main hart 0~3
+CPUAccess DENIED, MemAccess SB
+TE0~TE3 / funnel / SRAM sink 주소
+32KB sink pointer와 raw dump 절차
+```
+
+특히 `USEOAC`는 J-Link의 SiFive/RISC-V용 short activation과 방향이 일치한다.
+
+```text
+SetcJTAGInitMode = 1
+```
+
+`NOKEEPER`는 타깃의 keeper가 없거나 신뢰할 수 없다는 강한 정황이며, SEGGER 문서의
+missing-KEEPER workaround 조건과 일치한다. 따라서 500kHz 이하 실험을 해법으로
+계속 사용하지 않는다. 공식 문서상 workaround는 OScan1에서 500kHz 초과를 요구한다.
+
+반면 CMM을 더 읽어도 다음은 직접 얻기 어렵다.
+
+- TRACE32 SF-E76 CPU 드라이버 내부의 `SYStem.UP` 구현
+- J-Link DLL의 내부 chain-selection 로직
+- 깨진 자동 스캔 상태에서 실제 TAP IDCODE
+- CMM 밖의 인증/unlock 또는 silicon-private 초기화
+
+결론적으로 **T32 CMM 추가 전수조사는 종료**하지만, 이미 얻은 T32 정보는 새
+JLinkScript를 구성하는 데 충분히 유효하다. 지금 문제는 T32 정보 부족보다
+JLinkScript 구현 오류가 먼저다.
+
+### 5. 다음 P0 — 공식형 최소 manual-chain JLinkScript
+
+첫 시험은 변수를 넓게 훑지 않고 다음 한 조건으로 제한한다.
+
+```text
+device                 E76
+interface              cJTAG
+speed                  10MHz
+SetcJTAGInitMode       1
+hart                   0
+APB-AP                 index 0
+CoreBase               0x0
+success oracle         target_connected() == True
+```
+
+개념 정본:
+
+```c
+void ConfigTargetSettings(void) {
+  JLINK_SYS_Report("SFE76_MANUAL_CHAIN_V2");
+
+  JTAG_AllowTAPReset = 1;  // 1이 자동 검출 OFF
+
+  JLINK_JTAG_SetDeviceId(0, 0x5BA00477);
+  JLINK_JTAG_IRPre  = 0;
+  JLINK_JTAG_DRPre  = 0;
+  JLINK_JTAG_IRPost = 0;
+  JLINK_JTAG_DRPost = 0;
+  JLINK_JTAG_IRLen  = 4;
+
+  JLINK_ExecCommand(
+    "CORESIGHT_AddAP = Index=0 Type=APB-AP BaseAddr=0x00010000"
+  );
+  // APBAP2, AXIAP1, AHBAP1, APBAP3, APBAP4도 확정된 주소로 등록
+  JLINK_ExecCommand("CORESIGHT_SetIndexAPBAPToUse = 0");
+  JLINK_ExecCommand("CORESIGHT_SetCoreBaseAddr = 0x0");
+  JLINK_ExecCommand("RISCV_SetHartSel = 0");
+}
+```
+
+`0x5BA00477`은 SEGGER manual-chain 예제의 알려진 CoreSight DAP ID다. 실제 silicon
+ID라고 주장하는 값이 아니라 DLL에 이 TAP을 CoreSight DAP으로 선택시키기 위한
+선언값 후보다. 이 값이 실패할 때만 기존에 모아둔 알려진 DAP ID 후보를 제한 비교한다.
+
+### 6. 판정 규칙
+
+다음은 성공 신호가 아니다.
+
+```text
+connect() 무예외 종료
+connected() == True             // J-Link USB만 확인
+수동 입력한 ID가 로그에 출력
+DTM 오인 문구가 사라짐
+```
+
+유일한 1차 성공 오라클:
+
+```text
+target_connected() == True
+```
+
+그 뒤에만 DM/SBA와 trace를 시험한다. 처음 성공한 뒤 CoreBase `0x81480000`과
+APBAP2를 비교한다. target 연결 전에는 AP/CoreBase/hart 대규모 sweep을 금지한다.
+
+### 7. P1 — Commander로 독립 검증
+
+JLinkScript 결과를 pylink 외부에서 교차 확인한다.
+
+```text
+J-Link Commander
+  -Device E76
+  -If cJTAG
+  -Speed 10000
+  -JTAGConf 0,0
+  -JLinkScriptFile <manual-chain-v2>
+  -Log <logfile>
+```
+
+SEGGER RISC-V 문서는 자동 chain selection이 맞지 않을 때 Commander의 `JTAGConf`
+또는 JLinkScript manual chain을 사용하라고 명시한다. 조합 sweep이 아니라 동일한
+한 조건의 공식 CLI 재현만 보존한다.
+
+### 8. P2 — 정상 raw 상태를 보존한 2단계 연결
+
+P0/P1이 실패할 때만 수행한다.
+
+```text
+1. 일반 connect 1회로 cJTAG OScan1 진입을 시도(실패 허용)
+2. 같은 handle/전원 상태에서 raw DPIDR=0x11013913 확인
+3. AP IDR 6개가 T32 선언과 일치하는지 확인
+4. handle을 닫거나 TAP reset하지 않음
+5. PerformTIFInit=0 + manual chain 적용
+6. E76 target connect 재시도
+7. target_connected()로만 판정
+```
+
+이 단계까지 실패하면 공개된 J-Link 설정으로 가능한 소프트웨어 우회가 거의 소진됐다고
+판단할 수 있다. 그 전에는 "SEGGER 문의 외에는 방법 없음"으로 종료하지 않는다.
+
 ## 최신 피드백 — 2026-08-11: T32 CMM 조사 종료, J-Link DM 진단으로 전환
 
 > 이 절이 아래의 과거 CMM 조사 계획보다 우선한다. 필요한 T32 구조는 충분히

@@ -872,40 +872,57 @@ VERDICT: NO_SIGNAL
 ### hardware_version = **13.00** → KEEPER 가설은 **약해졌다**
 
 J-Link 하드웨어 **V13** = 현행 모델. 문서가 *"In **current** J-Link models,
-a workaround is implemented"* 라 했으니 **우회는 있을 가능성이 높다.**
+a workaround is implemented"* 라 했으니 우회는 있을 가능성이 높다.
 ⇒ "장비를 바꿔야 한다" 는 결론으로 가지 않는다.
 
-### ★ 증거를 한 줄로 세우면 — 실패 지점이 **한 단계**로 좁혀진다
+### ★★★ 치명적 정정 — `JTAG_AllowTAPReset` 을 **반대로** 썼다
 
+SEGGER 공식 정의:
 ```
-✓ 정상 통신(OScan1 정상상태)은 된다
-    DPIDR=0x11013913, AP 6개 IDR 이 T32 선언과 6/6 일치
-    → 잡음으로 만들 수 없는 값이다. 보드도 링크도 살아 있다.
+0 = Auto-detection is **enabled**
+1 = Auto-detection is **disabled**
+```
+우리는 **`0` 을 쓰면서 주석에 "자동 검출 끔"** 이라고 달았다.
 
-✗ J-Link 의 TIF init / 체인 스캔 단계만 깨진다
-    Id=0x00000001
-    → 우리 성공 경로는 perform_tif_init=False 로 그 단계를 건너뛴다
+⇒ **지금까지의 모든 "수동 체인" 시험은 자동 검출을 켜 둔 채 돌았다.**
+로그에 계속 `Id: 0x00000001` 이 나온 게 당연하다 — 우리가 선언한 TAP ID 를
+자동 검출이 다시 덮었을 수 있다.
 
-⇒ 실패하는 건 '통신' 이 아니라 **활성화·스캔 단계 하나**다.
-   escape sequence 를 쓰는 게 정확히 그 단계다.
+⇒ **"cJTAG 손잡이를 전부 돌렸다 / 소프트웨어로 더 할 게 없다" 는 판정을 철회한다.**
+
+### ★ 훅도 틀렸다
+
+manual chain 을 `InitTarget()` 에 넣었는데, 그 훅은 **전역 `CPU` 설정을 요구**한다.
+그런데 **`CPU` 상수 목록에 RISC-V 가 없다** — 만족시킬 수 없는 조건이었다.
+SEGGER 의 manual-chain 예제는 **`ConfigTargetSettings()`** 를 쓴다.
+`JLINK_JTAG_SetDeviceId` 와 체인 전역 설정은 타깃 통신이 아니므로
+그 훅의 금지 규칙과 모순되지 않는다.
+
+**⇒ `InitTarget()` 제거. 전부 `ConfigTargetSettings()` 한 곳으로.**
+
+### P0 — `--v2` : 공식형 최소 manual-chain, **1조건**
+
+```bash
+sudo python3 try_jlinkscript.py --v2 --reps 3
 ```
 
-**그 단계에 대해 J-Link 이 노출한 손잡이는 전부 돌렸다:**
-`SetcJTAGInitMode` 0/1/2 · 속도 10M/4M/1M/500k ·
-`JLINK_JTAG_SetDeviceId()` + `JTAG_AllowTAPReset=0` · 4선 JTAG.
+변수를 넓히지 않는다. feedback 이 지정한 단일 조건:
+```
+device E76 / cJTAG / 10MHz / SetcJTAGInitMode=1 / hart 0 /
+APB-AP index 0 / CoreBase 0x0 / 오라클 target_connected()
+TAP ID 0x5BA00477  (SEGGER manual-chain 예제의 알려진 CoreSight DAP ID)
+```
+체인 전역 이름만 두 갈래로 본다 — `JLINK_JTAG_*`(최신 예제) vs `JTAG_*`(구 매뉴얼).
+V9.66 에서 alias 인지 확실치 않다.
 
-### P0 — 이제 SEGGER 에 묻는다. **질문이 날카로워졌다**
+| VERDICT | 다음 |
+|---|---|
+| `TARGET_CONNECTED` | ★★★ 정본 스크립트를 그 form 으로 굳히고 DM·트레이스로 |
+| `STILL_NO_TARGET` | **이제서야** "손잡이를 다 돌렸다" 고 말할 수 있다 → `ASK.md` |
+| `SCRIPT_NOT_LOADED` | 전역 이름이 거부됐을 수 있다 → 로그 확인 |
 
-`ASK.md` §4-5. 핵심은 한 문장이다:
-
-> **정상상태 접근은 이미 되는데**(DPIDR 과 AP IDR 6개를 읽는다),
-> **J-Link 의 체인 검출 스캔만 실패한다.** 그 스캔을 건너뛰거나
-> 수동 선언한 체인으로 대체하려면 어떻게 해야 하는가?
-
-이건 SEGGER 가 즉답할 수 있는 형태이고, **"보드가 죽은 것 아니냐"** 로
-되돌아올 여지를 우리 실측이 막는다. 하드웨어 버전(V13.00)도 채워 넣었다.
-
-**우리가 소프트웨어로 더 돌릴 손잡이는 남아 있지 않다.**
+> `0x5BA00477` 은 **실제 실리콘 ID 주장이 아니다.** DLL 이 이 TAP 을
+> CoreSight DAP 으로 고르게 하는 **선언값**이다.
 
 ### P0.1 — 4선 JTAG 가 안 잡히는 것도 같이 물어볼 것
 

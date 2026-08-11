@@ -83,8 +83,8 @@ TIFS = [(0, 'JTAG (4선)  ← 미시도'), (7, 'cJTAG (2선) ← 지금까지')]
 #     IRLen=4 이고 TAPId 가 **알려진 CoreSight DAP TAP** → RISC-V behind DAP 로 간주
 #   ⇒ TAP ID 를 **수동 선언**해서 그 규칙을 발동시킨다. InitTarget() 의 용도다.
 #
-#   JTAG_AllowTAPReset = 0  ← "자동 JTAG 검출을 끈다. 특별한 init 이 필요해
-#                               TAP reset 으로 잃어버리는 장치는 꺼야 한다"(문서)
+#   JTAG_AllowTAPReset = **1** ← 0=자동검출 ON, 1=OFF. 우리는 0 을 쓰면서
+#                                 "끈다" 고 착각했다(feedback 지적).
 #   JLINK_JTAG_SetDeviceId(0, id)
 #
 #   ⚠ 전역 CPU 상수 목록에는 **RISC-V 가 없다**(ARM 전용). 그래서 CPU 는 설정하지
@@ -100,7 +100,7 @@ KNOWN_DAP_IDS = [
 INIT_TMPL = """/* 자동 생성 — probe_cjtag_mode.py */
 int InitTarget(void) {{
   JLINK_SYS_Report("SFE76_INIT_RAN");
-  JTAG_AllowTAPReset = 0;      // 자동 검출 끔 — 지금 그게 0x00000001 을 만든다
+  JTAG_AllowTAPReset = 1;      // ★ 1 이 자동 검출 OFF (0 은 ON — 반대로 썼었다)
   JTAG_IRPre  = 0;
   JTAG_DRPre  = 0;
   JTAG_IRPost = 0;
