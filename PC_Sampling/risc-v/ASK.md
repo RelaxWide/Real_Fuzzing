@@ -1,7 +1,13 @@
 # 질문서 — SF-E76 RISC-V DM 에 J-Link 으로 도달하지 못한다
 
 > 실측만 적었다. 추정은 "추정" 이라고 표시했다.
-> **§4(SEGGER)와 §5(벤더/설계팀)를 그대로 잘라 보내면 된다.**
+>
+> ⚠ **이 문서는 계획이 아니라 보조 채널이다.** 벤더는 T32 관련만 답할 수 있고,
+> **J-Link 스크립트는 우리가 만든다**(`try_jlinkscript.py` / `SF_E76_riscv.JLinkScript`).
+> 그러니 §5 에서는 **"J-Link 를 어떻게 설정하나" 를 묻지 말고, T32 가 이미
+> 알고 있는 사실**만 받아온다:
+> `APBACCESSPORT` 값 · `COREDEBUG.Base` 의 의미(DMI aperture 인가 컴포넌트 base 인가)
+> · `SYStem.UP` 전 unlock/`Data.Set` 시퀀스 유무 · 퓨즈/패스워드 여부 · 펌웨어 ELF.
 
 ---
 

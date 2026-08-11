@@ -676,21 +676,42 @@ feedback 의 판정 어휘로는 **`MEM_AP_TRANSFER_BROKEN`** 에 해당한다.
 > `0x81480003` / `0x81481003` 이 DM base 와 일치하는 것은 여전히 사실이지만,
 > 그것이 ROM 테이블인지는 **확정하지 못했다**(`ROM_ENTRY_LIKE_NOT_CONFIRMED`).
 
-### P0 — 남은 **단 하나의 자력 실험**: `find_dm.py --sweep` (미실행)
+### P0 — **J-Link 네이티브 경로.** JLinkScript 는 우리가 만든다
 
 ```bash
-sudo python3 find_dm.py --sweep
+sudo python3 try_jlinkscript.py --brief
 ```
 
-**지금까지 한 번도 안 돌렸다.** 그리고 성격이 다르다 —
-우리가 DMI 를 직접 읽는 게 아니라 **J-Link 의 지원 경로**로 붙이고,
-판정도 J-Link 에게 맡긴다(`halted()` 오라클, 비침습).
+벤더는 T32 만 답한다. **J-Link 스크립트는 우리 몫이고, 그 길을 우리가
+잘못된 이유로 닫아뒀다.**
 
-`AddAP` 문법(**`Addr=` vs `BaseAddr=`** — SEGGER 문서 두 곳이 다르다)
-× APB-AP 4개 × CoreBase 6개 = **48 조합**, 조합마다 별도 프로세스.
+★ **예전 JLinkScript 실패는 훅을 잘못 고른 탓이다.**
+`InitTarget()` 은 JTAG 체인과 전역 `CPU` 를 **수동으로 다 지정해야** 하는데
+안 해서 cJTAG 스캔이 깨졌다(`IRPrint=0x..0000`). 반면
+**`ConfigTargetSettings()` 는 SEGGER 문서상 타깃 통신이 금지된 훅**이라
+*"May not, under absolutely NO circumstances, call any API functions that
+perform target communication"* — **스캔을 깨뜨릴 수가 없다.**
+그리고 SEGGER 의 RISC-V-behind-DAP 예제가 쓰는 훅이 바로 이것이다.
 
-raw 트랜잭션이 안 되는 게 확인된 지금, **DMI 프로토콜을 J-Link 에 맡기는 것**이
-오히려 맞는 방향이다. 몇 분 걸린다.
+raw MEM-AP 트랜잭션이 성립하지 않는 게 확인된 지금,
+**DMI 프로토콜을 J-Link 에 맡기는 것이 맞다.** 우리는 위치만 알려준다.
+
+| 훑는 변수 | 값 | 근거 |
+|---|---|---|
+| `AddAP` 문법 | `BaseAddr=` / `Addr=` | SEGGER 문서 **두 곳이 서로 다르다** |
+| APB-AP 인덱스 | 0, 1, 4, 5 | APB 타입 AP 4개 |
+| CoreBase | `0x81480000` / `0x0` / `0x81481000` | ROM 엔트리 지목 / SEGGER 예제 / Ncore |
+
+오라클은 `halted()` — **DM 이 살아야만 되고 비침습**이다.
+조합마다 **별도 프로세스**(핸들 재사용은 거짓 성공을 만든다).
+
+`SF_E76_riscv.JLinkScript` 는 그 정본이다 — 값이 확정되면 이 파일 하나로 굳힌다.
+
+| VERDICT | 다음 |
+|---|---|
+| `DM_REACHED` | ★★ **끝.** 그 조합으로 굳히고 트레이스 레지스터로 간다 |
+| `CONNECT_ONLY` | connect 는 되는데 DM 이 안 산다 → hart/legacy 모드 변수 추가 |
+| `NO_CONNECT` | 스크립트 경로 자체가 안 먹음 → JLinkExe 로 직접 확인 |
 
 ### P0.1 — `probe_rom_dm.py` : 전송이 **어느 단계에서** 깨지는지 확정
 
