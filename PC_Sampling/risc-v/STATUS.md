@@ -778,27 +778,47 @@ pylink 의 `halted()` 는 **`@connection_required`** 라서
 ⇒ **connect 직후 세션이 죽는다.** DM 문제 이전에 **연결 유지**가 안 되는 것이다.
 지금까지 "connect 성공" 을 세어 온 게 전부 이 위에서 이뤄졌다.
 
-### P0 — 반복 측정 + **세션 생존 확인**
+### ✅ 2026-08-11 — `SESSION_ALIVE_NO_DM`
+
+**연결 유지 계층은 통과했다.** `connected=True` 인 세션이 나온다.
+`SESSION_DIES_AFTER_CONNECT` 가 아니므로 **물리/속도 계층은 원인이 아니다.**
+남은 건 **DM 뿐**이고, 이제 CoreBase/AP/hart 가 다시 의미를 갖는다.
+
+여기까지 계층별로 정리하면:
+
+| 계층 | 상태 |
+|---|---|
+| cJTAG / TAP 인식 | ✅ (TAP ID 수동 선언으로 해소) |
+| DAP 전원 | ✅ 디버그·시스템 둘 다 ACK |
+| AP 열거 / 레지스터 | ✅ IDR 6/6 일치 |
+| **connect 세션 유지** | ✅ **방금 통과** |
+| **RISC-V DM** | ❌ ← 여기 하나 남았다 |
+
+### P0 — `--dmsweep` : **살아있는 세션에서만** DM 변수를 훑는다
 
 ```bash
-sudo python3 try_jlinkscript.py --focus --reps 3
+sudo python3 try_jlinkscript.py --dmsweep --reps 3
 ```
 
-조합마다 3회 반복하고, connect 직후 **`connected` / `target_connected`** 를
-따로 기록한다. 비율로만 판단한다.
+원칙 두 개를 강제한다:
+- 조합마다 반복하고 **비율**로 본다 (1회 결과는 신호가 아니다)
+- **`connected=False` 인 시행은 버린다** — 죽은 세션의 측정은 실패가 아니라
+  **무효**다. raw DAP 때 `require_power` 게이트와 같은 원리다
+- 유효 시행이 0인 조합은 **판정하지 않고 출력도 안 한다** (옮겨 적을 양을 줄인다)
 
+훑는 것: `CoreBase` `{0x0, 0x1000, 0x2000, 0x4000, 0x10000, 0x20000}`
+× AP `{0,1}` × hart `{0}`. (`--aps` / `--harts` 로 넓힐 수 있다)
+
+출력은 이 형태의 몇 줄뿐이다:
 ```
-AP=0 hart=0  connect=2/3  connected=0/3  target_connected=0/3  halted=0/3
+base=0x1000 AP=0 hart=0 alive=2/3 halted=2      ★★ DM
 ```
 
-| VERDICT | 의미 | 다음 |
-|---|---|---|
-| `DM_REACHED` | ★★★ 끝 | 정본 스크립트 굳히기 |
-| `SESSION_ALIVE_NO_DM` | 세션은 사는데 DM 만 안 산다 | DM 변수(hart/CoreBase) 재개 |
-| **`SESSION_DIES_AFTER_CONNECT`** | **연결 유지가 안 된다** | **DM 이 아니라 물리/속도 계층** — 속도 낮추기, 타깃 전원 사이클 |
-
-`connected=0/3` 이 전 조합에서 나오면 **DM 관련 변수를 더 훑는 건 의미가 없다.**
-그 위 계층부터 고쳐야 한다.
+| VERDICT | 다음 |
+|---|---|
+| `DM_REACHED` | ★★★ 그 `base`/`AP` 로 정본 스크립트를 굳히고 **트레이스 레지스터로** |
+| `ALIVE_BUT_NO_DM` | CoreBase 후보가 다 틀렸거나 DM 접근에 별도 조건 — **오류 문구**가 단서 |
+| `NO_VALID_SESSION` | 세션이 안정적으로 안 산다 → 속도/전원 사이클 |
 
 ### (참고) 이전 `CONNECT_ONLY` 판정 — 무효
 

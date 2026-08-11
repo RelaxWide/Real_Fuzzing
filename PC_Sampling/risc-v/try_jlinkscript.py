@@ -49,7 +49,7 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.15  반복 + 연결상태 검증"
+VERSION = "2026-08-11.16  DM 스윕 (alive 게이트)"
 
 # ★ TAP ID 를 선언하면 JTAG-DTM 오인이 사라진다(실측: DTM오인아님 0/9 → 78/90).
 #   ⚠ 다만 "유효 IDCODE" 자체는 **우리가 선언한 값을 되돌려받은 것**일 수 있다.
@@ -213,6 +213,69 @@ def spawn(syntax, apidx, base, device, hart, tries, devid):
             'connect': False, 'dm_alive': False, 'error': 'no result'}
 
 
+DM_BASES = [0x0, 0x1000, 0x2000, 0x4000, 0x10000, 0x20000]
+
+
+def dmsweep(a):
+    """★ **살아있는 세션에서만** DM 변수를 훑는다.
+
+    `SESSION_ALIVE_NO_DM` 이 나왔다 = 연결 유지는 되고 DM 만 안 산다.
+    그러면 이제 CoreBase/AP/hart 가 다시 의미를 갖는다. 단 조건이 있다:
+
+      · 조합마다 `--reps` 회 반복한다 (1회 결과는 신호가 아니다)
+      · **`connected=False` 인 시행은 버린다.** 죽은 세션의 측정은
+        '실패' 가 아니라 **무효**다 — raw DAP 때 `require_power` 게이트와 같은 원리다
+      · 유효 시행이 하나도 없는 조합은 판정하지 않는다
+
+    출력은 **유효 시행이 있는 행만** 낸다 (손으로 옮겨 적을 수 있게).
+    """
+    print(f"\n{'=' * 68}\n [DMSWEEP] CoreBase × AP × hart, alive 세션만 집계"
+          f"\n{'=' * 68}")
+    print(f"  CoreBase {[hex(x) for x in DM_BASES]}")
+    print(f"  AP {a.aps}   hart {a.harts}   반복 {a.reps}회")
+    print("  죽은 세션(connected=False)은 **무효**로 버린다.\n")
+
+    rows = []
+    for base in DM_BASES:
+        for apidx in a.aps:
+            for hart in a.harts:
+                alive = halted = n = 0
+                errs = set()
+                for _ in range(a.reps):
+                    r = spawn('BaseAddr', apidx, base, 'E76', hart, a.tries, DEVIDS[0])
+                    n += 1
+                    if r.get('connected') is not True:
+                        continue                      # ← 무효. 실패로 세지 않는다
+                    alive += 1
+                    p = r.get('probe') or {}
+                    if isinstance(p.get('halted'), bool):
+                        halted += 1
+                    else:
+                        errs.add(str(p.get('halted'))[:44])
+                    time.sleep(0.2)
+                if alive:
+                    rows.append((base, apidx, hart, alive, n, halted, errs))
+                    print(f"  base=0x{base:<7X} AP={apidx} hart={hart}  "
+                          f"alive={alive}/{n}  halted={halted}/{alive}"
+                          + ("   ★★ DM" if halted else ""))
+                    for e in sorted(errs)[:1]:
+                        print(f"      {e}")
+
+    print(f"\nv={VERSION.split()[0]}  reps={a.reps}")
+    if not rows:
+        print("유효 시행이 있는 조합 없음 — 세션이 안정적으로 살지 않는다")
+        print("VERDICT: NO_VALID_SESSION")
+        return EXIT_INSUFFICIENT
+    for base, apidx, hart, alive, n, halted, _e in rows:
+        print(f"base=0x{base:X} AP={apidx} hart={hart} alive={alive}/{n} halted={halted}")
+    hit = [r for r in rows if r[5] > 0]
+    print("VERDICT:", "DM_REACHED" if hit else "ALIVE_BUT_NO_DM")
+    if not hit:
+        print("  → 살아있는 세션에서도 DM 이 안 산다. CoreBase 후보가 다 틀렸거나")
+        print("     DM 접근에 별도 조건이 있다. 오류 문구를 함께 볼 것.")
+    return EXIT_OK if hit else EXIT_INSUFFICIENT
+
+
 def focus(a):
     """connect 되는 조합을 **반복 측정**한다.
 
@@ -280,6 +343,10 @@ def main():
     ap.add_argument('--only-syntax', choices=SYNTAXES)
     ap.add_argument('--reps', type=int, default=3,
                     help='focus 모드에서 조합마다 반복할 횟수')
+    ap.add_argument('--dmsweep', action='store_true',
+                    help='★ 살아있는 세션에서만 CoreBase×AP×hart 를 훑는다')
+    ap.add_argument('--aps', default="0,1", help='dmsweep AP 인덱스')
+    ap.add_argument('--harts', default="0", help='dmsweep hart')
     ap.add_argument('--focus', action='store_true',
                     help='★ connect 되는 조합(CoreBase=0x0)만 깊이 판다 — hart 도 훑는다')
     ap.add_argument('--devices', default=",".join(DEVICES))
@@ -302,6 +369,10 @@ def main():
     if a.single:
         return run_one(a)
 
+    a.aps = [int(x) for x in a.aps.split(',') if x.strip()]
+    a.harts = [int(x) for x in a.harts.split(',') if x.strip()]
+    if a.dmsweep:
+        return dmsweep(a)
     if a.focus:
         return focus(a)
 
