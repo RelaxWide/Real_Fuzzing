@@ -235,6 +235,22 @@ TRACE32 는 `Data.Set AXI:0xC81040 %LE %Long 0x13333` 로 리셋을 해제합니
 > 5b. 트레이스 블록(`0xFD000000`, `0xFD180000`)은 **SBA 전용**입니까,
 >    아니면 **AXI-AP 로도 접근 가능**합니까? (SBA 는 DM 을 거치므로 우리가 막힙니다)
 > 5c. 그 버스 도메인에 **별도 클럭/전원 인에이블**이 필요합니까?
+> 5f. ★★ **가장 쉽게 답할 수 있는 것.** TRACE32 가 코어 enable 판정에 읽는
+>    다음 다섯 주소를 저희가 J-Link AXI-AP 로 읽으면 **전부 `0`**(오류 없음)입니다.
+>    ```
+>    AXI:0x00C81024  FCore  enable bit0
+>    AXI:0x00C81028  NCore0 bit0 / NCore1 bit16
+>    AXI:0x00C8102C  CMCore enable bit0
+>    AXI:0x00C81040  MPCore clock/reset bitmap
+>    AXI:0x00C81044  NCore  clock/reset bitmap
+>    ```
+>    **정상 동작 중인 보드에서 이 값들이 얼마여야 합니까?**
+>    (또는 TRACE32 로 한 번 읽어 그 값을 알려주셔도 됩니다 —
+>     `Data.Long(AXI:0x00C81024)` 등 다섯 줄)
+>
+>    저희는 기댓값을 몰라 **"정상 disabled 라서 0" 인지 "접근이 안 돼서 0" 인지
+>    구분할 수 없습니다.** HCore 는 TRACE32 가 AXI 를 읽지 않고 enabled 로
+>    처리하므로 positive control 로 쓸 수 없습니다.
 > 5d. ★★ **가장 알고 싶은 것.** TRACE32 는 `Data.Set AXI:0xC81040` 으로
 >    리셋을 해제합니다. 저희가 J-Link 의 AXI-AP(`DP:0x30000`, IDR
 >    `0x09130004`, `DeviceEn=1`)로 같은 주소를 읽으면 **오류 없이 `0`** 만
