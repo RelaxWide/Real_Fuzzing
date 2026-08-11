@@ -42,7 +42,14 @@ import time
 from sfe76_link import (require_api, Link, LinkError, AP_MAP,
                         add_common_args, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.27  Prot 스윕"
+VERSION = "2026-08-11.28  연속 구간 덤프"
+
+# ★ Prot 은 원인이 아니었다(PROT_NO_EFFECT). 그리고 전송은 66/66 정상이다.
+#   ⇒ 읽은 값들은 진짜 데이터다. 그런데 우리는 그 영역을 **띄엄띄엄 몇 개만**
+#     찍었고 **연속 구간을 통째로 본 적이 없다.** 두 경우가 구분이 안 된다:
+#       (a) 영역 전체가 같은 값   → 정말 아무것도 없다
+#       (b) 자리마다 값이 다르다  → 뭔가 있는데 우리가 레이아웃을 모른다
+#   (b)면 stride/레지스터 배치가 우리 가정과 다른 것이고 아직 길이 있다.
 
 # ★ probe_rom_dm 결과가 해석을 바꿨다:
 #     전송단계 ok:66, DP 오류비트 없음, TrInProg=False
@@ -156,6 +163,68 @@ class Rd:
             self._w(OFF_CSW, self.csw0)
 
 
+def window(a):
+    """★ 연속 구간을 덤프해 **구조가 있는지** 본다. 읽기 전용.
+
+    ROM 이 가리키는 곳을 몇 개만 찍어보고 "아무것도 없다" 고 결론냈는데,
+    그건 성긴 표본이었다. 연속으로 읽으면 두 경우가 갈린다:
+      · 전 구간이 같은 값        → 정말 비어 있다
+      · 자리마다 값이 다르다      → 레지스터가 있고 배치를 우리가 모르는 것
+
+    출력은 **값이 바뀌는 지점만** 낸다 (손으로 옮겨 적을 수 있게).
+    """
+    lk = Link(device=a.device, serial=a.serial, verbose=False)
+    base = dict((n, b) for n, b, _t in AP_MAP)[a.ap_name]
+    n = a.count
+    print(f"\n{'=' * 68}\n [WINDOW] {a.ap_name} 0x{a.win_base:08X} 부터 "
+          f"{n}워드 연속 덤프\n{'=' * 68}")
+    print("  띄엄띄엄 찍은 표본으로 '아무것도 없다' 고 결론냈었다. 연속으로 본다.")
+    print("  값이 **바뀌는 지점만** 출력한다.\n")
+    try:
+        with lk:
+            try:
+                lk.open_dap(tries=a.tries)
+            except LinkError as e:
+                print(f"  세션 무효: {e}")
+                return EXIT_INSUFFICIENT
+            r = Rd(lk.jl, base)
+            vals = []
+            for i in range(n):
+                vals.append(r.read32(a.win_base + i * 4))
+            r.restore()
+    except Exception as e:
+        print(f"  예외: {e}")
+        return EXIT_INSUFFICIENT
+
+    runs, prev, start = [], object(), 0
+    for i, v in enumerate(vals + [object()]):
+        if v != prev:
+            if i:
+                runs.append((start, i - 1, prev))
+            prev, start = v, i
+    uniq = {v for v in vals if v is not None}
+    print(f"  고유값 {len(uniq)}종 / {n}워드,  구간 {len(runs)}개\n")
+    for s_, e_, v in runs[:24]:
+        a0 = a.win_base + s_ * 4
+        a1 = a.win_base + e_ * 4
+        rng = f"0x{a0:08X}" + (f"~0x{a1:08X}" if e_ > s_ else "          ")
+        print(f"    {rng}  = {hx(v)}")
+    if len(runs) > 24:
+        print(f"    ... 외 {len(runs) - 24}개 구간")
+
+    print(f"\nv={VERSION.split()[0]}")
+    print(f"고유값={len(uniq)} 구간={len(runs)}")
+    print("VERDICT:", "STRUCTURED" if len(uniq) > 2 else "UNIFORM")
+    if len(uniq) > 2:
+        print("  ★★★ **자리마다 값이 다르다 — 레지스터가 있다.**")
+        print("     '아무것도 없다' 는 결론이 틀렸다. 배치를 우리가 몰랐던 것이다.")
+        print("     구간 경계가 레지스터 경계를 알려준다.")
+    else:
+        print("  전 구간이 사실상 같은 값 → 이 영역은 비어 있다.")
+        print("  다른 base 를 보거나(--win-base), 이 AP 가 아닌 것이다.")
+    return EXIT_OK
+
+
 def prot_sweep(a, addrs):
     """★ CSW.Prot 를 바꿔가며 읽는다. **읽기만 하므로 안전하다.**
 
@@ -237,6 +306,10 @@ def main():
                     choices=[n for n, _b, _t in AP_MAP])
     ap.add_argument('--addrs', default=None, help='콤마 구분 주소 (기본: 리셋 블록)')
     ap.add_argument('--sessions', type=int, default=3)
+    ap.add_argument('--window', action='store_true',
+                    help='★ 연속 구간을 덤프해 구조가 있는지 본다 (읽기 전용)')
+    ap.add_argument('--win-base', type=lambda x: int(x, 0), default=0x81480000)
+    ap.add_argument('--count', type=int, default=64)
     ap.add_argument('--prot-sweep', action='store_true',
                     help='★ CSW.Prot 를 바꿔가며 같은 주소를 읽는다 (읽기 전용)')
     ap.add_argument('--brief', action='store_true')
@@ -255,6 +328,8 @@ def main():
         print("  T32 리셋 해제가 AXI: 클래스를 쓴다 — 우리는 AXI-AP 를 써본 적이 없다.")
         print("  ⚠ **쓰기는 하지 않는다.** 동작 중인 SSD 를 리셋할 위험이 있다.\n")
 
+    if a.window:
+        return window(a)
     if a.prot_sweep:
         return prot_sweep(a, addrs)
 
