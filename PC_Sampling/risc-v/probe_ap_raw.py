@@ -598,6 +598,34 @@ def decode_dmstatus_v(v):
             'txt': f"version={ver}({names[ver]})  " + "  ".join(bits)}
 
 
+def brief_line(stable):
+    """★ **한 줄.** 타이핑으로 옮길 수 있는 최소량만 낸다.
+
+    판정에 실제로 필요한 값은 셋뿐이다:
+      +0xFFC CIDR3   → 0xB1 이면 CoreSight 컴포넌트가 거기 있다
+      +0x044 dmstatus (stride<<2 가정)
+      +0x011 dmstatus (stride 1  가정)
+    둘 중 하나에서 version(하위 4비트)이 2 나 3 이면 **DM 도달**이고,
+    동시에 **stride 도 결정된다.** 나머지 값은 이 판정을 바꾸지 않는다.
+    """
+    best, parts = None, []
+    for ap, vals in stable.items():
+        v = {a: x for a, (x, _e) in vals.items()}
+        g = lambda o: v.get(DM_PROBE_BASE + o)
+        c3, d2, d1 = g(0xFFC), g(0x044), g(0x011)
+        ver = None
+        for tag, x in (('<<2', d2), ('s1', d1)):
+            if x is not None and (x & 0xF) in (2, 3):
+                ver, best = f"{x & 0xF}/{tag}", ap
+        parts.append(f"{ap} FFC={_h4(c3)} 044={_h4(d2)} 011={_h4(d1)}"
+                     + (f" V={ver}" if ver else ""))
+    return parts, best
+
+
+def _h4(v):
+    return "----" if v is None else f"{v & 0xFFFFFFFF:08X}"
+
+
 def report_dm(stable):
     """★ `--addrs dm` 전용 판정. **원시값이 아니라 결론을 찍는다.**
 
@@ -784,16 +812,25 @@ def main():
                     help='독립 세션 반복. 전 세션 일치값만 인정한다')
     ap.add_argument('--no-rom', action='store_true', help='ROM 테이블 워크 생략')
     ap.add_argument('--no-alias', action='store_true', help='AP alias 검사 생략')
+    ap.add_argument('--brief', action='store_true',
+                    help='★ 결과를 **한 줄**로만 낸다 (손으로 옮겨 적을 때)')
     ap.add_argument('--addrs', default=None,
                     help="임의 절대주소를 **모든 AP 로** 읽는다. "
                          "'fw'=펌웨어 코드(양성 대조만), 'trace'=양성대조+트레이스 블록, "
                          "또는 콤마 구분 주소")
     a = ap.parse_args()
 
-    print(f"\n{'=' * 66}\n AP 직접 접근 — 코어/DM 을 거치지 않는다 (v{VERSION})\n{'=' * 66}")
-    print("  probe_dm.py 는 memory_read32 로 DM 을 읽으려 했다. 그건 CPU 컨텍스트를")
-    print("  거치는데, CPU 컨텍스트는 DM 이 살아야 생긴다 — **순환이었다.**")
-    print("  여기서는 DP→AP 레지스터를 직접 두드린다. DAP 전원만 있으면 된다.")
+    if not a.brief:
+        print(f"\n{'=' * 66}\n AP 직접 접근 — 코어/DM 을 거치지 않는다 (v{VERSION})\n{'=' * 66}")
+        print("  probe_dm.py 는 memory_read32 로 DM 을 읽으려 했다. 그건 CPU 컨텍스트를")
+        print("  거치는데, CPU 컨텍스트는 DM 이 살아야 생긴다 — **순환이었다.**")
+        print("  여기서는 DP→AP 레지스터를 직접 두드린다. DAP 전원만 있으면 된다.")
+
+    if a.brief:
+        import contextlib as _c, io as _io
+        _buf = _io.StringIO()
+        _ctx = _c.redirect_stdout(_buf)
+        _ctx.__enter__()
 
     runs = []
     for i in range(a.sessions):
@@ -907,6 +944,20 @@ def main():
     if al:
         print(f"alias_suspect={any(al)}")
     print("---8<---------------------")
+
+    if a.brief:
+        _ctx.__exit__(None, None, None)
+        st = {}
+        for n, m in (merged or {}).items():
+            st[n] = {ad: ((list({v for v, _e in obs})[0]
+                           if len({v for v, _e in obs}) == 1 else None), False)
+                     for ad, obs in m.items()}
+        parts, best = brief_line(st) if st else ([], None)
+        print(f"\nvalid={len(valid)}/{a.sessions}")
+        for p_ in parts:
+            print(p_)
+        print("VERDICT:", (f"DM 도달 {best}" if best else "미도달"))
+        return EXIT_OK if best else EXIT_INSUFFICIENT
 
     print(f"\n{'=' * 66}\n 다음\n{'=' * 66}")
     if solid:
