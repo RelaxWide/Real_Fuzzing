@@ -59,7 +59,7 @@ import time
 from sfe76_link import (require_api, Link, LinkError, AP_MAP, add_common_args,
                         EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.5  brief / version"
+VERSION = "2026-08-11.6  map"
 
 # DP 레지스터 인덱스
 DP_ABORT, DP_CTRL_STAT, DP_SELECT, DP_RDBUF = 0, 1, 2, 3
@@ -598,6 +598,57 @@ def decode_dmstatus_v(v):
             'txt': f"version={ver}({names[ver]})  " + "  ".join(bits)}
 
 
+def map_space(dap, aps, step=0x100000, limit=0x100000000, brief=False):
+    """★ AP 가 **실제로 디코드하는 주소 구간**을 훑어서 지도를 만든다.
+
+    지금까지는 주소를 하나씩 추측해 찍었고 전부 실패했다. 그 방식으로는
+    "이 주소가 안 보인다" 만 알 뿐 **어디가 보이는지**를 영영 모른다.
+    여기서는 반대로 간다 — 성긴 간격으로 전 공간을 훑어 **응답하는 구간**을
+    찾는다. 그러면 DM/트레이스가 어느 창에 있는지 추측이 아니라 관측이 된다.
+
+    판정: 한 구간에서 읽은 값이 '알려진 무응답 상수' 가 아니고, 이웃과
+          값이 다르면 **실제 디코드 구간**으로 본다.
+    """
+    known_dead = {0x00000000, 0xFFFFFFFF, 0xEAFFFFFE, 0xEAFFFFFC, 0x00000001, 0x00040700}
+    out = {}
+    for n, b in aps:
+        live, addr = [], 0
+        while addr < limit:
+            dap.clear_sticky()
+            v = dap.mem_read32(b, addr)
+            if v is not None and v not in known_dead:
+                live.append((addr, v))
+            addr += step
+        out[n] = live
+        if not brief:
+            print(f"\n  {n}: 응답 구간 {len(live)}개")
+            for a_, v in live[:24]:
+                print(f"      0x{a_:08X} = {hx(v)}")
+            if len(live) > 24:
+                print(f"      ... 외 {len(live) - 24}개")
+    return out
+
+
+def summarize_map(mp, step):
+    """연속 구간을 합쳐 한 줄로 만든다 (손으로 옮겨 적을 수 있게)."""
+    lines = []
+    for n, live in mp.items():
+        if not live:
+            lines.append(f"{n} live=none")
+            continue
+        runs, s0, prev = [], live[0][0], live[0][0]
+        for a_, _v in live[1:]:
+            if a_ == prev + step:
+                prev = a_
+            else:
+                runs.append((s0, prev))
+                s0 = prev = a_
+        runs.append((s0, prev))
+        lines.append(f"{n} live=" + ",".join(f"{s:08X}-{e:08X}" for s, e in runs[:6])
+                     + (f"(+{len(runs) - 6})" if len(runs) > 6 else ""))
+    return lines
+
+
 def brief_line(stable):
     """★ **한 줄.** 타이핑으로 옮길 수 있는 최소량만 낸다.
 
@@ -728,7 +779,8 @@ def one_session(a):
     lk = Link(core_base=a.core_base, hart=a.hart, device=a.device,
               serial=a.serial, ap_count=getattr(a, 'ap_count', None))
     out = {'valid': False, 'real_aps': [], 'dm': {}, 'rom': {},
-           'addr_res': {}, 'addr_list': [], 'alias': None, 'device_en': {}}
+           'addr_res': {}, 'addr_list': [], 'alias': None, 'device_en': {},
+           'map': {}}
     try:
         with lk:
             # ★ connect 성공을 요구하지 않는다. AP 접근에 필요한 건 DAP 전원뿐.
@@ -765,6 +817,9 @@ def one_session(a):
                 print("  ROM 테이블은 추정이 아니라 칩이 스스로 알려주는 목록이다.")
                 for n, b in usable:
                     out['rom'][n] = walk_rom(dap, n, b)
+
+            if a.map and usable:
+                out['map'] = map_space(dap, usable, a.map_step, a.map_limit, a.brief)
 
             if a.addrs and not usable:
                 print(f"\n  ⚠ **AP 접근 경로(TAR 되읽기)를 하나도 확보하지 못해**")
@@ -814,6 +869,12 @@ def main():
     ap.add_argument('--no-alias', action='store_true', help='AP alias 검사 생략')
     ap.add_argument('--brief', action='store_true',
                     help='★ 결과를 **한 줄**로만 낸다 (손으로 옮겨 적을 때)')
+    ap.add_argument('--map', action='store_true',
+                    help='★ AP 가 실제로 디코드하는 주소 구간을 훑는다')
+    ap.add_argument('--map-step', type=lambda x: int(x, 0), default=0x100000,
+                    help='훑는 간격 (기본 1MB)')
+    ap.add_argument('--map-limit', type=lambda x: int(x, 0), default=0x100000000,
+                    help='훑을 상한 (기본 4GB)')
     ap.add_argument('--version', action='store_true',
                     help='이 파일의 버전만 찍고 끝낸다 (구버전인지 확인용)')
     ap.add_argument('--addrs', default=None,
@@ -953,6 +1014,16 @@ def main():
 
     if a.brief:
         _ctx.__exit__(None, None, None)
+        if a.map:
+            mp = {}
+            for r in valid:
+                for n, live in (r.get('map') or {}).items():
+                    mp.setdefault(n, live)
+            print(f"\nv={VERSION.split()[0]}  valid={len(valid)}/{a.sessions}  "
+                  f"step=0x{a.map_step:X}")
+            for l in summarize_map(mp, a.map_step):
+                print(l)
+            return EXIT_OK if any(mp.values()) else EXIT_INSUFFICIENT
         st = {}
         for n, m in (merged or {}).items():
             st[n] = {ad: ((list({v for v, _e in obs})[0]
