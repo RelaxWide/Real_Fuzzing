@@ -137,6 +137,17 @@ APBAP1 으로 여러 주소를 32비트 읽은 결과입니다.
 > 3. Is there a way to make the DLL log the DMI transactions it attempts, so we
 >    can see which address it is driving? (`EnableRemarks`, verbose log level?)
 > 4. Is cJTAG + RISC-V-behind-DAP a supported combination in V9.66?
+> 5. ★ **KEEPER logic.** TRACE32 connects to this target using
+>    `SYStem.CONFIG.CJTAGFLAGS NOKEEPER USEOAC`, i.e. the SoC has **no KEEPER
+>    logic**. Your cJTAG page says a workaround exists but *"if a specific
+>    J-Link hardware version comes with this workaround can be checked via the
+>    model overview page"*.
+>    **Does our J-Link Plus (hardware version <채워넣기>, firmware <채워넣기>)
+>    include the no-KEEPER workaround?**
+>    Symptoms match a floating TMSC exactly: JTAG chain detection reports
+>    `Id: 0x00000001, IRLen: 04`, results differ between identical runs, and
+>    at <= 500 kHz no scan happens at all. `SetcJTAGInitMode` 0/1/2 make no
+>    difference. 4-wire JTAG (TIF=JTAG) produces no chain at all.
 >
 > A J-Link log file of the failing connect is attached.
 

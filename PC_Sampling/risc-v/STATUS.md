@@ -834,25 +834,62 @@ J-Link 자신의 JTAG 스캔이 Id=0x00000001 (쓰레기 IDCODE) 을 읽는다
 우리 raw DP 접근만 동작했던 이유도 이제 맞아떨어진다 —
 `perform_tif_init=False` 로 **재초기화를 건너뛰었기 때문**이다.
 
-### P0 — ★ **4선 JTAG.** 한 번도 안 해봤다
+### ★★★ 2026-08-11 — 원인은 **설정이 아니라 cJTAG KEEPER 로직**일 가능성이 크다
 
-```bash
-sudo python3 probe_cjtag_mode.py --tifsweep --speeds 10000,4000,1000,500
+```
+tif=0 (4선 JTAG)  모든 속도  Id=-  target=0      ← 스캔 자체가 안 잡힌다
+tif=7 (cJTAG)     10M/4M     Id=0x00000001 target=0
+tif=7 (cJTAG)     1M/500k    Id=-  target=0
+VERDICT: NO_SIGNAL
 ```
 
-T32 가 cJTAG 를 쓰기에 우리도 **cJTAG 만** 썼다. 그런데 **커넥터에 TDI/TDO 가
-물려 있다.** 그러면 평범한 4선 JTAG 를 쓸 수 있고,
-**cJTAG 활성화 시퀀스라는 문제의 원인 자체가 사라진다.**
-(4선 JTAG 에는 활성화 시퀀스가 아예 없다.)
+**SEGGER cJTAG 문서가 이 증상을 그대로 설명한다:**
 
-관찰 대상은 J-Link 로그의 **IDCODE** 와 **`target_connected()`** 다.
-`connect()` 무예외 종료는 **더 이상 신호로 쓰지 않는다.**
+> cJTAG 스펙은 타깃이 TCKC 상승엣지에 TMSC 를 놓아주도록 요구하고, 그동안
+> 라인을 유지하는 **KEEPER 로직**을 두도록 규정한다.
+> 그런데 *"some devices (**especially in the RISC-V segment**) have a buggy
+> KEEPER logic or no KEEPER logic at all"* → **TMSC 가 뜬다(floating)** →
+> *"can cause the target to detect escape sequences where there are none"*
+>
+> J-Link 에는 우회가 있지만 *"**if a specific J-Link hardware version comes
+> with this workaround, can be checked via the model overview page**"*
+> — **하드웨어 버전에 따라 있거나 없다.**
+>
+> 그리고 *"the workaround requires cJTAG speeds > 500 kHz ... J-Link ignores
+> speed settings < 500 kHz"* — **저속에서 스캔이 아예 없던 것과 맞는다.**
 
-| VERDICT | 의미 |
+**★ 결정적 정황: T32 는 이 타깃에 `CJTAGFLAGS NOKEEPER USEOAC` 로 붙는다.**
+`NOKEEPER` = **이 칩에 KEEPER 로직이 없다**는 뜻이고, T32 에는 그 전용 플래그가 있다.
+
+우리 증상 셋이 전부 floating TMSC 의 전형이다:
+- `Id=0x00000001` (읽은 데이터가 사실상 0)
+- **실행마다 결과가 바뀐다**
+- 500 kHz 이하에서 스캔 자체가 사라진다
+
+⇒ **설정 문제가 아닐 수 있다.** 그동안 DM·CoreBase·AP·TAP ID 를 훑은 것이
+성과가 없던 이유도 이걸로 설명된다 — **한참 아래 계층이 불안정했다.**
+
+### P0 — J-Link **하드웨어 버전**을 확인한다
+
+```bash
+sudo python3 probe_probe_hw.py
+```
+`hardware_version` 을 SEGGER **J-Link Model Overview** 페이지에서 대조한다:
+**이 하드웨어 버전에 KEEPER 우회가 있는가?**
+
+| | 결론 |
 |---|---|
-| `TARGET_CONNECTED` | ★★★ **끝.** 그 TIF/속도로 고정하고 DM·트레이스로 |
-| `IDCODE_OK_NO_TARGET` | TAP 은 잡히는데 그 위에서 막힘 → DM 변수 재개 |
-| `NO_SIGNAL` | 4선도 안 됨 → 배선·풀업·전원 등 하드웨어 |
+| **우회 있음** | 설정 문제로 되돌아간다. 단 4선 JTAG 가 안 잡히는 건 여전히 설명 필요 |
+| **우회 없음** | ★ **이 프로브로는 이 타깃의 cJTAG 를 안정적으로 못 쓴다.** 장비를 바꾸거나(최신 J-Link / J-Trace) T32 경로로 간다 |
+
+**이건 소프트웨어로 우회할 수 있는 종류가 아니다.** 확인 결과에 따라
+브링업을 계속할지, 장비/경로를 바꿀지가 갈린다.
+
+### P0.1 — 4선 JTAG 가 안 잡히는 것도 같이 물어볼 것
+
+커넥터에 TDI/TDO 가 있는데 4선 JTAG 스캔이 **아예 없다.**
+핀은 있으나 SoC 가 cJTAG 전용이거나, 모드 스트랩이 필요할 수 있다.
+→ 하드웨어 설계팀에 물을 것 (벤더가 아니라 **내부**다).
 
 ### (참고) 이전 `CONNECT_ONLY` 판정 — 무효
 
