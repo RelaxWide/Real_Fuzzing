@@ -49,7 +49,7 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.22  AP 셀렉터/device 스윕"
+VERSION = "2026-08-11.23  전체 로그 덤프"
 
 # ★ TAP 계층을 넘은 뒤 아직 안 돌린 변수 둘. 둘 다 문서 근거가 있다.
 #
@@ -273,6 +273,75 @@ def spawn(syntax, apidx, base, device, hart, tries, devid, form='JLINK_JTAG',
 
 
 DM_BASES = [0x0, 0x1000, 0x2000, 0x4000, 0x10000, 0x20000]
+
+
+def dumplog(a):
+    """★ **J-Link 자신의 전체 로그**를 받아 적는다. 조합 훑기를 멈추고 이걸 본다.
+
+    지금까지 우리는 로그에서 **몇 개 패턴만** 정규식으로 골라 봤다
+    (`Id:`, `JTAG-DTM`, `chain detection`). 그런데 실패 문구가
+    `Could not find supported CPU` 로 바뀐 지금 필요한 것은
+    **J-Link 이 어떤 AP 를 어떻게 두드렸고 무엇을 읽었는지**다.
+    그건 로그 본문에만 있고 우리는 그걸 한 번도 통째로 본 적이 없다.
+
+    파일로 전부 저장하고, 화면에는 **DAP/AP/CPU 탐지 구간만** 추려서 낸다.
+    이 로그는 SEGGER 지원에 첨부할 자료이기도 하다.
+    """
+    print(f"\n{'=' * 68}\n [LOG] J-Link 전체 로그 덤프\n{'=' * 68}")
+    print(f"  조합: sel={a.log_sel} AP={a.log_ap} device={a.log_dev} "
+          f"CoreBase=0x{a.log_base:X} hart={a.hart}")
+    selcmd = dict(SELECTORS)[a.log_sel]
+
+    sp = os.path.join(tempfile.gettempdir(), f"sfe76_dump_{os.getpid()}.JLinkScript")
+    gen_script(sp, 'BaseAddr', a.log_ap, a.log_base, a.hart,
+               CHAIN_TAP_ID, 'JLINK_JTAG', selcmd)
+    logs = []
+    cb = lambda m: logs.append(str(m).rstrip())
+    jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
+    try:
+        jl.exec_command(f"ScriptFile = {sp}")
+        jl.open()
+        jl.exec_command(f"SetcJTAGInitMode = {CJTAG_MODE}")
+        jl.exec_command("EnableRemarks = 1")
+        jl.exec_command("SetLogVerbose = 1")
+        jl.exec_command(f"ScriptFile = {sp}")
+        jl.set_tif(TIF_CJTAG)
+        jl.set_speed(SPEED_KHZ)
+        try:
+            jl.connect(a.log_dev, speed=SPEED_KHZ)
+        except Exception as e:
+            logs.append(f"[connect 예외] {e}")
+    except Exception as e:
+        logs.append(f"[예외] {e}")
+    finally:
+        try:
+            jl.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(sp)
+        except OSError:
+            pass
+
+    path = a.logfile or 'jlink_connect.log'
+    with open(path, 'w') as f:
+        f.write("\n".join(logs))
+    print(f"\n  전체 {len(logs)}줄 → {path}\n")
+
+    # 화면에는 진단에 쓰이는 구간만
+    keys = ('coresight', 'dap', ' ap', 'ap[', 'apb', 'ahb', 'axi', 'dmi', 'dm ',
+            'debug module', 'dmcontrol', 'dmstatus', 'hart', 'riscv', 'risc-v',
+            'idcode', 'id:', 'irlen', 'cpu', 'core', 'error', 'fail', 'cannot',
+            'could not', 'timeout')
+    sel_lines = [l for l in logs if any(k in l.lower() for k in keys)]
+    print(f"  {'─' * 64}\n  진단 관련 {len(sel_lines)}줄:")
+    for l in sel_lines[-40:]:
+        print(f"    {l[:110]}")
+    print(f"  {'─' * 64}")
+    print("\n  ★ 볼 것: J-Link 이 **어느 AP 를 두드렸고 무엇을 읽었는지**.")
+    print("     그게 우리가 준 AP 맵과 맞는지, 아니면 무시하고 다른 걸 봤는지.")
+    print(f"  ★ 이 파일({path})은 SEGGER 지원에 그대로 첨부할 자료다.")
+    return EXIT_OK
 
 
 def cpusweep(a):
@@ -541,6 +610,13 @@ def main():
     ap.add_argument('--only-syntax', choices=SYNTAXES)
     ap.add_argument('--reps', type=int, default=3,
                     help='focus 모드에서 조합마다 반복할 횟수')
+    ap.add_argument('--dumplog', action='store_true',
+                    help='★ J-Link 전체 로그를 파일로 덤프하고 진단 구간을 출력')
+    ap.add_argument('--logfile', default=None)
+    ap.add_argument('--log-sel', default='APB', choices=[x[0] for x in SELECTORS])
+    ap.add_argument('--log-ap', type=int, default=0)
+    ap.add_argument('--log-dev', default='E76')
+    ap.add_argument('--log-base', type=lambda x: int(x, 0), default=0x0)
     ap.add_argument('--cpusweep', action='store_true',
                     help='★ AP 셀렉터(APB/AHB) × device. TAP 통과 후 남은 두 변수')
     ap.add_argument('--cpu-devices', default=",".join(CPU_DEVICES))
@@ -580,6 +656,8 @@ def main():
     a.aps = [int(x) for x in a.aps.split(',') if x.strip()]
     a.harts = [int(x) for x in a.harts.split(',') if x.strip()]
     a.cpu_devices = [x.strip() for x in a.cpu_devices.split(',') if x.strip()]
+    if a.dumplog:
+        return dumplog(a)
     if a.cpusweep:
         return cpusweep(a)
     if a.v2:

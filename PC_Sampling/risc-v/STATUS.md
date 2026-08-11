@@ -932,30 +932,47 @@ DAP 는 탔는데 **그 뒤에서 RISC-V 코어를 못 찾는다.**
 `CoreBase × AP` 를 훑어도 안 붙는다. 실패 문구는 여전히
 **`Could not find supported CPU`** — DAP 는 탔는데 **그 뒤에서 코어를 못 찾는다.**
 
-### P0 — 아직 안 돌린 변수 **둘**. 문서 근거가 있다
+### ❌ `--cpusweep` — AHB 셀렉터도 아니다
+
+```
+sel=APB ap=0 dev=E76 에서 connect 가 한 번 올라온 것 외에는 전부
+err = Could not find supported CPU.   target = 0/N
+```
+AP 셀렉터도 device 도 아니다. **조합 훑기는 여기서 멈춘다.**
+
+### 지금 계층 상태 — TAP 은 넘었고 CPU 탐지에서 막힌다
+
+| 계층 | |
+|---|---|
+| cJTAG / DP 통신 | ✅ (raw 경로로 확인) |
+| DAP 전원 | ✅ 양쪽 ACK |
+| AP 열거 / IDR | ✅ 6/6 T32 선언과 일치 |
+| **TAP 인식** | ✅ **수동 선언으로 통과** (로그 IDCODE = 선언값, DTM 오인 소멸) |
+| **CPU 탐지** | ❌ `Could not find supported CPU` |
+| RISC-V DM | ⬜ 도달 못 함 |
+
+### P0 — **J-Link 자신의 전체 로그를 읽는다** (한 번도 안 했다)
 
 ```bash
-sudo python3 try_jlinkscript.py --cpusweep --reps 3
+sudo python3 try_jlinkscript.py --dumplog
 ```
 
-**① AP 셀렉터** — SEGGER RISC-V 예제 주석 원문:
-> *"If RISC-V is behind an **APB-AP**, use `CORESIGHT_SetIndexAPBAPToUse`
->  If RISC-V is behind an **AHB-AP**, use `CORESIGHT_SetIndexAHBAPToUse`"*
+지금까지 로그에서 **패턴 몇 개만** 정규식으로 골라 봤다
+(`Id:`, `JTAG-DTM`, `chain detection`). 그런데 실패가
+`Could not find supported CPU` 로 바뀐 지금 필요한 건
+**J-Link 이 어떤 AP 를 어떻게 두드렸고 무엇을 읽었는지**다.
+그건 로그 본문에만 있고 **우리는 그걸 통째로 본 적이 없다.**
 
-**우리는 APB 셀렉터만 써 왔다.** AHB-AP(index 3, `0x40000`)도 IDR 로 실재가
-확인돼 있고 TYPE=1(AHB3)로 T32 선언과 일치한다. **한 번도 안 써봤다.**
+`SetLogVerbose=1` + `EnableRemarks=1` 로 받아 `jlink_connect.log` 에 전부 저장하고,
+화면에는 **DAP/AP/CPU 탐지 구간만** 추려서 낸다(마지막 40줄).
 
-**② device** — *"`RISC-V` 는 안 되고 `E76` 이어야 한다"* 는 관측은
-**TAP 이 깨진 상태**에서 나온 것이다. 지금은 조건이 다르므로 **다시 본다.**
-(이 프로젝트에서 무효 조건의 관측을 그대로 들고 간 적이 여러 번 있다)
+조합은 인자로 바꾼다: `--log-sel APB|AHB --log-ap N --log-dev E76 --log-base 0x0`
 
-셀렉터 2 × device 3 = 6 조합. `CoreBase=0x0`, hart 0 고정.
-셀렉터에 맞춰 AP 인덱스도 바꾼다 — APB→0, AHB→3.
+**볼 것:** J-Link 이 **우리가 준 AP 맵을 실제로 쓰는지**, 아니면 무시하고
+다른 걸 두드리는지. 그게 다음 수를 정한다.
 
-| VERDICT | 다음 |
-|---|---|
-| `TARGET_CONNECTED` | ★★★ 그 조합으로 정본 굳히고 **DM·트레이스로** |
-| `STILL_NO_TARGET` | TAP ID 후보 교체(`--devid`) + hart/CoreBase 확대 |
+> 이 로그 파일은 **SEGGER 지원에 그대로 첨부할 자료**이기도 하다.
+> 어느 쪽으로 가든 헛일이 아니다.
 
 ### 교훈 — 세 번 반복된 것
 
