@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.28  --ident: ROM 테이블 전제 검증 + 주소공간 스캔"
+VERSION = "standalone 2026-08-11.29  --axi: AXI-AP 가 살아있나 (TAR 되읽기 대조)"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -663,6 +663,50 @@ SCAN_ADDRS = [0x0, 0x1000, 0x2000, 0x10000, 0x100000, 0x1000000,
               0xC0000000, 0xC81000, 0xE0000000, 0xFD000000, 0xFD180000]
 
 
+
+# ★★★ --axi : 쓰기 승인을 묻기 **전에** 반드시 답해야 하는 것.
+#
+#   T32 의 Reset Release 는 AXI:0xC81040 / 0xC81044 에 쓴다. 그런데
+#   AXIAP1 은 **모든 주소에서 0x00000000** 을 준다. 0 은 default slave
+#   라인(0x00000001 / 0xEAFFFFFE)이 **아니다** — APBAP1 과 거동이 다르다.
+#   둘 중 하나인데 구별한 적이 없다:
+#       (a) AXI 버스가 진짜 0 을 돌려준다 (리셋 중이면 그럴 수 있다)
+#       (b) AXI-AP 가 데이터를 아예 전달하지 못한다
+#
+#   ★ (b) 라면 0xC81040 에 써봐야 **검증조차 못 한다.** 실기 장치에 쓰기를
+#     제안하면서 결과를 못 읽는다는 건 말이 안 된다. 먼저 가른다.
+#
+#   양성 대조: **TAR 되읽기.** TAR 는 AP 레지스터이므로 쓰고 되읽어도
+#   타깃 버스에는 아무것도 안 쓴다. 되읽기가 맞으면 AP 는 살아 있고,
+#   그때의 0 은 **버스가 준 진짜 값**이다.
+TAR_PATTERNS = [0xC8104000, 0x00C81040, 0xDEADBEE0, 0x12345670, 0x00000000]
+
+
+def axi_health(d):
+    out = {'aps': []}
+    for name, apbase, _t in AP_MAP:
+        if name not in ('AXIAP1', 'AHBAP1', 'APBAP1'):
+            continue
+        csw0 = d.apr(apbase, OFF_CSW)
+        r = {'ap': name, 'CSW': hx(csw0), 'IDR': hx(d.apr(apbase, OFF_IDR)),
+             'CFG': hx(d.apr(apbase, OFF_CFG)), 'tar_ok': 0, 'tar_n': 0}
+        for pat in TAR_PATTERNS:
+            if not d.apw(apbase, OFF_TAR, pat):
+                continue
+            back = d.apr(apbase, OFF_TAR)
+            r['tar_n'] += 1
+            if back == pat:
+                r['tar_ok'] += 1
+        # T32 가 실제로 읽는 다섯 자리
+        r['reads'] = {}
+        for addr, note in AXI_T32_ADDRS:
+            v, _ = d.mem32(apbase, addr, csw0)
+            r['reads'][f"0x{addr:X}"] = hx(v)
+        if csw0 is not None:
+            d.apw(apbase, OFF_CSW, csw0)
+        out['aps'].append(r)
+    return out
+
 def ident_probe(d):
     out = {'aps': [], 'scan': []}
     for name, apbase, _t in AP_MAP:
@@ -947,6 +991,10 @@ def session(a, idx):
                 out['discover'] = discover(d)
             return out
 
+        if getattr(a, 'axi', False):
+            out['axi'] = axi_health(d)
+            return out
+
         if getattr(a, 'ident', False):
             out['ident'] = ident_probe(d)
             return out
@@ -1012,6 +1060,8 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--axi', action='store_true',
+                    help='* AXI-AP 가 데이터를 전달하나. TAR 되읽기 양성대조')
     ap.add_argument('--ident', action='store_true',
                     help='* DEVARCH 로 ROM 테이블 전제를 검증 + APBAP1 주소공간 스캔')
     ap.add_argument('--prot', action='store_true',
@@ -1096,6 +1146,33 @@ def main():
     print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
+
+    if a.axi:
+        print(f"\n{'=' * 70}\n [AXI] AXI-AP 가 데이터를 전달하나\n{'=' * 70}")
+        print("  T32 의 Reset Release 는 AXI:0xC81040/0xC81044 에 쓴다.")
+        print("  그런데 AXIAP1 은 모든 주소에서 0 이고, 0 은 default slave 라인이")
+        print("  **아니다**. (a) 버스가 진짜 0 인가 (b) AP 가 전달을 못 하나?")
+        print("  양성대조 = TAR 되읽기 (AP 레지스터라 타깃 버스엔 안 쓴다).")
+        print("  (b) 라면 0xC81040 에 써봐야 검증조차 못 한다.\n")
+        r0 = session(a, 0)
+        if not r0.get('ok'):
+            print("---8<---")
+            print(f"무효 세션 (AP일치={r0.get('ap_match')}/6) - 다시 실행")
+            print("---8<---")
+            return 6
+        print("---8<---")
+        healthy = []
+        for r in r0.get('axi', {}).get('aps', []):
+            rv = ",".join(f"{k}={v}" for k, v in r['reads'].items())
+            ok = r['tar_n'] and r['tar_ok'] == r['tar_n']
+            if ok and r['ap'] == 'AXIAP1':
+                healthy.append(r['ap'])
+            print(f"{r['ap']} IDR={r['IDR']} CFG={r['CFG']} "
+                  f"TAR되읽기={r['tar_ok']}/{r['tar_n']}{'(정상)' if ok else '(불일치)'}")
+            print(f"  {rv}")
+        print("VERDICT:", "AXI_AP_ALIVE" if healthy else "AXI_AP_NOT_DELIVERING")
+        print("---8<---")
+        return 0 if healthy else 6
 
     if a.ident:
         print(f"\n{'=' * 70}\n [IDENT] ROM 테이블 전제 검증 + 주소공간 스캔\n{'=' * 70}")
