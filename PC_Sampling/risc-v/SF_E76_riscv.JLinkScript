@@ -37,7 +37,7 @@ void ConfigTargetSettings(void) {
   JLINK_ExecCommand("CORESIGHT_AddAP = Index=4 Type=APB-AP BaseAddr=0x00050000");
   JLINK_ExecCommand("CORESIGHT_AddAP = Index=5 Type=APB-AP BaseAddr=0x00060000");
   JLINK_ExecCommand("CORESIGHT_SetIndexAPBAPToUse = 0");
-  JLINK_ExecCommand("CORESIGHT_SetCoreBaseAddr = 0x81480000");
+  JLINK_ExecCommand("CORESIGHT_SetCoreBaseAddr = 0x0");        /* ★ 실측: 0x0 에서만 connect 성공 */
   JLINK_ExecCommand("RISCV_SetHartSel = 0");
   return 0;
 }

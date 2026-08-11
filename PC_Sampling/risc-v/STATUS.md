@@ -738,34 +738,50 @@ SetcJTAGInitMode
 **JTAG-DTM 으로 오인**했다. `JLINK_JTAG_SetDeviceId()` 로 **선언하니 그 오인이 사라졌다.**
 지금까지 `CORESIGHT_*` 설정이 전부 무시된 이유가 이것이다.
 
-### P0 — **두 훅을 합친 스크립트**로 DM 을 노린다 (한 번도 없던 조합)
+### ★★★ 2026-08-11 — **설정이 드디어 결과를 바꾼다.** `CoreBase=0x0`
+
+```
+script실행=16/16   connect성공=2/16   DM살아있음=0
+connect 된 조합: ('BaseAddr', AP=0, '0x0')  ('BaseAddr', AP=1, '0x0')
+VERDICT: CONNECT_ONLY
+```
+
+| | 이전(TAP 선언 없음) | 지금(TAP 선언 있음) |
+|---|---|---|
+| connect | **24/24** — CoreBase 무관 | **2/16** — `CoreBase=0x0` 일 때만 |
+
+**설정이 실제로 적용되고 있다.** TAP 선언이 그 문을 열었다.
+그리고 **`0x81480000` 은 전부 실패, `0x0` 만 성공** —
+SEGGER 예제값이 맞았고, **`0x81480000` 은 AP 주소공간 값이 아니다.**
+(T32 의 `APB:` 버스 주소일 뿐이라는 해석이 실측으로 뒷받침됐다.)
+
+이제 남은 건 **connect 는 되는데 `halted()` 가 예외**라는 것 하나다.
+
+### P0 — `--focus` : DM 이 **어디까지** 사는지 가른다
 
 ```bash
-sudo python3 try_jlinkscript.py --brief
+sudo python3 try_jlinkscript.py --focus
 ```
 
-`SF_E76_riscv.JLinkScript` 를 **두 훅**으로 갱신했다. 각각 다른 문제를 푼다:
+`CoreBase=0x0` × AP{0,1} × **hart{0,1,2,3}** 를 돌면서, connect 뒤에
+**단계별로** 캔다 — `halted()` 만 보면 '실패' 로만 남고 왜인지 모른다:
 
-```c
-int  InitTarget(void)            // ① TAP 인식 실패 → 체인 수동 선언
-{ JTAG_AllowTAPReset=0; JTAG_IRLen=4; JLINK_JTAG_SetDeviceId(0, <DAP id>); }
-
-void ConfigTargetSettings(void)  // ② AP 맵 + DMI 위치 (RISC-V 는 자동탐색 불가)
-{ CORESIGHT_AddAP ×6; SetIndexAPBAPToUse; SetCoreBaseAddr; RISCV_SetHartSel; }
+```
+halted()          DM 이 살아야 된다
+core_id()         J-Link 이 코어를 식별했는가
+core_name()       무엇으로 봤는가 (RV32?)
+register_read(0)  레지스터 접근이 되는가
+로그에서 dmcontrol / hart / CoreSight 줄
 ```
 
-**지금까지 ①과 ② 를 같이 준 적이 없다.** ② 만 줬을 때는 ①이 없어 TAP 을
-오인해 ② 가 무시됐고, ① 만 줬을 때는 ② 가 없었다.
+`hart` 를 훑는 이유: `attach.cmm` 상 hcore=hart0 이지만, J-Link 의
+`RISCV_SetHartSel` 이 언제 적용되는지는 미확인이다.
 
-훑는 조합 **16개** = TAP ID 4 × AP 인덱스 {0,1} × CoreBase {`0x81480000`, `0x0`}
-(device `E76`, 문법 `BaseAddr=` 고정 — 앞선 결과로 좁혔다).
-오라클은 **`halted()`** — DM 이 살아야만 되고 비침습이다.
-
-| VERDICT | 다음 |
+| 결과 | 다음 |
 |---|---|
-| `DM_REACHED` | ★★★ **블로커 해소.** 그 값으로 정본 스크립트를 굳히고 트레이스 레지스터로 |
-| `CONNECT_ONLY` | TAP 은 잡혔는데 DM 이 안 산다 → hart / `UseNexusLegacyMode` / CoreBase 확대 |
-| `SCRIPT_NOT_LOADED` | 스크립트 미적용 — 결과 해석 금지 |
+| 어떤 hart 에서 `halted=False/True` | ★★★ **DM 도달.** 정본 스크립트를 그 값으로 굳힌다 |
+| 전부 `ERR ...` | 그 **예외 문구**가 다음 단서 (`dmstatus` 인지 `dmcontrol` 인지) |
+| `core_name` 이 나옴 | 코어 식별까지는 됐다는 뜻 — DM 일부는 산다 |
 
 ### (참고) 이전 `CONNECT_ONLY` 판정 — 무효
 

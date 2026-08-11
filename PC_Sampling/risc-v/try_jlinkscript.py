@@ -49,7 +49,7 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.13  InitTarget 체인선언 + ConfigTargetSettings AP맵"
+VERSION = "2026-08-11.14  focus 모드"
 
 # ★ TAP ID 를 선언하면 JTAG-DTM 오인이 사라진다(실측: DTM오인아님 0/9 → 78/90).
 #   ⚠ 다만 "유효 IDCODE" 자체는 **우리가 선언한 값을 되돌려받은 것**일 수 있다.
@@ -151,11 +151,24 @@ def run_one(a):
 
         rec['script_ran'] = any(MARKER in l for l in logs)
         if rec['connect']:
-            try:                                   # DM 이 살아야만 되는 호출
-                rec['halted'] = bool(jl.halted())
-                rec['dm_alive'] = True
-            except Exception as e:
-                rec['error'] = rec['error'] or str(e)[:120]
+            # ★ connect 성공 뒤 DM 이 **어디까지** 사는지 단계별로 캔다.
+            #   halted() 만 보면 '실패' 로만 남고 왜인지 모른다.
+            probes = [('halted', lambda: bool(jl.halted())),
+                      ('core_id', lambda: hex(jl.core_id())),
+                      ('core_name', lambda: str(jl.core_name())),
+                      ('reg0', lambda: hex(jl.register_read(0) & 0xFFFFFFFF)),
+                      ('cpu_halt_reasons', lambda: str(jl.cpu_halt_reasons())[:60])]
+            rec['probe'] = {}
+            for nm, fn in probes:
+                try:
+                    rec['probe'][nm] = fn()
+                except Exception as e:
+                    rec['probe'][nm] = f"ERR {str(e)[:70]}"
+            rec['dm_alive'] = not str(rec['probe'].get('halted', '')).startswith('ERR')
+            # 로그에서 DM/DTM 관련 줄만 뽑아 둔다
+            keys = ('dmcontrol', 'debug module', 'dtm', 'coresight', 'ap ', 'hart')
+            rec['loglines'] = [l for l in logs
+                               if any(k in l.lower() for k in keys)][:8]
     except Exception as e:
         rec['error'] = str(e)[:120]
     finally:
@@ -190,11 +203,46 @@ def spawn(syntax, apidx, base, device, hart, tries, devid):
             'connect': False, 'dm_alive': False, 'error': 'no result'}
 
 
+def focus(a):
+    """connect 가 되는 조합만 깊이 판다. **왜 DM 이 안 사는지**를 본다."""
+    print(f"\n{'=' * 68}\n [FOCUS] CoreBase=0x0 × AP{{0,1}} × hart{{0..3}}\n{'=' * 68}")
+    print("  connect 는 되는데 halted() 가 예외다. 그 예외 문구와")
+    print("  core_id / core_name / reg0 로 **DM 이 어디까지 사는지** 가른다.\n")
+    rows = []
+    for apidx in (0, 1):
+        for hart in (0, 1, 2, 3):
+            r = spawn('BaseAddr', apidx, 0x0, 'E76', hart, a.tries, DEVIDS[0])
+            r['hart'] = hart
+            rows.append(r)
+            p = r.get('probe') or {}
+            print(f"  AP={apidx} hart={hart}  connect={int(bool(r.get('connect')))}"
+                  f"  halted={p.get('halted')}")
+            for k in ('core_id', 'core_name', 'reg0'):
+                if k in p:
+                    print(f"      {k:10s}= {p[k]}")
+            for l in (r.get('loglines') or [])[:4]:
+                print(f"      log: {l[:96]}")
+            if not r.get('connect') and r.get('error'):
+                print(f"      err: {str(r['error'])[:96]}")
+            time.sleep(0.3)
+
+    ok = [r for r in rows if r.get('dm_alive')]
+    print(f"\nv={VERSION.split()[0]}  focus 조합={len(rows)}")
+    for r in rows:
+        p = r.get('probe') or {}
+        print(f"AP={r['ap']} hart={r['hart']} connect={int(bool(r.get('connect')))} "
+              f"halted={p.get('halted')} core_id={p.get('core_id')}")
+    print("VERDICT:", "DM_REACHED" if ok else "CONNECT_ONLY")
+    return EXIT_OK if ok else EXIT_INSUFFICIENT
+
+
 def main():
     require_api(4, "try_jlinkscript.py")
     ap = argparse.ArgumentParser()
     ap.add_argument('--brief', action='store_true')
     ap.add_argument('--only-syntax', choices=SYNTAXES)
+    ap.add_argument('--focus', action='store_true',
+                    help='★ connect 되는 조합(CoreBase=0x0)만 깊이 판다 — hart 도 훑는다')
     ap.add_argument('--devices', default=",".join(DEVICES))
     ap.add_argument('--tries', type=int, default=3)
     ap.add_argument('--hart', type=int, default=0)
@@ -214,6 +262,9 @@ def main():
         return EXIT_OK
     if a.single:
         return run_one(a)
+
+    if a.focus:
+        return focus(a)
 
     syns = [a.only_syntax] if a.only_syntax else SYNTAXES
     devs = [x.strip() for x in a.devices.split(',') if x.strip()]
