@@ -403,6 +403,20 @@ def verdict_dm(vals):
     return False
 
 
+# ★ 양성 대조 — **읽혀야 정상인 주소.**
+#   attach.cmm 의 `MAP.BOnchip 0x0++0x21BFFF` = 펌웨어 코드 영역(≈2.2MB).
+#   실물 코드가 있는 곳이므로 AXI/AHB-AP 로 읽히는 게 정상이다.
+#
+#   이게 없으면 "주소가 안 읽힌다" 와 "우리 mem_read32 가 원래 안 된다" 를
+#   **구분할 수 없다.** 지금까지 시도한 주소가 전부 실패해서 그 구분이 안 됐다.
+#   여기가 읽히면 경로는 정상이고, 실패는 그 주소가 디코드 안 되는 것이다.
+CONTROL_ADDRS = [
+    (0x00000000, '[양성대조] 펌웨어 코드 0x0 (리셋 벡터)'),
+    (0x00000004, '[양성대조] 펌웨어 코드 0x4'),
+    (0x00100000, '[양성대조] 펌웨어 코드 중간'),
+    (0x0021BFFC, '[양성대조] 펌웨어 코드 끝 (0x21BFFF)'),
+]
+
 # T32 ViewNexusTracedump.cmm 실물에서 온 트레이스 블록 주소
 TRACE_ADDRS = [
     (0xFD000000, 'NEXUS.0 TE  (hcore/hart0)'),
@@ -488,8 +502,13 @@ def one_session(a):
                     out['rom'][n] = walk_rom(dap, n, b)
 
             if a.addrs and usable:
-                lst = (TRACE_ADDRS if a.addrs.strip() == 'trace'
-                       else [(int(x, 0), '') for x in a.addrs.split(',') if x.strip()])
+                k = a.addrs.strip()
+                if k == 'trace':
+                    lst = CONTROL_ADDRS + TRACE_ADDRS   # 양성 대조를 **먼저**
+                elif k == 'fw':
+                    lst = CONTROL_ADDRS
+                else:
+                    lst = [(int(x, 0), '') for x in a.addrs.split(',') if x.strip()]
                 out['addr_hits'] = read_addrs(dap, usable, lst)
 
             if a.dm and usable:
@@ -515,8 +534,9 @@ def main():
                     help='독립 세션 반복. 전 세션 일치값만 인정한다')
     ap.add_argument('--no-rom', action='store_true', help='ROM 테이블 워크 생략')
     ap.add_argument('--addrs', default=None,
-                    help='임의 절대주소를 **모든 AP 로** 읽는다 (콤마). '
-                         "예: 'trace' 프리셋 또는 0xFD000000,0xFD180000")
+                    help="임의 절대주소를 **모든 AP 로** 읽는다. "
+                         "'fw'=펌웨어 코드(양성 대조만), 'trace'=양성대조+트레이스 블록, "
+                         "또는 콤마 구분 주소")
     a = ap.parse_args()
 
     print(f"\n{'=' * 66}\n AP 직접 접근 — 코어/DM 을 거치지 않는다 (v{VERSION})\n{'=' * 66}")
@@ -566,7 +586,20 @@ def main():
         for n, lst in (r.get('addr_hits') or {}).items():
             th.setdefault(n, set()).update(a_ for a_, _v in lst)
     if th:
-        print(f"\n{'=' * 66}\n ★★ 트레이스 블록에 닿은 AP\n{'=' * 66}")
+        ctrl_set = {a_ for a_, _l in CONTROL_ADDRS}
+        trace_set = {a_ for a_, _l in TRACE_ADDRS}
+        ctrl_ok = {n for n, ad in th.items() if ad & ctrl_set}
+        trace_ok = {n for n, ad in th.items() if ad & trace_set}
+        print(f"\n{'=' * 66}\n ★ 양성 대조 (펌웨어 코드 영역)\n{'=' * 66}")
+        print(f"    읽은 AP: {sorted(ctrl_ok) if ctrl_ok else '없음'}")
+        if ctrl_ok:
+            print("    ✅ **mem_read32 경로가 정상이다.** 다른 주소의 실패는")
+            print("       '그 주소가 그 AP 에서 디코드되지 않는다' 는 뜻이다.")
+        else:
+            print("    ❌ 코드 영역조차 못 읽는다 → **우리 mem_read32 가 문제다.**")
+            print("       주소 탓하기 전에 이걸 먼저 고쳐야 한다.")
+        print(f"\n    트레이스 블록을 읽은 AP: {sorted(trace_ok) if trace_ok else '없음'}")
+        print(f"\n{'=' * 66}\n ★★ 주소를 읽은 AP 전체\n{'=' * 66}")
         for n, addrs in th.items():
             print(f"    {n}: " + ", ".join(f"0x{x:08X}" for x in sorted(addrs)))
         print("\n  → **DM 없이 트레이스 파이프라인을 세울 수 있다.** 블로커 우회.")
