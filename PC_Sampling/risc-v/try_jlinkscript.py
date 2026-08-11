@@ -49,7 +49,7 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.20  v2 진단 출력"
+VERSION = "2026-08-11.21  선언 반영 확인 → DM 변수로"
 
 # ★★ 치명적 정정 (feedback 2026-08-11 최우선 절)
 #   JTAG_AllowTAPReset 을 **반대로** 썼다. SEGGER 공식 정의:
@@ -325,11 +325,23 @@ def v2(a):
         print("  스크립트가 안 돌았다 — 전역 이름이 거부됐을 수 있다. 로그 확인.")
     else:
         print("  스크립트는 돌았는데 여전히 타깃 미연결.")
-        if still_auto:
-            print("  ⚠ **자동 검출이 아직 돈다** — AllowTAPReset=1 이 안 먹었다는 뜻이다.")
-            print("     전역 이름/훅 위치를 다시 봐야 한다. 아직 끝이 아니다.")
+        declared = f"0x{CHAIN_TAP_ID:08X}".lower()
+        took = any(any(declared == x.lower() for x in row[7]) for row in out)
+        if took:
+            print(f"  ✅ **체인 선언이 반영됐다** — 로그 IDCODE 가 우리가 선언한 "
+                  f"0x{CHAIN_TAP_ID:08X} 다 (이전엔 0x00000001).")
+            print("     'chain detection' 문자열이 남는 건 J-Link 이 **수동 선언된**")
+            print("     체인을 로그로 찍는 것이므로 자동 검출이 도는 증거가 아니다.")
+            print("     DTM 오인도 사라졌다 → **이제 DAP 경로를 탄다.**")
+            print("\n  → 남은 실패는 'Could not find supported CPU' 다. 즉 DAP 는 탔는데")
+            print("     그 뒤에서 RISC-V 코어를 못 찾는다. 이제서야 아래가 의미를 갖는다:")
+            print("        sudo python3 try_jlinkscript.py --dmsweep --reps 3")
+            print("     (AP 인덱스 × CoreBase 를 살아있는 세션 기준으로 훑는다)")
+        elif still_auto:
+            print("  ⚠ 자동 검출이 아직 돌고 IDCODE 도 우리 선언값이 아니다.")
+            print("     AllowTAPReset=1 이 안 먹었다 — 전역 이름/훅 위치를 다시 볼 것.")
         else:
-            print("  ✅ 자동 검출은 꺼졌다. 그 위에서 실패한다 → err 문구가 다음 단서.")
+            print("  자동 검출은 꺼졌다. err 문구가 다음 단서.")
     return EXIT_OK if hit else EXIT_INSUFFICIENT
 
 
@@ -359,7 +371,7 @@ def dmsweep(a):
                 alive = halted = n = 0
                 errs = set()
                 for _ in range(a.reps):
-                    r = spawn('BaseAddr', apidx, base, 'E76', hart, a.tries, DEVIDS[0])
+                    r = spawn('BaseAddr', apidx, base, 'E76', hart, a.tries, CHAIN_TAP_ID)
                     n += 1
                     if r.get('target_connected') is not True:
                         continue          # ← 무효(타깃 미연결). 실패로 세지 않는다
@@ -417,7 +429,7 @@ def focus(a):
             agg[k] = {'connect': 0, 'connected': 0, 'tconn': 0, 'halted': 0,
                       'n': 0, 'errs': set()}
             for _ in range(a.reps):
-                r = spawn('BaseAddr', apidx, 0x0, 'E76', hart, a.tries, DEVIDS[0])
+                r = spawn('BaseAddr', apidx, 0x0, 'E76', hart, a.tries, CHAIN_TAP_ID)
                 g = agg[k]
                 g['n'] += 1
                 g['connect'] += bool(r.get('connect'))

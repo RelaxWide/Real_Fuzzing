@@ -900,29 +900,54 @@ SEGGER 의 manual-chain 예제는 **`ConfigTargetSettings()`** 를 쓴다.
 
 **⇒ `InitTarget()` 제거. 전부 `ConfigTargetSettings()` 한 곳으로.**
 
-### P0 — `--v2` : 공식형 최소 manual-chain, **1조건**
+### ★★★ 2026-08-11 — **체인 선언이 반영됐다.** TAP 계층 통과
+
+```
+form=JLINK_JTAG  script=3/3  connect=0/3  target=0/3
+form=JTAG        script=3/3  connect=0/3  target=0/3
+자동검출문자열=3/3   DTM오인=0/3   **로그 IDCODE = 0x5BA00477**
+err: Could not find supported CPU.
+```
+
+**로그 IDCODE 가 `0x5BA00477` 이다 — 우리가 선언한 값이다.** 이전엔 `0x00000001`.
+`AllowTAPReset=1` 정정이 먹었다. **DTM 오인도 0/3 으로 사라졌다.**
+
+> `chain detection` 문자열이 로그에 남는 건 J-Link 이 **수동 선언된** 체인을
+> 찍는 것이지 자동 검출이 도는 증거가 아니다 — IDCODE 가 우리 선언값인 게
+> 그 판별이다. (도구 판정도 이렇게 정정했다)
+
+**⇒ 이제 DAP 경로를 탄다.** 브링업 내내 못 넘던 TAP 계층을 넘었다.
+
+### 남은 실패는 성격이 다르다
+
+```
+Could not find supported CPU.
+```
+DAP 는 탔는데 **그 뒤에서 RISC-V 코어를 못 찾는다.**
+⇒ **이제서야** `SetIndexAPBAPToUse` / `SetCoreBaseAddr` / hart 가 의미를 갖는다.
+그동안 이 변수들을 훑어도 소용없던 건 TAP 계층에서 막혀 있었기 때문이다.
+
+### P0 — `--dmsweep` : AP × CoreBase (이번엔 유효한 실험이다)
 
 ```bash
-sudo python3 try_jlinkscript.py --v2 --reps 3
+sudo python3 try_jlinkscript.py --dmsweep --reps 3
 ```
-
-변수를 넓히지 않는다. feedback 이 지정한 단일 조건:
-```
-device E76 / cJTAG / 10MHz / SetcJTAGInitMode=1 / hart 0 /
-APB-AP index 0 / CoreBase 0x0 / 오라클 target_connected()
-TAP ID 0x5BA00477  (SEGGER manual-chain 예제의 알려진 CoreSight DAP ID)
-```
-체인 전역 이름만 두 갈래로 본다 — `JLINK_JTAG_*`(최신 예제) vs `JTAG_*`(구 매뉴얼).
-V9.66 에서 alias 인지 확실치 않다.
+`CoreBase {0x0, 0x1000, 0x2000, 0x4000, 0x10000, 0x20000}` × AP `{0,1}` × hart `0`.
+조합마다 3회 반복, **`target_connected=False` 인 시행은 버린다.**
+필요하면 `--aps 0,1,4,5 --harts 0,1,2,3` 으로 넓힌다.
 
 | VERDICT | 다음 |
 |---|---|
-| `TARGET_CONNECTED` | ★★★ 정본 스크립트를 그 form 으로 굳히고 DM·트레이스로 |
-| `STILL_NO_TARGET` | **이제서야** "손잡이를 다 돌렸다" 고 말할 수 있다 → `ASK.md` |
-| `SCRIPT_NOT_LOADED` | 전역 이름이 거부됐을 수 있다 → 로그 확인 |
+| `DM_REACHED` | ★★★ 정본 스크립트 굳히고 트레이스 레지스터로 |
+| `ALIVE_BUT_NO_DM` | CoreBase 후보 확대 / `RISCV_UseNexusLegacyMode` |
+| `TARGET_NEVER_CONNECTED` | AP·CoreBase 로는 안 됨 → TAP ID 후보를 바꿔 재시험 |
 
-> `0x5BA00477` 은 **실제 실리콘 ID 주장이 아니다.** DLL 이 이 TAP 을
-> CoreSight DAP 으로 고르게 하는 **선언값**이다.
+### 교훈 — 세 번 반복된 것
+
+**오라클과 설정 반영 여부를 먼저 검증하지 않으면 그 위의 측정은 전부 무효다.**
+`require_power` → `script_ran` → `target_connected` → 그리고 이번
+`AllowTAPReset` 값 반전. **네 번째다.**
+매번 "다 해봤다" 는 결론이 나왔고 매번 틀렸다.
 
 ### P0.1 — 4선 JTAG 가 안 잡히는 것도 같이 물어볼 것
 
