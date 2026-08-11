@@ -676,7 +676,63 @@ feedback 의 판정 어휘로는 **`MEM_AP_TRANSFER_BROKEN`** 에 해당한다.
 > `0x81480003` / `0x81481003` 이 DM base 와 일치하는 것은 여전히 사실이지만,
 > 그것이 ROM 테이블인지는 **확정하지 못했다**(`ROM_ENTRY_LIKE_NOT_CONFIRMED`).
 
-### ⚠ 2026-08-11 — `CONNECT_ONLY` 인데, **더 이상한 게 있다**
+### ★★★ 2026-08-11 — 진짜 블로커를 찾았다: **cJTAG 활성화 시퀀스**
+
+E76 으로 connect 했을 때 **J-Link 자신의 로그**:
+```
+JTAG chain detection found 1 devices: #0 Id: 0x00000001, IRLen: 04
+Unknown device, Assuming RISC-V TAP with JTAG-DTM setup
+DTM architecture: RISC-V JTAG-DTM version: 0.11, AddrBits: 0, DataBits: 34
+Error while reading <dmcontrol> debug register
+Connect failed
+```
+
+**`Id: 0x00000001` 은 IDCODE 가 아니다** (bit0 만 1인 빈 값).
+그래서 J-Link 이 TAPId 를 못 알아보고, SEGGER 의 TAP 선택 규칙에서
+
+> IRLen=4 이고 TAPId 가 **알려진 CoreSight DAP TAP** → RISC-V behind DAP 로 간주
+> 알려진 TAPId 가 없고 TAP 이 하나뿐이면 → 그냥 그것을 쓴다
+
+**두 번째로 떨어져 RISC-V JTAG-DTM 으로 오인**한다.
+⇒ 우리가 준 `CORESIGHT_*` 설정은 **애초에 쓰이지 않는다.**
+**`CoreBase` 를 뭘로 바꿔도 결과가 같았던 이유가 이것이다.** `AddrBits: 0` 도
+정상 DTM 이 아니라는 신호다.
+
+### 그리고 답이 문서에 있었다
+
+```
+SetcJTAGInitMode
+  0 = Long-form activation, JScan0 boot + OScan1 enter   (기본값)
+  1 = Short-form activation, OScan1 boot
+      → 원문: "**Needed for e.g. SiFive or RISC-V targets**"
+  2 = Wiliot 전용
+```
+
+**우리는 브링업 내내 `0` 을 썼다.** SiFive 타깃에 필요한 건 `1` 이다.
+
+우리가 직접 한 DP 읽기(`DPIDR=0x11013913`)는 됐는데 J-Link 의 스캔은 깨진 것도
+설명된다 — 우리 경로는 `perform_tif_init=False` 로 **재초기화를 건너뛰었다.**
+
+> `device` 도 **`E76`** 이어야 한다. `RISC-V` 로는 connect 자체가 제대로 안 된다.
+> ⚠ 내 도구들은 기본값이 `RISC-V` 였다 — `try_jlinkscript.py` 의 24/24 는
+> **틀린 device + 틀린 cJTAG 모드**에서 나온 것이라 **전부 무의미하다.**
+
+**⇒ `sfe76_link`: `CJTAG_MODE 0 → 1`, `DEVICE 'RISC-V' → 'E76'` (API_LEVEL 4)**
+
+### P0 — `probe_cjtag_mode.py` : TAP 인식부터 고친다
+
+```bash
+sudo python3 probe_cjtag_mode.py
+```
+모드 0/1/2 × device 를 훑고 **J-Link 자신의 로그에서 IDCODE 를 읽는다.**
+우리가 해석할 필요가 없다 — `0x00000001` 이 유효한 값으로 바뀌는지만 본다.
+
+| VERDICT | 의미 |
+|---|---|
+| `IDCODE_OK` | ★★ TAP 인식 성공 → 그 조합으로 고정하고 `try_jlinkscript.py` **재실행** |
+| `TAP_NOT_IDENTIFIED` | 어느 모드도 안 됨 → cJTAG 물리 계층(속도·배선·전원)으로 |
+
+### (참고) 이전 `CONNECT_ONLY` 판정 — 무효
 
 ```
 connect 성공=24   DM 살아있음=0

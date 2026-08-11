@@ -89,16 +89,17 @@ except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square\n"
              "  (venv 가 아니라 시스템 python3 에 있을 수 있다)")
 
-VERSION = "2026-08-11.1  open_dap / dap_power / ap_count"
+VERSION = "2026-08-11.2  cJTAG short-form + device E76"
 
 # ★ 파일 버전 스큐 감지용. 기능을 추가할 때마다 올린다.
 #   도구들이 시작할 때 이 값을 확인해서, 오래된 sfe76_link.py 를 쓰면
 #   AttributeError 대신 **무엇을 해야 하는지** 알려준다.
 #   실제로 두 번 겪었다: --ap-count 없음, open_dap 없음. 둘 다 pull 누락.
-API_LEVEL = 3
+API_LEVEL = 4
 #   1: checked API (connect_checked/halt_checked/read_pc/resume_checked)
 #   2: + ap_count, CORE_HART, DMI_STRIDE_SHIFT, add_common_args --ap-count
 #   3: + open_dap(전원만 요구), dap_power(전원 직접 요청)
+#   4: CJTAG_MODE 0→1 (SiFive 는 short-form), DEVICE 'RISC-V'→'E76'
 
 
 def require_api(level, tool=""):
@@ -118,8 +119,16 @@ def require_api(level, tool=""):
 # ── 연결 파라미터 (전부 실측값) ──────────────────────────────────────
 TIF_CJTAG   = 7          # cJTAG. pylink enum 에 없어 정수로 지정
 SPEED_KHZ   = 10000      # 낮추면 cJTAG 활성화 실패
-CJTAG_MODE  = 0          # SetcJTAGInitMode: 0=LONG 1=SHORT 2=WILIOT
-DEVICE      = 'RISC-V'
+# ★★ SetcJTAGInitMode — 브링업 내내 0 을 썼는데 문서가 1 을 지시한다:
+#   0 = Long-form activation, JScan0 boot + OScan1 enter (기본값)
+#   1 = Short-form activation, OScan1 boot
+#       → SEGGER 문서 원문: "**Needed for e.g. SiFive or RISC-V targets**"
+#   2 = Wiliot 전용
+#   증상과 맞는다: J-Link 의 JTAG chain detection 이 Id=0x00000001 (쓰레기)
+#   을 읽고 → TAPId 를 못 알아봐서 → CoreSight DAP 대신 RISC-V JTAG-DTM 으로
+#   오인하고 → dmcontrol 읽기에 실패한다.
+CJTAG_MODE  = 1
+DEVICE      = 'E76'      # ★ 'RISC-V' 는 connect 자체가 제대로 안 된다(실측)
 APB_INDEX   = 0          # DMI 가 붙은 AP (AddAP 의 Index)
 
 CORE_BASE_MAIN  = 0x81480000   # hcore/CMCore/Fcore0/QCore DM (4코어 공유)

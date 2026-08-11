@@ -54,7 +54,7 @@ VERSION = "2026-08-11.10  script-ran 검증"
 SYNTAXES = ['BaseAddr', 'Addr']
 AP_INDEXES = [0, 1, 4, 5]                      # APB 타입 AP
 CORE_BASES = [0x81480000, 0x0, 0x81481000]
-DEVICES = ['RISC-V']
+DEVICES = ['E76', 'E76-MC']   # ★ 'RISC-V' 는 connect 자체가 안 된다(실측)
 
 MARKER = "SFE76_SCRIPT_RAN"
 
@@ -102,7 +102,7 @@ def run_one(a):
         except Exception:
             rec['script_set_preopen'] = False
         jl.open()
-        jl.exec_command(f"SetcJTAGInitMode = {CJTAG_MODE}")
+        jl.exec_command(f"SetcJTAGInitMode = {CJTAG_MODE}")   # ★ 1 = SiFive short-form
         jl.set_tif(TIF_CJTAG)
         jl.set_speed(SPEED_KHZ)
         # ★ ScriptFile 은 connect 이전에 지정한다
@@ -165,7 +165,7 @@ def spawn(syntax, apidx, base, device, hart, tries):
 
 
 def main():
-    require_api(3, "try_jlinkscript.py")
+    require_api(4, "try_jlinkscript.py")
     ap = argparse.ArgumentParser()
     ap.add_argument('--brief', action='store_true')
     ap.add_argument('--only-syntax', choices=SYNTAXES)
@@ -179,7 +179,7 @@ def main():
     ap.add_argument('--ap-index', type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument('--core-base', type=lambda x: int(x, 0), default=0x81480000,
                     help=argparse.SUPPRESS)
-    ap.add_argument('--device', default='RISC-V', help=argparse.SUPPRESS)
+    ap.add_argument('--device', default='E76', help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.version:
         print(f"try_jlinkscript {VERSION}")
