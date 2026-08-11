@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.21  --dm: ROM 이 가리키는 곳에 DM 이 실재하나"
+VERSION = "standalone 2026-08-11.22  --pwr: 전원요청 조합 x APB Prot 스윕"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -571,6 +571,68 @@ def cid_ok(cid):
 #     세 후보를 전부 dmcontrol/dmstatus 자리에서 확인한다.
 DM_REGS = [(0x10, 'dmcontrol'), (0x11, 'dmstatus'), (0x38, 'sbcs')]
 
+# ★★★ --pwr : 우리가 T32 와 다르게 해온 것 하나.
+#
+#   attach.cmm:
+#       SYStem.Option.DAPSYSPWRUPREQ OFF    ← CSYSPWRUPREQ 를 **일부러 안 쓴다**
+#       SYStem.Option.DAPDBGPWRUPREQ ON     ← CDBGPWRUPREQ 만
+#   우리는 처음부터 CTRL/STAT 에 0x50000000 = **둘 다** 걸어왔다.
+#   "CSYSPWRUPACK 이 떴으니 무해하다" 고 판단했었는데 그건 근거가 아니다.
+#   ACK 은 핸드셰이크가 성립했다는 뜻일 뿐, 그 결과 시스템 전원 도메인이
+#   어떤 상태로 가는지는 말해주지 않는다. 기본값이 ON 인 옵션을 T32 가 굳이
+#   OFF 로 적어둔 데는 이유가 있다고 봐야 한다.
+#
+#   ★ 이 시험은 **DP CTRL/STAT 쓰기뿐**이다 — 타깃 버스에 아무것도 안 쓴다.
+#     되돌릴 수 있고 실기에 안전하다.
+#
+#   함께 볼 것: **APB Prot**. DM 이 secure 공간에 있고 우리 접근이
+#   non-secure 로 나가면 응답 대신 기본값이 온다. 이전 Prot 스윕은
+#   AXI 에만 했고 APB 에는 한 적이 없다.
+PWR_CFGS = [(0x10000000, 'DBG만 (T32와 동일)'),
+            (0x50000000, 'DBG+SYS (지금까지)'),
+            (0x00000000, '요청 없음')]
+
+
+def pwr_probe(d, dm_addr):
+    """전원요청 조합마다 DM 이 응답하는지 본다. APBAP1 고정."""
+    apbase = AP_MAP[0][1]
+    out = []
+    for req, label in PWR_CFGS:
+        d.dpw(DP_ABORT, 0x1E)
+        d.dpw(DP_CTRL, req)
+        for _ in range(30):
+            time.sleep(0.01)
+            c = d.dpr(DP_CTRL)
+            if c is not None and (req == 0 or c & (1 << 29)):
+                break
+        ctrl = d.dpr(DP_CTRL)
+        hit, _ = ap_idr_match(d)
+        csw = d.apr(apbase, OFF_CSW)
+        st, _ = d.mem32(apbase, dm_addr + (0x11 << 2), csw)
+        out.append({'how': label, 'CTRL': hx(ctrl), 'ap': hit,
+                    'dmstatus': hx(st), 'ver': None if st is None else st & 0xF})
+        if csw is not None:
+            d.apw(apbase, OFF_CSW, csw)
+    d.dpw(DP_CTRL, 0x50000000)          # 원상복구
+    return out
+
+
+def prot_probe(d, dm_addr):
+    """APB Prot 를 바꿔가며 dmstatus 를 읽는다. CSW[31:24] = Prot."""
+    apbase = AP_MAP[0][1]
+    csw0 = d.apr(apbase, OFF_CSW)
+    out = []
+    if csw0 is None:
+        return out
+    for p in (None, 0x00, 0x20, 0x40, 0x60):
+        csw = csw0 if p is None else ((csw0 & ~0x7F000000) | (p << 24))
+        st, _ = d.mem32(apbase, dm_addr + (0x11 << 2), csw)
+        out.append({'prot': '기본' if p is None else f"0x{p:02X}",
+                    'dmstatus': hx(st), 'ver': None if st is None else st & 0xF})
+    d.apw(apbase, OFF_CSW, csw0)
+    return out
+
+
 
 def dm_probe(d):
     out = []
@@ -731,6 +793,11 @@ def session(a, idx):
                 out['discover'] = discover(d)
             return out
 
+        if getattr(a, 'pwr', False):
+            out['pwr'] = pwr_probe(d, a.dmaddr)
+            out['prot'] = prot_probe(d, a.dmaddr)
+            return out
+
         if getattr(a, 'dm', False):
             out['dm'] = dm_probe(d)
             return out
@@ -783,6 +850,9 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--pwr', action='store_true',
+                    help='* 전원요청 조합(T32 는 DBG 만) x APB Prot 스윕. DP 쓰기만')
+    ap.add_argument('--dmaddr', type=lambda x: int(x, 0), default=0x81480000)
     ap.add_argument('--dm', action='store_true',
                     help='★ ROM 엔트리가 가리키는 곳에 DM 이 실재하나 (주소 후보 3종)')
     ap.add_argument('--rom', action='store_true',
@@ -856,6 +926,34 @@ def main():
     print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
+
+    if a.pwr:
+        print(f"\n{'=' * 70}\n [PWR] 전원요청 조합 x APB Prot\n{'=' * 70}")
+        print("  attach.cmm 은 DAPSYSPWRUPREQ **OFF** 다. 우리는 계속 둘 다 걸었다.")
+        print("  DP CTRL/STAT 쓰기만 한다 - 타깃 버스에 아무것도 안 쓴다.")
+        print(f"  dmstatus 를 0x{a.dmaddr + 0x44:08X} 에서 읽는다. 유효 ver = 2 또는 3.\n")
+        r0 = session(a, 0)
+        if not r0.get('ok'):
+            print("---8<---")
+            print(f"무효 세션 (AP일치={r0.get('ap_match')}/6) - 다시 실행")
+            print("---8<---")
+            return 6
+        print("---8<---")
+        live = []
+        for r in r0.get('pwr', []):
+            print(f"{r['how']:18s} CTRL={r['CTRL']} AP={r['ap']}/6 "
+                  f"dmstatus={r['dmstatus']} ver={r['ver']}"
+                  + ("  *DM살아있음" if r['ver'] in (2, 3) else ""))
+            if r['ver'] in (2, 3):
+                live.append(r['how'])
+        for r in r0.get('prot', []):
+            print(f"Prot={r['prot']:6s} dmstatus={r['dmstatus']} ver={r['ver']}"
+                  + ("  *DM살아있음" if r['ver'] in (2, 3) else ""))
+            if r['ver'] in (2, 3):
+                live.append('prot ' + r['prot'])
+        print("VERDICT:", f"DM_LIVE ({live[0]})" if live else "DM_ABSENT_ALL")
+        print("---8<---")
+        return 0 if live else 6
 
     if a.dm:
         print(f"\n{'=' * 70}\n [DM] ROM 이 가리키는 곳에 DM 이 응답하나\n{'=' * 70}")

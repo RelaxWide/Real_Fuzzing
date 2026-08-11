@@ -194,6 +194,32 @@ J-Link       Plus, FW V13 / 소프트웨어 **V9.66** (V9.12 → 업그레이드
 >   T32 의 `Reset Release` 서브루틴(`AXI:0xC81040/0xC81044` **쓰기**)이 그걸 한다.
 >   ⚠ 쓰기는 실기 NVMe 장치에 대한 것이므로 **사용자 명시 승인 없이는 안 한다**
 
+> ### ❌ 실측 (`--dm`) — `DM_ABSENT`
+>
+> 세 주소 후보(리터럴 / ROM+부호없음 / ROM+부호있음) **전부** default-slave 다.
+> `dmcontrol` = `0x00000001`(16B 정렬 라인값) 과 `0xEAFFFFFE`(비정렬 라인값).
+> ⇒ **주소 문제가 아니다.** ROM 은 DM 이 거기 있다고 말하는데 버스는 아무 응답이 없다.
+>
+> ### ★★ 리셋 가설로 가기 전에 — 우리가 T32 와 다르게 해온 것
+>
+> `attach.cmm`:
+> ```
+> SYStem.Option.DAPSYSPWRUPREQ OFF    ← CSYSPWRUPREQ 를 **일부러 안 쓴다**
+> SYStem.Option.DAPDBGPWRUPREQ ON     ← CDBGPWRUPREQ 만
+> ```
+> 우리는 처음부터 CTRL/STAT 에 `0x50000000` = **둘 다** 걸어왔다.
+> §2 에서 *"CSYSPWRUPACK 이 실제로 떴으니 가설 F 반증"* 이라고 적었는데,
+> **그건 근거가 아니다.** ACK 은 핸드셰이크가 성립했다는 뜻일 뿐, 그 결과
+> 시스템 전원 도메인이 어떤 상태로 가는지는 말하지 않는다. 기본값이 ON 인
+> 옵션을 T32 가 굳이 OFF 로 적어둔 데는 이유가 있다고 봐야 한다.
+>
+> 함께 볼 것: **APB Prot.** DM 이 secure 공간에 있고 우리 접근이 non-secure 로
+> 나가면 응답 대신 기본값이 온다. 이전 Prot 스윕은 **AXI 에만** 했고
+> APB 에는 한 적이 없다 — 정작 DM 이 있는 쪽이 APB 다.
+>
+> → `--pwr` (`.22`). **DP CTRL/STAT 쓰기뿐이고 타깃 버스엔 아무것도 안 쓴다.**
+> 되돌릴 수 있고 실기에 안전하다. 이것이 쓰기 승인 없이 할 수 있는 마지막 시험이다.
+
 **동작하는 설정 (pylink + exec_command, connect 前 주입):**
 ```
 SetcJTAGInitMode = 0
