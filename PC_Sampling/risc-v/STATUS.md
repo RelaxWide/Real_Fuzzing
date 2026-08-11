@@ -805,19 +805,54 @@ if not self.target_connected(): raise JLinkException('Target is not connected.')
 > 이 프로젝트의 반복 패턴이다: **오라클을 먼저 검증하지 않으면 측정이 전부 무효가 된다.**
 > `require_power`, `script_ran`, 그리고 이번 `target_connected` — 세 번째다.
 
-### P0 — 정정된 게이트로 재측정
+### ❌❌ `TARGET_NEVER_CONNECTED` — **connect 기반 결과는 전부 무효다**
+
+`target_connected()` 가 **한 번도 True 가 아니었다.** J-Link 은 타깃에 붙은 적이 없다.
+
+**무효 (connect 성공을 전제로 한 것 전부):**
+`try_jlinkscript` 24/24 · `CoreBase=0x0` 만 통과 · `focus` 의 hart 비교 ·
+`find_dm --devices` · "connect 성공 N개" 집계 전부
+
+**여전히 유효 (connect 없이 raw DP/AP 로 잰 것):**
+pylink 에서 `coresight_configure`=`@open_required`,
+`coresight_read/write`=`@coresight_configuration_required` — **셋 다
+`target_connected` 를 요구하지 않는다.** 그래서 아래는 살아남는다:
+- `DPIDR=0x11013913` (SiFive, DPv3/ADIv6)
+- DAP 전원 `CDBGPWRUPACK`+`CSYSPWRUPACK` 둘 다
+- **AP 6개 IDR 이 T32 선언과 6/6 일치**
+- `CSW.DeviceEn=1`, AP 레지스터 R/W
+- MEM-AP 읽기는 `0x0`/`0x4` 에서만 (나머지는 정렬만 보는 상수)
+- `AP@0x0 = 0x81480003 / 0x81481003`
+
+### ★ 그리고 진짜 소득 — **문제 계층이 확정됐다**
+
+```
+J-Link 자신의 JTAG 스캔이 Id=0x00000001 (쓰레기 IDCODE) 을 읽는다
+```
+⇒ **DM 설정 문제가 아니라 JTAG/cJTAG 신호 계층 문제다.**
+그동안 DM·CoreBase·AP 를 훑은 건 **한 계층 위에서 헛짚은 것**이다.
+우리 raw DP 접근만 동작했던 이유도 이제 맞아떨어진다 —
+`perform_tif_init=False` 로 **재초기화를 건너뛰었기 때문**이다.
+
+### P0 — ★ **4선 JTAG.** 한 번도 안 해봤다
 
 ```bash
-sudo python3 try_jlinkscript.py --dmsweep --reps 3
+sudo python3 probe_cjtag_mode.py --tifsweep --speeds 10000,4000,1000,500
 ```
 
-| VERDICT | 의미 | 다음 |
-|---|---|---|
-| `DM_REACHED` | ★★★ 끝 | 정본 스크립트 굳히고 트레이스로 |
-| `ALIVE_BUT_NO_DM` | **타깃엔 붙는데** DM 만 안 산다 | CoreBase 후보 확대 / 오류 문구 |
-| **`TARGET_NEVER_CONNECTED`** | **타깃에 한 번도 안 붙는다** | DM 이전 계층 — 속도 낮추기, 전원 사이클, cJTAG 배선 |
+T32 가 cJTAG 를 쓰기에 우리도 **cJTAG 만** 썼다. 그런데 **커넥터에 TDI/TDO 가
+물려 있다.** 그러면 평범한 4선 JTAG 를 쓸 수 있고,
+**cJTAG 활성화 시퀀스라는 문제의 원인 자체가 사라진다.**
+(4선 JTAG 에는 활성화 시퀀스가 아예 없다.)
 
-출력에 `target=k/n` 이 찍힌다. **`connect` 가 아니라 이 숫자만 보면 된다.**
+관찰 대상은 J-Link 로그의 **IDCODE** 와 **`target_connected()`** 다.
+`connect()` 무예외 종료는 **더 이상 신호로 쓰지 않는다.**
+
+| VERDICT | 의미 |
+|---|---|
+| `TARGET_CONNECTED` | ★★★ **끝.** 그 TIF/속도로 고정하고 DM·트레이스로 |
+| `IDCODE_OK_NO_TARGET` | TAP 은 잡히는데 그 위에서 막힘 → DM 변수 재개 |
+| `NO_SIGNAL` | 4선도 안 됨 → 배선·풀업·전원 등 하드웨어 |
 
 ### (참고) 이전 `CONNECT_ONLY` 판정 — 무효
 

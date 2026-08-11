@@ -65,7 +65,18 @@ import pylink
 
 from sfe76_link import require_api, TIF_CJTAG, SPEED_KHZ, EXIT_OK, EXIT_INSUFFICIENT
 
-VERSION = "2026-08-11.12  TAP 수동 선언 + 속도"
+VERSION = "2026-08-11.18  TIF 스윕 (4선 JTAG 포함)"
+
+# ★★ 한 번도 안 해본 것: **평범한 4선 JTAG**.
+#   T32 가 cJTAG 를 쓰기에 우리도 cJTAG 만 썼다. 그런데 커넥터에
+#   **TDI/TDO 가 물려 있다**(사용자 확인). 그러면 4선 JTAG 를 쓸 수 있고,
+#   cJTAG 활성화 시퀀스라는 **문제의 원인 자체가 사라진다.**
+#
+#   지금 증상: J-Link 의 스캔이 Id=0x00000001 (쓰레기)을 읽는다
+#   → TAP 을 못 알아봄 → JTAG-DTM 오인 → target_connected 가 끝내 False.
+#   cJTAG 2선의 활성화가 어설프면 정확히 이렇게 된다.
+#   4선 JTAG 는 활성화 시퀀스가 아예 없다.
+TIFS = [(0, 'JTAG (4선)  ← 미시도'), (7, 'cJTAG (2선) ← 지금까지')]
 
 # ★ IDCODE 가 어느 활성화 모드에서도 0x00000001 이면 자동 검출로는 안 된다.
 #   SEGGER 문서의 TAP 선택 규칙:
@@ -116,6 +127,46 @@ def bad_id(v):
     return n in (0x00000000, 0x00000001, 0xFFFFFFFF) or (n & 1) == 0
 
 
+def tifsweep(a):
+    """★ **4선 JTAG 를 처음 시험한다.** 지금 문제는 이 계층이다.
+
+    관찰 대상은 J-Link 자신의 로그 IDCODE 와 `target_connected()` 다.
+    `connect()` 무예외 종료는 **더 이상 신호로 쓰지 않는다** —
+    그게 `target_connected=False` 인데도 성공으로 세어 온 원인이었다.
+    """
+    print(f"\n{'=' * 68}\n [TIF] 4선 JTAG vs cJTAG × 속도\n{'=' * 68}")
+    print("  J-Link 스캔이 Id=0x00000001(쓰레기)을 읽는다 → TAP 미인식 → 연결 실패.")
+    print("  cJTAG 2선 활성화가 어설프면 정확히 이렇게 된다.")
+    print("  커넥터에 TDI/TDO 가 있으니 **4선 JTAG 는 활성화 시퀀스가 아예 없다.**\n")
+    speeds = [int(x) for x in a.speeds.split(',') if x.strip()]
+    rows = []
+    for tif, tlabel in TIFS:
+        for spd in speeds:
+            r = spawn(1, a.device_one, spd, None, tif)
+            r['tif'], r['tlabel'] = tif, tlabel
+            rows.append(r)
+            ok = not bad_id(r.get('idcode'))
+            print(f"  {tlabel:22s} {spd:>6d}kHz  Id={r.get('idcode') or '없음':10s}"
+                  f" IRLen={r.get('irlen') or '-'}"
+                  f"  target={int(bool(r.get('target_connected')))}"
+                  f"{'  ★ 유효 IDCODE' if ok else ''}")
+            time.sleep(0.4)
+
+    print(f"\nv={VERSION.split()[0]}")
+    for r in rows:
+        print(f"tif={r['tif']} spd={r['speed']} Id={r.get('idcode') or '-'} "
+              f"target={int(bool(r.get('target_connected')))}")
+    tgt = [r for r in rows if r.get('target_connected')]
+    good = [r for r in rows if not bad_id(r.get('idcode'))]
+    print("VERDICT:", "TARGET_CONNECTED" if tgt else
+          ("IDCODE_OK_NO_TARGET" if good else "NO_SIGNAL"))
+    if tgt:
+        r = tgt[0]
+        print(f"  ★★★ tif={r['tif']} speed={r['speed']} 에서 **타깃에 붙었다.**")
+        print("     sfe76_link 의 TIF/속도를 이 값으로 고정한다.")
+    return EXIT_OK if tgt else EXIT_INSUFFICIENT
+
+
 def write_init_script(devid):
     import tempfile
     p = os.path.join(tempfile.gettempdir(), f"sfe76_init_{os.getpid()}.JLinkScript")
@@ -125,7 +176,7 @@ def write_init_script(devid):
 
 
 def run_one(a):
-    rec = {'mode': a.mode, 'device': a.device, 'speed': a.speed,
+    rec = {'tif': a.tif, 'mode': a.mode, 'device': a.device, 'speed': a.speed,
            'devid': (f"0x{a.devid:08X}" if a.devid else None), 'connect': False,
            'idcode': None, 'irlen': None, 'dtm': False, 'dap': False,
            'dmcontrol_err': False, 'error': None}
@@ -147,7 +198,7 @@ def run_one(a):
                 jl.exec_command(f"ScriptFile = {sp}")
             except Exception:
                 pass
-        jl.set_tif(TIF_CJTAG)
+        jl.set_tif(a.tif)
         jl.set_speed(a.speed)
         try:
             jl.connect(a.device, speed=a.speed)
@@ -169,6 +220,10 @@ def run_one(a):
         rec['log_lines'] = len(logs)
         rec['init_ran'] = 'SFE76_INIT_RAN' in blob
         try:
+            rec['target_connected'] = bool(jl.target_connected())
+        except Exception:
+            rec['target_connected'] = False
+        try:
             jl.close()
         except Exception:
             pass
@@ -176,9 +231,10 @@ def run_one(a):
     return EXIT_OK if rec['connect'] else EXIT_INSUFFICIENT
 
 
-def spawn(mode, device, speed, devid):
+def spawn(mode, device, speed, devid, tif=7):
     cmd = [sys.executable, os.path.abspath(__file__), '--single',
-           '--mode', str(mode), '--device', device, '--speed', str(speed)]
+           '--mode', str(mode), '--device', device, '--speed', str(speed),
+           '--tif', str(tif)]
     if devid:
         cmd += ['--devid', hex(devid)]
     try:
@@ -198,6 +254,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--brief', action='store_true')
     ap.add_argument('--devices', default=",".join(DEVICES))
+    ap.add_argument('--device-one', default='E76', help='TIF 스윕에서 쓸 device')
     ap.add_argument('--version', action='store_true')
     ap.add_argument('--single', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--mode', type=int, default=1, help=argparse.SUPPRESS)
@@ -205,6 +262,9 @@ def main():
     ap.add_argument('--speed', type=int, default=SPEED_KHZ, help=argparse.SUPPRESS)
     ap.add_argument('--devid', type=lambda x: int(x, 0), default=None,
                     help=argparse.SUPPRESS)
+    ap.add_argument('--tif', type=int, default=7, help=argparse.SUPPRESS)
+    ap.add_argument('--tifsweep', action='store_true',
+                    help='★ 4선 JTAG vs cJTAG × 속도. 지금 증상의 계층을 친다')
     ap.add_argument('--speeds', default="10000,4000,1000",
                     help='시험할 JTAG 속도(kHz). IDCODE 가 쓰레기면 신호 무결성일 수도')
     ap.add_argument('--modes', default="1,0")
@@ -222,6 +282,9 @@ def main():
         print("  0x00000001 은 IDCODE 가 아니다 — 그래서 J-Link 이 TAP 을 못 알아보고")
         print("  CoreSight DAP 대신 RISC-V JTAG-DTM 으로 오인한다.\n")
         print("  SetcJTAGInitMode 1 = 'Needed for e.g. SiFive or RISC-V targets' (문서)\n")
+
+    if a.tifsweep:
+        return tifsweep(a)
 
     modes = [int(x) for x in a.modes.split(',') if x.strip()]
     speeds = [int(x) for x in a.speeds.split(',') if x.strip()]
