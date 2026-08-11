@@ -5,6 +5,227 @@
 > 목적: 현재 접근 방향이 맞는지 검토하고, 다음 작업자가 바로 이어서 판단할 수 있도록
 > 실측 사실과 권장 순서를 분리해 기록한다.
 
+## 최신 피드백 — 2026-08-11: T32 CMM 조사 종료, J-Link DM 진단으로 전환
+
+> 이 절이 아래의 과거 CMM 조사 계획보다 우선한다. 필요한 T32 구조는 충분히
+> 확인됐다. 더 많은 CMM 호출 체인을 한 줄씩 해석하는 작업은 중단한다.
+
+### 1. 결론
+
+현재 목표는 T32 환경을 그대로 복제하는 것이 아니라, **J-Link Plus로 SF-E76의
+legacy SiFive Nexus trace를 SRAM sink에서 회수해 코드 커버리지로 변환하는 것**이다.
+
+T32 스크립트에서 목표 달성에 필요한 정보는 이미 거의 확보됐다.
+
+```text
+cJTAG
+  → HCore에서 RISC-V DM 연결(SYStem.DOWN → WAIT 500ms → SYStem.UP)
+  → DM의 SBA(SB:/ESB:)로 trace register 접근
+  → TE0~TE3 → funnel → 32KB SRAM trace sink
+  → TE/TF disable → SRAM drain → raw .bin 저장
+```
+
+현재 주 블로커는 halt가 아니고, **J-Link가 HCore DM `0x81480000`을 T32의
+`SYStem.UP`과 같은 상태로 만들지 못하는 것**이다. 따라서 다음 작업은 CMM 추가
+조사가 아니라 Python/J-Link로 DM 접근 실패 지점을 측정하는 것이다.
+
+### 2. T32 attach에서 확인된 사실
+
+#### 코어와 DM
+
+| 코어 | DM base | hart/구성 |
+|---|---:|---|
+| HCore / CMCore / FCore / QCore | `APB:0x81480000` | hart 0/1/2/3, `CoreNumber 4` |
+| NCore | `APB:0x81481000` | 별도 core/chip 그룹, `CoreNumber 2` |
+
+#### DAP/AP 구성
+
+```text
+APBAP1.Base = DP:0x10000
+APBAP2.Base = DP:0x20000
+AXIAP1.Base = DP:0x30000
+AHBAP1.Base = DP:0x40000
+APBAP3.Base = DP:0x50000
+APBAP4.Base = DP:0x60000
+COREDEBUG.Base = APB:0x81480000 또는 APB:0x81481000
+```
+
+#### T32 접근 정책
+
+```text
+SYStem.CONFIG.DEBUGPORTTYPE CJTAG
+CJTAGFLAGS NOKEEPER USEOAC
+SYStem.MemAccess SB
+SYStem.CPUAccess DENIED
+SYStem.Option.ResetMode.NDMRST
+```
+
+HCore만 DAP master로 동작한다.
+
+```text
+HCore:
+  Slave OFF
+  DAPSYSPWRUPREQ OFF
+  DAPDBGPWRUPREQ ON
+  SYStem.Mode Prepare
+  SYStem.DOWN → WAIT 500ms → SYStem.UP
+
+CM/F/Q/NCore:
+  Slave ON
+  HCore가 초기화한 DAP/DM에 attach
+```
+
+코어별 `INTERCOM`/RCL/GDB 포트 번호, `TITLE`, GUI 창 구성, 반복되는
+`SYStem.RESet`, `CORE.ASSIGN`은 TRACE32 멀티 인스턴스 운용 정보다. J-Link trace
+구현에 그대로 복제할 필요가 없다.
+
+또한 `SYStem.Mode Prepare`는 사용자 정의 `Prepare` 매크로가 아니라 TRACE32 명령이다.
+별도 CMM 구현을 찾을 대상이 아니다. 반대로 `SYStem.UP`의 SF-E76 전용 내부 동작은
+TRACE32 CPU 드라이버에 숨겨졌을 수 있으므로 CMM을 더 읽어도 나오지 않을 수 있다.
+
+### 3. Nexus trace 경로에서 확인된 사실
+
+`ViewNexusTracedump.cmm`:
+
+```text
+SYStem.CONFIG.NEXUS.Type SiFive
+TE0 = SB:0xFD000000
+TE1 = SB:0xFD001000
+TE2 = SB:0xFD002000
+TE3 = SB:0xFD003000
+RVFUNNEL1 / RVSRAMTRACEsink1 = SB:0xFD180000
+NEXUS.0~3 → funnel port 0~3
+la.import.etb *
+la.list
+```
+
+`NexusTracedatadump.cmm`:
+
+```text
+TE0 control       = ESB:0xFD000000, bit1 clear로 disable
+TF control/base   = ESB:0xFD180000, bit1 clear로 disable
+write pointer     = base + 0x1C, bit0=wrap
+read pointer      = base + 0x20
+data port         = base + 0x24, 읽을 때 자동 증가
+buffer capacity   = 0x8000 bytes(32KB)
+output            = raw binary
+```
+
+wrap이면 write pointer에서 bit0을 제거한 위치를 oldest record로 보고 read pointer에
+기록한 뒤 최근 32KB를 drain한다. 따라서 wrap된 dump는 최신 구간은 보존하지만 그 전에
+덮어쓴 실행 이력까지 포함한 전체 coverage를 보장하지 않는다. 퍼저에서는 주기적 drain,
+짧은 test case 또는 `coverage_incomplete` 처리가 필요하다.
+
+이 스크립트들이 `SB:/ESB:`를 사용한다는 사실이 중요하다. T32의 실제 경로는 raw
+APB-AP direct read가 아니라 **RISC-V DM의 SBA**다. 따라서 raw MEM-AP에서
+`0xFD......`가 안 읽힌 결과는 T32 성공과 모순되지 않는다.
+
+### 4. CMM 조사에서 남은 미확정 사항과 종료 판단
+
+FAE GUI의 Nexus 관련 GOSUB는 다음 두 파일을 `DO`로 직접 호출할 뿐이다.
+
+```text
+NexusTracedatadump.cmm
+ViewNexusTracedump.cmm
+```
+
+확인한 CMM에서는 TE/funnel을 enable하는 명령이 발견되지 않았다. 가능한 주체는 다음이다.
+
+1. 펌웨어가 부팅 과정에서 이미 활성화
+2. TRACE32 `SYStem.UP`의 SF-E76 드라이버 내부 동작
+3. 별도 수동 명령 또는 아직 확보하지 않은 외부 자동화
+
+그러나 이것은 현재 DM 연결 블로커의 선행 정보가 아니다. DM/SBA 연결 뒤
+`TECTRL`, `TFCTRL`, write pointer를 읽으면 활성 상태와 실제 기록 여부를 바로 판단할
+수 있다. 따라서 enable 주체를 찾기 위한 CMM 전수 조사는 여기서 중단한다.
+
+`T32_Start_RISCV.bat`의 INTERCOM/RCL/GDB 포트와 `t32rem`은 TRACE32 프로세스와 GUI를
+기동·제어하기 위한 orchestration 정보다. J-Link coverage 로직에는 필요 없다.
+`main.cmm`의 `PrepareDump+Attach`/`AttachOnly`, `FAE.cmm`, `AllCoreAnalysis.cmm`의 GUI
+호출 관계도 trace enable을 찾지 못했다면 더 추적하지 않는다.
+
+### 5. 현재 가장 부족한 정보
+
+다른 CMM 파일이 아니라 다음 한 가지다.
+
+> J-Link가 APBAP1을 통해 `0x81480000`을 읽을 때, MEM-AP 전송의 어느 단계에서
+> 어떤 AP/DP 오류가 발생하는가?
+
+최소 수집 항목:
+
+```text
+AP IDR / BASE / CFG
+CSW 원본 및 설정 후 되읽기
+CSW.DeviceEn / SDeviceEn / Prot / Type
+TAR write 성공 여부와 readback
+DRW 반환값
+전송 전후 DP CTRL/STAT
+STICKYERR / WDATAERR / STICKYORUN
+ABORT 후 오류 해제 여부
+```
+
+주소 `0x0`에서 읽힌 `0x81480003`/`0x81481003`은 T32 DM base와 일치하는 매우 강한
+정황이지만, 아직 실제 CoreSight ROM table이라고 확정하지 않는다. APBAP1/2의
+`BASE`, 주소 `0xFE0~0xFFC` PIDR/CIDR, signed relative offset을 확인한 뒤
+`ROM_CONFIRMED`와 `ROM_ENTRY_LIKE`를 구분한다.
+
+`0x80000000`도 J-Link API error sentinel로 확정하지 않고 문맥상 의심값으로만 다룬다.
+
+### 6. 다음 코드 작업
+
+전체 4GB를 1MB 간격으로 읽는 `--map`은 다음 단계로 사용하지 않는다. 좁은 component를
+놓치고, fixed default response를 live 영역으로 오판하며, read side effect가 있는 MMIO를
+건드릴 수 있다.
+
+새 표적 진단기 `probe_rom_dm.py`를 만드는 것이 우선이다.
+
+```text
+기본 3개 독립 세션
+APBAP1/APBAP2만 우선 측정
+ROM 후보 0x0~0xC 및 PIDR/CIDR만 제한 접근
+DM 0x81480000/0x81481000 제한 접근
+각 DRW 뒤 DP error 상태 기록
+CSW 원본 보존 및 세션 종료 전 복구
+JSON 상세 로그 + 한 줄 brief 판정
+유효 세션 3회 미만이면 결론 금지
+```
+
+판정은 최소한 다음을 분리해야 한다.
+
+```text
+ROM_CONFIRMED_DM_REACHABLE
+ROM_CONFIRMED_DM_BLOCKED
+ROM_ENTRY_LIKE_NOT_CONFIRMED
+MEM_AP_TRANSFER_BROKEN
+ACCESS_ATTRIBUTE_OR_SECURITY_SUSPECTED
+INSUFFICIENT_VALID_SESSIONS
+```
+
+### 7. 이후 실행 순서
+
+```text
+1. probe_rom_dm.py로 HCore DM 실패 단계 확정
+2. J-Link native 연결 재시험
+   - cJTAG
+   - APBAP1
+   - CoreBase 0x81480000
+   - hart 0
+   - RISCV_UseNexusLegacyMode=1
+3. DM/SBA 연결 후 read-only로 확인
+   - 0xFD000000    TE0 control
+   - 0xFD180000    funnel control
+   - 0xFD18001C    write pointer
+   - 0xFD180020    read pointer
+   - 0xFD180024    data port
+4. write pointer가 실행 중 증가하는지 확인
+5. 필요할 때만 TE0/funnel enable 절차 구현
+6. 짧은 raw trace 1회를 회수해 기존 RISC-V coverage 변환 경로에 입력
+7. hart0 성공 뒤에만 hart1~3 및 NCore로 확장
+```
+
+Halt/PC sampling은 보조 진단 트랙일 뿐 주 목표의 gate가 아니다. 첫 합격 기준은
+`halt()`가 아니라 **HCore DM/SBA 접근과 raw Nexus trace 1회 회수**다.
+
 ## 결론
 
 큰 아키텍처 판단은 맞다.

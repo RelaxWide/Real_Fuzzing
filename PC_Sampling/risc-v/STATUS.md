@@ -92,9 +92,16 @@ IF (HCORE)                          ← 마스터 세션 하나만 전원을 요
     sys.CONFIG.Slave off
     SYStem.Option.DAPSYSPWRUPREQ OFF   ★★ CSYSPWRUPREQ 를 **안 쓴다**
     SYStem.Option.DAPDBGPWRUPREQ ON    ★★ CDBGPWRUPREQ 만 쓴다
+    SYStem.Mode Prepare
+    SYStem.DOWN → WAIT 500ms → SYStem.UP    ★ 신규 확인
 ELSE
-    sys.CONFIG.Slave on
+    sys.CONFIG.Slave on                 ← HCore 가 초기화한 DAP/DM 에 attach
 ```
+
+★ **`SYStem.DOWN` → 500ms 대기 → `SYStem.UP`** 이 HCore 시퀀스에 있다.
+우리는 이 **DOWN + 대기**를 한 번도 해본 적이 없다. 다만 `SYStem.UP` 의
+SF-E76 전용 내부 동작은 **TRACE32 CPU 드라이버 안**이라 CMM 을 더 읽어도
+안 나올 수 있다 — 그래서 CMM 전수 조사는 **여기서 종료**한다.
 
 `cpuaccess DENIED` + `memaccess SB` + `sys.m prepare` 는 **§1.3 의 무-halt 커버리지 수집과
 완전히 일치**한다 — 계획의 전제가 또 한 번 독립적으로 확인됐다.
@@ -567,8 +574,11 @@ APBAP2 → 0x81481000   = Ncore 의 DM
 
 **주소마다 값이 달라야 진짜인데, 전부 같다.** `0xEAFFFFFE` / `0x00000001` /
 `0x00040700` 은 **버스 미디코드 기본값**으로 보인다.
-→ **트레이스 블록은 MEM-AP 로 안 보인다.** T32 가 `SB:`(SBA)를 쓰는 이유이고,
-**경로 B(DM 우회)는 사실상 닫혔다.** DM 을 살리는 게 유일한 길이다.
+
+★ **이 결과는 T32 성공과 모순되지 않는다.** T32 의 실제 경로는 raw APB-AP
+직접 읽기가 아니라 **RISC-V DM 의 SBA**다(`SB:`/`ESB:`). 트레이스 블록이
+MEM-AP 로 안 보이는 건 **원래 그런 것**이고, 애초에 그렇게 접근한 적이 없다.
+→ **경로 B(DM 우회)는 닫혔다. DM 을 살리는 것이 유일한 길이다.**
 
 > 이 세 상수는 앞으로 **"읽은 값이 아님"** 의 지문으로 쓴다.
 
@@ -624,29 +634,50 @@ CoreSight ROM 엔트리는 원래 *ROM 베이스로부터의 상대 오프셋*�
 버스 주소이고, MEM-AP 창으로는 거기까지 닿지 않는 것**으로 보인다.
 → 이건 우리가 더 추측해서 좁힐 문제가 아니다 (`ASK.md` §5-1).
 
-### P0 — 추측을 그만두고 **AP 주소 지도**를 만든다
+### ⛔ `--map` 은 다음 단계로 쓰지 않는다 (feedback 2026-08-11 §6)
+
+만들어는 뒀지만 **P0 에서 내린다.** 이유가 셋이다:
+- 성긴 간격이라 **좁은 컴포넌트를 사이로 놓친다**
+- **고정 기본 응답을 live 로 오판**한다 (우리가 이미 겪은 실수)
+- **읽기 부작용이 있는 MMIO** 를 건드릴 수 있다 ← 실기에서 위험하다
+
+### P0 — `probe_rom_dm.py` : 전송이 **어느 단계에서** 깨지는지 확정
 
 ```bash
-sudo python3 probe_ap_raw.py --map --brief --no-rom --no-alias --sessions 1
+sudo python3 probe_rom_dm.py --brief
+sudo python3 probe_rom_dm.py --json rom_dm.json     # 상세가 필요할 때
 ```
 
-지금까지 주소를 하나씩 추측해 찍었고 전부 실패했다. 그 방식으로는
-**"이 주소가 안 보인다" 만 알 뿐 어디가 보이는지를 모른다.** 반대로 간다:
-**성긴 간격(기본 1MB)으로 전 공간을 훑어 응답하는 구간만** 모은다.
+가장 부족한 정보는 "어디가 보이나" 가 아니라 **이것 하나**다:
 
-출력은 AP 당 한 줄이다:
-```
-v=2026-08-11.6  valid=1/1  step=0x100000
-APBAP1 live=00000000-001FFFFF,40000000-4000FFFF
-APBAP2 live=none
-```
+> APBAP1 로 `0x81480000` 을 읽을 때 **MEM-AP 전송의 어느 단계에서
+> 어떤 AP/DP 오류**가 나는가?
 
-| 결과 | 의미 | 다음 |
-|---|---|---|
-| **응답 구간이 나옴** | ★ DM·트레이스가 **어느 창에 있는지 관측된다** | 그 창에서 CIDR 서명을 찾는다 |
-| **전 AP `live=none`** | MEM-AP 로는 **아무 메모리도 안 보인다** | raw 경로 완전히 닫힘 → `ASK.md` 만 남는다 |
+그래서 **접근은 최소로 좁히고**(APBAP1/2, ROM 후보 `0x0~0xC`+ID, DM 은 제한 접근)
+대신 **각 전송의 전후 상태를 전부** 남긴다: `IDR/BASE/CFG`, CSW 원본·설정·되읽기,
+`DeviceEn/SDeviceEn/Prot/Type`, TAR write·readback, DRW, **전송 전후 DP CTRL/STAT**,
+`STICKYERR/WDATAERR/STICKYORUN`, **ABORT 로 오류가 해제되는지**.
 
-오래 걸리면 `--map-limit 0x10000000`(256MB)으로 먼저 좁힌다.
+★ **CSW 원본을 보존하고 세션 종료 전에 복구한다.** 지금까지 CSW 를 고쳐 쓰고
+그대로 나왔다 — 다음 세션에 상태를 물려주는 원인이었다.
+
+**판정은 여섯 갈래로 분리한다** (한 줄로 나온다):
+
+| 판정 | 의미 |
+|---|---|
+| `ROM_CONFIRMED_DM_REACHABLE` | ★★ DM 까지 읽힌다 → CoreBase 설정으로 직행 |
+| `ROM_CONFIRMED_DM_BLOCKED` | ★ ROM 은 읽히는데 **그것이 가리키는 DM 만** 막힘 → `ASK.md` §5-1 이 정확히 이 질문 |
+| `ROM_ENTRY_LIKE_NOT_CONFIRMED` | ROM 처럼 보이나 확정 불가 → BASE/PIDR/CIDR·상대 오프셋 재확인 |
+| `MEM_AP_TRANSFER_BROKEN` | 전송 자체가 성립 안 함 → 우리 AP 코드부터 |
+| `ACCESS_ATTRIBUTE_OR_SECURITY_SUSPECTED` | 전송은 되는데 특정 영역만 거부 → Prot/Type/SDeviceEn 조합 |
+| `INSUFFICIENT_VALID_SESSIONS` | 유효 세션 3회 미만 → **결론 금지** |
+
+### ⚠ CIDR 부재를 "DM 없음" 의 근거로 쓰지 않는다 (feedback §2.4)
+
+`T32 COREDEBUG.Base = CoreSight component base` 라고 가정하고 `+0xFF0` CIDR 을
+읽었는데, **RISC-V DM 은 CoreSight 컴포넌트가 아닐 수 있다.**
+`COREDEBUG.Base` 가 곧 **DMI aperture base** 라면 CIDR 검사는 애초에 의미가 없다.
+→ 앞선 "CIDR 서명 없음" 은 **DM 부재의 증거가 아니다.** 참고 자료로만 남긴다.
 
 ### P0.0 — 동시에 `ASK.md` 를 보낸다
 
@@ -731,6 +762,11 @@ CoreBase 후보에 **`0x0` 이 맨 앞**에 있다 — SEGGER 예제가 `0x0` �
 `wrap 여부` · `TE overflow/stall 비트` · `sink empty/flush 완료` ·
 `실제 저장 바이트 수` · `source/hart 식별` · `capture 시작·종료 시점`
 
+**★ wrap 의 의미:** wrap 된 dump 는 **최근 32KB 는 보존**하지만 그 전에 덮어쓴
+실행 이력은 잃는다. 즉 커버리지가 **완전하지 않다.** 퍼저는 셋 중 하나가 필요하다:
+**주기적 drain** / **짧은 test case** / **`coverage_incomplete` 플래그 처리.**
+세 번째가 가장 현실적이다 — 기존 퍼저의 커버리지 집계에 이 플래그를 넣는다.
+
 **raw capture 는 짧은 workload 부터.** 고정 NVMe 명령 1개 → 캡처 시간을 단계적으로
 늘리며 **wrap/overflow 가 안 난 구간만** T32 와 비교한다. 버퍼 크기 충분 여부는
 그 실측 뒤에 정한다.
@@ -783,7 +819,7 @@ J-Link 은 한 번에 한 hart 가 기본이다. 4-source 의 SRC 구분과 공�
 | **C3d 주소 읽기 판정** | ✅ 엄격 기준 도입 — AP 별로 갈림 | | |
 | **C3e ROM 엔트리 → DM 위치** | ✅ `APBAP1→0x81480000`, `APBAP2→0x81481000` | | |
 | **C3f DM 컴포넌트 읽기** | ❌ ← **여기서 막힘.** 그 주소가 MEM-AP 로 안 보인다 | | |
-| **C3g AP 주소 지도** | ⬜ ← **다음 측정** (`--map`) | | |
+| **C3g 전송 실패 단계 확정** | ⬜ ← **다음 측정** (`probe_rom_dm.py`) | | |
 | C4 raw 트레이스 1회 회수 | ⬜ | | |
 | C5 T32 결과와 교차 검증 | ⬜ | | |
 | C6 퍼저 반복·복구·성능 | ⬜ | | |
