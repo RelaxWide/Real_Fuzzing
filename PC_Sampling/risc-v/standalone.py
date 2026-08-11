@@ -41,7 +41,16 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.7  u1 도 값을 찍는다"
+VERSION = "standalone 2026-08-11.8  --alias 디코드 폭 측정"
+
+# ★★ APBAP3 에서 aliasing 을 확인했다:
+#     오프셋 0x00000000 = 0x00040700   ==   오프셋 0x81592000 = 0x00040700
+#     오프셋 0x00000004 = 0x00000010   ==   오프셋 0x81592004 = 0x00000010
+#   상위 비트가 무시되고 주소가 접힌다.
+#
+#   ⇒ **AP 마다 디코드 폭을 먼저 재야 한다.** 그걸 모르고 큰 주소를 찍으면
+#     전부 첫 페이지로 접혀서 같은 곳을 읽고 "없다" 고 결론내게 된다.
+#     지금까지의 주소 탐색 상당수가 이 함정 위에 있었을 수 있다.
 
 # ★ APBAP3 앞 4워드에 내용이 있다 (유효 세션, DPIDR=0x6BA0009D):
 #     0x00=0x00040700  0x04=0x00000010  0x08=0x81592158  0x0C=0x000002C3
@@ -185,6 +194,34 @@ class Dap:
                    'before': before, 'after': decode_ctrl(self.dpr(DP_CTRL))}
 
 
+def alias_probe(jl, d, base, name):
+    """★ 그 AP 의 **주소 디코드 폭**을 잰다.
+
+    N비트만 디코드하면 주소 `2^N` 은 주소 `0` 과 같은 곳이다.
+    우연 배제를 위해 `2^N + 4` 가 `4` 와도 같은지 **함께** 본다.
+    """
+    csw = d.apr(base, OFF_CSW)
+    if csw is None:
+        return {'ap': name, 'width': None, 'note': 'CSW 못 읽음'}
+    r0, _ = d.mem32(base, 0x0, csw)
+    r4, _ = d.mem32(base, 0x4, csw)
+    if r0 is None:
+        return {'ap': name, 'width': None, 'note': '0x0 못 읽음'}
+    width, matches = None, []
+    for n in range(12, 32):
+        a0, _ = d.mem32(base, 1 << n, csw)
+        if a0 != r0:
+            continue
+        a4, _ = d.mem32(base, (1 << n) + 4, csw)
+        if a4 == r4:
+            matches.append(n)
+            if width is None:
+                width = n
+    d.apw(base, OFF_CSW, csw)
+    return {'ap': name, 'width': width, 'ref0': hx(r0), 'ref4': hx(r4),
+            'matches': matches}
+
+
 def session(a, idx):
     import os
     import tempfile
@@ -246,6 +283,10 @@ def session(a, idx):
         out['CTRL'] = decode_ctrl(d.dpr(DP_CTRL))
         out['ok'] = bool(out['CTRL'].get('CDBGACK')) and out['dpidr_ok']
 
+        if getattr(a, 'alias', False):
+            out['alias'] = [alias_probe(jl, d, b, n) for n, b, _t in AP_MAP]
+            return out
+
         for name, base, _t in AP_MAP:
             csw = d.apr(base, OFF_CSW)
             ap = {'IDR': hx(d.apr(base, OFF_IDR)), 'CSW': hx(csw),
@@ -283,6 +324,8 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--alias', action='store_true',
+                    help='★ AP 마다 주소 디코드 폭을 잰다 (2^N 이 0 과 같아지는 지점)')
     ap.add_argument('--ap', default=None,
                     help='이 AP 하나만 읽는다 (예: APBAP3). 기본은 6개 전부')
     ap.add_argument('--tapid', type=lambda x: int(x, 0), default=None,
@@ -329,6 +372,16 @@ def main():
                     errs[k] = errs.get(k, 0) + 1
 
     print(f"\n---8<---")
+    if getattr(a, 'alias', False):
+        print(f"ok={len(ok)}/{a.sessions} DPIDR={(last or {}).get('DPIDR')}")
+        for r in ((last or {}).get('alias') or []):
+            w = r.get('width')
+            sz = (f"{(1 << w) // 1024}KB" if w and w < 22 else
+                  f"{(1 << w) // 1024 // 1024}MB" if w else "wrap없음")
+            print(f"{r['ap']} width={w if w else '-'} ({sz}) ref0={r.get('ref0')}")
+        print("---8<---")
+        return 0 if ok else 6
+
     bad = [r for r in runs if not r.get('dpidr_ok')]
     if bad:
         print(f"\n⚠⚠ DPIDR 무효 세션 {len(bad)}/{a.sessions} — "
