@@ -1141,30 +1141,47 @@ ASIZE=29  ERRMODE=True  BASE_VALID=True  BASEPTR=0x6BA0009D6BA00000
 
 둘 다 근거가 있었지만 **DP 읽기가 되는지는 확인하지 않고** 바꿨다.
 
-### P0 — `--recover` : 유효 DPIDR 조건을 되찾는다
+### ❌ `--recover` 1차 `NOT_FOUND` — 차이가 **둘 더** 있었다
+
+스크립트 유무 × 모드 0/1 로는 못 찾았다. `standalone` 과
+**`0x11013913` 을 읽던 `sfe76_link` 경로의 명령이 다르다:**
+
+| sfe76_link (그때) | standalone (지금) |
+|---|---|
+| `AddAP` ×6 | 같음 |
+| **`CORESIGHT_SetIndexAPBAPToUse`** | **안 보냄** |
+| **`CORESIGHT_SetCoreBaseAddr`** | **안 보냄** |
+| **`RISCV_SetHartSel`** | **안 보냄** |
+| `connect('RISC-V')` | `connect('E76')` |
+
+**단일 파일로 만들면서 그 셋을 빠뜨렸다.** DP 초기화 경로가 달라질 수 있다.
+device 도 그때는 `RISC-V` 였다.
+
+### P0 — `--recover` 확장판 (16 조합)
 
 ```bash
-sudo python3 standalone.py --recover --sessions 3
+# ★ 먼저 타깃 전원 사이클을 권한다 — 긴 세션 동안 상태가 바뀌었을 수 있다
+sudo python3 standalone.py --recover --sessions 2
 ```
 
-**스크립트 유무 × 모드 0/1 = 4 조합**을 훑고 각 조합의 `DPIDR` 을 그대로 낸다.
+**TAP 스크립트 유무 × cJTAG 모드 0/1 × 명령셋 full/min × device RISC-V/E76**
+= 16 조합. 각 조합의 `DPIDR` 을 그대로 낸다(중복은 접어서 전사량을 줄였다).
 
 ```
-script=X mode=0  DPIDR=11013913,11013913,11013913   ★ 유효 3/3
-script=X mode=1  DPIDR=FFFFFFFF,...
-script=O mode=0  DPIDR=...
-script=O mode=1  DPIDR=...
-VERDICT: FOUND (script=X mode=0)
+script=X mode=0 cmds=full dev=RISC-V  DPIDR=11013913   ★ 유효 2/2
+...
+VERDICT: FOUND (script=X mode=0 cmds=full dev=RISC-V)
 ```
 
 | VERDICT | 다음 |
 |---|---|
-| **`FOUND (...)`** | ★★★ 그 조합으로 고정 → discovery·AXI·APBAP3 **전부 재측정** |
-| `NOT_FOUND` | 네 조합 다 아님 → 속도·device·전원 사이클로 확대 |
+| **`FOUND (...)`** | ★★★ 그 조합 고정 → discovery·AXI·APBAP3 **전부 재측정** |
+| `NOT_FOUND` | 소프트웨어 조합이 아니다 → **전원 사이클 · 속도 · 배선** |
 
-> **교훈이 하나 더 늘었다.** 설정을 바꿀 때마다 **"DP 가 여전히 읽히는가"** 를
-> 확인했어야 했다. 그 회귀 검사가 없어서 유효 세션을 잃은 줄도 모르고
-> 그 위에서 며칠치 측정을 했다.
+**`VERDICT` 줄 하나만** 주면 된다.
+
+> ⚠ **타깃 상태 변화 가능성.** 긴 세션 동안 CSW 를 여러 번 쓰고 connect 를
+> 수없이 시도했다. **전원 사이클 후 재시도가 먼저다.**
 
 ### P0.1 — (구) TAP 선언값 비교### P0.1 — TAP 선언값 비교 (유효 세션 확보용)
 

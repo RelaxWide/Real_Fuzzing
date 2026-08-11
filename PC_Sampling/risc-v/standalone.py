@@ -41,7 +41,17 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.14  --recover 유효 DPIDR 조건 탐색"
+VERSION = "standalone 2026-08-11.15  recover 확장 (명령셋·device)"
+
+# ★ NOT_FOUND 후 확인: standalone 이 원래 경로와 **명령이 다르다.**
+#   0x11013913 을 읽던 sfe76_link 는 AddAP 뒤에 이 셋을 더 보냈다:
+#     CORESIGHT_SetIndexAPBAPToUse / CORESIGHT_SetCoreBaseAddr / RISCV_SetHartSel
+#   standalone 은 셋 다 생략했다. DP 초기화 경로가 달라질 수 있다.
+#   device 도 그때는 'RISC-V', 지금은 'E76' 이다.
+#   ⇒ recover 를 명령셋 × device 까지 넓힌다.
+#
+# ⚠ 그리고 **타깃 상태 자체가 변했을 수 있다.** 긴 세션 동안 CSW 를 여러 번
+#   쓰고 connect 를 수없이 시도했다. **전원 사이클 후 재시도가 먼저다.**
 
 # ★ 유효 DPIDR(0x11013913)이 나왔던 브링업 초기와 지금의 차이:
 #     TAP 선언 스크립트   그때 없음        → 지금 항상 적용
@@ -401,6 +411,15 @@ def session(a, idx):
         jl.set_speed(SPEED_KHZ)
         for i, (_n, addr, typ) in enumerate(AP_MAP):
             jl.exec_command(f"CORESIGHT_AddAP = Index={i} Type={typ} BaseAddr=0x{addr:X}")
+        if getattr(a, 'full_cmds', True):
+            # ★ 0x11013913 을 읽던 경로가 보내던 셋. standalone 은 빠뜨렸었다.
+            for c in (f"CORESIGHT_SetIndexAPBAPToUse = {getattr(a, 'apidx', 0)}",
+                      f"CORESIGHT_SetCoreBaseAddr = 0x{getattr(a, 'corebase', 0x81480000):X}",
+                      "RISCV_SetHartSel = 0"):
+                try:
+                    jl.exec_command(c)
+                except Exception:
+                    pass
         try:
             jl.connect(a.device, speed=SPEED_KHZ)
             out['connect'] = True
@@ -494,6 +513,10 @@ def main():
     ap.add_argument('--no-tap-script', action='store_true',
                     help='TAP 선언 스크립트를 깔지 않는다 (브링업 초기 조건)')
     ap.add_argument('--cjtag-mode', type=int, default=CJTAG_MODE)
+    ap.add_argument('--min-cmds', dest='full_cmds', action='store_false',
+                    help='SetIndexAPBAPToUse/SetCoreBaseAddr/SetHartSel 을 보내지 않는다')
+    ap.add_argument('--apidx', type=int, default=0)
+    ap.add_argument('--corebase', type=lambda x: int(x, 0), default=0x81480000)
     ap.add_argument('--discover', action='store_true',
                     help='★ ADIv6 DPIDR1 / BASEPTR0 / BASEPTR1 을 읽는다 (미시도)')
     ap.add_argument('--loose', action='store_true',
@@ -542,22 +565,31 @@ def main():
     if a.recover:
         print(f"\n{'=' * 70}\n [RECOVER] 유효 DPIDR(0x{EXPECT_DPIDR:08X}) 조건 탐색"
               f"\n{'=' * 70}")
-        print("  브링업 초기에 이 값이 나왔다. 그 뒤 우리가 바꾼 둘을 되돌려 본다:")
-        print("    TAP 선언 스크립트 유무  ×  SetcJTAGInitMode 0/1\n")
+        print("  브링업 초기에 이 값이 나왔다. 그 뒤 바뀐 것을 전부 되돌려 본다:")
+        print("    TAP 스크립트 유무 × cJTAG 모드 0/1 × 명령셋 full/min × device")
+        print("    (full = SetIndexAPBAPToUse/SetCoreBaseAddr/SetHartSel 포함)")
+        print("  ⚠ 그 전에 **타깃 전원 사이클**을 권한다 — 긴 세션 동안 상태가")
+        print("     바뀌었을 수 있다.\n")
         print("---8<---")
         best = None
         for no_script in (True, False):
-            for mode in (0, 1):
+          for mode in (0, 1):
+            for full in (True, False):
+              for dev in ('RISC-V', 'E76'):
                 a.no_tap_script, a.cjtag_mode = no_script, mode
+                a.full_cmds, a.device = full, dev
                 got = []
-                for i in range(a.sessions):
+                for i in range(min(a.sessions, 2)):
                     r = session(a, i)
                     got.append(r.get('DPIDR'))
-                    time.sleep(0.3)
+                    time.sleep(0.25)
                 hit = sum(1 for g in got if g == f"{EXPECT_DPIDR:08X}")
-                tag = f"script={'X' if no_script else 'O'} mode={mode}"
-                print(f"{tag}  DPIDR={','.join(g or '-' for g in got)}"
-                      + (f"   ★ 유효 {hit}/{a.sessions}" if hit else ""))
+                tag = (f"script={'X' if no_script else 'O'} mode={mode} "
+                       f"cmds={'full' if full else 'min'} dev={dev}")
+                # 유효값이 없으면 서로 다른 결과만 요약해 전사량을 줄인다
+                uniq = ",".join(sorted({g or '-' for g in got}))
+                print(f"{tag}  DPIDR={uniq}"
+                      + (f"   ★ 유효 {hit}/{len(got)}" if hit else ""))
                 if hit and best is None:
                     best = tag
         print("VERDICT:", f"FOUND ({best})" if best else "NOT_FOUND")
