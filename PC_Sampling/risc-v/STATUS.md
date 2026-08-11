@@ -983,13 +983,38 @@ DP/AP **레지스터** 값은 교차검증됐지만(IDR 6/6 일치),
 ⇒ `sfe76_link` 가 raw 경로에서도 **TAP 수동 선언 스크립트를 깔도록** 고쳤다
 (`API_LEVEL 5`). 이제 raw 도구들이 **정상 TAP 위에서** 돈다.
 
+### ⚠ 정정 — `CoreBase = 0x0` 은 근거가 약했다
+
+**`0x0` 을 쓰게 된 근거 셋이 전부 약하거나 무효다:**
+
+| 근거 | 실제 |
+|---|---|
+| SEGGER 예제값이 `0x0` | 그건 **그쪽 예제 칩**에서 DMI 가 AP 오프셋 0 에 있다는 뜻이다. 우리 칩 값이 아니다 |
+| "`0x0` 일 때만 connect 성공" | **이미 무효 처리한 측정.** TAP 이 깨진 상태였고 `target_connected=False` 인 거짓 신호였다 |
+| "`0x81480000` 은 T32 의 APB **버스** 주소이지 AP 주소공간이 아니다" | **내 추론이고, 틀렸을 가능성이 크다** |
+
+**세 번째가 핵심이다.** MEM-AP 의 TAR 은 **그 버스의 주소**다. 즉 APB-AP 의
+"주소공간" 이 곧 **APB 버스 주소공간**이다. → T32 의 `APB:0x81480000` 은
+**그대로 AP 주소 `0x81480000`** 이어야 맞다.
+
+**⇒ 실제 근거가 있는 값은 `0x81480000` 이다** — 이 실리콘에서 **동작하는**
+T32 가 쓰는 값. 정본 스크립트와 도구 기본값을 되돌렸다.
+(`CORE_BASES` 에는 `0x81481000`(Ncore)도 넣었다)
+
 ### P0 — 정상 TAP 위에서 raw 측정을 다시 한다
 
 ```bash
 ./check_env.sh                       # API_LEVEL 5 확인
 sudo python3 probe_ap_raw.py --addrs dm --no-rom --brief --sessions 3
-sudo python3 probe_ap_raw.py --addrs fw --no-rom --brief --sessions 3
 ```
+
+그리고 **근거 있는 CoreBase 로 connect 를 다시** 본다:
+```bash
+sudo python3 try_jlinkscript.py --dumplog --log-base 0x81480000
+sudo python3 try_jlinkscript.py --dumplog --log-base 0x81481000   # Ncore
+```
+로그에 `Core base addr: 0x81480000 (user configured)` 가 찍히고 그 뒤가
+어떻게 되는지가 답이다. **`0x0` 으로 본 결과는 다시 볼 필요가 있다.**
 
 **같은 도구, 다른 전제.** 이전 결과와 비교하면 TAP 수정의 효과가 바로 보인다:
 

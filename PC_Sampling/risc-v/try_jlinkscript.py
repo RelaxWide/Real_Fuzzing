@@ -99,7 +99,7 @@ DEVIDS = [0x4BA00477, 0x2BA01477, 0x5BA00477, 0x6BA00477]
 
 SYNTAXES = ['BaseAddr']
 AP_INDEXES = [0, 1]                            # ROM 엔트리가 지목한 둘
-CORE_BASES = [0x81480000, 0x0]
+CORE_BASES = [0x81480000, 0x81481000, 0x0]
 DEVICES = ['E76']            # ★ 'RISC-V' 는 connect 자체가 안 된다(실측)
 
 MARKER = "SFE76_SCRIPT_RAN"
@@ -355,7 +355,9 @@ def cpusweep(a):
       ② "RISC-V 는 안 되고 E76" 이라는 관측은 **TAP 이 깨진 상태**의 것이다.
          지금은 조건이 다르므로 다시 본다.
 
-    CoreBase 는 `0x0`(SEGGER 예제값) 고정, hart 0 고정.
+    CoreBase 는 **T32 값 `0x81480000`** 고정, hart 0 고정.
+    (SEGGER 예제의 0x0 은 그쪽 칩 값일 뿐이고, "0x0 에서만 성공" 관측은
+     TAP 이 깨진 상태의 무효 측정이었다)
     셀렉터에 맞춰 AP 인덱스도 바꾼다 — APB 는 0, AHB 는 3(0x40000).
     """
     print(f"\n{'=' * 68}\n [CPU] AP 셀렉터 × device\n{'=' * 68}")
@@ -369,7 +371,7 @@ def cpusweep(a):
             tgt = conn = 0
             errs = set()
             for _ in range(a.reps):
-                r = spawn('BaseAddr', apidx, 0x0, dev, 0, a.tries,
+                r = spawn('BaseAddr', apidx, a.core_base, dev, 0, a.tries,
                           CHAIN_TAP_ID, 'JLINK_JTAG', selcmd)
                 conn += bool(r.get('connect'))
                 tgt += (r.get('target_connected') is True)
@@ -414,7 +416,8 @@ def v2(a):
     """
     forms = [a.form] if a.form else list(CHAIN_FORMS)
     print(f"\n{'=' * 68}\n [v2] 공식형 최소 manual-chain — 1조건\n{'=' * 68}")
-    print("  device=E76  cJTAG  10MHz  cJTAGInitMode=1  hart=0  AP=0  CoreBase=0x0")
+    print(f"  device=E76  cJTAG  10MHz  cJTAGInitMode=1  hart=0  AP=0  "
+          f"CoreBase=0x{a.core_base:X}")
     print(f"  TAP ID=0x{CHAIN_TAP_ID:08X}   체인 전역 이름: {forms}")
     print("  ★ AllowTAPReset=1 (자동 검출 OFF) — 이전엔 0 을 쓰면서 껐다고 착각했다")
     print(f"  반복 {a.reps}회. 오라클은 target_connected().\n")
@@ -424,7 +427,8 @@ def v2(a):
         ok = tgt = ran = cd = dtm = 0
         errs, ids = set(), set()
         for _ in range(a.reps):
-            r = spawn('BaseAddr', 0, 0x0, 'E76', 0, a.tries, CHAIN_TAP_ID, form)
+            r = spawn('BaseAddr', 0, a.core_base, 'E76', 0, a.tries,
+                      CHAIN_TAP_ID, form)
             ran += bool(r.get('script_ran'))
             ok += bool(r.get('connect'))
             tgt += (r.get('target_connected') is True)
@@ -616,7 +620,7 @@ def main():
     ap.add_argument('--log-sel', default='APB', choices=[x[0] for x in SELECTORS])
     ap.add_argument('--log-ap', type=int, default=0)
     ap.add_argument('--log-dev', default='E76')
-    ap.add_argument('--log-base', type=lambda x: int(x, 0), default=0x0)
+    ap.add_argument('--log-base', type=lambda x: int(x, 0), default=0x81480000)
     ap.add_argument('--cpusweep', action='store_true',
                     help='★ AP 셀렉터(APB/AHB) × device. TAP 통과 후 남은 두 변수')
     ap.add_argument('--cpu-devices', default=",".join(CPU_DEVICES))
