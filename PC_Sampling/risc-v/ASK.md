@@ -16,7 +16,7 @@
 | | |
 |---|---|
 | 타깃 | SiFive **SF-E76** 기반 커스텀 SSD 컨트롤러 (Arty 보드 아님) |
-| 프로브 | **J-Link Plus**, FW V13, 소프트웨어 **V9.66** |
+| 프로브 | **J-Link Plus**, **하드웨어 V13.00**, 소프트웨어 **V9.66** |
 | 인터페이스 | **cJTAG** (`SetcJTAGInitMode=0`, TIF=7), **10 MHz** |
 | 호스트 | Linux, pylink-square 2.0.0 |
 | 목표 | 펌웨어 코드 커버리지를 **트레이스 기반**으로 수집. halt 는 하지 않는다 |
@@ -137,7 +137,27 @@ APBAP1 으로 여러 주소를 32비트 읽은 결과입니다.
 > 3. Is there a way to make the DLL log the DMI transactions it attempts, so we
 >    can see which address it is driving? (`EnableRemarks`, verbose log level?)
 > 4. Is cJTAG + RISC-V-behind-DAP a supported combination in V9.66?
-> 5. ★ **KEEPER logic.** TRACE32 connects to this target using
+> 5. ★ **The one that matters.** Steady-state cJTAG communication **works** —
+>    with `JLINKARM_CORESIGHT_Configure("...IRLenDevice=4;PerformTIFInit=0;")`
+>    we read `DPIDR = 0x11013913` and all six AP IDR registers, and their TYPE
+>    fields match the TRACE32-declared AP types 6/6 (APB→6, AXI→4, AHB→1).
+>    **That is real data; the board and the link are alive.**
+>
+>    But J-Link's own **TIF init / JTAG chain detection** reads
+>    `Id: 0x00000001, IRLen: 04` and then assumes a RISC-V JTAG-DTM, and
+>    `target_connected()` is never true. In other words **only the
+>    activation / scan phase fails, not communication itself.**
+>
+>    We have tried every knob we could find for that phase:
+>    `SetcJTAGInitMode` 0/1/2, speeds 10 MHz / 4 MHz / 1 MHz / 500 kHz,
+>    declaring the TAP via `JLINK_JTAG_SetDeviceId()` with
+>    `JTAG_AllowTAPReset = 0` in `InitTarget()`, and 4-wire JTAG
+>    (`TIF=JTAG` produces no chain at all).
+>
+>    **How can we make J-Link skip or replace its chain-detection scan and use
+>    a manually declared chain, given that steady-state access already works?**
+>
+> 6. **KEEPER logic.** TRACE32 connects to this target using
 >    `SYStem.CONFIG.CJTAGFLAGS NOKEEPER USEOAC`, i.e. the SoC has **no KEEPER
 >    logic**. Your cJTAG page says a workaround exists but *"if a specific
 >    J-Link hardware version comes with this workaround can be checked via the
