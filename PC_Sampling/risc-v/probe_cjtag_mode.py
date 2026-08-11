@@ -65,7 +65,40 @@ import pylink
 
 from sfe76_link import require_api, TIF_CJTAG, SPEED_KHZ, EXIT_OK, EXIT_INSUFFICIENT
 
-VERSION = "2026-08-11.11  cJTAG 활성화 시퀀스"
+VERSION = "2026-08-11.12  TAP 수동 선언 + 속도"
+
+# ★ IDCODE 가 어느 활성화 모드에서도 0x00000001 이면 자동 검출로는 안 된다.
+#   SEGGER 문서의 TAP 선택 규칙:
+#     IRLen=4 이고 TAPId 가 **알려진 CoreSight DAP TAP** → RISC-V behind DAP 로 간주
+#   ⇒ TAP ID 를 **수동 선언**해서 그 규칙을 발동시킨다. InitTarget() 의 용도다.
+#
+#   JTAG_AllowTAPReset = 0  ← "자동 JTAG 검출을 끈다. 특별한 init 이 필요해
+#                               TAP reset 으로 잃어버리는 장치는 꺼야 한다"(문서)
+#   JLINK_JTAG_SetDeviceId(0, id)
+#
+#   ⚠ 전역 CPU 상수 목록에는 **RISC-V 가 없다**(ARM 전용). 그래서 CPU 는 설정하지
+#     않고 체인만 선언한다 — device 지정(E76)이 그 역할을 대신하길 기대한다.
+KNOWN_DAP_IDS = [
+    (None,       '선언 안 함 (현재 동작)'),
+    (0x4BA00477, 'ARM CoreSight DAP (A9 계열)'),
+    (0x2BA01477, 'ARM CoreSight DAP (M 계열)'),
+    (0x5BA00477, 'ARM CoreSight DAP'),
+    (0x6BA00477, 'ARM CoreSight DAP'),
+]
+
+INIT_TMPL = """/* 자동 생성 — probe_cjtag_mode.py */
+int InitTarget(void) {{
+  JLINK_SYS_Report("SFE76_INIT_RAN");
+  JTAG_AllowTAPReset = 0;      // 자동 검출 끔 — 지금 그게 0x00000001 을 만든다
+  JTAG_IRPre  = 0;
+  JTAG_DRPre  = 0;
+  JTAG_IRPost = 0;
+  JTAG_DRPost = 0;
+  JTAG_IRLen  = 4;
+  JLINK_JTAG_SetDeviceId(0, 0x{devid:08X});
+  return 0;
+}}
+"""
 
 MODES = [(1, 'SHORT/OScan1  ← SiFive 권장'), (0, 'LONG (지금까지 쓰던 것)'),
          (2, 'WILIOT')]
@@ -83,21 +116,41 @@ def bad_id(v):
     return n in (0x00000000, 0x00000001, 0xFFFFFFFF) or (n & 1) == 0
 
 
+def write_init_script(devid):
+    import tempfile
+    p = os.path.join(tempfile.gettempdir(), f"sfe76_init_{os.getpid()}.JLinkScript")
+    with open(p, 'w') as f:
+        f.write(INIT_TMPL.format(devid=devid))
+    return p
+
+
 def run_one(a):
-    rec = {'mode': a.mode, 'device': a.device, 'connect': False,
+    rec = {'mode': a.mode, 'device': a.device, 'speed': a.speed,
+           'devid': (f"0x{a.devid:08X}" if a.devid else None), 'connect': False,
            'idcode': None, 'irlen': None, 'dtm': False, 'dap': False,
            'dmcontrol_err': False, 'error': None}
     logs = []
     cb = lambda m: logs.append(str(m))
     jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
     try:
+        sp = write_init_script(a.devid) if a.devid else None
+        if sp:
+            try:
+                jl.exec_command(f"ScriptFile = {sp}")
+            except Exception:
+                pass
         jl.open()
         jl.exec_command(f"SetcJTAGInitMode = {a.mode}")
         jl.exec_command("EnableRemarks = 1")
+        if sp:
+            try:
+                jl.exec_command(f"ScriptFile = {sp}")
+            except Exception:
+                pass
         jl.set_tif(TIF_CJTAG)
-        jl.set_speed(SPEED_KHZ)
+        jl.set_speed(a.speed)
         try:
-            jl.connect(a.device, speed=SPEED_KHZ)
+            jl.connect(a.device, speed=a.speed)
             rec['connect'] = True
         except Exception as e:
             rec['error'] = str(e)[:120]
@@ -114,6 +167,7 @@ def run_one(a):
         rec['dap'] = ('coresight' in low) or ('dap' in low and 'jtag-dtm' not in low)
         rec['dmcontrol_err'] = 'dmcontrol' in low
         rec['log_lines'] = len(logs)
+        rec['init_ran'] = 'SFE76_INIT_RAN' in blob
         try:
             jl.close()
         except Exception:
@@ -122,18 +176,20 @@ def run_one(a):
     return EXIT_OK if rec['connect'] else EXIT_INSUFFICIENT
 
 
-def spawn(mode, device):
+def spawn(mode, device, speed, devid):
     cmd = [sys.executable, os.path.abspath(__file__), '--single',
-           '--mode', str(mode), '--device', device]
+           '--mode', str(mode), '--device', device, '--speed', str(speed)]
+    if devid:
+        cmd += ['--devid', hex(devid)]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=120).stdout
     except subprocess.TimeoutExpired:
-        return {'mode': mode, 'device': device, 'error': 'timeout',
+        return {'mode': mode, 'device': device, 'speed': speed, 'error': 'timeout',
                 'connect': False, 'idcode': None, 'dtm': False}
     for line in out.splitlines():
         if line.startswith("@@JSON@@"):
             return json.loads(line[len("@@JSON@@"):])
-    return {'mode': mode, 'device': device, 'error': 'no result',
+    return {'mode': mode, 'device': device, 'speed': speed, 'error': 'no result',
             'connect': False, 'idcode': None, 'dtm': False}
 
 
@@ -146,6 +202,12 @@ def main():
     ap.add_argument('--single', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--mode', type=int, default=1, help=argparse.SUPPRESS)
     ap.add_argument('--device', default='E76', help=argparse.SUPPRESS)
+    ap.add_argument('--speed', type=int, default=SPEED_KHZ, help=argparse.SUPPRESS)
+    ap.add_argument('--devid', type=lambda x: int(x, 0), default=None,
+                    help=argparse.SUPPRESS)
+    ap.add_argument('--speeds', default="10000,4000,1000",
+                    help='시험할 JTAG 속도(kHz). IDCODE 가 쓰레기면 신호 무결성일 수도')
+    ap.add_argument('--modes', default="1,0")
     a = ap.parse_args()
     if a.version:
         print(f"probe_cjtag_mode {VERSION}")
@@ -161,19 +223,28 @@ def main():
         print("  CoreSight DAP 대신 RISC-V JTAG-DTM 으로 오인한다.\n")
         print("  SetcJTAGInitMode 1 = 'Needed for e.g. SiFive or RISC-V targets' (문서)\n")
 
+    modes = [int(x) for x in a.modes.split(',') if x.strip()]
+    speeds = [int(x) for x in a.speeds.split(',') if x.strip()]
+    total = len(modes) * len(devs) * len(speeds) * len(KNOWN_DAP_IDS)
+    if not a.brief:
+        print(f"  총 {total} 조합 (모드 {modes} × device {devs} × "
+              f"속도 {speeds} × TAP ID {len(KNOWN_DAP_IDS)}종)\n")
+
     rows = []
-    for mode, label in MODES:
-        for dev in devs:
-            r = spawn(mode, dev)
-            rows.append(r)
-            ok = not bad_id(r.get('idcode'))
-            if not a.brief:
-                print(f"  mode={mode} ({label:26s}) dev={dev:8s} "
-                      f"Id={r.get('idcode') or '없음'} IRLen={r.get('irlen')} "
-                      f"{'★ 유효 IDCODE' if ok else ''}"
-                      f"{'  connect O' if r.get('connect') else ''}"
-                      f"{'  [JTAG-DTM 오인]' if r.get('dtm') else ''}")
-            time.sleep(0.4)
+    for devid, idlabel in KNOWN_DAP_IDS:
+        for mode in modes:
+            for spd in speeds:
+                for dev in devs:
+                    r = spawn(mode, dev, spd, devid)
+                    rows.append(r)
+                    ok = not bad_id(r.get('idcode'))
+                    if not a.brief and (ok or r.get('connect') or devid is None):
+                        print(f"  id={idlabel:28s} mode={mode} {spd:>5d}kHz "
+                              f"{dev:8s} Id={r.get('idcode') or '없음'}"
+                              f"{'  ★ 유효' if ok else ''}"
+                              f"{'  connect O' if r.get('connect') else ''}"
+                              f"{'  [DTM 오인]' if r.get('dtm') else ''}")
+                    time.sleep(0.3)
 
     good = [r for r in rows if not bad_id(r.get('idcode'))]
     conn = [r for r in rows if r.get('connect')]
@@ -181,8 +252,11 @@ def main():
 
     print(f"\nv={VERSION.split()[0]}")
     for r in rows:
-        print(f"mode={r['mode']} dev={r['device']:8s} Id={r.get('idcode') or '-'} "
-              f"connect={int(bool(r.get('connect')))} dtm={int(bool(r.get('dtm')))}")
+        if not bad_id(r.get('idcode')) or r.get('connect'):
+            print(f"mode={r['mode']} dev={r['device']:8s} spd={r.get('speed')} "
+                  f"id={r.get('devid') or '-'} Id={r.get('idcode') or '-'} "
+                  f"connect={int(bool(r.get('connect')))} dtm={int(bool(r.get('dtm')))}")
+    print(f"init스크립트실행={sum(1 for r in rows if r.get('init_ran'))}/{len(rows)}")
     print(f"유효IDCODE={len(good)}/{len(rows)}  connect={len(conn)}  "
           f"DTM오인아님={len(nodtm)}")
     print("VERDICT:", "IDCODE_OK" if good else

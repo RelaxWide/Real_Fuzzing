@@ -719,18 +719,54 @@ SetcJTAGInitMode
 
 **⇒ `sfe76_link`: `CJTAG_MODE 0 → 1`, `DEVICE 'RISC-V' → 'E76'` (API_LEVEL 4)**
 
-### P0 — `probe_cjtag_mode.py` : TAP 인식부터 고친다
+### ❌ cJTAG 모드만으로는 안 됐다 (2026-08-11)
+
+```
+유효IDCODE=0/9   connect=3   DTM오인아님=0
+```
+**모드 0/1/2 × device 3종 전부에서 IDCODE 가 `0x00000001`.**
+활성화 시퀀스 문제가 아니거나, 그것만으로는 부족하다.
+
+### P0 — TAP ID 를 **수동 선언**한다 (`InitTarget()`)
 
 ```bash
 sudo python3 probe_cjtag_mode.py
 ```
-모드 0/1/2 × device 를 훑고 **J-Link 자신의 로그에서 IDCODE 를 읽는다.**
-우리가 해석할 필요가 없다 — `0x00000001` 이 유효한 값으로 바뀌는지만 본다.
 
-| VERDICT | 의미 |
+자동 검출이 안 되면 **선언하면 된다.** SEGGER 의 규칙이
+
+> IRLen=4 이고 TAPId 가 **알려진 CoreSight DAP TAP** → RISC-V behind DAP 로 간주
+
+이므로, TAP ID 를 알려진 DAP ID 로 **선언해서 그 규칙을 발동시킨다.**
+`InitTarget()` 이 정확히 이 용도이고, 문서가 요구하는 것도 딱 이것이다 —
+*"JTAG chain has to be specified manually... all devices and their TAP IDs"*.
+
+```c
+int InitTarget(void) {
+  JTAG_AllowTAPReset = 0;    // "자동 JTAG 검출을 끈다"(문서) ← 지금 그게 0x1 을 만든다
+  JTAG_IRPre = 0; JTAG_DRPre = 0; JTAG_IRPost = 0; JTAG_DRPost = 0;
+  JTAG_IRLen = 4;
+  JLINK_JTAG_SetDeviceId(0, 0x4BA00477);   // 알려진 CoreSight DAP TAP
+  return 0;
+}
+```
+> ⚠ 전역 `CPU` 상수 목록에 **RISC-V 가 없다**(ARM 전용). 그래서 `CPU` 는 설정하지
+> 않고 체인만 선언한다 — `device=E76` 지정이 그 역할을 대신하길 기대한다.
+> 이전에 `InitTarget` 이 스캔을 깨뜨린 건 **체인을 선언 안 했기 때문**이고,
+> 이번엔 그걸 한다.
+
+**동시에 두 변수를 더 훑는다:**
+- **JTAG 속도** `10000 / 4000 / 1000` kHz — `Id=0x00000001` 은 **신호 무결성**
+  증상일 수도 있다. (예전 "속도 낮추면 실패" 관측은 **모드 0** 에서 나온 것이다)
+- **TAP ID** 5종 (선언 안 함 + 알려진 DAP ID 4개)
+
+`init스크립트실행=n/N` 이 같이 찍힌다 — 0 이면 스크립트가 안 먹은 것이라
+결과 해석 전에 그것부터 봐야 한다.
+
+| VERDICT | 다음 |
 |---|---|
-| `IDCODE_OK` | ★★ TAP 인식 성공 → 그 조합으로 고정하고 `try_jlinkscript.py` **재실행** |
-| `TAP_NOT_IDENTIFIED` | 어느 모드도 안 됨 → cJTAG 물리 계층(속도·배선·전원)으로 |
+| `IDCODE_OK` | ★★ TAP 인식 성공 → 그 조합 고정, `try_jlinkscript.py` 재실행 |
+| `TAP_NOT_IDENTIFIED` | 자력 한계. cJTAG 물리 계층(배선·풀업·전원) 또는 SEGGER 문의 |
 
 ### (참고) 이전 `CONNECT_ONLY` 판정 — 무효
 
