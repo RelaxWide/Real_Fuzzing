@@ -1115,28 +1115,58 @@ ASIZE=29  ERRMODE=True  BASE_VALID=True  BASEPTR=0x6BA0009D6BA00000
 같으면 **`DISCOVERY 무효`** 로 표시하며 파생값을 계산하지 않는다.
 (세 시나리오로 검증)
 
-### P0 — 먼저 **유효 세션**을 만든다. 그게 안 되면 아무것도 못 한다
+### ❌ TAP 선언값 둘 다 실패 (2026-08-11)
 
-지금 모든 문제의 뿌리는 하나다: **`DPIDR=0x11013913` 세션이 안 잡힌다.**
+```
+--tapid 0x11013913  →  ok=0/3  DPIDR=FFFFFFFF
+--tapid 0x5BA00477  →  ok=0/3  DPIDR=6BA0009D
+```
+어느 선언값도 `0x11013913` 을 만들지 못한다.
+
+### ★ 그럼 **그때와 지금의 차이**를 되짚어야 한다
+
+`0x11013913` 은 브링업 **초기**에 실제로 읽혔다. 그 뒤 우리가 바꾼 것:
+
+| 항목 | 그때 | 지금 |
+|---|---|---|
+| **TAP 선언 스크립트** | **없음** | 항상 적용 |
+| **`SetcJTAGInitMode`** | **0 (LONG)** | 1 (SHORT) |
+| device | RISC-V | E76 |
+
+**앞의 둘은 내가 "개선" 이라고 생각하고 넣은 것**인데,
+**유효 DPIDR 을 잃은 시점과 겹친다.**
+
+- TAP 선언은 **JTAG-DTM 오인을 없애려고** 넣었다
+- cJTAG 모드 1 은 문서의 *"Needed for e.g. SiFive"* 를 보고 바꿨다
+
+둘 다 근거가 있었지만 **DP 읽기가 되는지는 확인하지 않고** 바꿨다.
+
+### P0 — `--recover` : 유효 DPIDR 조건을 되찾는다
 
 ```bash
-sudo python3 standalone.py --tapid 0x11013913 --sessions 3
-sudo python3 standalone.py --tapid 0x5BA00477 --sessions 3
+sudo python3 standalone.py --recover --sessions 3
 ```
 
-`ok=?/3` 과 `DPIDR=` 만 보면 된다. **`ok` 가 0 이 아닌 선언값이 있으면**
-그걸로 고정하고 discovery·AXI·APBAP3 를 **전부 다시** 잰다.
+**스크립트 유무 × 모드 0/1 = 4 조합**을 훑고 각 조합의 `DPIDR` 을 그대로 낸다.
 
-| 결과 | 다음 |
+```
+script=X mode=0  DPIDR=11013913,11013913,11013913   ★ 유효 3/3
+script=X mode=1  DPIDR=FFFFFFFF,...
+script=O mode=0  DPIDR=...
+script=O mode=1  DPIDR=...
+VERDICT: FOUND (script=X mode=0)
+```
+
+| VERDICT | 다음 |
 |---|---|
-| 어느 한쪽이 `ok=3/3` | ★ 그 선언값으로 고정 → `--discover` 재실행 |
-| 둘 다 `ok=0/3` | `0x11013913` 세션을 못 만든다 → cJTAG/속도/전원 사이클 계층 |
-| 세션마다 갈림 | 불안정 — 반복 늘려 비율로 판단 |
+| **`FOUND (...)`** | ★★★ 그 조합으로 고정 → discovery·AXI·APBAP3 **전부 재측정** |
+| `NOT_FOUND` | 네 조합 다 아님 → 속도·device·전원 사이클로 확대 |
 
-> ⚠ `DPBANKSEL` 이 안 먹는 문제는 유효 세션을 잡은 뒤에도 남을 수 있다.
-> 그때는 pylink 의 DP API 로 뱅크 전환이 되는지부터 따로 확인해야 한다.
+> **교훈이 하나 더 늘었다.** 설정을 바꿀 때마다 **"DP 가 여전히 읽히는가"** 를
+> 확인했어야 했다. 그 회귀 검사가 없어서 유효 세션을 잃은 줄도 모르고
+> 그 위에서 며칠치 측정을 했다.
 
-### P0.1 — TAP 선언값 비교 (유효 세션 확보용)### P0.1 — TAP 선언값 비교 (유효 세션 확보용)
+### P0.1 — (구) TAP 선언값 비교### P0.1 — TAP 선언값 비교 (유효 세션 확보용)
 
 ```bash
 sudo python3 standalone.py --tapid 0x11013913 --sessions 3

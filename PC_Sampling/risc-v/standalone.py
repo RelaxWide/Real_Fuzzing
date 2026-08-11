@@ -41,7 +41,14 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.13  discovery 자기검증"
+VERSION = "standalone 2026-08-11.14  --recover 유효 DPIDR 조건 탐색"
+
+# ★ 유효 DPIDR(0x11013913)이 나왔던 브링업 초기와 지금의 차이:
+#     TAP 선언 스크립트   그때 없음        → 지금 항상 적용
+#     SetcJTAGInitMode   그때 0 (LONG)    → 지금 1 (SHORT)
+#     device             그때 RISC-V      → 지금 E76
+#   앞의 둘은 "개선" 이라고 생각하고 넣은 것인데 **유효 DPIDR 을 잃은 시점과
+#   겹친다.** 스크립트 유무 × 모드 0/1 을 훑어 그 조건을 되찾는다.
 
 # ⚠ discovery 가 두 가지를 안 지켰다 (실측에서 드러남):
 #   ① 세션이 무효(DPIDR VERSION=0)인데도 값을 찍고 파생값까지 계산했다
@@ -364,26 +371,32 @@ def _val_of(reads, addr):
 def session(a, idx):
     import os
     import tempfile
-    sp = os.path.join(tempfile.gettempdir(), f"sfe76_sa_{os.getpid()}.JLinkScript")
-    with open(sp, 'w') as f:
-        f.write(TAP_SCRIPT % CHAIN_TAP_ID)
+    use_script = not getattr(a, 'no_tap_script', False)
+    mode = getattr(a, 'cjtag_mode', CJTAG_MODE)
+    sp = None
+    if use_script:
+        sp = os.path.join(tempfile.gettempdir(), f"sfe76_sa_{os.getpid()}.JLinkScript")
+        with open(sp, 'w') as f:
+            f.write(TAP_SCRIPT % CHAIN_TAP_ID)
 
     out = {'session': idx, 'ok': False, 'aps': {}, 'log': []}
     logs = []
     cb = lambda m: logs.append(str(m).rstrip())
     jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
     try:
-        try:
-            jl.exec_command(f"ScriptFile = {sp}")
-        except Exception:
-            pass
+        if sp:
+            try:
+                jl.exec_command(f"ScriptFile = {sp}")
+            except Exception:
+                pass
         jl.open()
         out['probe'] = f"{jl.product_name} HW={jl.hardware_version} FW={jl.firmware_version}"
-        try:
-            jl.exec_command(f"ScriptFile = {sp}")
-        except Exception:
-            pass
-        jl.exec_command(f"SetcJTAGInitMode = {CJTAG_MODE}")
+        if sp:
+            try:
+                jl.exec_command(f"ScriptFile = {sp}")
+            except Exception:
+                pass
+        jl.exec_command(f"SetcJTAGInitMode = {mode}")
         jl.set_tif(TIF_CJTAG)
         jl.set_speed(SPEED_KHZ)
         for i, (_n, addr, typ) in enumerate(AP_MAP):
@@ -461,10 +474,11 @@ def session(a, idx):
             jl.close()
         except Exception:
             pass
-        try:
-            os.unlink(sp)
-        except OSError:
-            pass
+        if sp:
+            try:
+                os.unlink(sp)
+            except OSError:
+                pass
     return out
 
 
@@ -475,6 +489,11 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--recover', action='store_true',
+                    help='★ 유효 DPIDR 조건을 찾는다 — 스크립트 유무 × cJTAG 모드')
+    ap.add_argument('--no-tap-script', action='store_true',
+                    help='TAP 선언 스크립트를 깔지 않는다 (브링업 초기 조건)')
+    ap.add_argument('--cjtag-mode', type=int, default=CJTAG_MODE)
     ap.add_argument('--discover', action='store_true',
                     help='★ ADIv6 DPIDR1 / BASEPTR0 / BASEPTR1 을 읽는다 (미시도)')
     ap.add_argument('--loose', action='store_true',
@@ -519,6 +538,31 @@ def main():
     print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
+
+    if a.recover:
+        print(f"\n{'=' * 70}\n [RECOVER] 유효 DPIDR(0x{EXPECT_DPIDR:08X}) 조건 탐색"
+              f"\n{'=' * 70}")
+        print("  브링업 초기에 이 값이 나왔다. 그 뒤 우리가 바꾼 둘을 되돌려 본다:")
+        print("    TAP 선언 스크립트 유무  ×  SetcJTAGInitMode 0/1\n")
+        print("---8<---")
+        best = None
+        for no_script in (True, False):
+            for mode in (0, 1):
+                a.no_tap_script, a.cjtag_mode = no_script, mode
+                got = []
+                for i in range(a.sessions):
+                    r = session(a, i)
+                    got.append(r.get('DPIDR'))
+                    time.sleep(0.3)
+                hit = sum(1 for g in got if g == f"{EXPECT_DPIDR:08X}")
+                tag = f"script={'X' if no_script else 'O'} mode={mode}"
+                print(f"{tag}  DPIDR={','.join(g or '-' for g in got)}"
+                      + (f"   ★ 유효 {hit}/{a.sessions}" if hit else ""))
+                if hit and best is None:
+                    best = tag
+        print("VERDICT:", f"FOUND ({best})" if best else "NOT_FOUND")
+        print("---8<---")
+        return 0 if best else 6
 
     runs = [session(a, i) for i in range(a.sessions)]
     ok = [r for r in runs if r.get('ok')]
