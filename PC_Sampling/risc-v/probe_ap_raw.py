@@ -59,7 +59,7 @@ import time
 from sfe76_link import (require_api, Link, LinkError, AP_MAP, add_common_args,
                         EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-10.1"
+VERSION = "2026-08-11.4  report_dm / paste block / usable 진단"
 
 # DP 레지스터 인덱스
 DP_ABORT, DP_CTRL_STAT, DP_SELECT, DP_RDBUF = 0, 1, 2, 3
@@ -612,11 +612,19 @@ def report_dm(stable):
     for ap, vals in stable.items():
         v = {a: x for a, (x, _e) in vals.items()}
         cid = check_cidr(v)
+        print(f"\n  [{ap}]")
         if cid is None:
+            miss = [f"+0x{o:03X}" for o in (0xFF0, 0xFF4, 0xFF8, 0xFFC)
+                    if v.get(DM_PROBE_BASE + o) is None]
+            print(f"    CIDR 읽기 실패/불안정: {' '.join(miss)}")
+            lines.append(f"{ap} CIDR=읽기실패 {' '.join(miss)}")
+            for tag, dc, ds in (("stride<<2", DM_PROBE_BASE + 0x040, DM_PROBE_BASE + 0x044),
+                                ("stride 1 ", DM_PROBE_BASE + 0x010, DM_PROBE_BASE + 0x011)):
+                print(f"    {tag}: dmcontrol={hx(v.get(dc))}  dmstatus={hx(v.get(ds))}")
+                lines.append(f"{ap} {tag} dmcontrol={hx(v.get(dc))} dmstatus={hx(v.get(ds))}")
             continue
         klass = {1: 'ROM 테이블', 9: 'CoreSight 컴포넌트'}.get(cid['class'],
                                                             f"class={cid['class']}")
-        print(f"\n  [{ap}]")
         print(f"    CIDR = {' '.join(cid['raw'])}"
               f"   → {'✅ CoreSight 서명 일치' if cid['ok'] else '❌ 서명 불일치'}"
               f"   {klass if cid['ok'] else ''}")
@@ -730,6 +738,10 @@ def one_session(a):
                 for n, b in usable:
                     out['rom'][n] = walk_rom(dap, n, b)
 
+            if a.addrs and not usable:
+                print(f"\n  ⚠ **AP 접근 경로(TAR 되읽기)를 하나도 확보하지 못해**")
+                print(f"     주소를 하나도 읽지 않았다. --addrs 는 건너뛴다.")
+                print(f"     usable=0 → 이 세션에서는 판정 자체가 불가능하다.")
             if a.addrs and usable:
                 k = a.addrs.strip()
                 if k == 'trace':
@@ -850,6 +862,51 @@ def main():
         print(f"\n  AP alias 검사: " +
               ("★ **alias 의심** — 독립 AP 가 아니다" if any(al)
                else "✅ 전 세션에서 각 AP 가 자기 패턴 유지"))
+
+    # ── CSW.DeviceEn 집계 (이전 교체 때 사라졌던 블록 복구) ────────────
+    de = {}
+    for r in valid:
+        for n, v in (r.get('device_en') or {}).items():
+            de.setdefault(n, []).append(v)
+    if de:
+        print(f"\n{'=' * 70}\n ★ CSW.DeviceEn\n{'=' * 70}")
+        for n, vs in de.items():
+            print(f"    {n:7s} DeviceEn = {vs}")
+        flat = [v for vs in de.values() for v in vs if v is not None]
+        if flat and not any(flat):
+            print("\n  ★ 전 AP DeviceEn=0 → **지금 이 AP 들은 메모리 트랜잭션을 못 낸다.**")
+            print("     원인 후보: 인증 입력 / 전원 / 클럭 / reset / integration 신호.")
+            print("     ⚠ 잠금이라고 **단정하지 말 것.** 벤더 확인 사항이다 (ASK.md §5).")
+        elif flat and all(flat):
+            print("\n  ✅ DeviceEn=1 → **raw 메모리 시험을 진행할 수 있다.**")
+            print("     ⚠ 이것만으로 '잠금 아님' 은 성립하지 않는다 — 주소별 firewall /")
+            print("        Secure 제한 / SDeviceEn / Prot 로도 실패한다. 판정은 읽기 결과로.")
+        elif flat:
+            print("\n  ⚠ AP 마다 다르다 → DeviceEn=1 인 AP 로만 진행할 것.")
+
+    # ── 📋 어떤 경로로 왔든 **항상** 붙여넣기용 블록을 낸다 ────────────
+    print(f"\n{'=' * 70}\n 📋 아래 블록을 그대로 복사해서 주면 된다\n{'=' * 70}")
+    print("---8<--- PROBE_AP_RAW ---")
+    print(f"version={VERSION}")
+    print(f"addrs={a.addrs}  sessions={a.sessions}  valid={len(valid)}/{a.sessions}")
+    for i, r in enumerate(runs):
+        print(f"session{i}: valid={r['valid']} connect={r.get('connect_ok')} "
+              f"usable={[n for n, _b in (r.get('usable_aps') or [])]}")
+    for n, vs in (de or {}).items():
+        print(f"DeviceEn {n}={vs}")
+    if merged:
+        for n, m in sorted(merged.items()):
+            for ad in sorted(m):
+                obs = m[ad]
+                vals = {v for v, _e in obs}
+                one = (list(vals)[0] if len(vals) == 1 else None)
+                print(f"{n} 0x{ad:08X} = "
+                      + (hx(one) if one is not None else f"불안정{sorted(str(x) for x in vals)}"))
+    else:
+        print("MEASURED=없음 (주소를 하나도 읽지 못했다)")
+    if al:
+        print(f"alias_suspect={any(al)}")
+    print("---8<---------------------")
 
     print(f"\n{'=' * 66}\n 다음\n{'=' * 66}")
     if solid:
