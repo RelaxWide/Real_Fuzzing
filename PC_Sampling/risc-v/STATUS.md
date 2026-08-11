@@ -220,6 +220,41 @@ J-Link       Plus, FW V13 / 소프트웨어 **V9.66** (V9.12 → 업그레이드
 > → `--pwr` (`.22`). **DP CTRL/STAT 쓰기뿐이고 타깃 버스엔 아무것도 안 쓴다.**
 > 되돌릴 수 있고 실기에 안전하다. 이것이 쓰기 승인 없이 할 수 있는 마지막 시험이다.
 
+> ### ★★★★★ `attach.cmm` 실물 — **순서가 핵심이었다** (사용자 제공)
+>
+> ```
+> IF (HCORE)
+> (
+>      sys.CONFIG.Slave off
+>      SYStem.Option.DAPSYSPWRUPREQ OFF
+>      SYStem.Option.DAPDBGPWRUPREQ ON
+>      sys.m prepare
+> )
+> ELSE
+> (
+>      sys.CONFIG.Slave on
+>      sys.m.prepare
+> )
+> ```
+> 사용자 증언: **"이게 없으면 debug port fail 이 발생하고 재시도하면 성공하는
+> 이슈가 있었고, prepare 전에 설정을 추가하는 방식으로 바뀐 것"**
+>
+> 여기서 세 가지가 나온다:
+>
+> 1. **순서.** 전원 요청 옵션이 `sys.m prepare` **앞**에 온다. 즉 디버그 포트가
+>    올라오는 그 순간부터 `CDBGPWRUPREQ` 만 걸려 있어야 한다.
+>    우리는 세션마다 무조건 `0x50000000`(둘 다)으로 올렸고, `--pwr`(`.22`)은
+>    그 **뒤에** 바꿨다 — **순서가 반대였다.** `--pwr` 은 이 점에서 무의미하다.
+> 2. **`sys.m prepare` = `SYStem.Mode Prepare`** — 디버그 포트만 올리고
+>    **CPU 에는 붙지 않는 모드**다. T32 의 attach 경로는 애초에 CPU connect 를
+>    하지 않는다. 우리는 매 세션 `jl.connect()` 를 불러왔다.
+>    ⇒ `connect` 실패를 블로커로 취급해온 것 자체가 과녁을 잘못 본 것일 수 있다.
+> 3. **`sys.CONFIG.Slave off/on`** — 전원 요청은 **마스터 세션(HCORE)만** 한다.
+>    우리는 단일 세션이므로 마스터에 해당한다 (`Slave off` 쪽이 맞다).
+>
+> ⇒ `--prepare` (`.23`): 전원요청을 **처음부터** DBG 만 걸고, `connect` 유무를
+> 교차한다 (2×2). 여전히 **DP CTRL/STAT 쓰기뿐**이고 타깃 버스엔 안 쓴다.
+
 **동작하는 설정 (pylink + exec_command, connect 前 주입):**
 ```
 SetcJTAGInitMode = 0

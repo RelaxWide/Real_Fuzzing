@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.22  --pwr: 전원요청 조합 x APB Prot 스윕"
+VERSION = "standalone 2026-08-11.23  --prepare: 전원요청을 **처음부터** + connect 생략"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -746,12 +746,18 @@ def session(a, idx):
                     jl.exec_command(c)
                 except Exception:
                     pass
-        try:
-            jl.connect(a.device, speed=spd)
-            out['connect'] = True
-        except Exception as e:
-            out['connect'] = False
-            out['connect_err'] = str(e)[:100]
+        # ★★ sys.m prepare = SYStem.Mode Prepare — **디버그 포트만 올리고
+        #   CPU 에는 붙지 않는다.** T32 의 attach 경로는 이 모드를 쓴다.
+        #   우리는 매번 connect 를 불러왔다. --no-connect 로 그걸 뺀다.
+        if getattr(a, 'no_connect', False):
+            out['connect'] = None
+        else:
+            try:
+                jl.connect(a.device, speed=spd)
+                out['connect'] = True
+            except Exception as e:
+                out['connect'] = False
+                out['connect_err'] = str(e)[:100]
 
         d = Dap(jl)
         try:
@@ -767,8 +773,17 @@ def session(a, idx):
         dpidr = d.dpr(0)
         out['DPIDR'] = hx(dpidr)          # ★ 관측 기록일 뿐 — 게이트가 아니다
         out['dpidr_version'] = (None if dpidr is None else (dpidr >> 12) & 0xF)
+        # ★★★ 순서가 핵심이다. attach.cmm 은 옵션을 **sys.m prepare 앞**에 건다:
+        #     SYStem.Option.DAPSYSPWRUPREQ OFF / DAPDBGPWRUPREQ ON
+        #     sys.m prepare
+        #   사용자 증언: "이게 없으면 debug port fail, 재시도하면 성공" —
+        #   즉 **전원 요청 조합과 그 시점**이 디버그 포트 성립을 좌우한다.
+        #   지금까지 우리는 여기서 무조건 0x50000000(둘 다)을 걸었고,
+        #   --pwr 은 그 뒤에 바꿨다 — 순서가 반대였다.
+        pwrreq = getattr(a, 'pwrreq', 0x50000000)
+        out['pwrreq'] = f"0x{pwrreq:08X}"
         d.dpw(DP_ABORT, 0x1E)
-        d.dpw(DP_CTRL, 0x50000000)
+        d.dpw(DP_CTRL, pwrreq)
         for _ in range(30):
             time.sleep(0.01)
             c = d.dpr(DP_CTRL)
@@ -850,6 +865,10 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--prepare', action='store_true',
+                    help='* sys.m prepare 재현: 전원요청을 처음부터 x connect 유무')
+    ap.add_argument('--pwrreq', type=lambda x: int(x, 0), default=0x50000000)
+    ap.add_argument('--no-connect', action='store_true')
     ap.add_argument('--pwr', action='store_true',
                     help='* 전원요청 조합(T32 는 DBG 만) x APB Prot 스윕. DP 쓰기만')
     ap.add_argument('--dmaddr', type=lambda x: int(x, 0), default=0x81480000)
@@ -926,6 +945,35 @@ def main():
     print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
+
+    if a.prepare:
+        print(f"\n{'=' * 70}\n [PREPARE] attach.cmm 의 순서를 그대로\n{'=' * 70}")
+        print("  T32:  DAPSYSPWRUPREQ OFF / DAPDBGPWRUPREQ ON  →  sys.m prepare")
+        print("  = 전원요청을 **처음부터** DBG 만. 그리고 prepare 는 CPU 에 안 붙는다.")
+        print("  지금까지 우리는 항상 둘 다(0x50000000) + connect 였다.")
+        print(f"  dmstatus 를 0x{a.dmaddr + 0x44:08X} 에서 읽는다. 유효 ver = 2 또는 3.")
+        print("  ★ DP CTRL/STAT 쓰기뿐 - 타깃 버스에 아무것도 안 쓴다.\n")
+        print("---8<---")
+        live = []
+        for req, rl in ((0x10000000, 'DBG만'), (0x50000000, 'DBG+SYS')):
+            for nc, cl in ((True, 'connect없음'), (False, 'connect함')):
+                a.pwrreq, a.no_connect, a.dm = req, nc, True
+                r = session(a, 0)
+                dm = next((x for x in r.get('dm', [])
+                           if x['how'] == '리터럴'), None)
+                st = (dm or {}).get('regs', {}).get('dmstatus')
+                ver = None
+                if st and st != '----':
+                    ver = int(st, 16) & 0xF
+                print(f"{rl:8s} {cl:11s} CTRL={(r.get('CTRL') or {}).get('raw')} "
+                      f"AP={r.get('ap_match')}/6 dmstatus={st} ver={ver}"
+                      + ("  *DM살아있음" if ver in (2, 3) else ""))
+                if ver in (2, 3):
+                    live.append(f"{rl}/{cl}")
+                time.sleep(0.3)
+        print("VERDICT:", f"DM_LIVE ({live[0]})" if live else "DM_ABSENT_ALL")
+        print("---8<---")
+        return 0 if live else 6
 
     if a.pwr:
         print(f"\n{'=' * 70}\n [PWR] 전원요청 조합 x APB Prot\n{'=' * 70}")
