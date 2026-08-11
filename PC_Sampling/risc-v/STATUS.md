@@ -18,91 +18,137 @@ halt/PC 샘플링은 **안 한다**(T32 도 그 방식이 아님이 확인됨).
 
 ---
 
-## 0.5 ★★★ 결론 (2026-08-11 종합) — **읽기 전용 조사 종료**
+## 0.5 ★★★ 결론 (2026-08-11 종합, feedback 반영 후)
 
-> 아래는 전부 **유효 세션**(AP IDR 6/6 일치)에서 잰 것이다.
-> 그 아래 절들에는 무효 세션·잘못된 게이트 위에서 쓴 낡은 서술이 남아 있다.
-> **충돌하면 이 절이 우선한다.**
+> 아래는 전부 **유효 세션**에서 잰 것이다. 그 아래 절들에는 무효 세션·잘못된
+> 게이트 위에서 쓴 낡은 서술이 남아 있다. **충돌하면 이 절이 우선한다.**
+>
+> ★ 확정 실험의 세션 게이트는 **AP IDR 6/6** 이다. 4/6 은 복구·탐색 진단
+> 전용이며 **최종 결론의 근거로 쓰지 않는다** (`--explore`).
 
-### 살아 있는 것
+### 성립하는 연결 계층
 
-| 계층 | 상태 | 근거 |
-|---|---|---|
-| cJTAG 물리 | ✅ | TIF=7, 10MHz. 링크 불안정 아님 |
-| DP | ✅ | `DPIDR=0x6BA0009D` 재현, `CTRL/STAT` 제어 가능 |
-| DAP 전원 | ✅ | `CDBG`·`CSYS` 양쪽 ACK. `0x30000000`(DBG만)도 만들 수 있다 |
-| AP 6개 | ✅ | **IDR 6/6 일치**. T32 선언 타입과 정확히 일치 |
-| AP 트랜잭션 | ✅ | TAR 되읽기 **5/5** (APBAP1·AXIAP1·AHBAP1) |
-| APBAP1/2 ROM | ✅ | `ARCHID=0x0AF7` = Class 9 ROM Table. `BASE=0x3` → ROM 은 주소 0 |
+```
+cJTAG 통신
+  → DAP 전원 ACK
+    → AP 6개 IDR (T32 선언 타입과 6/6 일치)
+      → APBAP1/2 Class 9 ROM Table (DEVARCH.ARCHID = 0x0AF7)
+        → ROM 엔트리가 0x81480000 / 0x81481000 컴포넌트를 지목
+          → **해당 컴포넌트에서 유효한 DM 응답을 얻지 못함**
+```
 
-### 죽어 있는 것
+`DPIDR` 자리의 `0x6BA0009D` 는 `VERSION=0` 이라 정상 ADIv6 DPIDR 로 해석할 수
+없다. **정체는 미결이고, 물리 TAP IDCODE 라고 재명명해서도 안 된다.**
+다만 AP 접근 성립은 **독립 근거**(IDR 6/6, CIDR preamble/class 일관성,
+`ARCHID=0x0AF7`, ROM 엔트리가 T32 `COREDEBUG.Base` 두 주소와 일치)로 인정한다.
 
-| | 관측 |
+```
+DP register 0 식별값        미해결
+DAP / AP register / APB ROM 접근   유효
+```
+
+### 관측 (해석 아님)
+
+| 대상 | 관측 |
 |---|---|
-| DM (`0x81480000`/`0x81481000`) | `dmstatus` = `0xEAFFFFFE` = **버스 기본값**. 응답 없음 |
-| APBAP1 주소공간 | 격자 20곳(`0x0`~`0xFD180000`) 중 **응답은 ROM 자신 1곳뿐** |
-| 트레이스 블록 (`0xFD000000`/`0xFD180000`) | 6개 AP 어디에서도 안 닿음 |
-| AXI 리셋/클럭 레지스터 (`0xC81024/28/2C/40/44`) | 전부 `0x00000000` — **AP 는 살아 있으므로 진짜 값** |
+| DM `0x81480000` / `0x81481000` | 현재 MEM-AP 경로에서 `dmstatus` 무응답 / `0xEAFFFFFE` 패턴 |
+| APBAP1 주소공간 | **시험한 20개 지점 중 ROM 만 의미 있는 응답** |
+| 트레이스 블록 `0xFD000000`/`0xFD180000` | 6개 AP 어디에서도 유효 응답 없음 |
+| AXI `0xC81024/28/2C/40/44` | 전부 `0x00000000` |
 | J-Link `connect` | `Could not find supported CPU` |
 
-### ★ 확정: **리셋/클럭 미해제**
+`0x00000001`/`0xEAFFFFFE` 는 **반복되는 미매핑 후보 패턴**이다. SoC 응답 사양
+없이 "default slave 확정" 이라고 쓰지 않는다.
 
-ROM 테이블은 DM 이 `0x81480000` 에 있다고 말하는데 그 버스는 무응답이다.
-ROM 은 **항상-켜짐 DAP 도메인**에 있고, 그것이 가리키는 모든 것은 게이트 뒤에 있다.
-`T32_SEARCH.md` §0 이 예측한 그림 그대로다:
-*"DP·DAP전원·AP 는 항상-켜짐 도메인이라 멀쩡하고, APB 너머만 죽는다."*
+`DM version 14` 는 이 패턴의 하위 니블이라는 산술은 맞다. 그러나 그것만으로
+컴포넌트의 **물리적 부재나 리셋 상태를 구분할 수 없다.** 말할 수 있는 것은
+*"현재 경로에서 유효한 `dmstatus` 를 얻지 못했다"* 까지다.
 
-그리고 T32 가 코어 enable 판정에 **실제로 읽는** 다섯 자리가 전부 `0` 이다.
-AXI-AP 가 TAR 되읽기 5/5 로 살아 있으므로 이 `0` 은 전달 실패가 아니라
-**버스가 준 값**이다 — 아무것도 enable/release 되지 않았다는 뜻이다.
+### ❌❌ 철회 — TAR 되읽기는 AXI 타깃 데이터 경로의 양성 대조가 아니다
 
-### ★★ "DM version 14" 의 정체
+TAR 는 MEM-AP 의 **내부 레지스터**다.
 
 ```
-0xEAFFFFFE & 0xF = 0xE = 14
-```
-J-Link 의 `Unsupported or invalid DM version 14 detected` 는 **default slave
-라인의 하위 니블**이다. 설정 문제가 아니라 **부재**다.
-⇒ DMI stride / hartsel / CoreBase / device 이름으로 세운 가설은 **전부 무관**하다.
+TAR write/readback 성공이 증명하는 것:
+  DP → AXI-AP register 접근, TAR 값 저장
 
-### 배제된 것 (전부 실측)
+증명하지 못하는 것:
+  AXI-AP → SoC AXI interconnect → 0xC810xx slave → 정상 data 반환
+```
+
+⇒ 다음 세 문장을 **철회**한다: `AXI_AP_ALIVE` / *"0 은 버스가 준 진짜 값"* /
+*"쓰기 후 되읽기로 검증할 사전조건이 갖춰짐"*.
+확인된 것은 AXI-AP 의 **레지스터 인터페이스**가 응답한다는 데까지다.
+진짜 양성 대조는 **기대값이 알려진 실제 read-only 타깃 레지스터**이며 아직 없다.
+(판정명 `AXI_AP_REGIF_OK` 로 변경)
+
+### ❌❌ 철회 — "리셋/클럭 미해제 확정"
+
+관측 패턴은 리셋/클럭/전원 게이트와 잘 맞지만, 다음을 **배제하지 못한다**:
+
+- 주소별 firewall 또는 debug authentication
+- T32 와 다른 access port / transaction attribute
+- RAZ 또는 default slave 가 **오류 없이** 0 을 반환
+- AP 에서는 안 보이고 **DM SBA 에서만** 보이는 주소 경로
+- 실제로 disabled 된 보조 코어의 **정상 상태값**
+
+Prot 8종에서 ROM 양성대조가 유지된 것은 *"시험한 Prot 변경이 DM 을 노출하지
+않았다"* 는 뜻이다. ROM 주소와 DM 주소에 **서로 다른 firewall/power 정책**이
+적용될 수 있으므로 security·isolation 전체를 배제하지 않는다.
+
+그리고 **T32 의 정상 `AttachOnly` 경로는 reset-release 루틴을 호출하지 않고
+타깃 레지스터 쓰기도 하지 않는다** — 이미 확인된 사실이다. 별도 복구/분석
+루틴의 reset 값을 정상 attach 의 필수 시퀀스로 취급할 근거가 없다.
+
+**⇒ 현재 결론은 `reset/clock 확정` 이 아니라 "현재 정보만으로 downstream DM
+미응답 원인을 더 구분할 수 없음" 이다.**
+
+### 배제된 것 (실측)
 
 | 가설 | 어떻게 배제됐나 |
 |---|---|
-| 링크 불안정 | AP IDR **6/6**. `LINK_UNSTABLE` 판정과 전원사이클·배선·케이블 권고 철회 |
 | `DPIDR=0x11013913` 을 못 찾는 게 문제 | **그 값은 관측된 적이 없다.** 코드 주석 전제가 상수로 굳은 것 |
-| DPIDR `VERSION=0` 이라 세션 무효 | 틀림. AP 6/6 이면 유효 세션이다. 폐기했던 측정들 복권 |
-| 전원 요청 조합(`DAPSYSPWRUPREQ OFF`) | `0x30000000` = T32 요구 상태를 **실제로 만들었는데** DM 없음 |
-| secure/privileged 접근 | Prot 8종, **양성대조 8/8** (ROM `CIDR0=0x0D` 유지). 전부 실패 |
-| DM 주소가 틀렸다 | `ARCHID=0x0AF7` 로 ROM 확정. 주소 후보 3종 전부 기본값 |
+| DPIDR `VERSION=0` 이라 AP 결과 전체 무효 | 범위 과대. AP 접근 성립은 독립 근거로 인정 |
+| 전원 요청 조합(`DAPSYSPWRUPREQ OFF`) | `0x30000000` = T32 요구 상태를 실제로 만들었는데 DM 무응답 |
+| 시험한 Prot 8종 | 양성대조 유지, 어느 것도 DM 미노출 (security **전체** 배제는 아님) |
+| DM 주소가 틀렸다 | `ARCHID=0x0AF7` 로 ROM 확정, 후보 3종 전부 무응답 |
 | `CoreBase` 선택 | `0x81480000`/`0x81481000` 결과 동일 |
 | AP 6개 등록이 방해 | 순서 통제 시 1개 3/6 = 6개 3/6 |
 
-### 남은 것 — **쓰기 승인이 필요한 단계**
+⚠ AP IDR 6/6 은 **그 시점의 AP 경로가 재현됐다는 증거**이지, cJTAG 링크가 모든
+조건에서 안정적이라는 일반 증명이 아니다.
 
-읽기 전용으로 할 수 있는 것은 끝났다. 다음은 T32 의 `Reset Release` 재현뿐이다:
+### 쓰기는 승인하지 않는다
 
-```
-Data.Set AXI:0xC81040 %LE %Long 0x13333     ; ALL MPCore Reset Release
-Data.Set AXI:0xC81044 %LE %Long 0x10001     ; NCore Reset Release
-Data.Set AXI:0xC81044 %LE %Long 0x10003     ;   (변형)
-Data.Set MD:0x0       ...      0x6F         ; RISC-V `j .` — 코어를 제자리 루프에
-```
+`AXI:0xC81040/44` reset-control write 와 `MD:0x0 ← 0x6F` 는 **정상 attach 에
+필요하다는 근거가 없고** 실기 NVMe 상태를 손상할 수 있다.
+다음이 **전부** 갖춰진 별도 실험에서만 재검토한다:
+설계 담당자의 시퀀스 확인 / 희생 가능한 장치 / 전원 사이클·재플래시 복구 절차 /
+데이터 손실 허용.
 
-**⚠ 이 장치는 실기 NVMe SSD 다.** 위 쓰기는 다음 없이는 수행하지 않는다:
-1. 사용자의 **명시적 승인**
-2. **복구 절차** (전원 사이클로 원복되는지, 펌웨어 재기록 수단이 있는지)
-3. **데이터 손실 허용** 확인 — 리셋 해제는 동작 중인 컨트롤러를 건드린다
+### 남은 안전한 작업
 
-사전 조건은 갖춰졌다: AXI-AP 가 살아 있으므로 **쓰기 후 되읽기로 검증할 수 있다.**
+1. 확정 측정은 **AP IDR 6/6 + DP/AP 오류 없음 + 3개 독립 세션 일치**를 모두 요구
+2. `0x6BA0009D` 의 정체를 **raw JTAG/cJTAG IDCODE scan 과 DPACC read 를 분리**해
+   확인한다. AP 유효성 판단과 식별값 해석을 섞지 않는다
+3. `DPIDR1`/`BASEPTR0`/`BASEPTR1` 은 현재 pylink bank 경로가 아니라 검증 가능한
+   raw DPACC 또는 다른 공식 API 가 있을 때 read-only 로 재시도
+4. **AXI 타깃 데이터 경로의 양성 대조** — 기대값이 알려진 실제 read-only 타깃
+   레지스터로. **TAR 는 쓰지 않는다**
+5. T32 의 `AXI:` 가 `AXIAP1(DP:0x30000)` 인지 확인 + T32 에서 그 다섯 주소가
+   실제로 어떤 값을 반환하는지 확보
+6. Class 9 ROM 의 `DEVID`/`PIDR` 와 엔트리 속성에 power-domain 정보가 있는지
+   공식 CoreSight 규칙과 대조
 
-### 쓰기 전에 아직 남은 무료 정보 (T32 스크립트 검색)
+### 읽기 전용 조사의 진짜 종료 조건
 
-`T32_SEARCH.md` 참조. 특히:
-- `SYStem.CONFIG.AXIACCESSPORT` — T32 의 `AXI:` 가 **어느 AP** 인지.
-  우리는 `AXIAP1`(`DP:0x30000`)로 가정 중이고 검증한 적 없다
-- `Reset Release` 서브루틴의 **호출 순서와 조건** — 우리가 본 건 값뿐이다
-- `Data.LOAD` — 트레이스 디코더의 하드 의존인 펌웨어 ELF 경로
+1. AP IDR 6/6 및 엄격한 전송 판정이 **3세션**에서 재현
+2. 실제 AXI 타깃 양성대조를 확보 못 하거나, 확보했는데도 DM 계속 무응답
+3. raw DP discovery 에서도 추가 토폴로지 없음
+4. T32 실측과 SoC register/power/security 사양을 확보할 수 없음
+
+이 넷이 다 되면 결론은 **"현재 정보만으로 원인을 더 구분할 수 없음"** 이고,
+다음 단계는 SoC/T32 정보 확보 또는 **복구 가능한 별도 실험 장치** 준비다.
 
 ---
 
@@ -1166,7 +1212,8 @@ SetcJTAGInitMode
 
 **우리는 브링업 내내 `0` 을 썼다.** SiFive 타깃에 필요한 건 `1` 이다.
 
-우리가 직접 한 DP 읽기(`DPIDR=0x11013913`)는 됐는데 J-Link 의 스캔은 깨진 것도
+우리가 직접 한 DP 읽기(~~`DPIDR=0x11013913`~~ → **철회, §0.5**. 실측은
+`0x6BA0009D` 이고 정체 미결)는 됐는데 J-Link 의 스캔은 깨진 것도
 설명된다 — 우리 경로는 `perform_tif_init=False` 로 **재초기화를 건너뛰었다.**
 
 > `device` 도 **`E76`** 이어야 한다. `RISC-V` 로는 connect 자체가 제대로 안 된다.
@@ -1273,7 +1320,8 @@ if not self.target_connected(): raise JLinkException('Target is not connected.')
 pylink 에서 `coresight_configure`=`@open_required`,
 `coresight_read/write`=`@coresight_configuration_required` — **셋 다
 `target_connected` 를 요구하지 않는다.** 그래서 아래는 살아남는다:
-- `DPIDR=0x11013913` (SiFive, DPv3/ADIv6)
+- ~~`DPIDR=0x11013913` (SiFive, DPv3/ADIv6)~~ ❌ **철회** — 관측된 적 없음.
+  실측은 `0x6BA0009D`(VERSION=0, 정체 미결). §0.5 참조
 - DAP 전원 `CDBGPWRUPACK`+`CSYSPWRUPACK` 둘 다
 - **AP 6개 IDR 이 T32 선언과 6/6 일치**
 - `CSW.DeviceEn=1`, AP 레지스터 R/W
@@ -1570,6 +1618,16 @@ ASIZE=29  ERRMODE=True  BASE_VALID=True  BASEPTR=0x6BA0009D6BA00000
 **고쳤다:** 세션이 무효면 discovery 를 **시도조차 안 하고**, 네 뱅크가 전부
 같으면 **`DISCOVERY 무효`** 로 표시하며 파생값을 계산하지 않는다.
 (세 시나리오로 검증)
+
+> ## ❌❌❌ 아래 구간 전체 철회 (2026-08-11) — **§0.5 우선**
+>
+> 이 아래로 이어지는 `--recover` / `--link` / TAP 선언값 / "찾는 값 `0x11013913`"
+> 서술은 **존재하지 않는 기대값에 합격 기준을 걸고 쓴 것**이다.
+> `0x11013913` 은 저장소 어디에도 측정 기록이 없다(§1.1 철회 참조).
+> 따라서 그 구간의 `NOT_FOUND` / `LINK_UNSTABLE` 판정과 거기서 파생된
+> "링크 불안정 / 전원 사이클 / 배선·케이블" 권고는 **전부 무효**다.
+> 실제 상태는 §0.5 를 보라 — AP IDR **6/6** 으로 링크·AP 는 성립한다.
+> 이 구간은 방법론 기록으로만 남긴다.
 
 ### ❌ TAP 선언값 둘 다 실패 (2026-08-11)
 
@@ -2400,7 +2458,7 @@ J-Link 은 한 번에 한 hart 가 기본이다. 4-source 의 SRC 구분과 공�
 
 | | | |
 |---|---|---|
-| 1a | cJTAG / DP 통신 | ✅ `DPIDR=0x11013913` |
+| 1a | cJTAG / DP 통신 | ✅ 성립. 단 DP reg0 = `0x6BA0009D`(VERSION=0) **정체 미결** — `0x11013913` 은 철회 |
 | 1b | DAP 전원 | ✅ 디버그·시스템 양쪽 ACK |
 | 1c | AP 열거·식별 | ✅ IDR 6/6 이 T32 선언과 일치 |
 | 1d | **TAP 인식** | ✅ 수동 체인 선언으로 통과 (`AllowTAPReset=1`) |
@@ -2493,8 +2551,9 @@ AXI:0x00C81024 / 28 / 2C / 40 / 44 의 정상값
 
 ## 8. 한 줄 요약
 
-**DAP·AP·ROM 테이블까지 전부 살아 있고(AP IDR 6/6, TAR 되읽기 5/5), ROM 은 DM 이
-`0x81480000` 에 있다고 말하는데 그 버스는 무응답이다. APBAP1 주소공간 전체가
-ROM 하나 빼고 죽어 있고, T32 가 읽는 리셋/클럭 레지스터는 전부 0 이다.
-⇒ 리셋/클럭 미해제. 읽기 전용 조사는 끝났고, 다음은 실기 NVMe 에 대한
-쓰기(`AXI:0xC81040/44`)이므로 사용자 승인·복구 절차·데이터 손실 허용이 먼저다.**
+**cJTAG→DAP→AP 6개→APBAP1/2 Class 9 ROM Table 까지는 성립하고(IDR 6/6,
+ARCHID=0x0AF7), ROM 이 지목한 DM 컴포넌트에서 유효한 `dmstatus` 를 얻지 못한다.
+원인은 power/reset/clock, security/firewall/isolation, T32 와 다른 access path
+셋이 모두 열려 있고 **현재 정보로는 더 구분할 수 없다.** 실기 NVMe 에 대한
+reset-control 쓰기는 정상 attach 에 필요하다는 근거가 없어 승인하지 않는다 —
+희생 가능한 장치와 복구 절차가 갖춰진 별도 실험에서만 재검토한다.**

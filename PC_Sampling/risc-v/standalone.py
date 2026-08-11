@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.29  --axi: AXI-AP 가 살아있나 (TAR 되읽기 대조)"
+VERSION = "standalone 2026-08-11.30  TAR 대조 철회 + 확정게이트 6/6 (feedback)"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -98,7 +98,10 @@ VERSION = "standalone 2026-08-11.29  --axi: AXI-AP 가 살아있나 (TAR 되읽�
 EXPECT_DPIDR = 0x11013913          # 출처 불명 — 게이트 아님, 표시용으로만 둔다
 EXPECT_AP_IDR = {0x10000: 0x09130006, 0x20000: 0x09130006, 0x30000: 0x09130004,
                  0x40000: 0x09130001, 0x50000: 0x09130006, 0x60000: 0x09130006}
-AP_GATE_MIN = 4                    # 6개 중 몇 개가 맞아야 유효 세션으로 보는가
+# ★★ feedback 반영: 확정 실험의 세션 게이트는 **6/6** 이다.
+#   4/6 은 복구·탐색 진단에만 쓰고 **최종 결론의 근거로 쓰지 않는다.**
+AP_GATE_MIN = 6                    # 확정용
+AP_GATE_EXPLORE = 4                # --explore 시 완화 (탐색 전용, 결론 근거 아님)
 
 
 def ap_idr_match(d):
@@ -676,9 +679,18 @@ SCAN_ADDRS = [0x0, 0x1000, 0x2000, 0x10000, 0x100000, 0x1000000,
 #   ★ (b) 라면 0xC81040 에 써봐야 **검증조차 못 한다.** 실기 장치에 쓰기를
 #     제안하면서 결과를 못 읽는다는 건 말이 안 된다. 먼저 가른다.
 #
-#   양성 대조: **TAR 되읽기.** TAR 는 AP 레지스터이므로 쓰고 되읽어도
-#   타깃 버스에는 아무것도 안 쓴다. 되읽기가 맞으면 AP 는 살아 있고,
-#   그때의 0 은 **버스가 준 진짜 값**이다.
+#   ❌❌ 2026-08-11 철회 (feedback). **TAR 되읽기는 양성 대조가 아니다.**
+#     TAR 는 MEM-AP 의 **내부 레지스터**다. 쓰고 되읽는 것이 증명하는 범위:
+#         DP -> AXI-AP 레지스터 접근, TAR 값 저장                    (여기까지)
+#     증명하지 못하는 것:
+#         AXI-AP -> SoC 인터커넥트 -> 0xC810xx 슬레이브 -> 데이터 반환
+#     Arm 도 target address 설정 / data access / read-data 회수를 별도
+#     단계로 구분한다. TAR 되읽기는 **타깃 트랜잭션을 발생시키지 않는다.**
+#     ⇒ "AXI_AP_ALIVE", "0 은 버스가 준 진짜 값", "쓰기 후 되읽기로 검증 가능"
+#       세 문장 모두 철회한다.
+#     진짜 양성 대조는 **기대값이 알려진 실제 read-only 타깃 레지스터**다.
+#     아직 확보하지 못했다.
+#   이 모드가 지금 말할 수 있는 것은 AP **레지스터 인터페이스**가 응답한다까지다.
 TAR_PATTERNS = [0xC8104000, 0x00C81040, 0xDEADBEE0, 0x12345670, 0x00000000]
 
 
@@ -978,7 +990,8 @@ def session(a, idx):
         hit, idrs = ap_idr_match(d)
         out['ap_match'] = hit
         out['ap_idrs'] = {f"0x{b:X}": hx(v) for b, v in idrs.items()}
-        need = 1 if a.loose else AP_GATE_MIN
+        need = (1 if a.loose else
+                AP_GATE_EXPLORE if getattr(a, 'explore', False) else AP_GATE_MIN)
         out['ok'] = bool(out['CTRL'].get('CDBGACK')) and hit >= need
 
         if getattr(a, 'discover', False):
@@ -1060,6 +1073,9 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--explore', action='store_true',
+                    help='세션 게이트를 %d/6 으로 완화. 탐색 전용 — 결론 근거로 쓰지 말 것'
+                         % AP_GATE_EXPLORE)
     ap.add_argument('--axi', action='store_true',
                     help='* AXI-AP 가 데이터를 전달하나. TAR 되읽기 양성대조')
     ap.add_argument('--ident', action='store_true',
@@ -1165,12 +1181,18 @@ def main():
         for r in r0.get('axi', {}).get('aps', []):
             rv = ",".join(f"{k}={v}" for k, v in r['reads'].items())
             ok = r['tar_n'] and r['tar_ok'] == r['tar_n']
+            # ★ TAR 되읽기로는 AXIAP1 을 '살아있다' 고 판정하지 않는다 (아래 주석)
             if ok and r['ap'] == 'AXIAP1':
                 healthy.append(r['ap'])
             print(f"{r['ap']} IDR={r['IDR']} CFG={r['CFG']} "
                   f"TAR되읽기={r['tar_ok']}/{r['tar_n']}{'(정상)' if ok else '(불일치)'}")
             print(f"  {rv}")
-        print("VERDICT:", "AXI_AP_ALIVE" if healthy else "AXI_AP_NOT_DELIVERING")
+        print("★ TAR 되읽기는 **AP 레지스터 인터페이스**만 증명한다.")
+        print("  AXI-AP -> 인터커넥트 -> 슬레이브 -> 데이터 반환 은 증명하지 못한다.")
+        print("  ⇒ 위 0 들이 '버스가 준 진짜 값' 이라고 말할 수 없다.")
+        print("    타깃 데이터 경로의 양성대조는 **기대값이 알려진 실제 read-only")
+        print("    타깃 레지스터** 여야 한다. 아직 없다.")
+        print("VERDICT:", "AXI_AP_REGIF_OK" if healthy else "AXI_AP_REGIF_FAIL")
         print("---8<---")
         return 0 if healthy else 6
 

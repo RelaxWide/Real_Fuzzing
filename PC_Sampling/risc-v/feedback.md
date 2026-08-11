@@ -5,6 +5,176 @@
 > 목적: 현재 접근 방향이 맞는지 검토하고, 다음 작업자가 바로 이어서 판단할 수 있도록
 > 실측 사실과 권장 순서를 분리해 기록한다.
 
+## 최신 종합 재검토 — 2026-08-11: AP/ROM은 유효, 원인은 아직 미확정
+
+> 이 절이 아래의 모든 과거 피드백보다 우선한다. 최신 STATUS와 코드를 다시
+> 대조하면서 이전 피드백의 범위도 함께 정정했다. 현재 증거는 DAP/AP/ROM 접근과
+> DM 미응답까지는 강하게 지지하지만, 그 원인을 reset/clock으로 확정하거나
+> reset-control write로 넘어가는 것은 지지하지 않는다.
+
+### 1. Critical issues
+
+#### 이전 피드백 정정: `0x6BA0009D` 때문에 AP 결과 전체가 무효인 것은 아니다
+
+`coresight_read(0, ap=False)`의 반환값 `0x6BA0009D`는 DPIDR로 보면
+`VERSION=0`이라 정상적인 ADIv6 DPIDR로 해석할 수 없다. 그 정체는 여전히
+미결이며, 물리 TAP IDCODE라고 재명명해서도 안 된다.
+
+그러나 이전 피드백은 여기서 **그 세션의 AP 결과 전체도 무효**라고 범위를 너무
+넓혔다. 최신 재현에서는 독립적인 다음 증거가 있다.
+
+- AP IDR 6개가 T32 선언 타입과 6/6 일치
+- APBAP1/2의 CIDR preamble과 class가 일관됨
+- `DEVARCH.ARCHID=0x0AF7`로 Class 9 ROM Table 식별
+- ROM 엔트리가 T32 `COREDEBUG.Base` 두 주소와 정확히 일치
+
+따라서 `0x6BA0009D`의 정체가 미결이어도 **DAP→AP register→APB ROM 접근이
+성립한다는 결과는 별도 근거로 인정할 수 있다.** 올바른 표현은 다음이다.
+
+```text
+DP register 0 식별값        미해결 (`0x6BA0009D`, 정상 DPIDR로는 해석 불가)
+DAP/AP/ROM transaction      유효 (AP IDR 6/6 + ROM architecture identity)
+```
+
+다만 확정 실험의 세션 게이트는 4/6이 아니라 **6/6**으로 둔다. 4/6은 복구·탐색
+진단에만 쓰고 최종 결론의 근거로 사용하지 않는다.
+
+#### TAR readback은 AXI target data path의 양성 대조가 아니다
+
+현재 `standalone.py --axi`는 TAR에 5개 패턴을 쓰고 되읽은 뒤 AXI-AP가 target
+data를 전달할 수 있다고 판정한다. 하지만 TAR는 MEM-AP 내부 레지스터다.
+
+```text
+TAR write/readback 성공이 증명하는 것:
+  DP → AXI-AP register 접근, TAR 값 저장
+
+증명하지 못하는 것:
+  AXI-AP → SoC AXI interconnect → 0xC810xx slave → 정상 data 반환
+```
+
+Arm의 DAP 설명도 target address 설정, data access, read-data retrieval을 별도
+단계로 구분한다. TAR readback은 target data access를 발생시키지 않는다.
+
+공식 참고:
+`https://developer.arm.com/community/arm-community-blogs/b/architectures-and-processors-blog/posts/how-to-debug-coresight-basics-part-2`
+
+따라서 다음 코드/문서 표현은 철회한다.
+
+```text
+TAR 되읽기 5/5 → AXI_AP_ALIVE
+AXI-AP가 살아 있으므로 0은 버스가 준 진짜 값
+쓰기 후 되읽기로 검증할 사전조건이 갖춰짐
+```
+
+확인된 것은 AXI-AP의 **register interface**가 응답한다는 데까지다. 실제 AXI
+target transaction의 positive control은 아직 없다.
+
+#### `reset/clock 미해제 확정`은 증거보다 강하다
+
+현재 관측은 다음이다.
+
+```text
+ROM table                    접근됨
+ROM이 지목한 DM component    현재 MEM-AP 경로에서 무응답/default pattern
+AXI 0xC81024/28/2C/40/44     모두 0
+```
+
+이 패턴은 reset/clock/power gate와 잘 맞지만 다음 원인도 배제하지 못한다.
+
+- 주소별 firewall 또는 debug authentication
+- T32와 다른 access port/transaction attribute
+- RAZ 또는 default slave가 오류 없이 0을 반환
+- AP에서는 안 보이고 DM SBA에서만 보이는 주소 경로
+- 실제로 disabled된 보조 코어의 정상 상태값
+
+Prot 8종에서 ROM positive control이 유지된 것은 **시험한 Prot 변경이 DM을
+노출하지 않았다**는 뜻이다. ROM 주소와 DM 주소에 서로 다른 firewall/power
+정책이 적용될 수 있으므로 security·isolation 전체를 배제하지 않는다.
+
+또한 T32 정상 `AttachOnly` 경로가 reset-release 루틴을 호출하지 않고 target
+register write도 수행하지 않는다는 사실을 이미 확인했다. 별도 복구/분석 루틴의
+reset 값을 정상 attach 필수 시퀀스로 취급할 근거가 없다.
+
+### 2. Potential bugs / 문서 과장
+
+- `APBAP1 주소공간 전체가 죽었다`는 표현은 성긴 20개 주소 스캔보다 강하다.
+  `시험한 20개 지점 중 ROM만 의미 있는 응답`이라고 기록한다.
+- `0x00000001/0xEAFFFFFE` 패턴은 default-slave 응답으로 보이는 강한 정황이지만
+  SoC 응답 사양 없이 정체를 확정하지 않는다. `반복되는 미매핑 후보 패턴`이
+  안전한 표현이다.
+- `DM version 14`가 이 패턴의 low nibble이라는 산술은 맞지만, 그것만으로
+  component의 물리적 부재나 reset 상태를 구분할 수 없다. 현재 경로에서 유효한
+  `dmstatus`를 얻지 못했다는 뜻으로 제한한다.
+- AP IDR 일치 6/6은 그 시점의 AP 경로가 재현됐다는 강한 증거이지, cJTAG 링크가
+  모든 조건에서 안정적이라는 일반 증명은 아니다.
+- `DPIDR1/BASEPTR0/1`이 모두 같은 값이 나온 시험은 discovery 결과가 아니라
+  현재 pylink DPBANKSEL 경로가 성립하지 않은 결과다. `추가 토폴로지 없음`으로
+  집계하지 않는다.
+- STATUS 후반 마일스톤에는 아직 `DPIDR=0x11013913` 확정 등 철회된 문장이 남아
+  있다. 상단 우선 규칙이 있어도 다음 작업자가 오독할 수 있으므로 정리해야 한다.
+
+### 3. Reliability improvements / 현재의 정확한 상태
+
+지금까지 강하게 인정할 수 있는 연결 계층은 다음이다.
+
+```text
+cJTAG 통신
+  → DAP 전원 ACK
+    → AP 6개 IDR
+      → APBAP1/2 Class 9 ROM Table
+        → ROM entry가 0x81480000/0x81481000 component 지목
+          → 해당 component에서 유효한 DM 응답을 얻지 못함
+```
+
+원인은 다음 후보가 열린 상태다.
+
+```text
+power / reset / clock
+security / firewall / isolation
+MEM-AP transaction attribute 또는 T32와 다른 access path
+```
+
+reset write 전에 남은 안전한 작업은 다음이다.
+
+1. 확정 측정은 AP IDR **6/6**, DP/AP 오류 없음, 3개 독립 세션 일치를 모두 요구한다.
+2. `0x6BA0009D`의 정체는 raw JTAG/cJTAG IDCODE scan과 DPACC register read를
+   분리해 확인한다. AP 유효성 판단과 식별값 해석을 섞지 않는다.
+3. `DPIDR1/BASEPTR0/1`은 current pylink bank access가 아니라 검증 가능한 raw
+   DPACC 또는 다른 공식 API가 있을 때 read-only로 재시도한다.
+4. AXI target data path는 정상 기대값이 알려진 **실제 read-only target
+   register**로 positive control을 확보한다. TAR는 사용하지 않는다.
+5. T32의 `AXI:`가 `AXIAP1(DP:0x30000)`을 의미하는지와, 실제 T32에서 다섯
+   주소가 어떤 값을 반환하는지 확보한다.
+6. Class 9 ROM의 `DEVID/PIDR`와 엔트리 속성 중 power-domain 관련 정보가 있는지
+   공식 CoreSight 규칙과 대조한다.
+
+### 4. Suggested tests와 중단 조건
+
+다음 결과가 있어야 AXI 경로를 정상으로 인정한다.
+
+| 시험 | 인정 기준 |
+|---|---|
+| AXI-AP IDR/CSW/TAR | AP register interface만 확인 |
+| 실제 AXI read-only target register | 사양 또는 T32 기댓값과 일치해야 target data path 확인 |
+| DM candidate read | `dmstatus.version`이 유효해야 DM 도달 확인 |
+| raw IDCODE/DPACC | 서로 다른 명령으로 identity와 DPIDR를 분리 확인 |
+
+읽기 전용 원인 규명은 다음을 모두 만족할 때 종료할 수 있다.
+
+1. AP IDR 6/6 및 엄격한 전송 판정이 3세션에서 재현됨
+2. 실제 AXI target positive control을 확보하지 못하거나, 확보했지만 DM은 계속 미응답
+3. raw DP discovery 경로에서도 추가 토폴로지를 얻지 못함
+4. T32 실측과 SoC register/power/security 사양을 확보할 수 없음
+
+이 상태가 되면 결론은 `reset/clock 확정`이 아니라 **현재 정보만으로 downstream
+DM 미응답 원인을 더 구분할 수 없음**이다. 다음 단계는 SoC/T32 정보 확보 또는
+복구 가능한 별도 실험 장치 준비다.
+
+`AXI:0xC81040/44` reset-control write와 `MD:0x0 ← 0x6F`는 정상 attach에 필요하다는
+근거가 없고 실기 NVMe 상태를 손상할 수 있으므로 다음 단계로 승인하지 않는다.
+설계 담당자의 시퀀스 확인, 희생 가능한 장치, 전원 사이클·재플래시 복구 절차,
+데이터 손실 허용이 모두 갖춰진 별도 실험에서만 다시 검토한다.
+
 ## 최우선 정정 — 2026-08-11: `0x6BA0009D` 세션은 유효 DPIDR 세션이 아니다
 
 > 이 절이 아래의 모든 DPIDR·AXI·APBAP3·자력 탐색 종료 판단보다 우선한다.
