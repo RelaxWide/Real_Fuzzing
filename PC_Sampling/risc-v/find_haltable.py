@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-from sfe76_link import (Link, LinkError, CORE_BASE_MAIN, CORE_BASE_NCORE,
+from sfe76_link import (require_api, Link, LinkError, CORE_BASE_MAIN, CORE_BASE_NCORE,
                         CORE_BASE_LABEL, DEVICE, CONNECT_TRIES,
                         EXIT_OK, EXIT_HALT_FAIL)
 
@@ -94,6 +94,7 @@ def spawn(core_base, hart, apb, a):
 
 
 def main():
+    require_api(2, "find_haltable.py")
     ap = argparse.ArgumentParser()
     ap.add_argument('--core-bases', default=f"{hex(CORE_BASE_NCORE)},{hex(CORE_BASE_MAIN)}",
                     help='콤마 구분. 기본: Ncore 먼저(단순), 그다음 4코어 DM')

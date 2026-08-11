@@ -56,7 +56,7 @@ import argparse
 import sys
 import time
 
-from sfe76_link import (Link, LinkError, AP_MAP, add_common_args,
+from sfe76_link import (require_api, Link, LinkError, AP_MAP, add_common_args,
                         EXIT_OK, EXIT_INSUFFICIENT)
 
 VERSION = "2026-08-10.1"
@@ -506,6 +506,7 @@ def one_session(a):
 
 
 def main():
+    require_api(3, "probe_ap_raw.py")
     ap = add_common_args(argparse.ArgumentParser())
     ap.add_argument('--dm', type=lambda x: int(x, 0), default=None,
                     help='DM base (예: 0x81480000). 주면 AP 를 통해 DM 을 읽는다')

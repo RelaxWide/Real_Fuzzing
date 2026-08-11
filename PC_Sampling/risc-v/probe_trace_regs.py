@@ -48,7 +48,7 @@
 import argparse
 import sys
 
-from sfe76_link import (Link, LinkError, AP_MAP, add_common_args,
+from sfe76_link import (require_api, Link, LinkError, AP_MAP, add_common_args,
                         EXIT_OK, EXIT_INSUFFICIENT)
 
 VERSION = "2026-08-10.1"
@@ -126,6 +126,7 @@ def path_coresight(lk, ap_addr, addrs, csw):
 
 # ══════════════════════════════════════════════════════════════════
 def main():
+    require_api(2, "probe_trace_regs.py")
     ap = add_common_args(argparse.ArgumentParser())
     ap.add_argument('--read-data', action='store_true',
                     help='ETB+0x24 도 읽는다 (★ 읽기 포인터가 전진해 데이터를 소비)')

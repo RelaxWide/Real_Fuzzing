@@ -59,7 +59,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-from sfe76_link import (TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE, AP_MAP,
+from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, DEVICE, AP_MAP,
                         APB_INDEX, CORE_BASE_NCORE, EXIT_OK, EXIT_INSUFFICIENT)
 
 VERSION = "2026-08-10.2  전원요청 분리 (attach.cmm DAPSYSPWRUPREQ OFF)"
@@ -287,6 +287,7 @@ def ap_count_test(device, reps, tries):
 
 
 def main():
+    require_api(2, "probe_dap.py")
     ap = argparse.ArgumentParser()
     ap.add_argument('--device', default=DEVICE)
     ap.add_argument('--no-connect', action='store_true',

@@ -59,7 +59,7 @@ import time
 
 import pylink
 
-from sfe76_link import TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, AP_MAP, EXIT_OK, EXIT_INSUFFICIENT
+from sfe76_link import require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE, AP_MAP, EXIT_OK, EXIT_INSUFFICIENT
 
 VERSION = "2026-08-10.1"
 
@@ -214,6 +214,7 @@ def mode_sweep(a):
 
 
 def main():
+    require_api(2, "find_dm.py")
     ap = argparse.ArgumentParser()
     ap.add_argument('--devices', action='store_true', help='[A] 장치명 모드')
     ap.add_argument('--sweep', action='store_true', help='[B] 전수 모드')

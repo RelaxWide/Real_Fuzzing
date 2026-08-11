@@ -89,7 +89,31 @@ except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square\n"
              "  (venv 가 아니라 시스템 python3 에 있을 수 있다)")
 
-VERSION = "2026-08-07.2  checked API"
+VERSION = "2026-08-11.1  open_dap / dap_power / ap_count"
+
+# ★ 파일 버전 스큐 감지용. 기능을 추가할 때마다 올린다.
+#   도구들이 시작할 때 이 값을 확인해서, 오래된 sfe76_link.py 를 쓰면
+#   AttributeError 대신 **무엇을 해야 하는지** 알려준다.
+#   실제로 두 번 겪었다: --ap-count 없음, open_dap 없음. 둘 다 pull 누락.
+API_LEVEL = 3
+#   1: checked API (connect_checked/halt_checked/read_pc/resume_checked)
+#   2: + ap_count, CORE_HART, DMI_STRIDE_SHIFT, add_common_args --ap-count
+#   3: + open_dap(전원만 요구), dap_power(전원 직접 요청)
+
+
+def require_api(level, tool=""):
+    """도구 시작점에서 호출한다. 버전이 낮으면 명확히 알려주고 종료한다."""
+    if API_LEVEL >= level:
+        return
+    import sys as _s
+    print(f"\n{'!' * 64}")
+    print(f" sfe76_link.py 가 오래됐다 — {tool or '이 도구'} 는 API_LEVEL {level} 이 필요한데")
+    print(f" 지금 파일은 {API_LEVEL} 이다. **저장소를 받아오지 않았다.**")
+    print(f"\n   cd {__file__.rsplit('/', 1)[0]}")
+    print("   git pull")
+    print("   grep -n 'API_LEVEL' sfe76_link.py     # 값이 올라갔는지 확인")
+    print(f"{'!' * 64}\n")
+    _s.exit(6)
 
 # ── 연결 파라미터 (전부 실측값) ──────────────────────────────────────
 TIF_CJTAG   = 7          # cJTAG. pylink enum 에 없어 정수로 지정

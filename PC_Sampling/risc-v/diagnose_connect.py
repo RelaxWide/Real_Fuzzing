@@ -36,7 +36,7 @@ import subprocess
 import sys
 import time
 
-from sfe76_link import (Link, LinkError, CORE_BASE_NCORE, add_common_args,
+from sfe76_link import (require_api, Link, LinkError, CORE_BASE_NCORE, add_common_args,
                         EXIT_OK, EXIT_CONNECT_FAIL)
 
 VERSION = "2026-08-07.6  프로세스 격리"
@@ -138,6 +138,7 @@ def exp_f(a, nharts=5):
 
 
 def main():
+    require_api(2, "diagnose_connect.py")
     ap = add_common_args(argparse.ArgumentParser())
     ap.add_argument('--only', choices=['D', 'E', 'F'])
     ap.add_argument('--devices', default="RISC-V,RV32,RV32IMAC,SiFive-E76,E76",

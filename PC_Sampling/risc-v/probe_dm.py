@@ -55,7 +55,7 @@ import argparse
 import sys
 import time
 
-from sfe76_link import (Link, LinkError,
+from sfe76_link import (require_api, Link, LinkError,
                         CORE_BASE_LABEL, add_common_args, EXIT_OK, EXIT_INSUFFICIENT)
 
 VERSION = "2026-08-10.1"
@@ -166,6 +166,7 @@ def one_session(a, base, shifts):
 
 
 def main():
+    require_api(2, "probe_dm.py")
     ap = add_common_args(argparse.ArgumentParser())
     ap.add_argument('--shifts', default="2,0", help='시도할 매핑 stride (콤마)')
     ap.add_argument('--sessions', type=int, default=5,

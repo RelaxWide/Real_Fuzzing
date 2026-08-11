@@ -34,7 +34,7 @@ import json
 import sys
 import time
 
-from sfe76_link import (Link, LinkError, CORE_BASE_LABEL, add_common_args,
+from sfe76_link import (require_api, Link, LinkError, CORE_BASE_LABEL, add_common_args,
                         EXIT_OK, EXIT_PC_FAIL, EXIT_INSUFFICIENT, EXIT_RESUME_FAIL)
 
 VERSION = "2026-08-07.3  checked G2/G3/G4"
@@ -137,6 +137,7 @@ def sample_pc(lk, pc_index, n, settle_ms):
 
 # ══════════════════════════════════════════════════════════════════
 def main():
+    require_api(2, "verify_halt_pc.py")
     ap = add_common_args(argparse.ArgumentParser())
     ap.add_argument('--scan-registers', action='store_true',
                     help='PC 후보 조사만 하고 끝낸다 (샘플링 안 함)')
