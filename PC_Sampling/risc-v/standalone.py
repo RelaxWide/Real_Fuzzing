@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.17  게이트를 DPIDR → AP IDR 일치로 교체"
+VERSION = "standalone 2026-08-11.18  --replay: 기록된 성공 설정 그대로 재생"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -434,6 +434,80 @@ def _val_of(reads, addr):
         return None
 
 
+# ★★★ --replay: 저장소가 기록한 **실제 성공 설정**의 글자 그대로 재생.
+#
+#   f45f0ca "J-Link connect 성공 — 최대 관문 통과" (Aug 8) 커밋 메시지:
+#       SetcJTAGInitMode = 0 / TIF=7(cJTAG) / speed=10000
+#       CORESIGHT_AddAP Index=0..5
+#       CORESIGHT_SetIndexAPBAPToUse = 0
+#       CORESIGHT_SetCoreBaseAddr    = 0x81481000     ← 0x81480000 아님
+#       connect('RISC-V')
+#   917bacf (Aug 8) 같은 시기 실측:
+#       DP 통신 OK (DPIDR 0x6BA0009D) / CTRL/STAT 0xF0000000
+#   caf874e: 성공 당시 실제로 일어난 일은 **핸들 하나로 open, 중간에 close
+#       하지 않고** 1회차 CoreBase=0x81480000(실패) → 2회차 0x81481000(성공).
+#
+#   지금 standalone 의 기본값은 이것과 **네 군데** 다르다:
+#       cJTAG mode  0 → 1        TAP 스크립트  없음 → 항상 적용
+#       CoreBase    0x81481000 → 0x81480000        device  RISC-V → E76
+#   그리고 --recover 는 앞의 셋만 훑고 **CoreBase 는 한 번도 안 바꿨다.**
+#   순서 의존(같은 핸들 2회 시도)도 재현한 적이 없다.
+#
+#   ⇒ 이 함수는 스윕이 아니다. 기록된 그 한 조합을 그대로 다시 한다.
+def replay(a):
+    out = []
+    logs = []
+    cb = lambda m: logs.append(str(m).rstrip())
+    jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
+    try:
+        jl.open()                                   # ★ 핸들 하나. 중간에 안 닫는다
+        jl.exec_command("SetcJTAGInitMode = 0")     # ★ 0 (LONG) — 지금 기본은 1
+        jl.set_tif(TIF_CJTAG)
+        jl.set_speed(10000)
+        for i, (_n, addr, typ) in enumerate(AP_MAP):
+            jl.exec_command(f"CORESIGHT_AddAP = Index={i} Type={typ} BaseAddr=0x{addr:X}")
+        jl.exec_command("CORESIGHT_SetIndexAPBAPToUse = 0")
+
+        for attempt, cb_addr in enumerate((0x81480000, 0x81481000), 1):
+            r = {'attempt': attempt, 'corebase': f"0x{cb_addr:08X}"}
+            jl.exec_command(f"CORESIGHT_SetCoreBaseAddr = 0x{cb_addr:X}")
+            try:
+                jl.connect('RISC-V', speed=10000)   # ★ device 는 RISC-V
+                r['connect'] = True
+            except Exception as e:
+                r['connect'] = False
+                r['err'] = str(e)[:70]
+            try:
+                jl.coresight_configure(ir_pre=0, dr_pre=0, ir_post=0, dr_post=0,
+                                       ir_len=4, perform_tif_init=False)
+            except Exception:
+                try:
+                    jl.coresight_configure()
+                except Exception:
+                    pass
+            d = Dap(jl)
+            r['DPIDR'] = hx(d.dpr(0))
+            d.dpw(DP_ABORT, 0x1E)
+            d.dpw(DP_CTRL, 0x50000000)
+            for _ in range(30):
+                time.sleep(0.01)
+                c = d.dpr(DP_CTRL)
+                if c and c & (1 << 29):
+                    break
+            r['CTRL'] = hx(d.dpr(DP_CTRL))
+            hit, _ = ap_idr_match(d)
+            r['ap_match'] = hit
+            out.append(r)
+    except Exception as e:
+        out.append({'fatal': str(e)[:120]})
+    finally:
+        try:
+            jl.close()
+        except Exception:
+            pass
+    return out
+
+
 def session(a, idx):
     import os
     import tempfile
@@ -568,6 +642,10 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--replay', action='store_true',
+                    help='★ f45f0ca 가 기록한 실제 성공 설정을 글자 그대로 재생'
+                         ' (mode=0, CoreBase 0x81480000→0x81481000, device RISC-V,'
+                         ' 스크립트 없음, 핸들 하나)')
     ap.add_argument('--link', action='store_true',
                     help='★ 물리 계층 — 원래 설정 고정 후 cJTAG 모드 × 속도 스윕')
     ap.add_argument('--speeds', default="10000,4000,2000,1000,500")
@@ -624,6 +702,30 @@ def main():
     print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
+
+    if a.replay:
+        print(f"\n{'=' * 70}\n [REPLAY] f45f0ca 가 기록한 성공 설정 재생"
+              f"\n{'=' * 70}")
+        print("  mode=0 / TIF=7 / 10MHz / AddAP 0..5 / APBAPToUse=0 / device=RISC-V")
+        print("  TAP 스크립트 없음. 핸들 하나로 CoreBase 를 바꿔 2회 시도.")
+        print("  당시 실측: DPIDR=6BA0009D, CTRL=F0000000, 2회차에서 connect 성공\n")
+        print("---8<---")
+        rs = replay(a)
+        for r in rs:
+            if 'fatal' in r:
+                print("FATAL", r['fatal'])
+                continue
+            print(f"{r['attempt']}) CoreBase={r['corebase']} "
+                  f"connect={'O' if r.get('connect') else 'X'} "
+                  f"DPIDR={r.get('DPIDR')} CTRL={r.get('CTRL')} "
+                  f"AP일치={r.get('ap_match')}/6"
+                  + (f"  err={r['err']}" if r.get('err') else ""))
+        good = [r for r in rs if r.get('ap_match', 0) >= AP_GATE_MIN]
+        conn = [r for r in rs if r.get('connect')]
+        print("VERDICT:", "REPLAY_OK" if good else
+                          "CONNECT_ONLY" if conn else "REPLAY_FAILED")
+        print("---8<---")
+        return 0 if good else 6
 
     if a.link:
         print(f"\n{'=' * 70}\n [LINK] 물리 계층 — 속도를 낮춰본다"
