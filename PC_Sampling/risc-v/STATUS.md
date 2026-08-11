@@ -1469,11 +1469,30 @@ J-Link 은 한 번에 한 hart 가 기본이다. 4-source 의 SRC 구분과 공�
 | 1d | **TAP 인식** | ✅ 수동 체인 선언으로 통과 (`AllowTAPReset=1`) |
 | 1e | 설정 전달 | ✅ J-Link 로그가 AP 맵·CoreBase 반영 확인 |
 | 1f | MEM-AP 전송 | ✅ 66/66 정상, 오류비트 없음 |
-| **1g** | **DM 도달** | ❌ **현재 지점.** ROM 은 DM 을 가리키는데 그 자리가 비어 있다 |
+| **1g** | **DM 도달** (`dmstatus` version 유효) | ❌ **현재 지점.** ROM 은 DM 을 가리키는데 그 자리가 비어 있다 |
+| 1h | `dmcontrol.dmactive` 래치 | ⬜ **브링업 최초의 그 에러 단계** |
+| 1i | hartsel + hart 존재/가용 | ⬜ `allnonexistent` / `allunavail` |
+| 1j | CPU 식별(`misa` 등) | ⬜ ⚠ J-Link 이 **코어를 임시 halt** 한다 |
+
+> **⚠ `1g` 를 통과해도 connect 가 끝나는 게 아니다.** `1h~1j` 가 비로소 시작된다.
+> 특히 `1h` 는 브링업 최초의 `Timeout waiting for debug module to become active`
+> 그 단계이고, `1j` 는 초기 로그에 있던
+> `Temp. halting CPU for feature detection` 이다.
+>
+> **★ 그리고 `1j` 는 우리 목표와 충돌한다.** 동작 중인 SSD 를 halt 하는 것은
+> 위험하고, 무-halt 트레이스라는 방식과도 어긋난다.
+> T32 는 `cpuaccess DENIED` + `sys.m prepare` 로 **이 단계를 아예 하지 않는다.**
+>
+> **★★ 그래서 connect 성공 자체가 목표가 아니다.**
+> DM 에서 우리가 진짜 원하는 건 **SBA** — 트레이스 레지스터에 닿는 경로다
+> (`RISCV_Set*BaseAddr ... MemTypeToUse=2`). 최소 요구는
+> **"SBA 로 `0xFD......` 를 읽고 쓸 수 있는가"** 이지 `connect()` 의 성공이 아니다.
+> J-Link 이 그 최소 요구만으로 트레이스를 구동해 주는지는 **미확인**이고,
+> 안 되면 raw MEM-AP 로 직접 구동하는 경로(지금 막힌 그것)로 돌아온다.
 
 > 보조 트랙(halt/PC 샘플링 = G1·G2)은 **목표가 아니다.** 실패해도 무방하다.
 
-### Phase 2 — 트레이스 수집  (1g 해소가 선행)
+### Phase 2 — 트레이스 수집  (`1g~1j` 또는 **SBA 확보**가 선행)
 
 | | | |
 |---|---|---|
