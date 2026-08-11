@@ -719,54 +719,53 @@ SetcJTAGInitMode
 
 **⇒ `sfe76_link`: `CJTAG_MODE 0 → 1`, `DEVICE 'RISC-V' → 'E76'` (API_LEVEL 4)**
 
-### ❌ cJTAG 모드만으로는 안 됐다 (2026-08-11)
+### ★★ 2026-08-11 — **TAP 오인이 사라졌다.** 체인 수동 선언이 먹었다
 
 ```
-유효IDCODE=0/9   connect=3   DTM오인아님=0
+1차 (모드만 훑음)      유효IDCODE=0/9    DTM오인아님=0/9
+2차 (TAP ID 선언 추가) 유효IDCODE=24/90  DTM오인아님=78/90  connect=71/90
+                       init스크립트실행=72/90     VERDICT: IDCODE_OK
 ```
-**모드 0/1/2 × device 3종 전부에서 IDCODE 가 `0x00000001`.**
-활성화 시퀀스 문제가 아니거나, 그것만으로는 부족하다.
 
-### P0 — TAP ID 를 **수동 선언**한다 (`InitTarget()`)
+**`24 = 4(선언한 ID) × 2(모드) × 3(속도) × 1(device)`** 로 딱 떨어진다.
+
+> ⚠ **"유효 IDCODE" 자체는 증거가 약하다** — 우리가 선언한 값을 J-Link 이
+> 되돌려준 것일 수 있다. **의미 있는 신호는 `DTM오인아님 0/9 → 78/90`** 이다.
+> 동작이 실제로 바뀌었다.
+
+**확정:** TAP 자동 검출이 `Id=0x00000001` 을 읽어 실패했고, 그래서 SEGGER 규칙
+*"IRLen=4 + 알려진 CoreSight DAP TAP → RISC-V behind DAP"* 를 못 타고
+**JTAG-DTM 으로 오인**했다. `JLINK_JTAG_SetDeviceId()` 로 **선언하니 그 오인이 사라졌다.**
+지금까지 `CORESIGHT_*` 설정이 전부 무시된 이유가 이것이다.
+
+### P0 — **두 훅을 합친 스크립트**로 DM 을 노린다 (한 번도 없던 조합)
 
 ```bash
-sudo python3 probe_cjtag_mode.py
+sudo python3 try_jlinkscript.py --brief
 ```
 
-자동 검출이 안 되면 **선언하면 된다.** SEGGER 의 규칙이
-
-> IRLen=4 이고 TAPId 가 **알려진 CoreSight DAP TAP** → RISC-V behind DAP 로 간주
-
-이므로, TAP ID 를 알려진 DAP ID 로 **선언해서 그 규칙을 발동시킨다.**
-`InitTarget()` 이 정확히 이 용도이고, 문서가 요구하는 것도 딱 이것이다 —
-*"JTAG chain has to be specified manually... all devices and their TAP IDs"*.
+`SF_E76_riscv.JLinkScript` 를 **두 훅**으로 갱신했다. 각각 다른 문제를 푼다:
 
 ```c
-int InitTarget(void) {
-  JTAG_AllowTAPReset = 0;    // "자동 JTAG 검출을 끈다"(문서) ← 지금 그게 0x1 을 만든다
-  JTAG_IRPre = 0; JTAG_DRPre = 0; JTAG_IRPost = 0; JTAG_DRPost = 0;
-  JTAG_IRLen = 4;
-  JLINK_JTAG_SetDeviceId(0, 0x4BA00477);   // 알려진 CoreSight DAP TAP
-  return 0;
-}
+int  InitTarget(void)            // ① TAP 인식 실패 → 체인 수동 선언
+{ JTAG_AllowTAPReset=0; JTAG_IRLen=4; JLINK_JTAG_SetDeviceId(0, <DAP id>); }
+
+void ConfigTargetSettings(void)  // ② AP 맵 + DMI 위치 (RISC-V 는 자동탐색 불가)
+{ CORESIGHT_AddAP ×6; SetIndexAPBAPToUse; SetCoreBaseAddr; RISCV_SetHartSel; }
 ```
-> ⚠ 전역 `CPU` 상수 목록에 **RISC-V 가 없다**(ARM 전용). 그래서 `CPU` 는 설정하지
-> 않고 체인만 선언한다 — `device=E76` 지정이 그 역할을 대신하길 기대한다.
-> 이전에 `InitTarget` 이 스캔을 깨뜨린 건 **체인을 선언 안 했기 때문**이고,
-> 이번엔 그걸 한다.
 
-**동시에 두 변수를 더 훑는다:**
-- **JTAG 속도** `10000 / 4000 / 1000` kHz — `Id=0x00000001` 은 **신호 무결성**
-  증상일 수도 있다. (예전 "속도 낮추면 실패" 관측은 **모드 0** 에서 나온 것이다)
-- **TAP ID** 5종 (선언 안 함 + 알려진 DAP ID 4개)
+**지금까지 ①과 ② 를 같이 준 적이 없다.** ② 만 줬을 때는 ①이 없어 TAP 을
+오인해 ② 가 무시됐고, ① 만 줬을 때는 ② 가 없었다.
 
-`init스크립트실행=n/N` 이 같이 찍힌다 — 0 이면 스크립트가 안 먹은 것이라
-결과 해석 전에 그것부터 봐야 한다.
+훑는 조합 **16개** = TAP ID 4 × AP 인덱스 {0,1} × CoreBase {`0x81480000`, `0x0`}
+(device `E76`, 문법 `BaseAddr=` 고정 — 앞선 결과로 좁혔다).
+오라클은 **`halted()`** — DM 이 살아야만 되고 비침습이다.
 
 | VERDICT | 다음 |
 |---|---|
-| `IDCODE_OK` | ★★ TAP 인식 성공 → 그 조합 고정, `try_jlinkscript.py` 재실행 |
-| `TAP_NOT_IDENTIFIED` | 자력 한계. cJTAG 물리 계층(배선·풀업·전원) 또는 SEGGER 문의 |
+| `DM_REACHED` | ★★★ **블로커 해소.** 그 값으로 정본 스크립트를 굳히고 트레이스 레지스터로 |
+| `CONNECT_ONLY` | TAP 은 잡혔는데 DM 이 안 산다 → hart / `UseNexusLegacyMode` / CoreBase 확대 |
+| `SCRIPT_NOT_LOADED` | 스크립트 미적용 — 결과 해석 금지 |
 
 ### (참고) 이전 `CONNECT_ONLY` 판정 — 무효
 

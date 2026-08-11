@@ -1,61 +1,43 @@
 /*********************************************************************
-*   SF-E76 (RISC-V behind CoreSight DAP) — J-Link 연결 스크립트
+*   SF-E76 (RISC-V behind CoreSight DAP) — J-Link 연결 스크립트 **정본**
 *
-*   SEGGER KB "J-Link RISC-V > RISC-V behind a CoreSight DAP" 예제 형태
-*   그대로다. 그 문서가 못박는 전제:
+*   실측으로 확정된 값만 들어 있다. 자세한 근거는 STATUS.md.
+*   훅 두 개가 각각 다른 문제를 푼다:
+*     ① InitTarget()          TAP 인식 실패(Id=0x00000001) → 체인 수동 선언
+*     ② ConfigTargetSettings() AP 맵과 DMI 위치 (RISC-V 는 자동 탐색 불가)
 *
-*     * There is no ROM table scan available for RISC-V
-*     * J-Link cannot auto-detect behind which AP the RISC-V can be found
-*     * J-Link cannot auto-detect where in the AP address space the
-*       RISC-V DMI registers can be found
-*     * the user needs to manually specify where to find the RISC-V core
-*
-*   ★ 훅으로 ConfigTargetSettings() 만 쓴다. 이유가 중요하다.
-*
-*     SEGGER 문서: "May not, under absolutely NO circumstances, call any
-*     API functions that perform target communication."
-*
-*     즉 이 훅은 **타깃 통신이 금지**돼 있어서 cJTAG 스캔을 깨뜨릴 수가 없다.
-*     예전에 JLinkScript 를 폐기한 것은 InitTarget() 을 썼기 때문이다 —
-*     그 훅은 JTAG 체인과 전역 CPU 를 **수동으로 다 지정해야** 하는데
-*     안 해서 스캔이 깨졌다(IRPrint=0x..0000). 훅을 잘못 고른 것이지
-*     JLinkScript 경로가 막힌 게 아니었다.
-*
-*   ── 값의 출처 (전부 실측 또는 T32 실물) ──────────────────────────
-*   AP 주소   T32 SYStem.CONFIG.APBAP1.Base DP:0x10000 등
-*             + AP IDR 실측으로 6/6 타입 일치 확인
-*   CoreBase  T32 sys.config.coredebug.base APB:0x81480000 (hcore DM)
-*   hart      T32 SYS.CONFIG HARTINDEX 0. 1. 2. 3. → hcore = hart 0
-*
-*   ⚠ SetCoreBaseAddr 가 "AP 주소공간 오프셋" 인지 "APB 버스 주소" 인지는
-*     아직 미확정이다. try_jlinkscript.py 가 후보를 훑는다.
+*   ⚠ CoreBase / AP index / TAP ID 는 try_jlinkscript.py 가 확정하면
+*     그 값으로 이 파일을 굳힌다.
 *********************************************************************/
 
+/* ── ① 체인 선언 ─────────────────────────────────────────────────
+   자동 검출이 Id=0x00000001 을 읽어 TAP 을 못 알아본다. 그러면 SEGGER 규칙
+   "IRLen=4 + 알려진 CoreSight DAP TAP → RISC-V behind DAP" 를 못 타고
+   JTAG-DTM 으로 오인한다. 그래서 **직접 선언**한다.
+   문서: InitTarget 을 구현하면 "JTAG chain has to be specified manually".
+   (전역 CPU 는 설정하지 않는다 — 상수 목록에 RISC-V 가 없다. device 로 대신한다) */
+int InitTarget(void) {
+  JTAG_AllowTAPReset = 0;
+  JTAG_IRPre  = 0;
+  JTAG_DRPre  = 0;
+  JTAG_IRPost = 0;
+  JTAG_DRPost = 0;
+  JTAG_IRLen  = 4;
+  JLINK_JTAG_SetDeviceId(0, 0x4BA00477);
+  return 0;
+}
+
+/* ── ② AP 맵과 DMI 위치 ──────────────────────────────────────────
+   타깃 통신이 금지된 훅이라 스캔을 깨뜨리지 않는다. */
 void ConfigTargetSettings(void) {
-  //
-  // AP 맵 — T32 의 DP:0xN0000 이 그대로 base 가 된다.
-  // 파라미터 이름은 SEGGER 문서 두 곳이 다르다:
-  //   Command Strings 페이지 : Addr=
-  //   J-Link RISC-V  페이지  : BaseAddr=      ← RISC-V 문맥이므로 이쪽을 쓴다
-  //
   JLINK_ExecCommand("CORESIGHT_AddAP = Index=0 Type=APB-AP BaseAddr=0x00010000");
   JLINK_ExecCommand("CORESIGHT_AddAP = Index=1 Type=APB-AP BaseAddr=0x00020000");
   JLINK_ExecCommand("CORESIGHT_AddAP = Index=2 Type=AXI-AP BaseAddr=0x00030000");
   JLINK_ExecCommand("CORESIGHT_AddAP = Index=3 Type=AHB-AP BaseAddr=0x00040000");
   JLINK_ExecCommand("CORESIGHT_AddAP = Index=4 Type=APB-AP BaseAddr=0x00050000");
   JLINK_ExecCommand("CORESIGHT_AddAP = Index=5 Type=APB-AP BaseAddr=0x00060000");
-
-  //
-  // RISC-V DMI 가 붙은 AP 와 그 안에서의 위치.
-  // ROM 엔트리 실측(APBAP1 @0x0 = 0x81480003)이 index 0 을 지목한다.
-  //
   JLINK_ExecCommand("CORESIGHT_SetIndexAPBAPToUse = 0");
   JLINK_ExecCommand("CORESIGHT_SetCoreBaseAddr = 0x81480000");
-
-  //
-  // hcore = hart 0
-  //
   JLINK_ExecCommand("RISCV_SetHartSel = 0");
-
   return 0;
 }

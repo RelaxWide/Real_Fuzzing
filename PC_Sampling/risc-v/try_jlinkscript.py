@@ -49,16 +49,42 @@ import pylink
 from sfe76_link import (require_api, TIF_CJTAG, SPEED_KHZ, CJTAG_MODE,
                         AP_MAP, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.10  script-ran 검증"
+VERSION = "2026-08-11.13  InitTarget 체인선언 + ConfigTargetSettings AP맵"
 
-SYNTAXES = ['BaseAddr', 'Addr']
-AP_INDEXES = [0, 1, 4, 5]                      # APB 타입 AP
-CORE_BASES = [0x81480000, 0x0, 0x81481000]
-DEVICES = ['E76', 'E76-MC']   # ★ 'RISC-V' 는 connect 자체가 안 된다(실측)
+# ★ TAP ID 를 선언하면 JTAG-DTM 오인이 사라진다(실측: DTM오인아님 0/9 → 78/90).
+#   ⚠ 다만 "유효 IDCODE" 자체는 **우리가 선언한 값을 되돌려받은 것**일 수 있다.
+#      의미 있는 신호는 DTM 오인이 사라진 것과, 그 위에서 DM 이 사는지다.
+DEVIDS = [0x4BA00477, 0x2BA01477, 0x5BA00477, 0x6BA00477]
+
+SYNTAXES = ['BaseAddr']
+AP_INDEXES = [0, 1]                            # ROM 엔트리가 지목한 둘
+CORE_BASES = [0x81480000, 0x0]
+DEVICES = ['E76']            # ★ 'RISC-V' 는 connect 자체가 안 된다(실측)
 
 MARKER = "SFE76_SCRIPT_RAN"
 
 TEMPLATE = """/* 자동 생성 — try_jlinkscript.py */
+
+/* ── ① 체인 선언 ─────────────────────────────────────────────────
+   자동 검출이 Id=0x00000001 을 읽어 TAP 을 못 알아본다. 그러면 SEGGER 규칙
+   "IRLen=4 + 알려진 CoreSight DAP TAP → RISC-V behind DAP" 를 못 타고
+   JTAG-DTM 으로 오인한다. 그래서 **직접 선언**한다.
+   문서: InitTarget 을 구현하면 "JTAG chain has to be specified manually".
+   (전역 CPU 는 설정하지 않는다 — 상수 목록에 RISC-V 가 없다. device 로 대신한다) */
+int InitTarget(void) {{
+  JLINK_SYS_Report("{marker}_INIT");
+  JTAG_AllowTAPReset = 0;
+  JTAG_IRPre  = 0;
+  JTAG_DRPre  = 0;
+  JTAG_IRPost = 0;
+  JTAG_DRPost = 0;
+  JTAG_IRLen  = 4;
+  JLINK_JTAG_SetDeviceId(0, 0x{devid:08X});
+  return 0;
+}}
+
+/* ── ② AP 맵과 DMI 위치 ──────────────────────────────────────────
+   타깃 통신이 금지된 훅이라 스캔을 깨뜨리지 않는다. */
 void ConfigTargetSettings(void) {{
   // ★ 이 줄이 J-Link 로그에 보이면 스크립트가 **실제로 로드·실행**된 것이다.
   //    JLINK_SYS_Report 는 호스트 측 출력이라 "타깃 통신" 금지 규칙에 걸리지 않는다.
@@ -72,14 +98,14 @@ void ConfigTargetSettings(void) {{
 """
 
 
-def gen_script(path, syntax, apidx, corebase, hart):
+def gen_script(path, syntax, apidx, corebase, hart, devid=DEVIDS[0]):
     aps = "\n".join(
         f'  JLINK_ExecCommand("CORESIGHT_AddAP = Index={i} Type={t} '
         f'{syntax}=0x{addr:08X}");'
         for i, (_n, addr, t) in enumerate(AP_MAP))
     with open(path, 'w') as f:
         f.write(TEMPLATE.format(marker=MARKER, aps=aps, apidx=apidx,
-                                corebase=corebase, hart=hart))
+                                corebase=corebase, hart=hart, devid=devid))
     return path
 
 
@@ -90,7 +116,7 @@ def run_one(a):
            'device': a.device, 'script_ok': None, 'connect': False,
            'dm_alive': False, 'error': None, 'script_ran': None}
     sp = os.path.join(tempfile.gettempdir(), f"sfe76_{os.getpid()}.JLinkScript")
-    gen_script(sp, a.syntax, a.ap_index, a.core_base, a.hart)
+    gen_script(sp, a.syntax, a.ap_index, a.core_base, a.hart, a.devid)
     logs = []
     cb = lambda m: logs.append(str(m))
     jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
@@ -147,10 +173,10 @@ def run_one(a):
     return EXIT_OK if rec['dm_alive'] else EXIT_INSUFFICIENT
 
 
-def spawn(syntax, apidx, base, device, hart, tries):
+def spawn(syntax, apidx, base, device, hart, tries, devid):
     cmd = [sys.executable, os.path.abspath(__file__), '--single',
            '--syntax', syntax, '--ap-index', str(apidx),
-           '--core-base', hex(base), '--device', device,
+           '--core-base', hex(base), '--device', device, '--devid', hex(devid),
            '--hart', str(hart), '--tries', str(tries)]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=180).stdout
@@ -180,6 +206,8 @@ def main():
     ap.add_argument('--core-base', type=lambda x: int(x, 0), default=0x81480000,
                     help=argparse.SUPPRESS)
     ap.add_argument('--device', default='E76', help=argparse.SUPPRESS)
+    ap.add_argument('--devid', type=lambda x: int(x, 0), default=DEVIDS[0],
+                    help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.version:
         print(f"try_jlinkscript {VERSION}")
@@ -189,7 +217,7 @@ def main():
 
     syns = [a.only_syntax] if a.only_syntax else SYNTAXES
     devs = [x.strip() for x in a.devices.split(',') if x.strip()]
-    total = len(syns) * len(AP_INDEXES) * len(CORE_BASES) * len(devs)
+    total = len(syns) * len(AP_INDEXES) * len(CORE_BASES) * len(devs) * len(DEVIDS)
     if not a.brief:
         print(f"\n{'=' * 68}\n JLinkScript 네이티브 연결 (v{VERSION})\n{'=' * 68}")
         print("  DMI 프로토콜은 J-Link 이 안다. 우리는 위치만 알려준다.")
@@ -198,17 +226,19 @@ def main():
         print(f"  총 {total} 조합, 조합마다 별도 프로세스.\n")
 
     hits, rows = [], []
-    for syn in syns:
+    for devid in DEVIDS:
+      for syn in syns:
         for dev in devs:
             for apidx in AP_INDEXES:
                 for base in CORE_BASES:
-                    r = spawn(syn, apidx, base, dev, a.hart, a.tries)
+                    r = spawn(syn, apidx, base, dev, a.hart, a.tries, devid)
+                    r['devid'] = f"0x{devid:08X}"
                     rows.append(r)
                     mark = ("★★ DM" if r.get('dm_alive')
                             else "connect만" if r.get('connect') else "실패")
                     if not a.brief:
-                        print(f"  [{syn:8s}] AP={apidx} base=0x{base:08X} {dev:7s}"
-                              f"  {mark}")
+                        print(f"  id=0x{devid:08X} AP={apidx} base=0x{base:08X} "
+                              f"{dev:6s}  {mark}")
                         if r.get('error') and not r.get('dm_alive'):
                             print(f"      {str(r['error'])[:100]}")
                     if r.get('dm_alive'):
@@ -225,7 +255,7 @@ def main():
         print("   → connect 24/24 성공은 스크립트와 무관한 결과였다.")
         print("   → ScriptFile 지정 방식부터 고쳐야 한다 (JLinkExe -jlinkscriptfile 로 교차확인).")
     for r in hits:
-        print(f"HIT syntax={r['syntax']} ap={r['ap']} base={r['base']} dev={r['device']}")
+        print(f"HIT devid={r.get('devid')} ap={r['ap']} base={r['base']} dev={r['device']}")
     if not hits and conn:
         # connect 는 되는데 DM 이 안 사는 조합만 요약해서 보여준다
         u = sorted({(r['syntax'], r['ap'], r['base']) for r in conn})[:6]
