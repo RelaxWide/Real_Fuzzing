@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.26  device 기본값 E76 으로 복귀 (실측 근거)"
+VERSION = "standalone 2026-08-11.27  --prot: 양성대조 붙인 APB Prot 스윕"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -629,6 +629,46 @@ def pwr_probe(d, dm_addr):
     return out
 
 
+
+# ★★★ --prot : secure/privileged 접근 가설. 사용자가 일찍 물었던 것이고
+#   아직 **APB 에는 한 번도 안 해봤다** (이전 Prot 스윕은 AXI 전용이었다).
+#
+#   가설: DM 이 secure 공간에 있고 우리 접근이 non-secure 로 나가면
+#         응답 대신 버스 기본값이 온다 — 지금 보이는 그림 그대로다.
+#
+#   ★ 이전 prot_probe 의 결함: **양성 대조가 없었다.** Prot 값이 그냥 무효라
+#     실패한 건지, 유효한데 DM 만 안 나오는 건지 구별할 수 없었다.
+#     이제 Prot 마다 **ROM 의 CIDR0 도 같이 읽는다** — 그건 0x0D 가 나와야
+#     하는 곳이다(실측 확인됨). 판정:
+#       CID0 = 0D 인데 dmstatus 만 기본값  →  그 Prot 는 유효, DM 이 없다
+#       CID0 도 깨짐                       →  그 Prot 자체가 무효. 판정 불가
+def prot_probe2(d, dm_addr):
+    apbase = AP_MAP[0][1]
+    base = d.apr(apbase, OFF_BASE)
+    csw0 = d.apr(apbase, OFF_CSW)
+    info = {'BASE': hx(base), 'CSW': hx(csw0),
+            'Prot0': None if csw0 is None else f"0x{(csw0 >> 24) & 0x7F:02X}"}
+    rows = []
+    if csw0 is None or base is None or base == 0xFFFFFFFF:
+        return info, rows
+    rb = base & 0xFFFFF000
+    # APB4-AP CSW[31:24] = Prot.  bit28=HNONSEC 상당, bit29/30 privileged 등
+    # 구현마다 다르므로 의미 부여 없이 **훑고 관측만** 한다.
+    for p in (None, 0x00, 0x10, 0x20, 0x30, 0x40, 0x60, 0x70):
+        csw = csw0 if p is None else ((csw0 & ~0x7F000000) | (p << 24))
+        cid, _ = d.mem32(apbase, rb + 0xFF0, csw)          # 양성 대조
+        st, _ = d.mem32(apbase, dm_addr + (0x11 << 2), csw)
+        rows.append({
+            'prot': '기본' if p is None else f"0x{p:02X}",
+            'cid0': hx(cid),
+            'ctl_ok': cid is not None and (cid & 0xFF) == 0x0D,
+            'dmstatus': hx(st),
+            'ver': None if st is None else st & 0xF,
+        })
+    d.apw(apbase, OFF_CSW, csw0)
+    return info, rows
+
+
 def prot_probe(d, dm_addr):
     """APB Prot 를 바꿔가며 dmstatus 를 읽는다. CSW[31:24] = Prot."""
     apbase = AP_MAP[0][1]
@@ -833,6 +873,10 @@ def session(a, idx):
                 out['discover'] = discover(d)
             return out
 
+        if getattr(a, 'prot', False):
+            out['prot2'] = prot_probe2(d, a.dmaddr)
+            return out
+
         if getattr(a, 'pwr', False):
             out['pwr'] = pwr_probe(d, a.dmaddr)
             out['prot'] = prot_probe(d, a.dmaddr)
@@ -890,6 +934,8 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--prot', action='store_true',
+                    help='* APB Prot 스윕. Prot 마다 ROM CIDR0 를 양성대조로 같이 읽는다')
     ap.add_argument('--prepare', action='store_true',
                     help='* sys.m prepare 재현: 전원요청을 처음부터 x connect 유무')
     ap.add_argument('--pwrreq', type=lambda x: int(x, 0), default=0x50000000)
@@ -970,6 +1016,38 @@ def main():
     print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
+
+    if a.prot:
+        print(f"\n{'=' * 70}\n [PROT] APB Prot x 양성대조\n{'=' * 70}")
+        print("  가설: DM 이 secure 공간이고 우리 접근이 non-secure 면")
+        print("        응답 대신 버스 기본값이 온다 - 지금 그림 그대로다.")
+        print("  Prot 마다 ROM 의 CIDR0(=0x0D 여야 함)를 같이 읽어 양성대조로 쓴다:")
+        print("    CID0=0D 인데 dmstatus 만 기본값 -> Prot 유효, DM 이 없다")
+        print("    CID0 도 깨짐                    -> 그 Prot 자체가 무효, 판정불가\n")
+        r0 = session(a, 0)
+        if not r0.get('ok'):
+            print("---8<---")
+            print(f"무효 세션 (AP일치={r0.get('ap_match')}/6) - 다시 실행")
+            print("---8<---")
+            return 6
+        info, rows = r0.get('prot2', ({}, []))
+        print("---8<---")
+        print(f"APBAP1 BASE={info.get('BASE')} CSW={info.get('CSW')} "
+              f"현재Prot={info.get('Prot0')}")
+        live, testable = [], 0
+        for r in rows:
+            testable += int(r['ctl_ok'])
+            print(f"Prot={r['prot']:5s} CID0={r['cid0']}"
+                  f"{'(대조OK)' if r['ctl_ok'] else '(대조깨짐)'} "
+                  f"dmstatus={r['dmstatus']} ver={r['ver']}"
+                  + ("  *DM살아있음" if r['ver'] in (2, 3) else ""))
+            if r['ver'] in (2, 3):
+                live.append(r['prot'])
+        print("VERDICT:", f"DM_LIVE (Prot={live[0]})" if live else
+                          f"PROT_RULED_OUT (유효대조 {testable}/{len(rows)})"
+                          if testable else "PROT_UNTESTABLE")
+        print("---8<---")
+        return 0 if live else 6
 
     if a.prepare:
         print(f"\n{'=' * 70}\n [PREPARE] attach.cmm 의 순서를 그대로\n{'=' * 70}")

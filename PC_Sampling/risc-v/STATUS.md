@@ -294,6 +294,40 @@ J-Link       Plus, FW V13 / 소프트웨어 **V9.66** (V9.12 → 업그레이드
 > | `CSYSPWRUPREQ` 이미 1 | J-Link 이 스스로 건다. 뒤에 지워도 소용없다 | **JLinkScript `InitTarget()`** 로 기동 절차 자체를 우리가 가져와야 한다 |
 > | `CSYSPWRUPREQ` 0 | 애초에 안 건다 | **순서 가설 자체가 무효.** 리셋 해제로 간다 |
 
+> ### ❌❌❌ 실측 (`--prepare`, `.25`) — **전원 요청 가설은 죽었다**
+>
+> ```
+> DBG만    connect없음   최초CTRL=0x80000000 → 0x80000000
+> DBG만    connect함     최초CTRL=0xF0000000 → 0x30000000   dmstatus=EAFFFFFE
+> DBG+SYS  connect없음   최초CTRL=0x80000000 → 0x80000000
+> DBG+SYS  connect함     최초CTRL=0xF0000000 → 0xF0000000   dmstatus=EAFFFFFE
+> ```
+>
+> **1. J-Link 은 `CSYSPWRUPREQ` 를 스스로 건다.** 우리가 손대기 전 `0xF0000000`
+>    = `CDBGPWRUPREQ+ACK` + `CSYSPWRUPREQ+ACK`. 이건 예상대로였다.
+>
+> **2. 그런데 우리 쓰기가 먹는다.** 2번 줄 `0xF0000000 → 0x30000000` =
+>    `CDBGPWRUPREQ+ACK` 만 남고 `CSYS` 는 깨끗이 내려갔다.
+>    **T32 가 요구하는 상태(`DAPSYSPWRUPREQ OFF`/`DAPDBGPWRUPREQ ON`) 그 자체다.**
+>    그런데도 `dmstatus = EAFFFFFE`. ⇒ **전원 요청은 원인이 아니다.**
+>    ("뒤에 지워도 소용없다" 던 내 예상도 틀렸다 — 지워졌고, 그래도 DM 은 없다)
+>
+> **3. no-connect 경로는 pylink 로 못 만든다.** `0x80000000` 이 전후 동일 =
+>    우리 쓰기조차 안 먹혔다. `perform_tif_init=True` 로도 DAP 에 못 닿는다.
+>    `SYStem.Mode Prepare` 등가물은 pylink 로 불가. (connect 하면 AP 6/6 이라
+>    실질 손해는 없다)
+>
+> ### 남은 읽기 전용 가설: **secure/privileged 접근** (`--prot`, `.27`)
+>
+> 사용자가 일찍 물었던 것이고 **APB 에는 한 번도 안 해봤다** (이전 Prot 스윕은
+> AXI 전용). ★ 이번엔 **양성 대조**를 붙인다 — Prot 마다 ROM 의 `CIDR0`(=`0x0D`
+> 실측 확인됨)를 같이 읽는다:
+> - `CID0=0D` 인데 `dmstatus` 만 기본값 → 그 Prot 는 유효, **DM 이 없다**
+> - `CID0` 도 깨짐 → 그 Prot 자체가 무효, **판정 불가**
+>
+> 이게 `PROT_RULED_OUT` 이면 읽기 전용으로 할 수 있는 건 끝이고,
+> 남는 건 T32 의 `Reset Release`(`AXI:0xC81040/44` **쓰기**)뿐이다.
+
 **동작하는 설정 (pylink + exec_command, connect 前 주입):**
 ```
 SetcJTAGInitMode = 0
