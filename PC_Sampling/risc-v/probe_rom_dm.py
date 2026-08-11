@@ -63,7 +63,16 @@ import time
 from sfe76_link import (require_api, Link, LinkError, AP_MAP,
                         add_common_args, EXIT_OK, EXIT_INSUFFICIENT)
 
-VERSION = "2026-08-11.7  표적 진단"
+VERSION = "2026-08-11.26  AXI 포함, 전송 단계 진단"
+
+# ★ 이 도구는 만들어 놓고 **한 번도 안 돌렸다.** 지금 필요한 게 정확히 이것이다.
+#   APB 도 AXI 도 모든 주소가 버스 기본값으로 나온다. 그런데 우리는
+#   **전송이 어느 단계에서 어떻게 끝나는지**를 한 번도 안 봤다:
+#     · CSW.TrInProg (전송이 아직 진행 중인가)
+#     · DRW 읽기 후 STICKYERR / WDATAERR / STICKYORUN
+#     · ABORT 로 오류가 해제되는가
+#   "기본값이 돌아온다" 와 "버스가 에러를 낸다" 는 완전히 다른 상태이고,
+#   그 구분이 다음 수를 정한다.
 
 DP_ABORT, DP_CTRL_STAT, DP_SELECT = 0, 1, 2
 OFF_CSW, OFF_TAR, OFF_DRW = 0xD00, 0xD04, 0xD0C
@@ -71,7 +80,7 @@ OFF_CFG, OFF_BASE, OFF_IDR = 0xDF4, 0xDF8, 0xDFC
 SUSPECT = 0x80000000
 
 # 우선 측정 대상 — APBAP1/APBAP2 만 (feedback §6)
-TARGET_APS = ['APBAP1', 'APBAP2']
+TARGET_APS = ['APBAP1', 'APBAP2', 'AXIAP1']   # ★ AXI 추가 — 리셋 블록이 거기다
 
 # ROM 후보: AP 주소공간 앞쪽 엔트리 + ID 레지스터
 ROM_ADDRS = [0x0, 0x4, 0x8, 0xC] + [0xFE0, 0xFE4, 0xFE8, 0xFEC,
@@ -79,6 +88,8 @@ ROM_ADDRS = [0x0, 0x4, 0x8, 0xC] + [0xFE0, 0xFE4, 0xFE8, 0xFEC,
 # DM 후보: 제한 접근만
 DM_BASES = [0x81480000, 0x81481000]
 DM_OFFS = [0x000, 0x004, 0x040, 0x044]
+# ★ T32 리셋 해제가 쓰는 AXI 주소 — 여기가 읽히는지도 같은 방식으로 본다
+EXTRA_ADDRS = [0xC81040, 0xC81044]
 
 DEAD = {0x00000000, 0xFFFFFFFF, 0xEAFFFFFE, 0xEAFFFFFC, 0x00000001, 0x00040700}
 
@@ -215,6 +226,7 @@ def run_session(a, idx):
                     ap['SDeviceEn'] = bool(csw & (1 << 23))
                     ap['Prot'] = f"0x{(csw >> 24) & 0x7F:02X}"
                     ap['Type'] = csw & 0xF
+                    ap['TrInProg'] = bool(csw & (1 << 7))
 
                 ap['rom'] = {}
                 for off in ROM_ADDRS:
@@ -226,6 +238,9 @@ def run_session(a, idx):
                     for o in DM_OFFS:
                         v, _r = p.read32(name, base, b + o, csw)
                         ap['dm'][f"0x{b + o:08X}"] = hx(v)
+                for x in EXTRA_ADDRS:            # T32 리셋 컨트롤러
+                    v, _r = p.read32(name, base, x, csw)
+                    ap['dm'][f"0x{x:08X}"] = hx(v)
 
                 # ★ CSW 원본 복구 — 다음 세션에 상태를 물려주지 않는다
                 if csw is not None and csw != SUSPECT:
@@ -307,6 +322,22 @@ def main():
     nvalid = sum(1 for s in sessions if s.get('valid'))
 
     print(f"\nv={VERSION.split()[0]}  valid={nvalid}/{a.sessions}")
+
+    # ★ 전송 단계 요약 — 이게 이 도구의 핵심 산출물이다
+    last = next((s_ for s_ in reversed(sessions) if s_.get('valid')), None)
+    if last:
+        stages, errs = {}, {}
+        for rec in last.get('log', []):
+            stages[rec.get('stage')] = stages.get(rec.get('stage'), 0) + 1
+            af = rec.get('after') or {}
+            for k in ('STICKYERR', 'WDATAERR', 'STICKYORUN'):
+                if af.get(k):
+                    errs[k] = errs.get(k, 0) + 1
+        print("전송단계:", dict(sorted(stages.items())))
+        print("DP오류비트:", dict(sorted(errs.items())) or "없음")
+        for nm, apd in (last.get('aps') or {}).items():
+            print(f"{nm} DeviceEn={apd.get('DeviceEn')} TrInProg={apd.get('TrInProg')} "
+                  f"Prot={apd.get('Prot')} CFG={apd.get('CFG')} BASE={apd.get('BASE')}")
     for name, e in ev.items():
         print(f"{name} rom0={e['rom0']} rom4={e['rom4']} dm0={e['dm0']} "
               f"idr={sorted(x for x in e['idr'] if x)} devEn={sorted(map(str, e['devEn']))}")
