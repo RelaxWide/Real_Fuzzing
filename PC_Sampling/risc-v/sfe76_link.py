@@ -275,15 +275,76 @@ class Link:
             except Exception as e:
                 self._say(f"  [Link] coresight_configure 실패: {e}")
                 return (None, None)
-        try:
-            v = self.jl.coresight_read(1, ap=False)      # DP CTRL/STAT
-        except Exception as e:
-            self._say(f"  [Link] CTRL/STAT 읽기 실패: {e}")
-            return (None, None)
-        if v is None or v < 0:
+        def _rd():
+            try:
+                v = self.jl.coresight_read(1, ap=False)   # DP CTRL/STAT
+                return None if (v is None or v < 0) else v
+            except Exception:
+                return None
+
+        v = _rd()
+        # ACK 가 없으면 **우리가 직접 전원을 요청한다.**
+        # connect 가 실패한 세션에서는 J-Link 이 이 단계를 안 했을 수 있다.
+        if v is None or not (v & (1 << 29)):
+            try:
+                self.jl.coresight_write(0, 0x0000001E, ap=False)      # ABORT: sticky 클리어
+                self.jl.coresight_write(1, 0x50000000, ap=False)      # CDBG|CSYSPWRUPREQ
+            except Exception:
+                pass
+            for _ in range(30):
+                time.sleep(0.01)
+                v = _rd()
+                if v is not None and (v & (1 << 29)):
+                    break
+        if v is None:
+            self._say("  [Link] CTRL/STAT 읽기 실패")
             return (None, None)
         self.ctrl_stat = v
         return (bool(v & (1 << 29)), bool(v & (1 << 31)))
+
+    def open_dap(self, tries=CONNECT_TRIES):
+        """**raw DAP 작업용 진입점.** connect 성공을 요구하지 않는다.
+
+        ★ 왜 필요한가. DP/AP 레지스터를 직접 두드리는 데 필요한 건 **DAP 전원**
+          뿐이다. J-Link 의 `connect(device)` 는 그 위에서 **CPU 를 식별**하려 하고,
+          우리 칩은 거기서 `Could not find supported CPU` / `dmactive 타임아웃`
+          으로 실패한다 — 그런데 그건 **CPU 계층의 실패**지 DAP 계층의 실패가 아니다.
+
+          실제로 브링업 초기의 DPIDR 도 connect 가 실패한 세션에서 읽었다.
+          그런데 `connect_checked` 를 쓰면서 **connect 실패 = 세션 무효**로
+          묶어버려, CPU 를 못 찾는다는 이유로 **AP 측정 자체를 건너뛰고 있었다.**
+
+        반환: (connect_ok, ctrl_stat)  — 전원이 안 서면 LinkError.
+        """
+        if not self.apply_settings():
+            raise LinkError("설정 단계 실패", EXIT_CONNECT_FAIL)
+
+        connect_ok, last = False, None
+        for t in range(1, tries + 1):
+            try:
+                self.jl.connect(self.device, speed=self.speed)
+                connect_ok = True
+                self.connect_tries_used = t
+                self._say(f"  [Link] connect 성공 ({t}/{tries})")
+                break
+            except Exception as e:
+                last = str(e)
+                self._say(f"  [Link] connect 시도 {t}/{tries} 실패: {str(e)[:80]}")
+                time.sleep(0.25)
+        if not connect_ok:
+            self._say(f"  [Link] connect 는 실패했다 — **CPU 계층 실패다.**")
+            self._say(f"         DAP 전원이 서 있으면 AP 측정은 그대로 진행한다.")
+
+        dbg, sysa = self.dap_power()
+        self.dap_power_ok = bool(dbg)
+        if not dbg:
+            raise LinkError(f"DAP 전원 ACK 없음 (무효 세션). 마지막 connect 오류: {last}",
+                            EXIT_CONNECT_FAIL)
+        self._say(f"  [Link] ✅ DAP 전원 확보 — CDBGPWRUPACK=1 "
+                  f"CSYSPWRUPACK={int(bool(sysa))} "
+                  f"CTRL/STAT=0x{(self.ctrl_stat or 0):08X}  "
+                  f"(connect={'성공' if connect_ok else '실패'})")
+        return connect_ok, self.ctrl_stat
 
     def connect_checked(self, tries=CONNECT_TRIES, require_power=True):
         """설정 1회 + connect bounded retry.

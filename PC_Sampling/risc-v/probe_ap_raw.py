@@ -452,12 +452,16 @@ def one_session(a):
            'addr_hits': {}, 'device_en': {}}
     try:
         with lk:
+            # ★ connect 성공을 요구하지 않는다. AP 접근에 필요한 건 DAP 전원뿐.
+            #   'Could not find supported CPU' 는 **CPU 계층** 실패이지
+            #   DAP 계층 실패가 아니다 — 그걸로 측정을 건너뛰면 안 된다.
             try:
-                lk.connect_checked(tries=a.tries, require_power=True)
+                conn_ok, _ = lk.open_dap(tries=a.tries)
             except LinkError as e:
-                print(f"  세션 무효: {e}")
+                print(f"  세션 무효(전원 미확보): {e}")
                 return out
             out['valid'] = True
+            out['connect_ok'] = conn_ok
             dap = Dap(lk.jl)
 
             real, dev_en = enumerate_aps(dap)

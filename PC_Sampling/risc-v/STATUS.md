@@ -282,6 +282,32 @@ DP 통신 ✅   DAP 전원 ✅   AP 열거·IDR ✅   AP 레지스터 읽기 ✅
 ```
 **"디버그 하드웨어는 다 보이는데 아무것도 못 만진다"** — 잠금의 전형이다.
 
+### ⚠ 그전에 — 도구가 측정을 스스로 막고 있었다 (2026-08-11)
+
+`Could not find supported CPU` 로 **전 세션이 무효 처리**돼 AP 측정이 아예
+돌지 않았다. 원인은 우리 코드의 전제다:
+
+```
+connect_checked()  →  connect 실패 = 세션 무효 = 측정 건너뜀
+```
+
+**틀렸다.** DP/AP 레지스터를 직접 두드리는 데 필요한 건 **DAP 전원**뿐이다.
+`connect(device)` 는 그 위에서 **CPU 를 식별**하려는 단계이고,
+`Could not find supported CPU` 는 **CPU 계층의 실패**지 DAP 계층의 실패가 아니다.
+실제로 브링업 초기의 DPIDR 도 **connect 가 실패한 세션에서** 읽었다.
+
+pylink 로 확인:
+```
+coresight_configure  → @open_required        (connect 불필요)
+coresight_read/write → @coresight_configuration_required  (connect 불필요)
+```
+**raw DAP 경로는 원래 connect 없이 열려 있다.**
+
+→ `Link.open_dap()` 신설. connect 는 **best-effort**(cJTAG 활성화·전원 시퀀스를
+위해 시도만)하고, 세션 유효성은 **DAP 전원 ACK 로만** 판정한다.
+`dap_power()` 도 ACK 가 없으면 **직접 `CTRL/STAT=0x50000000` 을 써서 요청**한다 —
+connect 가 실패한 세션에서는 J-Link 이 그 단계를 안 했을 수 있다.
+
 ### 이걸 가르는 단 하나의 측정: `CSW.DeviceEn`
 
 MEM-AP `CSW`(AP+0xD00)의 **bit6 `DeviceEn`** 은 그 AP 의 **버스 포트가 켜져
