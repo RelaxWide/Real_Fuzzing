@@ -65,9 +65,14 @@ connect('RISC-V')
 2. **DM 은 하나만 쓰면 된다** → SEGGER 의 "Multiple DM not supported" 한계에 안 걸린다.
    Ncore 는 코드 맵에서도 제외돼 있으니 커버리지 대상이 아니다.
 3. `&core_base=**APB:**0x81480000` — CoreBase 가 **APB 주소공간** 값임이 명시됐다.
-   → `SetIndexAPBAPToUse=0` + `SetCoreBaseAddr=0x81480000` 구조는 **맞다**.
+   ⚠ 다만 `APB:` 는 **주소 클래스만** 알려준다. APB-AP 가 **4개**인데
+   **어느 것인지는 모른다** — `APBAP1(index 0)` 확정이 아니다.
+   T32 의 `SYStem.CONFIG.APBACCESSPORT` 를 찾아야 확정된다 (`T32_SEARCH.md` ①).
 
-**DMI aperture 추론 (강함, 미검증):** 두 DM base 간격이 `0x1000` = 4KB
+**DMI aperture 추론 (약함, 미검증):** 두 DM base 간격이 `0x1000` = 4KB
+⚠ 4KB 는 **단순 컴포넌트 예약 크기**일 수도 있다. `<<2` 매핑의 근거로는 약하다.
+아래는 **후보**일 뿐이며 벤더 확인 전에 확정으로 쓰지 말 것.
+
 = DMI 주소 1024개 × 4바이트 ⇒ **APB 주소 = CoreBase + (dmi_addr << 2)**
 `dmcontrol(0x10)` → `0x81480040`, `dmstatus(0x11)` → `0x81480044`, `sbcs(0x38)` → `0x814800E0`
 (`sfe76_link.DMI_STRIDE_SHIFT` / `probe_dm.py --shifts 2`)
@@ -125,13 +130,33 @@ la.import.etb *   /   la.list
 
 **★ J-Link 명령이 1:1로 대응한다** — 이 구조를 그대로 옮길 수 있다:
 ```
+RISCV_UseNexusLegacyMode = 1          ★ 아래 이유로 **필수 후보**
+RISCV_SetHartSel      = 0
 RISCV_SetTEBaseAddr   = 0xFD000000   MemTypeToUse=2(SBA)   ← hart 별
 RISCV_SetTFBaseAddr   = 0xFD180000   MemTypeToUse=2
 RISCV_SetSRAMBaseAddr = 0xFD180000   MemTypeToUse=2
-RISCV_SetHartSel      = 0
 ```
-`SYStem.CONFIG.NEXUS.Type SiFive` = SEGGER 의 **SiFive N-Trace** 지원과 같은 것.
-→ **커버리지 수집 계층의 설계 불확실성이 거의 사라졌다.**
+
+### ⚠ legacy SiFive Nexus ≠ ratified N-Trace 1.0
+
+`NEXUS.Type **SiFive**` 는 비준된 N-Trace 1.0 이 아니라 **legacy SiFive Insight
+Nexus** 일 가능성이 높다. SEGGER 도 E-Series 용으로 별도 명령을 둔다:
+`RISCV_UseNexusLegacyMode = 1`.
+
+**레지스터 오프셋이 다르다** — 이게 실무적으로 치명적이다:
+
+| | T32 legacy 스크립트(실물) | Ratified TCI 1.0 |
+|---|---|---|
+| write ptr | **`+0x1C`** | `+0x20` |
+| read ptr | **`+0x20`** | `+0x28` |
+| data | **`+0x24`** | `+0x40` |
+
+→ **`RISC-V_Trace_Control_Interface.pdf` 는 개념 참고용이다.** 이 칩의 실제
+레지스터 맵과 디코더를 그대로 설명한다고 보면 안 된다. **T32 스크립트의
+오프셋이 정답**이고, 디코더도 legacy Nexus 기준으로 만들어야 한다.
+
+→ 설계 불확실성이 **줄었을 뿐** 사라지지 않았다. legacy/ratified 구분과
+버퍼 wrap·overflow 처리가 남아 있다.
 
 ### 1.2c-1 ★★ 이것이 여는 우회로
 
@@ -198,8 +223,14 @@ ETB base          ESB:0xFD180000     ← 둘이 같은 주소
 ```
 TE enable → NVMe 명령 1개 실행 → TE disable → 버퍼 드레인 → 디코드 → 그 명령의 커버리지
 ```
-명령당 32KB 면 충분. **halt 가 없어 ARM 제품의 호스트 프리즈 문제가 원천적으로 없고,
-부분맹(halt under-sampling)도 사라진다** — 완전한 분기 트레이스.
+**halt 가 없어 ARM 제품의 호스트 프리즈 문제가 원천적으로 없다** — 이건 확정.
+
+⚠ **"명령당 32KB 면 충분" 과 "완전한 분기 트레이스" 는 미검증이다.**
+버퍼가 wrap 하면 **오래된 트레이스가 사라지고**, FIFO overflow 시 N-Trace
+Error Message 가 난다. 즉 **부분맹이 사라진다는 보장이 없다** — 형태가 달라질 뿐.
+→ 캡처마다 **wrap 여부 / TE overflow·stall 비트 / sink flush 완료 /
+실제 바이트 수 / hart 식별 / 시작·종료 시점**을 반드시 기록해야 한다.
+버퍼 크기 충분 여부는 **짧은 workload 실측 후** 결정한다.
 
 ### 1.5 J-Link 버전 의존성 (문서 확인)
 
@@ -225,7 +256,7 @@ DMI 위치까지는 인식(DPIDR / AP map / CoreBase). **DM 이 active 로 응�
 | **G** | **connect 자체가 불안정 — 설정을 고정해도 결과가 갈린다** | ★★ **확정.** 단발 성공률 6/12 (아래) |
 | ~~E~~ | ~~AP 6개 등록이 J-Link 열거를 깨뜨림~~ | **반증됨.** 1개 3/6 = 6개 3/6 |
 | ~~F~~ | ~~`CSYSPWRUPREQ` 를 이 칩이 ACK 안 함~~ | **반증됨.** `CSYSPWRUPACK` 이 실제로 떴다 |
-| ~~A~~ | ~~디버그 접근 제어(secure JTAG) 잠금~~ | **반증됨 (2026-08-11).** 전 AP `CSW.DeviceEn=1` × 3세션 — 버스 포트가 **열려 있다** |
+| A | 디버그 접근 제어(secure JTAG) 잠금 | **약해짐.** 전 AP `DeviceEn=1` = 트랜잭션 발행은 가능. ⚠ 단 `DeviceEn=1` 이 '잠금 아님' 을 뜻하진 **않는다**(주소별 firewall / Secure 제한 / SDeviceEn / Prot) |
 | **B** | **DM 주소 `0x81480000` 이 틀렸거나 다른 AP 뒤에 있다** | ★★ **최유력으로 승격.** AP 는 6개 다 실재·접근 가능한데 이 주소만 안 읽힌다 |
 | C | DM 전원/클럭 게이팅 | 미검증 — 전원 ACK 가 뜬 조건에서 DM 을 다시 봐야 한다 |
 | D | 잘못된 DM | **해소.** hart 0~3 이 전부 `0x81480000`, Ncore 는 대상 아님 |
@@ -474,8 +505,10 @@ AXI-AP 우회가 된다 해도 J-Link 의 정규 경로로는 못 쓰고, **raw 
 | 트레이스 주소(`0xFD......`) 읽기 | 전 AP 실패, TAR 불일치 | ⛔ **무효** — CSW 검증 누락 버그로 AP 를 우리가 망가뜨림 |
 | `find_dm --devices` | `Could not find supported CPU` | ✅ **배제** — 커스텀 SoC 라 J-Link 내장 E76 스크립트가 맞을 리 없다 |
 | `find_dm --sweep` | **미실행** | ⬜ |
-| **`CSW.DeviceEn`** | **전 AP `[True,True,True]`** | ✅ **가설 A 반증** — 잠금이 아니다 |
-| `mem_read32` 양성 대조 | **미측정** | ⬜ ← **여기가 다음** |
+| **`CSW.DeviceEn`** | **전 AP `[True,True,True]`** | ✅ **트랜잭션 발행 가능** (잠금 반증은 **아님**) |
+| 주소 읽기 (`--addrs trace`) | 전 AP 가 `0xFD000000`~`0xFD180020` **전부 '닿음'** | ⚠ **판정 기준이 허술했다** — 아래 |
+| AP alias 검사 | **미실시** | ⬜ |
+| 값 교차검증 | **미실시** | ⬜ ← **여기가 다음** |
 
 ### 남은 단 하나의 증상
 
@@ -489,31 +522,75 @@ DP ✅   DAP 전원 ✅   AP 열거·IDR ✅   AP 레지스터 R/W ✅
 
 ## 6.1 다음 할 일
 
-### ✅ 끝난 것 — `CSW.DeviceEn` = 1 (전 AP, 3세션)
+### 2026-08-11 결과 — 그리고 **왜 아직 결론이 아닌가**
 
-**secure JTAG 잠금이 아니다.** AP 의 버스 포트는 하드웨어적으로 **열려 있다.**
-→ 실패 원인은 **주소 또는 우리 코드**다. `ASK.md` §5-5(잠금 여부)는 우선순위가 내려간다.
+```
+CSW.DeviceEn        전 AP [True, True, True]
+주소 읽기           전 AP 가 0xFD000000/1000/2000/3000, 0xFD180000/1C/20 **전부 '닿음'**
+```
 
-### P0 — mem_read32 **양성 대조** (지금)
+**`DeviceEn=1`** → 그 MEM-AP 가 **지금 트랜잭션을 낼 수 있다**는 것까지만 말한다.
+⚠ **'잠금 아님' 의 증명이 아니다.** DeviceEn=1 이어도 주소별 firewall,
+Secure 접근 제한, `SDeviceEn`, `Prot`/`Type` 설정 때문에 실패할 수 있고,
+DeviceEn=0 의 원인도 인증뿐 아니라 전원·클럭·reset·integration 신호일 수 있다.
+
+**그리고 "전부 닿음" 은 아직 성공이 아니다.** 이전 판정 기준이
+`값 != 0xFFFFFFFF` 였다 — **전 주소가 `0x00000000` 이어도 전부 성공으로 찍힌다.**
+6개 AP 가 7개 주소를 **똑같이** 읽었다는 결과 자체가 그 증상일 수 있다:
+
+- 진짜로 같은 버스를 보고 있거나
+- **AP 들이 alias 이거나**
+- **전부 미디코드 기본값(고정 패턴)을 읽고 있거나**
+
+→ 판정 로직을 다시 짰다(아래 P0). **값의 다양성**이 이 셋을 가른다.
+
+### P0 — 값이 **진짜인지** 가른다 (판정 로직 재작성됨)
 
 ```bash
 sudo python3 probe_ap_raw.py --addrs trace --no-rom --sessions 3
 ```
 
-★ **우리는 아직 `mem_read32` 가 어떤 주소로든 되긴 하는지를 모른다.**
-시도한 주소가 전부 실패해서 **"주소가 안 읽힌다"** 와 **"우리 코드가 원래 안 된다"**
-가 구분되지 않았다. 그래서 **읽혀야 정상인 주소**를 먼저 읽는다:
+**통과 조건을 엄격하게 바꿨다. 넷을 전부 만족해야 통과다:**
 
-`0x0` / `0x4` / `0x100000` / `0x21BFFC` — `MAP.BOnchip 0x0++0x21BFFF` 의
-**펌웨어 코드 영역**. 실물 코드가 있으니 AXI/AHB-AP 로 읽히는 게 정상이다.
+```
+① 실패(None) 없음
+② sticky 에러 없음
+③ ★ 주소마다 값이 다름     ← 핵심
+④ 값이 0 / 0xFFFFFFFF 만은 아님
+```
 
-| 양성 대조 | 결론 | 다음 |
+**③ 이 전부를 가른다.** 전 주소가 같은 값이면 버스가 응답한 게 아니라
+미디코드 기본값을 보고 있는 것이다. 이전 기준(`!= 0xFFFFFFFF`)으로는
+**전부 0 이어도 성공으로 찍혔다.**
+
+그리고 **`[X] AP alias 검사**를 추가했다 — AP 마다 서로 다른 패턴을 TAR 에 쓴 뒤
+전부 되읽는다. alias 면 나중에 쓴 값이 앞 AP 에서도 보인다.
+IDR 이 서로 달랐던 것은 *"선택에 따라 타입이 달라진다"* 까지만 말해주지,
+**같은 IDR 의 APB-AP 4개가 독립이라는 증명은 아니다.**
+
+출력 맨 끝 `★★★ 판정` 블록만 보면 된다. 통과해도 **확정되는 것은 이것뿐**이다:
+
+> 그 AP 로 그 주소들에서 **서로 다른 값이 안정적으로 읽힌다**
+
+**아직 확정 안 되는 것** (도구가 직접 이 목록을 출력한다):
+- 읽은 값이 **맞는 값인지** — 예상값·펌웨어 바이너리·T32 와 대조해야 안다
+- 6개 AP 가 **독립인지** — `[X]` 결과를 볼 것
+- TE/sink 를 **제어**할 수 있는지 — 읽기와 쓰기는 다른 문제다
+- 트레이스를 **실제로 받아낼 수 있는지** — wrap/overflow 미검증
+
+> ⚠ **양성 대조의 한계.** `MAP.BOnchip 0x0++0x21BFFF` 는 T32 의 **디버거
+> 메모리맵 선언**이지, 그 주소가 AXI/AHB-AP 로 반드시 읽힌다는 증거가 아니다.
+> 진짜 양성 대조는 **펌웨어 바이너리와 값이 일치하는 주소** 또는 **알려진
+> read-only SoC ID 레지스터**여야 한다. 현재 것은 잠정이다.
+
+### P0.5 — 두 경로를 **병렬 후보**로 유지한다
+
+| 경로 | 내용 | 상태 |
 |---|---|---|
-| **읽힘** | ✅ 경로 정상 → 다른 주소 실패는 **그 AP 가 그 주소를 디코드 안 함** | 트레이스 블록 결과를 그대로 신뢰. 읽히면 **DM 우회 성공** |
-| **못 읽음** | ❌ **우리 `mem_read32` 가 문제다** | 주소 탓하기 전에 이걸 먼저 고친다 |
+| **A. SEGGER 네이티브** | J-Link Plus + `RISCV_UseNexusLegacyMode=1` + `Set*BaseAddr`. **Ozone 으로 최소 실험** — SEGGER 의 legacy SiFive 디코더를 재사용할 수 있으면 공수가 훨씬 적다 | DM/SBA 정상화가 선행 |
+| **B. raw MEM-AP 직접 제어** | 트레이스 레지스터를 AP 로 직접 read/write. J-Link 의 RISC-V CPU 연결을 우회 | ← 지금 P0 |
 
-덤으로: 코드 영역이 읽히면 **펌웨어 이미지를 JTAG 으로 덤프할 수 있다** —
-`ASK.md` 의 ELF 요청과 별개로 디코더용 바이너리를 자력 확보하는 길이 열린다.
+**둘 중 하나를 버리지 않는다.** A 는 디코더 공수를 크게 줄이고, B 는 블로커를 우회한다.
 
 ### P0' — 옛 P0 (완료)
 
@@ -561,8 +638,20 @@ CoreBase 후보에 **`0x0` 이 맨 앞**에 있다 — SEGGER 예제가 `0x0` �
 
 ### P4 — 커버리지 파이프라인 (블로커 해소 후)
 
+**★ 캡처마다 반드시 기록할 것** (없으면 커버리지 수치를 믿을 수 없다):
+`wrap 여부` · `TE overflow/stall 비트` · `sink empty/flush 완료` ·
+`실제 저장 바이트 수` · `source/hart 식별` · `capture 시작·종료 시점`
+
+**raw capture 는 짧은 workload 부터.** 고정 NVMe 명령 1개 → 캡처 시간을 단계적으로
+늘리며 **wrap/overflow 가 안 난 구간만** T32 와 비교한다. 버퍼 크기 충분 여부는
+그 실측 뒤에 정한다.
+
+**초기 구현은 `hcore`/TE0 하나로 제한한다.** T32 는 TE 4개를 funnel 에 물리지만
+J-Link 은 한 번에 한 hart 가 기본이다. 4-source 의 SRC 구분과 공유 버퍼 압력은
+나중에 따로 검증한다.
+
 ```
-1. TE/ETB 포인터 로직        T32 스크립트와 동일 순서. 32비트 R/W 만 필요
+1. TE/ETB 포인터 로직        T32 legacy 오프셋(+0x1C/+0x20/+0x24) 그대로. 32비트 R/W 만
 2. raw Nexus 바이트 덤프     .bin
 3. 디코더                    Nexus 메시지 + 디스어셈블리 → PC 시퀀스
 4. PC → BB/함수 매핑         ★ 기존 퍼저에 이미 있음 (Ghidra RISC-V export 만 새로)

@@ -59,7 +59,7 @@ Timeout waiting for debug module to become active     (dmcontrol.dmactive 안 �
 | 시도 | 결과 |
 |---|---|
 | `CORESIGHT_AddAP`(6개) + `SetIndexAPBAPToUse=0` + `SetCoreBaseAddr=0x81480000` | dmactive 타임아웃 |
-| `SetCoreBaseAddr` 후보 전수 (`0x0`, `0x81480000`, `0x81481000`, …) × APB-AP 인덱스 전수 | 전부 실패 |
+| `SetCoreBaseAddr` = `0x81480000` / `0x81481000` × APB-AP 인덱스 일부 | 전부 실패 (**전수 스윕은 아직 미실행**) |
 | 장치명 `E76` / `E76-MC` / `RISC-V` (AP 맵 수동지정 없이) | `Could not find supported CPU` |
 | 장치명 `E76ARTY` | `Target is not connected` |
 | MEM-AP 로 `0x81480000` 직접 읽기 (TAR/DRW) | DRW 읽기 실패 |
@@ -90,9 +90,9 @@ INTERCOM.execute ... sys.config.coredebug.base &core_base
 > APB/AXI/AHB types exactly, so the AP map and addresses are correct.
 >
 > **The problem.** `JLINKARM_Connect()` fails with
-> *"Timeout waiting for debug module to become active"*. We swept
-> `CORESIGHT_SetIndexAPBAPToUse` over all four APB-APs and
-> `CORESIGHT_SetCoreBaseAddr` over several candidates including `0x0` — none work.
+> *"Timeout waiting for debug module to become active"*. We tried several
+> `CORESIGHT_SetIndexAPBAPToUse` / `CORESIGHT_SetCoreBaseAddr` combinations
+> without success (an exhaustive sweep is still in progress).
 > Selecting device `E76` / `E76-MC` without a manual AP map gives
 > *"Could not find supported CPU"*.
 >
@@ -136,6 +136,11 @@ INTERCOM.execute ... sys.config.coredebug.base &core_base
 >    아니면 **AXI-AP 로도 접근 가능**합니까? (SBA 는 DM 을 거치므로 우리가 막힙니다)
 > 5c. 그 버스 도메인에 **별도 클럭/전원 인에이블**이 필요합니까?
 > 6. T32 가 `SYStem.Option.DAPSYSPWRUPREQ OFF` 로 설정된 이유가 있습니까?
+> 6b. 이 칩의 Nexus 는 **legacy SiFive Insight Nexus** 입니까, 아니면
+>    **비준된 N-Trace 1.0** 입니까? (T32 는 `NEXUS.Type SiFive`, sink 오프셋이
+>    `+0x1C/+0x20/+0x24` 로 비준본과 다릅니다)
+> 6c. sink 의 **wrap / overflow 정책**은? stop-on-wrap 이 있습니까?
+>    TE 의 overflow/stall 상태 비트는 어디서 읽습니까?
 > 7. **트레이스 인에이블 설정**은 어느 스크립트에 있습니까?
 >    (`NexusTracedatadump.cmm` 에는 **끄는 것만** 있습니다. TE 켜기,
 >    `TECTRL` 비트 정의, BTM/HTM 선택, 주소 범위 필터, sync 주기)

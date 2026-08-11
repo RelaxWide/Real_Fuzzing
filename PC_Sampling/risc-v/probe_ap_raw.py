@@ -184,8 +184,8 @@ class Dap:
         self.last['csw'] = csw
         # ★ 버그였다: CSW 가 에러 센티널(0x80000000)이어도 그대로 가공해
         #   CSW 에 써 넣고 있었다 → AP 를 우리 손으로 망가뜨린다.
-        if is_error(csw):
-            self.last['why'] = f"CSW 읽기 실패/에러값 {hx(csw)} — 쓰지 않고 중단"
+        if not csw_usable(csw):
+            self.last['why'] = f"CSW 읽기 실패/의심값 {hx(csw)} — 쓰지 않고 중단"
             return None
         # Size=2(word), AddrInc=off. 나머지 비트(Prot/SPIDEN 등)는 보존한다.
         if not self.ap_write(ap_base, OFF_CSW, (csw & ~0x37) | 0x02):
@@ -200,7 +200,7 @@ class Dap:
             # ★ 되읽기 값이 정보다. 상위 비트가 잘려 있으면 그 AP 의
             #   주소 디코드 폭이 좁다는 뜻 — 그 주소는 그 AP 로 못 간다.
             self.last['why'] = f"TAR 불일치 쓴값={hx(addr)} 읽은값={hx(back)}"
-            if back is not None and not is_error(back):
+            if back is not None and back != SUSPECT:
                 lost = (addr ^ back) & 0xFFFFFFFF
                 self.last['why'] += f"  (달라진 비트 {hx(lost)})"
                 if back == (addr & back):
@@ -279,7 +279,8 @@ def decode_csw(v):
         return f"{hx(v)}  ← API 에러 센티널"
     dev = bool(v & (1 << 6))
     parts = [
-        f"DeviceEn={int(dev)}" + ("  ★★ 0 = 버스 포트 꺼짐" if not dev else ""),
+        f"DeviceEn={int(dev)}" + ("  ← 이 MEM-AP 는 지금 트랜잭션을 낼 수 없다"
+                                  if not dev else "  ← 트랜잭션 발행 가능"),
         f"SDeviceEn/SPIDEN={int(bool(v & (1 << 23)))}",
         f"DbgSwEnable={int(bool(v & (1 << 31)))}",
         f"TrInProg={int(bool(v & (1 << 7)))}",
@@ -296,13 +297,30 @@ def decode_cfg(v):
             f"LargeData={(v >> 2) & 1}")
 
 
-def is_error(v):
-    """J-Link API 에러 센티널. 값이 아니다.
+# ── 문맥별 유효성 검사 ──────────────────────────────────────────────
+#   ★ 하나의 is_error() 로 전부 판정하면 안 된다. 레지스터마다 "정상인 값" 이
+#     다르다. 특히 CSW 는 0 이나 bit31 이 선 값도 **정상일 수 있다.**
+#     `0x80000000` = DLL 오류 센티널이라는 것도 **API 계약으로 확인된 바 없다** —
+#     재시도로 사라지는 관측이 있을 뿐이다. 그래서 '의심' 으로만 다룬다.
+SUSPECT = 0x80000000
 
-    `0x80000000` 은 DLL 이 돌려주는 에러 코드다(브링업 초기부터 반복 관측).
-    간헐적으로 뒤쪽 AP 에 붙는다 — **AP 가 없다는 뜻이 아니다.**
-    """
-    return v is None or v in (0x80000000, 0xFFFFFFFF, 0)
+
+def idr_valid(v):
+    """AP IDR: 0 / 0xFFFFFFFF 는 AP 없음. CLASS 필드가 있어야 한다."""
+    if v is None or v in (0x00000000, 0xFFFFFFFF, SUSPECT):
+        return False
+    return ((v >> 13) & 0xF) != 0
+
+
+def csw_usable(v):
+    """CSW: 값 자체로 정오를 못 가린다. **쓰기 전에 안전한지**만 본다.
+    읽기 실패(None)와 의심값(0x80000000)일 때만 가공·기입을 막는다."""
+    return v is not None and v != SUSPECT
+
+
+def is_error(v):
+    """(구) 범용 판정 — IDR 문맥에서만 쓴다. 신규 코드는 위 두 개를 쓸 것."""
+    return not idr_valid(v)
 
 
 def decode_idr(v, declared=None):
@@ -346,11 +364,12 @@ def enumerate_aps(dap):
         csw = dap.ap_read(base, OFF_CSW, retry=2)
         print(f"      CSW = {decode_csw(csw)}")
         print(f"      CFG = {decode_cfg(dap.ap_read(base, OFF_CFG, retry=2))}")
-        if csw is not None and not is_error(csw) and not (csw & (1 << 6)):
-            print("            ⚠ DeviceEn=0 → 이 AP 로는 메모리 접근이 **원천 불가**")
-        if not is_error(idr):
+        if csw_usable(csw) and not (csw & (1 << 6)):
+            print("            ⚠ DeviceEn=0 → 이 AP 는 **지금** 메모리 트랜잭션을 못 낸다.")
+            print("               원인 후보: 인증 입력 / 전원 / 클럭 / reset / integration 신호")
+        if idr_valid(idr):
             real.append((name, base, idr))
-        dev_en[name] = (None if is_error(csw) else bool(csw & (1 << 6)))
+        dev_en[name] = (None if not csw_usable(csw) else bool(csw & (1 << 6)))
     return real, dev_en
 
 
@@ -430,40 +449,145 @@ TRACE_ADDRS = [
 
 
 def read_addrs(dap, aps, addrs):
-    """임의 절대주소를 **모든 AP 로** 읽어 어느 AP 가 그 주소를 디코드하는지 본다.
+    """임의 절대주소를 **모든 AP 로** 읽는다. 값을 그대로 기록만 한다.
 
-    ★ 왜 결정적인가. T32 는 트레이스 블록에 `SB:` (System Bus = RISC-V SBA)로
-      접근한다. SBA 는 **DM 의 일부**라 DM 이 필요하다 — 우리가 막힌 지점이다.
-      그런데 AXI-AP 는 시스템 메모리로 가는 **독립 경로**다. 같은 버스 주소를
-      AXI-AP 로 읽을 수 있으면 **DM 없이 트레이스 파이프라인을 세울 수 있다.**
-      그러면 지금 블로커를 통째로 우회한다.
+    ★ 판정은 여기서 하지 않는다. `verdict_addrs()` 가 엄격한 기준으로 한다.
+      이전 판은 `v != 0xFFFFFFFF` 를 "읽힘" 으로 쳤다 — **전 주소가 0 이어도
+      전부 성공으로 보고된다.** 실제로 전 AP·전 주소가 똑같이 "닿음" 으로
+      나온 것이 그 증상일 수 있다.
     """
-    print(f"\n{'=' * 66}\n [T] 트레이스 블록 — 모든 AP 로 시도 (DM 우회 가능성)\n{'=' * 66}")
-    print("  T32 는 SB:(=SBA, DM 필요)로 접근한다. AXI/AHB-AP 는 독립 경로다.")
-    print("  하나라도 읽히면 **DM 블로커를 우회**할 수 있다.\n")
-    hits = {}
+    print(f"\n{'=' * 66}\n [T] 주소 읽기 — 모든 AP × 모든 주소 (값만 기록)\n{'=' * 66}")
+    res = {}                      # res[ap][addr] = (value|None, sticky_err)
     for addr, label in addrs:
-        print(f"  0x{addr:08X}  {label}")
+        print(f"\n  0x{addr:08X}  {label}")
         for n, b in aps:
             dap.clear_sticky()
             v = dap.mem_read32(b, addr)
-            ok = v is not None and v not in (0xFFFFFFFF,)
+            st = dap.sticky()
+            err = 'STICKYERR' in st or 'STICKYORUN' in st
+            res.setdefault(n, {})[addr] = (v, err)
             if v is None:
-                why = dap.last.get('why', '?')
-                print(f"      {n:7s} = 실패   {why}")
-                print(f"                {dap.sticky()}")
+                print(f"      {n:7s} = 실패   {dap.last.get('why', '?')}")
             else:
-                print(f"      {n:7s} = {hx(v)}" + ("   ★ 읽힘" if ok else ""))
-            if ok:
-                hits.setdefault(n, []).append((addr, v))
-    return hits
+                print(f"      {n:7s} = {hx(v)}" + ("   ⚠STICKY" if err else ""))
+    return res
+
+
+def verdict_addrs(res, ctrl_addrs, trace_addrs, valid_sessions):
+    """★ **판정.** 값이 나왔다고 성공이 아니다. 아래를 전부 만족해야 한다.
+
+      1. 실패(None)가 없다
+      2. sticky 에러가 없다
+      3. **주소마다 값이 다르다** ← 가장 중요.
+         전 주소가 같은 값이면 버스가 응답한 게 아니라
+         **고정 패턴(0, 0xFFFFFFFF, 미디코드 기본값)** 을 보고 있는 것이다
+      4. 값이 자명한 상수(0, 0xFFFFFFFF)만은 아니다
+
+    3번이 핵심이다. "전 AP 가 전 주소를 읽었다" 는 결과는 **진짜 성공** 이거나
+    **전부 같은 쓰레기값** 이거나 둘 중 하나인데, 값의 다양성으로만 갈린다.
+    """
+    out = {}
+    for n, m in res.items():
+        vals = {a: v for a, (v, _e) in m.items()}
+        errs = any(e for _v, e in m.values())
+        fails = [a for a, v in vals.items() if v is None]
+        got = {a: v for a, v in vals.items() if v is not None}
+        uniq = set(got.values())
+        trivial = uniq <= {0x00000000, 0xFFFFFFFF}
+        out[n] = {
+            'fails': fails, 'sticky': errs, 'n_uniq': len(uniq),
+            'trivial': trivial, 'vals': got,
+            'pass': (not fails and not errs and len(uniq) > 1 and not trivial),
+        }
+    return out
+
+
+def print_verdict_addrs(v, ctrl_addrs, trace_addrs, valid_sessions):
+    bar = '=' * 70
+    print(f"\n{bar}\n ★★★ 판정 — 주소 읽기\n{bar}")
+    print("  통과 조건 (전부 만족해야 함):")
+    print("    ① 실패 없음  ② sticky 에러 없음  ③ **주소마다 값이 다름**")
+    print("    ④ 값이 0/0xFFFFFFFF 만은 아님")
+    print("  ③ 이 핵심이다 — 전 주소가 같은 값이면 버스가 응답한 게 아니라")
+    print("     미디코드 기본값을 보고 있는 것이다.\n")
+
+    ca = {a for a, _l in ctrl_addrs}
+    ta = {a for a, _l in trace_addrs}
+    any_pass = False
+    for n, r in v.items():
+        mark = "✅ 통과" if r['pass'] else "❌ 불통과"
+        print(f"  {n:7s} {mark}   고유값 {r['n_uniq']}종"
+              + (f"  실패 {len(r['fails'])}개" if r['fails'] else "")
+              + ("  sticky" if r['sticky'] else "")
+              + ("  **값이 전부 0 또는 0xFFFFFFFF**" if r['trivial'] else ""))
+        if r['pass']:
+            any_pass = True
+            c = {a: x for a, x in r['vals'].items() if a in ca}
+            t = {a: x for a, x in r['vals'].items() if a in ta}
+            if c:
+                print("           양성대조(펌웨어 코드): "
+                      + "  ".join(f"0x{a:08X}={hx(x)}" for a, x in sorted(c.items())))
+            if t:
+                print("           트레이스 블록        : "
+                      + "  ".join(f"0x{a:08X}={hx(x)}" for a, x in sorted(t.items())))
+
+    print(f"\n{bar}\n 결론\n{bar}")
+    if valid_sessions < 3:
+        print(f"  ⚠ 유효 세션 {valid_sessions}/3 미만 — **결론 내지 말 것.**")
+        return
+    if not any_pass:
+        print("  ❌ 어느 AP 도 통과하지 못했다.")
+        print("     값이 나왔더라도 주소마다 동일하면 그건 **읽은 게 아니다.**")
+        print("     → 우리 mem_read32 경로 자체를 먼저 의심해야 한다.")
+        return
+    print("  ✅ 통과한 AP 가 있다. 다만 **여기서 확정되는 것은 다음뿐이다:**")
+    print("     · 그 AP 로 그 주소들에서 서로 다른 값이 안정적으로 읽힌다")
+    print()
+    print("  ⚠ **아직 확정되지 않은 것** (실측 전에 결론 금지):")
+    print("     · 읽은 값이 **맞는 값인지** — 예상값·펌웨어 바이너리·T32 와 대조 필요")
+    print("     · 6개 AP 가 **독립 AP 인지** — 같은 값이면 alias 일 수 있다 (아래 [X])")
+    print("     · TE/sink 를 **제어**할 수 있는지 — 읽기와 쓰기는 다른 문제다")
+    print("     · 트레이스를 **실제로 받아낼 수 있는지** — wrap/overflow 미검증")
+
+
+def alias_check(dap, aps):
+    """★ 6개 AP 가 **정말 독립인가**, 아니면 같은 AP 의 alias 인가.
+
+    IDR 이 서로 달랐던 것은 "선택에 따라 타입이 달라진다" 까지만 말해준다.
+    같은 IDR 을 가진 APB-AP 4개가 실은 하나일 가능성은 IDR 로 못 가른다.
+
+    방법: AP 마다 **서로 다른 패턴**을 TAR 에 쓴 뒤, 전부 되읽는다.
+          alias 면 나중에 쓴 값이 앞 AP 에서도 보인다.
+    """
+    print(f"\n{'=' * 66}\n [X] AP alias 검사 — 6개가 정말 독립인가\n{'=' * 66}")
+    pat = {n: 0xA0000000 | (i << 16) | i for i, (n, _b) in enumerate(aps)}
+    for n, b in aps:
+        dap.clear_sticky()
+        dap.ap_write(b, OFF_TAR, pat[n])
+    print("  각 AP 의 TAR 에 고유 패턴을 쓴 뒤 전부 되읽는다:")
+    back, alias = {}, False
+    for n, b in aps:
+        dap.clear_sticky()
+        back[n] = dap.ap_read(b, OFF_TAR)
+        m = "✅ 자기 패턴" if back[n] == pat[n] else "⚠ 불일치"
+        who = [k for k, p in pat.items() if p == back[n]]
+        if who and who[0] != n:
+            m = f"★ **{who[0]} 의 패턴** → alias 의심"
+            alias = True
+        print(f"    {n:7s} 쓴값={hx(pat[n])}  읽은값={hx(back[n])}   {m}")
+    if alias:
+        print("\n  ★★ **AP 가 독립이 아니다.** 여러 이름이 같은 AP 를 가리킨다.")
+        print("     → 'AP 6개 실재' 결론을 철회하고 AP 맵을 다시 세워야 한다.")
+    else:
+        print("\n  ✅ 각 AP 가 자기 패턴을 유지 → **독립 AP 로 볼 근거가 생겼다.**")
+    return {'alias': alias, 'pat': pat, 'back': back}
 
 
 def one_session(a):
     lk = Link(core_base=a.core_base, hart=a.hart, device=a.device,
               serial=a.serial, ap_count=getattr(a, 'ap_count', None))
     out = {'valid': False, 'real_aps': [], 'dm': {}, 'rom': {},
-           'addr_hits': {}, 'device_en': {}}
+           'addr_res': {}, 'addr_list': [], 'alias': None, 'device_en': {}}
     try:
         with lk:
             # ★ connect 성공을 요구하지 않는다. AP 접근에 필요한 건 DAP 전원뿐.
@@ -509,7 +633,10 @@ def one_session(a):
                     lst = CONTROL_ADDRS
                 else:
                     lst = [(int(x, 0), '') for x in a.addrs.split(',') if x.strip()]
-                out['addr_hits'] = read_addrs(dap, usable, lst)
+                out['addr_res'] = read_addrs(dap, usable, lst)
+                out['addr_list'] = lst
+            if usable and not a.no_alias:
+                out['alias'] = alias_check(dap, usable)
 
             if a.dm and usable:
                 print(f"\n{'=' * 66}\n [4] DM 읽기 (추정 주소 0x{a.dm:X})\n{'=' * 66}")
@@ -533,6 +660,7 @@ def main():
     ap.add_argument('--sessions', type=int, default=3,
                     help='독립 세션 반복. 전 세션 일치값만 인정한다')
     ap.add_argument('--no-rom', action='store_true', help='ROM 테이블 워크 생략')
+    ap.add_argument('--no-alias', action='store_true', help='AP alias 검사 생략')
     ap.add_argument('--addrs', default=None,
                     help="임의 절대주소를 **모든 AP 로** 읽는다. "
                          "'fw'=펌웨어 코드(양성 대조만), 'trace'=양성대조+트레이스 블록, "
@@ -581,51 +709,32 @@ def main():
     elif len(allv) > 1:
         print(f"\n  ✅ IDR 값이 서로 다르다({len(allv)}종) → **SELECT 가 실제로 AP 를 전환한다.**")
 
-    th = {}
+    # ── 주소 읽기 판정 (엄격 기준) ──────────────────────────────
+    merged, lst = {}, []
     for r in valid:
-        for n, lst in (r.get('addr_hits') or {}).items():
-            th.setdefault(n, set()).update(a_ for a_, _v in lst)
-    if th:
-        ctrl_set = {a_ for a_, _l in CONTROL_ADDRS}
-        trace_set = {a_ for a_, _l in TRACE_ADDRS}
-        ctrl_ok = {n for n, ad in th.items() if ad & ctrl_set}
-        trace_ok = {n for n, ad in th.items() if ad & trace_set}
-        print(f"\n{'=' * 66}\n ★ 양성 대조 (펌웨어 코드 영역)\n{'=' * 66}")
-        print(f"    읽은 AP: {sorted(ctrl_ok) if ctrl_ok else '없음'}")
-        if ctrl_ok:
-            print("    ✅ **mem_read32 경로가 정상이다.** 다른 주소의 실패는")
-            print("       '그 주소가 그 AP 에서 디코드되지 않는다' 는 뜻이다.")
-        else:
-            print("    ❌ 코드 영역조차 못 읽는다 → **우리 mem_read32 가 문제다.**")
-            print("       주소 탓하기 전에 이걸 먼저 고쳐야 한다.")
-        print(f"\n    트레이스 블록을 읽은 AP: {sorted(trace_ok) if trace_ok else '없음'}")
-        print(f"\n{'=' * 66}\n ★★ 주소를 읽은 AP 전체\n{'=' * 66}")
-        for n, addrs in th.items():
-            print(f"    {n}: " + ", ".join(f"0x{x:08X}" for x in sorted(addrs)))
-        print("\n  → **DM 없이 트레이스 파이프라인을 세울 수 있다.** 블로커 우회.")
-        print("     이 AP 를 RISCV_Set*BaseAddr 의 APIndex 로 쓰거나,")
-        print("     raw AP 접근으로 ETB 드레인을 직접 구현한다.")
+        lst = r.get('addr_list') or lst
+        for n, m in (r.get('addr_res') or {}).items():
+            for ad, (v, e) in m.items():
+                merged.setdefault(n, {}).setdefault(ad, []).append((v, e))
+    if merged:
+        # 세션마다 값이 흔들리면 그 주소는 신뢰하지 않는다
+        stable = {}
+        for n, m in merged.items():
+            stable[n] = {}
+            for ad, obs in m.items():
+                vs = {v for v, _e in obs}
+                er = any(e for _v, e in obs)
+                stable[n][ad] = ((vs.pop() if len(vs) == 1 else None), er)
+        ca = [x for x in lst if x[0] in {a_ for a_, _l in CONTROL_ADDRS}]
+        ta = [x for x in lst if x[0] in {a_ for a_, _l in TRACE_ADDRS}]
+        v = verdict_addrs(stable, ca, ta, len(valid))
+        print_verdict_addrs(v, ca, ta, len(valid))
 
-    de = {}
-    for r in valid:
-        for n, v in (r.get('device_en') or {}).items():
-            de.setdefault(n, []).append(v)
-    if de:
-        print(f"\n{'=' * 66}\n ★ CSW.DeviceEn — 디버그 접근 제어(secure JTAG) 판정\n{'=' * 66}")
-        for n, vs in de.items():
-            print(f"    {n:7s} DeviceEn = {vs}")
-        flat = [v for vs in de.values() for v in vs if v is not None]
-        if flat and not any(flat):
-            print("\n  ★★ **전 AP DeviceEn=0.** 버스 포트가 하드웨어로 꺼져 있다.")
-            print("     소프트웨어로 되돌릴 수 없다. 원인은 둘 중 하나다:")
-            print("       (a) SiFive Insight 의 디버그 접근 제어(퓨즈/패스워드/PKI) 잠금")
-            print("       (b) 해당 버스 도메인에 전원/클럭이 안 들어와 있음")
-            print("     → 우리 코드로 더 할 수 있는 게 없다. ASK.md 로 넘어간다.")
-        elif flat and all(flat):
-            print("\n  ✅ DeviceEn=1 — AP 버스 포트는 **열려 있다.**")
-            print("     잠금이 아니다. 실패 원인은 주소/코드 쪽이다.")
-        elif flat:
-            print("\n  ⚠ AP 마다 다르다 → DeviceEn=1 인 AP 로만 진행할 것.")
+    al = [r['alias']['alias'] for r in valid if r.get('alias')]
+    if al:
+        print(f"\n  AP alias 검사: " +
+              ("★ **alias 의심** — 독립 AP 가 아니다" if any(al)
+               else "✅ 전 세션에서 각 AP 가 자기 패턴 유지"))
 
     print(f"\n{'=' * 66}\n 다음\n{'=' * 66}")
     if solid:
