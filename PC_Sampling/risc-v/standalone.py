@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.27  --prot: 양성대조 붙인 APB Prot 스윕"
+VERSION = "standalone 2026-08-11.28  --ident: ROM 테이블 전제 검증 + 주소공간 스캔"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -642,6 +642,80 @@ def pwr_probe(d, dm_addr):
 #     하는 곳이다(실측 확인됨). 판정:
 #       CID0 = 0D 인데 dmstatus 만 기본값  →  그 Prot 는 유효, DM 이 없다
 #       CID0 도 깨짐                       →  그 Prot 자체가 무효. 판정 불가
+
+# ★★★ --ident : 검증 없이 깔고 온 전제를 친다.
+#
+#   우리는 "CID 클래스 9 = ROM 테이블" 이라고 읽고, 그래서 오프셋 0 의
+#   0x81480003 을 **ROM 엔트리**로 해석했다. 그런데 **클래스 9 는 모든
+#   CoreSight 컴포넌트**를 뜻한다 — ROM 테이블만이 아니다.
+#   ROM 테이블이라면 DEVARCH(0xFBC).ARCHID = 0x0AF7 이어야 한다.
+#   아니면 0x81480003 은 그냥 레지스터 값이고 "DM 은 0x81480000" 이라는
+#   추론 전체가 무너진다.
+#
+#   함께: PIDR 로 컴포넌트의 정체(설계자/부품번호)를 읽고,
+#         APBAP1 주소공간을 성기게 훑어 **응답하는 곳이 ROM 말고 또 있나** 본다.
+ARCHID_ROM = 0x0AF7
+
+# 성긴 스캔 격자. 응답이 default slave 라인이 아닌 곳만 보고한다.
+SCAN_ADDRS = [0x0, 0x1000, 0x2000, 0x10000, 0x100000, 0x1000000,
+              0x10000000, 0x40000000, 0x80000000, 0x81000000, 0x81400000,
+              0x81480000, 0x81481000, 0x81500000, 0x81592000,
+              0xC0000000, 0xC81000, 0xE0000000, 0xFD000000, 0xFD180000]
+
+
+def ident_probe(d):
+    out = {'aps': [], 'scan': []}
+    for name, apbase, _t in AP_MAP:
+        if not name.startswith('APBAP'):
+            continue
+        base = d.apr(apbase, OFF_BASE)
+        if base is None or base == 0xFFFFFFFF or not (base & 1):
+            continue
+        rb = base & 0xFFFFF000
+        csw = d.apr(apbase, OFF_CSW)
+
+        def rd(off):
+            v, _ = d.mem32(apbase, rb + off, csw)
+            return v
+
+        cid1 = rd(0xFF0 + 4)
+        if cid1 is None:
+            continue
+        devarch, devtype, devid = rd(0xFBC), rd(0xFCC), rd(0xFC8)
+        pid = [rd(0xFE0), rd(0xFE4), rd(0xFE8), rd(0xFEC), rd(0xFD0)]
+        r = {'ap': name, 'cls': (cid1 >> 4) & 0xF,
+             'DEVARCH': hx(devarch), 'DEVTYPE': hx(devtype), 'DEVID': hx(devid)}
+        if devarch is not None and (devarch & (1 << 20)):        # PRESENT
+            aid = devarch & 0xFFFF
+            r['ARCHID'] = f"0x{aid:04X}"
+            r['is_rom'] = (aid == ARCHID_ROM)
+        else:
+            r['ARCHID'] = '없음'
+            r['is_rom'] = False
+        if all(x is not None for x in pid):
+            part = ((pid[1] & 0xF) << 8) | (pid[0] & 0xFF)
+            des = ((pid[2] & 0x7) << 4) | ((pid[1] >> 4) & 0xF)
+            cont = pid[4] & 0xF
+            r['PART'] = f"0x{part:03X}"
+            r['DESIGNER'] = f"0x{((cont << 7) | des):03X}"
+        out['aps'].append(r)
+        if csw is not None:
+            d.apw(apbase, OFF_CSW, csw)
+
+    # APBAP1 주소공간 성긴 스캔 — ROM 말고 응답하는 곳이 있나
+    apbase = AP_MAP[0][1]
+    csw = d.apr(apbase, OFF_CSW)
+    for addr in SCAN_ADDRS:
+        v, _ = d.mem32(apbase, addr, csw)
+        if v is None:
+            continue
+        if is_default_line(addr, v):
+            continue
+        out['scan'].append((addr, hx(v)))
+    if csw is not None:
+        d.apw(apbase, OFF_CSW, csw)
+    return out
+
 def prot_probe2(d, dm_addr):
     apbase = AP_MAP[0][1]
     base = d.apr(apbase, OFF_BASE)
@@ -873,6 +947,10 @@ def session(a, idx):
                 out['discover'] = discover(d)
             return out
 
+        if getattr(a, 'ident', False):
+            out['ident'] = ident_probe(d)
+            return out
+
         if getattr(a, 'prot', False):
             out['prot2'] = prot_probe2(d, a.dmaddr)
             return out
@@ -934,6 +1012,8 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--ident', action='store_true',
+                    help='* DEVARCH 로 ROM 테이블 전제를 검증 + APBAP1 주소공간 스캔')
     ap.add_argument('--prot', action='store_true',
                     help='* APB Prot 스윕. Prot 마다 ROM CIDR0 를 양성대조로 같이 읽는다')
     ap.add_argument('--prepare', action='store_true',
@@ -1016,6 +1096,34 @@ def main():
     print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
+
+    if a.ident:
+        print(f"\n{'=' * 70}\n [IDENT] ROM 테이블 전제 검증 + 주소공간 스캔\n{'=' * 70}")
+        print("  CID 클래스 9 는 **모든** CoreSight 컴포넌트다 - ROM 만이 아니다.")
+        print("  ROM 이라면 DEVARCH.ARCHID = 0x0AF7. 아니면 오프셋0 의 0x81480003 은")
+        print("  ROM 엔트리가 아니라 그냥 레지스터 값이고, 'DM 은 0x81480000' 이")
+        print("  통째로 무너진다.\n")
+        r0 = session(a, 0)
+        if not r0.get('ok'):
+            print("---8<---")
+            print(f"무효 세션 (AP일치={r0.get('ap_match')}/6) - 다시 실행")
+            print("---8<---")
+            return 6
+        ident = r0.get('ident', {})
+        print("---8<---")
+        roms = 0
+        for r in ident.get('aps', []):
+            roms += int(r['is_rom'])
+            print(f"{r['ap']} cls={r['cls']} DEVARCH={r['DEVARCH']} "
+                  f"ARCHID={r['ARCHID']}{' =ROM테이블' if r['is_rom'] else ' *ROM아님*'} "
+                  f"DEVTYPE={r['DEVTYPE']} PART={r.get('PART')} "
+                  f"DESIGNER={r.get('DESIGNER')}")
+        sc = ident.get('scan', [])
+        print(f"스캔 {len(sc)}곳 응답: "
+              + (", ".join(f"0x{a:08X}={v}" for a, v in sc) if sc else "없음(전부 기본값)"))
+        print("VERDICT:", "ROM_CONFIRMED" if roms else "NOT_A_ROM_TABLE")
+        print("---8<---")
+        return 0 if roms else 6
 
     if a.prot:
         print(f"\n{'=' * 70}\n [PROT] APB Prot x 양성대조\n{'=' * 70}")
