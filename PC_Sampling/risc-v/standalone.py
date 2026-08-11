@@ -41,7 +41,12 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.15  recover 확장 (명령셋·device)"
+VERSION = "standalone 2026-08-11.16  --link 물리계층 (속도 스윕)"
+
+# ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
+#   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
+#   값이 뒤섞이는 건 **링크 계층 불안정**의 신호다 → 소프트웨어 조합
+#   스윕으로는 못 고친다. 속도부터 낮춰본다(지금껏 10MHz 만 썼다).
 
 # ★ NOT_FOUND 후 확인: standalone 이 원래 경로와 **명령이 다르다.**
 #   0x11013913 을 읽던 sfe76_link 는 AddAP 뒤에 이 셋을 더 보냈다:
@@ -77,6 +82,24 @@ VERSION = "standalone 2026-08-11.15  recover 확장 (명령셋·device)"
 EXPECT_DPIDR = 0x11013913          # 이 타깃에서 기대하는 값
 EXPECT_AP_IDR = {0x10000: 0x09130006, 0x20000: 0x09130006, 0x30000: 0x09130004,
                  0x40000: 0x09130001, 0x50000: 0x09130006, 0x60000: 0x09130006}
+
+
+def classify_dpidr(v):
+    """읽힌 값의 정체를 분류한다. 전부 '못 읽음' 이지만 이유가 다르다."""
+    if v is None:
+        return "읽기 실패"
+    if v == EXPECT_DPIDR:
+        return "★ 유효 (DPv3/SiFive)"
+    if v == 0xFFFFFFFF:
+        return "라인 계속 1 — 응답 없음"
+    if v == 0x00000001:
+        return "스캔 실패 (0만 읽고 RAO 만 1)"
+    if v == 0x80000000:
+        return "J-Link API 에러 센티널 (데이터 아님)"
+    ver = (v >> 12) & 0xF
+    if ver in (1, 2, 3):
+        return f"DPv{ver} 형식이나 기대값과 다름"
+    return f"VERSION={ver} (reserved) — DPIDR 아님"
 
 
 def dpidr_valid(v, strict=True):
@@ -408,7 +431,8 @@ def session(a, idx):
                 pass
         jl.exec_command(f"SetcJTAGInitMode = {mode}")
         jl.set_tif(TIF_CJTAG)
-        jl.set_speed(SPEED_KHZ)
+        spd = getattr(a, 'speed', SPEED_KHZ)
+        jl.set_speed(spd)
         for i, (_n, addr, typ) in enumerate(AP_MAP):
             jl.exec_command(f"CORESIGHT_AddAP = Index={i} Type={typ} BaseAddr=0x{addr:X}")
         if getattr(a, 'full_cmds', True):
@@ -421,7 +445,7 @@ def session(a, idx):
                 except Exception:
                     pass
         try:
-            jl.connect(a.device, speed=SPEED_KHZ)
+            jl.connect(a.device, speed=spd)
             out['connect'] = True
         except Exception as e:
             out['connect'] = False
@@ -508,6 +532,9 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--link', action='store_true',
+                    help='★ 물리 계층 — 원래 설정 고정 후 cJTAG 모드 × 속도 스윕')
+    ap.add_argument('--speeds', default="10000,4000,2000,1000,500")
     ap.add_argument('--recover', action='store_true',
                     help='★ 유효 DPIDR 조건을 찾는다 — 스크립트 유무 × cJTAG 모드')
     ap.add_argument('--no-tap-script', action='store_true',
@@ -562,6 +589,37 @@ def main():
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
 
+    if a.link:
+        print(f"\n{'=' * 70}\n [LINK] 물리 계층 — 속도를 낮춰본다"
+              f"\n{'=' * 70}")
+        print("  DPIDR 이 실행마다 FFFFFFFF / 6BA0009D / 80000000 로 흔들린다.")
+        print("  설정이 원인이면 조합마다 일관돼야 한다 → **링크 불안정** 신호다.")
+        print("  지금껏 10MHz 만 썼다. 낮춰본다.")
+        print("  ⚠ 타깃 전원 사이클을 먼저 하는 것을 권한다.\n")
+        print("---8<---")
+        a.no_tap_script, a.full_cmds, a.device = True, True, 'RISC-V'
+        speeds = [int(x) for x in a.speeds.split(',') if x.strip()]
+        found = None
+        for mode in (0, 1):
+            for spd in speeds:
+                a.cjtag_mode = mode
+                a.speed = spd
+                got = [session(a, i).get('DPIDR') for i in range(min(a.sessions, 3))]
+                hit = sum(1 for g in got if g == f"{EXPECT_DPIDR:08X}")
+                kinds = sorted({classify_dpidr(int(g, 16) if g and g != '----' else None)
+                                for g in got})
+                print(f"mode={mode} {spd:>5d}kHz  {','.join(g or '-' for g in got)}"
+                      + (f"  ★ 유효 {hit}/{len(got)}" if hit else f"  [{kinds[0]}]"))
+                if hit and not found:
+                    found = f"mode={mode} {spd}kHz"
+                time.sleep(0.3)
+        print("VERDICT:", f"FOUND ({found})" if found else "LINK_UNSTABLE")
+        if not found:
+            print("  어느 속도에서도 유효 DPIDR 이 안 나온다.")
+            print("  → 타깃 전원 사이클 / cJTAG 배선·풀업 / 프로브 케이블 순으로 본다.")
+        print("---8<---")
+        return 0 if found else 6
+
     if a.recover:
         print(f"\n{'=' * 70}\n [RECOVER] 유효 DPIDR(0x{EXPECT_DPIDR:08X}) 조건 탐색"
               f"\n{'=' * 70}")
@@ -590,6 +648,8 @@ def main():
                 uniq = ",".join(sorted({g or '-' for g in got}))
                 print(f"{tag}  DPIDR={uniq}"
                       + (f"   ★ 유효 {hit}/{len(got)}" if hit else ""))
+                if len({g for g in got}) > 1:
+                    print("      ⚠ 같은 조합에서 값이 흔들린다 — 링크 불안정")
                 if hit and best is None:
                     best = tag
         print("VERDICT:", f"FOUND ({best})" if best else "NOT_FOUND")

@@ -1157,31 +1157,52 @@ ASIZE=29  ERRMODE=True  BASE_VALID=True  BASEPTR=0x6BA0009D6BA00000
 **단일 파일로 만들면서 그 셋을 빠뜨렸다.** DP 초기화 경로가 달라질 수 있다.
 device 도 그때는 `RISC-V` 였다.
 
-### P0 — `--recover` 확장판 (16 조합)
+### ❌ `--recover` 16 조합도 `NOT_FOUND` — **증상의 성격이 바뀌었다**
+
+DPIDR 로 올라오는 값이 실행마다 다르다: `FFFFFFFF` / `6BA0009D` / `80000000`.
+
+### 우리가 찾는 값과, 지금 나오는 값들
+
+**찾는 값 `0x11013913`** — `VERSION=3`(DPv3) + `DESIGNER=0x489`(**SiFive**).
+**둘이 동시에 맞는 건 우연으로 안 나온다.** 그래서 이 값을 신뢰한다.
+
+| 나오는 값 | 정체 |
+|---|---|
+| `0xFFFFFFFF` | 라인이 계속 1 — **응답 없음** |
+| `0x00000001` | 스캔이 0만 읽고 `bit0`(RAO)만 1 — **스캔 실패** |
+| `0x80000000` | **J-Link API 에러 센티널** — 데이터가 아니다 |
+| `0x6BA0009D` | `VERSION=0`(reserved) — **DPIDR 아님** |
+
+### ★ 값이 **섞여 나온다**는 것이 진단이다
+
+설정이 원인이면 **조합마다 일관되게 같은 값**이 나와야 한다.
+실행마다 다른 값이 나오는 건 **링크 계층이 불안정**하다는 신호다.
+⇒ **소프트웨어 조합 스윕으로는 못 고친다.**
+
+### P0 — `--link` : 속도를 낮춘다 (지금껏 10MHz 만 썼다)
 
 ```bash
-# ★ 먼저 타깃 전원 사이클을 권한다 — 긴 세션 동안 상태가 바뀌었을 수 있다
-sudo python3 standalone.py --recover --sessions 2
+# ★ 타깃 전원 사이클 먼저
+sudo python3 standalone.py --link --sessions 3
 ```
 
-**TAP 스크립트 유무 × cJTAG 모드 0/1 × 명령셋 full/min × device RISC-V/E76**
-= 16 조합. 각 조합의 `DPIDR` 을 그대로 낸다(중복은 접어서 전사량을 줄였다).
+원래 설정(스크립트 없음 · full 명령셋 · `RISC-V`)으로 고정하고
+**cJTAG 모드 0/1 × 속도 10M/4M/2M/1M/500k** 를 훑는다.
+각 줄에 값과 **그 값의 정체**를 함께 낸다.
 
 ```
-script=X mode=0 cmds=full dev=RISC-V  DPIDR=11013913   ★ 유효 2/2
-...
-VERDICT: FOUND (script=X mode=0 cmds=full dev=RISC-V)
+mode=0 10000kHz  FFFFFFFF,FFFFFFFF  [라인 계속 1 — 응답 없음]
+mode=0  1000kHz  11013913,11013913  ★ 유효 2/2
+VERDICT: FOUND (mode=0 1000kHz)
 ```
 
 | VERDICT | 다음 |
 |---|---|
-| **`FOUND (...)`** | ★★★ 그 조합 고정 → discovery·AXI·APBAP3 **전부 재측정** |
-| `NOT_FOUND` | 소프트웨어 조합이 아니다 → **전원 사이클 · 속도 · 배선** |
+| **`FOUND (...)`** | ★★★ 그 속도로 고정 → **전부 재측정** |
+| `LINK_UNSTABLE` | 어느 속도도 안 됨 → **전원 사이클 · cJTAG 배선/풀업 · 프로브 케이블** |
 
-**`VERDICT` 줄 하나만** 주면 된다.
-
-> ⚠ **타깃 상태 변화 가능성.** 긴 세션 동안 CSW 를 여러 번 쓰고 connect 를
-> 수없이 시도했다. **전원 사이클 후 재시도가 먼저다.**
+> 브링업 초기에 *"1000kHz 로 낮추면 cJTAG 활성화 실패"* 라고 적어뒀는데,
+> 그건 **모드 0 · 다른 코드 상태**에서의 관측이라 지금 전제로 쓸 수 없다.
 
 ### P0.1 — (구) TAP 선언값 비교### P0.1 — TAP 선언값 비교 (유효 세션 확보용)
 
