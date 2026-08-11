@@ -41,7 +41,14 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.12  DPIDR VERSION 게이트 + ADIv6 discovery"
+VERSION = "standalone 2026-08-11.13  discovery 자기검증"
+
+# ⚠ discovery 가 두 가지를 안 지켰다 (실측에서 드러남):
+#   ① 세션이 무효(DPIDR VERSION=0)인데도 값을 찍고 파생값까지 계산했다
+#   ② 네 뱅크가 **전부 같은 값**이면 DPBANKSEL 이 안 먹은 것인데 그대로 해석했다
+#      → 서로 다른 레지스터가 같은 값일 리 없다. 읽기가 일어나지 않은 것이다.
+#      (J-Link 이 DP 읽기 전에 자기 SELECT 로 덮어쓰는 것으로 보인다)
+#   두 경우 모두 **파생값을 계산하지 않는다.**
 
 # ★★ 게이트가 너무 약했다 (feedback). bit0 홀수만 보다가 VERSION=0 인
 #   0x6BA0009D 를 유효 세션으로 통과시켰다.
@@ -278,6 +285,13 @@ def discover(d):
     d.sel = None
 
     r = {'raw': {k: hx(v) for k, v in out.items()}}
+    # ★ 자기검증: 네 뱅크가 전부 같으면 DPBANKSEL 이 안 먹은 것이다
+    vals = [v for v in out.values() if v is not None]
+    if len(vals) == 4 and len(set(vals)) == 1:
+        r['bank_failed'] = True
+        r['why'] = ('네 뱅크가 전부 같은 값 — DPBANKSEL 이 반영되지 않았다. '
+                    'discovery 읽기가 일어나지 않았으므로 파생값을 내지 않는다')
+        return r
     d1 = out.get('DPIDR1')
     if d1 is not None:
         r['ASIZE'] = d1 & 0x7F
@@ -409,7 +423,13 @@ def session(a, idx):
         out['ok'] = bool(out['CTRL'].get('CDBGACK')) and out['dpidr_ok']
 
         if getattr(a, 'discover', False):
-            out['discover'] = discover(d)
+            # ★ 세션이 무효면 discovery 를 시도조차 하지 않는다
+            if not out['dpidr_ok']:
+                out['discover'] = {'skipped': True,
+                                   'why': f"세션 무효 (DPIDR={out['DPIDR']}, "
+                                          f"VERSION={out['dpidr_version']})"}
+            else:
+                out['discover'] = discover(d)
             return out
 
         if getattr(a, 'alias', False):
@@ -517,12 +537,19 @@ def main():
         print(f"ok={len(ok)}/{a.sessions} DPIDR={(last or {}).get('DPIDR')} "
               f"ver={(last or {}).get('dpidr_version')}")
         dv = (last or {}).get('discover') or {}
-        for k, v in (dv.get('raw') or {}).items():
-            print(f"{k}={v}")
-        if 'ASIZE' in dv:
-            print(f"ASIZE={dv['ASIZE']} ERRMODE={dv['ERRMODE']}")
-        if 'BASE_VALID' in dv:
-            print(f"BASE_VALID={dv['BASE_VALID']} BASEPTR={dv.get('BASEPTR')}")
+        if dv.get('skipped'):
+            print(f"DISCOVERY 건너뜀 — {dv['why']}")
+            print("★ 유효 DPIDR 세션(0x11013913)부터 확보해야 한다.")
+        else:
+            for k, v in (dv.get('raw') or {}).items():
+                print(f"{k}={v}")
+            if dv.get('bank_failed'):
+                print(f"DISCOVERY 무효 — {dv['why']}")
+            else:
+                if 'ASIZE' in dv:
+                    print(f"ASIZE={dv['ASIZE']} ERRMODE={dv['ERRMODE']}")
+                if 'BASE_VALID' in dv:
+                    print(f"BASE_VALID={dv['BASE_VALID']} BASEPTR={dv.get('BASEPTR')}")
         print("---8<---")
         return 0 if ok else 6
 

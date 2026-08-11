@@ -1093,27 +1093,50 @@ ADIv6 는 DP `SELECT.DPBANKSEL`(bits[3:0])로 DP 주소 `0x0` 에서 다른 레�
 우리는 그동안 그 주소를 **T32 스크립트에서 추측**해 왔는데,
 **ADIv6 에서는 하드웨어가 직접 알려준다.** 시험 이력이 전혀 없다.
 
-### P0 — 유효 세션에서 discovery 부터
+### ❌ discovery 1차 — **테스트 자체가 무효였다** (내 코드 결함 둘)
+
+```
+DPIDR=6BA0009D  DPIDR1=6BA0009D  BASEPTR0=6BA0009D  BASEPTR1=6BA0009D
+ASIZE=29  ERRMODE=True  BASE_VALID=True  BASEPTR=0x6BA0009D6BA00000
+```
+
+**① 세션이 무효인데 값을 찍었다.** `DPIDR=0x6BA0009D` 는 `VERSION=0` 이라
+방금 만든 게이트가 무효로 판정하는 값이다. 그런데 `--discover` 경로가
+**그 게이트를 무시**했다.
+
+**② 네 뱅크가 전부 같은 값이다.** 서로 다른 레지스터가 같을 리 없다 →
+**`DPBANKSEL` 이 반영되지 않았다.** J-Link 이 DP 읽기 전에 자기 `SELECT` 로
+덮어쓰는 것으로 보인다. **discovery 읽기가 일어나지 않았다.**
+
+⇒ `ASIZE=29` · `ERRMODE=True` · `BASEPTR=0x6BA0009D6BA00000` 은
+**같은 값에서 비트만 뽑은 쓰레기**다. `BASE_VALID=True` 도 그냥 bit0 이 1이라서다.
+
+**고쳤다:** 세션이 무효면 discovery 를 **시도조차 안 하고**, 네 뱅크가 전부
+같으면 **`DISCOVERY 무효`** 로 표시하며 파생값을 계산하지 않는다.
+(세 시나리오로 검증)
+
+### P0 — 먼저 **유효 세션**을 만든다. 그게 안 되면 아무것도 못 한다
+
+지금 모든 문제의 뿌리는 하나다: **`DPIDR=0x11013913` 세션이 안 잡힌다.**
 
 ```bash
-sudo python3 standalone.py --discover --sessions 3
+sudo python3 standalone.py --tapid 0x11013913 --sessions 3
+sudo python3 standalone.py --tapid 0x5BA00477 --sessions 3
 ```
-`ok=3/3` 이고 `DPIDR=11013913 ver=3` 이어야 유효하다.
 
-```
-DPIDR1=........  ASIZE=..  ERRMODE=..
-BASEPTR0=........ BASEPTR1=........  BASE_VALID=True  BASEPTR=0x........
-```
+`ok=?/3` 과 `DPIDR=` 만 보면 된다. **`ok` 가 0 이 아닌 선언값이 있으면**
+그걸로 고정하고 discovery·AXI·APBAP3 를 **전부 다시** 잰다.
 
 | 결과 | 다음 |
 |---|---|
-| **`BASE_VALID=True`** | ★★★ **루트 ROM 주소를 하드웨어에서 얻는다.** 추측 끝 |
-| `BASE_VALID=False` | ADIv6 discovery 미구현 → 다른 경로 |
-| `ok=0/3` | `0x11013913` 세션이 안 잡힌다 → `--tapid` 비교부터 |
+| 어느 한쪽이 `ok=3/3` | ★ 그 선언값으로 고정 → `--discover` 재실행 |
+| 둘 다 `ok=0/3` | `0x11013913` 세션을 못 만든다 → cJTAG/속도/전원 사이클 계층 |
+| 세션마다 갈림 | 불안정 — 반복 늘려 비율로 판단 |
 
-**그 뒤에** 유효 세션에서 AXI 다섯 주소·APBAP3·lane 패턴을 **다시** 잰다.
+> ⚠ `DPBANKSEL` 이 안 먹는 문제는 유효 세션을 잡은 뒤에도 남을 수 있다.
+> 그때는 pylink 의 DP API 로 뱅크 전환이 되는지부터 따로 확인해야 한다.
 
-### P0.1 — TAP 선언값 비교 (유효 세션 확보용)
+### P0.1 — TAP 선언값 비교 (유효 세션 확보용)### P0.1 — TAP 선언값 비교 (유효 세션 확보용)
 
 ```bash
 sudo python3 standalone.py --tapid 0x11013913 --sessions 3
