@@ -90,7 +90,11 @@ J-Link 시험에서는 그 인증을 재현하지 않았다.
 | DAP (DPIDR/CTRL/전원) | 인증과 무관, 항상 접근 | ✅ |
 | MEM-AP (IDR/CSW) | 인증이 안 막음 | ✅ 6/6 |
 | ROM 테이블 | 항상-켜짐 도메인, 읽힘 | ✅ 0x0AF7 |
-| **DM/core debug/trace** | **인증이 게이트하는 게 바로 이것** — 미인가면 무응답/RAZ/default | ✅ DM 만 무응답 |
+| **DM/core debug/trace** | 인증이 게이트하는 계층 (단 §0.36 이 형태를 정정) | ✅ DM 만 무응답 |
+
+> ⚠ §0.36 이 이 표의 "인증=DM 무응답" 을 정정한다. **표준 DM 내부 인증**은
+> 오히려 dmstatus 를 유효 형식으로 보여준다 — 우리 증상은 그게 아니라
+> **DM 앞단(외부 게이트/전원/리셋/firewall)** 이 막힌 모습이다.
 
 `DeviceEn=1`(AP 포트 켜짐)이면서 DM 만 죽는 것도 인증과 모순 아님 — DeviceEn 은
 AP 버스 포트, `DBGEN` 은 그 아래 컴포넌트를 따로 게이트.
@@ -116,6 +120,73 @@ DM default-slave" 를 낸다. ⇒ **증상 일치 ≠ lock 확정.**
 
 **결론:** 증상상 secure JTAG lock 이 가장 잘 맞고 구조적으로도 앞뒤가 맞다.
 그러나 확정은 T32 A/B 후. 그 A/B 가 손 많이 가는 J-Link 구현 전 값싼 보험이다.
+
+---
+
+## 0.36 ★★★★ 진단 정밀화 (2026-08-12, 외부 검토) — **DM 내부 인증이 아니라 "DM 앞단 게이트"**
+
+외부 검토 의견이 §0.35 의 "인증 lock 교과서적 증상" 을 정확히 교정했다. 인정하고 반영한다.
+
+### 이미 가진 데이터가 "표준 DM 내부 인증" 을 반증한다
+
+RISC-V Debug Spec: DM **내부** 인증이 잠겨도(`authenticated=0`)
+- `dmstatus.version` 은 **유효 형식으로 읽혀야** 한다 (version 2/3)
+- `authenticated` / `authbusy` / `dmcontrol.dmactive` / `authdata` 접근 가능
+- 나머지 DM 레지스터만 보통 0
+
+그런데 우리는 `dmstatus` 자리(`0x81480044`)에서 **`0xEAFFFFFE`** = aperture 죽은 값을
+받았다. **유효 dmstatus 형식이 아니다.** ⇒ 새 측정 없이, 기존 `--dm`/`--dmid`
+데이터가 **표준 DM 내부 인증을 반증한다.**
+
+### 잠금 위치별 대조 (검토 의견)
+
+| 잠금 위치 | dmstatus 예상 | 현재와 일치 |
+|---|---|---|
+| TAP/cJTAG 전체 잠금 | IDCODE 외 DAP/AP 접근도 실패 | ❌ |
+| DAP/AP 잠금 | AP IDR·ROM 접근 실패 | ❌ |
+| **표준 RISC-V DM 내부 인증** | dmstatus 유효 형식 + authenticated=0 | ❌ **불일치** |
+| **SoC 외부 보안 게이트가 DM aperture 전체 차단** | aperture 전체 무응답/default | ✅ 일치 |
+| DM power/reset/clock 또는 firewall | aperture 전체 무응답 | ✅ 일치 |
+
+### ⇒ 정밀화된 결론
+
+증상이 가리키는 것은 **DM 앞단(upstream)이 통째로 막힌 것**이다. secure debug 로
+지금 상황이 나오는 것은 충분히 가능하나, 그렇다면 **DM authdata 방식이 아니라
+APB bridge/firewall/power-domain 앞단을 여는 외부 게이트 방식**이다.
+그 외부 게이트 증상은 인증 아닌 power/reset/firewall 과 **여전히 구별 안 된다.**
+
+= secure debug 배제가 아니라 **"외부 게이트 형태" 로 재정의** + "DM 내부 인증"
+좁은 형태는 데이터로 **하향.** (검토 의견도 "현재 값만으로 증명한 것은 아니다")
+
+### 판단에 미치는 영향
+
+1. **T32 A/B(§0.35)가 여전히, 오히려 더 중요한 확정 시험이다** — clavis 직후
+   aperture 가 살아나면 "외부 secure 게이트를 clavis 가 연다" 증명, 아니면 다른 게이트.
+2. **구현 위치가 바뀐다** — clavis 의 challenge/response 레지스터가 DM authdata 가
+   아니라 **다른 APB/system 주소**에 있다. J-Link 구현 시 그 주소 확보가 핵심.
+
+### J-Link 구현 작업량 (검토 의견, 동의)
+
+| clavis 인증 방식 | 난이도 |
+|---|---|
+| 공개 레지스터에 고정 challenge/response 쓰기 | 낮음∼중간 |
+| challenge 읽기 + 기존 signer/HSM 호출 + response 쓰기 | 중간∼높음 |
+| J-Link connect 전에 raw cJTAG/AP 접근을 직접 유지 | 높음 |
+| 인증 후 J-Link connect/reset 이 다시 lock | 매우 높음, SEGGER device support 필요 가능 |
+| 키/서명서버/프로토콜 사양 없음 | 코딩 문제 아님 — **자산 부재** |
+| SEGGER 가 이미 이 SoC 인증 지원 | 낮음, 설정·자산 연동 |
+
+"단순 Python 수정" 이 아니라 **"J-Link 연결 선행 단계를 새로 만드는 작업"**.
+가장 어려운 건 암호 연산이 아니라: challenge/response 접근 경로 / 인증 후 어느
+reset 까지 unlock 유지 / **`connect()` 가 TAP·reset 으로 재잠금하는지** / 인증을
+core detection **앞에** 끼울 수 있는지 / `InitTarget()` 은 메모리 API 불가 →
+인증이 APB 트랜잭션을 요구하면 스크립트 몇 줄로 안 끝남.
+
+### SEGGER 실마리
+
+**SEGGER Device Provisioner** 가 정확히 이걸 위한 도구다 — challenge 가져와 외부
+서명 후 response 제출. 다른 칩(TI CC2744)엔 지원 있음. **SF-E76 지원 여부가
+SEGGER 문의의 핵심 질문**이 된다.
 
 ---
 
