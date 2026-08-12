@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-12.32  --p1 Commander 교차검증 / --p2 2단계 연결"
+VERSION = "standalone 2026-08-12.33  manual chain 이 cJTAG 를 깨는가 (P1 대조/P2 전후)"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -819,7 +819,7 @@ def p0_run(a, do_downup):
 #   SEGGER RISC-V 문서도 자동 chain selection 이 안 맞을 때 Commander 의
 #   JTAGConf 또는 JLinkScript manual chain 을 쓰라고 명시한다.
 #   ⚠ 조합 스윕이 아니라 **P0 와 동일한 한 조건**의 공식 CLI 재현만 한다.
-def p1_run(a):
+def p1_run(a, use_script=True):
     import os
     import shutil
     import subprocess
@@ -836,9 +836,10 @@ def p1_run(a):
     for cand in ('JLinkExe', 'jlinkexe', 'JLink.exe', 'JLink'):
         exe = exe or shutil.which(cand)
     cmd = [exe or 'JLinkExe', '-Device', 'E76', '-If', 'cJTAG',
-           '-Speed', '10000', '-JTAGConf', '0,0',
-           '-JLinkScriptFile', sp, '-Log', lg,
-           '-ExitOnError', '1', '-CommandFile', cf]
+           '-Speed', '10000', '-JTAGConf', '0,0']
+    if use_script:
+        cmd += ['-JLinkScriptFile', sp]
+    cmd += ['-Log', lg, '-ExitOnError', '1', '-CommandFile', cf]
     r = {'cmd': " ".join(cmd), 'exe_found': bool(exe), 'dir': d}
     if not exe:
         r['note'] = 'JLinkExe 를 PATH 에서 못 찾음 — 위 명령을 직접 실행'
@@ -856,8 +857,8 @@ def p1_run(a):
     except OSError:
         pass
     keys = ('Target connected', 'Cannot connect', 'Could not', 'DM version',
-            'Debug Spec', 'IRLen', 'Id:', 'SFE76_MANUAL_CHAIN_V2',
-            'JTAG-DTM', 'dmcontrol', 'dmstatus')
+            'Debug Spec', 'IRLen', 'IRPrint', 'TotalIRLen', 'Id:',
+            'SFE76_MANUAL_CHAIN_V2', 'JTAG-DTM', 'dmcontrol', 'dmstatus')
     r['hits'] = [l.strip() for l in out.splitlines()
                  if any(k in l for k in keys)][:10]
     r['connected'] = any('Target connected' in l for l in r['hits'])
@@ -912,6 +913,12 @@ def p2_run(a):
 
         # [4] handle 을 닫지 않는다. TAP reset 도 하지 않는다.
         # [5] PerformTIFInit=0 + manual chain 적용
+        # ★★ 여기가 핵심 측정이다. P1 에서 Commander 가 IRPrint=0x000..0 /
+        #   TotalIRLen=? 를 찍었다 — 스캔 계층이 죽어 있다는 뜻인데, 같은 조건의
+        #   pylink raw 경로는 AP IDR 6/6 을 읽는다. 둘이 동시에 참일 수 있는
+        #   설명은 하나다: **manual chain 을 얹는 순간 살아 있던 경로가 죽는다.**
+        #   그래서 manual chain 적용 **전후로 AP IDR 을 각각 잰다.**
+        #     6/6 → 0/6 이면 manual chain 이 원인이다 (그리고 P0/P1 실패도 설명된다)
         jl.exec_command(f"ScriptFile = {sp}")
         try:
             jl.coresight_configure(ir_pre=0, dr_pre=0, ir_post=0, dr_post=0,
@@ -919,6 +926,9 @@ def p2_run(a):
             r['steps'].append({'s': '5 manual chain', 'v': 'applied'})
         except Exception as e:
             r['steps'].append({'s': '5 manual chain', 'v': str(e)[:50]})
+        hit2, _ = ap_idr_match(Dap(jl))
+        r['ap_match_after'] = hit2
+        r['steps'].append({'s': '5b AP IDR(후)', 'v': f"{hit2}/6"})
 
         # [6] E76 재시도  [7] target_connected() 로만 판정
         try:
@@ -1430,21 +1440,30 @@ def main():
         print("  지금까지 전부 pylink 한 경로로만 쟀다.")
         print("  Commander 에서 되면 문제는 타깃이 아니라 **pylink 경로**다.")
         print("  안 되면 타깃 쪽이 확정된다. P0 와 동일한 한 조건만 재현한다.\n")
-        r = p1_run(a)
+        print("  ★ 이번엔 **스크립트 유무 2회**를 비교한다.")
+        print("    1차에서 IRPrint=0x000..0 / TotalIRLen=? 가 나왔다. 브링업 최초에는")
+        print("    TotalIRLen=4 / IRPrint=0x01 (ARM DAP 서명) 이었다.")
+        print("    manual chain 이 cJTAG 활성화를 깨는지 단일 변수로 가른다.\n")
         print("---8<---")
-        if not r.get('exe_found'):
-            print("JLinkExe 를 PATH 에서 못 찾음. 아래를 직접 실행:")
-            print(r['cmd'])
-            print("VERDICT: P1_NOT_RUN")
-            print("---8<---")
-            return 6
-        if 'error' in r:
-            print("실행 오류:", r['error'])
-        for l in r.get('hits', []):
-            print(" ", l[:100])
-        print("VERDICT:", "P1_CONNECTED" if r.get('connected') else "P1_NOT_CONNECTED")
+        conn = False
+        for use in (False, True):
+            r = p1_run(a, use_script=use)
+            tag = "스크립트O" if use else "스크립트X"
+            if not r.get('exe_found'):
+                print("JLinkExe 를 PATH 에서 못 찾음. 아래를 직접 실행:")
+                print(r['cmd'])
+                print("VERDICT: P1_NOT_RUN")
+                print("---8<---")
+                return 6
+            if 'error' in r:
+                print(f"{tag} 실행 오류:", r['error'])
+            ir = [l for l in r.get('hits', [])
+                  if 'IRPrint' in l or 'TotalIRLen' in l or 'Id:' in l]
+            print(f"{tag}: " + (" | ".join(x[:56] for x in ir[:2]) or "스캔줄 없음"))
+            conn = conn or r.get('connected')
+        print("VERDICT:", "P1_CONNECTED" if conn else "P1_NOT_CONNECTED")
         print("---8<---")
-        return 0 if r.get('connected') else 6
+        return 0 if conn else 6
 
     if a.p2:
         print(f"\n{'=' * 70}\n [P2] raw 상태를 보존한 2단계 연결 (feedback §8)\n{'=' * 70}")
@@ -1460,6 +1479,16 @@ def main():
         for st in r.get('steps', []):
             print(f"{st['s']:16s} {st['v']}")
         print(f"target_connected={r.get('target_connected')}")
+        b, af = r.get('ap_match'), r.get('ap_match_after')
+        if b is not None and af is not None:
+            if b >= AP_GATE_MIN and af < AP_GATE_MIN:
+                print(f"★ manual chain 을 얹자 AP 가 죽었다 ({b}/6 → {af}/6).")
+                print("  = P1 의 IRPrint=0x000..0 과 같은 현상. **manual chain 이 원인**")
+            elif b >= AP_GATE_MIN and af >= AP_GATE_MIN:
+                print(f"AP 는 전후 모두 살아있다 ({b}/6 → {af}/6).")
+                print("  = manual chain 은 무죄. 막히는 곳은 그 위의 CPU 계층이다")
+            else:
+                print(f"AP 가 처음부터 부족하다 ({b}/6 → {af}/6). 세션부터 다시")
         print("VERDICT:", "P2_CONNECTED" if r.get('target_connected')
                           else "P2_NOT_CONNECTED")
         print("---8<---")

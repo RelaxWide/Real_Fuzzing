@@ -178,6 +178,41 @@ P2 원문 2번의 `raw DPIDR=0x11013913` 은 철회값이므로 **AP IDR 6/6** �
 이 둘까지 실패해야 *"공개된 J-Link 설정으로 가능한 소프트웨어 우회가 소진"* 이라고
 말할 수 있다.
 
+### ★★★ 실측 (`--p1` 1차) — **스캔 계층이 죽어 있다**
+
+```
+SFE76_MANUAL_CHAIN_V2          ← 스크립트는 실행됐다
+TotalIRLen = ?
+IRPrint    = 0x000000000000000000
+Error: Could not connect to the target device.
+```
+
+브링업 최초(`edece50`, 08-07)에는 **`TotalIRLen=4`, `IRPrint=0x01`**(ARM DAP 서명)
+이었다. 지금은 **전부 0** 이고 길이도 못 잰다.
+
+그런데 **같은 조건의 pylink raw 경로는 AP IDR 6/6 을 읽는다.**
+둘이 동시에 참일 수 있는 설명은 하나다:
+
+> **manual chain(`JTAG_AllowTAPReset = 1`)이 cJTAG 활성화를 깨고 있다.**
+
+`AllowTAPReset = 1` 은 자동 검출을 끄는 동시에 **TAP reset 을 막는다.**
+cJTAG 는 4선→2선 escape 로 OScan1 에 진입하는데, 그 진입이 안 되면
+체인은 전부 0 으로 읽힌다 — 지금 그림 그대로다.
+그러면 P0 실패도, P1 실패도, P2 실패도 **한 원인으로 설명된다.**
+
+### ⇒ 단일 변수로 가른다 (`.33`)
+
+| 시험 | 무엇 |
+|---|---|
+| `--p1` | Commander 를 **스크립트 유무 2회** 돌려 `IRPrint`/`TotalIRLen` 비교 |
+| `--p2` | manual chain 적용 **전후로 AP IDR** 을 각각 측정 |
+
+판정:
+- 스크립트X 에서 `IRPrint=0x01` 이 돌아오거나, P2 에서 `6/6 → 0/6` 이면
+  **manual chain 이 원인이다.** feedback §5 의 정본 자체를 이 타깃에선
+  쓸 수 없다는 뜻이고, 방향이 바뀐다
+- 둘 다 변화 없으면 manual chain 은 무죄. 막히는 곳은 그 위의 CPU 계층이다
+
 ### 쓰기는 승인하지 않는다
 
 `AXI:0xC81040/44` reset-control write 와 `MD:0x0 ← 0x6F` 는 **정상 attach 에
