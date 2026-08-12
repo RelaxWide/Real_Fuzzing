@@ -142,6 +142,42 @@ aperture 레이아웃을 확보한 뒤에만.
 
 ## 실행
 
+### `clavis.cmm` 인증 흐름 분석 — 현재 P0
+
+현재 다음 단계는 secure-debug 값을 추측해서 쓰는 것이 아니라, T32 환경에만 있는
+`clavis.cmm`의 **구조**를 확인하는 것이다. `analyze_clavis.py`는 CMM을 실행하지
+않고 다음 항목만 정적으로 추출한다.
+
+- challenge/response·crypto 관련 명령의 위치
+- `Data.Long`/`Data.Set`/`PER.Set` 등 target read/write 위치
+- 하위 `DO` 호출과 외부 파일·프로그램 의존성
+- `ENTRY` 인자 흐름과 error handler
+
+문자열, 민감 변수의 우변, 32비트를 넘는 hex 값은 보고서에서 자동으로 가린다.
+32비트 주소와 파일 basename은 판단에 필요해 남기므로, 공유 전에는 보고서를
+한 번 직접 확인한다.
+
+Windows T32 스크립트 PC에서 실행 예:
+
+```powershell
+python analyze_clavis.py `
+  "G:\T32\Func\SED\clavis.cmm" `
+  "G:\T32\Attach.cmm" `
+  --search-root "G:\T32" `
+  --markdown clavis_report.md
+```
+
+JSON이 편하면 `--markdown clavis_report.md` 대신 `--json clavis_report.json`을
+사용한다. 생성된 보고서에는 실제 키·인증서 내용이나 원본 CMM 전체를 넣지 않는다.
+`clavis.cmm`이 암호화된 바이너리이거나 호출 대상이 변수 때문에 하나로 결정되지
+않으면 경고 또는 `UNRESOLVED`로 표시한다.
+
+분석기 자체 테스트:
+
+```bash
+python3 -m unittest -v test_analyze_clavis.py
+```
+
 ```bash
 # 연결만 확인
 sudo python3 sfe76_link.py

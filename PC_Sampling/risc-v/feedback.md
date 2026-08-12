@@ -5,6 +5,141 @@
 > 목적: 현재 접근 방향이 맞는지 검토하고, 다음 작업자가 바로 이어서 판단할 수 있도록
 > 실측 사실과 권장 순서를 분리해 기록한다.
 
+## 최우선 정정 — 2026-08-12: challenge-response 존재는 확인됐지만 J-Link 실패 원인은 아직 미확정
+
+> 이 절이 아래의 모든 과거 `clavis.cmm` 평가보다 우선한다. 새 정보에 따라
+> `clavis.cmm`이 실제 challenge-response 인증을 수행한다는 점은 인정한다.
+> 그러나 이것만으로 현재 J-Link의 DM 미응답 원인을 authentication 하나로
+> 확정하거나, 전원·리셋·접근 경로 후보를 제거하거나, 코딩 단계가 끝났다고
+> 결론낼 수는 없다.
+
+### 1. Critical issues
+
+#### STATUS 내부의 우선 결론이 서로 충돌한다
+
+최신 `STATUS.md`에는 다음 주장이 동시에 존재한다.
+
+```text
+§0.3  security/authentication으로 원인 확정
+§0.4  security/reset/firewall/other-path는 모두 열려 있음
+§0.5  현재 정보만으로 downstream DM 미응답 원인을 구분할 수 없음
+§8    secure JTAG challenge-response로 원인 확정
+```
+
+문서 서두는 §0.5가 현재 결론이며 충돌 시 우선한다고 명시한다. 따라서 문서 자체의
+규칙으로도 현재 정식 결론은 **원인 미확정**이다. §0.3과 §8의 `원인 확정` 표현은
+`가장 강한 원인 후보`로 내려야 한다.
+
+#### challenge-response의 존재와 현재 실패의 인과관계는 별개다
+
+새 정보로 강하게 확인된 것은 다음이다.
+
+1. 정상 T32 RISC-V attach의 선행 경로에서 `clavis.cmm`이 호출된다.
+2. 그 스크립트는 실제 challenge-response 인증을 수행한다.
+3. 현재 J-Link 시험에서는 그에 해당하는 명시적 인증 절차를 수행하지 않았다.
+
+따라서 **인증 누락은 현재 가장 강한 원인 후보**다. 하지만 다음 인과관계는 아직
+직접 관측되지 않았다.
+
+```text
+clavis 실행 전   → 동일 경로의 DM 무응답
+clavis 성공 후   → 동일 경로의 DM 정상 응답
+clavis 생략/실패 → T32 attach 실패
+```
+
+이 전후 대조 없이 “모든 관측을 설명한다”는 것은 가설의 설명력이지 원인 증명이
+아니다. power/reset/clock, firewall/isolation, T32와 J-Link의 access path 또는
+transaction attribute 차이도 현재 무응답을 만들 수 있다.
+
+#### `DBGEN` 게이트는 확인값이 아니라 구현 추정이다
+
+STATUS는 인증 성공 시 `DBGEN`이 열려 DM이 나타난다고 단정한다. 하지만 현재
+제공된 정보에는 `DBGEN`, `NIDEN`, `SPIDEN`, `SPNIDEN` 또는 타깃 인증 상태
+레지스터의 실제 전후 값이 없다. 이 SoC가 DM aperture를 어떤 신호로 게이트하는지
+확인되지 않았으므로 다음과 같이 써야 한다.
+
+```text
+challenge-response 성공 후 디버그 접근 권한 또는 경로가 활성화될 가능성이 높다.
+구체적인 gate 신호와 DM 노출 방식은 미확정이다.
+```
+
+### 2. Potential bugs / 과도한 파생 결론
+
+challenge-response라는 말만으로 다음을 자동으로 확정할 수 없다.
+
+- challenge가 매번 새로운 난수인지
+- response가 비밀 키 기반 서명·MAC인지, 다른 알고리즘인지
+- 비밀 키가 반드시 `clavis.cmm` 밖에 있는지
+- T32 내장 기능, 로컬 실행 파일, 키 파일, HSM, 원격 서버 중 무엇을 사용하는지
+- J-Link가 해당 인증을 지원하지 않는지
+- 인증 자산 없이는 구현이 원리적으로 불가능한지
+
+이 항목들은 `clavis.cmm` 본문과 하위 호출·외부 의존성에서 확인해야 한다.
+challenge-response라도 response가 공개된 고정 알고리즘과 장치별 허가 데이터로
+생성되는 구조인지, 보안팀의 비밀 키/HSM이 필요한 구조인지에 따라 다음 단계가
+완전히 달라진다.
+
+`J-Link P0/P1/P2 실패`도 인증 원인의 독립 증거로 세면 안 된다. 세 시험은 모두
+인증을 하지 않은 동일 계열 J-Link 경로이므로 서로 독립적인 원인 판별 실험이
+아니다.
+
+### 3. Reliability improvements / 현재 결론 문구
+
+현재 상태는 다음처럼 기록하는 것이 정확하다.
+
+```text
+T32의 정상 RISC-V attach 선행 경로에 challenge-response 인증이 존재한다.
+J-Link 시험에서는 그 인증을 재현하지 않았다.
+따라서 인증 누락이 현재 DM 미응답의 가장 강한 원인 후보로 상승했다.
+
+그러나 인증 전후의 동일 경로 DM 응답 변화나 clavis 실패 시 attach 실패가
+확인되지 않아, 현재 J-Link 실패의 직접 원인으로는 아직 확정할 수 없다.
+```
+
+연결 계층에 대한 기존 결론은 유지한다.
+
+```text
+cJTAG → DAP/AP → APBAP1/2 Class 9 ROM 접근은 성립한다.
+ROM이 지목한 DM aperture에서는 유효한 dmstatus를 얻지 못했다.
+```
+
+`--dmid` 1회 결과도 security 원인을 증명하지 않는다. 시험 주소 전부에서 동일한
+`0xEAFFFFFE`가 나왔다는 관측만 유지하고, 원인은 인증·전원·리셋·firewall·접근
+경로 중 구분되지 않았다고 기록한다.
+
+### 4. Suggested tests / 확정에 필요한 증거
+
+가장 강한 확인은 다음 셋 중 하나다.
+
+1. 동일 T32 세션에서 `clavis` **직전과 성공 직후** 같은 DM 주소를 같은 접근
+   클래스로 읽어, 무응답에서 정상 `dmstatus`로 바뀌는지 확인한다.
+2. 안전한 시험 환경에서 `clavis` 생략 또는 인증 실패 시 attach가 실패하고,
+   정상 인증 시 성공하는 A/B 결과를 확보한다.
+3. 타깃의 공식 authentication 상태 레지스터가 locked→unlocked로 바뀌는 동시에
+   DM 응답이 살아나는 것을 확인한다.
+
+그리고 `clavis.cmm` 및 의존성에서 다음을 확인한다.
+
+- challenge를 읽는 명령·주소·접근 클래스
+- response를 쓰는 명령·주소·접근 클래스
+- response 생성 명령 또는 호출 대상
+- 키·인증서·로컬 실행 파일·HSM·서버 의존성
+- 인자 `0x0`의 용도
+- `CLAVIS_ERROR_HANDLER`가 attach를 중단하는지 또는 경고 후 계속하는지
+
+비밀 키나 인증 자산의 실제 내용은 문서나 로그에 복사하지 않는다. 존재 여부,
+저장 형태와 정상적인 사용 인터페이스만 확인한다.
+
+### 최종 평가
+
+**`security/authentication이 가장 강한 후보`라는 방향은 맞다.** 그러나 최신
+STATUS의 `원인 확정`, `DBGEN 미인가 확정`, `전원/리셋·다른 경로 배제`,
+`키 없이는 원리적으로 재현 불가`, `코딩 단계 종료`는 아직 증명되지 않았다.
+
+다음 작업은 새 probe 작성이 아니라 `clavis.cmm`의 실제 데이터 흐름과 인증 전후
+DM 응답을 확인하는 것이다. 그 결과가 나오기 전까지 target/reset/unlock 추정값
+쓰기는 계속 금지한다.
+
 ## 최신 STATUS 재검토 — 2026-08-12: `clavis.cmm` 확인은 맞지만 원인 판정은 아직 이르다
 
 > 이 절이 아래의 과거 피드백보다 우선한다. 최신 `STATUS.md`의 방향은
