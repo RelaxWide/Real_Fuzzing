@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-11.31  --p0: feedback P0 글자 그대로 + DOWN/500ms/UP"
+VERSION = "standalone 2026-08-12.32  --p1 Commander 교차검증 / --p2 2단계 연결"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -811,6 +811,141 @@ def p0_run(a, do_downup):
                      or 'version' in l.lower()][:4]
     return r
 
+
+# ★★★ --p1 : feedback §7 — J-Link Commander 로 **pylink 밖에서** 교차 확인.
+#
+#   왜 필요한가: 지금까지 전부 pylink 한 경로로만 쟀다. Commander 에서
+#   되면 문제는 타깃이 아니라 **pylink 경로**다. 안 되면 타깃 쪽이 확정된다.
+#   SEGGER RISC-V 문서도 자동 chain selection 이 안 맞을 때 Commander 의
+#   JTAGConf 또는 JLinkScript manual chain 을 쓰라고 명시한다.
+#   ⚠ 조합 스윕이 아니라 **P0 와 동일한 한 조건**의 공식 CLI 재현만 한다.
+def p1_run(a):
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    d = tempfile.mkdtemp(prefix='sfe76_p1_')
+    sp = os.path.join(d, 'manual_chain_v2.JLinkScript')
+    lg = os.path.join(d, 'jlink.log')
+    cf = os.path.join(d, 'cmds.jlink')
+    with open(sp, 'w') as f:
+        f.write(p0_script_text())
+    with open(cf, 'w') as f:
+        f.write("connect\nq\n")
+    exe = None
+    for cand in ('JLinkExe', 'jlinkexe', 'JLink.exe', 'JLink'):
+        exe = exe or shutil.which(cand)
+    cmd = [exe or 'JLinkExe', '-Device', 'E76', '-If', 'cJTAG',
+           '-Speed', '10000', '-JTAGConf', '0,0',
+           '-JLinkScriptFile', sp, '-Log', lg,
+           '-ExitOnError', '1', '-CommandFile', cf]
+    r = {'cmd': " ".join(cmd), 'exe_found': bool(exe), 'dir': d}
+    if not exe:
+        r['note'] = 'JLinkExe 를 PATH 에서 못 찾음 — 위 명령을 직접 실행'
+        return r
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        r['rc'] = p.returncode
+        out = (p.stdout or '') + (p.stderr or '')
+    except Exception as e:
+        r['error'] = str(e)[:100]
+        return r
+    try:
+        with open(lg, errors='replace') as f:
+            out += f.read()
+    except OSError:
+        pass
+    keys = ('Target connected', 'Cannot connect', 'Could not', 'DM version',
+            'Debug Spec', 'IRLen', 'Id:', 'SFE76_MANUAL_CHAIN_V2',
+            'JTAG-DTM', 'dmcontrol', 'dmstatus')
+    r['hits'] = [l.strip() for l in out.splitlines()
+                 if any(k in l for k in keys)][:10]
+    r['connected'] = any('Target connected' in l for l in r['hits'])
+    return r
+
+
+# ★★★ --p2 : feedback §8 — 정상 raw 상태를 **보존한** 2단계 연결.
+#
+#   핵심은 4번이다: **handle 을 닫거나 TAP reset 하지 않는다.**
+#   지금까지 우리는 조합을 바꿀 때마다 handle 을 새로 열었다. cJTAG 는
+#   4선→2선 전환이 타깃에 상태를 남기므로, 한 번 성립한 OScan1 상태를
+#   깨지 않고 그 위에 manual chain 을 얹는 것이 이 절차의 요점이다.
+#
+#   ⚠ 원문 2번의 `raw DPIDR=0x11013913` 은 철회된 값이므로 **AP IDR 6/6**
+#     으로 대체한다 (§0.5).
+def p2_run(a):
+    import os
+    import tempfile
+    sp = os.path.join(tempfile.gettempdir(), f"sfe76_p2_{os.getpid()}.JLinkScript")
+    with open(sp, 'w') as f:
+        f.write(p0_script_text())
+    logs = []
+    cb = lambda m: logs.append(str(m).rstrip())
+    r = {'steps': []}
+    jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
+    try:
+        jl.open()
+        jl.exec_command("SetcJTAGInitMode = 1")
+        jl.set_tif(TIF_CJTAG)
+        jl.set_speed(10000)
+        for i, (_n, addr, typ) in enumerate(AP_MAP):
+            jl.exec_command(f"CORESIGHT_AddAP = Index={i} Type={typ} BaseAddr=0x{addr:X}")
+
+        # [1] 일반 connect 1회 — 실패 허용. cJTAG OScan1 진입이 목적이다
+        try:
+            jl.connect('E76', speed=10000)
+            e1 = None
+        except Exception as e:
+            e1 = str(e)[:60]
+        r['steps'].append({'s': '1 일반connect', 'v': 'ok' if not e1 else e1})
+
+        # [2][3] 같은 handle / 전원 상태에서 AP IDR 6/6 확인 (원문의 DPIDR 대체)
+        try:
+            jl.coresight_configure(ir_pre=0, dr_pre=0, ir_post=0, dr_post=0,
+                                   ir_len=4, perform_tif_init=False)
+        except Exception:
+            pass
+        d = Dap(jl)
+        hit, _ = ap_idr_match(d)
+        r['ap_match'] = hit
+        r['steps'].append({'s': '2-3 AP IDR', 'v': f"{hit}/6"})
+
+        # [4] handle 을 닫지 않는다. TAP reset 도 하지 않는다.
+        # [5] PerformTIFInit=0 + manual chain 적용
+        jl.exec_command(f"ScriptFile = {sp}")
+        try:
+            jl.coresight_configure(ir_pre=0, dr_pre=0, ir_post=0, dr_post=0,
+                                   ir_len=4, perform_tif_init=False)
+            r['steps'].append({'s': '5 manual chain', 'v': 'applied'})
+        except Exception as e:
+            r['steps'].append({'s': '5 manual chain', 'v': str(e)[:50]})
+
+        # [6] E76 재시도  [7] target_connected() 로만 판정
+        try:
+            jl.connect('E76', speed=10000)
+            e2 = None
+        except Exception as e:
+            e2 = str(e)[:60]
+        tc = False
+        try:
+            tc = bool(jl.target_connected())
+        except Exception:
+            pass
+        r['steps'].append({'s': '6 재connect', 'v': 'ok' if not e2 else e2})
+        r['target_connected'] = tc
+    except Exception as e:
+        r['fatal'] = str(e)[:110]
+    finally:
+        try:
+            jl.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(sp)
+        except OSError:
+            pass
+    return r
+
 def axi_health(d):
     out = {'aps': []}
     for name, apbase, _t in AP_MAP:
@@ -1190,6 +1325,10 @@ def main():
     ap.add_argument('--addrs', default="0x0,0x4,0x81480000,0x81480044,0xC81040,0xC81044",
                     help="콤마 구분 주소. 'dmi' 를 주면 DMI 레지스터 자리를 자동 계산")
     ap.add_argument('--json', default=None)
+    ap.add_argument('--p1', action='store_true',
+                    help='* feedback §7 — J-Link Commander 로 pylink 밖에서 교차확인')
+    ap.add_argument('--p2', action='store_true',
+                    help='* feedback §8 — handle 을 닫지 않는 2단계 연결')
     ap.add_argument('--p0', action='store_true',
                     help='* feedback §5/§6 P0 글자 그대로. 오라클=target_connected()')
     ap.add_argument('--explore', action='store_true',
@@ -1285,6 +1424,46 @@ def main():
     print(f"  TAP ID 수동 선언 0x{CHAIN_TAP_ID:08X}  (AllowTAPReset=1)")
     print(f"  AP {[n for n, _b, _t in AP_MAP]}")
     print(f"  주소 {[hex(x) for x in a.addrs]}\n")
+
+    if a.p1:
+        print(f"\n{'=' * 70}\n [P1] J-Link Commander 교차 검증 (feedback §7)\n{'=' * 70}")
+        print("  지금까지 전부 pylink 한 경로로만 쟀다.")
+        print("  Commander 에서 되면 문제는 타깃이 아니라 **pylink 경로**다.")
+        print("  안 되면 타깃 쪽이 확정된다. P0 와 동일한 한 조건만 재현한다.\n")
+        r = p1_run(a)
+        print("---8<---")
+        if not r.get('exe_found'):
+            print("JLinkExe 를 PATH 에서 못 찾음. 아래를 직접 실행:")
+            print(r['cmd'])
+            print("VERDICT: P1_NOT_RUN")
+            print("---8<---")
+            return 6
+        if 'error' in r:
+            print("실행 오류:", r['error'])
+        for l in r.get('hits', []):
+            print(" ", l[:100])
+        print("VERDICT:", "P1_CONNECTED" if r.get('connected') else "P1_NOT_CONNECTED")
+        print("---8<---")
+        return 0 if r.get('connected') else 6
+
+    if a.p2:
+        print(f"\n{'=' * 70}\n [P2] raw 상태를 보존한 2단계 연결 (feedback §8)\n{'=' * 70}")
+        print("  핵심은 4번: **handle 을 닫거나 TAP reset 하지 않는다.**")
+        print("  지금까지 조합을 바꿀 때마다 handle 을 새로 열었다. cJTAG 는")
+        print("  4선->2선 전환이 타깃에 상태를 남기므로, 한 번 성립한 OScan1")
+        print("  상태를 깨지 않고 그 위에 manual chain 을 얹는 게 요점이다.")
+        print("  (원문 2번의 raw DPIDR=0x11013913 은 철회값이라 AP IDR 6/6 로 대체)\n")
+        r = p2_run(a)
+        print("---8<---")
+        if 'fatal' in r:
+            print("FATAL", r['fatal'])
+        for st in r.get('steps', []):
+            print(f"{st['s']:16s} {st['v']}")
+        print(f"target_connected={r.get('target_connected')}")
+        print("VERDICT:", "P2_CONNECTED" if r.get('target_connected')
+                          else "P2_NOT_CONNECTED")
+        print("---8<---")
+        return 0 if r.get('target_connected') else 6
 
     if a.p0:
         print(f"\n{'=' * 70}\n [P0] feedback §5/§6 을 글자 그대로\n{'=' * 70}")

@@ -153,6 +153,31 @@ ndmreset** 이지 AXI 레지스터 쓰기가 아니다. `0xC81040` 경로는 애
 
 → `--p0` (`.31`) 이 위 표를 전부 지키고 `DOWN → 500ms → UP` 까지 재현한다.
 
+### ❌ 실측 (`--p0`) — 양쪽 다 `target_connected=False`
+
+```
+UP                target_connected=False
+DOWN->500ms->UP   target_connected=False
+VERDICT: NOT_CONNECTED
+```
+
+feedback P0 를 **전부 지킨 상태**에서(mode 1 / CoreBase 0x0 / manual chain /
+E76 / 10MHz / `DOWN→500ms→UP` 포함) 연결되지 않는다.
+⇒ P0 소진. **단, 여기서 "SEGGER 문의 외엔 없음" 으로 끝내지 않는다** —
+feedback §8 이 P1/P2 를 명시적으로 남겨뒀다.
+
+### 남은 두 단계 (`.32`)
+
+| | 무엇 | 왜 |
+|---|---|---|
+| **P1** (§7) | J-Link **Commander** 로 동일 조건 재현 | 지금까지 전부 **pylink 한 경로**로만 쟀다. Commander 에서 되면 문제는 타깃이 아니라 pylink 경로다 |
+| **P2** (§8) | **handle 을 닫지 않는** 2단계 연결 | 조합을 바꿀 때마다 handle 을 새로 열어왔다. cJTAG 는 4선→2선 전환이 타깃에 상태를 남기므로, 성립한 OScan1 을 깨지 않고 그 위에 manual chain 을 얹는 것이 요점 |
+
+P2 원문 2번의 `raw DPIDR=0x11013913` 은 철회값이므로 **AP IDR 6/6** 으로 대체한다.
+
+이 둘까지 실패해야 *"공개된 J-Link 설정으로 가능한 소프트웨어 우회가 소진"* 이라고
+말할 수 있다.
+
 ### 쓰기는 승인하지 않는다
 
 `AXI:0xC81040/44` reset-control write 와 `MD:0x0 ← 0x6F` 는 **정상 attach 에
