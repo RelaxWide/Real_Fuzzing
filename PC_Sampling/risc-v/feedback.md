@@ -5,6 +5,175 @@
 > 목적: 현재 접근 방향이 맞는지 검토하고, 다음 작업자가 바로 이어서 판단할 수 있도록
 > 실측 사실과 권장 순서를 분리해 기록한다.
 
+## 최신 STATUS 재검토 — 2026-08-12: `clavis.cmm` 확인은 맞지만 원인 판정은 아직 이르다
+
+> 이 절이 아래의 과거 피드백보다 우선한다. 최신 `STATUS.md`의 방향은
+> **새로운 범용 probe를 계속 만드는 대신 실제 RISC-V attach 선행 경로인
+> `clavis.cmm`을 확인한다**는 점에서는 맞다. 그러나 `clavis`의 의미,
+> `--dmid`의 판별력, `DOWN→UP` 재현을 현재보다 좁게 해석해야 한다.
+
+### 1. Critical issues
+
+#### `clavis.cmm`은 중요한 미확인 입력이지만 아직 secure unlock의 원인 증거는 아니다
+
+현재 확보된 강한 사실은 다음까지다.
+
+```cmm
+ON ERROR GOTO CLAVIS_ERROR_HANDLER
+do "&FuncDir/SED/clavis.cmm" 0x0    // called once for secure jtag
+ON ERROR DEFAULT
+```
+
+- RISC-V core attach 설정 전에 `clavis.cmm`이 호출된다.
+- 주석은 secure JTAG와 관련된 호출이라고 명시한다.
+- J-Link 경로에서는 이 호출에 해당하는 동작을 재현하지 않았다.
+
+따라서 **파일 내용을 확인하는 것이 현재 최우선 정보 수집 과제**라는 판단은
+타당하다. 하지만 파일명 `clavis`의 라틴어 뜻은 기술 증거가 아니다. 또한 전용
+에러 핸들러가 있다는 사실만으로 실패 시 attach 전체가 반드시 중단된다고 단정할
+수 없다. 그 결론에는 `CLAVIS_ERROR_HANDLER` 본문과 복귀·종료 동작이 필요하다.
+
+현재 표현은 `가장 강한 단일 리드`보다 다음이 정확하다.
+
+```text
+정상 RISC-V attach 선행 경로에서 확인된 가장 중요한 미해석 호출
+```
+
+#### `--dmid` 결과는 secure와 reset/power를 판별하지 못한다
+
+유효 AP 세션에서 `0x81480000 + 0xFF0`을 포함한 시험 주소가 모두
+`0xEAFFFFFE`였다는 관측은 유용하다. 이는 적어도 **현재 MEM-AP 경로에서는 DM의
+기능 레지스터뿐 아니라 시험한 식별 주소에서도 유효 데이터를 얻지 못했다**는
+사실을 강화한다.
+
+그러나 다음 이분법은 성립하지 않는다.
+
+```text
+CIDR 응답       → 컴포넌트 존재, 기능만 secure-gated
+CIDR 무응답     → 전원/리셋/물리적 부재
+```
+
+ROM 엔트리가 지목한 SF-E76 DMI aperture가 반드시 표준 CoreSight CIDR을 같은
+주소창의 `+0xFF0`에 노출한다는 타깃 사양을 아직 확보하지 못했다. 설령 노출하는
+구조여도 인증·firewall·transaction attribute가 전체 aperture를 가릴 수 있다.
+따라서 `cidOK=False`는 secure 가설을 일반적으로 약화시키지 않는다. 약화되는 것은
+오직 **“ID 블록은 보이고 기능 레지스터만 가려진다”는 좁은 형태**뿐이다.
+
+`DM_COMPONENT_NOT_DECODING(전원/리셋/부재쪽)` 판정명도 원인을 포함하므로
+과도하다. 다음처럼 관측만 표현하는 이름이 안전하다.
+
+```text
+DM_APERTURE_NO_VALID_RESPONSE
+```
+
+#### `DOWN → 500 ms → UP`은 정상 AttachOnly 경로로 확인되지 않았다
+
+사용자가 앞서 확인한 내용은 `SYStem.UP`이 `DynUTLoad.cmm`에서만 검색되고,
+정상 `AttachOnly → Attach.cmm`에서는 reset-release 호출이나 target register
+write가 없다는 것이다. 최신 `STATUS.md`는 다시 `DOWN→UP`을 HCore 정상 시퀀스로
+기록하고, T32가 그 과정에서 DM을 나타나게 한다고 단정한다. 현재 제공된 새
+`clavis` 호출 정보에는 `DOWN` 또는 `UP`이 없다.
+
+더구나 `standalone.py --p0`이 수행한 것은 J-Link handle을 `close()`하고 500 ms
+뒤 새 handle을 `open()`하여 `connect()`를 재시도한 것이다. 이것은 T32
+`SYStem.DOWN/UP`의 등가 동작이 아니다. 따라서 다음 주장은 모두 철회해야 한다.
+
+```text
+--p0가 T32 DOWN→UP을 재현했다
+DOWN→UP 시험이 실패했으므로 해당 T32 경로가 배제됐다
+T32에서 DOWN→UP 전후 값을 비교하는 것이 현재 필수 입력이다
+```
+
+실제 RISC-V 호출 경로에서 `SYStem.DOWN/UP`이 새로 확인될 때만 별도 후보로
+복원한다.
+
+### 2. Potential bugs
+
+#### `NODECODE_VALUES`는 일반적인 실데이터 판별자로 사용할 수 없다
+
+`standalone.py`는 다음 값을 모두 무응답 서명으로 분류한다.
+
+```python
+{0x00000001, 0x00000000, 0xEAFFFFFE, 0xEAFFFFFC, 0xFFFFFFFF}
+```
+
+하지만 `0x00000000`과 `0x00000001`은 레지스터에 따라 정상값일 수 있다. 이번
+실측처럼 **모든 시험 주소가 동일하게 `0xEAFFFFFE`**인 결과를 무효 응답으로
+취급하는 것은 합리적이지만, 집합 구성원 하나와 같다는 이유만으로 각 읽기를
+일반적으로 `no-decode`로 판정하면 다시 거짓 음성이 생길 수 있다.
+
+판정은 다음을 함께 사용해야 한다.
+
+1. AP IDR 6/6 및 DP/AP 오류 상태
+2. 같은 세션의 ROM 양성 대조
+3. 여러 서로 다른 주소에서 비정상적으로 동일한 값이 반복되는지
+4. 해당 레지스터의 ID preamble 또는 명시된 기대값
+5. 독립 세션 반복
+
+#### 단일 유효 세션을 곧바로 `결과 확정`으로 쓰지 않는다
+
+최신 STATUS의 `.35` 결과는 유효한 관측이지만, 문서 자체의 확정 기준은
+`AP IDR 6/6 + 오류 없음 + 독립 3세션 일치`다. 세 번의 독립 결과가 기록되지
+않았다면 `결과 확정` 대신 `유효 세션 1회 관측`으로 남겨야 한다.
+
+#### “T32가 DM이 나타나기 전에 타깃 상태를 바꾼다”는 아직 추론이다
+
+T32에서 attach와 trace 수집이 된다는 사실은 강하지만, 현재 CMM에서 확인된
+`Prepare`, DAP power policy, `clavis` 중 무엇이 DM 노출 조건을 바꾸는지는 모른다.
+특히 CMM이 ARM 원본을 RISC-V로 포팅한 코드이고 원본 diff도 없으므로, 실제
+호출과 타깃 고유성이 확인되기 전에는 숨은 상태 변경을 확정하지 않는다.
+
+### 3. Reliability improvements
+
+현재 판단은 다음 수준으로 고정하는 것이 맞다.
+
+```text
+cJTAG → DAP/AP → APBAP1/2 Class 9 ROM까지 접근된다.
+ROM 엔트리는 T32 CoreDebug.Base와 같은 주소를 지목한다.
+그 주소의 dmcontrol/dmstatus 및 이번에 시험한 +0xFxx 식별 주소에서
+유효한 응답을 얻지 못했다.
+
+원인은 power/reset/clock, security/authentication/firewall,
+T32와 다른 access path/attribute 중 구분되지 않았다.
+```
+
+`clavis.cmm`은 이 원인 후보 중 security/authentication을 확인할 직접 자료이므로
+우선순위가 높다. 하지만 내용을 읽기 전에는 J-Link로 재현할 시퀀스를 설계하거나
+키가 필요하다고 결론내리지 않는다.
+
+또한 기존 ARM 원본에서 계승된 루틴과 RISC-V용 변경을 구분할 diff가 없으므로,
+다음 세 조건을 계속 적용한다.
+
+1. 실제 `T32_Start_RISCV → Startup → main → AttachOnly` 호출 경로에 있는가
+2. `SF-E76`, hart, DMI/SBA, SiFive Nexus처럼 RISC-V 고유 표지가 있는가
+3. AP IDR·ROM 엔트리 등 독립 실측과 일치하는가
+
+### 4. Suggested tests / 다음 행동
+
+1. **`clavis.cmm` 본문 확보가 P0다.** `Data.Set`, `PER.Set`, `Data.Long`,
+   `Data.In`, `OPEN/READ`, 다른 `DO`, 암호화·해시·challenge 관련 명령과 인자
+   `0x0` 사용처를 찾는다.
+2. `CLAVIS_ERROR_HANDLER` 본문도 함께 확인한다. 실패가 attach 중단인지,
+   경고 후 계속인지 구분해야 한다.
+3. `clavis.cmm`이 호출하는 하위 CMM 또는 외부 키·인증서가 있으면 그 의존성까지
+   목록화한다. 실제 비밀값은 문서에 복사하지 말고 존재와 입력 방식만 기록한다.
+4. `--dmid`는 같은 조건의 독립 세션 3회만 재현하고 종료한다. 결과명은 원인 중립적
+   이름으로 바꾸며, 추가 주소 스캔으로 원인을 찾으려 하지 않는다.
+5. `--p0`의 `DOWN→UP 재현` 표기와 STATUS의 관련 결론을 제거한다. 코드를 유지할
+   경우 이름은 `JLINK_SESSION_REOPEN_RETRY`처럼 실제 동작대로 바꾼다.
+6. `clavis`가 고정된 공개 레지스터 시퀀스임이 확인되기 전까지 target write,
+   reset-control write, unlock 추정값 쓰기는 하지 않는다.
+
+### 최종 평가
+
+**방향의 절반은 맞다.** 새 probe를 계속 늘리는 단계는 사실상 끝났고,
+`clavis.cmm` 및 실제 RISC-V AttachOnly 호출 경로를 확인하는 쪽으로 전환해야 한다.
+반면 최신 STATUS처럼 `clavis=최유력 secure 원인`, `DM ID 무응답=reset/power 쪽`,
+`J-Link close/open=T32 DOWN/UP 재현`으로 연결하면 증거보다 앞서간다.
+
+현재 다음 한 가지 작업을 고르면 **`clavis.cmm` 내용과 그 의존성·에러 처리 확인**이다.
+그 자료를 확보하지 못하면 안전한 읽기 전용 실험만으로 원인을 더 나누기는 어렵다.
+
 ## 최우선 전제 추가 — 2026-08-11: T32 CMM은 ARM 원본을 RISC-V로 포팅한 코드다
 
 > 이 절이 아래의 모든 T32 스크립트 해석보다 우선한다. 현재 CMM은 처음부터

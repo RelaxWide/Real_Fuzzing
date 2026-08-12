@@ -18,7 +18,7 @@ halt/PC 샘플링은 **안 한다**(T32 도 그 방식이 아님이 확인됨).
 
 ---
 
-## 0.4 ★★★ 가장 강한 단일 리드 (2026-08-12) — secure JTAG unlock (`clavis.cmm`) — **미확정**
+## 0.4 ★★★ 가장 중요한 미해석 호출 (2026-08-12) — `clavis.cmm` (secure JTAG) — **미확정**
 
 사용자가 `attach.cmm` 의 core-attach **이전** 시퀀스를 줬다:
 
@@ -98,23 +98,25 @@ APBAP1 comp=0x81480000  cidOK=False  폴트=0
 이 영역은 정렬 무관하게 `0xEAFFFFFE` 균일이라 정렬 주소 2곳이 "기대와 다름
 = 실데이터" 로 오판됐다. `.35` 에서 no-decode 값 집합으로 엄격 판정하도록 수정.
 
-**바르게 읽으면:**
-- DM 컴포넌트의 **ID 블록(`+0xFF0` 등)이 유효 CoreSight CIDR 을 안 준다**
-  (`0x0D..05B1` 아님). `cidOK=False`
-- **폴트(STICKYERR) 도 안 난다.** 조용히 `0xEAFFFFFE` 균일
+**바르게 읽으면:** DM 컴포넌트의 시험 주소(`+0xFF0` ID 블록 포함) 전부가
+`0xEAFFFFFE` 균일이고 `cidOK=False`, 폴트 없음.
 
-⇒ *"컴포넌트 있고 기능만 게이팅"* 이 아니라 **"컴포넌트가 디코드 자체를 안 함"**
-쪽이다. present-but-gated 라면 ID 블록은 보통 응답한다.
-**이 측정은 §0.4(secure) 를 지지하지 않고 오히려 약화시킨다.**
+❌❌ **철회 (feedback §1)** — 여기서 *"ID 블록 무응답 = 전원/리셋/부재 쪽"* 으로
+방향을 준 것은 틀렸다. **이 측정은 secure vs reset/power 를 판별하지 못한다:**
+- SF-E76 DMI aperture 가 `+0xFF0` 에 표준 CoreSight CIDR 을 노출한다는 타깃
+  사양을 **확보하지 못했다**. 노출 안 하는 구조면 `cidOK=False` 는 당연하다
+- 노출하는 구조여도 인증/firewall/attribute 가 aperture **전체**를 가릴 수 있다
+- ⇒ `cidOK=False` 는 secure 를 일반적으로 약화시키지 **않는다.** 약화되는 건
+  오직 *"ID 는 보이고 기능만 가려진다"* 는 **좁은 형태**뿐이다
 
-정리하면 지금 무게중심:
+말할 수 있는 것은 여기까지다 (원인 중립, 판정명 `DM_APERTURE_NO_VALID_RESPONSE`):
 ```
-secure JTAG(§0.4)        ← DM ID 블록 무응답으로 **약화** (배제는 아님)
-전원 / 리셋 / 클럭 / 부재   ← DM 컴포넌트가 디코드조차 안 하는 것과 부합
+현재 MEM-AP 경로에서, DM aperture 의 기능·식별 주소 모두 유효 응답 없음.
+원인은 power/reset/clock · security/auth/firewall · 다른 access path 중
+**구분되지 않음.**
 ```
-단 §0.5 원칙은 유지: **어느 하나로 확정하지 않는다.** clavis 내용과 T32 실측이
-있어야 갈린다. (전원/리셋도 "확정" 이 아니라 "부합" 이다 — 무응답의 원인이
-authentication 으로 ID 블록까지 막힌 경우를 완전히 배제하진 못한다.)
+⚠ 이건 **유효 세션 1회 관측**이다. 문서 확정 기준(AP 6/6 + 오류없음 + 독립
+3세션 일치)을 아직 안 채웠다.
 
 ### ⚠ 회귀 수정 — 측정 세션이 0/6 로 죽던 원인
 
@@ -124,7 +126,7 @@ authentication 으로 ID 블록까지 막힌 경우를 완전히 배제하진 �
 connect 경로(`--p0/p1/p2`)는 자기 스크립트를 쓰므로 무관하다.
 (이 회귀 때문에 `--dmid` 가 대부분 `AP일치=0/6` 으로 죽고 드물게만 통과했다.)
 
-### ✅ 재측정 (`.35`, 유효 세션 6/6) — 결과 확정: DM 무응답, 폴트 없음
+### 재측정 (`.35`→`.36`, 유효 세션 6/6, **1회 관측**) — DM aperture 무응답
 
 회귀 수정 후 세션이 정상 6/6 통과. 그 위에서:
 ```
@@ -137,11 +139,18 @@ STICKYERR 없음. 앞의 `2/9 PRESENT` 거짓양성은 완전히 사라졌다.
 DM 이 응답하나" 만 본다 — DM 을 깨우지 않는다. T32 에서 DM 이 보이는 건 T32 가
 **DM 이 나타나기 전에 타깃 상태를 바꾸기 때문**이다(clavis secure / DOWN→UP 리셋).
 
-진전에 필요한 두 외부 입력 (측정 아님):
-1. `clavis.cmm` 내용 — 고정 시퀀스면 재현 가능, 키/challenge 면 벽
-2. T32 에서 `DOWN→UP` **전후** `0x81480000` / `0xC81040/44` 값 변화 — 무엇이
-   DM 을 나타나게 하는지 직접 보여준다. `0xC81040/44` 는 AXI 타깃 경로의 진짜
-   양성 대조(feedback 요구)도 겸한다.
+❌ 철회 (feedback §1): *"T32 가 DM 이 나타나기 전에 상태를 바꾼다"* 는 아직
+추론이다. Prepare/DAP power/clavis 중 무엇이 DM 노출을 바꾸는지 모른다. 그리고
+정상 `AttachOnly` 경로엔 `DOWN→UP` 이 없다(이미 확인) — `--p0` 이 한 건
+handle close/open 재시도일 뿐 T32 `DOWN/UP` 등가가 아니다. 이 표기 전부 철회.
+
+진전에 필요한 것 (측정 아님), feedback §4 우선순위대로:
+1. **`clavis.cmm` 본문** (P0) — `Data.Set`/`PER.Set`/`Data.In`/`Data.Long`/
+   `OPEN`/`READ`/하위 `DO`/challenge·hash 명령과 인자 `0x0` 사용처
+2. `CLAVIS_ERROR_HANDLER` 본문 — 실패가 attach 중단인지 경고 후 계속인지
+3. clavis 가 호출하는 하위 CMM·외부 키/인증서 의존성 목록 (비밀값은 적지 말 것)
+⚠ clavis 가 **고정된 공개 레지스터 시퀀스**임이 확인되기 전까지 target write /
+reset-control write / unlock 추정값 쓰기는 하지 않는다.
 
 확정/반증 방법 둘:
 1. **`clavis.cmm` 내용** — 결정적. 우리가 안 건드린 레지스터를 만지는가

@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-12.35  측정세션 스크립트 OFF 복귀 + dmid 정렬오판 수정"
+VERSION = "standalone 2026-08-12.36  feedback: dmid 원인중립 + NODECODE 폐기 + DOWN/UP 철회"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -745,8 +745,9 @@ def p0_script_text():
     return P0_SCRIPT % (CHAIN_TAP_ID, aps)
 
 
-def p0_run(a, do_downup):
-    """feedback P0 한 조건. do_downup 이면 DOWN -> 500ms -> UP 을 재현한다."""
+def p0_run(a, reopen):
+    """feedback P0 한 조건. reopen 이면 close/500ms/open 재시도.
+    ⚠ 이것은 T32 SYStem.DOWN/UP 이 **아니다** (feedback §1). 단순 세션 재열기."""
     import os
     import tempfile
     sp = os.path.join(tempfile.gettempdir(), f"sfe76_p0_{os.getpid()}.JLinkScript")
@@ -754,7 +755,7 @@ def p0_run(a, do_downup):
         f.write(p0_script_text())
     logs = []
     cb = lambda m: logs.append(str(m).rstrip())
-    r = {'downup': do_downup, 'stages': []}
+    r = {'reopen': reopen, 'stages': []}
     jl = pylink.JLink(log=cb, detailed_log=cb, error=cb, warn=cb)
     try:
         jl.exec_command(f"ScriptFile = {sp}")
@@ -778,8 +779,8 @@ def p0_run(a, do_downup):
             r['stages'].append({'tag': tag, 'target_connected': tc, 'err': err})
             return tc
 
-        ok = attempt('UP')
-        if do_downup and not ok:
+        ok = attempt('1st')
+        if reopen and not ok:
             # SYStem.DOWN -> WAIT 500ms -> SYStem.UP
             try:
                 jl.close()
@@ -793,7 +794,7 @@ def p0_run(a, do_downup):
             jl.exec_command("SetcJTAGInitMode = 1")
             jl.set_tif(TIF_CJTAG)
             jl.set_speed(10000)
-            ok = attempt('DOWN->500ms->UP')
+            ok = attempt('close+500ms+reopen')  # ★ T32 DOWN/UP 아님
         r['ok'] = ok
     except Exception as e:
         r['fatal'] = str(e)[:110]
@@ -1097,6 +1098,8 @@ DM_ID_OFFS = [(0xFF0, 'CIDR0'), (0xFF4, 'CIDR1'), (0xFF8, 'CIDR2'), (0xFFC, 'CID
 
 # 응답 없음 서명값. 정렬에 따라 0x00000001, 그 외 0xEAFFFFFE/0xEAFFFFFC/0.
 # ID 블록이 이 값들만 주면 컴포넌트가 **디코드를 안 하는 것**이다.
+# ❌ 폐기 (feedback §2): 값 하나가 이 집합에 있다고 no-decode 로 단정하면
+#   거짓 음성이 생긴다. 판정은 '여러 주소가 동일값 반복' 으로 대체했다.
 NODECODE_VALUES = {0x00000001, 0x00000000, 0xEAFFFFFE, 0xEAFFFFFC, 0xFFFFFFFF}
 
 
@@ -1121,18 +1124,22 @@ def dmid_probe(d):
             d.dpw(DP_ABORT, 0x1E)                       # sticky 클리어
             v, meta = d.mem32(apbase, comp + off, csw)
             flt = meta.get('dp_error', False)
-            dfl = is_default_line(comp + off, v)
             if off in (0xFF0, 0xFF4, 0xFF8, 0xFFC):
                 cid.append(None if v is None else v & 0xFF)
-            real = v is not None and v not in NODECODE_VALUES
             if flt:
                 r['faults'] += 1
-            if real:
-                r['nondefault'] += 1
-            mark = 'F' if flt else ('.' if real else 'x')   # x = 무응답 서명값
-            r['regs'].append((rn, hx(v), mark))
+            r['regs'].append([rn, hx(v), v, flt])       # [이름, hex, raw, 폴트]
         ok, cls = cid_ok(cid)
         r['cid_ok'], r['cid_cls'] = ok, cls
+        # ★ feedback §2: 값 하나가 집합에 있다는 이유로 no-decode 를 단정하지
+        #   않는다. 판정은 **여러 주소가 비정상적으로 동일값인지**로 한다.
+        vals = [rr[2] for rr in r['regs'] if rr[2] is not None]
+        r['uniform'] = (len(set(vals)) == 1) if len(vals) > 1 else False
+        r['uniform_val'] = hx(vals[0]) if r['uniform'] else None
+        for rr in r['regs']:
+            real = (rr[2] is not None and not rr[3] and not r['uniform'])
+            rr.append('.' if real else ('F' if rr[3] else 'x'))
+        r['nondefault'] = sum(1 for rr in r['regs'] if rr[4] == '.')
         if csw is not None:
             d.apw(apbase, OFF_CSW, csw)
         out.append(r)
@@ -1571,10 +1578,10 @@ def main():
         print("  ★ 유일한 성공 오라클 = target_connected() == True")
         print("    (connect 무예외 / connected() / 로그의 ID / DTM 문구 소실은")
         print("     전부 성공 신호가 **아니다** - feedback §6)")
-        print("  ★ 2회차는 SYStem.DOWN -> WAIT 500ms -> SYStem.UP 재현.")
-        print("    HCore 시퀀스의 마지막 단계인데 한 번도 안 해봤다.\n")
+        print("  ★ 2회차는 handle close/500ms/open 재시도.")
+        print("    ⚠ 이것은 T32 SYStem.DOWN/UP 이 아니다 (feedback §1).\n")
         print("---8<---")
-        r = p0_run(a, do_downup=True)
+        r = p0_run(a, reopen=True)
         if 'fatal' in r:
             print("FATAL", r['fatal'])
         for st in r.get('stages', []):
@@ -1739,11 +1746,11 @@ def main():
 
     if a.dmid:
         print(f"\n{'=' * 70}\n [DMID] DM 컴포넌트 자신의 ID 블록\n{'=' * 70}")
-        print("  ROM 은 그 ID 블록(0x0AF7)으로 진짜임을 확인했다.")
-        print("  DM 컴포넌트의 ID 블록은 한 번도 안 읽었다. 그게 가른다:")
-        print("    CIDR=0D..05B1 나옴  -> 컴포넌트 있음, 기능만 죽음 = **게이팅**")
-        print("    그것도 default-line -> 디코드 안 함 = **전원/리셋/부재**")
-        print("  F=폴트(STICKYERR)  d=default-line  .=실데이터\n")
+        print("  DM 컴포넌트의 ID 블록(+0xFF0)은 한 번도 안 읽었다. 관측만 한다.")
+        print("  ⚠ 이 aperture 가 표준 CIDR 을 노출한다는 사양은 없다 -")
+        print("    secure/reset 원인 판별에는 못 쓴다 (feedback §1).")
+        print("  F=폴트(STICKYERR)  x=무응답/전주소동일값  .=실데이터")
+        print("  ★ 독립 3세션 재현 후에만 확정 (지금은 1회 관측)\n")
         r0 = session(a, 0)
         if not r0.get('ok'):
             print("---8<---")
@@ -1753,17 +1760,16 @@ def main():
         print("---8<---")
         present = []
         for r in r0.get('dmid', []):
-            regs = " ".join(f"{n}={v}{m}" for n, v, m in r['regs'])
+            regs = " ".join(f"{rr[0]}={rr[1]}{rr[4]}" for rr in r['regs'])
             print(f"{r['ap']} comp={r['comp']} cidOK={r['cid_ok']} "
                   f"실데이터={r['nondefault']}/{len(r['regs'])} 폴트={r['faults']}"
-                  + ("  (전부 동일값=무응답)" if r.get('uniform') else ""))
+                  + (f"  (전 주소 동일값={r['uniform_val']})" if r.get('uniform') else ""))
             print(f"  {regs}")
-            uniform = len({v for _n, v, _m in r['regs']}) == 1
-            r['uniform'] = uniform
             if r['cid_ok'] or r['nondefault'] > 0:
                 present.append(r['ap'])
-        print("VERDICT:", "DM_COMPONENT_PRESENT(게이팅쪽)" if present
-                          else "DM_COMPONENT_NOT_DECODING(전원/리셋/부재쪽)")
+        print("★ 이 결과는 secure vs reset/power 를 **판별하지 못한다** (feedback §1).")
+        print("VERDICT:", "DM_APERTURE_VALID_RESPONSE" if present
+                          else "DM_APERTURE_NO_VALID_RESPONSE (1회 관측)")
         print("---8<---")
         return 0 if present else 6
 
