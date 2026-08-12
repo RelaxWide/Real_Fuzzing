@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-12.33  manual chain 이 cJTAG 를 깨는가 (P1 대조/P2 전후)"
+VERSION = "standalone 2026-08-12.34  --dmid: DM 컴포넌트 ID 블록이 응답하나"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -1078,6 +1078,60 @@ def prot_probe(d, dm_addr):
 
 
 
+# ★★★ --dmid : DM 컴포넌트 **자신의 ID 블록**을 읽는다.
+#
+#   지금까지 우리는 DM 의 **기능 레지스터**(dmcontrol +0x40 / dmstatus +0x44)만
+#   읽고 default-line 이 나오니 "없다" 고 했다. 하지만 ROM 이 진짜인지는
+#   그 **ID 블록**(CIDR 0xFF0~0xFFC / DEVARCH 0xFBC)으로 확인했다 (→ 0x0AF7).
+#   **DM 컴포넌트의 ID 블록은 한 번도 안 읽었다.** 그게 이걸 가른다:
+#
+#     ID 블록이 CoreSight ID 를 준다  → 컴포넌트는 거기 있다. 기능만 죽음 = 게이팅
+#     ID 블록도 default-line          → 디코드 자체 안 함 = 전원/리셋/부재
+#
+#   각 읽기의 STICKYERR(폴트) 여부도 같이 본다 — 조용한 default vs 에러 응답.
+#   ROM 엔트리에서 컴포넌트 주소를 계산한다 (BASE=0x3 이므로 rb=0, 주소=엔트리오프셋).
+DM_ID_OFFS = [(0xFF0, 'CIDR0'), (0xFF4, 'CIDR1'), (0xFF8, 'CIDR2'), (0xFFC, 'CIDR3'),
+              (0xFBC, 'DEVARCH'), (0xFCC, 'DEVTYPE'), (0xFC8, 'DEVID'),
+              (0x040, 'dmcontrol'), (0x044, 'dmstatus')]
+
+
+def dmid_probe(d):
+    out = []
+    for name, apbase, _t in AP_MAP:
+        if not name.startswith('APBAP'):
+            continue
+        base = d.apr(apbase, OFF_BASE)
+        if base is None or base == 0xFFFFFFFF or not (base & 1):
+            continue
+        rb = base & 0xFFFFF000
+        e0, _ = d.mem32(apbase, rb, d.apr(apbase, OFF_CSW))
+        if not e0 or not (e0 & 1):
+            continue
+        comp = (rb + (e0 & 0xFFFFF000)) & 0xFFFFFFFF   # DM 컴포넌트 base
+        csw = d.apr(apbase, OFF_CSW)
+        r = {'ap': name, 'comp': f"0x{comp:08X}", 'regs': [], 'faults': 0,
+             'nondefault': 0}
+        cid = []
+        for off, rn in DM_ID_OFFS:
+            d.dpw(DP_ABORT, 0x1E)                       # sticky 클리어
+            v, meta = d.mem32(apbase, comp + off, csw)
+            flt = meta.get('dp_error', False)
+            dfl = is_default_line(comp + off, v)
+            if off in (0xFF0, 0xFF4, 0xFF8, 0xFFC):
+                cid.append(None if v is None else v & 0xFF)
+            if flt:
+                r['faults'] += 1
+            if v is not None and not dfl:
+                r['nondefault'] += 1
+            r['regs'].append((rn, hx(v), 'F' if flt else ('d' if dfl else '.')))
+        ok, cls = cid_ok(cid)
+        r['cid_ok'], r['cid_cls'] = ok, cls
+        if csw is not None:
+            d.apw(apbase, OFF_CSW, csw)
+        out.append(r)
+    return out
+
+
 def dm_probe(d):
     out = []
     for name, apbase, _t in AP_MAP:
@@ -1283,6 +1337,10 @@ def session(a, idx):
             out['prot'] = prot_probe(d, a.dmaddr)
             return out
 
+        if getattr(a, 'dmid', False):
+            out['dmid'] = dmid_probe(d)
+            return out
+
         if getattr(a, 'dm', False):
             out['dm'] = dm_probe(d)
             return out
@@ -1357,6 +1415,8 @@ def main():
     ap.add_argument('--pwr', action='store_true',
                     help='* 전원요청 조합(T32 는 DBG 만) x APB Prot 스윕. DP 쓰기만')
     ap.add_argument('--dmaddr', type=lambda x: int(x, 0), default=0x81480000)
+    ap.add_argument('--dmid', action='store_true',
+                    help='* DM 컴포넌트 자신의 ID 블록(CIDR/DEVARCH) 응답 여부 + sticky')
     ap.add_argument('--dm', action='store_true',
                     help='★ ROM 엔트리가 가리키는 곳에 DM 이 실재하나 (주소 후보 3종)')
     ap.add_argument('--rom', action='store_true',
@@ -1666,6 +1726,33 @@ def main():
         print("VERDICT:", f"DM_LIVE ({live[0]})" if live else "DM_ABSENT_ALL")
         print("---8<---")
         return 0 if live else 6
+
+    if a.dmid:
+        print(f"\n{'=' * 70}\n [DMID] DM 컴포넌트 자신의 ID 블록\n{'=' * 70}")
+        print("  ROM 은 그 ID 블록(0x0AF7)으로 진짜임을 확인했다.")
+        print("  DM 컴포넌트의 ID 블록은 한 번도 안 읽었다. 그게 가른다:")
+        print("    CIDR=0D..05B1 나옴  -> 컴포넌트 있음, 기능만 죽음 = **게이팅**")
+        print("    그것도 default-line -> 디코드 안 함 = **전원/리셋/부재**")
+        print("  F=폴트(STICKYERR)  d=default-line  .=실데이터\n")
+        r0 = session(a, 0)
+        if not r0.get('ok'):
+            print("---8<---")
+            print(f"무효 세션 (AP일치={r0.get('ap_match')}/6) - 다시 실행")
+            print("---8<---")
+            return 6
+        print("---8<---")
+        present = []
+        for r in r0.get('dmid', []):
+            regs = " ".join(f"{n}={v}{m}" for n, v, m in r['regs'])
+            print(f"{r['ap']} comp={r['comp']} cidOK={r['cid_ok']} "
+                  f"실데이터={r['nondefault']}/{len(r['regs'])} 폴트={r['faults']}")
+            print(f"  {regs}")
+            if r['cid_ok'] or r['nondefault'] > 0:
+                present.append(r['ap'])
+        print("VERDICT:", "DM_COMPONENT_PRESENT(게이팅쪽)" if present
+                          else "DM_COMPONENT_NOT_DECODING(전원/리셋/부재쪽)")
+        print("---8<---")
+        return 0 if present else 6
 
     if a.dm:
         print(f"\n{'=' * 70}\n [DM] ROM 이 가리키는 곳에 DM 이 응답하나\n{'=' * 70}")
