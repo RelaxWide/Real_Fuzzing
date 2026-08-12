@@ -18,6 +18,56 @@ halt/PC 샘플링은 **안 한다**(T32 도 그 방식이 아님이 확인됨).
 
 ---
 
+## 0.4 ★★★★★ 1순위 가설 (2026-08-12) — **secure JTAG unlock (`clavis.cmm`)**
+
+사용자가 `attach.cmm` 의 core-attach **이전** 시퀀스를 줬다:
+
+```
+ON ERROR GOTO CLAVIS_ERROR_HANDLER
+do "&FuncDir/SED/clavis.cmm" 0x0    // called once for secure jtag
+ON ERROR DEFAULT
+... (지역변수 / SYStem.CPU / CONFIG)
+GOSUB SET_CORE_ENABLE_BITMAP
+→ attach 성공 판단
+```
+
+**`clavis`** = 라틴어 **열쇠**. 전용 에러 핸들러가 감싸고, 모든 것보다 **먼저
+한 번** 실행된다. = 이게 실패하면 attach 전체가 중단된다.
+
+### 이 하나가 지금까지의 **모든** 관측을 동시에 설명한다
+
+| 관측 | secure-unlock 미수행으로 설명 |
+|---|---|
+| DAP / AP / ROM 은 읽힌다 | 인증 게이트는 항상-켜짐 도메인을 안 막는다 |
+| ROM 이 가리키는 **DM 만** 무응답 | `DBGEN/SPIDEN` 미인가 시 그 컴포넌트가 게이트된다 |
+| Prot 8종 전부 무효 | 인증은 Prot 가 아니라 **인가 신호**로 걸린다 |
+| 전원요청 조합 무관 | 전원과 인증은 다른 축 |
+| mode/CoreBase/device 무관 | 전부 인증 아래 계층 |
+| P0/P1/P2 connect 실패 | J-Link 은 unlock 을 안 한다 |
+| AXI core-enable = 0 | `SET_CORE_ENABLE_BITMAP` 은 unlock **이후** |
+| **T32 는 된다** | `clavis.cmm` 을 **먼저** 돌린다 |
+
+feedback 이 열어둔 원인 후보 중 정확히 `security / firewall / isolation` 을 지목한다.
+
+### 분기점 — `clavis.cmm` **안**을 봐야 갈린다
+
+| clavis 가 하는 일 | 재현 가능? |
+|---|---|
+| 고정 시퀀스 (특정 레지스터에 **상수** 쓰기) | ✅ 그대로 재현 |
+| challenge-response 인증 (읽고→가공→되쓰기) | ❌ 키 없이는 벽 |
+| 외부 키/인증서 파일 로드 | ❌ 그 파일이 진짜 열쇠 |
+
+`clavis.cmm` 에서 볼 것:
+1. `Data.Set`/`PER.Set` 줄 — 접근클래스(`DAP:`/`APB:`/`AXI:`)·주소·값
+2. `Data.In`/`Data.Long(...)` 로 **읽은 뒤** 되쓰는 줄 → challenge-response 신호
+3. 외부 파일 로드(`OPEN`/`READ`/인증서 경로)
+4. 인자 `0x0` 이 안에서 어떻게 쓰이나 (unlock 레벨/슬롯)
+
+⚠ 이 가설이 맞으면 §0.5 의 "원인 미확정" 은 **1순위가 secure unlock 으로 좁혀진다**
+(배제는 아니다 — clavis 내용 확인 전까지 firewall/other-path 도 열어둔다).
+
+---
+
 ## 0.5 ★★★ 결론 (2026-08-11 종합, feedback 반영 후)
 
 > 아래는 전부 **유효 세션**에서 잰 것이다. 그 아래 절들에는 무효 세션·잘못된
