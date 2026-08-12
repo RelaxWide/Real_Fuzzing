@@ -18,62 +18,65 @@ halt/PC 샘플링은 **안 한다**(T32 도 그 방식이 아님이 확인됨).
 
 ---
 
-## 0.3 ★★★★★ 원인 확정 (2026-08-12) — **secure JTAG challenge-response 인증 (`clavis.cmm`)**
+## 0.3 ★★★★ 가장 강한 원인 후보 (2026-08-12) — secure JTAG challenge-response (`clavis.cmm`) — **미확정**
 
-> 사용자 확인: **`clavis.cmm` 자체가 clavis 로 challenge-response 인증을 수행한다.**
-> 이로써 feedback 이 열어둔 세 원인 갈래 중 **security/authentication 으로 확정**된다.
-> (전원/리셋, 다른 access path 는 원인에서 내린다.)
+> ❌❌ 직전 판(이 절을 "원인 확정" 으로 쓴 것)을 **철회한다** (feedback 2026-08-12).
+> 나는 또 앞서갔다 — "가장 강한 후보" 를 "확정" 으로 승격시켰다. 이번엔 secure 로.
+>
+> **핵심 구분: challenge-response 가 *존재하는 것* 과 그게 *지금 J-Link 실패의
+> 직접 원인인 것* 은 별개다.** 나는 후자를 관측 없이 단정했다.
 
-### 무엇이 확정됐나
+### 강하게 확인된 것 (여기까지만)
 
-challenge-response 인증은 정의상:
-- 타깃이 **난수 challenge** 발행 (매번 다름)
-- 호스트가 **비밀 키**(또는 HSM/서명 서버)로 response 생성
-- response 검증 통과 시 `DBGEN`/디버그 인가가 열림 → DM 노출
+1. 정상 T32 RISC-V attach 선행 경로에서 `clavis.cmm` 이 호출된다
+2. 그 스크립트는 실제 challenge-response 인증을 수행한다 (사용자 확인)
+3. J-Link 시험에서는 그 인증에 해당하는 절차를 수행하지 않았다
 
-**비밀 키는 `clavis.cmm` 안에 없다.** 스크립트는 challenge 를 읽어 외부 키/서명자에
-넘기고 response 를 받는 **껍데기**다. ⇒ 스크립트를 봐도, 고정 시퀀스를 흉내내도
-소용없다. challenge 가 매번 바뀌므로 **키 없이는 원리적으로 재현 불가.**
-(= feedback 이 말한 "재현 가능한 고정 시퀀스" 가 아니라 **"벽" 갈래**)
+⇒ **인증 누락이 현재 DM 미응답의 가장 강한 원인 후보로 상승했다.** 여기까지가 정직한 상태.
 
-### 모든 관측과 일치
+### ❌ 아직 증명 안 됐는데 확정으로 썼던 것 (전부 철회)
 
-| 관측 | 인증 게이트로 설명 |
+| 내가 쓴 것 | 왜 이른가 |
 |---|---|
-| DAP/AP/ROM 읽힘 | 인증은 항상-켜짐 도메인을 안 막는다 |
-| DM 만 무응답 | `DBGEN` 미인가로 그 컴포넌트 게이트 |
-| DM aperture 전체 무응답·폴트없음 | aperture 통째 인가 뒤 (feedback §1 이 가능하다던 형태) |
-| J-Link P0/P1/P2 connect 실패 | J-Link 은 challenge-response 를 안 한다 |
-| **T32 는 됨** | `clavis.cmm` 으로 인증 통과 |
+| security 로 **원인 확정** | 인과 전후 대조 미관측. "모든 관측을 설명" 은 설명력이지 증명 아님 |
+| 전원/리셋·다른 경로 **배제** | 그 셋도 현재 무응답을 만들 수 있다. 안 내린다 |
+| **`DBGEN` 미인가**로 게이트 | `DBGEN/NIDEN/SPIDEN` 등 인증 상태 레지스터 전후 값 없음 = 구현 추정 |
+| **키 없이 원리적 재현 불가** | challenge 가 난수인지, response 가 비밀키 기반인지, 키가 clavis 밖인지 미확인. **공개 고정 알고리즘 + 장치별 허가 데이터**일 수도 |
+| **코딩 단계 종료** | 위가 안 갈렸으므로 이르다 |
+| P0/P1/P2 실패 = 인증 증거 | 셋 다 인증 안 한 같은 J-Link 계열 → 독립 실험 아님. 증거로 못 셈 |
 
-### ⇒ 판단: "못 뚫은 것" 이 아니라 "설계상 못 뚫게 한 것"
+### 정직한 현재 결론 (§0.5 와 일치)
 
-J-Link 소프트웨어 우회로 갈 길은 여기서 끝이다. 남은 경로는 전부 **자산/권한
-확보**이지 코딩이 아니다:
+```
+T32 정상 attach 선행 경로에 challenge-response 인증이 존재한다.
+J-Link 시험에서는 그 인증을 재현하지 않았다.
+⇒ 인증 누락이 DM 미응답의 **가장 강한 원인 후보**로 상승.
 
-1. **SEGGER 문의** — "SiFive clavis / secure debug challenge-response 를 J-Link 이
-   수행할 수 있나". 되면 인증 자산을 J-Link 에 먹이는 방법이 있다
-2. **인증 우회 트레이스** — 원 목표는 CPU 제어가 아니라 트레이스 버퍼(`0xFD180000`)
-   회수다. 그 sink 가 DM 인가와 **다른 도메인**이면 인증 없이 접근될 수도.
-   (단 `--addrs trace` 에서 AP 로는 안 닿았고, T32 는 DM SBA 로 간다 — SBA 도
-   인증 뒤일 공산이 크다)
-3. **인증 자산 확보** — 설계/보안팀의 debug 키 또는 서명 서버 접근을 받아
-   T32 가 쓰는 그 경로를 J-Link/우리 도구에 이식
+그러나 인증 전후의 동일 경로 DM 응답 변화나 clavis 실패 시 attach 실패가
+확인되지 않아, 현재 J-Link 실패의 **직접 원인으로는 아직 확정 못 한다.**
+원인은 여전히 authentication · power/reset/clock · firewall · access path 중
+구분되지 않았다.
+```
 
-### 방향을 가르는 마지막 한 가지
+### 확정에 필요한 증거 (feedback §4) — 셋 중 하나
 
-`clavis.cmm` 이 challenge-response 를 **어떻게** 하는가:
-- **T32 내장 기능**(`SYStem.Option`/전용 명령) 호출 → 키가 T32 설정·별도 파일에
-  있다 → **그 자산을 J-Link 로 옮기는 게 관건** (경로 2/3, 가능성 있음)
-- **외부 서명 서버/HSM** 호출 → 그 인프라 접근이 곧 열쇠 (경로 3)
+1. 같은 T32 세션에서 `clavis` **직전 vs 성공 직후** 같은 DM 주소를 같은 접근
+   클래스로 읽어, 무응답→정상 `dmstatus` 로 바뀌는지
+2. 안전한 환경에서 `clavis` 생략/실패 시 attach 실패, 정상 인증 시 성공하는 A/B
+3. 타깃 공식 authentication 상태 레지스터 locked→unlocked 와 DM 응답 부활의 동시성
 
-⚠ 어느 쪽이든 **우리가 코드로 만들 수 있는 단계는 끝났다.** target write /
-reset-control write / unlock 추정값 쓰기는 계속 하지 않는다 — 인증 우회가 아니라
-정당한 인증 자산으로만 넘는다.
+그리고 `clavis.cmm` 본문에서 (다음 단계를 가른다):
+- challenge 읽는 명령·주소·접근클래스 / response 쓰는 명령·주소·접근클래스
+- response 생성 명령 또는 호출 대상 (T32 내장 / 로컬 exe / 키파일 / HSM / 서버)
+- 키·인증서 의존성의 **존재 여부와 사용 인터페이스**(실제 비밀값은 적지 않는다)
+- 인자 `0x0` 용도 / `CLAVIS_ERROR_HANDLER` 가 중단인지 경고 후 계속인지
+
+⚠ target/reset/unlock 추정값 쓰기는 계속 금지. 새 probe 작성이 아니라 위 자료
+확인이 다음 작업이다.
 
 ---
 
-## 0.4 (구) 미해석 호출 기록 — `clavis.cmm` — **§0.3 으로 확정됨**
+## 0.4 (구) 미해석 호출 기록 — `clavis.cmm`
 
 사용자가 `attach.cmm` 의 core-attach **이전** 시퀀스를 줬다:
 
@@ -2847,9 +2850,9 @@ AXI:0x00C81024 / 28 / 2C / 40 / 44 의 정상값
 
 ## 8. 한 줄 요약
 
-**원인 확정: secure JTAG challenge-response 인증(`clavis.cmm`).** cJTAG→DAP→AP→ROM
-까지는 되지만 DM 은 `DBGEN` 미인가로 게이트돼 무응답이다. 인증의 비밀 키가
-스크립트 밖(외부 키/서명 서버)에 있어 **키 없이는 J-Link 로 재현 불가** —
-"못 뚫은 것" 이 아니라 설계상 막힌 것이다. 남은 경로는 SEGGER 문의 / 인증과
-다른 도메인일 수 있는 트레이스 sink 우회 / 설계·보안팀의 인증 자산 확보 셋뿐이고,
-전부 코딩이 아니라 **자산·권한 확보**다. target/reset write 는 계속 안 한다.
+**cJTAG→DAP→AP→ROM 까지는 되지만 ROM 이 지목한 DM aperture 에서 유효 응답을 못
+얻는다. 정상 T32 attach 선행 경로에 challenge-response 인증(`clavis.cmm`)이 존재하고
+J-Link 는 그걸 재현하지 않으므로 — 인증 누락이 DM 미응답의 *가장 강한 원인 후보*로
+상승했다. 그러나 인증 전후 DM 응답 변화를 관측하지 못해 *직접 원인으로는 미확정*
+이고, 전원/리셋·firewall·access-path 도 아직 안 내렸다. 다음은 새 probe 가 아니라
+`clavis.cmm` 데이터 흐름과 인증 전후 DM 응답 확인. target/reset write 는 계속 금지.**
