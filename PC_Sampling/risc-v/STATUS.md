@@ -18,7 +18,7 @@ halt/PC 샘플링은 **안 한다**(T32 도 그 방식이 아님이 확인됨).
 
 ---
 
-## 0.4 ★★★★★ 1순위 가설 (2026-08-12) — **secure JTAG unlock (`clavis.cmm`)**
+## 0.4 ★★★ 가장 강한 단일 리드 (2026-08-12) — secure JTAG unlock (`clavis.cmm`) — **미확정**
 
 사용자가 `attach.cmm` 의 core-attach **이전** 시퀀스를 줬다:
 
@@ -34,20 +34,23 @@ GOSUB SET_CORE_ENABLE_BITMAP
 **`clavis`** = 라틴어 **열쇠**. 전용 에러 핸들러가 감싸고, 모든 것보다 **먼저
 한 번** 실행된다. = 이게 실패하면 attach 전체가 중단된다.
 
-### 이 하나가 지금까지의 **모든** 관측을 동시에 설명한다
+### ⚠ 이 가설이 증상을 설명하는 건 맞지만, **다른 셋도 똑같이 설명한다**
 
-| 관측 | secure-unlock 미수행으로 설명 |
-|---|---|
-| DAP / AP / ROM 은 읽힌다 | 인증 게이트는 항상-켜짐 도메인을 안 막는다 |
-| ROM 이 가리키는 **DM 만** 무응답 | `DBGEN/SPIDEN` 미인가 시 그 컴포넌트가 게이트된다 |
-| Prot 8종 전부 무효 | 인증은 Prot 가 아니라 **인가 신호**로 걸린다 |
-| 전원요청 조합 무관 | 전원과 인증은 다른 축 |
-| mode/CoreBase/device 무관 | 전부 인증 아래 계층 |
-| P0/P1/P2 connect 실패 | J-Link 은 unlock 을 안 한다 |
-| AXI core-enable = 0 | `SET_CORE_ENABLE_BITMAP` 은 unlock **이후** |
-| **T32 는 된다** | `clavis.cmm` 을 **먼저** 돌린다 |
+"어느 계층까진 되고 그 다음이 안 된다"는 그림은 secure JTAG 고유의 서명이
+**아니다.** 리셋/클럭, 버스 firewall, T32 와 다른 접근 경로 — feedback 이 열어둔
+넷이 전부 같은 표를 채운다. 그러므로 증상 일치는 **지목의 근거가 아니다.**
 
-feedback 이 열어둔 원인 후보 중 정확히 `security / firewall / isolation` 을 지목한다.
+**게다가 우리가 이미 판별 측정을 했고, 크루드한 lock 형태는 반증됐다:**
+§2.5 에서 스스로 "이걸 가르는 단 하나의 측정" 으로 지정한 `CSW.DeviceEn` 이
+**전 AP `DeviceEn=1`** 이다 = AP 버스 포트는 하드웨어로 켜져 있다.
+(단 feedback: DeviceEn 은 완벽한 oracle 이 아니다 — DM 만 `DBGEN` 으로
+게이트되면서 AP 포트 비트는 1일 수 있다. ⇒ 확정도 반증도 아닌 **미결**)
+
+### clavis 가 준 진짜 새 정보 (증상 설명이 아니라)
+
+일반론(`SiFive 가 secure JTAG 를 지원한다`, §2.5)에서 →
+**이 타깃의 T32 attach 가 실제로 그 unlock 을 돌리고 우리는 안 돌린다** 로
+올라갔다. 지금 열린 넷 중 **가장 강한 단일 리드**다. 그러나 리드 ≠ 확정.
 
 ### 분기점 — `clavis.cmm` **안**을 봐야 갈린다
 
@@ -63,8 +66,15 @@ feedback 이 열어둔 원인 후보 중 정확히 `security / firewall / isolat
 3. 외부 파일 로드(`OPEN`/`READ`/인증서 경로)
 4. 인자 `0x0` 이 안에서 어떻게 쓰이나 (unlock 레벨/슬롯)
 
-⚠ 이 가설이 맞으면 §0.5 의 "원인 미확정" 은 **1순위가 secure unlock 으로 좁혀진다**
-(배제는 아니다 — clavis 내용 확인 전까지 firewall/other-path 도 열어둔다).
+확정/반증 방법 둘:
+1. **`clavis.cmm` 내용** — 결정적. 우리가 안 건드린 레지스터를 만지는가
+2. **DM 읽기의 STICKYERR** (지금 가능) — 권한 차단은 보통 트랜잭션을 **폴트**
+   시키고(sticky 셋), 전원/리셋 사영역은 **조용히** default-slave 를 준다.
+   ROM 이 지목한 컴포넌트 읽기가 **에러 없이** default-slave 면 이상한 조합이다.
+   (완벽한 판별자는 아님 — 구현별로 다르다)
+
+⚠ 이건 §0.5 의 "원인 미확정" 을 **뒤집지 않는다.** 1순위 리드일 뿐,
+넷(security/reset/firewall/other-path)은 다 열려 있다.
 
 ---
 
