@@ -41,7 +41,7 @@ try:
 except ImportError:
     sys.exit("pylink 없음 →  pip3 install pylink-square")
 
-VERSION = "standalone 2026-08-12.34  --dmid: DM 컴포넌트 ID 블록이 응답하나"
+VERSION = "standalone 2026-08-12.35  측정세션 스크립트 OFF 복귀 + dmid 정렬오판 수정"
 
 # ★ DPIDR 로 FFFFFFFF / 6BA0009D / 80000000 이 **실행마다 섞여** 나온다.
 #   설정이 원인이면 조합마다 일관되게 같은 값이 나와야 한다.
@@ -1095,6 +1095,11 @@ DM_ID_OFFS = [(0xFF0, 'CIDR0'), (0xFF4, 'CIDR1'), (0xFF8, 'CIDR2'), (0xFFC, 'CID
               (0x040, 'dmcontrol'), (0x044, 'dmstatus')]
 
 
+# 응답 없음 서명값. 정렬에 따라 0x00000001, 그 외 0xEAFFFFFE/0xEAFFFFFC/0.
+# ID 블록이 이 값들만 주면 컴포넌트가 **디코드를 안 하는 것**이다.
+NODECODE_VALUES = {0x00000001, 0x00000000, 0xEAFFFFFE, 0xEAFFFFFC, 0xFFFFFFFF}
+
+
 def dmid_probe(d):
     out = []
     for name, apbase, _t in AP_MAP:
@@ -1119,11 +1124,13 @@ def dmid_probe(d):
             dfl = is_default_line(comp + off, v)
             if off in (0xFF0, 0xFF4, 0xFF8, 0xFFC):
                 cid.append(None if v is None else v & 0xFF)
+            real = v is not None and v not in NODECODE_VALUES
             if flt:
                 r['faults'] += 1
-            if v is not None and not dfl:
+            if real:
                 r['nondefault'] += 1
-            r['regs'].append((rn, hx(v), 'F' if flt else ('d' if dfl else '.')))
+            mark = 'F' if flt else ('.' if real else 'x')   # x = 무응답 서명값
+            r['regs'].append((rn, hx(v), mark))
         ok, cls = cid_ok(cid)
         r['cid_ok'], r['cid_cls'] = ok, cls
         if csw is not None:
@@ -1430,11 +1437,14 @@ def main():
     ap.add_argument('--speeds', default="10000,4000,2000,1000,500")
     ap.add_argument('--recover', action='store_true',
                     help='★ AP IDR 이 맞는 조건을 찾는다 — 스크립트 유무 × cJTAG 모드')
-    # ❌ .19 에서 기본 off 로 바꾼 것도 같은 폐기 추론. feedback §5 의 정본
-    #   ConfigTargetSettings 는 manual chain 을 **항상** 포함한다.
+    # ❌❌ .31 에서 기본 ON 으로 바꾼 것이 회귀였다. manual chain(AllowTAPReset=1)은
+    #   P1 증거상 cJTAG 활성화를 깬다(IRPrint=0x000..0) → 측정 세션이 AP 0/6 로 죽는다.
+    #   feedback §5 의 manual chain 은 **connect(P0/P1/P2) 경로용**이고 그쪽은
+    #   자기 스크립트를 따로 쓴다. raw-DAP 측정 세션은 스크립트 없이 6/6 이 정상.
+    #   ⇒ 측정 기본값은 스크립트 OFF (.19~.29 상태로 복귀).
     ap.add_argument('--tap-script', dest='no_tap_script', action='store_false',
-                    default=False,
-                    help='TAP 선언 스크립트를 깐다 (기본값 — feedback §5)')
+                    default=True,
+                    help='TAP 선언 스크립트를 깐다 (측정 기본은 OFF — manual chain 이 스캔을 깬다)')
     ap.add_argument('--no-tap-script', dest='no_tap_script', action='store_true',
                     help='TAP 선언 스크립트를 깔지 않는다 (브링업 초기 조건)')
     ap.add_argument('--cjtag-mode', type=int, default=CJTAG_MODE)
@@ -1745,8 +1755,11 @@ def main():
         for r in r0.get('dmid', []):
             regs = " ".join(f"{n}={v}{m}" for n, v, m in r['regs'])
             print(f"{r['ap']} comp={r['comp']} cidOK={r['cid_ok']} "
-                  f"실데이터={r['nondefault']}/{len(r['regs'])} 폴트={r['faults']}")
+                  f"실데이터={r['nondefault']}/{len(r['regs'])} 폴트={r['faults']}"
+                  + ("  (전부 동일값=무응답)" if r.get('uniform') else ""))
             print(f"  {regs}")
+            uniform = len({v for _n, v, _m in r['regs']}) == 1
+            r['uniform'] = uniform
             if r['cid_ok'] or r['nondefault'] > 0:
                 present.append(r['ap'])
         print("VERDICT:", "DM_COMPONENT_PRESENT(게이팅쪽)" if present
