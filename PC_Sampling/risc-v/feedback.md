@@ -5,6 +5,109 @@
 > 목적: 현재 접근 방향이 맞는지 검토하고, 다음 작업자가 바로 이어서 판단할 수 있도록
 > 실측 사실과 권장 순서를 분리해 기록한다.
 
+## 최신 작업 인수인계 — 2026-08-12: `clavis.cmm` 구조 분석기를 구현·배포했다
+
+> 현재 P0는 secure-debug unlock 값을 추측해서 쓰는 것이 아니다. T32 환경에만
+> 있는 `clavis.cmm`의 실제 데이터 흐름을 비밀값 없이 확인하는 것이다. 이를 위해
+> `analyze_clavis.py`를 구현하고 GitHub `main`에 배포했다.
+>
+> 커밋: `2cd6a2eb1ec591b8b8f3d416e3b60891679a4c68`
+
+### 1. Critical issues / 이 도구의 경계
+
+`analyze_clavis.py`는 **인증 구현이나 unlock 도구가 아니다.** CMM을 실행하지 않는
+read-only 정적 분석기이며 다음 구조만 추출한다.
+
+- challenge/response 및 crypto 관련 명령 위치
+- `Data.Long`/`Data.In` 등 target read 위치
+- `Data.Set`/`PER.Set` 등 target write 위치
+- 하위 `DO`/`CD.DO` 호출 관계
+- 파일·외부 프로그램·signer/HSM 후보 의존성
+- `ENTRY` 인자 흐름 및 error handler
+
+따라서 분석 결과에 challenge/response 명령이 나타나도 그것만으로 현재 J-Link
+실패의 직접 원인이 인증이라고 확정하지 않는다. 반대로 패턴을 찾지 못해도 CMM이
+하위 바이너리·T32 내장 명령·변수 경로를 사용하면 인증이 없다고 결론낼 수 없다.
+
+### 2. Potential bugs / 비밀정보 보호 범위
+
+공유용 보고서에서는 다음을 자동으로 가린다.
+
+- 인용 문자열 내용 — 파일인 경우 전체 경로를 버리고 basename만 유지
+- `key`, `secret`, `password`, `token`, `private`, `signature` 계열 변수의 우변
+- 32비트를 초과하는 hex literal
+- CMM의 `;` 주석 전체
+- 로컬 search-root의 절대 경로
+
+반면 구현 판단에 필요한 **32비트 주소, 변수명, 명령명, 파일 basename**은 남긴다.
+따라서 보고서를 전달하기 전 사용자가 한 번 직접 열어 회사 내부 식별정보가 없는지
+확인해야 한다. 원본 CMM, 실제 키, 인증서 내용, response 값은 저장소에 올리지 않는다.
+
+파일이 암호화된 바이너리이거나 NUL byte를 포함하면 분석하지 않고 경고한다.
+변수가 포함된 `DO` 경로를 search-root 안에서 basename 하나로 결정할 수 없으면
+`UNRESOLVED`로 남긴다. 이 경우 해당 하위 파일을 entry 인자로 직접 추가한다.
+
+### 3. Reliability improvements / 구현 상태
+
+추가된 파일:
+
+```text
+PC_Sampling/risc-v/analyze_clavis.py
+PC_Sampling/risc-v/test_analyze_clavis.py
+```
+
+합성 CMM을 이용해 다음 5개 테스트를 통과했다.
+
+1. 하위 CMM 재귀 분석과 의존성 해석
+2. 민감 변수·긴 hex·전체 경로 redaction
+3. 32비트 target 주소 보존
+4. binary/NUL 입력 거부
+5. 인용 문자열 안의 세미콜론은 유지하면서 실제 CMM 주석은 제거
+
+이 도구는 target/J-Link에 접근하지 않으므로 SSD 상태를 바꾸지 않는다. 기존
+`standalone.py` 및 connect probe도 변경하지 않았다.
+
+### 4. Suggested tests / 사용자 환경에서 다음 실행
+
+T32 CMM이 있는 Windows PC에서 저장소의 `PC_Sampling/risc-v`로 이동한 뒤 실행한다.
+
+```powershell
+python analyze_clavis.py `
+  "G:\T32\Func\SED\clavis.cmm" `
+  "G:\T32\Attach.cmm" `
+  --search-root "G:\T32" `
+  --markdown clavis_report.md
+```
+
+실제 경로가 다르면 두 입력과 `--search-root`만 바꾼다. JSON이 편하면 마지막을
+다음과 같이 바꾼다.
+
+```powershell
+--json clavis_report.json
+```
+
+생성된 보고서에서 우선 확인할 것은 다음이다.
+
+1. challenge를 읽는 주소와 접근 클래스
+2. response를 쓰는 주소와 접근 클래스
+3. response 생성이 CMM 내부인지, T32 전용 명령인지, 외부 프로그램인지
+4. 키 파일·인증서·HSM·서명 서버 의존성의 존재 여부
+5. 인자 `0x0`의 사용처
+6. `CLAVIS_ERROR_HANDLER`가 attach를 중단하는지 또는 계속하는지
+
+보고서 결과에 따른 다음 분기는 다음과 같다.
+
+| 결과 | 다음 판단 |
+|---|---|
+| 공개 주소 + 고정 공개 계산 | J-Link pre-connect 단계로 재현 가능성 높음 |
+| challenge 주소 + 기존 signer 호출 | signer 인터페이스를 유지한 J-Link bridge 설계 |
+| T32 전용 인증 명령 | SEGGER Device Provisioner/DSK 또는 벤더 지원 필요 가능성 큼 |
+| 외부 키/HSM/서버 의존 | 코딩 전에 정당한 인증 자산·사용 권한 확보 필요 |
+| 하위 CMM unresolved | 해당 파일을 추가 입력으로 분석 재실행 |
+
+현재 target/reset/unlock 추정값 쓰기는 계속 금지한다. 다음 코드 구현은
+`clavis_report`에서 확인된 실제 주소·프로토콜·signer 경계를 받은 뒤 결정한다.
+
 ## 최우선 정정 — 2026-08-12: challenge-response 존재는 확인됐지만 J-Link 실패 원인은 아직 미확정
 
 > 이 절이 아래의 모든 과거 `clavis.cmm` 평가보다 우선한다. 새 정보에 따라
