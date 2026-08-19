@@ -3533,7 +3533,10 @@ class NVMeFuzzer:
         # excluded_opcodes 에 든 opcode 의 명령은 선택 풀에서도 제거 → random_gen 선택 차단 +
         # 초기 Format/Sanitize one-shot(아래 게이트가 self.commands 멤버십을 봄)까지 자동 스킵.
         # (seed 생성/opcode 변이는 이미 excluded 를 존중. 이로써 --exclude-opcodes 가 전 경로 차단.)
-        _excl = set(config.excluded_opcodes)
+        # config excluded_opcodes 를 캐시한다 — 선택 풀 필터(여기)와 전송 chokepoint
+        # (_send_nvme_command)가 **같은 집합**을 본다. opcode 기준(admin/io 무관).
+        self._excluded_opcodes = frozenset(config.excluded_opcodes)
+        _excl = self._excluded_opcodes
         if _excl:
             _filtered = [c for c in base if c.opcode not in _excl]
             if _filtered:
@@ -10056,6 +10059,16 @@ class NVMeFuzzer:
         else:
             passthru_type = "admin-passthru" if cmd.cmd_type == NVMeCommandType.ADMIN else "io-passthru"
 
+        # config 의 excluded_opcodes 최종 강제 — 선택 풀·시드·opcode 변이는 이미 존중하지만,
+        # LLM 생성·replay·sequence·workload 등 **어느 경로로 들어와도** 이 단일 chokepoint
+        # 에서 확정 차단한다. 풀 필터와 동일하게 opcode 기준(admin/io 무관), opcode_override
+        # 반영된 actual_opcode 로 판정하므로 변이로 뒤바뀐 opcode 도 잡힌다.
+        if actual_opcode in self._excluded_opcodes:
+            log.warning(f"[GUARD] excluded opcode 0x{actual_opcode:02x} 전송 차단 — "
+                        f"config excluded_opcodes (cmd={cmd.name}, {passthru_type})")
+            self.stats['blocked_excluded_opcode'] = self.stats.get('blocked_excluded_opcode', 0) + 1
+            return self.RC_SKIP
+
         # 가성 불량 방지 가드: host(kernel) 소유 전송로를 깨는 admin opcode 는 전송하지 않는다.
         # (Delete/Create I/O SQ·CQ, AER, Doorbell Buffer Config — admin 일 때만. IO 동명령은 정상)
         # mutation/seed/replay/sequence 모든 경로가 여기를 지나므로 단일 chokepoint.
@@ -14951,6 +14964,12 @@ class NVMeFuzzer:
                 if _blk > 0:
                     summary_lines.append(f"Blocked admin opcode: {_blk}회 "
                                          f"(큐관리/AER/DBBUF 가성 방지)")
+                # config excluded_opcodes 전송 차단 누적 — 전 경로(LLM/replay/workload 포함)
+                # 를 chokepoint 에서 강제. 이 값이 있으면 config 설정이 실제로 막고 있다는 뜻.
+                _blk_excl = self.stats.get('blocked_excluded_opcode', 0)
+                if _blk_excl > 0:
+                    summary_lines.append(f"Blocked excluded opcode: {_blk_excl}회 "
+                                         f"(config excluded_opcodes, 전 경로 강제)")
                 # v9.7 ③: 커널 errno 로 device 까지 못 간 명령 — 펌웨어 미실행이므로 커버리지 기여 0.
                 #   이 값이 크면 발송 인자가 커널 한계를 넘고 있다는 뜻(전송 상한/정렬 점검).
                 _unsub = self.stats.get('unsubmitted_cmds', 0)
