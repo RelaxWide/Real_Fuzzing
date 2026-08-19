@@ -7,7 +7,8 @@
 > 그러니 §5 에서는 **"J-Link 를 어떻게 설정하나" 를 묻지 말고, T32 가 이미
 > 알고 있는 사실**만 받아온다:
 > `APBACCESSPORT` 값 · `COREDEBUG.Base` 의 의미(DMI aperture 인가 컴포넌트 base 인가)
-> · `SYStem.UP` 전 unlock/`Data.Set` 시퀀스 유무 · 퓨즈/패스워드 여부 · 펌웨어 ELF.
+> · `SYStem.UP` 전 unlock/`Data.Set` 시퀀스 유무 · **`clavis.cmm` 의 challenge/response
+> 접근 클래스와 주소**(값 아님) · 퓨즈/패스워드 여부 · 펌웨어 ELF.
 
 ---
 
@@ -224,14 +225,30 @@ TRACE32 는 `Data.Set AXI:0xC81040 %LE %Long 0x13333` 로 리셋을 해제합니
 > 3. DM 이 두 개(`0x81480000`, `0x81481000`)로 보이는데, **각각 어느 AP 뒤**입니까?
 > 4. DM 에 **별도의 전원/클럭 인에이블**이 필요합니까?
 >    (ARM DAP 의 `CDBGPWRUPREQ` 와 별개로)
-> 5. ★ **디버그 접근 제어가 걸려 있습니까?** SiFive Insight 문서의
+> 5. ★★★ **`clavis.cmm` 의 secure JTAG 인증 — 지금 가장 알고 싶은 것입니다.**
+>    `attach.cmm` 이 core-attach **직전**에 이것을 호출하는 것을 확인했습니다:
+>    ```
+>    ON ERROR GOTO CLAVIS_ERROR_HANDLER
+>    do "&FuncDir/SED/clavis.cmm" 0x0    // called once for secure jtag
+>    ```
+>    저희 J-Link 시험에는 이 단계가 **없습니다.** 그래서 여쭙습니다 —
+>    **비밀값이나 키는 필요 없고, 접근 경로만 알면 됩니다:**
+>    - challenge 를 **읽는 주소와 접근 클래스**(`APB:`/`AXI:`/`AP:`)는?
+>    - response 를 **쓰는 주소와 접근 클래스**는?
+>    - response 는 **무엇이 생성**합니까? (T32 내장 / 외부 exe / 키파일 / HSM / 서명 서버)
+>    - 인자 `0x0` 의 의미와, `CLAVIS_ERROR_HANDLER` 가 **중단**입니까 **경고 후 계속**입니까?
+>    - 인증은 **어느 리셋까지 유지**됩니까? (J-Link 의 connect/TAP reset 이 재잠금시키는지)
+>    - 이 인증 없이 DM(`0x81480000`)에 접근하면 **원래 무응답이 정상**입니까?
+> 5a. 위와 별개로 SiFive Insight 문서의
 >    *"Multilayered Debug Access Control — fused permanent disable pins,
->    32-bit password barriers, or public-key cryptographic authentication"* 말입니다.
->    - 이 양산/평가 파트에 **퓨즈나 패스워드가 설정되어 있습니까?**
->    - 있다면 **해제 절차와 값**은 무엇입니까?
->    - T32 는 그 해제를 **어디서** 합니까? (우리가 받은 스크립트에는 없습니다)
->    - 증상: DP·DAP 전원·AP 열거·AP 레지스터 읽기는 전부 정상인데
->      **메모리 트랜잭션이 전 AP·전 주소에서 실패**하고 `dmactive` 가 안 올라옵니다.
+>    32-bit password barriers, or public-key cryptographic authentication"* 중
+>    이 양산/평가 파트에 **무엇이 적용**되어 있습니까? (퓨즈 / 패스워드 / PKI)
+>    - 증상: DP·DAP 전원·AP 열거·AP 레지스터 읽기·**APB ROM 테이블 읽기**는 전부
+>      정상인데, ROM 이 지목한 **DM aperture 만** 고정 상수(`0xEAFFFFFE`)를 돌려주고
+>      `dmactive` 가 안 올라옵니다.
+>    - ⚠ 참고: 표준 RISC-V **DM 내부 인증**이라면 잠긴 상태에서도 `dmstatus` 가
+>      유효 형식으로 읽혀야 하는데 그렇지 않습니다. 그래서 **DM 앞단(APB bridge /
+>      firewall / power-domain)을 여는 외부 게이트**로 보고 있습니다. 맞습니까?
 > 5b. 트레이스 블록(`0xFD000000`, `0xFD180000`)은 **SBA 전용**입니까,
 >    아니면 **AXI-AP 로도 접근 가능**합니까? (SBA 는 DM 을 거치므로 우리가 막힙니다)
 > 5c. 그 버스 도메인에 **별도 클럭/전원 인에이블**이 필요합니까?

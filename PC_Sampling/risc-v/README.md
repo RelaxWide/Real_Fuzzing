@@ -2,17 +2,21 @@
 
 SiFive **E76** 기반 RISC-V SSD 컨트롤러에 퍼저를 올리기 위한 작업.
 
-> ## ★ 먼저 읽을 것: [`STATUS.md`](STATUS.md)
+> ## ★ 먼저 읽을 것: [`STATUS.md`](STATUS.md) — 현재 원인 판단은 **§0.3~§0.36**
 >
 > **T32 로 이 제품의 커버리지가 실제로 측정되며, 그 방식은 halt 가 아니다.**
-> 따라서 현재 주 트랙은 **"T32 커버리지 메커니즘 식별"(C0~C6)** 이고,
-> 아래의 halt/PC/resume(G0~G6)는 **보조 트랙**이다.
-> 이 문서의 실행 안내도 대부분 보조 트랙용이다.
+> 따라서 **트레이스 기반으로 간다**(STATUS §7 Phase 0 = 완료). 아래의
+> halt/PC/resume(G0~G6)는 **보조 트랙**이고, 이 문서의 실행 안내도 대부분 그쪽이다.
+>
+> **현재 블로커는 한 지점** — cJTAG→DAP→AP→ROM 까지 되는데 **ROM 이 지목한 DM
+> aperture 가 무응답**이다 (STATUS §0.5 · §2 · §7 의 `1g`).
+> **현재 P0 는 `clavis.cmm` 구조 확인**(아래 실행 절)이고, 원인을 가르는 결정적
+> 시험은 **T32 A/B**(STATUS §0.35)다.
 
-**v10.0 범위:** 커버리지 수집 방식이 확정되기 전까지는 **미정**이다.
-halt PC 샘플링이면 샘플러 층 교체만으로 끝나지만(기존 `pc_sampling_fuzzer_v9.7.py`
-대비 `_read_all_pcs()` 수준), instrumentation bitmap 이면 수집 계층 자체가 달라진다.
-NVMe 전송·코퍼스·변이·LLM·replay·POR 는 어느 쪽이든 그대로 간다.
+**v10.0 범위:** 수집 방식은 **트레이스로 확정**됐다(T32 가 halt 를 쓰지 않음이
+`cpuaccess DENIED` 로 확인). 따라서 새로 만들 것은 **커버리지 수집 계층**뿐이고,
+NVMe 전송·코퍼스·변이·LLM·replay·POR 는 기존 `pc_sampling_fuzzer_v9.7.py` 것을
+그대로 재사용한다. 다만 그 수집 계층은 **DM 도달(SBA)이 선행 조건**이라 아직 착수 전이다.
 
 ---
 
@@ -25,12 +29,14 @@ NVMe 전송·코퍼스·변이·LLM·replay·POR 는 어느 쪽이든 그대로 
 | ARM DP 통신 | ✅ `DP reg0 = 0x6BA0009D` |
 | 디버그 도메인 전원 | ✅ `CTRL/STAT = 0xF0000000` |
 | AP map / DMI base 선언 | ✅ |
-| **J-Link connect** | ⚠️ **되지만 2회차에만** — 근본원인 규명 중 |
-| **halt** | ❌ **실패** — `JLINKARM_Halt()` 가 DLL 레벨에서 거부 |
-| PC / resume | ⬜ halt 가 안 돼 도달 못 함 |
+| APB ROM Table (`ARCHID=0x0AF7`) | ✅ ROM 이 DM `0x81480000`/`0x81481000` 을 지목 |
+| **★ DM aperture 응답** | ❌ **현재 블로커.** 미매핑 상수(`0xEAFFFFFE` 등)만 — 게이트 미확정 |
+| SBA → 트레이스 레지스터 | ⬜ DM 도달이 선행 조건 |
+| **J-Link connect** | ⚠️ 세션마다 갈림 (`Could not find supported CPU` / 2회차 성공) |
+| ~~halt~~ / PC / resume | ⬜ **보조 트랙** — 주 경로 아님 (트레이스로 확정) |
 | 코어 귀속 (어느 코어인가) | ⬜ 미확정 |
 | 반복 reconnect / POR / crash 복구 | ⬜ 미검증 |
-| Nexus 트레이스 | ⬜ 병행 트랙 (크리티컬 패스 아님) |
+| Nexus 트레이스 | ⬜ **주 경로** — DM/SBA 가 열리면 여기가 커버리지 소스 |
 
 ### 게이트 — 지금 어디까지 왔나
 
@@ -44,7 +50,8 @@ NVMe 전송·코퍼스·변이·LLM·replay·POR 는 어느 쪽이든 그대로 
 | **G5** | workload 중 반복 샘플링 | ⬜ |
 | **G6** | close/reopen · POR · crash 복구 | ⬜ |
 
-**이 게이트는 halt PC 샘플링 대안 트랙의 것이다.** 주 트랙은 `STATUS.md` 의 C0~C6.
+**이 게이트는 halt PC 샘플링 대안 트랙의 것이다.** 주 트랙의 게이트는
+`STATUS.md` §7 의 Phase 1 (`1a`~`1j`) 이고, 현재 지점은 **`1g` = DM 도달**이다.
 halt 경로를 택하게 될 경우의 착수 조건이 G4, 장시간 투입 조건이 G5+G6 이다.
 
 > ⚠️ **`connect()` 성공은 코어 도달을 뜻하지 않는다 — 실측으로 확인됐다.**
@@ -214,7 +221,8 @@ sudo python3 diagnose_connect.py
 
 | # | 질문 | 확인 방법 |
 |---|---|---|
-| 0 | **★ T32 는 어떤 메커니즘으로 커버리지를 얻나** | `STATUS.md` P0. **주 트랙** |
+| 0 | ~~T32 는 어떤 메커니즘으로 커버리지를 얻나~~ | ✅ **답 나옴** — 트레이스(온칩 sink), halt 아님. STATUS §7 Phase 0 |
+| 0b | **★ DM aperture 를 막는 게이트가 무엇인가** (인증 / 전원·리셋 / firewall) | **현재 P0.** `analyze_clavis.py` → **T32 A/B**(STATUS §0.35). 셋은 J-Link 관측만으론 안 갈린다 |
 | 1 | 첫 connect 가 왜 실패하나 | `diagnose_connect.py`. 유력 가설 = RISC-V DM 의 `dmactive` (쓴 뒤 되읽어 1 될 때까지 기다려야 하는데 J-Link 이 안 기다리는 것으로 의심) |
 | 2 | halt / PC / resume 이 되나 | `verify_halt_pc.py` — **보조 트랙**. 현재 halt 실패(APB=0 범위) |
 | 3 | PC 레지스터 인덱스 | `verify_halt_pc.py --scan-registers`. **추측 금지** — 이름/T32 교차검증/fingerprint 중 하나로 확정해야 샘플링한다 |
