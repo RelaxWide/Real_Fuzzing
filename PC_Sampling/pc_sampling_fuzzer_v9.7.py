@@ -216,6 +216,10 @@ RAG_MAX_SEQS         = int(_RAG.get('max_seq_per_round', 4))
 RAG_MAX_UNCOV_FUNCS  = int(_RAG.get('max_uncov_funcs', 40))
 RAG_SEED_AT_STARTUP  = bool(_RAG.get('seed_at_startup', True))
 RAG_ENERGY_BOOST     = float(_RAG.get('llm_energy_boost', 1.5))
+# corpus_eval 자기점수(llm_score)가 이 값 **미만**일 때만 에너지 페널티(*0.5).
+# 실측상 corpus_eval 점수가 0.25~0.65 에 몰려 변별력이 낮아, 구 임계 0.3 은 정상
+# 시드까지 자해(자기평가로 자기 페널티)했다. 클러스터 바닥 밑(극단적 저점)만 벌준다.
+RAG_LLM_SCORE_FLOOR  = float(_RAG.get('llm_score_penalty_below', 0.15))
 RAG_RESERVED_POLICY  = str(_RAG.get('reserved_policy', 'reject'))
 RAG_RESULT_STALE     = int(_RAG.get('result_stale_execs', 50000))
 RAG_TASKS            = dict(_RAG.get('tasks', {}))
@@ -6019,8 +6023,9 @@ class NVMeFuzzer:
         elif sc.startswith('llm'):
             e *= self._llm_boost
         ls = getattr(seed, 'llm_score', None)
-        if ls is not None and ls < 0.3:
-            e *= 0.5   # LLM 이 낮게 평가한 시드 비우선화(삭제는 안 함)
+        if ls is not None and ls < RAG_LLM_SCORE_FLOOR:
+            e *= 0.5   # LLM 이 **극단적으로** 낮게 평가한 시드만 비우선화(삭제 안 함).
+            #          구 0.3 은 0.25~0.65 클러스터를 벌줘 자기평가로 자기 페널티였음.
         return e
 
     def _calculate_energy(self, seed: 'Union[Seed, SequenceSeed]') -> float:
@@ -6966,14 +6971,25 @@ class NVMeFuzzer:
         if len(self.corpus) <= 10:
             return
 
-        # Pass 1: 단일 Seed만으로 PC → best 매핑 (data 크기 기준)
+        # Pass 1: 단일 Seed만으로 PC → best 매핑.
+        # favored 대표 선정 키: 작을수록 우선(AFL 최소화). 단 **LLM 계보 + data payload**
+        # 시드는 크기와 무관하게 대표로 보존한다 — 구조적 payload(data-parsing FW 코드
+        # 도달)가 이 퍼저의 핵심 가치라, 같은 PC 를 커버하는 빈/작은 mutation 에게 favored
+        # 를 뺏기면 LLM 기여가 구조적으로 소실됐다(요인1). 동점은 LLM 계보 우선.
+        # 트레이드오프: LLM-data 시드가 favored 로 남아 corpus 최소화가 약간 완화되나,
+        # 그게 의도다(payload 시드를 살려 피드백/선택/컬링보호에 유지).
+        def _fav_key(s):
+            _llm = self._is_llm_seed(s)
+            _llm_data = _llm and len(s.data) > 0
+            return (0 if _llm_data else 1, len(s.data), 0 if _llm else 1)
+
         pc_best: dict[int, object] = {}
         for seed in self.corpus:
             if not isinstance(seed, Seed) or not seed.covered_pcs:
                 continue
             for pc in seed.covered_pcs:
                 cur = pc_best.get(pc)
-                if cur is None or len(seed.data) < len(cur.data):
+                if cur is None or _fav_key(seed) < _fav_key(cur):
                     pc_best[pc] = seed
 
         # Pass 2: 단일 Seed가 없는 PC만 SequenceSeed가 채움
