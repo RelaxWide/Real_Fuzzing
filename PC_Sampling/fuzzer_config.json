@@ -1107,6 +1107,89 @@
       "enable_jlink_dump": true,
       "state_fields": "r8"
     },
+    "PM9M1_LNB": {
+      "_comment_timeouts": "nvme_timeouts/nvme_passthru_timeout_ms/nvme_kernel_timeout_sec 는 제품별 override (global timeouts 위에 덮어씀). 제품마다 다르게 조정 가능. 생략 시 global 사용.",
+      "nvme_timeouts": {
+        "command": 8000,
+        "format": 120000,
+        "flush": 8000,
+        "selftest_short": 8000,
+        "selftest_ext": 8000,
+        "verify": 22000,
+        "sanitize": 180000
+      },
+      "interface": "swd",
+      "openocd_config": "r8_pcsr.cfg",
+      "jlink_device": "Cortex-R8",
+      "tcl_prefix": "r8",
+      "pcsr_addrs": [
+        "0x80030084",
+        "0x80032084",
+        "0x80034084"
+      ],
+      "sampler_type": "pcsr",
+      "go_settle_ms": 0,
+      "power_addr": "0x30313f30",
+      "power_mask": "0x00010101",
+      "invalid_pc_vals": [
+        "0x6ba02476",
+        "0x6ba02477",
+        "0x6ba00476",
+        "0x6ba00477"
+      ],
+      "fw_addr_start": "0x0",
+      "fw_addr_end": "0x3B7FFF",
+      "bb_file": "basic_blocks_PM9M1.txt",
+      "func_file": "functions_PM9M1.txt",
+      "enable_ufas": true,
+      "ufas_ini": "PM9M1_A815.ini",
+      "enable_jlink_dump": true,
+      "state_fields": "r8",
+      "_comment_variant": "PM9M1_LNB: 기존 PM9M1 동작(전 state 필드 관측, LID 0xDF snapshot 포함). PM9M1 과 동일."
+    },
+    "PM9M1_HP": {
+      "_comment_timeouts": "nvme_timeouts/nvme_passthru_timeout_ms/nvme_kernel_timeout_sec 는 제품별 override (global timeouts 위에 덮어씀). 제품마다 다르게 조정 가능. 생략 시 global 사용.",
+      "nvme_timeouts": {
+        "command": 8000,
+        "format": 120000,
+        "flush": 8000,
+        "selftest_short": 8000,
+        "selftest_ext": 8000,
+        "verify": 22000,
+        "sanitize": 180000
+      },
+      "interface": "swd",
+      "openocd_config": "r8_pcsr.cfg",
+      "jlink_device": "Cortex-R8",
+      "tcl_prefix": "r8",
+      "pcsr_addrs": [
+        "0x80030084",
+        "0x80032084",
+        "0x80034084"
+      ],
+      "sampler_type": "pcsr",
+      "go_settle_ms": 0,
+      "power_addr": "0x30313f30",
+      "power_mask": "0x00010101",
+      "invalid_pc_vals": [
+        "0x6ba02476",
+        "0x6ba02477",
+        "0x6ba00476",
+        "0x6ba00477"
+      ],
+      "fw_addr_start": "0x0",
+      "fw_addr_end": "0x3B7FFF",
+      "bb_file": "basic_blocks_PM9M1.txt",
+      "func_file": "functions_PM9M1.txt",
+      "enable_ufas": true,
+      "ufas_ini": "PM9M1_A815.ini",
+      "enable_jlink_dump": true,
+      "state_fields": "r8",
+      "state_exclude_lids": [
+        223
+      ],
+      "_comment_variant": "PM9M1_HP: PM9M1_LNB 와 동일하되 LID 0xDF(223) snapshot 을 관측하지 않는다(state_exclude_lids). df_* 벤더필드가 빠져 get-log LID=0xDF 를 발행하지 않음."
+    },
     "BM9H1": {
       "nvme_timeouts": {
         "command": 8000,

@@ -8935,7 +8935,11 @@ class NVMeFuzzer:
                 for line in r.stdout.splitlines():
                     if 'value:' in line.lower() or 'Current value' in line:
                         import re as _re
-                        m = _re.search(r'value\s*:?\s*0x([0-9a-fA-F]+)',
+                        # nvme-cli 버전에 따라 'Current value:0x00000000' 또는
+                        # 'Current Value:00000000'(0x 없는 bare hex) 둘 다 나온다.
+                        # 0x 를 강제하면 후자가 파싱 실패 → _orig=None → 아래 성공
+                        # 로그가 {None:#010x} 로 예외. 0x 를 선택적으로 받는다.
+                        m = _re.search(r'value\s*:?\s*(?:0x)?([0-9a-fA-F]+)',
                                        line, _re.IGNORECASE)
                         if m:
                             self._orig_apst_cdw11 = int(m.group(1), 16)
@@ -8964,7 +8968,11 @@ class NVMeFuzzer:
                  '--data-len', '256', '--data', _fname],
                 capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
-                log.warning(f"[APST] 비활성화 완료 (원본 CDW11={self._orig_apst_cdw11:#010x})")
+                # 원본 캡처가 실패(None)해도 set-feature 성공 자체는 유효하므로
+                # 포맷 예외로 성공 경로를 깨지 않는다(None → 'unknown').
+                _orig_repr = ('unknown' if self._orig_apst_cdw11 is None
+                              else f"{self._orig_apst_cdw11:#010x}")
+                log.warning(f"[APST] 비활성화 완료 (원본 CDW11={_orig_repr})")
                 _ok_apst = True
                 self._record_setfeature_history(
                     0x0C, 0, b'\x00' * 256, 'APST disable')
@@ -15527,6 +15535,18 @@ if __name__ == "__main__":
     if _resolved_state_fields is None:
         print(f"[WARN] state_fields 세트 '{_sf_setname}' 없음 → 'r8' 사용")
         _resolved_state_fields = STATE_FIELD_SETS.get('r8', [])
+    # v9.7: 제품별 LID 제외 — 예: PM9M1_HP 는 LID 0xDF(223) snapshot 을 관측하지 않는다.
+    #   해당 lid 의 vendor 필드를 세트에서 빼면 state monitor / snapshot 이 그 LID 로
+    #   get-log 를 발행하지 않는다(양쪽 다 config.state_fields 에서만 LID 를 얻음).
+    _excl_lids = set(_profile.get('state_exclude_lids') or [])
+    if _excl_lids:
+        _before = len(_resolved_state_fields)
+        _resolved_state_fields = [f for f in _resolved_state_fields
+                                  if f.get('lid') not in _excl_lids]
+        _dropped = _before - len(_resolved_state_fields)
+        print(f"[Product] {args.product}: state_exclude_lids="
+              f"{sorted(hex(l) for l in _excl_lids)} → 필드 {_dropped}개 제외 "
+              f"(해당 LID get-log 미발행)")
 
     config = FuzzConfig(
         openocd_config=resolved_cfg,
