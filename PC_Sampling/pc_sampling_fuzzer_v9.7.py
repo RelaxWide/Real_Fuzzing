@@ -5222,7 +5222,9 @@ class NVMeFuzzer:
                 lines.append("\nField values THIS device ACCEPTED (reached firmware) — vary WITHIN "
                              "these valid envelopes, not copies:")
                 for n, av in acc[:10]:
-                    lines.append(f"  {n}: " + ", ".join(f"cdw10=0x{v:x}" for v in av[:3]))
+                    # ★ 10진수로 예시한다. hex(0x..)로 보여주면 LLM 이 JSON 값도 0x 로
+                    #   미러링해 파싱이 깨진다(HARD RULES: numeric=DECIMAL 과 일관).
+                    lines.append(f"  {n}: " + ", ".join(f"cdw10={v}" for v in av[:3]))
             # v9.1 #1: 명령별 디바이스 상태 digest — 미구현 회피 / 구현-필드교정 분리.
             #   (기존 '저수확 회피' 단일목록을 대체 — 구현된 명령을 회피시키던 오조준 제거)
             dig = []
