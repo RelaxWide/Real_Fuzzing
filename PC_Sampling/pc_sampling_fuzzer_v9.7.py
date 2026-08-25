@@ -491,10 +491,13 @@ ALLOWED_FORMAT_SES = frozenset(_ST.get('allowed_format_ses', [0x00]))
 #   admin opcode 0x09, FID=CDW10[7:0], WPS=CDW11[2:0].
 #     WPS 0=No Write Protect / 1=Write Protect / 2=Until Power Cycle / 3=Permanent.
 #   1/2/3 은 namespace 를 read-only 로 잠가 이후 모든 write 를 거부(io_workload 무력화).
-#   정책(이 장치 기준): WPS=1 만 lock/unlock 테스트 — 발송 허용 후 **즉시 in-band 로
-#   WPS=0 해제 + read-back 검증**(PM9M1 에서 in-band 가역 실증됨). WPS=2 는 자연 복구가
-#   POR 뿐인데 이 장치는 POR=ROM 모드라 복구 불가 → 차단. WPS=3=영구 → 차단. WPS=0 은 해제라 허용.
-#   ★ 이 장치는 POR 복구 불가라, 해제는 rc 를 믿지 않고 get-feature read-back 으로 검증한다.
+#   정책(이 장치 기준): WPS=1 만 lock/unlock 테스트. LLM/builtin 시퀀스 안에서 발송되면
+#   그 **시퀀스 단위 동안 잠금을 유지**(안의 write 가 실제 read-only 를 겪어 reject 경로가
+#   fuzz 됨) → 시퀀스 경계에서 **in-band WPS=0 해제 + read-back 검증**. 시퀀스 밖(단독/
+#   state-replay)이면 즉시 해제. PM9M1 에서 in-band 가역 실증됨. WPS=2 는 자연 복구가 POR
+#   뿐인데 이 장치는 POR=ROM 모드라 복구 불가 → 차단. WPS=3=영구 → 차단. WPS=0 은 해제라 허용.
+#   ★ POR 복구 불가라 해제는 rc 대신 get-feature read-back 으로 검증하고, 실패하면(불량)
+#   퍼징을 정지한다(_wp_stuck; POR 미시도).
 _SET_FEATURES_OPCODE = 0x09
 _WRITE_PROTECT_FID   = 0x84
 _WPS_WRITE_PROTECT   = 0x1     # 유일하게 in-band 가역 확인된 상태(발송 허용 + auto-clear)
@@ -3872,6 +3875,10 @@ class NVMeFuzzer:
         self._pending_seq_ctx: Optional[dict] = None   # 공유 SLBA/NLB/data (Write→Compare 등)
         self._pending_seq_seeds: Optional[List['Seed']] = None  # corpus SequenceSeed replay용
         self._seq_cmds_in_window: int = 0
+        # write-protect(WPS=1)를 시퀀스 단위로 잡아 그 안의 write 가 실제 read-only 상태를
+        # 겪게(reject 경로 fuzz) 한 뒤 경계에서 해제. 보유 중인 nsid / 정지(불량) 신호.
+        self._wp_held_nsid: Optional[int] = None
+        self._wp_stuck: bool = False   # 시퀀스 후 해제 실패(불량) → 퍼징 정지
         # sequence 실행 중 개별 저장 대신 누적 — 완료 시 SequenceSeed로 저장
         self._seq_sink: Optional[dict] = None  # {'commands', 'new_pcs', 'covered_pcs', 'interesting'}
         # 실제 전송된 opcode 분포 (원본과 다른 경우만)
@@ -9287,6 +9294,21 @@ class NVMeFuzzer:
         self.stats['wp_clear_fail'] = self.stats.get('wp_clear_fail', 0) + 1
         return False
 
+    def _restore_held_wp(self, where: str) -> bool:
+        """시퀀스 단위로 보유(hold)했던 write-protect 를 해제+검증한다. 보유 없으면 무해.
+        성공 True. 실패 시 self._wp_stuck 을 세워 메인 루프가 정지하게 한다 — 사용자
+        판단: 해제 실패는 이미 불량 상황이므로 조용히 계속하지 말고 멈춘다(POR 미시도)."""
+        ns = self._wp_held_nsid
+        if ns is None:
+            return True
+        self._wp_held_nsid = None
+        if self._clear_write_protect(ns):      # read-back 검증 포함(실패 시 크리티컬 로그)
+            self.stats['wp_test'] = self.stats.get('wp_test', 0) + 1
+            return True
+        log.error(f"[WriteProtect] ★ 시퀀스 후 해제 실패({where}) — 불량으로 판단, 퍼징 정지")
+        self._wp_stuck = True
+        return False
+
     def _write_protect_clear(self) -> None:
         """startup: namespace 가 이미 write-protect(WPS!=0)면 in-band 해제(+검증).
         이전 실행/외부에서 잠긴 채 올라온 경우 복구. 이미 해제면 무해. WPS=3(Permanent)
@@ -10707,15 +10729,21 @@ class NVMeFuzzer:
                     and actual_opcode == _NS_ATTACH_OPCODE and (seed.cdw10 & 0xF) == 1):
                 self._reattach_namespace(actual_nsid)
 
-            # Write Protect(WPS=1) 성공 시 즉시 in-band 해제 — lock 핸들러를 fuzz 한 뒤
-            # unlock 핸들러까지 fuzz 하면서 잠금을 남기지 않는다(POR 복구 불가 장치라
-            # read-back 검증; 실패 시 _clear_write_protect 가 크리티컬 경고).
+            # Write Protect 상태 추적:
+            #   WPS=1 성공: LLM/builtin 시퀀스 진행 중이면 잠금을 **보유**(그 안의 write 가
+            #     실제 read-only 를 겪어 reject 경로가 fuzz 됨) → 시퀀스 경계에서 해제.
+            #     시퀀스 밖(단독/state-replay)이면 즉시 해제(reject 창 없음, 잠금 안 남김).
+            #   WPS=0 성공: LLM 이 직접 unlock → 우리 해제 의무 소멸.
             if (WRITE_PROTECT_TEST and rc == 0 and passthru_type == "admin-passthru"
                     and actual_opcode == _SET_FEATURES_OPCODE
-                    and (seed.cdw10 & 0xFF) == _WRITE_PROTECT_FID
-                    and (seed.cdw11 & 0x7) == _WPS_WRITE_PROTECT):
-                if self._clear_write_protect(actual_nsid):
-                    self.stats['wp_test'] = self.stats.get('wp_test', 0) + 1
+                    and (seed.cdw10 & 0xFF) == _WRITE_PROTECT_FID):
+                _wps = seed.cdw11 & 0x7
+                if _wps == _WPS_WRITE_PROTECT:
+                    self._wp_held_nsid = actual_nsid
+                    if not (self._pending_seq_seeds or self._pending_sequence):
+                        self._restore_held_wp("immediate")   # 시퀀스 밖 → 즉시
+                elif _wps == 0:
+                    self._wp_held_nsid = None                 # LLM 이 직접 풀었다
 
             return rc
 
@@ -14792,6 +14820,14 @@ class NVMeFuzzer:
                 # 명령 사이에 다른 NVMe 명령이 끼어들면 firmware 상태가 바뀌어
                 # Write→Compare 등 의존 시퀀스의 결과가 달라짐.
                 _seq_in_progress = bool(self._pending_sequence or self._pending_seq_seeds)
+                # write-protect 시퀀스 단위 복원: 시퀀스가 끝났는데(=단위 경계) 잠금을 아직
+                # 보유 중이면 여기서 해제+검증. 해제 실패(불량)면 _wp_stuck → 정지.
+                if self._wp_stuck:
+                    log.error("[WriteProtect] stuck 상태 — 퍼징 정지")
+                    break
+                if self._wp_held_nsid is not None and not _seq_in_progress:
+                    if not self._restore_held_wp("seq-boundary"):
+                        break
                 # v7.2: DET_BUDGET 비율만큼만 det stage 소비.
                 # 기존 구조는 _det_queue가 있으면 무조건 소비해서
                 # Write seed가 coverage를 내면 ~400회 Write 전용 실행이 연속으로 발생,
@@ -15073,6 +15109,10 @@ class NVMeFuzzer:
             log.warning("Interrupted by user — 정리 작업 완료 후 종료합니다 (잠시 대기)...")
 
         finally:
+            # 시퀀스 도중 종료돼 write-protect 를 보유한 채라면 여기서 해제 시도
+            # (best-effort; 실패해도 다음 실행 startup clear 가 최후 net).
+            if self._wp_held_nsid is not None:
+                self._restore_held_wp("run-exit")
             # Ctrl+C가 정리 작업을 중단하지 않도록 SIGINT 임시 무시.
             # finally 블록이 KeyboardInterrupt로 중단되면 그래프/통계 저장이
             # 스킵되므로, 정리가 끝날 때까지 추가 시그널을 억제한다.
