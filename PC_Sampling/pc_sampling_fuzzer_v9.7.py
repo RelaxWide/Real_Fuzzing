@@ -487,6 +487,18 @@ _SANITIZE_OPCODE   = 0x84
 _FORMAT_OPCODE     = 0x80
 ALLOWED_SANACT     = frozenset(_ST.get('allowed_sanact', [0x01, 0x05]))
 ALLOWED_FORMAT_SES = frozenset(_ST.get('allowed_format_ses', [0x00]))
+# ★ SetFeatures Namespace Write Protection(FID 0x84, ≠ Sanitize opcode 0x84).
+#   admin opcode 0x09, FID=CDW10[7:0], WPS=CDW11[2:0].
+#     WPS 0=No Write Protect / 1=Write Protect / 2=Until Power Cycle / 3=Permanent.
+#   1/2/3 은 namespace 를 read-only 로 잠가 이후 모든 write 를 거부(io_workload 무력화).
+#   정책(이 장치 기준): WPS=1 만 lock/unlock 테스트 — 발송 허용 후 **즉시 in-band 로
+#   WPS=0 해제 + read-back 검증**(PM9M1 에서 in-band 가역 실증됨). WPS=2 는 자연 복구가
+#   POR 뿐인데 이 장치는 POR=ROM 모드라 복구 불가 → 차단. WPS=3=영구 → 차단. WPS=0 은 해제라 허용.
+#   ★ 이 장치는 POR 복구 불가라, 해제는 rc 를 믿지 않고 get-feature read-back 으로 검증한다.
+_SET_FEATURES_OPCODE = 0x09
+_WRITE_PROTECT_FID   = 0x84
+_WPS_WRITE_PROTECT   = 0x1     # 유일하게 in-band 가역 확인된 상태(발송 허용 + auto-clear)
+WRITE_PROTECT_TEST   = bool(_ST.get('write_protect_test', True))  # False = WPS!=0 전부 차단
 
 OPCODE_MUT_PROB        = _MU['opcode']
 NSID_MUT_PROB          = _MU['nsid']
@@ -9230,6 +9242,71 @@ class NVMeFuzzer:
         except Exception as e:
             log.warning(f"[KeepAlive] set-feature 실패: {e}")
 
+    def _read_wps(self, nsid: int) -> Optional[int]:
+        """get-feature FID 0x84 로 현재 WPS(CDW11[2:0]) 를 읽는다. 실패/미지원 시 None.
+        nvme-cli 버전차: 'Current value:0x..' / 'Current Value:..'(0x 없음) 둘 다 수용."""
+        try:
+            r = subprocess.run(
+                ['nvme', 'get-feature', self.config.nvme_device, '-n', str(nsid),
+                 '-f', hex(_WRITE_PROTECT_FID)],
+                capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if 'value' in line.lower():
+                    m = re.search(r'value\s*:?\s*(?:0x)?([0-9a-fA-F]+)', line, re.IGNORECASE)
+                    if m:
+                        return int(m.group(1), 16) & 0x7
+        except Exception:
+            pass
+        return None
+
+    def _clear_write_protect(self, nsid: int) -> bool:
+        """WPS=0 in-band 해제 + **read-back 검증**(재시도 1회). 반환: 해제 확인 True.
+
+        ★ 이 장치는 POR=ROM 모드라 POR 복구가 불가하다. 그래서 set-feature 의 rc 를
+          믿지 않고 get-feature 로 실제 WPS==0 을 확인한다. 실패하면 자동 복구 수단이
+          없으므로 크리티컬 경고(수동 해제 필요) — POR 는 절대 시도하지 않는다.
+        """
+        dev = self.config.nvme_device
+        _wps = None
+        for _ in range(2):
+            try:
+                subprocess.run(
+                    ['nvme', 'set-feature', dev, '-n', str(nsid),
+                     '-f', hex(_WRITE_PROTECT_FID), '-v', '0'],
+                    capture_output=True, text=True, timeout=5)
+            except Exception:
+                pass
+            _wps = self._read_wps(nsid)
+            if _wps == 0:
+                self._record_setfeature_history(_WRITE_PROTECT_FID, 0, None,
+                                                'WriteProtect clear')
+                return True
+        log.error(f"[WriteProtect] ★ WPS=0 해제 실패 (read-back WPS={_wps}) — namespace 가 "
+                  f"write-protect 로 남음. 이 장치는 POR 복구 불가 → 수동 해제 필요: "
+                  f"nvme set-feature {dev} -n {nsid} -f 0x84 -v 0. 이후 write 실패 가능.")
+        self.stats['wp_clear_fail'] = self.stats.get('wp_clear_fail', 0) + 1
+        return False
+
+    def _write_protect_clear(self) -> None:
+        """startup: namespace 가 이미 write-protect(WPS!=0)면 in-band 해제(+검증).
+        이전 실행/외부에서 잠긴 채 올라온 경우 복구. 이미 해제면 무해. WPS=3(Permanent)
+        은 해제 불가 → 경고만. (발송 정책상 WPS=1 만 테스트되고 즉시 해제되므로, 여기는
+        주로 '이전에 잠긴 잔여' 청소용.)"""
+        ns  = self.config.nvme_namespace
+        wps = self._read_wps(ns)
+        if wps is None:
+            log.info("[WriteProtect] startup: FID 0x84 상태 확인 실패(미지원/파싱) — skip")
+            return
+        if wps == 0:
+            return   # 이미 해제
+        if wps == 3:
+            log.error("[WriteProtect] startup: WPS=3 Permanent — 해제 불가(영구). "
+                      "수동/벤더 복구 필요")
+            return
+        log.warning(f"[WriteProtect] startup: 기존 write-protect(WPS={wps}) 감지 — 해제 시도")
+        if self._clear_write_protect(ns):
+            log.warning("[WriteProtect] startup: write-protect 해제 완료 — write 복구")
+
     def _keepalive_restore(self) -> None:
         """퍼징 종료 시 원본 Keep-Alive 상태 복원."""
         if self._orig_keepalive_val == 0:
@@ -10330,6 +10407,24 @@ class NVMeFuzzer:
             self.stats['blocked_format_ses'] = self.stats.get('blocked_format_ses', 0) + 1
             return self.RC_SKIP
 
+        # SetFeatures Namespace Write Protection(FID 0x84) 정책:
+        #   WPS=0(unlock) 항상 허용. WPS=1 은 테스트 모드면 허용 → 발송 후 즉시 in-band
+        #   해제(아래 post-send). WPS=2(POR 복구뿐; 이 장치 POR=ROM모드 불가)·3(영구)은 차단.
+        #   스키마는 CDW11 을 free-form 으로 둬 못 막으므로 발송 시점에서 막는다.
+        #   FID/WPS 는 actual_opcode 기준(변이로 0x09/0x84 가 된 경우도 잡힘).
+        if (passthru_type == "admin-passthru"
+                and actual_opcode == _SET_FEATURES_OPCODE
+                and (seed.cdw10 & 0xFF) == _WRITE_PROTECT_FID):
+            _wps = seed.cdw11 & 0x7
+            if not (_wps == 0 or (_wps == _WPS_WRITE_PROTECT and WRITE_PROTECT_TEST)):
+                _why = ("Permanent(불가역)" if _wps == 3
+                        else "Until-Power-Cycle(POR 복구 불가 장치)" if _wps == 2
+                        else "테스트 비활성")
+                log.warning(f"[GUARD] SetFeatures Write Protect(FID 0x84) WPS={_wps:03b}b "
+                            f"전송 차단 — {_why} (cdw11=0x{seed.cdw11:08x})")
+                self.stats['blocked_write_protect'] = self.stats.get('blocked_write_protect', 0) + 1
+                return self.RC_SKIP
+
         # Admin 명령어별 고정 응답 크기
         ADMIN_FIXED_RESPONSE = {
             "Identify": 4096,
@@ -10611,6 +10706,16 @@ class NVMeFuzzer:
             if (AUTO_REATTACH_NS and rc == 0 and passthru_type == "admin-passthru"
                     and actual_opcode == _NS_ATTACH_OPCODE and (seed.cdw10 & 0xF) == 1):
                 self._reattach_namespace(actual_nsid)
+
+            # Write Protect(WPS=1) 성공 시 즉시 in-band 해제 — lock 핸들러를 fuzz 한 뒤
+            # unlock 핸들러까지 fuzz 하면서 잠금을 남기지 않는다(POR 복구 불가 장치라
+            # read-back 검증; 실패 시 _clear_write_protect 가 크리티컬 경고).
+            if (WRITE_PROTECT_TEST and rc == 0 and passthru_type == "admin-passthru"
+                    and actual_opcode == _SET_FEATURES_OPCODE
+                    and (seed.cdw10 & 0xFF) == _WRITE_PROTECT_FID
+                    and (seed.cdw11 & 0x7) == _WPS_WRITE_PROTECT):
+                if self._clear_write_protect(actual_nsid):
+                    self.stats['wp_test'] = self.stats.get('wp_test', 0) + 1
 
             return rc
 
@@ -14345,6 +14450,9 @@ class NVMeFuzzer:
         # Keep-Alive: 주기적 admin cmd → PS3/PS4 wake-up → L1 진입 불가
         self._apst_disable()
         self._keepalive_disable()
+        # 이전 실행/외부에서 namespace 가 write-protect(FID 0x84)로 잠겨 있으면 해제.
+        # (발송 가드가 이후 설정은 막으므로 startup 1회 복구로 충분.)
+        self._write_protect_clear()
 
         # J-Link PC 읽기 진단 + idle PC 감지 — POR + APST/Keep-Alive disable 직후의
         # 가장 깨끗한 idle 상태에서 수집. PM preflight (30 PowerCombo + 17 S1/S2
@@ -15174,6 +15282,21 @@ class NVMeFuzzer:
                 if _blk_excl > 0:
                     summary_lines.append(f"Blocked excluded opcode: {_blk_excl}회 "
                                          f"(config excluded_opcodes, 전 경로 강제)")
+                # SetFeatures Write Protect(FID 0x84) 차단 누적 — WPS=2(POR복구불가)/3(영구).
+                _blk_wp = self.stats.get('blocked_write_protect', 0)
+                if _blk_wp > 0:
+                    summary_lines.append(f"Blocked write-protect: {_blk_wp}회 "
+                                         f"(WPS=2/3, namespace 잠금 방지)")
+                # WPS=1 lock/unlock 테스트: 발송→즉시 in-band 해제(검증) 성공 횟수.
+                _wp_t = self.stats.get('wp_test', 0)
+                if _wp_t > 0:
+                    summary_lines.append(f"Write-protect test(WPS=1): {_wp_t}회 "
+                                         f"(lock→in-band unlock 검증)")
+                # ★ 해제 실패(read-back WPS!=0) — POR 복구 불가라 수동 개입 필요.
+                _wp_f = self.stats.get('wp_clear_fail', 0)
+                if _wp_f > 0:
+                    summary_lines.append(f"★ Write-protect UNLOCK FAIL: {_wp_f}회 "
+                                         f"— namespace 잠긴 채 남음(수동 해제 필요)")
                 # v9.7 ③: 커널 errno 로 device 까지 못 간 명령 — 펌웨어 미실행이므로 커버리지 기여 0.
                 #   이 값이 크면 발송 인자가 커널 한계를 넘고 있다는 뜻(전송 상한/정렬 점검).
                 _unsub = self.stats.get('unsubmitted_cmds', 0)
