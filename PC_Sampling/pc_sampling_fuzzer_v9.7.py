@@ -5677,7 +5677,12 @@ class NVMeFuzzer:
         added_s = added_q = 0
         # seeds — A: 중복 주입 방지, ③(3): 항목별 accept/dup 로그
         for item in (data.get('seeds') or [])[:RAG_MAX_SEEDS]:
-            seed = self._llm_make_seed(item, item.get('seed_class') or 'llm_new_group')
+            # LLM 라벨은 보존하되 계보 접두('llm')를 강제한다. LLM 이 seed_class 를
+            # 'vendor_edge' 처럼 접두 없이 주면 _is_llm_seed 가 False 가 돼 크레딧/부스트/
+            # cull 보호에서 누락됐다(단일 LLM 시드 계보 유실 버그). 'llm_vendor_edge' 로
+            # 만들어 디버그 라벨은 유지하면서 계보 판정은 복구한다.
+            _sc = str(item.get('seed_class') or 'new_group')
+            seed = self._llm_make_seed(item, _sc if _sc.startswith('llm') else f'llm_{_sc}')
             if seed is None:
                 self._llm_stats['dropped'] += 1
                 continue
