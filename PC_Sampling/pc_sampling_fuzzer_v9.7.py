@@ -3379,6 +3379,23 @@ def _llm_schema_ok(obj) -> bool:
     return isinstance(obj, dict) and any(k in obj for k in _LLM_TOP_KEYS)
 
 
+def _coerce_int(v, default=0):
+    """LLM 필드값 → int. 프롬프트는 10진수를 요구하지만, 그래도 LLM 이 "0x1f"·"31"
+    처럼 문자열/16진을 줄 수 있어 관용적으로 흡수한다(seed 를 통째로 드롭하지 않게).
+    파싱 불가면 default. bare 0x 리터럴은 _sanitize_json 이 이미 10진수로 바꾼다."""
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        try:
+            return int(s, 16) if s.lower().startswith('0x') else int(s, 10)
+        except Exception:
+            return default
+    return default
+
+
 def _sanitize_json(text: str) -> str:
     """JSON **문자열 밖**의 두 가지 LLM 흔한 오류를 교정한다:
       1) 맨 16진 리터럴  "cdw10": 0x1   → 10진수(1). json.loads 는 0x 를 못 읽어
@@ -5019,14 +5036,22 @@ class NVMeFuzzer:
         "spec-aware NVMe commands and sequences that reach under-tested firmware code, given "
         "the fuzzer's current coverage gaps and the exact command schemas.\n"
         "HARD RULES:\n"
-        " - Output ONLY a single JSON object, no prose. Keys: \"seeds\", \"sequences\", "
-        "\"evaluations\" (include only what the task asks).\n"
-        " - Each command uses a \"command\" name from the provided schema list and CDW fields "
-        "(cdw2,cdw3,cdw10..cdw15) as integers within the schema's valid/vendor ranges.\n"
+        " - Output ONLY a single strict-JSON object — no prose, no markdown/code fence, no "
+        "comments. Keys: \"seeds\", \"sequences\", \"evaluations\" (include only what the task asks).\n"
+        " - Emit only LITERAL JSON values. NEVER use expressions, function calls (e.g. "
+        "repeat()), string concatenation, ellipses (...), or trailing commas. A standard JSON "
+        "parser must accept your output verbatim.\n"
+        " - All numeric fields (cdw2,cdw3,cdw10..cdw15, nsid, seed_id) are DECIMAL integers "
+        "(e.g. 31 — NOT 0x1f, NOT \"31\"). No hex prefix, no quotes, no expressions. Keep them "
+        "within the schema's valid/vendor ranges.\n"
+        " - Each command uses a \"command\" name from the provided schema list.\n"
         " - NEVER propose destructive/locking commands (FormatNVM, Sanitize, Security lock, "
         "Namespace Delete). They will be rejected.\n"
-        " - Optional per-seed: \"nsid\" (int), \"data_hex\" (hex string), \"seed_class\", "
+        " - Optional per-seed: \"nsid\" (decimal int), \"data_hex\", \"seed_class\", "
         "\"rationale\".\n"
+        f" - \"data_hex\" is a LITERAL lowercase hex string, exactly 2 chars per byte (e.g. "
+        f"\"00ff1a\"), at most {MAX_INPUT_LEN} bytes. Write the bytes out literally — NO "
+        "expressions, NO repeat(), NO '...'.\n"
         "JSON shape: {\"seeds\":[{\"command\":str,\"cdw10\":int,...,\"seed_class\":str}], "
         "\"sequences\":[{\"commands\":[{\"command\":str,\"cdw10\":int,...}],\"seed_class\":str}], "
         "\"evaluations\":[{\"seed_id\":int,\"score\":float,\"keep\":bool}]}"
@@ -5149,6 +5174,9 @@ class NVMeFuzzer:
         for n in tgt[:8]:
             lines.append(f"  {n}: {self._DATA_LAYOUTS.get(n, 'valid data per its spec structure')}")
         lines.append("Emit data_hex ONLY for the commands listed here; omit it for all others.")
+        lines.append(f"data_hex MUST be a literal lowercase hex string (2 chars/byte, "
+                     f"<= {MAX_INPUT_LEN} bytes). Do NOT abbreviate with expressions/repeat()/'...' "
+                     "— write the exact bytes.")
         return "\n".join(lines)
 
     def _llm_grounding_block(self) -> str:
@@ -5549,7 +5577,7 @@ class NVMeFuzzer:
                 if RAG_DEBUG:
                     log.warning(f"[LLM/item] drop {name!r} (unknown command)")
                 return None
-            cdw = {f'cdw{w}': int(item.get(f'cdw{w}', 0)) for w in (2, 3, 10, 11, 12, 13, 14, 15)}
+            cdw = {f'cdw{w}': _coerce_int(item.get(f'cdw{w}', 0)) for w in (2, 3, 10, 11, 12, 13, 14, 15)}
             repaired, _fixed, ok = self.llm.schema_bridge.validate_and_repair(name, cdw)
             if not ok:
                 if RAG_DEBUG:
@@ -5573,7 +5601,7 @@ class NVMeFuzzer:
                 cdw10=repaired.get('cdw10', 0), cdw11=repaired.get('cdw11', 0),
                 cdw12=repaired.get('cdw12', 0), cdw13=repaired.get('cdw13', 0),
                 cdw14=repaired.get('cdw14', 0), cdw15=repaired.get('cdw15', 0),
-                nsid_override=(int(nsid) if isinstance(nsid, int) else None),
+                nsid_override=(_coerce_int(nsid, None) if nsid is not None else None),
                 found_at=self.executions, seed_class=seed_class)
         except Exception:
             return None
