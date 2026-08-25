@@ -2163,6 +2163,9 @@ class OpenOCDPCSampler:
 
         self.stop_event    = threading.Event()
         self.openocd_error = threading.Event()  # 연속 실패로 샘플링 불가 → 메인 루프에 통보
+        # 링크 손실 ERROR 로그 dedup: 명령마다 워커가 새로 뜨므로 한 outage 가 여러 명령을
+        # 지나면 매 명령마다 error 를 찍어 스팸이 된다. outage 시작에 1회만 ERROR, 복구 시 1회.
+        self._link_loss_reported = False
         # halt 샘플러 health 카운터(누적) — 메인 루프의 health 모니터가 델타로 읽음.
         # PCSR 은 _read_all_pcs 가 halt 를 안 하므로 사실상 fail=0(무영향).
         self.halt_ok_total   = 0
@@ -2333,9 +2336,19 @@ class OpenOCDPCSampler:
             log.warning(f"[OpenOCD] 타겟 재초기화 예외: {e}")
             return False
 
-    def _reconnect(self) -> bool:
+    def _reconnect(self, attempts: int = 3) -> bool:
         log.warning("[OpenOCD] 재시작 시도...")
         self._stop_worker()   # 소켓/프로세스 만지기 전 샘플링 스레드 정지(경합 방지)
+        # ★ USB 정상 해제: SIGTERM 만으로는 libjaylink 가 J-Link USB 를 잠근 채 종료해
+        #   새 OpenOCD 가 'no j-link device found' 로 죽는다(close() 와 동일 이유).
+        #   프로세스/소켓이 살아있으면 telnet 'shutdown' 으로 먼저 정상 해제를 시도한다
+        #   (best-effort — 링크가 이미 깨졌으면 예외 무시).
+        if self._sock and self._openocd_alive():
+            try:
+                self._sock.sendall(b'shutdown\n')
+                time.sleep(0.5)   # OpenOCD 가 USB 해제하고 종료할 시간
+            except Exception:
+                pass
         self._close_telnet()
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
@@ -2344,7 +2357,21 @@ class OpenOCDPCSampler:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
         self._proc = None
-        return self._launch_openocd() and self._reopen_telnet()
+        # ★ 초기 connect() 와 동일하게 매 시도마다 stale 정리 + USB 해제 대기
+        #   (_kill_stale_openocd 의 fuser -k / pkill / time.sleep(1.0))를 거친 뒤 재기동.
+        #   일시적 USB 해제 레이스를 bounded retry 로 견딘다 — 한 번 실패가 곧바로
+        #   fatal(퍼저 종료)이 되지 않게 한다.
+        attempts = max(1, attempts)
+        for _i in range(1, attempts + 1):
+            self._kill_stale_openocd()
+            if self._launch_openocd() and self._reopen_telnet():
+                if _i > 1:
+                    log.warning(f"[OpenOCD] 재시작 성공 ({_i}/{attempts}회차)")
+                return True
+            log.warning(f"[OpenOCD] 재시작 {_i}/{attempts} 실패"
+                        + (" — USB 해제 대기 후 재시도..." if _i < attempts else " — 포기"))
+            self._terminate_proc()   # 부분 기동된 프로세스 정리 후 다음 시도
+        return False
 
     def _reopen_telnet(self) -> bool:
         try:
@@ -2370,20 +2397,30 @@ class OpenOCDPCSampler:
         s.connect((self.config.openocd_host, self.config.openocd_port))
         self._sock = s
         self._sock_buf = b''
-        # 초기 배너 전체 drain: OpenOCD가 > 를 여러 번 보낼 수 있음.
-        # 0.5초 대기 후 수신 가능한 데이터를 모두 버려 clean slate 확보.
-        time.sleep(0.5)
-        self._sock.settimeout(0.2)
+        # 배너/프롬프트를 **프롬프트('> ')가 보일 때까지** 결정론적으로 소비한다.
+        # (구) 시간기반 drain(0.5s)은 재연결 시 배너가 늦게 오면 command/response
+        # 정렬이 한 칸 밀려(off-by-one), 이후 모든 응답을 **직전 명령의 echo**로 읽는다.
+        # 실제 관측: read_all_pcs 자리에서 proc 정의 echo(0x1e + PCSR주소 3개 = 토큰 4개)를
+        # 읽어 '파싱 실패(토큰 4개)' → 재초기화 실패 → full 재시작 → 포트4444 타임아웃.
+        _deadline = time.monotonic() + self._SOCK_TIMEOUT
+        self._sock.settimeout(0.3)
+        _seen_prompt = False
         try:
-            while True:
-                chunk = self._sock.recv(self._RECV_BUF)
+            while time.monotonic() < _deadline:
+                try:
+                    chunk = self._sock.recv(self._RECV_BUF)
+                except socket.timeout:
+                    if _seen_prompt:
+                        break          # 프롬프트 봤고 더 올 데이터 없음 = 정렬 완료
+                    continue
                 if not chunk:
                     break
-        except socket.timeout:
-            pass
+                self._sock_buf += chunk
+                if b'> ' in self._sock_buf:
+                    _seen_prompt = True
         finally:
             self._sock.settimeout(self._SOCK_TIMEOUT)
-        self._sock_buf = b''   # 버퍼 완전 초기화
+        self._sock_buf = b''   # 프롬프트까지 소비 — clean slate (정렬 보장)
 
     def _close_telnet(self):
         if self._sock:
@@ -2392,6 +2429,28 @@ class OpenOCDPCSampler:
             except Exception:
                 pass
             self._sock = None
+        self._sock_buf = b''
+
+    def _drain_socket(self):
+        """소켓에 남은 미소비 데이터를 짧은 타임아웃으로 비워 command/response
+        정렬을 리셋한다. 파싱 실패(desync) 후 한 칸 밀림이 이후 읽기로 전파되는
+        것을 끊어 self-heal 시킨다(전파 시 10회 실패→불필요한 full 재시작)."""
+        if not self._sock:
+            self._sock_buf = b''
+            return
+        self._sock_buf = b''
+        try:
+            self._sock.settimeout(0.15)
+            while True:
+                if not self._sock.recv(self._RECV_BUF):
+                    break
+        except (socket.timeout, OSError):
+            pass
+        finally:
+            try:
+                self._sock.settimeout(self._SOCK_TIMEOUT)
+            except Exception:
+                pass
         self._sock_buf = b''
 
     def _sock_read_until(self, marker: str) -> str:
@@ -2500,10 +2559,14 @@ class OpenOCDPCSampler:
             _resp_lower = resp.lower()
             if resp.startswith('ERR:') or 'error' in _resp_lower or 'failed' in _resp_lower:
                 log.warning(f"[OpenOCD] 에러 응답 감지: {repr(resp)}")
+                self._drain_socket()   # desync 가능성 — 다음 읽기 재정렬
                 return None
             parts = re.findall(r'0x[0-9a-fA-F]+', resp)
             if len(parts) != n:
                 log.warning(f"[OpenOCD] 파싱 실패 (토큰 {len(parts)}개, 기대 {n}개): {repr(resp)}")
+                # 응답 자리에서 직전 명령 echo 를 읽은 정렬 밀림(off-by-one) — 버퍼를
+                # 비워 다음 read_all_pcs 가 깨끗한 정렬로 읽게 한다(persistent desync 차단).
+                self._drain_socket()
                 return None
             pcs = tuple(int(p, 16) & ~1 for p in parts[:n])
             # 무효 PC 필터 1: sentinel(0xFFFFFFFE) 또는 0 — 모두 해당할 때만
@@ -2716,7 +2779,15 @@ class OpenOCDPCSampler:
                     #    (안 그러면 메인 루프가 매 명령 [OpenOCD] 복구 경로를 헛돌며 로그 노이즈).
                     #    실제 (B)코어 고착은 별도 health 모니터(coverage 정체 병행)가 잡는다.
                     if self._read_fail_needs_recovery():
-                        log.error(f"[Sampler] PC read 연속 {_consecutive_fail}회 실패 — 링크 손실 의심, 복구")
+                        # outage 시작에만 ERROR 1회. 같은 outage 가 여러 명령을 지나며
+                        # 매 명령 워커가 여기 도달해도 스팸하지 않는다(복구 시 재-무장).
+                        if not self._link_loss_reported:
+                            log.error(f"[Sampler] PC read 연속 {_consecutive_fail}회 실패 "
+                                      f"— 링크 손실 의심, 복구")
+                            self._link_loss_reported = True
+                        else:
+                            log.debug(f"[Sampler] PC read 연속 {_consecutive_fail}회 실패 "
+                                      f"— 링크 손실 지속(복구 대기)")
                         self.openocd_error.set()
                     else:
                         log.debug(f"[Sampler] halt 연속 {_consecutive_fail}회 실패 — 코어 WFI 추정"
@@ -2734,6 +2805,12 @@ class OpenOCDPCSampler:
                     time.sleep(_backoff)
                 continue
             self.halt_ok_total += 1
+            # 링크 손실을 ERROR 로 보고했던 outage 가 실제 PC 읽기 성공으로 끝났으면
+            # 복구를 딱 1회 알린다(dedup 재-무장). "복구됨" 은 실제 읽힘 기준이라 정확하다.
+            if self._link_loss_reported:
+                log.warning(f"[Sampler] 링크 복구됨 — PC 읽기 정상 재개 "
+                            f"(PC={hex(pcs_tuple[0])})")
+                self._link_loss_reported = False
             # 실패 스트릭 후 성공 시 복구 확인 — 파일 로그(debug)로만. 무해 WFI 구간에서
             # 자주 떠 터미널 노이즈가 되므로, 터미널 신호는 health 모니터로 일원화한다.
             if _consecutive_fail >= 3:
