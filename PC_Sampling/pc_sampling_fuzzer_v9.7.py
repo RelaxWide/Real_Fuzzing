@@ -3369,17 +3369,82 @@ def _llm_schema_dict() -> dict:
             "schemas": schemas, "guards": guards}
 
 
+# LLM 응답 top-level 스키마 키. 이 중 하나도 없는 dict 는 (내부 seed/command
+# 객체 같은) **파편**이므로 파싱 성공으로 쳐선 안 된다 — apply 가 읽는 키 전부.
+_LLM_TOP_KEYS = ('seeds', 'sequences', 'evaluations', 'io_workload')
+
+
+def _llm_schema_ok(obj) -> bool:
+    """스키마 유효한 top-level 응답 객체인가(파편이 아닌가)."""
+    return isinstance(obj, dict) and any(k in obj for k in _LLM_TOP_KEYS)
+
+
+def _sanitize_json(text: str) -> str:
+    """JSON **문자열 밖**의 두 가지 LLM 흔한 오류를 교정한다:
+      1) 맨 16진 리터럴  "cdw10": 0x1   → 10진수(1). json.loads 는 0x 를 못 읽어
+         전체 파싱이 즉시 깨진다(_normalize 는 따옴표 친 "0x1" 만 처리 → 이미 늦음).
+      2) 트레일링 콤마   {"a":1,}  [1,2,]  → 콤마 제거.
+    문자열 내부(예: desc 의 '0x80')는 건드리지 않는다."""
+    out = []
+    i, n = 0, len(text)
+    in_str, esc = False, False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        # (1) 맨 16진 리터럴 0x[hex]
+        if ch == '0' and i + 1 < n and text[i + 1] in 'xX':
+            j = i + 2
+            while j < n and text[j] in '0123456789abcdefABCDEF':
+                j += 1
+            if j > i + 2:
+                out.append(str(int(text[i:j], 16)))
+                i = j
+                continue
+        # (2) 트레일링 콤마: , (공백)* 뒤가 } 또는 ]
+        if ch == ',':
+            k = i + 1
+            while k < n and text[k] in ' \t\r\n':
+                k += 1
+            if k < n and text[k] in '}]':
+                i += 1        # 콤마 버림
+                continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
 def _llm_extract_json(text: str):
-    """LLM 응답 텍스트에서 첫 balanced JSON 객체를 뽑아 파싱. prose 로 감싸도 견딤.
-    실패 시 None (호출자가 결과 폐기). 절대 raise 하지 않음."""
+    """LLM 응답에서 **스키마 유효한** JSON 객체를 뽑아 파싱. prose 로 감싸도 견딤.
+    맨 16진/트레일링콤마를 먼저 정규화하고, top-level 스키마 키가 없는 dict
+    파편은 **실패(None)** 로 보고한다 — 그래야 재시도 리프롬프트·폐기·경고가
+    정상 작동한다(파편을 성공으로 둔갑시켜 조용히 0개 주입하던 버그 수정).
+    실패 시 None. 절대 raise 하지 않음."""
     if not text:
         return None
+    s = _sanitize_json(text)
+    # 1) 전체가 JSON 인 경우 (정규화 후)
     try:
-        return json.loads(text)
+        obj = json.loads(s)
+        if _llm_schema_ok(obj):
+            return obj
     except Exception:
         pass
-    # 첫 '{' 부터 brace-depth 스캔으로 balanced 블록 추출(문자열 내 중괄호 무시).
-    s = text
+    # 2) prose 로 감쌈: balanced 블록을 훑어 **스키마 유효한 첫 dict** 를 반환.
+    #    파편(스키마 키 없는 내부 객체)은 건너뛰고 계속 스캔한다.
     start = s.find('{')
     while start != -1:
         depth, in_str, esc = 0, False, False
@@ -3401,9 +3466,12 @@ def _llm_extract_json(text: str):
                 depth -= 1
                 if depth == 0:
                     try:
-                        return json.loads(s[start:i + 1])
+                        obj = json.loads(s[start:i + 1])
+                        if _llm_schema_ok(obj):
+                            return obj
                     except Exception:
-                        break
+                        pass
+                    break   # 이 블록은 무효/파편 → 다음 '{' 로
         start = s.find('{', start + 1)
     return None
 
