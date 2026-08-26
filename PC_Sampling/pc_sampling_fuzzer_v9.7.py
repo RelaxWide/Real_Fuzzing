@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v9.1
+PC Sampling 기반 SSD 펌웨어 Coverage-Guided Fuzzer v9.7
 
 OpenOCD PCSR 비침습 샘플링 + nvme-cli passthru 기반 Coverage-Guided + State-Aware
 Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/덤프를 데이터 주도 설정.
@@ -16,67 +16,34 @@ Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/�
 - POR:      pmu_4_1.py 전원 사이클 → PCIe rescan → OpenOCD 재연결.
 - Defect:   timeout 시 stuck PC 분석 → JLink dump → UFAS dump → PC 모니터링.
 
-버전 요약 (자세한 내용은 git log / 각 버전 md 참조)
-- v9.5: Phase 0 — LLM 피드백 루프 수리(LLM 동작을 실제로 바꾸는 첫 버전). task 기아 제거
-        (plateau max-consecutive cap) + 워크로드 성공 재정의(FFM 단방향→새 상태/양방향 이동)
-        + corpus_eval 층화표본 + matched-contrastive(같은 명령 한-필드-차이 쌍 되먹임, v9.4 ledger
-        소비). 효과는 B1(v9.4) vs B2(v9.5) ablation 으로 측정. 상세: pc_sampling_fuzzer_v9.5.md.
-- v9.4: 관측 층 — 커버리지 소스 라벨링(mutation|llm × form) + SC/state discovery-count + 3축 성장
-        graph + outcome ledger(LLM 제안↔실행결과 prov_id 조인) + staleness credit 수정. 상세 md.
-- v9.1: 디바이스 실제 NVMe SC 되먹임 — SC=0x01(Invalid Opcode)=미구현 판정으로 LLM 조준
-        (미구현 회피/구현 필드교정 분리, accept-CDW few-shot, 구조적 data_hex, 스키마 캡 제거)
-        + 확정 미구현 시드 에너지 바닥 + state-cov 전역이벤트 필터 + J-Link close resume 하드닝.
-        상세: pc_sampling_fuzzer_v9.1.md.
-- v9.0: LLM-guided fuzzing 추가(in-process 직접 호출). 기존 fuzzing 루프는 무변경, 스펙 아는
-        사내 LLM 을 백그라운드 워커로 돌려 신규 명령군 시드·멀티-명령 시퀀스를 시드 풀에 주기
-        주입하고 corpus 를 평가. LLM 산출물은 스키마 검증(validate_and_repair)+위험필터
-        (is_dangerous)+발송 가드 3중 방어. --rag off/import실패 시 v8.8 byte-동등. 사내 래퍼는
-        generate_rag_response(user) 단일인자 지원(config pass_system_prompt=false). 상세: v9.0.md.
-- v8.8: 주기 차트 생성을 os.fork() → '완전 독립 subprocess'(--render-charts)로 교체. 거대
-        퍼저 프로세스 fork(주소공간 COW + FD 상속 + 멀티스레드 fork)가 호스트 OS 를 logless
-        즉시 재부팅시키는 트리거임이 실측 확인 → fork 완전 제거. 차트 데이터만 pickle 스냅샷
-        으로 디스크에 쓰고 새 인터프리터에서 렌더(디바이스/OpenOCD 미접근). + FAIL CMD data_len
-        로그를 실제 전송 transfer length(=replay 와 동일)로 수정(read 등 응답형 0 표기 버그).
-- v8.7: PCSR always-on 계측 완전 제거 → windowed(명령마다 start/stop) 단일 경로. always-on
-        (세션 내내 연속 PCSR 폴링)이 host OS freeze(alloc_vmap_area GPF + vmap_area_lock
-        soft-lockup)와 연관됨이 확인되어 제거(--no-always-on 옵션도 제거). prefill 샘플링은
-        v8.4 _pf_sampler(유한 구간 전용 스레드)로 복원. v8.5/v8.6 기능은 모두 유지.
-- v8.6: 주기 matplotlib 차트를 fork 자식에서 격리 생성(인프로세스 반복 figure → python3
-        segfault 차단; 자식 비정상 종료는 [Graph] 경고). vmalloc/kernel-taint 진단(vmon):
-        메인 루프 10000-exec 마다 /proc/meminfo·tainted 로깅([VMon] 파일전용, [Taint] 터미널).
-- v8.5: PCSR always-on 계측 도입(→ v8.7 에서 제거). --ignore-opcodes(특정 opcode timeout 을
-        크래시로 안 치고 POR 복구 후 계속), --no-erase(FormatNVM/Sanitize 전체소거 차단 +
-        excluded_opcodes 가 명령 선택 풀까지 필터 — 데이터 보존), prefill 중 PCSR 샘플링.
-- v8.4: device-aware IO 워크로드 엔진 추가. fuzz 100 명령 사이에 rc=0 보장 Write/Read 100 명령
-        블록을 주입(load-class 6 + structural 8 패턴)하여 SSD 내부 동작(GC/wear leveling/
-        read disturb/SLC)을 의도적으로 자극. 워크로드를 정상 회계(source='workload')로 흘려
-        every-100 state 캡처가 결과 state 변화를 state_corpus(C2)에 수확·replay. rc=0 경계는
-        Identify(nsze/mdts/lba) 런타임 자동. config io_workload 섹션 + --no-io-workload.
-- v8.3: 모든 사용자 설정값·경로를 fuzzer_config.json 으로 외부화. 모듈 로드 시 JSON 을 읽어
-        같은 이름의 전역(FW_ADDR_*/PRODUCT_PROFILES/NVME_TIMEOUTS/mutation·power·paths 등)에
-        주입 → FuzzConfig 기본값/argparse default 가 자동으로 JSON 값을 따름. 버전 비종속 공유
-        파일이라 .py 복사해도 설정 재사용. --config PATH 로 교체. 동작은 v8.2 와 byte-동등(검증).
-- v8.2: P9 profile 정리 — J-Link halt 에서 안 쓰는 OpenOCD/PCSR/UFAS 키
-        (openocd_config/tcl_prefix/pcsr_addrs/power_addr/power_mask/ufas_ini) 제거.
-        main() profile 읽기를 .get(기본값) 으로 관용화 → 제품이 N/A 키 생략 가능.
-        PM9M1/BM9H1 동작 불변.
-- v8.1: P9 전용 J-Link(pylink) halt 샘플러(JLinkHaltSampler) 추가. OpenOCD telnet halt 의
-        소켓 desync(빈 reg pc → resume 누락 → R5 컨트롤러 wedge) 문제를 in-process pylink
-        halt/register_read/JLINKARM_Go 로 대체. P9 sampler_type='jlink_halt'. PM9M1/BM9H1
-        (PCSR) 경로는 무변경. pylink 미설치 호스트는 import 가드로 무영향(P9 선택 시에만 필요).
-- v8.0: 제품 추가 P9(Cortex-R5·SWD). 모든 target-specific 값을 PRODUCT_PROFILES 한 곳으로
-        일반화(interface/cfg/jlink_device/tcl_prefix/pcsr_addrs/power/DPIDR/addr_range/
-        UFAS·JLink dump on-off). 신규 제품은 데이터만 추가. P9 는 UFAS·J-Link 덤프 불가 →
-        둘 다 비활성, bring-up 값은 placeholder(SESSION_HANDOFF_v8.8.md 참조).
-- v7.8: `--unsupported-skip` (EngineErrInt 자동 감지 → power cycle 후 메인 루프 계속),
-        `--no-jlink` (J-Link 없이 NVMe-only fuzz).
-- v7.7: S1 PCIe config bit perturb + S2 CLKREQ# timing perturb (PM rotation 통합).
-- v7.6: 시각화 (coverage_growth velocity, firmware_map gradient, csfuzz_dynamics).
-- v7.5: SequenceSeed corpus + 2-pass favored cull + ctx 모드.
-- v7.4: Phase 1/2/3 (NLB/MDTS, 64-bit LBA, builtin sequence).
-- v7.3: _account_command 헬퍼, m2 정규화.
-- v7.0: State-Aware (NVMeStateMonitor / dual interesting).
-- v6.x: OpenOCD PCSR, JTAG 지원, Schema Mutation, PS3/PS4 idle slot.
+버전 요약 (한 줄 요약; 상세는 git log / 각 버전 md)
+- v9.7: 전송상한 실측화(MDTS) + excluded_opcodes chokepoint 강제 + Write Protection 가드
+        (WPS=1 시퀀스 hold 테스트) + telnet 재연결 desync/USB 레이스 수리 + LLM 파서·프롬프트·
+        계보·favored/energy 수정 + PM9M1 LNB/HP 분리 + APST 파싱.
+- v9.6: LLM 부스트 자동조정 + 소거(Sanitize/Format) 발송 가드.
+- v9.5: LLM 피드백 루프 수리 — task 기아 제거 + 워크로드 성공 재정의 + corpus_eval 층화표본.
+- v9.4: 관측 층 — 커버리지 소스 라벨링 + discovery-count + 3축 성장 graph + outcome ledger.
+- v9.3: LLM I/O 워크로드 버스트 + 파생 state 필드 + pattern-cap 수정.
+- v9.2: 시퀀스 dedupe + staleness 감쇠 + SecuritySend ALLOWLIST + Tier2/3 data_hex 되먹임.
+- v9.1: NVMe SC 되먹임(Invalid Opcode=미구현) + 미구현 에너지 바닥 + J-Link close 하드닝.
+- v9.0: LLM-guided fuzzing 추가(in-process 백그라운드 워커, 스키마·위험·발송 3중 방어).
+- v8.8: 주기 차트를 독립 subprocess 로(os.fork 호스트 재부팅 트리거 제거).
+- v8.7: PCSR always-on 제거 → windowed 단일 경로(host freeze 연관).
+- v8.6: 차트 fork 격리 + vmalloc/taint 진단(vmon).
+- v8.5: PCSR always-on 도입(→v8.7 제거) + --ignore-opcodes/--no-erase + prefill 샘플링.
+- v8.4: device-aware IO 워크로드 엔진(GC/wear/read-disturb 자극, source=workload 회계).
+- v8.3: 설정 외부화(fuzzer_config.json) — v8.2 byte-동등.
+- v8.2: P9 profile 정리(N/A 키 생략 관용).
+- v8.1: P9 J-Link halt 샘플러(telnet halt desync 대체).
+- v8.0: 제품 P9 추가 + target 값 PRODUCT_PROFILES 일반화.
+- v7.8: --unsupported-skip / --no-jlink.
+- v7.7: S1 PCIe bit / S2 CLKREQ# perturb.
+- v7.6: 시각화(velocity/gradient/dynamics).
+- v7.5: SequenceSeed corpus + 2-pass favored cull.
+- v7.4: Phase 1/2/3(NLB/MDTS, 64-bit LBA, builtin sequence).
+- v7.3: _account_command 헬퍼.
+- v7.0: State-Aware(NVMeStateMonitor).
+- v6.x: OpenOCD PCSR, JTAG, Schema Mutation, PS3/4 idle slot.
 """
 
 from __future__ import annotations
@@ -488,16 +455,11 @@ _FORMAT_OPCODE     = 0x80
 ALLOWED_SANACT     = frozenset(_ST.get('allowed_sanact', [0x01, 0x05]))
 ALLOWED_FORMAT_SES = frozenset(_ST.get('allowed_format_ses', [0x00]))
 # ★ SetFeatures Namespace Write Protection(FID 0x84, ≠ Sanitize opcode 0x84).
-#   admin opcode 0x09, FID=CDW10[7:0], WPS=CDW11[2:0].
-#     WPS 0=No Write Protect / 1=Write Protect / 2=Until Power Cycle / 3=Permanent.
-#   1/2/3 은 namespace 를 read-only 로 잠가 이후 모든 write 를 거부(io_workload 무력화).
-#   정책(이 장치 기준): WPS=1 만 lock/unlock 테스트. LLM/builtin 시퀀스 안에서 발송되면
-#   그 **시퀀스 단위 동안 잠금을 유지**(안의 write 가 실제 read-only 를 겪어 reject 경로가
-#   fuzz 됨) → 시퀀스 경계에서 **in-band WPS=0 해제 + read-back 검증**. 시퀀스 밖(단독/
-#   state-replay)이면 즉시 해제. PM9M1 에서 in-band 가역 실증됨. WPS=2 는 자연 복구가 POR
-#   뿐인데 이 장치는 POR=ROM 모드라 복구 불가 → 차단. WPS=3=영구 → 차단. WPS=0 은 해제라 허용.
-#   ★ POR 복구 불가라 해제는 rc 대신 get-feature read-back 으로 검증하고, 실패하면(불량)
-#   퍼징을 정지한다(_wp_stuck; POR 미시도).
+#   admin 0x09, FID=CDW10[7:0], WPS=CDW11[2:0]: 0=off/1=WriteProtect/2=UntilPwrCycle/3=Permanent.
+#   정책(PM9M1: POR=ROM모드, in-band WPS=1↔0 가역 실증): WPS=1 만 테스트. LLM/builtin 시퀀스
+#   안이면 그 시퀀스 동안 잠금 유지(안의 write 가 read-only 를 겪어 reject 경로 fuzz) → 경계에서
+#   WPS=0 해제+read-back 검증. 시퀀스 밖은 즉시 해제. WPS=2(POR 복구뿐)·3(영구)은 차단.
+#   해제 실패=불량 → 퍼징 정지(_wp_stuck; POR 미시도). config write_protect_test 로 끔.
 _SET_FEATURES_OPCODE = 0x09
 _WRITE_PROTECT_FID   = 0x84
 _WPS_WRITE_PROTECT   = 0x1     # 유일하게 in-band 가역 확인된 상태(발송 허용 + auto-clear)
@@ -9250,8 +9212,8 @@ class NVMeFuzzer:
             log.warning(f"[KeepAlive] set-feature 실패: {e}")
 
     def _read_wps(self, nsid: int) -> Optional[int]:
-        """get-feature FID 0x84 로 현재 WPS(CDW11[2:0]) 를 읽는다. 실패/미지원 시 None.
-        nvme-cli 버전차: 'Current value:0x..' / 'Current Value:..'(0x 없음) 둘 다 수용."""
+        """get-feature FID 0x84 → 현재 WPS(CDW11[2:0]). 실패/미지원 None.
+        ('value:0x..' / 'Value:..'(0x 없음) 두 형식 수용)"""
         try:
             r = subprocess.run(
                 ['nvme', 'get-feature', self.config.nvme_device, '-n', str(nsid),
@@ -9267,12 +9229,8 @@ class NVMeFuzzer:
         return None
 
     def _clear_write_protect(self, nsid: int) -> bool:
-        """WPS=0 in-band 해제 + **read-back 검증**(재시도 1회). 반환: 해제 확인 True.
-
-        ★ 이 장치는 POR=ROM 모드라 POR 복구가 불가하다. 그래서 set-feature 의 rc 를
-          믿지 않고 get-feature 로 실제 WPS==0 을 확인한다. 실패하면 자동 복구 수단이
-          없으므로 크리티컬 경고(수동 해제 필요) — POR 는 절대 시도하지 않는다.
-        """
+        """WPS=0 해제 + read-back 검증(재시도 1회). 성공 True.
+        POR=ROM 모드라 POR 미사용; rc 대신 실제 WPS==0 을 확인, 실패 시 크리티컬 경고."""
         dev = self.config.nvme_device
         _wps = None
         for _ in range(2):
@@ -9295,9 +9253,7 @@ class NVMeFuzzer:
         return False
 
     def _restore_held_wp(self, where: str) -> bool:
-        """시퀀스 단위로 보유(hold)했던 write-protect 를 해제+검증한다. 보유 없으면 무해.
-        성공 True. 실패 시 self._wp_stuck 을 세워 메인 루프가 정지하게 한다 — 사용자
-        판단: 해제 실패는 이미 불량 상황이므로 조용히 계속하지 말고 멈춘다(POR 미시도)."""
+        """hold 한 write-protect 해제+검증. 실패 시 _wp_stuck(퍼징 정지). 보유 없으면 무해."""
         ns = self._wp_held_nsid
         if ns is None:
             return True
@@ -9310,10 +9266,8 @@ class NVMeFuzzer:
         return False
 
     def _write_protect_clear(self) -> None:
-        """startup: namespace 가 이미 write-protect(WPS!=0)면 in-band 해제(+검증).
-        이전 실행/외부에서 잠긴 채 올라온 경우 복구. 이미 해제면 무해. WPS=3(Permanent)
-        은 해제 불가 → 경고만. (발송 정책상 WPS=1 만 테스트되고 즉시 해제되므로, 여기는
-        주로 '이전에 잠긴 잔여' 청소용.)"""
+        """startup: 이전/외부에서 잠긴 write-protect(WPS!=0)를 in-band 해제(+검증).
+        WPS=3(Permanent)은 해제 불가 → 경고만."""
         ns  = self.config.nvme_namespace
         wps = self._read_wps(ns)
         if wps is None:
@@ -10429,11 +10383,8 @@ class NVMeFuzzer:
             self.stats['blocked_format_ses'] = self.stats.get('blocked_format_ses', 0) + 1
             return self.RC_SKIP
 
-        # SetFeatures Namespace Write Protection(FID 0x84) 정책:
-        #   WPS=0(unlock) 항상 허용. WPS=1 은 테스트 모드면 허용 → 발송 후 즉시 in-band
-        #   해제(아래 post-send). WPS=2(POR 복구뿐; 이 장치 POR=ROM모드 불가)·3(영구)은 차단.
-        #   스키마는 CDW11 을 free-form 으로 둬 못 막으므로 발송 시점에서 막는다.
-        #   FID/WPS 는 actual_opcode 기준(변이로 0x09/0x84 가 된 경우도 잡힘).
+        # Write Protect(FID 0x84) 정책(상단 상수 참조): WPS=0/1 허용, 2/3 차단. 스키마가
+        # CDW11 free-form 이라 발송 시점에서 막는다. FID/WPS 는 actual_opcode 기준.
         if (passthru_type == "admin-passthru"
                 and actual_opcode == _SET_FEATURES_OPCODE
                 and (seed.cdw10 & 0xFF) == _WRITE_PROTECT_FID):
@@ -10729,11 +10680,8 @@ class NVMeFuzzer:
                     and actual_opcode == _NS_ATTACH_OPCODE and (seed.cdw10 & 0xF) == 1):
                 self._reattach_namespace(actual_nsid)
 
-            # Write Protect 상태 추적:
-            #   WPS=1 성공: LLM/builtin 시퀀스 진행 중이면 잠금을 **보유**(그 안의 write 가
-            #     실제 read-only 를 겪어 reject 경로가 fuzz 됨) → 시퀀스 경계에서 해제.
-            #     시퀀스 밖(단독/state-replay)이면 즉시 해제(reject 창 없음, 잠금 안 남김).
-            #   WPS=0 성공: LLM 이 직접 unlock → 우리 해제 의무 소멸.
+            # Write Protect 상태 추적(정책=상단 상수): WPS=1→시퀀스 중이면 hold(경계서 해제),
+            # 밖이면 즉시 해제. WPS=0→LLM 이 직접 unlock, 의무 소멸.
             if (WRITE_PROTECT_TEST and rc == 0 and passthru_type == "admin-passthru"
                     and actual_opcode == _SET_FEATURES_OPCODE
                     and (seed.cdw10 & 0xFF) == _WRITE_PROTECT_FID):
