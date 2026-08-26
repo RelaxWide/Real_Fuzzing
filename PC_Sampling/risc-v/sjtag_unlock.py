@@ -31,6 +31,7 @@ import argparse
 import hashlib
 import math
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -51,6 +52,10 @@ require_api(5, "sjtag_unlock.py")
 # ══════════════════════════════════════════════════════════════════════
 SJTAG_BASE = None          # 예: 0x........  (clavis 의 &base)
 SIGN_TOOL  = None          # 예: "/path/to/signer" 또는 r"C:\...\signer.exe"
+# ★ 서명 도구가 Windows .exe 인데 이 스크립트를 **리눅스에서** 돌린다면 PE 를
+#   네이티브로 exec 할 수 없다. wine 등 런처를 앞에 붙인다(빈칸/따옴표 shlex 분리).
+#   예: "wine"  또는  "wine64"  또는  r"wine C:\\path\\wrap".  CLI --tool-prefix 우선.
+TOOL_PREFIX = ""           # 예: "wine"  (비면 도구를 직접 exec)
 
 # clavis 가 서명 도구를 부르는 방식과 동일한 인자.
 #   os.area &tool -s3 -f5           → 공개키 Qx,Qy (34 워드) 를 stdout 으로
@@ -243,23 +248,49 @@ def _parse_words(text, want):
     return words
 
 
-def run_tool(tool, args, want, label):
+def _decode_tool_output(raw):
+    """도구 stdout(bytes)을 텍스트로. Windows .exe 는 UTF-16/BOM 로 뱉을 수 있어
+    text=True 의 로케일 디코드로는 깨진다. BOM 을 먼저 보고, 없으면 UTF-8→UTF-16
+    순으로 시도해 hex 워드가 실제로 나오는 인코딩을 고른다. 마지막은 replace."""
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16")           # BOM 이 LE/BE 를 지정
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", "replace")
+    # NUL 이 많으면 UTF-16(BOM 없는) 일 가능성이 큼 — 그쪽을 먼저 시도.
+    order = ("utf-16-le", "utf-8") if raw.count(0) > len(raw) // 4 else ("utf-8", "utf-16-le")
+    for enc in order:
+        try:
+            txt = raw.decode(enc)
+            if _WORD_RE.search(txt):          # 이 인코딩에서 hex 워드가 보이면 채택
+                return txt
+        except (UnicodeError, ValueError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def run_tool(tool, args, want, label, prefix=()):
+    # prefix = wine 등 런처(리눅스에서 .exe 를 돌릴 때). 비면 도구를 직접 exec.
+    cmd = [*prefix, tool, *args]
     try:
-        # errors="replace" — 도구 출력이 비-UTF-8 이어도 예외가 최상위로 새어
-        # EXIT_INSUFFICIENT 로 잘못 분류되지 않게 한다. 깨진 문자는 파서가 거른다.
-        proc = subprocess.run([tool, *args], capture_output=True, text=True,
-                              errors="replace", timeout=TOOL_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired, UnicodeError) as e:
-        raise SecureJtagError(f"{label}: 서명 도구 실행 실패 — {e}", EXIT_TOOL_FAIL)
-    # 비밀 가능성(서명값)을 로그에 남기지 않는다 — 해시·줄수만.
-    digest = hashlib.sha256(proc.stdout.encode("utf-8", "replace")).hexdigest()[:16]
-    nlines = len([l for l in proc.stdout.splitlines() if l.strip()])
+        # bytes 로 받아 우리가 인코딩을 판별한다(로케일 자동디코드에 맡기지 않음).
+        proc = subprocess.run(cmd, capture_output=True, timeout=TOOL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        hint = ""
+        if isinstance(e, OSError) and not prefix and str(tool).lower().endswith(".exe") \
+                and sys.platform != "win32":
+            hint = ("  (Windows .exe 를 리눅스에서 직접 exec 함 — "
+                    "--tool-prefix wine 로 감싸라)")
+        raise SecureJtagError(f"{label}: 서명 도구 실행 실패 — {e}{hint}", EXIT_TOOL_FAIL)
+    # 비밀 가능성(서명값)을 로그에 남기지 않는다 — 원시 bytes 해시·줄수만.
+    digest = hashlib.sha256(proc.stdout).hexdigest()[:16]
+    out = _decode_tool_output(proc.stdout)
+    nlines = len([l for l in out.splitlines() if l.strip()])
     print(f"    [{label}] 도구 종료코드={proc.returncode} 비어있지않은줄={nlines} "
           f"stdout_sha256={digest}..")
     if proc.returncode != 0:
         raise SecureJtagError(f"{label}: 서명 도구 종료코드 {proc.returncode}",
                               EXIT_TOOL_FAIL)
-    return _parse_words(proc.stdout, want)
+    return _parse_words(out, want)
 
 
 def order_words(words, word_order):
@@ -392,7 +423,7 @@ def validate_target(dap, base, reads=3):
 
 
 # ── 인증 상태머신 (clavis.cmm 그대로) ────────────────────────────────
-def unlock(dap, base, tool, word_order, timeout=60.0):
+def unlock(dap, base, tool, word_order, timeout=60.0, tool_prefix=()):
     """base = SJTAG_BASE. 반환: UnlockResult(status, state).
     status 는 ST_ALREADY / ST_OPEN_NO_SOFT_LOCK / ST_AUTHENTICATED.
     AUTH_PASS 를 못 얻고 인증을 끝까지 갔으면 예외."""
@@ -435,7 +466,7 @@ def unlock(dap, base, tool, word_order, timeout=60.0):
     poll_bit(dap, A(OFF_STATE), REQUEST_READY, REQUEST_READY, timeout, "REQUEST_READY")
 
     print("  [4] 공개키 수신·주입")
-    pub = order_words(run_tool(tool, PUBKEY_FLAGS, PUBKEY_WORDS, "pubkey"), word_order)
+    pub = order_words(run_tool(tool, PUBKEY_FLAGS, PUBKEY_WORDS, "pubkey", tool_prefix), word_order)
     for k, word in enumerate(pub):
         w(dap, A(OFF_REQUEST) + 4 * k, word, f"REQUEST[{k}]")
     time.sleep(0.5)
@@ -450,7 +481,7 @@ def unlock(dap, base, tool, word_order, timeout=60.0):
     chal_args = [f"0x{x:08X}" for x in reversed(challenge)]       # no[20]..no[0]
 
     print("  [6] 서명 수신·주입")
-    sig = order_words(run_tool(tool, SIGN_FLAGS + chal_args, SIG_WORDS, "sign"), word_order)
+    sig = order_words(run_tool(tool, SIGN_FLAGS + chal_args, SIG_WORDS, "sign", tool_prefix), word_order)
     for k, word in enumerate(sig):
         w(dap, A(OFF_RESPONSE) + 4 * k, word, f"RESPONSE[{k}]")
 
@@ -559,9 +590,16 @@ def prepare_session(lk, power, tap_note, tif_init=True):
         # 통신/J-Link 오류는 호환성 문제가 아니다 — 원 오류로 실패시킨다.
         raise SecureJtagError(f"coresight_configure 실패: {e}", EXIT_CONFIG)
 
-    # 요청한 도메인의 ACK 를 모두 확인한다. both 인데 CDBG 만 뜨면 실패로 본다.
+    # req = 요청 비트(CSYS=bit30, CDBG=bit28), need = 진행 게이트로 요구하는 ACK.
+    #   dbg-only : CDBG 요청, CDBG ACK 필수  (기존 — 비-secure 타깃 기준)
+    #   both     : 둘 다 요청, 둘 다 ACK 필수
+    #   sys-only : 둘 다 **요청**하되(CDBG req 를 미리 걸어둬야 인증 후 ACK 가 올라옴,
+    #              T32 clavis 의 DAPDBGPWERUPREQ ON 과 동일), 진행은 **CSYS ACK 만**
+    #              요구. → secure 타깃에서 CDBG ACK 가 인증 뒤에야 뜨는 가설을 시험.
     if power == "dbg-only":
         req, need = 0x10000000, (1 << 29)                     # CDBGPWRUPACK
+    elif power == "sys-only":
+        req, need = 0x50000000, (1 << 31)                     # 요청=SYS+DBG, 진행=CSYS ACK
     else:
         req, need = 0x50000000, (1 << 29) | (1 << 31)         # CDBG+CSYSPWRUPACK
     jl.coresight_write(0, 0x0000001E, ap=False)               # ABORT: sticky 클리어
@@ -579,8 +617,13 @@ def prepare_session(lk, power, tap_note, tif_init=True):
             EXIT_CONNECT_FAIL)
     lk.ctrl_stat = ack
     lk.dap_power_ok = True
+    cdbg = "ACK" if ack & (1 << 29) else "미ACK"
+    csys = "ACK" if ack & (1 << 31) else "미ACK"
     print(f"  [prepare] connect 없이 DAP 전원 확보 CTRL/STAT={hx(ack)} "
-          f"(요청={power}, TAP={tap_note})")
+          f"(요청={power}, TAP={tap_note})  CSYS={csys} CDBG={cdbg}")
+    if power == "sys-only" and not (ack & (1 << 29)):
+        print("    → CDBG 미ACK (예상됨). 시스템 전원으로 APB 인증 선수행 후 "
+              "CDBGPWRUPACK 전이를 관찰한다.")
     return ack
 
 
@@ -591,12 +634,18 @@ def main():
     ap.add_argument("--base", type=lambda x: int(x, 0), default=None,
                     help="SJTAG_BASE (clavis 의 &base). CONFIG 값보다 우선")
     ap.add_argument("--tool", default=None, help="서명 도구 경로. CONFIG 값보다 우선")
+    ap.add_argument("--tool-prefix", default=None,
+                    help="서명 도구 앞에 붙일 런처(예: 'wine'). 리눅스에서 .exe 실행 시. "
+                         "CONFIG TOOL_PREFIX 보다 우선. shlex 로 분리")
     ap.add_argument("--execute", action="store_true",
                     help="★ 실제 인증(쓰기)을 한다. 없으면 read-only probe 만.")
     ap.add_argument("--word-order", choices=("t32-negative", "stdout"), default=None,
                     help="공개키/서명 워드 주소순서. --execute 시 필수.")
-    ap.add_argument("--power", choices=("dbg-only", "both"), default="dbg-only",
-                    help="DAP 전원요청. 기본 dbg-only = CMM 방식(CSYSPWRUPREQ OFF)")
+    ap.add_argument("--power", choices=("dbg-only", "both", "sys-only"),
+                    default="dbg-only",
+                    help="DAP 전원요청. dbg-only=CDBG ACK 필수(기존). "
+                         "sys-only=CSYS ACK 만으로 진행(secure 타깃: 인증 후 CDBG 열림 가설). "
+                         "both=둘 다 ACK 필수")
     ap.add_argument("--tap-script", choices=("on", "off"), default="off",
                     help="수동 TAP 체인 선언. 기본 off = CMM 방식(NOKEEPER USEOAC만). "
                          "⚠ STATUS §1.1 은 ScriptFile 경로를 폐기로, sfe76_link 는 "
@@ -628,6 +677,12 @@ def main():
 
     base = a.base if a.base is not None else SJTAG_BASE
     tool = a.tool if a.tool is not None else SIGN_TOOL
+    prefix_str = a.tool_prefix if a.tool_prefix is not None else TOOL_PREFIX
+    try:
+        tool_prefix = shlex.split(prefix_str or "")
+    except ValueError as e:
+        print(f"--tool-prefix 파싱 실패(따옴표 확인): {e}", file=sys.stderr)
+        return EXIT_CONFIG
     if base is None:
         print("설정 필요: --base 0x.... (또는 CONFIG SJTAG_BASE)", file=sys.stderr)
         return EXIT_CONFIG
@@ -644,6 +699,10 @@ def main():
             print("--execute 에는 --word-order {t32-negative|stdout} 가 필요하다",
                   file=sys.stderr)
             return EXIT_CONFIG
+        if not tool_prefix and str(tool).lower().endswith(".exe") \
+                and sys.platform != "win32":
+            print("  ⚠ 도구가 .exe 인데 리눅스에서 런처 없이 직접 exec 하려 한다. "
+                  "실행 안 되면 --tool-prefix wine 를 붙여라.", file=sys.stderr)
     if a.core_base not in DM_AP:
         print(f"core_base 0x{a.core_base:X} 는 DM-AP 매핑에 없다 "
               f"(가능: {', '.join(hex(k) for k in DM_AP)})", file=sys.stderr)
@@ -654,7 +713,8 @@ def main():
 
     mode = "EXECUTE(쓰기)" if a.execute else "PROBE(read-only)"
     print(f"\n{'=' * 66}\n {VERSION}  [{mode}]\n{'=' * 66}")
-    print(f"  SJTAG_BASE=0x{base:X} (APBAP3 DP:0x{APBAP3_BASE:X})  tool={tool}")
+    print(f"  SJTAG_BASE=0x{base:X} (APBAP3 DP:0x{APBAP3_BASE:X})  tool={tool}"
+          + (f"  launcher={' '.join(tool_prefix)}" if tool_prefix else ""))
     print(f"  DM 검증 CoreBase=0x{a.core_base:X}→AP DP:0x{DM_AP[a.core_base]:X}  "
           f"power={a.power}  tif-init={a.tif_init}  tap={a.tap_script}  "
           f"word-order={a.word_order}")
@@ -702,7 +762,8 @@ def main():
             return EXIT_OK
 
         try:
-            result = unlock(dap, base, tool, a.word_order, timeout=a.timeout)
+            result = unlock(dap, base, tool, a.word_order, timeout=a.timeout,
+                            tool_prefix=tool_prefix)
         except SecureJtagError as e:
             print(f"\n  ❌ Secure JTAG 실패: {e}")
             return e.exit_code
@@ -714,6 +775,40 @@ def main():
             ST_OPEN_NO_SOFT_LOCK: "✅ SOFT_LOCK 미설정 — 인증 불필요로 열림 (AUTH_PASS 아님)",
         }[result.status]
         print(f"\n  {status_msg}. 이하는 별개의 DM 관찰/인과 검증.")
+
+        # ── ★ 직접 증거: 인증 전/후 CDBGPWRUPACK 전이 (dmstatus stride 추정보다 강함) ──
+        #   가설: secure 타깃은 디버그 전원을 SJTAG 인증 성공 후에야 연다.
+        #   prepare 에서 CDBG req 는 이미 걸어뒀으니, 인증 뒤 ACK(bit29)가 뜨면
+        #   "인증이 디버그 전원 게이트를 열었다"는 직접 증명이 된다.
+        CDBG_ACK = 1 << 29
+        cs_before = lk.ctrl_stat or 0                         # prepare 시점(인증 전)
+
+        def _read_cs():
+            v = lk.jl.coresight_read(1, ap=False)
+            return (v & 0xFFFFFFFF) if (v is not None and v >= 0) else None
+
+        cs_after = _read_cs()
+        # 인증 직후 CDBG ACK 가 아직이면, req 를 재-어서트하고 잠깐 더 기다린다.
+        # (게이트가 인증 상태 반영에 몇 ms 걸릴 수 있어 즉시 0 을 단정하지 않는다)
+        if not ((cs_after or 0) & CDBG_ACK):
+            lk.jl.coresight_write(1, 0x50000000, ap=False)    # CSYS+CDBG req 재요청
+            for _ in range(20):
+                time.sleep(0.02)
+                cs_after = _read_cs()
+                if (cs_after or 0) & CDBG_ACK:
+                    break
+        dbg_b = bool(cs_before & CDBG_ACK)
+        dbg_a = bool((cs_after or 0) & CDBG_ACK)
+        print(f"  [power A/B] CTRL/STAT before={hx(cs_before)} after={hx(cs_after)}  "
+              f"CDBGPWRUPACK {int(dbg_b)}→{int(dbg_a)}")
+        if result.status == ST_AUTHENTICATED and not dbg_b and dbg_a:
+            print("  ★★★ CDBGPWRUPACK 0→1: SJTAG 인증이 디버그 전원 게이트를 "
+                  "열었다 — 직접 증명 (전원영역 신호, stride 추정 불필요).")
+        elif result.status == ST_AUTHENTICATED and not dbg_a:
+            print("  ⚠ 인증 성공(AUTH_PASS) 했으나 CDBGPWRUPACK 은 여전히 0. "
+                  "디버그 전원 게이트가 이 신호로는 안 열림 — 다른 앞단 게이트/리셋 "
+                  "필요하거나 CDBG req 재요청이 필요할 수 있다.")
+
         after = read_dmstatus(dap, a.core_base)
         print(f"  [after ] dmstatus(추정) @0x{a.core_base + DMSTATUS_OFF:X} "
               f"= {hx(after[0])}  {after[1]}")

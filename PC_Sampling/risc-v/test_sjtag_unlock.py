@@ -226,8 +226,8 @@ class StateMachine(unittest.TestCase):
         self._orig = sj.run_tool
         self.tool_calls = []
 
-        def stub(tool, args, want, label):
-            self.tool_calls.append((label, list(args), want))
+        def stub(tool, args, want, label, prefix=()):
+            self.tool_calls.append((label, list(args), want, list(prefix)))
             return list(range(want))
         sj.run_tool = stub
 
@@ -280,7 +280,7 @@ class StateMachine(unittest.TestCase):
         self.assertEqual(len(req_writes), PUBKEY_WORDS)
 
         # 도구 호출: pubkey/sign 각각 정확히 34워드 요구
-        by_label = {label: (args, want) for label, args, want in self.tool_calls}
+        by_label = {label: (args, want) for label, args, want, _pfx in self.tool_calls}
         self.assertEqual(by_label["pubkey"][1], PUBKEY_WORDS)
         self.assertEqual(by_label["sign"][1], SIG_WORDS)
 
