@@ -39,7 +39,7 @@ from collections import namedtuple
 from sfe76_link import (require_api, Link, LinkError, AP_MAP, add_common_args,
                         CORE_BASE_MAIN, CORE_BASE_NCORE, RISCV_ADDRS, ADDRS_REAL,
                         EXIT_OK, EXIT_CONNECT_FAIL, EXIT_INSUFFICIENT)
-from probe_ap_raw import (Dap, OFF_CSW, OFF_TAR, OFF_DRW, OFF_IDR,
+from dap_access import (Dap, OFF_CSW, OFF_TAR, OFF_DRW, OFF_IDR,
                           csw_usable, hx)
 
 VERSION = "sjtag_unlock 2026-08-13.2"

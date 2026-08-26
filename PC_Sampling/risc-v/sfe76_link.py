@@ -32,8 +32,7 @@ DP          reg0 = 0x6BA0009D  (PARTNO 0xBA00 = ARM DAP.
 전원        CTRL/STAT ← 0x50000000 → 0xF0000000 (CSYSPWRUPACK|CDBGPWRUPACK)
 AP map      T32 의 `DP:0xN0000` 이 그대로 `Addr`.
             `CORESIGHT_AddAP` 의 `Index` 는 **J-Link 내부 맵 번호**이지 APSEL 아님.
-CoreBase    0x81480000  hcore/CMCore/Fcore0/QCore (4코어 공유)
-            0x81481000  Ncore
+CoreBase    hcore 계열(4코어 공유) / Ncore — 실제 값은 sjtag_addrs.json (기밀)
             ⚠ 둘 다 **J-Link connect 후보로 통과**했을 뿐이다.
               DM register/hart/PC/halt 미검증 — "접근 가능" 이 아니다.
 
@@ -76,7 +75,7 @@ CoreBase    0x81480000  hcore/CMCore/Fcore0/QCore (4코어 공유)
         ...  # 보드 복구(POR) 필요
 
 단독 실행:
-    sudo python3 sfe76_link.py --core-base 0x81481000
+    sudo python3 sfe76_link.py --core-base <ncore-base>
 """
 
 import argparse
@@ -195,7 +194,7 @@ CORE_HART = {
 # DMI 레지스터의 APB aperture 매핑 (강한 추론, 미검증)
 #   두 DM base 의 간격이 0x1000 = 4KB → DMI 주소 1024개 × 4바이트.
 #   ⇒ APB 주소 = CoreBase + (dmi_addr << 2)
-#   예: dmcontrol(0x10) → 0x81480040,  dmstatus(0x11) → 0x81480044
+#   예: dmcontrol(0x10) → CoreBase+0x40,  dmstatus(0x11) → CoreBase+0x44
 DMI_STRIDE_SHIFT = 2
 DM_APERTURE_SIZE = 0x1000
 
@@ -618,7 +617,7 @@ class Link:
 # ══════════════════════════════════════════════════════════════════
 def add_common_args(ap):
     ap.add_argument('--core-base', type=lambda x: int(x, 0), default=CORE_BASE_NCORE,
-                    help='기본 0x81481000 (Ncore — 단일 하트로 추정되어 변수가 적다)')
+                    help='기본 Ncore CoreBase (단일 하트로 추정되어 변수가 적다)')
     ap.add_argument('--hart', type=int, default=None)
     ap.add_argument('--device', default=DEVICE)
     ap.add_argument('--serial', default=None, help='J-Link serial (여러 대 연결 시 필수)')

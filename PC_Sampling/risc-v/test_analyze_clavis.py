@@ -49,9 +49,9 @@ class AnalyzeClavisTests(unittest.TestCase):
             self.assertTrue(any("NUL byte" in item for item in report.warnings))
 
     def test_long_hex_is_redacted_but_address_is_kept(self):
-        line = "Data.Set APB:0x81480000 %Long 0x0011223344556677"
+        line = "Data.Set APB:0x40000000 %Long 0x0011223344556677"
         safe = ac.sanitize(line)
-        self.assertIn("0x81480000", safe)
+        self.assertIn("0x40000000", safe)
         self.assertIn("<hex:64bit>", safe)
         self.assertNotIn("0011223344556677", safe)
 
