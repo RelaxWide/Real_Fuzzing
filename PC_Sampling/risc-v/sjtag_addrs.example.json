@@ -1,0 +1,26 @@
+{
+  "_comment": "TEMPLATE — sjtag_addrs.json 으로 복사해 T32/clavis 실제 값으로 채우세요. 실제 파일은 .gitignore 됩니다. 아래는 전부 PLACEHOLDER(실제 SF-E76 주소 아님) — 코드 import/단위테스트만 되게 하는 더미입니다.",
+  "ap_map": [
+    ["APBAP1", "0x1000", "APB-AP"],
+    ["APBAP2", "0x2000", "APB-AP"],
+    ["AXIAP1", "0x3000", "AXI-AP"],
+    ["AHBAP1", "0x4000", "AHB-AP"],
+    ["APBAP3", "0x5000", "APB-AP"],
+    ["APBAP4", "0x6000", "APB-AP"]
+  ],
+  "core_base_main": "0x10000000",
+  "core_base_ncore": "0x10001000",
+  "chain_tap_id": "0x00000000",
+  "apbap3_idr_expect": "0x00000000",
+  "dead_fingerprints": ["0x0", "0xFFFFFFFF"],
+  "sjtag_offsets": {
+    "hw_version": "0x0", "state": "0x4", "chip_id0": "0x8", "chip_id1": "0xC",
+    "resp_domain": "0x10", "resp_lv0": "0x14", "resp_lv1": "0x18",
+    "dbg_control": "0x100", "request": "0x200", "challenge": "0x300", "response": "0x400"
+  },
+  "sjtag_state_bits": {
+    "auth_pass": "0x1", "soft_lock": "0x2", "request_ready": "0x4",
+    "response_ready": "0x8", "state_info_mask": "0x700",
+    "invalid_pubkey": "0x1000", "sw_reset_mask": "0x10"
+  }
+}

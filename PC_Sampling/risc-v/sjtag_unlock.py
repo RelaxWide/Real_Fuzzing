@@ -2,10 +2,10 @@
 """SF-E76 Secure JTAG (PKC/ECDSA) 인증 — clavis.cmm 의 J-Link(pylink) 포팅.
 
 T32 `clavis.cmm` 이 하는 secure-JTAG challenge-response 를 J-Link 으로 재현한다.
-그 스크립트는 코어를 halt 하지 않고 **`APB3:` (= APBAP3, DP:0x50000) 접근**으로
+그 스크립트는 코어를 halt 하지 않고 **`APB3:`(=APBAP3) 접근**으로
 SJTAG 레지스터 블록을 두드려 `AUTH_PASS` 를 세운다.
 
-**가설(이 프로그램으로 검증하려는 것):** 이 인증이 DM(0x81480000) 앞단의 외부
+**가설(이 프로그램으로 검증하려는 것):** 이 인증이 DM 앞단의 외부
 게이트를 여는 **가장 강한 후보**다(STATUS §0.3/§0.36). "인증 뒤에야 DM 이 살아난다"
 는 아직 증명 전이며, 이 도구의 인증 전/후 dmstatus A/B 가 그 증거를 만든다.
 
@@ -37,7 +37,7 @@ import time
 from collections import namedtuple
 
 from sfe76_link import (require_api, Link, LinkError, AP_MAP, add_common_args,
-                        CORE_BASE_MAIN, CORE_BASE_NCORE,
+                        CORE_BASE_MAIN, CORE_BASE_NCORE, RISCV_ADDRS, ADDRS_REAL,
                         EXIT_OK, EXIT_CONNECT_FAIL, EXIT_INSUFFICIENT)
 from probe_ap_raw import (Dap, OFF_CSW, OFF_TAR, OFF_DRW, OFF_IDR,
                           csw_usable, hx)
@@ -60,28 +60,40 @@ SIGN_FLAGS   = ["-s1", "-f5"]
 TOOL_TIMEOUT = 120         # 서명 도구가 오래 걸릴 수 있다(초)
 
 
-# ── SJTAG 레지스터맵 (clavis.cmm 그대로; 전부 &base 기준 오프셋) ──────
-OFF_HW_VERSION  = 0x0
-OFF_STATE       = 0x4
-OFF_CHIP_ID0    = 0x8
-OFF_CHIP_ID1    = 0xC
-OFF_RESP_DOMAIN = 0x10
-OFF_RESP_LV0    = 0x14
-OFF_RESP_LV1    = 0x18
-OFF_DBG_CONTROL = 0x100
-OFF_REQUEST     = 0x800     # 공개키 Qx,Qy 주입
-OFF_CHALLENGE   = 0x888     # Nonce 읽기
-OFF_RESPONSE    = 0x8CC     # 서명 r,s 주입
-OFF_TOP         = OFF_RESPONSE + 4 * 33   # 이 블록이 쓰는 최상단 오프셋
+# ── SJTAG 레지스터맵 (clavis.cmm 유래) — 기밀이라 외부 JSON 에서 로드 ──────
+#   실제 값: sjtag_addrs.json(.gitignore). 없으면 example placeholder(테스트만).
+def _a(v, default=0):
+    if isinstance(v, str):
+        try:
+            return int(v, 0)
+        except ValueError:
+            return default
+    return v if isinstance(v, int) else default
+
+_OFF = RISCV_ADDRS.get("sjtag_offsets", {})
+_BIT = RISCV_ADDRS.get("sjtag_state_bits", {})
+
+OFF_HW_VERSION  = _a(_OFF.get("hw_version"))
+OFF_STATE       = _a(_OFF.get("state"))
+OFF_CHIP_ID0    = _a(_OFF.get("chip_id0"))
+OFF_CHIP_ID1    = _a(_OFF.get("chip_id1"))
+OFF_RESP_DOMAIN = _a(_OFF.get("resp_domain"))
+OFF_RESP_LV0    = _a(_OFF.get("resp_lv0"))
+OFF_RESP_LV1    = _a(_OFF.get("resp_lv1"))
+OFF_DBG_CONTROL = _a(_OFF.get("dbg_control"))
+OFF_REQUEST     = _a(_OFF.get("request"))     # 공개키 Qx,Qy 주입
+OFF_CHALLENGE   = _a(_OFF.get("challenge"))   # Nonce 읽기
+OFF_RESPONSE    = _a(_OFF.get("response"))    # 서명 r,s 주입
+OFF_TOP         = OFF_RESPONSE + 4 * 33        # 이 블록이 쓰는 최상단 오프셋
 
 # STATE 비트
-AUTH_PASS       = 0x100
-SOFT_LOCK       = 0x10
-REQUEST_READY   = 0x40
-RESPONSE_READY  = 0x80
-STATE_INFO_MASK = 0x70000
-INVALID_PUBKEY  = 0x110000
-SW_RESET_MASK   = 0x1
+AUTH_PASS       = _a(_BIT.get("auth_pass"))
+SOFT_LOCK       = _a(_BIT.get("soft_lock"))
+REQUEST_READY   = _a(_BIT.get("request_ready"))
+RESPONSE_READY  = _a(_BIT.get("response_ready"))
+STATE_INFO_MASK = _a(_BIT.get("state_info_mask"))
+INVALID_PUBKEY  = _a(_BIT.get("invalid_pubkey"))
+SW_RESET_MASK   = _a(_BIT.get("sw_reset_mask"))
 
 PUBKEY_WORDS   = 34         # Qx,Qy  (P-521: 17+17)
 SIG_WORDS      = 34         # r,s
@@ -94,11 +106,10 @@ CHALLENGE_PREFIX = [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF]
 # ⚠ "T32 가 정말 하위 32비트만 쓴다" 는 실측으로 재확인하면 더 안전하다.
 RESPONSE_GRANT = 0xFFFFFFFF
 
-APBAP3_IDR_EXPECT = 0x09130006     # ASK.md §2 실측 (APB-AP)
+APBAP3_IDR_EXPECT = _a(RISCV_ADDRS.get("apbap3_idr_expect"))   # 실측 APB-AP IDR
 
 # MEM-AP 로 유효값 대신 나오는 미매핑/default-slave 지문 (STATUS §0.5)
-DEAD_FINGERPRINTS = {0x00000000, 0xFFFFFFFF, 0xEAFFFFFE, 0xEAFFFFFC,
-                     0x00000001, 0x00040700}
+DEAD_FINGERPRINTS = {_a(x) for x in RISCV_ADDRS.get("dead_fingerprints", [])}
 # STATE 는 0x0 이 유효 초기값일 수 있어 지문에서 뺀다(HW_VERSION 은 0 도 의심).
 STATE_DEAD = DEAD_FINGERPRINTS - {0x00000000}
 
@@ -119,8 +130,8 @@ def ap_base(name):
     raise KeyError(name)
 
 APBAP3_BASE = ap_base("APBAP3")   # SJTAG 인증 블록
-APBAP1_BASE = ap_base("APBAP1")   # 0x81480000 DM
-APBAP2_BASE = ap_base("APBAP2")   # 0x81481000 DM (Ncore)
+APBAP1_BASE = ap_base("APBAP1")   # hcore 계열 DM
+APBAP2_BASE = ap_base("APBAP2")   # Ncore DM
 
 # core_base → 그 DM 이 매달린 MEM-AP (STATUS §1.2 실측)
 DM_AP = {CORE_BASE_MAIN: APBAP1_BASE, CORE_BASE_NCORE: APBAP2_BASE}
@@ -296,6 +307,53 @@ def rd(dap, addr, label):
 
 
 # ── 쓰기 전 검증 게이트 (Critical #1) ────────────────────────────────
+def scan_sjtag(dap, base, window=0, step=0x1000):
+    """진단(읽기전용): base 의 SJTAG 알려진 오프셋들을 읽어 default-slave/live 분류.
+    window>0 이면 base±window 를 step 으로 훑어 HW/STATE 둘 다 live 인 후보 base 를 찾는다.
+    → base 가 맞는지(=live 다수), 아니면 진짜 위치를 실측으로 가린다. base 는 노출 안 함."""
+    named = [("HW_VERSION", OFF_HW_VERSION), ("STATE", OFF_STATE),
+             ("CHIP_ID0", OFF_CHIP_ID0), ("CHIP_ID1", OFF_CHIP_ID1),
+             ("DBG_CONTROL", OFF_DBG_CONTROL), ("REQUEST", OFF_REQUEST),
+             ("CHALLENGE", OFF_CHALLENGE), ("RESPONSE", OFF_RESPONSE)]
+
+    def _live(v):
+        return v is not None and v not in DEAD_FINGERPRINTS
+
+    print(f"\n  [scan] base 의 SJTAG 오프셋 (각 3회 읽기):")
+    live = 0
+    for nm, off in named:
+        vals = [dap.mem_read32(APBAP3_BASE, base + off) for _ in range(3)]
+        if any(v is None for v in vals):
+            cls = "read-fail"
+        elif len(set(vals)) != 1:
+            cls = f"VARIES {[hx(v) for v in vals]}"
+        elif vals[0] in DEAD_FINGERPRINTS:
+            cls = "default-slave"
+        else:
+            cls = "LIVE"
+            live += 1
+        _v = hx(vals[0]) if (vals and vals[0] is not None) else "?"
+        print(f"    +0x{off:04X} {nm:12} = {_v}  [{cls}]")
+    print(f"  [scan] LIVE {live}/{len(named)} → "
+          + ("base 가 SJTAG 블록으로 보임" if live >= 2
+             else "default-slave 위주 — base 의심/미도달"))
+
+    if window > 0:
+        lo = max(0, base - window)
+        hi = min(0xFFFFFFFF - OFF_TOP, base + window)
+        print(f"\n  [scan] base±0x{window:X} 스윕(step 0x{step:X}) — HW·STATE 둘 다 live 인 후보:")
+        found, cand = 0, lo
+        while cand <= hi:
+            hwv = dap.mem_read32(APBAP3_BASE, cand + OFF_HW_VERSION)
+            stv = dap.mem_read32(APBAP3_BASE, cand + OFF_STATE)
+            if _live(hwv) and _live(stv):
+                print(f"    후보 base=0x{cand:X}  HW={hx(hwv)} STATE={hx(stv)}")
+                found += 1
+            cand += max(step, 4)
+        print(f"  [scan] live 후보 {found}개"
+              + ("" if found else " — 이 범위엔 SJTAG 블록 없음(범위/접근방식 재검토)"))
+
+
 def validate_target(dap, base, reads=3):
     """쓰기 전에 base/AP 가 진짜 SJTAG 블록인지 확인한다.
     반환: (ok, problems, info). 실기 쓰기는 problems 가 비었을 때만 허용."""
@@ -548,7 +606,20 @@ def main():
                          "TIF 를 초기화할 주체가 이것뿐이다(standalone.py:1276). "
                          "off 는 이미 활성화된 링크 재사용 실험용.")
     ap.add_argument("--timeout", type=float, default=60.0, help="각 폴링 단계 타임아웃(초)")
+    ap.add_argument("--scan", action="store_true",
+                    help="probe 진단: base 기준 SJTAG 알려진 오프셋들을 읽어 "
+                         "default-slave/live 분류. --scan-window 주면 base 주변도 스윕.")
+    ap.add_argument("--scan-window", type=lambda x: int(x, 0), default=0,
+                    help="--scan 시 base±window 를 step 으로 훑어 live 후보 base 탐색(0=끔).")
+    ap.add_argument("--scan-step", type=lambda x: int(x, 0), default=0x1000,
+                    help="--scan-window 스윕 간격 (기본 0x1000).")
     a = ap.parse_args()
+
+    # ★ 기밀 주소 맵이 실제 값인지 확인. placeholder(example)면 실기 불가.
+    if not ADDRS_REAL:
+        print("주소 맵 미설정: sjtag_addrs.example.json 을 sjtag_addrs.json 으로 복사해 "
+              "실제 T32/clavis 값으로 채우세요 (이 파일은 .gitignore 됩니다).", file=sys.stderr)
+        return EXIT_CONFIG
 
     # 이 도구의 커버리지 대상은 hcore(=CORE_BASE_MAIN). 사용자가 --core-base 를
     # 명시하지 않았으면 Ncore 기본값 대신 MAIN 으로 바꾼다.
@@ -604,6 +675,11 @@ def main():
             print(f"  세션 준비 실패: {e}")
             return e.exit_code
         dap = MemDap(lk.jl)
+
+        # ── 진단 스캔 (읽기만) — base 가 SJTAG 블록인지/어디인지 실측 ──
+        if a.scan:
+            scan_sjtag(dap, base, a.scan_window, a.scan_step)
+            return EXIT_OK
 
         # ── 쓰기 전 검증 게이트 (probe/execute 공통) ─────────────────
         ok, problems, info = validate_target(dap, base)

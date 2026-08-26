@@ -384,3 +384,4 @@ output
 *:Zone.Identifier
 # v9.0 RAG 브리지 런타임 drop-box(요청/응답 파일) — 커밋 대상 아님
 PC_Sampling/rag/bridge/
+PC_Sampling/risc-v/sjtag_addrs.json

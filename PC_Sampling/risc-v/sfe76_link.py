@@ -133,8 +133,45 @@ CJTAG_MODE  = 1
 DEVICE      = 'E76'      # ★ 'RISC-V' 는 connect 자체가 제대로 안 된다(실측)
 APB_INDEX   = 0          # DMI 가 붙은 AP (AddAP 의 Index)
 
-CORE_BASE_MAIN  = 0x81480000   # hcore/CMCore/Fcore0/QCore DM (4코어 공유)
-CORE_BASE_NCORE = 0x81481000   # Ncore DM
+
+# ── 기밀 주소/레지스터 맵을 외부 JSON 에서 로드 ─────────────────────
+#   AP 맵·DM(CoreBase)·SJTAG 레지스터 오프셋 등 SF-E76 고유 값은 코드에 박지 않는다.
+#   실제 값: sjtag_addrs.json (★ .gitignore — 커밋 금지). 없으면 sjtag_addrs.example.json
+#   (placeholder — import/테스트만 됨). 실기 실행은 ADDRS_REAL 로 real JSON 유무를 확인한다.
+def _load_riscv_addrs():
+    import json as _j
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    for _name, _real in (("sjtag_addrs.json", True), ("sjtag_addrs.example.json", False)):
+        _p = os.path.join(_dir, _name)
+        if os.path.exists(_p):
+            try:
+                with open(_p) as _f:
+                    _d = _j.load(_f)
+                _d["_is_real"] = _real
+                return _d
+            except Exception as _e:
+                print(f"[addrs] {_name} 로드 실패: {_e}")
+    return {"_is_real": False}
+
+
+def _addr_int(v, default=0):
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        try:
+            return int(v, 0)
+        except ValueError:
+            return default
+    return default
+
+
+RISCV_ADDRS = _load_riscv_addrs()
+ADDRS_REAL = bool(RISCV_ADDRS.get("_is_real"))
+
+CORE_BASE_MAIN  = _addr_int(RISCV_ADDRS.get("core_base_main"))   # 4코어 공유 DM
+CORE_BASE_NCORE = _addr_int(RISCV_ADDRS.get("core_base_ncore"))  # Ncore DM
 
 CORE_BASE_LABEL = {
     CORE_BASE_MAIN:  "hcore/CMCore/Fcore0/QCore",
@@ -169,7 +206,7 @@ DM_APERTURE_SIZE = 0x1000
 #   ⚠ 지금까지의 raw MEM-AP 측정은 **이 수정 이전**에 잰 것이다.
 #     DP/AP 레지스터 값은 교차검증됐지만(IDR 6/6) 메모리 트랜잭션까지
 #     유효했다는 보장이 없다 → 이 스크립트를 깔고 다시 재야 한다.
-CHAIN_TAP_ID = 0x5BA00477
+CHAIN_TAP_ID = _addr_int(RISCV_ADDRS.get("chain_tap_id"))
 TAP_SCRIPT = """/* 자동 생성 — sfe76_link */
 void ConfigTargetSettings(void) {
   JTAG_AllowTAPReset = 1;          /* 1 = 자동 검출 OFF */
@@ -193,14 +230,7 @@ def write_tap_script(tapid=CHAIN_TAP_ID):
 
 
 # T32 SYStem.CONFIG 의 AP 목록 — (이름, CoreSight 주소, J-Link 타입)
-AP_MAP = [
-    ("APBAP1", 0x10000, "APB-AP"),
-    ("APBAP2", 0x20000, "APB-AP"),
-    ("AXIAP1", 0x30000, "AXI-AP"),
-    ("AHBAP1", 0x40000, "AHB-AP"),
-    ("APBAP3", 0x50000, "APB-AP"),
-    ("APBAP4", 0x60000, "APB-AP"),
-]
+AP_MAP = [(_n, _addr_int(_a), _t) for (_n, _a, _t) in RISCV_ADDRS.get("ap_map", [])]
 
 CONNECT_TRIES  = 3
 STATE_TIMEOUT  = 2.0     # halt/resume 사후 상태 확인 대기(초)
