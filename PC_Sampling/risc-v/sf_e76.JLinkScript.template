@@ -1,0 +1,51 @@
+// sf_e76.JLinkScript.template
+// SiFive E76 — SJTAG 인증 후 RISC-V DM(DMI) 위치를 J-Link 에 지정하는 스크립트.
+//
+// [배경]
+//   J-Link 는 RISC-V DM 이 DAP(AP) 어디에 있는지 auto-detect 하지 못한다
+//   (SEGGER "J-Link RISC-V" 문서). generic RV32/RV64 나 device=E76 로 붙어도
+//   DM 위치를 몰라 dmcontrol 접근이 막힌다. 이 스크립트의 ConfigTargetSettings() 에서
+//   AP 맵 + DMI 가 붙은 AP 인덱스 + DM base 를 명시하면 J-Link 가 DM 에 도달한다.
+//
+// [사용법]
+//   1) 이 파일을  sf_e76.JLinkScript  로 복사한다(확장자에서 .template 제거).
+//   2) 아래 <...> placeholder 를 sjtag_addrs.json 값으로 채운다:
+//        <APBAP1_DP_BASE> = ap_map 의 APBAP1  (RISC-V DM 이 붙은 APB-AP 의 DP 주소)
+//        <DM_BASE>        = core_base_main     (그 AP 공간에서 DM/DMI 레지스터 위치)
+//      ※ 우리 툴의 --dm-activate 가 이 AP/base 로 dmstatus(version=3) 를 잡은 그 값이다.
+//   3) JLinkExe(또는 GDBServer)에 물린다:
+//        JLink.exe -device E76 -if cJTAG -speed 10000 \
+//                  -JLinkScriptFile <path>/sf_e76.JLinkScript
+//
+// [★ 순서 — 반드시]
+//   ① 먼저 sjtag_unlock.py --execute 로 SJTAG PKC 인증(AUTH_PASS 는 지속된다).
+//   ② 그다음 이 JLinkExe 로 connect — JLinkExe 는 PKC 인증을 하지 않는다.
+//      인증은 우리 툴이 세워두고, JLinkExe 는 이미 열린·활성(dmactive=1) DM 에 붙는다.
+//
+// [실주소 취급] 이 .template 는 placeholder 뿐이라 커밋해도 안전하다.
+//   실제 값을 채운 sf_e76.JLinkScript 는 로컬 파일로 두거나(.gitignore), 커밋하려면
+//   sjtag_addrs.json 과 동일하게 사내 LLM 컨텍스트에서 제외한다.
+
+int ConfigTargetSettings(void) {
+  //
+  // AP 맵 — DM 이 붙은 APB-AP 를 정의. BaseAddr 는 그 AP 의 DP 주소.
+  // (E76 내장 스크립트가 이미 AP 를 잡아 Index=0 이 충돌하면 빈 인덱스로 바꾸고
+  //  아래 SetIndexAPBAPToUse 도 그 번호에 맞춘다.)
+  //
+  JLINK_ExecCommand("CORESIGHT_AddAP = Index=0 Type=APB-AP BaseAddr=<APBAP1_DP_BASE>");
+  //
+  // 위에서 정의한 AP 중 RISC-V DMI 를 가진 것의 인덱스.
+  //   APB-AP 뒤면 CORESIGHT_SetIndexAPBAPToUse, AHB-AP 뒤면 SetIndexAHBAPToUse.
+  //
+  JLINK_ExecCommand("CORESIGHT_SetIndexAPBAPToUse = 0");
+  //
+  // 그 AP 공간에서 DMI(DM) 레지스터가 있는 주소.
+  //
+  JLINK_ExecCommand("CORESIGHT_SetCoreBaseAddr = <DM_BASE>");
+
+  // (선택) cJTAG 초기화가 필요하면 — 우리 툴은 SiFive 용 short-form(=1)을 쓴다.
+  //   JLinkExe cJTAG connect 가 이미 되면 불필요.
+  // JLINK_ExecCommand("SetcJTAGInitMode = 1");
+
+  return 0;
+}

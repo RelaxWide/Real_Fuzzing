@@ -384,3 +384,5 @@ output
 *:Zone.Identifier
 # v9.0 RAG 브리지 런타임 drop-box(요청/응답 파일) — 커밋 대상 아님
 PC_Sampling/rag/bridge/
+# JLinkScript 실제값 파일(주소 채운 것) — 커밋 금지. .template 만 커밋.
+PC_Sampling/risc-v/sf_e76.JLinkScript

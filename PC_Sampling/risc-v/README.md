@@ -145,6 +145,34 @@ r,s(34워드, **세션마다 다름**)를 stdout에 줄당 1개 hex로 낸다. �
   root용 win32 prefix 생성 후 `--tool-prefix wine`. 단독 확인:
   `wine /path/signer.exe -s3 -f5` → 34줄.
 
+## JLinkExe 로 DM 디버그 (인증 후)
+
+인증(AUTH_PASS)은 세션을 넘어 지속되고 DM 도 dmactive=1 로 열린다(실측). 하지만
+**J-Link 는 RISC-V DM 이 AP 어디에 있는지 auto-detect 못 한다** — device=E76 로 붙어도
+DM 위치를 몰라 dmcontrol 이 막힌다. JLinkScript 로 DM 위치를 명시하면 된다.
+
+| 파일 | 역할 |
+|---|---|
+| `sf_e76.JLinkScript.template` | 커밋본 템플릿(placeholder). CORESIGHT_AddAP/SetIndexAPBAPToUse/SetCoreBaseAddr |
+| `sf_e76.JLinkScript` | 로컬 실제값(.gitignore). template 복사 후 sjtag_addrs.json 값으로 채움 |
+
+**워크플로우:**
+```bash
+# 1) 우리 툴로 SJTAG 인증 (AUTH_PASS 세우고 종료 — 인증은 지속됨)
+sudo python3 sjtag_unlock.py --base 0x<BASE> \
+    --tool /path/signer.exe --tool-prefix wine \
+    --power both --execute --word-order t32-negative
+
+# 2) JLinkExe 로 DM 접근 — DM 위치를 JLinkScript 로 알려줌
+cp sf_e76.JLinkScript.template sf_e76.JLinkScript   # <...> 를 json 값으로 채운다
+JLink.exe -device E76 -if cJTAG -speed 10000 -JLinkScriptFile <path>/sf_e76.JLinkScript
+```
+- 스크립트 값: `<APBAP1_DP_BASE>`=json ap_map APBAP1, `<DM_BASE>`=json core_base_main
+  (우리 `--dm-activate` 가 dmstatus version=3 을 잡은 그 AP/base).
+- JLinkExe 는 PKC 인증을 하지 않는다 — **①인증(우리 툴) → ②JLinkExe connect** 순서 필수.
+- connect 후 J-Link 가 dmstatus(version=3, authenticated=1)를 읽으면 halt/디버그 가능.
+- E76 내장 스크립트가 AP 를 이미 잡아 Index=0 이 충돌하면 빈 인덱스로 바꾼다.
+
 ## 테스트
 
 ```bash
