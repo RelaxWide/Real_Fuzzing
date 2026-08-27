@@ -679,25 +679,46 @@ def dm_activate(dap, core_base):
     return False
 
 
-def _dm_read_csr(dap, dm_ap, core_base, regno):
-    """abstract command(access register)로 CSR/GPR 를 읽는다(hart halt 상태 가정).
-    aarsize 32→64 순으로 시도(XLEN 미상 대응). 실패면 None. — J-Link 의 identify 가
-    misa(0x301) 를 읽는 바로 그 경로다."""
+def _abstract_exec(dap, dm_ap, core_base, cmd):
+    """abstract command 1개 실행: cmderr 클리어 → command 기입 → busy 대기 → cmderr 반환.
+    반환 0=성공, >0=cmderr 코드, -1=읽기실패."""
     acs = core_base + DM_ABSTRACTCS_OFF
+    dap.mem_write32(dm_ap, acs, 0x00000700)                # cmderr W1C 클리어
+    if not dap.mem_write32(dm_ap, core_base + DM_COMMAND_OFF, cmd):
+        return -1
+    st = None
+    for _ in range(40):
+        st = dap.mem_read32(dm_ap, acs)
+        if st is not None and not ((st >> 12) & 1):        # busy=0
+            break
+        time.sleep(0.005)
+    return (st >> 8) & 7 if st is not None else -1
+
+
+def _dm_read_csr(dap, dm_ap, core_base, regno):
+    """abstract command(access register)로 CSR/GPR 직접 읽기. aarsize 32→64 시도.
+    성공 시 값, 실패 None. (일부 DM 은 CSR 직접 접근 미지원 → progbuf 필요)"""
     for aarsize in (2, 3):
-        dap.mem_write32(dm_ap, acs, 0x00000700)            # cmderr W1C 클리어
         cmd = (aarsize << 20) | (1 << 17) | (regno & 0xFFFF)   # transfer=1, read
-        if not dap.mem_write32(dm_ap, core_base + DM_COMMAND_OFF, cmd):
-            continue
-        st = None
-        for _ in range(30):
-            st = dap.mem_read32(dm_ap, acs)
-            if st is not None and not ((st >> 12) & 1):    # busy=0
-                break
-            time.sleep(0.005)
-        if st is not None and ((st >> 8) & 7) == 0:        # cmderr==0
+        if _abstract_exec(dap, dm_ap, core_base, cmd) == 0:
             return dap.mem_read32(dm_ap, core_base + DM_DATA0_OFF)
     return None
+
+
+def _dm_read_csr_progbuf(dap, dm_ap, core_base, csr):
+    """progbuf 경유 CSR 읽기 — 직접 abstract CSR 접근이 미지원(cmderr=2)일 때.
+    progbuf 에 `csrr s0,csr; ebreak` 를 넣고 postexec 로 실행(→ s0=csr), 그 뒤 s0(x8)을
+    abstract 로 읽는다. J-Link 가 progbuf 코어에서 misa 를 읽는 방식과 동일."""
+    pb0 = core_base + (0x20 << 2)                          # progbuf0 @ DMI 0x20
+    csrr_s0 = (csr << 20) | (0b010 << 12) | (8 << 7) | 0x73   # csrrs x8, csr, x0
+    if not dap.mem_write32(dm_ap, pb0, csrr_s0):
+        return None
+    dap.mem_write32(dm_ap, pb0 + 4, 0x00100073)           # ebreak
+    if _abstract_exec(dap, dm_ap, core_base, (2 << 20) | (1 << 18)) != 0:   # postexec 실행
+        return None
+    if _abstract_exec(dap, dm_ap, core_base, (2 << 20) | (1 << 17) | 0x1008) != 0:  # read x8
+        return None
+    return dap.mem_read32(dm_ap, core_base + DM_DATA0_OFF)
 
 
 def dm_halt(dap, core_base, hart=0):
@@ -727,9 +748,16 @@ def dm_halt(dap, core_base, hart=0):
           f"anyhalted={int(bool(st and (st >> 8) & 1))}")
     dap.mem_write32(dm_ap, ctl, DMACTIVE | hs)      # haltreq 내림
     misa = acs0 = acs1 = None
+    misa_via = ""
     if halted:
         acs0 = dap.mem_read32(dm_ap, core_base + DM_ABSTRACTCS_OFF)   # 능력(progbuf/datacount)
-        misa = _dm_read_csr(dap, dm_ap, core_base, 0x301)             # halt 중 misa 읽기(=identify)
+        misa = _dm_read_csr(dap, dm_ap, core_base, 0x301)             # ① abstract 직접
+        if misa is not None:
+            misa_via = "abstract"
+        else:                                                        # ② progbuf 폴백
+            misa = _dm_read_csr_progbuf(dap, dm_ap, core_base, 0x301)
+            if misa is not None:
+                misa_via = "progbuf"
         acs1 = dap.mem_read32(dm_ap, core_base + DM_ABSTRACTCS_OFF)   # 명령 후 cmderr
         dap.mem_write32(dm_ap, ctl, RESUMEREQ | DMACTIVE | hs)        # 코어 원상복구(resume)
         time.sleep(0.05)
@@ -748,9 +776,14 @@ def dm_halt(dap, core_base, hart=0):
               f"progbufsize={progbuf} cmderr={cmderr}({ERRS.get(cmderr, '?')})")
     if misa is not None:
         exts = "".join(c for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ") if misa & (1 << i))
-        print(f"    misa=0x{misa:08X}  확장=[{exts}]")
-        print("  [dm-halt] ✅ halt+misa 읽기 성공 — J-Link 의 identify 를 우리가 완수. "
-              "'Failed to identify' 는 확실히 J-Link 설정/리셋 시퀀스 문제.")
+        print(f"    misa=0x{misa:08X}  확장=[{exts}]  (읽기경로={misa_via})")
+        print(f"  [dm-halt] ✅ halt + misa 읽기 성공(via {misa_via}) — J-Link 의 identify 를 "
+              "우리가 완수. 코어는 progbuf 로 읽힌다.")
+        if misa_via == "progbuf":
+            print("  → J-Link 도 이 progbuf 코어에서 misa 를 읽을 수 있어야 한다. 'Failed to "
+                  "identify' 는 J-Link 가 progbuf 방식을 안 쓰거나 connect 리셋으로 어긋난 것. "
+                  "JLinkScript 에 UseMemAccTypeWhileCoreHalted = MEM_ACC_PROG_BUF 명시 + "
+                  "reset 없는 connect 를 시도하라.")
         return True
     # misa 실패 — 원인을 abstractcs 로 안내
     if acs0 is not None and (acs0 & 0xF) == 0:
