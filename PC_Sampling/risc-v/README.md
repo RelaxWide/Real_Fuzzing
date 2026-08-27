@@ -1,7 +1,28 @@
-# SF-E76 Secure JTAG unlock
+# SF-E76 Secure JTAG unlock → 디버그 → (다음) 코드 커버리지
 
 SiFive **E76** 기반 SSD 컨트롤러의 **secure JTAG(PKC/ECDSA challenge-response)** 인증을
-J-Link(pylink)로 수행해 디버그(DM) 게이트를 여는 도구.
+J-Link(pylink)로 수행해 디버그(DM) 게이트를 열고, JLinkExe 로 코어에 붙는다.
+
+## 현재 상태 (요약 — 완성)
+
+**전 구간 동작 확인됨**(실측). cJTAG → 디버그 전원 → **SJTAG PKC 인증(AUTH_PASS)** →
+DM 활성 → hart halt → **misa=0x40901105 (RV32 IMAC+U+X)** → JLinkExe `RISC-V identified`.
+
+- **원스텝 실행**: `sudo WINEPREFIX=... SIGNER=... ./run_debug.sh 0x<BASE>`
+  → 인증 → JLinkScript 생성 → JLinkExe `-autoconnect` 로 **바로 connect**.
+- **인증은 전원사이클마다** 재수행(nonce 설계상 세션/전원 단위).
+- **주소는 `sjtag_addrs.json` 한 파일에만**(사내 LLM 컨텍스트에서 그 파일만 제외). 코드·문서·
+  `sf_e76.JLinkScript.template` 은 placeholder. 스크립트는 `--gen-jlinkscript` 로 자동 생성.
+- 막혔다 풀린 핵심들: 콜드 DP warmup, sticky 재시도, DM `dmactive=1`, CSR 은 **progbuf** 경유,
+  JLinkExe 는 **`SetcJTAGInitMode=1`**(SiFive short-form) + DM 위치(`CORESIGHT_*`) + `-JTAGConf -1,-1`.
+
+## 다음 목표 — 코드 커버리지 (RISC-V Nexus trace)
+
+이 디버그 접근을 발판으로 **명령어 트레이스 기반 코드 커버리지**를 확보해 SSD 펌웨어
+fuzzer(상위 `PC_Sampling/`)의 coverage-guided 루프에 물리는 것이 다음 단계다. 상세는
+아래 **"다음 단계 — RISC-V Nexus trace"** 섹션 참고.
+
+---
 
 T32 `clavis.cmm`의 인증 상태머신을 포팅했다. 인증 자체(state machine·폴링·34워드 전송·
 challenge 조합)는 코드에 있고, **사용자가 넣는 것은 두 가지뿐**이다:
@@ -211,6 +232,35 @@ J-Link 가 SiFive short-form 활성화를 안 써서다. → **JLinkScript 에 `
 1. **우리 툴 직후 즉시 연결**: `--execute`+`--dm-activate` 로 warm·인증·DM활성 후 바로 JLinkExe.
 2. **`-log C:\jlink.log`** 로 IRPrint/TotalIRLen 값 재확인(TAP 이 잡히면 IRPrint≠0).
 3. 4-hart 라 필요시 `RISCV_SetHartSel = 0` 명시.
+
+## 다음 단계 — RISC-V Nexus trace 로 코드 커버리지
+
+목표: 디버그 접근이 뚫렸으니 **명령어/브랜치 트레이스**로 실행 PC 커버리지를 뽑아,
+상위 `PC_Sampling/` 의 coverage-guided fuzzer(현재 PC **샘플링** 기반)를 **정확한 트레이스**
+기반으로 강화한다.
+
+**트레이스 방식**: 이 SiFive 코어는 **ARM ETM 이 아니라 RISC-V Nexus trace**(IEEE-ISTO 5001,
+"Advanced Trace Encoder"). BTM(Branch Taken)/HTM(History) 메시지로 실행 경로를 압축 출력.
+J-Link 가 이를 지원한다(문서: `G:\RISC-V` 의 *RISC-V N-Trace*, *Trace Control Interface*,
+*SiFive Trace and Debug*).
+
+**J-Link 설정(JLinkScript 에 추가 예정, 값은 실측→json)**:
+- `RISCV_SetTEBaseAddr = <TE_BASE> [MemTypeToUse=1(DMI)/2(SBA)]` — **Trace Encoder** base.
+  (문서: "이걸 안 세우면 buffer/pin trace 둘 다 안 된다".)
+- 트레이스 **sink** 지정: `RISCV_SetSRAMBaseAddr`(온칩 SRAM 버퍼) 또는 `RISCV_SetPIBBaseAddr`
+  /`RISCV_SetATBBaseAddr`(핀/ATB). SSD 컨트롤러엔 핀 트레이스가 없을 가능성 → **SRAM 버퍼**가 현실적.
+- 필요시 `RISCV_SetTFBaseAddr`(funnel), `RISCV_UseNexusViaATB`, `RISCV_UseNexusLegacyMode`.
+
+**해야 할 일(로드맵)**:
+1. 트레이스 컴포넌트 주소(TE/funnel/sink) **실측 확정** → `sjtag_addrs.json` 에 추가
+   (DM base 를 dm-activate 로 확정했듯이). AP/MemType 도 결정.
+2. 위 `RISCV_Set*BaseAddr` 를 `sf_e76.JLinkScript.template` 에 추가 + `--gen-jlinkscript` 확장.
+3. J-Link 로 **SRAM 버퍼 트레이스** 캡처 → BTM/HTM 디코드 → 실행된 PC/브랜치 집합 추출.
+4. 그 커버리지를 fuzzer coverage-guided 루프에 연결(기존 PC 샘플링 대체/보강).
+
+**주의**: 트레이스는 인증된 디버그 세션 위에서만 되므로 **인증(run_debug.sh) 선행**은 그대로.
+트레이스 활성화가 실행 타이밍을 바꾸지 않는지(SiFive Insight 는 "no altering critical
+execution timing" 표방) fuzzer 관측치와 교차검증 필요.
 
 ## 테스트
 
