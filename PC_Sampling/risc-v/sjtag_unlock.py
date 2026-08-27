@@ -141,6 +141,7 @@ APBAP2_BASE = ap_base("APBAP2")   # Ncore DM
 # core_base → 그 DM 이 매달린 MEM-AP (STATUS §1.2 실측)
 DM_AP = {CORE_BASE_MAIN: APBAP1_BASE, CORE_BASE_NCORE: APBAP2_BASE}
 DMSTATUS_OFF = 0x11 << 2          # dmstatus 후보 오프셋 (미검증, STATUS §1.2)
+DMCONTROL_OFF = 0x10 << 2         # dmcontrol (dmactive=bit0 로 DM 리셋 해제)
 
 
 class SecureJtagError(RuntimeError):
@@ -641,9 +642,38 @@ def dm_scan(dap, core_base, window=0x100):
         print(f"  [dm-scan] ✅ dmstatus 후보 {len(found)}개 — AUTH_PASS 가 DM 을 열었다(강한 증거). "
               f"JLinkExe 엔 이 DM base(0x{core_base:X})/AP 를 알려주면 접근 가능.")
     else:
-        print("  [dm-scan] ✗ 유효 dmstatus 없음 — auth 는 됐지만 DM 이 이 AP/주소로 안 열림. "
-              "추가 게이트(리셋/전원/firewall) 또는 DM AP·base 재확인 필요.")
+        print("  [dm-scan] ✗ 유효 dmstatus 없음 — DM 이 비활성(dmactive=0)이거나 이 AP/주소로 "
+              "안 열림. --dm-activate 로 dmcontrol.dmactive=1 을 써보면 갈린다.")
     return found
+
+
+def dm_activate(dap, core_base):
+    """RISC-V DM 을 dmcontrol.dmactive(bit0)=1 로 리셋에서 깨운다. dmactive=0 이면 DM 이
+    리셋 상태라 dmstatus 등이 0 으로 읽힌다. auth 로 DM 게이트가 열렸다면 이 write 가 먹고
+    dmstatus 가 version 2/3 으로 살아난다. 안 먹으면(리드백 0) DM 이 이 AP/주소로 안 열린 것.
+    ★ dmactive 는 코어를 멈추지 않는 표준 DM 기동 write — SJTAG 인증과 무관(카운터 무소모)."""
+    dm_ap = DM_AP.get(core_base)
+    if dm_ap is None:
+        print(f"  [dm-activate] core_base 0x{core_base:X} AP 매핑 미상")
+        return False
+    print(f"\n  [dm-activate] dmcontrol(@0x{core_base + DMCONTROL_OFF:X}) <= dmactive=1")
+    dap.clear_sticky()
+    ok = dap.mem_write32(dm_ap, core_base + DMCONTROL_OFF, 0x1)
+    dap.clear_sticky()
+    back = dap.mem_read32(dm_ap, core_base + DMCONTROL_OFF)
+    st = dap.mem_read32(dm_ap, core_base + DMSTATUS_OFF)
+    dap.clear_sticky()
+    print(f"    write={'OK' if ok else '실패'}  dmcontrol 리드백={hx(back)}  dmstatus={hx(st)}")
+    if back is not None and (back & 0x1) and st is not None and (st & 0xF) in (2, 3):
+        print(f"    ✅ DM 활성화 성공 (dmactive=1, dmstatus version={st & 0xF}) — "
+              "AUTH_PASS 가 DM 을 열었다 확정. JLinkExe 엔 DM base/AP 만 알려주면 됨.")
+        return True
+    if back is None or not (back & 0x1):
+        print("    ✗ dmcontrol write 가 안 먹음(리드백에 dmactive 없음) — DM 이 이 AP/주소로 "
+              "안 열림. 추가 게이트(리셋/전원/firewall) 또는 DM base/AP 재확인 필요.")
+    else:
+        print("    ⚠ dmactive 는 섰으나 dmstatus 무효 — DM 코어측 별도 문제(리셋 홀드 등).")
+    return False
 
 
 # ── 세션 준비 — CMM 방식(prepare-only, connect 없음) ─────────────────
@@ -865,6 +895,9 @@ def main():
                          "(version 2/3) 실측. auth 후 DM 열림 확정용(read-only). 인증 잔존 시 단독 사용 가능")
     ap.add_argument("--dm-window", type=lambda x: int(x, 0), default=0x100, metavar="N",
                     help="dm-scan 스캔 폭(기본 0x100)")
+    ap.add_argument("--dm-activate", action="store_true",
+                    help="DM 기동: dmcontrol.dmactive=1 을 써 DM 을 리셋해제 후 dmstatus 확인. "
+                         "auth 잔존 시 단독으로 'DM 열림' 확정용(표준 write, 인증 무관)")
     ap.add_argument("--scan", action="store_true",
                     help="probe 진단: base 기준 SJTAG 알려진 오프셋들을 읽어 "
                          "default-slave/live 분류. --scan-window 주면 base 주변도 스윕.")
@@ -970,7 +1003,11 @@ def main():
             read_burst(dap, base, a.read_burst, delay=a.burst_delay / 1000.0)
             return EXIT_OK
 
-        # ── DM 스캔 (읽기만) — auth 잔존 상태에서 DM 열림 실측 ──
+        # ── DM 스캔/기동 — auth 잔존 상태에서 DM 열림 실측 ──
+        if a.dm_activate:
+            dm_activate(dap, a.core_base)
+            dm_scan(dap, a.core_base, a.dm_window)
+            return EXIT_OK
         if a.dm_scan:
             dm_scan(dap, a.core_base, a.dm_window)
             return EXIT_OK
@@ -1059,7 +1096,9 @@ def main():
                   "필요하거나 CDBG req 재요청이 필요할 수 있다.")
 
         # ── DM 실측 (같은 세션에서 이어서) — auth 가 DM 을 열었는지 확정 ──
-        #   세션을 닫지 않고 인증 직후 그대로 DM AP 를 스캔한다(별도 세션이면 리셋 위험).
+        #   세션을 닫지 않고 인증 직후 그대로: DM 을 dmactive=1 로 깨운 뒤 스캔한다.
+        #   (dmactive 안 세우면 DM 이 리셋 상태라 dmstatus 가 0 으로 읽힘)
+        dm_activate(dap, a.core_base)
         dm_scan(dap, a.core_base, a.dm_window)
 
         after = read_dmstatus(dap, a.core_base)

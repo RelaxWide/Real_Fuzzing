@@ -79,8 +79,10 @@ sudo python3 sjtag_unlock.py --base 0x<BASE> \
     --tool /path/signer.exe --tool-prefix wine \
     --power both --execute --word-order t32-negative
 
-# 4) DM 스캔 (read-only) — auth 잔존 상태에서 DM(dmstatus) 열렸는지 단독 확인
-sudo python3 sjtag_unlock.py --base 0x<BASE> --power both --dm-scan
+# 4) DM 기동+확인 — dmcontrol.dmactive=1 써서 DM 리셋해제 후 dmstatus 확인
+#    (auth 잔존 시 단독 사용 가능. dmactive 는 코어 안 멈추는 표준 write, 인증 무관)
+sudo python3 sjtag_unlock.py --base 0x<BASE> --power both --dm-activate
+# (읽기만 하려면 --dm-scan — 단 dmactive=0 이면 DM 이 0 으로 읽혀 안 잡힘)
 ```
 
 - **드롭 판별(0b)** — `[drop]` 줄로 두 원인 가르기(현재 핵심):
@@ -94,8 +96,12 @@ sudo python3 sjtag_unlock.py --base 0x<BASE> --power both --dm-scan
 - **인증 성공 후(실측)**: STATE=`0x110`(AUTH_PASS 0x100 + SOFT_LOCK 0x10) → **AUTH_PASS 지속됨**
   (별도 세션/JLinkExe connect 후에도 남음). 즉 인증은 세션이 날리지 않는다. 다만 **AUTH_PASS ≠
   DM 접근** — DM 은 별도 AP(APBAP1 의 COREDEBUG.Base)라, ①JLinkExe 가 그 DM 위치를 모르거나
-  (JLinkScript/설정 필요) ②AUTH_PASS 외 추가 게이트가 있을 수 있다. `--dm-scan`/`dm_scan`(인증
-  세션에서 이어서)으로 유효 dmstatus 가 잡히면 ① 확정(JLinkExe 에 DM base 만 알려주면 됨).
+  (JLinkScript/설정 필요) ②AUTH_PASS 외 추가 게이트가 있을 수 있다.
+- **DM 은 dmactive=1 로 깨워야 함(실측)**: DM AP(APBAP1)@COREDEBUG.Base 를 그냥 읽으면
+  `0x00000000`(dmstatus version=0) — DM 이 리셋상태라서다. `--dm-activate`(또는 execute 가
+  auth 직후 자동)로 `dmcontrol.dmactive=1` 을 쓴 뒤 dmstatus 가 version 2/3 으로 살면 → **auth
+  가 DM 열음 확정**(JLinkExe 엔 DM base/AP 만 지정). dmcontrol write 가 안 먹으면(리드백 0) →
+  DM 이 이 AP/주소로 안 열림 = 추가 게이트/재확인.
 - **diag(0)** AP 스윕: **APBAP3만 실패·AXI/AHB LIVE** 면 SJTAG 경로가 시스템 도메인일 가능성.
 - **인증(3)** 은 `--execute`가 있어야만 쓰기를 한다. 그 전엔 read-only.
 - **`--power sys-only`**: CDBG ACK 없이도 진행. 봐야 할 로그는 `[power A/B] … CDBGPWRUPACK 0→1`
