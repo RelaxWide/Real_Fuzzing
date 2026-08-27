@@ -726,28 +726,41 @@ def dm_halt(dap, core_base, hart=0):
     print(f"    dmstatus={hx(st)}  allhalted={int(halted)} "
           f"anyhalted={int(bool(st and (st >> 8) & 1))}")
     dap.mem_write32(dm_ap, ctl, DMACTIVE | hs)      # haltreq 내림
-    misa = None
+    misa = acs0 = acs1 = None
     if halted:
-        misa = _dm_read_csr(dap, dm_ap, core_base, 0x301)   # halt 중 misa 읽기(=J-Link identify)
-        dap.mem_write32(dm_ap, ctl, RESUMEREQ | DMACTIVE | hs)   # 코어 원상복구(resume)
+        acs0 = dap.mem_read32(dm_ap, core_base + DM_ABSTRACTCS_OFF)   # 능력(progbuf/datacount)
+        misa = _dm_read_csr(dap, dm_ap, core_base, 0x301)             # halt 중 misa 읽기(=identify)
+        acs1 = dap.mem_read32(dm_ap, core_base + DM_ABSTRACTCS_OFF)   # 명령 후 cmderr
+        dap.mem_write32(dm_ap, ctl, RESUMEREQ | DMACTIVE | hs)        # 코어 원상복구(resume)
         time.sleep(0.05)
         dap.mem_write32(dm_ap, ctl, DMACTIVE | hs)
     dap.clear_sticky()
     if not halted:
         print("  [dm-halt] ✗ halt 안 됨 — DM 은 열렸으나 코어 halt 가 안 됨 = 코어측 추가 게이트.")
         return False
+    # abstractcs 디코드 — abstract command 이 왜 되나/안 되나
+    if acs0 is not None:
+        ERRS = {0: "none", 1: "busy", 2: "not-supported", 3: "exception",
+                4: "halt/resume", 5: "bus", 7: "other"}
+        datacount, progbuf = acs0 & 0xF, (acs0 >> 24) & 0x1F
+        cmderr = (acs1 >> 8) & 7 if acs1 is not None else -1
+        print(f"    abstractcs=0x{(acs1 or acs0):08X}  datacount={datacount} "
+              f"progbufsize={progbuf} cmderr={cmderr}({ERRS.get(cmderr, '?')})")
     if misa is not None:
         exts = "".join(c for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ") if misa & (1 << i))
         print(f"    misa=0x{misa:08X}  확장=[{exts}]")
-        if misa != 0:
-            print("  [dm-halt] ✅ halt+misa 읽기 성공 — J-Link 가 하는 identify 를 우리가 완수. "
-                  "'Failed to identify' 는 확실히 J-Link 설정/리셋 시퀀스 문제.")
-        else:
-            print("  [dm-halt] ⚠ halt 는 되나 misa=0 — 이 코어가 misa 를 0 으로 보고한다. "
-                  "J-Link 가 misa 로 코어 식별을 못 해 실패했을 수 있음(device/코어타입 강제 필요).")
-    else:
-        print("  [dm-halt] ✅ halt 성공, 단 misa(abstract cmd) 읽기 실패 — abstract command "
-              "경로 문제 가능(J-Link identify 도 여기서 실패했을 수 있음).")
+        print("  [dm-halt] ✅ halt+misa 읽기 성공 — J-Link 의 identify 를 우리가 완수. "
+              "'Failed to identify' 는 확실히 J-Link 설정/리셋 시퀀스 문제.")
+        return True
+    # misa 실패 — 원인을 abstractcs 로 안내
+    if acs0 is not None and (acs0 & 0xF) == 0:
+        print("  [dm-halt] ⚠ datacount=0 — abstract data 레지스터가 없다(이 DM 은 abstract "
+              "레지스터 접근 미지원). J-Link 는 progbuf/SBA 로 접근해야 함.")
+    if acs0 is not None and ((acs0 >> 24) & 0x1F) == 0:
+        print("  [dm-halt] ⚠ progbufsize=0 — program buffer 없음. abstract+progbuf 둘 다 없으면 "
+              "레지스터 접근은 SBA/AAM 로만 → J-Link mem-access-type 설정이 필요.")
+    print("  [dm-halt] halt 는 성공. misa(abstract cmd) 실패 원인 = 위 abstractcs 참고. "
+          "J-Link 도 같은 이유로 identify 실패한 것 — DM 능력에 맞는 접근방식을 J-Link 에 지정해야.")
     return True
 
 
