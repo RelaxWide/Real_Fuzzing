@@ -175,6 +175,26 @@ JLink.exe -device E76 -if cJTAG -speed 10000 -JLinkScriptFile <path>/sf_e76.JLin
 - connect 후 J-Link 가 dmstatus(version=3, authenticated=1)를 읽으면 halt/디버그 가능.
 - E76 내장 스크립트가 AP 를 이미 잡아 Index=0 이 충돌하면 빈 인덱스로 바꾼다.
 
+### 확정된 상태 (우리 툴로 전 구간 증명)
+
+`--dm-halt` 로 다음이 실측 확인됨 — **하드웨어·디버그 체인은 완전히 동작**한다:
+- 인증(AUTH_PASS) → DM 활성(dmactive=1, dmstatus version=3, authenticated=1)
+- hart halt(allhalted=1) → **misa=0x40901105 = RV32 IMAC+U+X** (progbuf 경유로 읽음)
+- 이 DM 은 abstract CSR 직접접근 미지원(cmderr=2), **progbufsize=16 → CSR 은 progbuf 로 읽어야**.
+  J-Link 는 datacount>0 이면 자동으로 progbuf 를 쓴다(mem-access-type 강제는 문서상 불가·불필요).
+
+→ 남은 것은 **J-Link connect 시퀀스**뿐. `Failed to identify` 는 게이트가 아니다.
+
+### connect 실패(`Failed to identify`) 디버깅
+
+1. **우리 툴 직후 즉시 J-Link 연결**: `--execute`(인증)+`--dm-activate` 로 warm·인증·DM활성
+   상태를 만들고 바로 JLinkExe 연결(콜드 DP/transport flakiness 최소화). 실패 시 재시도.
+2. **정확한 실패 지점 로그**: `JLinkGDBServer -device E76 -if cJTAG -speed 10000
+   -JLinkScriptFile <path> -log C:\jlink.log` → 로그에서 abstractcs/progbuf/reset 중
+   어디서 죽는지 확인.
+3. **reset 없는 connect**: connect 시 reset 이 auth/DM 을 어긋내면 실패 → attach/no-reset 시도.
+4. 4-hart 라 필요시 스크립트에 `RISCV_SetHartSel = 0` 명시.
+
 ## 테스트
 
 ```bash
