@@ -27,8 +27,8 @@ pylink 의 `halt()` / `restart()` 는 실패나 no-op 상황에서 **예외 대�
             없다"** 고 명시 → 수동 선언 필수.
 
 인터페이스  cJTAG, TIF=7, **10MHz** (1000kHz 로 낮추면 활성화 자체가 실패)
-DP          reg0 = 0x6BA0009D  (PARTNO 0xBA00 = ARM DAP.
-                                DESIGNER 는 ARM(0x23B)이 아님 = 벤더 DAP)
+DP          reg0(DPIDR) = 0x6BA0…  (PARTNO=ARM DAP 계열, DESIGNER≠ARM = 벤더 DAP.
+                                     하위 지문값은 마스킹 — 실값은 실기 로그로 확인)
 전원        CTRL/STAT ← 0x50000000 → 0xF0000000 (CSYSPWRUPACK|CDBGPWRUPACK)
 AP map      T32 의 `DP:0xN0000` 이 그대로 `Addr`.
             `CORESIGHT_AddAP` 의 `Index` 는 **J-Link 내부 맵 번호**이지 APSEL 아님.

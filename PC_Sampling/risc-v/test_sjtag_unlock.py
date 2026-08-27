@@ -567,7 +567,7 @@ class MainGuards(unittest.TestCase):
 class MemWrite(unittest.TestCase):
     """실제 MemDap.mem_write32 를 MockJL 로 검증 (posted-write/sticky 경로)."""
 
-    BASE = 0x50000            # APBAP3
+    BASE = 0xB000             # mock AP 베이스 (실주소 아님 — 값 무관)
     ADDR = 0x40000004
 
     def _dap(self, ctrl_stat):

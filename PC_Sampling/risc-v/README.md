@@ -35,7 +35,7 @@ AP 맵·CoreBase·SJTAG 레지스터 오프셋 등 주소는 **코드(.py)에 �
 
 ## 현재 진단 — 디버그 전원이 인증 뒤에 열린다 (가설)
 
-실기 관측: `DPIDR=0x6BA0009D`(DP/cJTAG 링크 정상), `CTRL/STAT=0x80000000` →
+실기 관측: `DPIDR=0x6BA0…`(값 마스킹, DP/cJTAG 링크 정상), `CTRL/STAT=0x80000000` →
 **CSYSPWRUPACK(bit31)=1**(시스템 전원 확보), **CDBGPWRUPACK(bit29)=0**(디버그 전원 거부).
 
 **가설**: 이 secure 타깃은 디버그 전원을 **SJTAG 인증 성공 후에야** 연다. 즉 인증은
