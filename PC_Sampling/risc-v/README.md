@@ -24,14 +24,16 @@ challenge 조합)는 코드에 있고, **사용자가 넣는 것은 두 가지�
 
 ## 원스텝 실행 (권장)
 
-인증 → JLinkScript 생성 → J-Link 디버그 서버까지 한 방에:
+인증 → JLinkScript 생성 → **J-Link connect 까지** 한 방에:
 ```bash
 sudo WINEPREFIX=/root/.wine32 SIGNER=/path/signer.exe \
      ./run_debug.sh 0x<BASE>
 ```
-- 전원사이클마다 이대로 실행(인증 포함). 이미 인증됐으면 `NO_AUTH=1` 로 인증 건너뜀.
+- 인증 후 **JLinkExe 가 `-autoconnect 1` 로 즉시 타깃에 접속** → 연결된 `J-Link>` 프롬프트.
+- 전원사이클마다 이대로(인증 포함). 이미 인증됐으면 `NO_AUTH=1` 로 인증 스킵.
 - 환경변수: `SIGNER`(서명 .exe), `TOOL_PREFIX`(기본 wine), `WORD_ORDER`(기본 t32-negative),
-  `JLINK`(기본 JLinkGDBServer). 그 뒤 GDB/IDE 를 서버에 붙인다.
+  `JLINK`(기본 `JLinkExe`; `JLinkGDBServer` 로 하면 GDB 서버 기동), `JLINK_SCRIPT`(있으면
+  connect 후 그 Commander 스크립트 자동 실행 — 예: halt/regs/g).
 - 문제 진단이 필요할 때만 아래 단계별 도구(diag/read-burst/dm-*)를 개별 사용.
 
 ## 설정 — 주소 맵
