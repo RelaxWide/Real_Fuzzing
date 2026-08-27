@@ -33,23 +33,30 @@ AP 맵·CoreBase·SJTAG 레지스터 오프셋 등 주소는 **코드(.py)에 �
 - 실기: `sjtag_addrs.json`(실제 값)으로 동작.
 - example만 있는 환경: placeholder라 실기 쓰기가 거부되고 단위 테스트만 통과.
 
-## 현재 진단 — 디버그 전원이 인증 뒤에 열린다 (가설)
+## 현재 진단 — 디버그 전원을 못 세우는 것이 블로커
 
-실기 관측: `DPIDR=0x6BA0…`(값 마스킹, DP/cJTAG 링크 정상), `CTRL/STAT=0x80000000` →
-**CSYSPWRUPACK(bit31)=1**(시스템 전원 확보), **CDBGPWRUPACK(bit29)=0**(디버그 전원 거부).
+실기 관측: `DPIDR=0x6BA0…`(마스킹, DP/cJTAG 링크 정상), `CTRL/STAT=0x80000000` →
+**CSYSPWRUPACK(bit31)=1**(시스템 전원 확보), **CDBGPWRUPACK(bit29)=0**(디버그 전원 미확보).
+`--power sys-only` probe 에서 APBAP3 IDR 읽기 실패(SUSPECT 값).
 
-**가설**: 이 secure 타깃은 디버그 전원을 **SJTAG 인증 성공 후에야** 연다. 즉 인증은
-시스템 전원으로 APB(APBAP3)에 접근해 **먼저** 수행하고, 디버그 전원은 그 뒤에 열린다.
-clavis도 `DAPDBGPWERUPREQ ON`으로 요청만 걸고 CDBG ACK를 기다리지 않은 채 APB 인증을
-수행한다 — 이 포팅이 CDBG ACK를 필수로 요구해 데드락(rc=2)에 빠졌던 것이 원인이다.
+clavis 는 **디버그 전원을 켠 채로** APBAP3(=`APB3:`)에서 인증한다. 즉 디버그 전원은
+**인증 전에 이미 필요**하고(인증이 여는 것은 전원이 아니라 그 뒤의 DM/코어 접근),
+우리도 과거 APBAP3 IDR 을 읽은 적이 있다. → 진짜 문제는 "인증해야 전원이 열린다"가
+아니라 **지금 connectionless 셋업이 디버그 전원을 못 세우는 것**이다.
 
-→ `--power sys-only`: CSYS+CDBG를 **요청**하되 진행 게이트는 **CSYS ACK만** 본다.
-인증 후 `CDBGPWRUPACK 0→1` 전이가 뜨면 = **인증이 디버그 전원 게이트를 연다는 직접 증명.**
+의심: 우리가 쓴 CDBG 전원요청이 CTRL/STAT 리드백에 안 서는 정황(req 비트=0) →
+**전원요청 write 자체가 안 먹을 수 있음.**
+
+→ `--diag` 로 (1) CDBG 요청이 latch 되는지, (2) 6개 AP 중 어디에 닿는지, (3) sticky 를
+실측해 **"전원요청 문제 / 도메인 문제 / 이미 확보"** 중 무엇인지 가른다.
 
 ## 실행
 
 ```bash
-# 1) probe (read-only, 서명 도구 불필요) — 시스템 전원만으로 SJTAG 레지스터가 읽히는지
+# 0) diag (원인 판별의 출발점) — CDBG 요청 latch 여부 + 6개 AP IDR 스윕 + sticky
+sudo python3 sjtag_unlock.py --base 0x<BASE> --power both --diag
+
+# 1) probe (read-only, 서명 도구 불필요) — base 뒤 SJTAG 블록 검증
 sudo python3 sjtag_unlock.py --base 0x<BASE> --power sys-only
 
 # 2) scan — base 가 진짜 SJTAG 블록인지/어디인지 실측(default-slave vs live)
@@ -62,6 +69,10 @@ sudo python3 sjtag_unlock.py --base 0x<BASE> \
     --power sys-only --execute --word-order t32-negative
 ```
 
+- **diag(0)** 판정:
+  - `[prepare] … CDBG req/ack=0/0` + `⚠ CDBG req 안 섬` → **전원요청 write 문제**(진짜 원인 후보).
+  - AP 스윕에서 **APBAP3만 실패, AXI/AHB LIVE** → SJTAG 경로가 시스템 도메인일 가능성.
+  - **전부 LIVE** → 디버그 전원 이미 확보 → 인증(3) 진행.
 - **인증(3)** 은 `--execute`가 있어야만 쓰기를 한다. 그 전엔 read-only.
 - **`--power sys-only`**: CDBG ACK 없이도 진행. 봐야 할 로그는 `[power A/B] … CDBGPWRUPACK 0→1`
   과 `★★★ … 직접 증명`. (dmstatus stride 추정보다 강한 전원영역 신호)

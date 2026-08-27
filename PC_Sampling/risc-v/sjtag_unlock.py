@@ -553,7 +553,36 @@ def read_dmstatus(dap, core_base):
 
 
 # ── 세션 준비 — CMM 방식(prepare-only, connect 없음) ─────────────────
-def prepare_session(lk, power, tap_note, tif_init=True):
+def diag_sweep(dap):
+    """현재 전원 상태로 6개 AP 의 IDR 을 훑는다 — '인증/디버그전원 없이 어디에 닿나'.
+    APBAP3(SJTAG)가 디버그 도메인이라 지금 전원으론 못 닿는지, 아니면 시스템계열
+    AP 는 닿는지, 아니면 전부 실패(=링크/전원요청 자체 문제)인지를 가른다."""
+    print("\n  [diag] AP IDR 스윕 (지금 전원으로 닿는 AP 판별):")
+    live, susp, fail = 0, 0, 0
+    for name, base, kind in AP_MAP:
+        idr = dap.ap_read(base, OFF_IDR)
+        if idr is None:
+            cls, fail = "실패(None)", fail + 1
+        elif idr == 0x80000000:
+            cls, susp = "SUSPECT(읽기에러)", susp + 1
+        elif idr in (0, 0xFFFFFFFF):
+            cls, fail = f"{hx(idr)}(미응답)", fail + 1
+        else:
+            cls, live = "LIVE", live + 1
+        print(f"    {name:8}(0x{base:X}, {kind:7}) IDR={hx(idr):>12}  [{cls}]")
+    print(f"  [diag] sticky: {dap.sticky()}")
+    print(f"  [diag] LIVE {live} / SUSPECT {susp} / 실패 {fail}")
+    if live == 0:
+        print("  → 아무 AP도 안 닿음: 도메인 논쟁 이전에 링크/전원요청부터 문제. "
+              "(위 'CDBG req 안 섬' 경고와 함께 보면 전원요청 write 경로 의심)")
+    elif susp or fail:
+        print("  → 일부만 닿음: LIVE 인 AP = 지금 전원으로 접근 가능. "
+              "APBAP3만 실패고 AXI/AHB가 LIVE면 '인증경로=시스템도메인 AP' 가설↑.")
+    else:
+        print("  → 모든 AP LIVE: 디버그 전원이 이미 확보됨. APBAP3 인증 진행 가능.")
+
+
+def prepare_session(lk, power, tap_note, tif_init=True, strict=True):
     """CMM 의 'DAPDBGPWRUPREQ ON / DAPSYSPWRUPREQ OFF / sys.m.prepare' 재현.
     connect() 를 하지 않는다 — CPU 탐지가 TAP/reset 을 건드리는 것을 피한다.
     raw AP 접근은 DAP 전원만으로 성립함이 확인돼 있다(open_dap 주석).
@@ -604,23 +633,35 @@ def prepare_session(lk, power, tap_note, tif_init=True):
         req, need = 0x50000000, (1 << 29) | (1 << 31)         # CDBG+CSYSPWRUPACK
     jl.coresight_write(0, 0x0000001E, ap=False)               # ABORT: sticky 클리어
     jl.coresight_write(1, req, ap=False)
-    ack = None
+    last, ack = None, None
     for _ in range(50):
         time.sleep(0.01)
         v = jl.coresight_read(1, ap=False)
-        if v is not None and v >= 0 and (v & need) == need:
-            ack = v & 0xFFFFFFFF
-            break
+        if v is not None and v >= 0:
+            last = v & 0xFFFFFFFF
+            if (v & need) == need:
+                ack = last
+                break
+    report = ack if ack is not None else last
+    # REQ 비트가 리드백에 서는지까지 찍는다 — "요청이 실제로 latch됐나"가 핵심 진단.
+    if report is not None:
+        b = lambda n: "1" if report & (1 << n) else "0"
+        print(f"  [prepare] CTRL/STAT={hx(report)} (요청={power}, TAP={tap_note})  "
+              f"CSYS req/ack={b(30)}/{b(31)}  CDBG req/ack={b(28)}/{b(29)}")
+        if report & (1 << 28) == 0 and req & (1 << 28):
+            print("    ⚠ CDBG req 를 썼는데 리드백에 안 섬 — 전원요청 write 가 "
+                  "안 먹는다(ACK 실패의 진짜 원인일 수 있음).")
     if ack is None:
-        raise SecureJtagError(
-            f"DAP 전원 ACK 실패 (prepare, power={power}, 필요비트=0x{need:08X})",
-            EXIT_CONNECT_FAIL)
+        msg = (f"DAP 전원 ACK 실패 (power={power}, 필요비트=0x{need:08X}, "
+               f"CTRL/STAT={hx(report)})")
+        if strict:
+            raise SecureJtagError(msg, EXIT_CONNECT_FAIL)
+        print(f"  ⚠ {msg} — diag 로 계속")
+        lk.ctrl_stat = report
+        lk.dap_power_ok = False
+        return report
     lk.ctrl_stat = ack
     lk.dap_power_ok = True
-    cdbg = "ACK" if ack & (1 << 29) else "미ACK"
-    csys = "ACK" if ack & (1 << 31) else "미ACK"
-    print(f"  [prepare] connect 없이 DAP 전원 확보 CTRL/STAT={hx(ack)} "
-          f"(요청={power}, TAP={tap_note})  CSYS={csys} CDBG={cdbg}")
     if power == "sys-only" and not (ack & (1 << 29)):
         print("    → CDBG 미ACK (예상됨). 시스템 전원으로 APB 인증 선수행 후 "
               "CDBGPWRUPACK 전이를 관찰한다.")
@@ -655,6 +696,9 @@ def main():
                          "TIF 를 초기화할 주체가 이것뿐이다(standalone.py:1276). "
                          "off 는 이미 활성화된 링크 재사용 실험용.")
     ap.add_argument("--timeout", type=float, default=60.0, help="각 폴링 단계 타임아웃(초)")
+    ap.add_argument("--diag", action="store_true",
+                    help="전원/AP 진단: CDBG 요청 latch 여부 + 6개 AP IDR 스윕 + sticky. "
+                         "전원 ACK 실패해도 죽지 않고 계속(어디에 닿는지 실측)")
     ap.add_argument("--scan", action="store_true",
                     help="probe 진단: base 기준 SJTAG 알려진 오프셋들을 읽어 "
                          "default-slave/live 분류. --scan-window 주면 base 주변도 스윕.")
@@ -730,11 +774,18 @@ def main():
         return EXIT_INSUFFICIENT
     try:
         try:
-            prepare_session(lk, a.power, a.tap_script, tif_init=(a.tif_init == "on"))
+            # --diag 는 전원 ACK 실패해도 계속(non-strict)해서 어디에 닿는지 본다.
+            prepare_session(lk, a.power, a.tap_script,
+                            tif_init=(a.tif_init == "on"), strict=not a.diag)
         except SecureJtagError as e:
             print(f"  세션 준비 실패: {e}")
             return e.exit_code
         dap = MemDap(lk.jl)
+
+        # ── 전원/AP 진단 (읽기만) — 디버그전원·도메인 판정 ──
+        if a.diag:
+            diag_sweep(dap)
+            return EXIT_OK
 
         # ── 진단 스캔 (읽기만) — base 가 SJTAG 블록인지/어디인지 실측 ──
         if a.scan:
