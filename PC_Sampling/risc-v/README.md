@@ -185,15 +185,17 @@ JLink.exe -device E76 -if cJTAG -speed 10000 -JLinkScriptFile <path>/sf_e76.JLin
 
 → 남은 것은 **J-Link connect 시퀀스**뿐. `Failed to identify` 는 게이트가 아니다.
 
-### connect 실패(`Failed to identify`) 디버깅
+### connect 실패(`Failed to identify`) — 원인=cJTAG init (실측 확인)
 
-1. **우리 툴 직후 즉시 J-Link 연결**: `--execute`(인증)+`--dm-activate` 로 warm·인증·DM활성
-   상태를 만들고 바로 JLinkExe 연결(콜드 DP/transport flakiness 최소화). 실패 시 재시도.
-2. **정확한 실패 지점 로그**: `JLinkGDBServer -device E76 -if cJTAG -speed 10000
-   -JLinkScriptFile <path> -log C:\jlink.log` → 로그에서 abstractcs/progbuf/reset 중
-   어디서 죽는지 확인.
-3. **reset 없는 connect**: connect 시 reset 이 auth/DM 을 어긋내면 실패 → attach/no-reset 시도.
-4. 4-hart 라 필요시 스크립트에 `RISCV_SetHartSel = 0` 명시.
+J-Link 로그 분석: `ConfigTargetSettings()` 후 TAP 스캔에서 `IRPrint=0x000…`(TAP 미검출)
+→ `Failed to identify`. 즉 DM/progbuf 가 아니라 **cJTAG TAP 활성화 실패**가 원인.
+J-Link 가 SiFive short-form 활성화를 안 써서다. → **JLinkScript 에 `SetcJTAGInitMode = 1`**
+(위 템플릿에 포함됨). 이게 TAP 스캔 전에 적용돼 DAP 가 잡힌다.
+
+여전히 안 되면:
+1. **우리 툴 직후 즉시 연결**: `--execute`+`--dm-activate` 로 warm·인증·DM활성 후 바로 JLinkExe.
+2. **`-log C:\jlink.log`** 로 IRPrint/TotalIRLen 값 재확인(TAP 이 잡히면 IRPrint≠0).
+3. 4-hart 라 필요시 `RISCV_SetHartSel = 0` 명시.
 
 ## 테스트
 

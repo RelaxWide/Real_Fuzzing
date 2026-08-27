@@ -34,6 +34,12 @@
 
 int ConfigTargetSettings(void) {
   //
+  // cJTAG 활성화 short-form (SiFive/RISC-V 필수). 없으면 J-Link 의 TAP 스캔이
+  // IRPrint=0(TAP 미검출)으로 실패해 'Failed to identify target' 이 난다(실측 확인).
+  // 우리 툴도 SetcJTAGInitMode=1 로 활성화한다. TAP 스캔 전에 적용되도록 먼저 둔다.
+  //
+  JLINK_ExecCommand("SetcJTAGInitMode = 1");
+  //
   // AP 맵 — DM 이 붙은 APB-AP 를 정의. BaseAddr 는 그 AP 의 DP 주소.
   // (E76 내장 스크립트가 이미 AP 를 잡아 Index=0 이 충돌하면 빈 인덱스로 바꾸고
   //  아래 SetIndexAPBAPToUse 도 그 번호에 맞춘다.)
@@ -48,10 +54,6 @@ int ConfigTargetSettings(void) {
   // 그 AP 공간에서 DMI(DM) 레지스터가 있는 주소.
   //
   JLINK_ExecCommand("CORESIGHT_SetCoreBaseAddr = <DM_BASE>");
-
-  // (선택) cJTAG 초기화가 필요하면 — 우리 툴은 SiFive 용 short-form(=1)을 쓴다.
-  //   JLinkExe cJTAG connect 가 이미 되면 불필요.
-  // JLINK_ExecCommand("SetcJTAGInitMode = 1");
 
   return 0;
 }
