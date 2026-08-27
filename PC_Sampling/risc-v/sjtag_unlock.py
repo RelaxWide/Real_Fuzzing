@@ -936,6 +936,16 @@ def main():
             return EXIT_CONFIG
         print("  ✅ 검증 통과 — APBAP3 뒤 유효 SJTAG 블록으로 보임")
 
+        # STATE 비트 디코드 — AUTH_PASS 지속 여부를 한눈에 (probe 로 인증 잔존 확인)
+        st0 = next((v for v in info.get('state', []) if v is not None), None)
+        if st0 is not None:
+            flags = [nm for m, nm in ((AUTH_PASS, "AUTH_PASS"), (SOFT_LOCK, "SOFT_LOCK"),
+                                      (REQUEST_READY, "REQUEST_READY"),
+                                      (RESPONSE_READY, "RESPONSE_READY")) if st0 & m]
+            print(f"  [state] STATE=0x{st0:08X}  [{' | '.join(flags) or '플래그 없음'}]  "
+                  + ("→ 이미 인증됨(AUTH_PASS 지속)" if st0 & AUTH_PASS
+                     else "→ AUTH_PASS 없음(미인증/리셋됨)"))
+
         before = read_dmstatus(dap, a.core_base)
         print(f"  [before] dmstatus(추정) @0x{a.core_base + DMSTATUS_OFF:X} "
               f"= {hx(before[0])}  {before[1]}")
