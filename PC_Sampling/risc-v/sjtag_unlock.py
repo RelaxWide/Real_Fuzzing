@@ -142,6 +142,9 @@ APBAP2_BASE = ap_base("APBAP2")   # Ncore DM
 DM_AP = {CORE_BASE_MAIN: APBAP1_BASE, CORE_BASE_NCORE: APBAP2_BASE}
 DMSTATUS_OFF = 0x11 << 2          # dmstatus 후보 오프셋 (미검증, STATUS §1.2)
 DMCONTROL_OFF = 0x10 << 2         # dmcontrol (dmactive=bit0 로 DM 리셋 해제)
+DM_DATA0_OFF     = 0x04 << 2      # abstract data0
+DM_ABSTRACTCS_OFF = 0x16 << 2     # abstractcs (busy=bit12, cmderr=bits10:8)
+DM_COMMAND_OFF   = 0x17 << 2      # abstract command (access register)
 
 
 class SecureJtagError(RuntimeError):
@@ -676,6 +679,27 @@ def dm_activate(dap, core_base):
     return False
 
 
+def _dm_read_csr(dap, dm_ap, core_base, regno):
+    """abstract command(access register)로 CSR/GPR 를 읽는다(hart halt 상태 가정).
+    aarsize 32→64 순으로 시도(XLEN 미상 대응). 실패면 None. — J-Link 의 identify 가
+    misa(0x301) 를 읽는 바로 그 경로다."""
+    acs = core_base + DM_ABSTRACTCS_OFF
+    for aarsize in (2, 3):
+        dap.mem_write32(dm_ap, acs, 0x00000700)            # cmderr W1C 클리어
+        cmd = (aarsize << 20) | (1 << 17) | (regno & 0xFFFF)   # transfer=1, read
+        if not dap.mem_write32(dm_ap, core_base + DM_COMMAND_OFF, cmd):
+            continue
+        st = None
+        for _ in range(30):
+            st = dap.mem_read32(dm_ap, acs)
+            if st is not None and not ((st >> 12) & 1):    # busy=0
+                break
+            time.sleep(0.005)
+        if st is not None and ((st >> 8) & 7) == 0:        # cmderr==0
+            return dap.mem_read32(dm_ap, core_base + DM_DATA0_OFF)
+    return None
+
+
 def dm_halt(dap, core_base, hart=0):
     """dmcontrol.haltreq=1 로 hart 를 halt 시도 → dmstatus.allhalted 확인 후 resume 한다.
     J-Link 의 'identify'(=halt 후 misa 읽기)가 하는 halt 를 직접 재현해서, 코어 디버그가
@@ -702,17 +726,29 @@ def dm_halt(dap, core_base, hart=0):
     print(f"    dmstatus={hx(st)}  allhalted={int(halted)} "
           f"anyhalted={int(bool(st and (st >> 8) & 1))}")
     dap.mem_write32(dm_ap, ctl, DMACTIVE | hs)      # haltreq 내림
-    if halted:                                      # 코어 원상복구(resume)
-        dap.mem_write32(dm_ap, ctl, RESUMEREQ | DMACTIVE | hs)
+    misa = None
+    if halted:
+        misa = _dm_read_csr(dap, dm_ap, core_base, 0x301)   # halt 중 misa 읽기(=J-Link identify)
+        dap.mem_write32(dm_ap, ctl, RESUMEREQ | DMACTIVE | hs)   # 코어 원상복구(resume)
         time.sleep(0.05)
         dap.mem_write32(dm_ap, ctl, DMACTIVE | hs)
     dap.clear_sticky()
-    if halted:
-        print("  [dm-halt] ✅ hart halt 성공 — auth 후 코어 디버그가 동작한다. "
-              "J-Link 'Failed to identify' 는 게이트가 아니라 J-Link 설정/시퀀스 문제.")
-    else:
+    if not halted:
         print("  [dm-halt] ✗ halt 안 됨 — DM 은 열렸으나 코어 halt 가 안 됨 = 코어측 추가 게이트.")
-    return halted
+        return False
+    if misa is not None:
+        exts = "".join(c for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ") if misa & (1 << i))
+        print(f"    misa=0x{misa:08X}  확장=[{exts}]")
+        if misa != 0:
+            print("  [dm-halt] ✅ halt+misa 읽기 성공 — J-Link 가 하는 identify 를 우리가 완수. "
+                  "'Failed to identify' 는 확실히 J-Link 설정/리셋 시퀀스 문제.")
+        else:
+            print("  [dm-halt] ⚠ halt 는 되나 misa=0 — 이 코어가 misa 를 0 으로 보고한다. "
+                  "J-Link 가 misa 로 코어 식별을 못 해 실패했을 수 있음(device/코어타입 강제 필요).")
+    else:
+        print("  [dm-halt] ✅ halt 성공, 단 misa(abstract cmd) 읽기 실패 — abstract command "
+              "경로 문제 가능(J-Link identify 도 여기서 실패했을 수 있음).")
+    return True
 
 
 # ── 세션 준비 — CMM 방식(prepare-only, connect 없음) ─────────────────
