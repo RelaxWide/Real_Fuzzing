@@ -54,7 +54,9 @@ echo "== [2/3] JLinkScript 생성 =="
 python3 "$DIR/sjtag_unlock.py" --gen-jlinkscript "$SCRIPT"
 
 echo "== [3/3] J-Link connect: $JLINK =="
-COMMON=(-device E76 -if cJTAG -speed 10000 -JLinkScriptFile "$SCRIPT")
+# -JTAGConf -1,-1 = JTAG 체인 위치 자동감지(대화형 JTAGConf 프롬프트에서 Enter=기본값과 동일).
+# 이거 없으면 JLinkExe 가 JTAGConf 입력을 기다리며 멈춘다.
+COMMON=(-device E76 -if cJTAG -speed 10000 -JTAGConf -1,-1 -JLinkScriptFile "$SCRIPT")
 case "$JLINK" in
   *GDBServer*|*gdbserver*|*GDBServerCL*)
     exec "$JLINK" "${COMMON[@]}" ;;              # GDB 서버(클라이언트 대기, 시작 시 타깃 connect)
