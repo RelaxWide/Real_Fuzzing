@@ -82,6 +82,28 @@ sudo python3 sjtag_unlock.py --base 0x<BASE> \
   (도구 출력을 되뒤집어 주소 증가순으로 주입). `[4] pubkey`에서 `INVALID_PUBLIC_KEY`면
   `--word-order stdout`으로 재시도.
 
+## 인증 시도 아끼기 — 사전 절차 (전부 카운터 무소모)
+
+인증 횟수 제한이 있을 수 있어, **실제 인증(4)은 마지막 1회**로 미루고 그 전까지는
+시도를 소모하지 않는 단계만 수행한다. 관측: pubkey 주입 중 word~21 에서 AP 에러
+(0x80000000 = STICKYERR 후 접근 실패)로 중단 — 순수 transport 문제.
+
+1. **write 견고성(코드)**: 워드 쓰기 실패 시 sticky 클리어 + 재시도로 자가복구 →
+   34워드 완주. (`w()` 재시도 + `mem_write32` 진입부 self-heal)
+2. **transport 검증(read-only, 카운터 0)**:
+   ```bash
+   sudo python3 sjtag_unlock.py --base 0x<BASE> --power both --read-burst 20
+   ```
+   REQUEST 34워드를 20회 연속 읽어(=write와 동일 재시도) 긴 시퀀스를 안 끊고 견디는지
+   실증. `최종실패 0` 이면 완주 확신. (reads 는 상태머신 무관 → 인증 무소모)
+3. **credential 사전 확정(오프라인, HW 불필요)**:
+   ```bash
+   python3 sjtag_unlock.py --analyze-pubkey --tool /path/signer.exe --tool-prefix wine
+   ```
+   `-s3` 2회 실행 → 정적키 동일성 + P-521 좌표구조(각 17워드, 최상위워드<0x200)로
+   word-order 후보를 2개로 좁힘. grant(`0xFFFFFFFF`)·challenge 배열은 clavis 대조로 확정됨.
+4. **그 다음에야** 실제 인증 1회(`--execute`). 직전 STATE 읽어 락아웃 여부 확인.
+
 ## 서명 도구 (.exe) 실행
 
 `.exe`는 `-s3 -f5`로 공개키 Qx,Qy(34워드, **정적**)를, `-s1 -f5 <challenge>`로 서명

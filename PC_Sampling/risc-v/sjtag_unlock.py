@@ -195,8 +195,13 @@ class MemDap(Dap):
         return None if v is None else bool(v & self.STICKY_ERR)
 
     def mem_write32(self, base, addr, val):
-        """MEM-AP 로 32비트 쓰기. TAR 되읽기 + posted-write 완료/오류를 확인한다."""
+        """MEM-AP 로 32비트 쓰기. TAR 되읽기 + posted-write 완료/오류를 확인한다.
+        진입부 CSW 가 STICKYERR 로 SUSPECT(0x80000000) 면 한 번 sticky 를 클리어하고
+        재읽기 — 직전 워드의 sticky 가 다음 워드를 연쇄로 죽이는 것을 끊는다."""
         csw = self.ap_read(base, OFF_CSW)
+        if not csw_usable(csw):
+            self.clear_sticky()                       # 연쇄 방지: 한 번 복구 시도
+            csw = self.ap_read(base, OFF_CSW)
         if not csw_usable(csw):
             self.last = {'why': f"CSW 의심값 {hx(csw)} — 쓰지 않고 중단"}
             return False
@@ -306,6 +311,42 @@ def order_words(words, word_order):
     raise ValueError(word_order)
 
 
+def analyze_pubkey(tool, tool_prefix):
+    """오프라인 pubkey 정적 분석 — HW/J-Link/인증 불필요, 카운터 무소모.
+    (a) -s3 를 2회 실행해 정적 키 동일성, (b) 두 word-order 로 늘어놓고 P-521 좌표
+    구조(각 17워드, 최상위 워드가 패딩/작은값 < 0x200)로 후보를 좁힌다."""
+    print(f"\n{'=' * 66}\n  PUBKEY 정적 분석 (오프라인 — HW/인증 무관)\n{'=' * 66}")
+    w1 = run_tool(tool, PUBKEY_FLAGS, PUBKEY_WORDS, "pubkey#1", tool_prefix)
+    w2 = run_tool(tool, PUBKEY_FLAGS, PUBKEY_WORDS, "pubkey#2", tool_prefix)
+    if w1 != w2:
+        print("  ⚠ 2회 실행 결과가 다르다 — 정적이어야 할 공개키가 비결정적. 툴/키 확인.")
+    else:
+        print(f"  ✓ 2회 동일 ({PUBKEY_WORDS}워드) — 정적 키 정상.")
+
+    SMALL = 0x200                    # P-521: 좌표 < 2^521 → 최상위 32비트 워드 < 0x200
+    HALF = PUBKEY_WORDS // 2         # 17
+    print(f"\n  P-521 좌표 = {HALF}워드씩 2개(Qx,Qy). 각 좌표 최상위 워드는 < 0x{SMALL:X}.")
+    for name in ("stdout", "t32-negative"):
+        words = order_words(w1, name)
+        smalls = [i for i, x in enumerate(words) if x < SMALL]
+        last, first = {HALF - 1, 2 * HALF - 1}, {0, HALF}     # {16,33} / {0,17}
+        if set(smalls) >= last:
+            verdict = f"작은워드가 좌표 끝 {sorted(last)} → MSW-last 정렬(정합)"
+        elif set(smalls) >= first:
+            verdict = f"작은워드가 좌표 앞 {sorted(first)} → MSW-first 정렬(정합)"
+        else:
+            verdict = "작은워드 위치가 좌표경계와 안 맞음 (이 배열 부정합 의심)"
+        print(f"\n  [--word-order {name}]  작은워드(<0x{SMALL:X}) index={smalls}")
+        print(f"    → {verdict}")
+        print(f"    Qx: [0]={hx(words[0])} [{HALF-1}]={hx(words[HALF-1])} | "
+              f"Qy: [{HALF}]={hx(words[HALF])} [{2*HALF-1}]={hx(words[2*HALF-1])}")
+    print("\n  해석: 두 배열은 서로 거울상이라 '구조 정합'은 양쪽 다 나올 수 있다"
+          "(한쪽 MSW-first, 한쪽 MSW-last). 이 분석은 (1) 키가 정상 2×17 구조임을 확정,"
+          " (2) 후보를 정확히 2개로 좁힌다. device 가 어느 엔디안을 원하는지가 최종 미지수"
+          " — clavis 관례를 알면 택1, 모르면 점4 단 1회로 확정.")
+    return EXIT_OK
+
+
 # ── 폴링 / 접근 헬퍼 (전부 APBAP3; addr = 절대 APB 주소) ─────────────
 def poll_bit(dap, addr, mask, want, timeout, label, abort_mask=0):
     deadline = time.monotonic() + timeout
@@ -323,10 +364,17 @@ def poll_bit(dap, addr, mask, want, timeout, label, abort_mask=0):
         time.sleep(1.0)
 
 
-def w(dap, addr, val, label):
-    if not dap.mem_write32(APBAP3_BASE, addr, val):
-        raise SecureJtagError(f"{label}: APBAP3 쓰기 실패 ({dap.last.get('why')})",
-                              EXIT_CONFIG)
+def w(dap, addr, val, label, retries=3):
+    """일시적 AP 에러(STICKYERR→CSW SUSPECT)를 sticky 클리어 후 재시도로 흡수한다.
+    34워드 주입 중 한 워드가 순간 끊겨도 자가복구해 시퀀스를 완주시키는 것이 목적."""
+    for attempt in range(retries):
+        if dap.mem_write32(APBAP3_BASE, addr, val):
+            if attempt:
+                print(f"    ↻ {label}: sticky {attempt}회 클리어 후 성공(자가복구)")
+            return
+        dap.clear_sticky()
+    raise SecureJtagError(
+        f"{label}: APBAP3 쓰기 {retries}회 실패 ({dap.last.get('why')})", EXIT_CONFIG)
 
 
 def rd(dap, addr, label):
@@ -582,6 +630,40 @@ def diag_sweep(dap):
         print("  → 모든 AP LIVE: 디버그 전원이 이미 확보됨. APBAP3 인증 진행 가능.")
 
 
+def read_burst(dap, base, passes, retries=3):
+    """write 루프와 동일한 주소(REQUEST 34워드)를 passes 회 연속 읽어 AP transport
+    안정성을 실증한다. reads 는 상태머신을 안 건드리므로 **인증 카운터 무소모**.
+    write 와 동일한 재시도 로직으로, 일시적 sticky 를 재시도가 다 흡수하는지 본다."""
+    addrs = [OFF_REQUEST + 4 * k for k in range(PUBKEY_WORDS)]     # 34워드
+    print(f"\n  [read-burst] REQUEST {PUBKEY_WORDS}워드 × {passes}회 연속 읽기 "
+          f"(write와 동일 재시도, 카운터 무소모):")
+    total = recovered = hard_fail = 0
+    first_hard = None
+    for p in range(passes):
+        for k, off in enumerate(addrs):
+            total += 1
+            ok = False
+            for attempt in range(retries):
+                if dap.mem_read32(APBAP3_BASE, base + off) is not None:
+                    ok = True
+                    if attempt:
+                        recovered += 1
+                    break
+                dap.clear_sticky()
+            if not ok:
+                hard_fail += 1
+                if first_hard is None:
+                    first_hard = (p, k)
+    print(f"  [read-burst] 총 {total}, 재시도복구 {recovered}, 최종실패 {hard_fail}")
+    if hard_fail == 0:
+        print(f"  → 재시도가 일시적 AP 에러를 전부 흡수. {PUBKEY_WORDS}워드 완주 가능 확신↑ "
+              f"(복구 {recovered}회 = 실제로 sticky 가 떴다는 증거)")
+    else:
+        print(f"  → 최종실패 {hard_fail}건(첫 실패 pass {first_hard[0]} word {first_hard[1]}). "
+              "재시도로도 안 되면 근본 링크/전원 문제 — 재시도만으론 부족.")
+    return hard_fail == 0
+
+
 def prepare_session(lk, power, tap_note, tif_init=True, strict=True):
     """CMM 의 'DAPDBGPWRUPREQ ON / DAPSYSPWRUPREQ OFF / sys.m.prepare' 재현.
     connect() 를 하지 않는다 — CPU 탐지가 TAP/reset 을 건드리는 것을 피한다.
@@ -699,6 +781,12 @@ def main():
     ap.add_argument("--diag", action="store_true",
                     help="전원/AP 진단: CDBG 요청 latch 여부 + 6개 AP IDR 스윕 + sticky. "
                          "전원 ACK 실패해도 죽지 않고 계속(어디에 닿는지 실측)")
+    ap.add_argument("--analyze-pubkey", action="store_true",
+                    help="오프라인: 툴 -s3 를 2회 실행해 정적키 동일성 + word-order 후보 분석 "
+                         "(HW/J-Link/인증 불필요, 카운터 무소모). --tool 필요")
+    ap.add_argument("--read-burst", type=int, default=0, metavar="N",
+                    help="transport 검증: REQUEST 34워드를 N회 연속 읽어 AP 안정성 실증 "
+                         "(read-only, 인증 카운터 무소모). write 수정 검증용")
     ap.add_argument("--scan", action="store_true",
                     help="probe 진단: base 기준 SJTAG 알려진 오프셋들을 읽어 "
                          "default-slave/live 분류. --scan-window 주면 base 주변도 스윕.")
@@ -727,6 +815,18 @@ def main():
     except ValueError as e:
         print(f"--tool-prefix 파싱 실패(따옴표 확인): {e}", file=sys.stderr)
         return EXIT_CONFIG
+
+    # ── 오프라인 pubkey 분석 — HW/J-Link 없이 즉시 (base 불필요) ──
+    if a.analyze_pubkey:
+        if tool is None:
+            print("--analyze-pubkey 에는 --tool <서명도구> 가 필요하다", file=sys.stderr)
+            return EXIT_CONFIG
+        try:
+            return analyze_pubkey(tool, tool_prefix)
+        except SecureJtagError as e:
+            print(f"  pubkey 분석 실패: {e}")
+            return e.exit_code
+
     if base is None:
         print("설정 필요: --base 0x.... (또는 CONFIG SJTAG_BASE)", file=sys.stderr)
         return EXIT_CONFIG
@@ -785,6 +885,11 @@ def main():
         # ── 전원/AP 진단 (읽기만) — 디버그전원·도메인 판정 ──
         if a.diag:
             diag_sweep(dap)
+            return EXIT_OK
+
+        # ── transport 검증 (읽기만) — write 수정이 34워드 완주시키는지 실증 ──
+        if a.read_burst:
+            read_burst(dap, base, a.read_burst)
             return EXIT_OK
 
         # ── 진단 스캔 (읽기만) — base 가 SJTAG 블록인지/어디인지 실측 ──
