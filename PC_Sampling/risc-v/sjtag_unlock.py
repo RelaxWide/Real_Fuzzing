@@ -676,6 +676,45 @@ def dm_activate(dap, core_base):
     return False
 
 
+def dm_halt(dap, core_base, hart=0):
+    """dmcontrol.haltreq=1 로 hart 를 halt 시도 → dmstatus.allhalted 확인 후 resume 한다.
+    J-Link 의 'identify'(=halt 후 misa 읽기)가 하는 halt 를 직접 재현해서, 코어 디버그가
+    auth 후 실제로 되는지(=J-Link 'Failed to identify' 는 J-Link 설정/시퀀스 문제) vs
+    안 되는지(=코어측 추가 게이트)를 가른다.
+    ★ 잠깐 코어를 멈췄다 재개한다(디버그 표준 동작). SJTAG 인증 카운터 무관."""
+    dm_ap = DM_AP.get(core_base)
+    if dm_ap is None:
+        print(f"  [dm-halt] core_base 0x{core_base:X} AP 매핑 미상")
+        return False
+    HALTREQ, RESUMEREQ, DMACTIVE = 1 << 31, 1 << 30, 0x1
+    hs = (hart & 0x3FF) << 16                       # hartsello (dmcontrol[25:16])
+    ctl, sts = core_base + DMCONTROL_OFF, core_base + DMSTATUS_OFF
+    print(f"\n  [dm-halt] hart{hart} haltreq=1 (코어 잠깐 멈춤)…")
+    dap.clear_sticky()
+    dap.mem_write32(dm_ap, ctl, HALTREQ | DMACTIVE | hs)
+    st = None
+    for _ in range(30):
+        time.sleep(0.02)
+        st = dap.mem_read32(dm_ap, sts)
+        if st is not None and (st >> 9) & 1:       # allhalted
+            break
+    halted = bool(st and (st >> 9) & 1)
+    print(f"    dmstatus={hx(st)}  allhalted={int(halted)} "
+          f"anyhalted={int(bool(st and (st >> 8) & 1))}")
+    dap.mem_write32(dm_ap, ctl, DMACTIVE | hs)      # haltreq 내림
+    if halted:                                      # 코어 원상복구(resume)
+        dap.mem_write32(dm_ap, ctl, RESUMEREQ | DMACTIVE | hs)
+        time.sleep(0.05)
+        dap.mem_write32(dm_ap, ctl, DMACTIVE | hs)
+    dap.clear_sticky()
+    if halted:
+        print("  [dm-halt] ✅ hart halt 성공 — auth 후 코어 디버그가 동작한다. "
+              "J-Link 'Failed to identify' 는 게이트가 아니라 J-Link 설정/시퀀스 문제.")
+    else:
+        print("  [dm-halt] ✗ halt 안 됨 — DM 은 열렸으나 코어 halt 가 안 됨 = 코어측 추가 게이트.")
+    return halted
+
+
 # ── 세션 준비 — CMM 방식(prepare-only, connect 없음) ─────────────────
 def diag_sweep(dap):
     """현재 전원 상태로 6개 AP 의 IDR 을 훑는다 — '인증/디버그전원 없이 어디에 닿나'.
@@ -929,6 +968,10 @@ def main():
     ap.add_argument("--dm-activate", action="store_true",
                     help="DM 기동: dmcontrol.dmactive=1 을 써 DM 을 리셋해제 후 dmstatus 확인. "
                          "auth 잔존 시 단독으로 'DM 열림' 확정용(표준 write, 인증 무관)")
+    ap.add_argument("--dm-halt", action="store_true",
+                    help="hart 를 halt 시도(dmcontrol.haltreq)→allhalted 확인 후 resume. "
+                         "J-Link 'Failed to identify'가 J-Link 설정 문제인지 코어측 게이트인지 판별. "
+                         "★코어 잠깐 멈춤(인증 무관)")
     ap.add_argument("--scan", action="store_true",
                     help="probe 진단: base 기준 SJTAG 알려진 오프셋들을 읽어 "
                          "default-slave/live 분류. --scan-window 주면 base 주변도 스윕.")
@@ -1042,7 +1085,11 @@ def main():
             read_burst(dap, base, a.read_burst, delay=a.burst_delay / 1000.0)
             return EXIT_OK
 
-        # ── DM 스캔/기동 — auth 잔존 상태에서 DM 열림 실측 ──
+        # ── DM 스캔/기동/halt — auth 잔존 상태에서 DM·코어 디버그 실측 ──
+        if a.dm_halt:
+            dm_activate(dap, a.core_base)
+            dm_halt(dap, a.core_base, a.hart or 0)
+            return EXIT_OK
         if a.dm_activate:
             dm_activate(dap, a.core_base)
             dm_scan(dap, a.core_base, a.dm_window)
