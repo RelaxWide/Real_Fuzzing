@@ -33,31 +33,44 @@ AP 맵·CoreBase·SJTAG 레지스터 오프셋 등 주소는 **코드(.py)에 �
 - 실기: `sjtag_addrs.json`(실제 값)으로 동작.
 - example만 있는 환경: placeholder라 실기 쓰기가 거부되고 단위 테스트만 통과.
 
-## 현재 진단 — 디버그 전원을 못 세우는 것이 블로커
+## 현재 진단 — 디버그 전원 '창'이 유지가 안 됨 (드롭)
 
-실기 관측: `DPIDR=0x6BA0…`(마스킹, DP/cJTAG 링크 정상), `CTRL/STAT=0x80000000` →
-**CSYSPWRUPACK(bit31)=1**(시스템 전원 확보), **CDBGPWRUPACK(bit29)=0**(디버그 전원 미확보).
-`--power sys-only` probe 에서 APBAP3 IDR 읽기 실패(SUSPECT 값).
+진행 경과:
+- **전원 확보는 해결됨**: `--power both` 로 fresh init 시 `CTRL/STAT=0xF0000000`
+  (CSYS/CDBG req·ack 전부 ON) → 디버그 전원 확보, APBAP3(=clavis 의 `APB3:`) 접근 가능.
+- **그러나 창이 유지 안 됨**: read/write **40~180 트랜잭션(가변)** 뒤
+  `0xF0000000 → 0x80000000` 로 드롭. **CDBG req 비트(28)까지 빠짐**(CSYS만 남음).
+  cJTAG 재init 으로도 복구 안 됨. 링크/시스템 전원은 내내 정상, **디버그 전원 도메인만 회수.**
+- 전체 인증은 pubkey 34 + sig 34 + 폴링 = 쉽게 180 tx 초과 → **창 유지가 인증의 선결 조건.**
 
-clavis 는 **디버그 전원을 켠 채로** APBAP3(=`APB3:`)에서 인증한다. 즉 디버그 전원은
-**인증 전에 이미 필요**하고(인증이 여는 것은 전원이 아니라 그 뒤의 DM/코어 접근),
-우리도 과거 APBAP3 IDR 을 읽은 적이 있다. → 진짜 문제는 "인증해야 전원이 열린다"가
-아니라 **지금 connectionless 셋업이 디버그 전원을 못 세우는 것**이다.
+원인 후보 2개 (문서 대조 후):
+1. **cJTAG KEEPER escape**: RISC-V 는 KEEPER 부재/버그가 흔해 TMSC floating →
+   없는 escape sequence 오검출 → escape "Reset" 이 링크/DP 리셋 → 전원요청 클리어.
+   (SEGGER cJTAG 문서) 단 J-Link **HW V13.00 은 no-KEEPER 워크어라운드 세대**라
+   '워크어라운드 부재'는 아님. cJTAG init 모드도 올바름(`SetcJTAGInitMode=1`=SiFive용).
+2. **전원 도메인 회수**: 벤더 PMU 가 디버그 도메인을 타이머/유휴로 내림.
+   (표준 CoreSight 엔 자동 타임아웃 없음 → 벤더 특유)
 
-의심: 우리가 쓴 CDBG 전원요청이 CTRL/STAT 리드백에 안 서는 정황(req 비트=0) →
-**전원요청 write 자체가 안 먹을 수 있음.**
+**T32(clavis)는 왜 유지되나**: clavis 는 `CJTAGFLAGS NOKEEPER USEOAC` 로 no-keeper 처리를
+켜고, 모든 접근을 상시 떠 있는 AUX T32 인스턴스(`INTERCOM.execute Localhost:&AUXport`)로
+수행 — persistent 세션이 DAP 를 붙잡는다. 우리는 connectionless one-shot 이라 그 유지 주체가 없음.
 
-→ `--diag` 로 (1) CDBG 요청이 latch 되는지, (2) 6개 AP 중 어디에 닿는지, (3) sticky 를
-실측해 **"전원요청 문제 / 도메인 문제 / 이미 확보"** 중 무엇인지 가른다.
+→ 두 후보를 가르는 **결정적 측정**: 드롭 순간 **DPIDR 이 같이 깨지나**.
+   DPIDR 깨짐=링크/DP 리셋(KEEPER escape), DPIDR 정상+CDBG=0=전원 도메인만 회수.
+   `--read-burst` 가 드롭 시 DPIDR·CTRL/STAT 를 캡처하고, `--burst-delay` 로 시간기반/tx기반을 가른다.
 
 ## 실행
 
 ```bash
-# 0) diag (원인 판별의 출발점) — CDBG 요청 latch 여부 + 6개 AP IDR 스윕 + sticky
+# 0) diag — CDBG 요청 latch 여부 + 6개 AP IDR 스윕 + sticky
 sudo python3 sjtag_unlock.py --base 0x<BASE> --power both --diag
 
+# 0b) ★ 전원창 드롭 원인 판별 (read-only, 카운터 무소모) — 현재 핵심 단계
+sudo python3 sjtag_unlock.py --base 0x<BASE> --power both --read-burst 30
+sudo python3 sjtag_unlock.py --base 0x<BASE> --power both --read-burst 30 --burst-delay 50
+
 # 1) probe (read-only, 서명 도구 불필요) — base 뒤 SJTAG 블록 검증
-sudo python3 sjtag_unlock.py --base 0x<BASE> --power sys-only
+sudo python3 sjtag_unlock.py --base 0x<BASE> --power both
 
 # 2) scan — base 가 진짜 SJTAG 블록인지/어디인지 실측(default-slave vs live)
 sudo python3 sjtag_unlock.py --base 0x<BASE> --power sys-only --scan
@@ -69,10 +82,15 @@ sudo python3 sjtag_unlock.py --base 0x<BASE> \
     --power sys-only --execute --word-order t32-negative
 ```
 
-- **diag(0)** 판정:
-  - `[prepare] … CDBG req/ack=0/0` + `⚠ CDBG req 안 섬` → **전원요청 write 문제**(진짜 원인 후보).
-  - AP 스윕에서 **APBAP3만 실패, AXI/AHB LIVE** → SJTAG 경로가 시스템 도메인일 가능성.
-  - **전부 LIVE** → 디버그 전원 이미 확보 → 인증(3) 진행.
+- **드롭 판별(0b)** — `[drop]` 줄로 두 원인 가르기(현재 핵심):
+
+  | DPIDR at drop | `--burst-delay` 넣으니 | 결론 | 다음 |
+  |---|---|---|---|
+  | **깨짐**(0x8..0/None) | tx 무관 같은 tx | cJTAG KEEPER escape | TMSC pull / JLinkScript cJTAG / SEGGER 문의 |
+  | **정상**(0x6BA0…)+CDBG=0 | 더 빨리 죽음 | 전원 도메인 타이머 회수 | 전원 keepalive 재검토 |
+  | **정상**+CDBG=0 | tx 무관 | 전원 도메인 활동 회수 | 전원·링크 상호작용 조사 |
+
+- **diag(0)** AP 스윕: **APBAP3만 실패·AXI/AHB LIVE** 면 SJTAG 경로가 시스템 도메인일 가능성.
 - **인증(3)** 은 `--execute`가 있어야만 쓰기를 한다. 그 전엔 read-only.
 - **`--power sys-only`**: CDBG ACK 없이도 진행. 봐야 할 로그는 `[power A/B] … CDBGPWRUPACK 0→1`
   과 `★★★ … 직접 증명`. (dmstatus stride 추정보다 강한 전원영역 신호)
