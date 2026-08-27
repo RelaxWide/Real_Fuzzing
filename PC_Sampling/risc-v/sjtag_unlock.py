@@ -851,6 +851,33 @@ def prepare_session(lk, power, tap_note, tif_init=True, strict=True):
     return ack
 
 
+def gen_jlinkscript(out_path, template="sf_e76.JLinkScript.template"):
+    """sjtag_addrs.json 값으로 sf_e76.JLinkScript 를 생성한다 — 주소 단일 출처(json)
+    유지 + 수동 편집 제거. 템플릿의 placeholder 를 실제 AP/DM 주소로 치환한다.
+    (오프라인 — HW 불필요. 생성물은 .gitignore 라 실주소는 json 에만 남는다.)"""
+    subs = {"<APBAP1_DP_BASE>": f"0x{APBAP1_BASE:X}",       # DM 붙은 APB-AP
+            "<DM_BASE>": f"0x{CORE_BASE_MAIN:X}"}           # DM/DMI 위치
+    try:
+        with open(template, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        print(f"템플릿 못 읽음({template}): {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    for k, v in subs.items():
+        if k not in text:
+            print(f"⚠ 템플릿에 placeholder {k} 없음", file=sys.stderr)
+        text = text.replace(k, v)
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        print(f"생성 실패({out_path}): {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    print(f"생성: {out_path}  (APBAP1={subs['<APBAP1_DP_BASE>']}, "
+          f"DM_BASE={subs['<DM_BASE>']})  ← sjtag_addrs.json 값")
+    return EXIT_OK
+
+
 # ── main ─────────────────────────────────────────────────────────────
 def main():
     ap = add_common_args(argparse.ArgumentParser(
@@ -885,6 +912,10 @@ def main():
     ap.add_argument("--analyze-pubkey", action="store_true",
                     help="오프라인: 툴 -s3 를 2회 실행해 정적키 동일성 + word-order 후보 분석 "
                          "(HW/J-Link/인증 불필요, 카운터 무소모). --tool 필요")
+    ap.add_argument("--gen-jlinkscript", nargs="?", const="sf_e76.JLinkScript",
+                    default=None, metavar="PATH",
+                    help="오프라인: sjtag_addrs.json 값으로 JLinkScript 생성(수동편집 불필요). "
+                         "기본 출력 sf_e76.JLinkScript. HW 불필요")
     ap.add_argument("--read-burst", type=int, default=0, metavar="N",
                     help="transport 검증: REQUEST 34워드를 N회 연속 읽어 AP 안정성 실증 "
                          "(read-only, 인증 카운터 무소모). 드롭 시 DPIDR·CTRL/STAT 캡처")
@@ -926,6 +957,14 @@ def main():
     except ValueError as e:
         print(f"--tool-prefix 파싱 실패(따옴표 확인): {e}", file=sys.stderr)
         return EXIT_CONFIG
+
+    # ── 오프라인 JLinkScript 생성 — HW/J-Link 불필요 ──
+    if a.gen_jlinkscript is not None:
+        if not ADDRS_REAL:
+            print("⚠ 실제 sjtag_addrs.json 이 아니라 placeholder(example) — 생성 무의미. "
+                  "실기 값 채운 json 에서 실행하라.", file=sys.stderr)
+            return EXIT_CONFIG
+        return gen_jlinkscript(a.gen_jlinkscript)
 
     # ── 오프라인 pubkey 분석 — HW/J-Link 없이 즉시 (base 불필요) ──
     if a.analyze_pubkey:

@@ -7,13 +7,19 @@
 //   DM 위치를 몰라 dmcontrol 접근이 막힌다. 이 스크립트의 ConfigTargetSettings() 에서
 //   AP 맵 + DMI 가 붙은 AP 인덱스 + DM base 를 명시하면 J-Link 가 DM 에 도달한다.
 //
-// [사용법]
-//   1) 이 파일을  sf_e76.JLinkScript  로 복사한다(확장자에서 .template 제거).
+// [사용법 — 권장: 생성기]
+//   sjtag_addrs.json 값을 자동 치환해 sf_e76.JLinkScript 를 만든다(수동편집 불필요):
+//        python3 sjtag_unlock.py --gen-jlinkscript
+//   (주소 단일 출처=json 유지. 생성물은 .gitignore.)
+//
+// [사용법 — 수동(대안)]
+//   1) 이 파일을  sf_e76.JLinkScript  로 복사(확장자에서 .template 제거).
 //   2) 아래 <...> placeholder 를 sjtag_addrs.json 값으로 채운다:
 //        <APBAP1_DP_BASE> = ap_map 의 APBAP1  (RISC-V DM 이 붙은 APB-AP 의 DP 주소)
 //        <DM_BASE>        = core_base_main     (그 AP 공간에서 DM/DMI 레지스터 위치)
 //      ※ 우리 툴의 --dm-activate 가 이 AP/base 로 dmstatus(version=3) 를 잡은 그 값이다.
-//   3) JLinkExe(또는 GDBServer)에 물린다:
+//
+// [실행] 생성된 sf_e76.JLinkScript 를 JLinkExe(또는 GDBServer)에 물린다:
 //        JLink.exe -device E76 -if cJTAG -speed 10000 \
 //                  -JLinkScriptFile <path>/sf_e76.JLinkScript
 //

@@ -163,12 +163,14 @@ sudo python3 sjtag_unlock.py --base 0x<BASE> \
     --tool /path/signer.exe --tool-prefix wine \
     --power both --execute --word-order t32-negative
 
-# 2) JLinkExe 로 DM 접근 — DM 위치를 JLinkScript 로 알려줌
-cp sf_e76.JLinkScript.template sf_e76.JLinkScript   # <...> 를 json 값으로 채운다
+# 2) JLinkScript 생성 — json 값 자동 치환(수동편집 불필요)
+python3 sjtag_unlock.py --gen-jlinkscript          # → sf_e76.JLinkScript (.gitignore)
+
+# 3) JLinkExe 로 DM 접근 — DM 위치를 그 JLinkScript 로 알려줌
 JLink.exe -device E76 -if cJTAG -speed 10000 -JLinkScriptFile <path>/sf_e76.JLinkScript
 ```
-- 스크립트 값: `<APBAP1_DP_BASE>`=json ap_map APBAP1, `<DM_BASE>`=json core_base_main
-  (우리 `--dm-activate` 가 dmstatus version=3 을 잡은 그 AP/base).
+- `--gen-jlinkscript` 가 `<APBAP1_DP_BASE>`=json ap_map APBAP1, `<DM_BASE>`=json core_base_main
+  을 채운다(우리 `--dm-activate` 가 dmstatus version=3 을 잡은 그 AP/base). 주소는 계속 json 에만.
 - JLinkExe 는 PKC 인증을 하지 않는다 — **①인증(우리 툴) → ②JLinkExe connect** 순서 필수.
 - connect 후 J-Link 가 dmstatus(version=3, authenticated=1)를 읽으면 halt/디버그 가능.
 - E76 내장 스크립트가 AP 를 이미 잡아 Index=0 이 충돌하면 빈 인덱스로 바꾼다.
