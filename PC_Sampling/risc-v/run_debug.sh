@@ -34,9 +34,18 @@ SCRIPT="$DIR/sf_e76.JLinkScript"
 if [ "${NO_AUTH:-0}" != "1" ]; then
   : "${SIGNER:?인증하려면 SIGNER=서명.exe 경로 필요 (또는 NO_AUTH=1)}"
   echo "== [1/3] SJTAG 인증 =="
+  # --execute 는 AUTH_PASS 확보해도 DM 검증 판정 때문에 비-0(10/11)을 낼 수 있다.
+  # set -e 로 죽지 않게 rc 를 받아, '인증 OK' 코드면 계속 진행하고 진짜 실패만 중단.
+  set +e
   python3 "$DIR/sjtag_unlock.py" --base "$BASE" \
       --tool "$SIGNER" --tool-prefix "$TOOL_PREFIX" \
       --power both --execute --word-order "$WORD_ORDER"
+  rc=$?
+  set -e
+  case "$rc" in
+    0|10|11) echo "  → 인증 OK (rc=$rc, AUTH_PASS 확보) — connect 로 진행" ;;
+    *)       echo "  ✗ 인증 실패 (rc=$rc) — connect 중단"; exit "$rc" ;;
+  esac
 else
   echo "== [1/3] 인증 건너뜀 (NO_AUTH=1) =="
 fi
