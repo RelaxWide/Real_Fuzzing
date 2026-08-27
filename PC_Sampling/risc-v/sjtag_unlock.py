@@ -630,13 +630,18 @@ def diag_sweep(dap):
         print("  → 모든 AP LIVE: 디버그 전원이 이미 확보됨. APBAP3 인증 진행 가능.")
 
 
-def read_burst(dap, base, passes, retries=3):
+def read_burst(dap, base, passes, retries=3, delay=0.0):
     """write 루프와 동일한 주소(REQUEST 34워드)를 passes 회 연속 읽어 AP transport
     안정성을 실증한다. reads 는 상태머신을 안 건드리므로 **인증 카운터 무소모**.
-    write 와 동일한 재시도 로직으로, 일시적 sticky 를 재시도가 다 흡수하는지 본다."""
+
+    드롭 순간 **DPIDR·CTRL/STAT 를 캡처**해 원인을 가른다:
+      - DPIDR 도 깨짐 → escape/reset 이 링크/DP 까지 리셋 = cJTAG KEEPER escape.
+      - DPIDR 정상, CDBG ACK 만 0 → 전원 도메인만 회수(전면 링크리셋 아님).
+    delay>0 이면 읽기 사이에 쉰다 — 드롭이 '시간 기반'인지 '트랜잭션 기반'인지 판별용."""
     addrs = [OFF_REQUEST + 4 * k for k in range(PUBKEY_WORDS)]     # 34워드
-    print(f"\n  [read-burst] REQUEST {PUBKEY_WORDS}워드 × {passes}회 연속 읽기 "
-          f"(write와 동일 재시도, 카운터 무소모):")
+    print(f"\n  [read-burst] REQUEST {PUBKEY_WORDS}워드 × {passes}회"
+          + (f", 읽기간 delay {delay * 1000:.0f}ms" if delay else "")
+          + " (카운터 무소모):")
     total = recovered = hard_fail = 0
     first_hard = None
     for p in range(passes):
@@ -652,16 +657,27 @@ def read_burst(dap, base, passes, retries=3):
                 dap.clear_sticky()
             if not ok:
                 hard_fail += 1
-                if first_hard is None:
-                    first_hard = (p, k)
+                if first_hard is None:               # 첫 드롭 순간 링크/전원 캡처
+                    first_hard = (p, k, dap.dp_read(0), dap.dp_read(1))
+            if delay:
+                time.sleep(delay)
     print(f"  [read-burst] 총 {total}, 재시도복구 {recovered}, 최종실패 {hard_fail}")
     if hard_fail == 0:
         print(f"  → 재시도가 일시적 AP 에러를 전부 흡수. {PUBKEY_WORDS}워드 완주 가능 확신↑ "
               f"(복구 {recovered}회 = 실제로 sticky 가 떴다는 증거)")
+        return True
+    p0, k0, dpidr, ctrl = first_hard
+    tx = p0 * PUBKEY_WORDS + k0
+    print(f"  [drop] 첫 드롭 @ pass {p0} word {k0} (tx≈{tx})  "
+          f"DPIDR={hx(dpidr)}  CTRL/STAT={hx(ctrl)}")
+    if dpidr is None or dpidr in (0x80000000, 0x0, 0xFFFFFFFF):
+        print("  → ★ DPIDR도 깨짐: escape/reset 이 링크/DP까지 리셋 = cJTAG KEEPER escape 강력 시사.")
+    elif ctrl is not None and not (ctrl & (1 << 29)):
+        print("  → ★ DPIDR 정상인데 CDBGPWRUPACK만 0: 전면 링크리셋 아님 = 전원 도메인만 회수 "
+              "(KEEPER escape보다 전원게이트 쪽 원인).")
     else:
-        print(f"  → 최종실패 {hard_fail}건(첫 실패 pass {first_hard[0]} word {first_hard[1]}). "
-              "재시도로도 안 되면 근본 링크/전원 문제 — 재시도만으론 부족.")
-    return hard_fail == 0
+        print("  → DPIDR·CTRL 정상인데 AP만 실패: AP/APB 수준 문제(전원·링크 아님).")
+    return False
 
 
 def prepare_session(lk, power, tap_note, tif_init=True, strict=True):
@@ -786,7 +802,9 @@ def main():
                          "(HW/J-Link/인증 불필요, 카운터 무소모). --tool 필요")
     ap.add_argument("--read-burst", type=int, default=0, metavar="N",
                     help="transport 검증: REQUEST 34워드를 N회 연속 읽어 AP 안정성 실증 "
-                         "(read-only, 인증 카운터 무소모). write 수정 검증용")
+                         "(read-only, 인증 카운터 무소모). 드롭 시 DPIDR·CTRL/STAT 캡처")
+    ap.add_argument("--burst-delay", type=float, default=0.0, metavar="MS",
+                    help="read-burst 읽기 사이 지연(ms). 드롭이 시간기반인지 tx기반인지 판별용")
     ap.add_argument("--scan", action="store_true",
                     help="probe 진단: base 기준 SJTAG 알려진 오프셋들을 읽어 "
                          "default-slave/live 분류. --scan-window 주면 base 주변도 스윕.")
@@ -889,7 +907,7 @@ def main():
 
         # ── transport 검증 (읽기만) — write 수정이 34워드 완주시키는지 실증 ──
         if a.read_burst:
-            read_burst(dap, base, a.read_burst)
+            read_burst(dap, base, a.read_burst, delay=a.burst_delay / 1000.0)
             return EXIT_OK
 
         # ── 진단 스캔 (읽기만) — base 가 SJTAG 블록인지/어디인지 실측 ──
