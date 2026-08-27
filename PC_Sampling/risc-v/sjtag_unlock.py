@@ -729,11 +729,20 @@ def prepare_session(lk, power, tap_note, tif_init=True, strict=True):
         req, need = 0x50000000, (1 << 31)                     # 요청=SYS+DBG, 진행=CSYS ACK
     else:
         req, need = 0x50000000, (1 << 29) | (1 << 31)         # CDBG+CSYSPWRUPACK
-    jl.coresight_write(0, 0x0000001E, ap=False)               # ABORT: sticky 클리어
-    jl.coresight_write(1, req, ap=False)
+    # ── 콜드 warmup ──────────────────────────────────────────────────
+    # 실측: cJTAG 활성화 직후엔 DP 가 아직 동기 전이라 첫 트랜잭션(전원요청 write)이
+    # 통째로 안 먹는다(CTRL/STAT=0x0, req 리드백 0). 그래서 DP SELECT/DPIDR priming 으로
+    # DP 를 깨우고, ABORT·req 를 **주기적으로 재기입**하며 길게 폴링해 warmup 중에 전원을
+    # latch 시킨다. (예전엔 --diag 의 AP IDR 스윕이 이 warmup 을 우연히 대신 해줬다.)
+    jl.coresight_write(2, 0x00000000, ap=False)               # DP SELECT=0 (CTRL/STAT 뱅크)
+    for _ in range(3):
+        jl.coresight_read(0, ap=False)                        # DPIDR priming (반환 버림)
     last, ack = None, None
-    for _ in range(50):
-        time.sleep(0.01)
+    for i in range(80):
+        if i % 4 == 0:                                        # 주기적 재-어서트
+            jl.coresight_write(0, 0x0000001E, ap=False)       # ABORT: sticky 클리어
+            jl.coresight_write(1, req, ap=False)              # 전원요청 재기입
+        time.sleep(0.02)
         v = jl.coresight_read(1, ap=False)
         if v is not None and v >= 0:
             last = v & 0xFFFFFFFF

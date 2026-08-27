@@ -33,31 +33,28 @@ AP 맵·CoreBase·SJTAG 레지스터 오프셋 등 주소는 **코드(.py)에 �
 - 실기: `sjtag_addrs.json`(실제 값)으로 동작.
 - example만 있는 환경: placeholder라 실기 쓰기가 거부되고 단위 테스트만 통과.
 
-## 현재 진단 — 디버그 전원 '창'이 유지가 안 됨 (드롭)
+## 현재 진단 — ① 콜드 DP warmup (해결됨) / ② 유지 드롭 (측정 중)
 
-진행 경과:
-- **전원 확보는 해결됨**: `--power both` 로 fresh init 시 `CTRL/STAT=0xF0000000`
-  (CSYS/CDBG req·ack 전부 ON) → 디버그 전원 확보, APBAP3(=clavis 의 `APB3:`) 접근 가능.
-- **그러나 창이 유지 안 됨**: read/write **40~180 트랜잭션(가변)** 뒤
-  `0xF0000000 → 0x80000000` 로 드롭. **CDBG req 비트(28)까지 빠짐**(CSYS만 남음).
-  cJTAG 재init 으로도 복구 안 됨. 링크/시스템 전원은 내내 정상, **디버그 전원 도메인만 회수.**
-- 전체 인증은 pubkey 34 + sig 34 + 폴링 = 쉽게 180 tx 초과 → **창 유지가 인증의 선결 조건.**
+**① 콜드 전원요청 실패 = DP warmup 문제 (실측으로 확정, 수정됨)**
+실측: cJTAG 활성화 **직후**엔 DP 가 아직 동기 전이라 **첫 트랜잭션(전원요청 write)이 통째로
+안 먹는다** — `CTRL/STAT=0x00000000`, CDBG req 리드백 0. 그래서 초기 폴링이 ACK 를 못 받고
+"DAP 전원 ACK 실패". 그런데 `--diag` 의 AP IDR 스윕(DP SELECT 바꿔가며 다수 read)이 **DP 를
+깨우면** 그 도중 전원이 latch되고, 한 번 뜨면 close/reopen 후에도 남아 다음 실행은 바로 붙었다.
+→ **원인은 "전원 못 세움/KEEPER"가 아니라 콜드 DP warmup.** `prepare_session` 이 이제
+DP SELECT/DPIDR priming + ABORT·req **주기적 재기입** + 긴 폴링으로 warmup 을 내장 —
+`--diag` 를 먼저 안 돌려도 콜드에서 전원이 latch된다.
 
-원인 후보 2개 (문서 대조 후):
-1. **cJTAG KEEPER escape**: RISC-V 는 KEEPER 부재/버그가 흔해 TMSC floating →
-   없는 escape sequence 오검출 → escape "Reset" 이 링크/DP 리셋 → 전원요청 클리어.
-   (SEGGER cJTAG 문서) 단 J-Link **HW V13.00 은 no-KEEPER 워크어라운드 세대**라
-   '워크어라운드 부재'는 아님. cJTAG init 모드도 올바름(`SetcJTAGInitMode=1`=SiFive용).
-2. **전원 도메인 회수**: 벤더 PMU 가 디버그 도메인을 타이머/유휴로 내림.
-   (표준 CoreSight 엔 자동 타임아웃 없음 → 벤더 특유)
-
-**T32(clavis)는 왜 유지되나**: clavis 는 `CJTAGFLAGS NOKEEPER USEOAC` 로 no-keeper 처리를
-켜고, 모든 접근을 상시 떠 있는 AUX T32 인스턴스(`INTERCOM.execute Localhost:&AUXport`)로
-수행 — persistent 세션이 DAP 를 붙잡는다. 우리는 connectionless one-shot 이라 그 유지 주체가 없음.
-
-→ 두 후보를 가르는 **결정적 측정**: 드롭 순간 **DPIDR 이 같이 깨지나**.
-   DPIDR 깨짐=링크/DP 리셋(KEEPER escape), DPIDR 정상+CDBG=0=전원 도메인만 회수.
-   `--read-burst` 가 드롭 시 DPIDR·CTRL/STAT 를 캡처하고, `--burst-delay` 로 시간기반/tx기반을 가른다.
+**② 전원 확보 후 40~180 tx 뒤 드롭 (별개 현상, 측정 중)**
+전원이 `0xF0000000` 로 뜬 뒤에도 read/write **40~180 tx(가변)** 후 `→ 0x80000000` 로
+드롭(CDBG req 까지 빠짐), 복구는 fresh 필요. 링크/시스템 전원은 정상, 디버그 도메인만 회수.
+전체 인증(pubkey 34+sig 34+폴링)은 180 tx 를 넘기므로 **이 유지 문제 해결이 인증의 선결 조건.**
+- 후보: cJTAG KEEPER escape(RISC-V 흔함, TMSC floating→오검출→escape 리셋) vs 벤더 PMU
+  도메인 회수. 단 J-Link HW V13.00 은 no-KEEPER 워크어라운드 세대·cJTAG init 모드도 올바름
+  (`SetcJTAGInitMode=1`=SiFive용) → 문서만으론 미확정.
+- **결정 측정**: `--read-burst` 가 드롭 순간 **DPIDR·CTRL/STAT 캡처** — DPIDR 깨짐=링크/DP
+  리셋(KEEPER escape), DPIDR 정상+CDBG=0=전원 도메인만 회수. `--burst-delay` 로 시간/tx 기반.
+- T32(clavis)가 유지되는 이유: `CJTAGFLAGS NOKEEPER USEOAC` + 상시 AUX 세션
+  (`INTERCOM.execute Localhost:&AUXport`)이 DAP 를 붙잡음. 우리는 connectionless one-shot.
 
 ## 실행
 
