@@ -600,6 +600,36 @@ def read_dmstatus(dap, core_base):
     return v, tag, alive
 
 
+def dm_scan(dap, core_base, window=0x100):
+    """DM 의 AP(APBAP1/2)로 core_base 주변을 훑어 RISC-V dmstatus(version 2/3)를 **실측**한다.
+    dmstatus 는 [3:0]=version(2=0.13,3=1.0), [31:23]=reserved(0), [7]=authenticated 로
+    시그니처가 뚜렷하다. auth 후 이게 잡히면 'AUTH_PASS 가 DM 을 열었다' 확정.
+    read-only(dmcontrol 등 쓰기 없음) — 인증 카운터 무관."""
+    dm_ap = DM_AP.get(core_base)
+    if dm_ap is None:
+        print(f"  [dm-scan] core_base 0x{core_base:X} AP 매핑 미상")
+        return []
+    print(f"\n  [dm-scan] DM AP(DP:0x{dm_ap:X}) @ 0x{core_base:X} +0..0x{window:X} 스캔:")
+    found = []
+    for off in range(0, window, 4):
+        v = dap.mem_read32(dm_ap, core_base + off)
+        if v is None or v in DEAD_FINGERPRINTS:
+            continue
+        if (v & 0xF) in (2, 3) and (v >> 23) == 0:        # dmstatus 시그니처
+            ver, auth = v & 0xF, (v >> 7) & 1
+            allh, allr = (v >> 9) & 1, (v >> 11) & 1
+            print(f"    +0x{off:03X} = 0x{v:08X}  ← dmstatus 후보 "
+                  f"(version={ver} authenticated={auth} allhalted={allh} allrunning={allr})")
+            found.append((off, v))
+    if found:
+        print(f"  [dm-scan] ✅ dmstatus 후보 {len(found)}개 — AUTH_PASS 가 DM 을 열었다(강한 증거). "
+              f"JLinkExe 엔 이 DM base(0x{core_base:X})/AP 를 알려주면 접근 가능.")
+    else:
+        print("  [dm-scan] ✗ 유효 dmstatus 없음 — auth 는 됐지만 DM 이 이 AP/주소로 안 열림. "
+              "추가 게이트(리셋/전원/firewall) 또는 DM AP·base 재확인 필요.")
+    return found
+
+
 # ── 세션 준비 — CMM 방식(prepare-only, connect 없음) ─────────────────
 def diag_sweep(dap):
     """현재 전원 상태로 6개 AP 의 IDR 을 훑는다 — '인증/디버그전원 없이 어디에 닿나'.
@@ -814,6 +844,11 @@ def main():
                          "(read-only, 인증 카운터 무소모). 드롭 시 DPIDR·CTRL/STAT 캡처")
     ap.add_argument("--burst-delay", type=float, default=0.0, metavar="MS",
                     help="read-burst 읽기 사이 지연(ms). 드롭이 시간기반인지 tx기반인지 판별용")
+    ap.add_argument("--dm-scan", action="store_true",
+                    help="DM 스캔: DM AP(APBAP1/2)로 core_base 주변을 읽어 RISC-V dmstatus"
+                         "(version 2/3) 실측. auth 후 DM 열림 확정용(read-only). 인증 잔존 시 단독 사용 가능")
+    ap.add_argument("--dm-window", type=lambda x: int(x, 0), default=0x100, metavar="N",
+                    help="dm-scan 스캔 폭(기본 0x100)")
     ap.add_argument("--scan", action="store_true",
                     help="probe 진단: base 기준 SJTAG 알려진 오프셋들을 읽어 "
                          "default-slave/live 분류. --scan-window 주면 base 주변도 스윕.")
@@ -919,6 +954,11 @@ def main():
             read_burst(dap, base, a.read_burst, delay=a.burst_delay / 1000.0)
             return EXIT_OK
 
+        # ── DM 스캔 (읽기만) — auth 잔존 상태에서 DM 열림 실측 ──
+        if a.dm_scan:
+            dm_scan(dap, a.core_base, a.dm_window)
+            return EXIT_OK
+
         # ── 진단 스캔 (읽기만) — base 가 SJTAG 블록인지/어디인지 실측 ──
         if a.scan:
             scan_sjtag(dap, base, a.scan_window, a.scan_step)
@@ -1001,6 +1041,10 @@ def main():
             print("  ⚠ 인증 성공(AUTH_PASS) 했으나 CDBGPWRUPACK 은 여전히 0. "
                   "디버그 전원 게이트가 이 신호로는 안 열림 — 다른 앞단 게이트/리셋 "
                   "필요하거나 CDBG req 재요청이 필요할 수 있다.")
+
+        # ── DM 실측 (같은 세션에서 이어서) — auth 가 DM 을 열었는지 확정 ──
+        #   세션을 닫지 않고 인증 직후 그대로 DM AP 를 스캔한다(별도 세션이면 리셋 위험).
+        dm_scan(dap, a.core_base, a.dm_window)
 
         after = read_dmstatus(dap, a.core_base)
         print(f"  [after ] dmstatus(추정) @0x{a.core_base + DMSTATUS_OFF:X} "

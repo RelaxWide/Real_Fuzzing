@@ -73,10 +73,14 @@ sudo python3 sjtag_unlock.py --base 0x<BASE> --power both
 sudo python3 sjtag_unlock.py --base 0x<BASE> --power sys-only --scan
 sudo python3 sjtag_unlock.py --base 0x<BASE> --power sys-only --scan --scan-window 0x100000
 
-# 3) 전체 인증 (쓰기) — 서명 도구 + 워드 순서 필요. 인증 후 CDBGPWRUPACK 전이 관찰
+# 3) 전체 인증 (쓰기) — 서명 도구 + 워드 순서 필요.
+#    인증 직후 **같은 세션에서** dm_scan 이 이어서 돌아 DM 열림을 실측한다.
 sudo python3 sjtag_unlock.py --base 0x<BASE> \
     --tool /path/signer.exe --tool-prefix wine \
-    --power sys-only --execute --word-order t32-negative
+    --power both --execute --word-order t32-negative
+
+# 4) DM 스캔 (read-only) — auth 잔존 상태에서 DM(dmstatus) 열렸는지 단독 확인
+sudo python3 sjtag_unlock.py --base 0x<BASE> --power both --dm-scan
 ```
 
 - **드롭 판별(0b)** — `[drop]` 줄로 두 원인 가르기(현재 핵심):
@@ -87,6 +91,11 @@ sudo python3 sjtag_unlock.py --base 0x<BASE> \
   | **정상**(0x6BA0…)+CDBG=0 | 더 빨리 죽음 | 전원 도메인 타이머 회수 | 전원 keepalive 재검토 |
   | **정상**+CDBG=0 | tx 무관 | 전원 도메인 활동 회수 | 전원·링크 상호작용 조사 |
 
+- **인증 성공 후(실측)**: STATE=`0x110`(AUTH_PASS 0x100 + SOFT_LOCK 0x10) → **AUTH_PASS 지속됨**
+  (별도 세션/JLinkExe connect 후에도 남음). 즉 인증은 세션이 날리지 않는다. 다만 **AUTH_PASS ≠
+  DM 접근** — DM 은 별도 AP(APBAP1 의 COREDEBUG.Base)라, ①JLinkExe 가 그 DM 위치를 모르거나
+  (JLinkScript/설정 필요) ②AUTH_PASS 외 추가 게이트가 있을 수 있다. `--dm-scan`/`dm_scan`(인증
+  세션에서 이어서)으로 유효 dmstatus 가 잡히면 ① 확정(JLinkExe 에 DM base 만 알려주면 됨).
 - **diag(0)** AP 스윕: **APBAP3만 실패·AXI/AHB LIVE** 면 SJTAG 경로가 시스템 도메인일 가능성.
 - **인증(3)** 은 `--execute`가 있어야만 쓰기를 한다. 그 전엔 read-only.
 - **`--power sys-only`**: CDBG ACK 없이도 진행. 봐야 할 로그는 `[power A/B] … CDBGPWRUPACK 0→1`
