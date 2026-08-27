@@ -13,13 +13,26 @@ challenge 조합)는 코드에 있고, **사용자가 넣는 것은 두 가지�
 
 | 파일 | 역할 |
 |---|---|
-| `sjtag_unlock.py` | 메인 — secure JTAG 인증 + probe/scan |
+| `run_debug.sh` | ★ 원스텝: 인증 → JLinkScript 생성 → J-Link 서버 기동 |
+| `sjtag_unlock.py` | 메인 — 인증 + probe/diag/dm-* + gen-jlinkscript |
 | `sfe76_link.py` | J-Link 연결 계층 |
 | `dap_access.py` | ADIv6 DP/AP 원시 접근(MEM-AP read/write) |
-| `analyze_clavis.py` | `clavis.cmm` 정적 구조 분석기(자립, 비밀값 마스킹) |
+| `sf_e76.JLinkScript.template` | JLinkScript 템플릿(DM 위치·cJTAG init) |
 | `sjtag_addrs.json` | 실제 주소/레지스터 맵 (코드엔 주소 없음 — 여기서 로드) |
 | `sjtag_addrs.example.json` | 주소/레지스터 맵 **템플릿**(placeholder) |
-| `test_*.py` | 단위 테스트(하드웨어 불필요) |
+| `test_sjtag_unlock.py` | 단위 테스트(하드웨어 불필요) |
+
+## 원스텝 실행 (권장)
+
+인증 → JLinkScript 생성 → J-Link 디버그 서버까지 한 방에:
+```bash
+sudo WINEPREFIX=/root/.wine32 SIGNER=/path/signer.exe \
+     ./run_debug.sh 0x<BASE>
+```
+- 전원사이클마다 이대로 실행(인증 포함). 이미 인증됐으면 `NO_AUTH=1` 로 인증 건너뜀.
+- 환경변수: `SIGNER`(서명 .exe), `TOOL_PREFIX`(기본 wine), `WORD_ORDER`(기본 t32-negative),
+  `JLINK`(기본 JLinkGDBServer). 그 뒤 GDB/IDE 를 서버에 붙인다.
+- 문제 진단이 필요할 때만 아래 단계별 도구(diag/read-burst/dm-*)를 개별 사용.
 
 ## 설정 — 주소 맵
 
@@ -201,5 +214,4 @@ J-Link 가 SiFive short-form 활성화를 안 써서다. → **JLinkScript 에 `
 
 ```bash
 python3 -m unittest -v test_sjtag_unlock.py
-python3 -m unittest -v test_analyze_clavis.py
 ```
