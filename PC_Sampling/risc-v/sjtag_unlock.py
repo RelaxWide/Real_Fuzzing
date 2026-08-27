@@ -351,7 +351,12 @@ def analyze_pubkey(tool, tool_prefix):
 def poll_bit(dap, addr, mask, want, timeout, label, abort_mask=0):
     deadline = time.monotonic() + timeout
     while True:
-        v = dap.mem_read32(APBAP3_BASE, addr)
+        v = None
+        for _ in range(3):                       # 일시적 sticky 흡수
+            v = dap.mem_read32(APBAP3_BASE, addr)
+            if v is not None:
+                break
+            dap.clear_sticky()
         if v is None:
             raise SecureJtagError(f"{label}: 읽기 실패 ({dap.last.get('why')})", EXIT_CONFIG)
         if abort_mask and (v & abort_mask) == abort_mask:
@@ -377,12 +382,18 @@ def w(dap, addr, val, label, retries=3):
         f"{label}: APBAP3 쓰기 {retries}회 실패 ({dap.last.get('why')})", EXIT_CONFIG)
 
 
-def rd(dap, addr, label):
-    v = dap.mem_read32(APBAP3_BASE, addr)
-    if v is None:
-        raise SecureJtagError(f"{label}: APBAP3 읽기 실패 ({dap.last.get('why')})",
-                              EXIT_CONFIG)
-    return v
+def rd(dap, addr, label, retries=3):
+    # 읽기도 write 처럼 일시적 AP 에러(STICKYERR→TAR 잘림/CSW SUSPECT)를 sticky 클리어
+    # 후 재시도로 흡수한다. (직전 다른 AP 접근이 남긴 sticky 가 첫 읽기를 죽이는 것 방지)
+    for attempt in range(retries):
+        v = dap.mem_read32(APBAP3_BASE, addr)
+        if v is not None:
+            if attempt:
+                print(f"    ↻ {label}: sticky {attempt}회 클리어 후 성공(자가복구)")
+            return v
+        dap.clear_sticky()
+    raise SecureJtagError(f"{label}: APBAP3 읽기 {retries}회 실패 ({dap.last.get('why')})",
+                          EXIT_CONFIG)
 
 
 # ── 쓰기 전 검증 게이트 (Critical #1) ────────────────────────────────
@@ -484,6 +495,7 @@ def unlock(dap, base, tool, word_order, timeout=60.0, tool_prefix=()):
     def A(off):
         return base + off
 
+    dap.clear_sticky()          # 직전 다른 AP(DM) 접근이 남긴 sticky 를 지우고 시작
     state = rd(dap, A(OFF_STATE), "STATE 최초읽기")
     print(f"  [0] STATE={hx(state)}  HW={hx(rd(dap, A(OFF_HW_VERSION), 'HW'))}")
     if state & AUTH_PASS:
@@ -592,6 +604,7 @@ def read_dmstatus(dap, core_base):
     if dm_ap is None:
         return None, f"core_base 0x{core_base:X} 매핑 미상", False
     v = dap.mem_read32(dm_ap, core_base + DMSTATUS_OFF)
+    dap.clear_sticky()          # DM(APBAP1) 접근 실패가 이후 APBAP3 접근을 오염시키지 않게
     if v is None:
         return None, "읽기실패", False
     ver = v & 0xF
@@ -613,7 +626,10 @@ def dm_scan(dap, core_base, window=0x100):
     found = []
     for off in range(0, window, 4):
         v = dap.mem_read32(dm_ap, core_base + off)
-        if v is None or v in DEAD_FINGERPRINTS:
+        if v is None:
+            dap.clear_sticky()                  # 실패가 다음 읽기를 연쇄로 죽이지 않게
+            continue
+        if v in DEAD_FINGERPRINTS:
             continue
         if (v & 0xF) in (2, 3) and (v >> 23) == 0:        # dmstatus 시그니처
             ver, auth = v & 0xF, (v >> 7) & 1

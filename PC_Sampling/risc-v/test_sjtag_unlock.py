@@ -91,6 +91,9 @@ class MockDap:
         self.writes = []
         self.target_reads = 0              # ap_read + mem_read32 호출 횟수
 
+    def clear_sticky(self):
+        pass                               # 실기 sticky 클리어의 no-op 목
+
     def ap_read(self, ap_base, off):
         self.target_reads += 1
         if off == OFF_IDR:
