@@ -53,6 +53,7 @@ case "$JLINK" in
     if [ -n "${JLINK_SCRIPT:-}" ]; then          # commander 스크립트로 connect+명령 자동
       exec "$JLINK" "${COMMON[@]}" -autoconnect 1 -CommanderScript "$JLINK_SCRIPT"
     else
-      exec "$JLINK" "${COMMON[@]}" -autoconnect 1 ;;   # 즉시 connect 후 대화형 프롬프트
-    fi ;;
+      exec "$JLINK" "${COMMON[@]}" -autoconnect 1   # 즉시 connect 후 대화형 프롬프트
+    fi
+    ;;
 esac
