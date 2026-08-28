@@ -628,6 +628,54 @@ def read_dmstatus(dap, core_base):
     return v, tag, alive
 
 
+def trace_status(dap):
+    """N-Trace 상태 실측(read-only): TECTRL/TFCTRL enable 비트 + ETB write/read 포인터.
+    Ozone 'No Data' 원인을 가른다 — 인코더 미enable / 버퍼 빔(실행無) / 데이터有(디코드문제).
+    트레이스 레지스터는 시스템버스(T32 SB:)에 있어, 닿는 AP 를 자동 스윕해 읽는다.
+    ETB 레지스터맵(NexusTracedatadump.cmm): +0x1C=Wptr(bit0=wrap), +0x20=Rptr, +0x24=Data."""
+    tr = RISCV_ADDRS.get("trace", {})
+    te = _a(tr.get("te_base", 0))
+    sink = _a(tr.get("sram_sink_base", 0))
+    funnel = _a(tr.get("funnel_base") or 0)
+    if not te or not sink:
+        print("  [trace-status] json 에 trace(te_base/sram_sink_base) 설정 없음")
+        return
+    # 트레이스 레지스터에 닿는 AP 찾기(시스템버스 계열 우선).
+    apn = None
+    for nm in ("AXIAP1", "AHBAP1", "APBAP1", "APBAP4", "APBAP3"):
+        try:
+            b = ap_base(nm)
+        except KeyError:
+            continue
+        v = dap.mem_read32(b, te)
+        if v is not None and v not in DEAD_FINGERPRINTS:
+            apn = (nm, b, v)
+            break
+    if apn is None:
+        print(f"  [trace-status] TECTRL(0x{te:X})를 어떤 AP로도 못 읽음 — 접근방식/주소 재확인.")
+        return
+    nm, b, tectrl = apn
+    tfctrl = dap.mem_read32(b, funnel) if funnel else None
+    wptr = dap.mem_read32(b, sink + 0x1C)
+    rptr = dap.mem_read32(b, sink + 0x20)
+    te_en = (tectrl >> 1) & 1
+    print(f"\n  [trace-status] via {nm}(DP:0x{b:X}):")
+    print(f"    TECTRL(0x{te:X})={hx(tectrl)}  TE={'enabled' if te_en else 'DISABLED'}")
+    if funnel:
+        print(f"    TFCTRL(0x{funnel:X})={hx(tfctrl)}  "
+              f"TF={'enabled' if (tfctrl and (tfctrl >> 1) & 1) else 'DISABLED'}")
+    print(f"    ETB Wptr(0x{sink + 0x1C:X})={hx(wptr)}  Rptr={hx(rptr)}"
+          + (f"  wrap={wptr & 1}" if wptr is not None else ""))
+    # 판정
+    if not te_en:
+        print("  → ★ TE(인코더) DISABLED — Ozone/J-Link 이 인코더 enable 을 안 함. "
+              "트레이스가 시작 안 돼서 No Data. (TECTRL bit1 을 켜야 함)")
+    elif wptr is None or (wptr & 0xFFFFFFFE) == 0:
+        print("  → ★ 버퍼 Wptr=0 — 인코더는 켜졌으나 데이터가 안 써짐(실행無 or funnel→sink 라우팅 문제).")
+    else:
+        print("  → 버퍼에 데이터 있음(Wptr>0). Ozone No Data 면 디코드/버퍼읽기 문제.")
+
+
 def dm_scan(dap, core_base, window=0x100):
     """DM 의 AP(APBAP1/2)로 core_base 주변을 훑어 RISC-V dmstatus(version 2/3)를 **실측**한다.
     dmstatus 는 [3:0]=version(2=0.13,3=1.0), [31:23]=reserved(0), [7]=authenticated 로
@@ -1082,6 +1130,9 @@ def main():
     ap.add_argument("--dm-activate", action="store_true",
                     help="DM 기동: dmcontrol.dmactive=1 을 써 DM 을 리셋해제 후 dmstatus 확인. "
                          "auth 잔존 시 단독으로 'DM 열림' 확정용(표준 write, 인증 무관)")
+    ap.add_argument("--trace-status", action="store_true",
+                    help="N-Trace 상태 실측: TECTRL/TFCTRL enable + ETB write pointer. "
+                         "Ozone 'No Data' 원인 판별(인코더 미enable/버퍼빔/디코드문제). read-only")
     ap.add_argument("--dm-halt", action="store_true",
                     help="hart 를 halt 시도(dmcontrol.haltreq)→allhalted 확인 후 resume. "
                          "J-Link 'Failed to identify'가 J-Link 설정 문제인지 코어측 게이트인지 판별. "
@@ -1200,6 +1251,9 @@ def main():
             return EXIT_OK
 
         # ── DM 스캔/기동/halt — auth 잔존 상태에서 DM·코어 디버그 실측 ──
+        if a.trace_status:
+            trace_status(dap)
+            return EXIT_OK
         if a.dm_halt:
             dm_activate(dap, a.core_base)
             dm_halt(dap, a.core_base, a.hart or 0)
