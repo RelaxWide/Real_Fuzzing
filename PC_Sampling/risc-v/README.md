@@ -45,16 +45,19 @@ challenge 조합)는 코드에 있고, **사용자가 넣는 것은 두 가지�
 
 ## 원스텝 실행 (권장)
 
-인증 → JLinkScript 생성 → **J-Link connect 까지** 한 방에:
+**사전 1회**: `sjtag_addrs.json` 의 `"runtime"` 에 `sjtag_base`(=--base), `sign_tool`(서명 .exe)
+을 채운다. (`tool_prefix`=wine, `word_order`=t32-negative 는 기본으로 채워져 있음.)
+
+그다음, 인증 → JLinkScript 생성 → **J-Link connect 까지** 한 방에:
 ```bash
-sudo WINEPREFIX=/root/.wine32 SIGNER=/path/signer.exe \
-     ./run_debug.sh 0x<BASE>
+sudo ./run_debug.sh
 ```
-- 인증 후 **JLinkExe 가 `-autoconnect 1` 로 즉시 타깃에 접속** → 연결된 `J-Link>` 프롬프트.
+- **base·tool·word-order 는 json runtime 에서** 읽으므로 인자/환경변수 불필요.
+- **wine 환경**(`WINEPREFIX=/root/.wine32` 등)은 스크립트가 기본값으로 export — 다르면 환경변수로 override.
+- 인증 후 **JLinkExe `-autoconnect 1` 로 즉시 접속** → 연결된 `J-Link>` 프롬프트.
 - 전원사이클마다 이대로(인증 포함). 이미 인증됐으면 `NO_AUTH=1` 로 인증 스킵.
-- 환경변수: `SIGNER`(서명 .exe), `TOOL_PREFIX`(기본 wine), `WORD_ORDER`(기본 t32-negative),
-  `JLINK`(기본 `JLinkExe`; `JLinkGDBServer` 로 하면 GDB 서버 기동), `JLINK_SCRIPT`(있으면
-  connect 후 그 Commander 스크립트 자동 실행 — 예: halt/regs/g).
+- override(선택): `sudo ./run_debug.sh 0x<BASE>`(base), 환경변수 `WINEPREFIX`/`JLINK`
+  (기본 JLinkExe; `JLinkGDBServer` 로 GDB 서버)/`JLINK_SCRIPT`(connect 후 Commander 명령 자동).
 - 문제 진단이 필요할 때만 아래 단계별 도구(diag/read-burst/dm-*)를 개별 사용.
 
 ## 설정 — 주소 맵

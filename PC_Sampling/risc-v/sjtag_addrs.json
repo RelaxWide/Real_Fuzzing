@@ -22,5 +22,12 @@
     "auth_pass": "0x100", "soft_lock": "0x10", "request_ready": "0x40",
     "response_ready": "0x80", "state_info_mask": "0x70000",
     "invalid_pubkey": "0x110000", "sw_reset_mask": "0x1"
+  },
+  "runtime": {
+    "_comment": "오케스트레이터 기본값. sjtag_base·sign_tool 을 실기값으로 채운다(비면 CLI 로 넘겨야 함).",
+    "sjtag_base": "",
+    "sign_tool": "",
+    "tool_prefix": "wine",
+    "word_order": "t32-negative"
   }
 }

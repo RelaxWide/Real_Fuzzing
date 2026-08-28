@@ -5,41 +5,39 @@
 #   [1] SJTAG PKC 인증(AUTH_PASS)  — sjtag_unlock.py --execute
 #   [2] JLinkScript 생성(json 값)  — sjtag_unlock.py --gen-jlinkscript
 #   [3] J-Link connect              — JLinkExe -autoconnect 1 (실행 즉시 타깃 접속)
-#       또는 JLINK=JLinkGDBServer 로 GDB 서버 기동(클라이언트 대기)
 #
-# 사용:
-#   sudo WINEPREFIX=/root/.wine32 SIGNER=/path/signer.exe ./run_debug.sh 0x<BASE>
-#   → 인증 후 JLinkExe 가 바로 connect 되어 J-Link> 프롬프트(연결됨)로 떨어진다.
+# 사용 (base/tool/word-order 는 sjtag_addrs.json 의 "runtime" 에서 읽음):
+#   sudo ./run_debug.sh
+#   sudo ./run_debug.sh 0x<BASE>          # base 만 override 하고 싶을 때
+#
+# ★ 사전 준비: sjtag_addrs.json 의 "runtime" 에 sjtag_base, sign_tool 채워둔다(1회).
+#   wine 환경(WINEPREFIX 등)은 아래 기본값 사용 — 다르면 환경변수로 override.
 #
 # 환경변수(선택):
-#   SIGNER       서명 .exe 경로               (필수 — 인증 시)
-#   TOOL_PREFIX  서명도구 런처                (기본: wine)
-#   WORD_ORDER   t32-negative | stdout        (기본: t32-negative)
-#   JLINK        JLinkExe | JLinkGDBServer    (기본: JLinkExe = 즉시 connect)
-#   JLINK_SCRIPT J-Link Commander 스크립트    (있으면 connect 후 그 명령들 자동 실행)
+#   WINEPREFIX   wine prefix                 (기본: /root/.wine32)
+#   JLINK        JLinkExe | JLinkGDBServer   (기본: JLinkExe = 즉시 connect)
+#   JLINK_SCRIPT connect 후 자동 실행할 Commander 스크립트(halt/regs 등)
 #   NO_AUTH=1    인증 건너뛰기(이미 인증됨 — 전원 안 내렸을 때)
-#
-# ★ 인증은 전원사이클마다 필요. 전원 내렸으면 NO_AUTH 없이(=인증 포함) 실행.
 set -euo pipefail
 
-BASE="${1:-}"
-[ -n "$BASE" ] || { echo "사용: sudo ./run_debug.sh 0x<BASE>"; exit 2; }
-
 DIR="$(cd "$(dirname "$0")" && pwd)"
-TOOL_PREFIX="${TOOL_PREFIX:-wine}"
-WORD_ORDER="${WORD_ORDER:-t32-negative}"
-JLINK="${JLINK:-JLinkExe}"
 SCRIPT="$DIR/sf_e76.JLinkScript"
+JLINK="${JLINK:-JLinkExe}"
+
+# wine 환경 기본값(없을 때만) — 인증에 wine 서명도구 쓸 때. sudo(root) 기준 prefix.
+export WINEPREFIX="${WINEPREFIX:-/root/.wine32}"
+export WINEDEBUG="${WINEDEBUG:--all}"
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-mscoree,mshtml=}"
+
+# base 는 json runtime 에서 읽지만, 인자로 주면 그걸로 override.
+BASE_ARG=()
+[ -n "${1:-}" ] && BASE_ARG=(--base "$1")
 
 if [ "${NO_AUTH:-0}" != "1" ]; then
-  : "${SIGNER:?인증하려면 SIGNER=서명.exe 경로 필요 (또는 NO_AUTH=1)}"
-  echo "== [1/3] SJTAG 인증 =="
-  # --execute 는 AUTH_PASS 확보해도 DM 검증 판정 때문에 비-0(10/11)을 낼 수 있다.
-  # set -e 로 죽지 않게 rc 를 받아, '인증 OK' 코드면 계속 진행하고 진짜 실패만 중단.
+  echo "== [1/3] SJTAG 인증 (base/tool/word-order 는 json runtime) =="
+  # --execute 는 AUTH_PASS 확보해도 DM 판정으로 비-0(10/11)을 낼 수 있어 rc 로 판단.
   set +e
-  python3 "$DIR/sjtag_unlock.py" --base "$BASE" \
-      --tool "$SIGNER" --tool-prefix "$TOOL_PREFIX" \
-      --power both --execute --word-order "$WORD_ORDER"
+  python3 "$DIR/sjtag_unlock.py" "${BASE_ARG[@]}" --power both --execute
   rc=$?
   set -e
   case "$rc" in
@@ -54,14 +52,13 @@ echo "== [2/3] JLinkScript 생성 =="
 python3 "$DIR/sjtag_unlock.py" --gen-jlinkscript "$SCRIPT"
 
 echo "== [3/3] J-Link connect: $JLINK =="
-# -JTAGConf -1,-1 = JTAG 체인 위치 자동감지(대화형 JTAGConf 프롬프트에서 Enter=기본값과 동일).
-# 이거 없으면 JLinkExe 가 JTAGConf 입력을 기다리며 멈춘다.
+# -JTAGConf -1,-1 = JTAG 체인 위치 자동감지(대화형 프롬프트 스킵).
 COMMON=(-device E76 -if cJTAG -speed 10000 -JTAGConf -1,-1 -JLinkScriptFile "$SCRIPT")
 case "$JLINK" in
   *GDBServer*|*gdbserver*|*GDBServerCL*)
-    exec "$JLINK" "${COMMON[@]}" ;;              # GDB 서버(클라이언트 대기, 시작 시 타깃 connect)
+    exec "$JLINK" "${COMMON[@]}" ;;                # GDB 서버(클라이언트 대기, 시작 시 connect)
   *)
-    if [ -n "${JLINK_SCRIPT:-}" ]; then          # commander 스크립트로 connect+명령 자동
+    if [ -n "${JLINK_SCRIPT:-}" ]; then
       exec "$JLINK" "${COMMON[@]}" -autoconnect 1 -CommanderScript "$JLINK_SCRIPT"
     else
       exec "$JLINK" "${COMMON[@]}" -autoconnect 1   # 즉시 connect 후 대화형 프롬프트

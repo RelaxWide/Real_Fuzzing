@@ -75,6 +75,17 @@ def _a(v, default=0):
             return default
     return v if isinstance(v, int) else default
 
+# runtime 기본값 — sjtag_addrs.json 의 "runtime" 에서 base/tool/prefix/word-order 를 받는다.
+# (CLI 로 주면 CLI 우선; json 에 있으면 인자 없이도 동작 → 오케스트레이터가 간단해진다.)
+_RT = RISCV_ADDRS.get("runtime", {})
+if _RT.get("sjtag_base"):
+    SJTAG_BASE = _a(_RT["sjtag_base"])
+if _RT.get("sign_tool"):
+    SIGN_TOOL = _RT["sign_tool"]
+if _RT.get("tool_prefix"):
+    TOOL_PREFIX = _RT["tool_prefix"]
+_RT_WORD_ORDER = _RT.get("word_order") or None      # --word-order 기본값
+
 _OFF = RISCV_ADDRS.get("sjtag_offsets", {})
 _BIT = RISCV_ADDRS.get("sjtag_state_bits", {})
 
@@ -1011,7 +1022,8 @@ def main():
                          "CONFIG TOOL_PREFIX 보다 우선. shlex 로 분리")
     ap.add_argument("--execute", action="store_true",
                     help="★ 실제 인증(쓰기)을 한다. 없으면 read-only probe 만.")
-    ap.add_argument("--word-order", choices=("t32-negative", "stdout"), default=None,
+    ap.add_argument("--word-order", choices=("t32-negative", "stdout"),
+                    default=_RT_WORD_ORDER,
                     help="공개키/서명 워드 주소순서. --execute 시 필수.")
     ap.add_argument("--power", choices=("dbg-only", "both", "sys-only"),
                     default="dbg-only",

@@ -22,5 +22,12 @@
     "auth_pass": "0x1", "soft_lock": "0x2", "request_ready": "0x4",
     "response_ready": "0x8", "state_info_mask": "0x700",
     "invalid_pubkey": "0x1000", "sw_reset_mask": "0x10"
+  },
+  "runtime": {
+    "_comment": "오케스트레이터 기본값(placeholder). 실기 json 에서 sjtag_base·sign_tool 채움.",
+    "sjtag_base": "0x0",
+    "sign_tool": "/path/to/signer.exe",
+    "tool_prefix": "wine",
+    "word_order": "t32-negative"
   }
 }
