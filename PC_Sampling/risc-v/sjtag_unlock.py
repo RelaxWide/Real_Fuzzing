@@ -629,17 +629,61 @@ def read_dmstatus(dap, core_base):
     return v, tag, alive
 
 
-def _trace_ap(dap, te):
-    """트레이스 레지스터(시스템버스)에 닿는 AP 를 찾는다. (name, base) 또는 None."""
-    for nm in ("AXIAP1", "AHBAP1", "APBAP1", "APBAP4", "APBAP3"):
-        try:
-            b = ap_base(nm)
-        except KeyError:
-            continue
-        v = dap.mem_read32(b, te)
-        if v is not None and v not in DEAD_FINGERPRINTS:
-            return nm, b
+# ── SBA (System Bus Access) — DM 경유 시스템버스 read/write (T32 SB:/J-Link MemType=2) ──
+#   트레이스 레지스터(0xFD......)는 MEM-AP 로 안 닿고 SBA 로만 접근된다.
+SBCS_OFF    = 0x38 << 2       # sbcs   (sbaccess[19:17], sbreadonaddr[20], sbbusy[21], sberror[14:12])
+SBADDR0_OFF = 0x39 << 2       # sbaddress0
+SBDATA0_OFF = 0x3C << 2       # sbdata0
+_SB32 = 2 << 17               # sbaccess=32bit
+
+
+def _sba_ready(dap):
+    """SBA 사용 가능? DM AP + sbasize>0 확인. (dm_ap, core_base) 또는 None."""
+    ap = DM_AP.get(CORE_BASE_MAIN)
+    if ap is None:
+        return None
+    cs = dap.mem_read32(ap, CORE_BASE_MAIN + SBCS_OFF)
+    if cs is None or ((cs >> 5) & 0x7F) == 0:            # sbasize==0 → SBA 미구현
+        return None
+    return ap, CORE_BASE_MAIN
+
+
+def _sba_wait(dap, ap, cb):
+    for _ in range(200):
+        cs = dap.mem_read32(ap, cb + SBCS_OFF)
+        if cs is not None and not ((cs >> 21) & 1):     # sbbusy=0
+            return cs
     return None
+
+
+def _sba_read(dap, ap, cb, addr):
+    dap.mem_write32(ap, cb + SBCS_OFF, _SB32 | (1 << 20))   # sbreadonaddr
+    dap.mem_write32(ap, cb + SBADDR0_OFF, addr)                     # 주소 쓰면 자동 read
+    _sba_wait(dap, ap, cb)
+    return dap.mem_read32(ap, cb + SBDATA0_OFF)
+
+
+def _sba_write(dap, ap, cb, addr, val):
+    dap.mem_write32(ap, cb + SBCS_OFF, _SB32)
+    dap.mem_write32(ap, cb + SBADDR0_OFF, addr)
+    dap.mem_write32(ap, cb + SBDATA0_OFF, val)                      # 데이터 쓰면 자동 write
+    _sba_wait(dap, ap, cb)
+
+
+def _sba_fifo(dap, ap, cb, addr, nwords):
+    """같은 주소(FIFO Data 레지스터)를 nwords 회 연속 읽기. sbreadonaddr+sbreadondata 로
+    파이프라인: 주소쓰기가 첫 read 트리거, sbdata0 읽을 때마다 다음 read 트리거."""
+    dap.mem_write32(ap, cb + SBCS_OFF, _SB32 | (1 << 20) | (1 << 15))   # readonaddr+readondata
+    dap.mem_write32(ap, cb + SBADDR0_OFF, addr)
+    out = bytearray()
+    fails = 0
+    for _ in range(nwords):
+        v = dap.mem_read32(ap, cb + SBDATA0_OFF)
+        if v is None:
+            v, fails = 0, fails + 1
+        out += struct.pack("<I", v & 0xFFFFFFFF)
+    dap.mem_write32(ap, cb + SBCS_OFF, _SB32)                    # readondata 해제
+    return out, fails
 
 
 def trace_dump(dap, out_path, buf_size=0x7FFF):
@@ -654,44 +698,39 @@ def trace_dump(dap, out_path, buf_size=0x7FFF):
     if not te or not sink:
         print("  [trace-dump] json trace(te_base/sram_sink_base) 설정 없음")
         return EXIT_CONFIG
-    ap = _trace_ap(dap, te)
-    if ap is None:
-        print("  [trace-dump] 트레이스 레지스터 접근 AP 못 찾음")
+    sb = _sba_ready(dap)
+    if sb is None:
+        print("  [trace-dump] SBA(시스템버스) 사용 불가 — 트레이스 레지스터 접근 못 함")
         return EXIT_CONFIG
-    nm, b = ap
-    print(f"\n  [trace-dump] via {nm}(DP:0x{b:X}) sink=0x{sink:X}")
+    ap, cb = sb
+    print(f"\n  [trace-dump] SBA via DM(0x{cb:X}) sink=0x{sink:X}")
     # TE/TF disable (bit1) — 안정된 버퍼 읽기용.
-    for name, reg in (("TE", te), ("TF", funnel)):
+    for reg in (te, funnel):
         if reg:
-            v = dap.mem_read32(b, reg)
+            v = _sba_read(dap, ap, cb, reg)
             if v is not None:
-                dap.mem_write32(b, reg, v & ~0x2)
+                _sba_write(dap, ap, cb, reg, v & ~0x2)
     # 포인터 처리 (cmm 그대로)
-    W = dap.mem_read32(b, sink + 0x1C)
-    R = dap.mem_read32(b, sink + 0x20)
+    W = _sba_read(dap, ap, cb, sink + 0x1C)
+    R = _sba_read(dap, ap, cb, sink + 0x20)
     if W is None:
         print("  [trace-dump] W pointer 읽기 실패")
         return EXIT_CONFIG
     if W & 1:                                            # wrapped(full)
         nbytes = buf_size
-        dap.mem_write32(b, sink + 0x20, W & 0xFFFFFFFE)  # R = 가장 오래된 레코드
+        _sba_write(dap, ap, cb, sink + 0x20, W & 0xFFFFFFFE)   # R = 가장 오래된 레코드
         print(f"    wrapped(full) — {nbytes} bytes")
     else:
         nbytes = W
         if R:
-            dap.mem_write32(b, sink + 0x20, 0)
+            _sba_write(dap, ap, cb, sink + 0x20, 0)
         if W == 0:
             print("  [trace-dump] 버퍼 비어있음")
             return EXIT_OK
         print(f"    not-wrapped — {nbytes} bytes")
-    # Data 레지스터 반복 읽기
-    data = bytearray()
-    fails = 0
-    while len(data) < nbytes:
-        v = dap.mem_read32(b, sink + 0x24)
-        if v is None:
-            v, fails = 0, fails + 1
-        data += struct.pack("<I", v & 0xFFFFFFFF)
+    # Data 레지스터(FIFO) 버스트 읽기
+    data, fails = _sba_fifo(dap, ap, cb, sink + 0x24, (nbytes + 3) // 4)
+    data = data[:nbytes]
     try:
         with open(out_path, "wb") as f:
             f.write(bytes(data))
@@ -715,26 +754,21 @@ def trace_status(dap):
     if not te or not sink:
         print("  [trace-status] json 에 trace(te_base/sram_sink_base) 설정 없음")
         return
-    # 트레이스 레지스터에 닿는 AP 찾기(시스템버스 계열 우선).
-    apn = None
-    for nm in ("AXIAP1", "AHBAP1", "APBAP1", "APBAP4", "APBAP3"):
-        try:
-            b = ap_base(nm)
-        except KeyError:
-            continue
-        v = dap.mem_read32(b, te)
-        if v is not None and v not in DEAD_FINGERPRINTS:
-            apn = (nm, b, v)
-            break
-    if apn is None:
-        print(f"  [trace-status] TECTRL(0x{te:X})를 어떤 AP로도 못 읽음 — 접근방식/주소 재확인.")
+    # 트레이스 레지스터는 SBA(시스템버스)로만 접근된다.
+    sb = _sba_ready(dap)
+    if sb is None:
+        print("  [trace-status] SBA(시스템버스) 사용 불가 — 트레이스 레지스터 접근 못 함")
         return
-    nm, b, tectrl = apn
-    tfctrl = dap.mem_read32(b, funnel) if funnel else None
-    wptr = dap.mem_read32(b, sink + 0x1C)
-    rptr = dap.mem_read32(b, sink + 0x20)
+    ap, cb = sb
+    tectrl = _sba_read(dap, ap, cb, te)
+    if tectrl is None:
+        print(f"  [trace-status] TECTRL(0x{te:X}) SBA 읽기 실패")
+        return
+    tfctrl = _sba_read(dap, ap, cb, funnel) if funnel else None
+    wptr = _sba_read(dap, ap, cb, sink + 0x1C)
+    rptr = _sba_read(dap, ap, cb, sink + 0x20)
     te_en = (tectrl >> 1) & 1
-    print(f"\n  [trace-status] via {nm}(DP:0x{b:X}):")
+    print(f"\n  [trace-status] SBA via DM(0x{cb:X}):")
     print(f"    TECTRL(0x{te:X})={hx(tectrl)}  TE={'enabled' if te_en else 'DISABLED'}")
     if funnel:
         print(f"    TFCTRL(0x{funnel:X})={hx(tfctrl)}  "
