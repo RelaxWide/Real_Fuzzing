@@ -12,7 +12,7 @@
   "core_base_ncore": "0x81481000",
   "chain_tap_id": "0x5BA00477",
   "apbap3_idr_expect": "0x09130006",
-  "dead_fingerprints": ["0x0", "0xFFFFFFFF", "0xEAFFFFFE", "0xEAFFFFFC", "0x1", "0x40700"],
+  "dead_fingerprints": ["0x0", "0xFFFFFFFF", "0xEAFFFFFE", "0xEAFFFFFC", "0x1"],
   "sjtag_offsets": {
     "hw_version": "0x0", "state": "0x4", "chip_id0": "0x8", "chip_id1": "0xC",
     "resp_domain": "0x10", "resp_lv0": "0x14", "resp_lv1": "0x18",
