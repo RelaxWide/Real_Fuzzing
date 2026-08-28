@@ -32,6 +32,7 @@ import hashlib
 import math
 import re
 import shlex
+import struct
 import subprocess
 import sys
 import time
@@ -628,6 +629,80 @@ def read_dmstatus(dap, core_base):
     return v, tag, alive
 
 
+def _trace_ap(dap, te):
+    """트레이스 레지스터(시스템버스)에 닿는 AP 를 찾는다. (name, base) 또는 None."""
+    for nm in ("AXIAP1", "AHBAP1", "APBAP1", "APBAP4", "APBAP3"):
+        try:
+            b = ap_base(nm)
+        except KeyError:
+            continue
+        v = dap.mem_read32(b, te)
+        if v is not None and v not in DEAD_FINGERPRINTS:
+            return nm, b
+    return None
+
+
+def trace_dump(dap, out_path, buf_size=0x7FFF):
+    """NexusTracedatadump.cmm 이식 — ETB(온칩 SRAM sink)의 raw Nexus 트레이스를 덤프.
+    TE/TF disable → W/R 포인터로 유효구간 계산(wrap 처리) → Data 레지스터(+0x24)를
+    반복 읽어 추출 → .bin 저장. Ozone 이 이 SiFive sink 를 못 읽을 때 우리가 직접 뽑는다.
+    ETB 맵: +0x1C=Wptr(bit0=wrap), +0x20=Rptr, +0x24=Data(읽으면 자동 advance)."""
+    tr = RISCV_ADDRS.get("trace", {})
+    te = _a(tr.get("te_base", 0))
+    sink = _a(tr.get("sram_sink_base", 0))
+    funnel = _a(tr.get("funnel_base") or 0)
+    if not te or not sink:
+        print("  [trace-dump] json trace(te_base/sram_sink_base) 설정 없음")
+        return EXIT_CONFIG
+    ap = _trace_ap(dap, te)
+    if ap is None:
+        print("  [trace-dump] 트레이스 레지스터 접근 AP 못 찾음")
+        return EXIT_CONFIG
+    nm, b = ap
+    print(f"\n  [trace-dump] via {nm}(DP:0x{b:X}) sink=0x{sink:X}")
+    # TE/TF disable (bit1) — 안정된 버퍼 읽기용.
+    for name, reg in (("TE", te), ("TF", funnel)):
+        if reg:
+            v = dap.mem_read32(b, reg)
+            if v is not None:
+                dap.mem_write32(b, reg, v & ~0x2)
+    # 포인터 처리 (cmm 그대로)
+    W = dap.mem_read32(b, sink + 0x1C)
+    R = dap.mem_read32(b, sink + 0x20)
+    if W is None:
+        print("  [trace-dump] W pointer 읽기 실패")
+        return EXIT_CONFIG
+    if W & 1:                                            # wrapped(full)
+        nbytes = buf_size
+        dap.mem_write32(b, sink + 0x20, W & 0xFFFFFFFE)  # R = 가장 오래된 레코드
+        print(f"    wrapped(full) — {nbytes} bytes")
+    else:
+        nbytes = W
+        if R:
+            dap.mem_write32(b, sink + 0x20, 0)
+        if W == 0:
+            print("  [trace-dump] 버퍼 비어있음")
+            return EXIT_OK
+        print(f"    not-wrapped — {nbytes} bytes")
+    # Data 레지스터 반복 읽기
+    data = bytearray()
+    fails = 0
+    while len(data) < nbytes:
+        v = dap.mem_read32(b, sink + 0x24)
+        if v is None:
+            v, fails = 0, fails + 1
+        data += struct.pack("<I", v & 0xFFFFFFFF)
+    try:
+        with open(out_path, "wb") as f:
+            f.write(bytes(data))
+    except OSError as e:
+        print(f"  [trace-dump] 저장 실패: {e}")
+        return EXIT_CONFIG
+    print(f"  [trace-dump] 저장 {out_path}  {len(data)} bytes (읽기실패 {fails})")
+    print("  → raw Nexus(BTM/HTM). 디코드하면 실행 PC/커버리지 (다음 단계).")
+    return EXIT_OK
+
+
 def trace_status(dap):
     """N-Trace 상태 실측(read-only): TECTRL/TFCTRL enable 비트 + ETB write/read 포인터.
     Ozone 'No Data' 원인을 가른다 — 인코더 미enable / 버퍼 빔(실행無) / 데이터有(디코드문제).
@@ -1133,6 +1208,9 @@ def main():
     ap.add_argument("--trace-status", action="store_true",
                     help="N-Trace 상태 실측: TECTRL/TFCTRL enable + ETB write pointer. "
                          "Ozone 'No Data' 원인 판별(인코더 미enable/버퍼빔/디코드문제). read-only")
+    ap.add_argument("--trace-dump", nargs="?", const="trace.bin", default=None, metavar="PATH",
+                    help="온칩 트레이스 버퍼(ETB)를 직접 덤프해 raw Nexus .bin 저장 "
+                         "(NexusTracedatadump.cmm 이식). 기본 trace.bin")
     ap.add_argument("--dm-halt", action="store_true",
                     help="hart 를 halt 시도(dmcontrol.haltreq)→allhalted 확인 후 resume. "
                          "J-Link 'Failed to identify'가 J-Link 설정 문제인지 코어측 게이트인지 판별. "
@@ -1254,6 +1332,8 @@ def main():
         if a.trace_status:
             trace_status(dap)
             return EXIT_OK
+        if a.trace_dump is not None:
+            return trace_dump(dap, a.trace_dump)
         if a.dm_halt:
             dm_activate(dap, a.core_base)
             dm_halt(dap, a.core_base, a.hart or 0)
