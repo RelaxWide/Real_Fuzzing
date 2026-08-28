@@ -29,5 +29,12 @@
     "sign_tool": "/path/to/signer.exe",
     "tool_prefix": "wine",
     "word_order": "t32-negative"
+  },
+  "trace": {
+    "_comment": "N-Trace 컴포넌트(placeholder). 실기: te_base/sram_sink_base 채움. mem_type 2=SBA.",
+    "te_base": "0xF0000000",
+    "funnel_base": "0xF0080000",
+    "sram_sink_base": "0xF0080000",
+    "mem_type": 2
   }
 }

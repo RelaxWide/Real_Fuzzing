@@ -29,5 +29,12 @@
     "sign_tool": "",
     "tool_prefix": "wine",
     "word_order": "t32-negative"
+  },
+  "trace": {
+    "_comment": "SiFive N-Trace (ViewNexusTracedump.cmm 유래). SB:=SBA → mem_type=2. te_base 는 코어0(코어n=+0x1000*n).",
+    "te_base": "0xFD000000",
+    "funnel_base": "0xFD180000",
+    "sram_sink_base": "0xFD180000",
+    "mem_type": 2
   }
 }

@@ -999,6 +999,26 @@ def gen_jlinkscript(out_path, template="sf_e76.JLinkScript.template"):
         if k not in text:
             print(f"⚠ 템플릿에 placeholder {k} 없음", file=sys.stderr)
         text = text.replace(k, v)
+
+    # ── N-Trace 설정(json "trace" 있으면 자동 삽입) — ViewNexusTracedump.cmm 등가 ──
+    #   RISCV_SetTEBaseAddr(인코더)/SetTFBaseAddr(funnel)/SetSRAMBaseAddr(온칩 sink).
+    #   MemTypeToUse: 2=SBA(T32 SB:), 1=DMI, 0=Core. 커버리지(Ozone Trace)용.
+    tr = RISCV_ADDRS.get("trace", {})
+    trace_msg = ""
+    if tr.get("te_base") and tr.get("sram_sink_base"):
+        mt = tr.get("mem_type", 2)
+        lines = [f'  JLINK_ExecCommand("RISCV_SetTEBaseAddr = 0x{_a(tr["te_base"]):X} '
+                 f'MemTypeToUse={mt}");']
+        if tr.get("funnel_base"):
+            lines.append(f'  JLINK_ExecCommand("RISCV_SetTFBaseAddr = '
+                         f'0x{_a(tr["funnel_base"]):X} MemTypeToUse={mt}");')
+        lines.append(f'  JLINK_ExecCommand("RISCV_SetSRAMBaseAddr = '
+                     f'0x{_a(tr["sram_sink_base"]):X} MemTypeToUse={mt}");')
+        block = "\n  // ── N-Trace (커버리지) ──\n" + "\n".join(lines) + "\n"
+        # ConfigTargetSettings 의 return 0; 앞에 삽입.
+        text = text.replace("\n  return 0;", block + "\n  return 0;", 1)
+        trace_msg = f", TE=0x{_a(tr['te_base']):X}, SRAM=0x{_a(tr['sram_sink_base']):X}"
+
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(text)
@@ -1006,7 +1026,7 @@ def gen_jlinkscript(out_path, template="sf_e76.JLinkScript.template"):
         print(f"생성 실패({out_path}): {e}", file=sys.stderr)
         return EXIT_CONFIG
     print(f"생성: {out_path}  (APBAP1={subs['<APBAP1_DP_BASE>']}, "
-          f"DM_BASE={subs['<DM_BASE>']})  ← sjtag_addrs.json 값")
+          f"DM_BASE={subs['<DM_BASE>']}{trace_msg})  ← sjtag_addrs.json 값")
     return EXIT_OK
 
 
