@@ -997,9 +997,9 @@ def dm_scan(dap, core_base, window=0x100):
     read-only(dmcontrol 등 쓰기 없음) — 인증 카운터 무관."""
     dm_ap = DM_AP.get(core_base)
     if dm_ap is None:
-        print(f"  [dm-scan] core_base 0x{core_base:X} AP 매핑 미상")
+        print(f"  [dm-scan] core_base AP 매핑 미상")
         return []
-    print(f"\n  [dm-scan] DM AP(DP:0x{dm_ap:X}) @ 0x{core_base:X} +0..0x{window:X} 스캔:")
+    print(f"\n  [dm-scan] DM AP @ core_base +0..0x{window:X} 스캔 (주소는 sjtag_addrs.json):")
     found = []
     for off in range(0, window, 4):
         v = dap.mem_read32(dm_ap, core_base + off)
@@ -1030,9 +1030,9 @@ def dm_activate(dap, core_base):
     ★ dmactive 는 코어를 멈추지 않는 표준 DM 기동 write — SJTAG 인증과 무관(카운터 무소모)."""
     dm_ap = DM_AP.get(core_base)
     if dm_ap is None:
-        print(f"  [dm-activate] core_base 0x{core_base:X} AP 매핑 미상")
+        print(f"  [dm-activate] core_base AP 매핑 미상")
         return False
-    print(f"\n  [dm-activate] dmcontrol(@0x{core_base + DMCONTROL_OFF:X}) <= dmactive=1")
+    print(f"\n  [dm-activate] dmcontrol(core_base+DMCONTROL) <= dmactive=1")
     dap.clear_sticky()
     ok = dap.mem_write32(dm_ap, core_base + DMCONTROL_OFF, 0x1)
     dap.clear_sticky()
@@ -1102,7 +1102,7 @@ def dm_halt(dap, core_base, hart=0):
     ★ 잠깐 코어를 멈췄다 재개한다(디버그 표준 동작). SJTAG 인증 카운터 무관."""
     dm_ap = DM_AP.get(core_base)
     if dm_ap is None:
-        print(f"  [dm-halt] core_base 0x{core_base:X} AP 매핑 미상")
+        print(f"  [dm-halt] core_base AP 매핑 미상")
         return False
     HALTREQ, RESUMEREQ, DMACTIVE = 1 << 31, 1 << 30, 0x1
     hs = (hart & 0x3FF) << 16                       # hartsello (dmcontrol[25:16])
@@ -1181,7 +1181,7 @@ def pc_probe(dap, core_base, n=64, hart=0):
     ★ 코어를 멈추지 않는다(진짜 비침습인지 자체가 판정 대상). 인증 카운터 무관."""
     dm_ap = DM_AP.get(core_base)
     if dm_ap is None:
-        print(f"  [pc-probe] core_base 0x{core_base:X} AP 매핑 미상")
+        print(f"  [pc-probe] core_base AP 매핑 미상")
         return False
     ERRS = {0: "none", 1: "busy", 2: "not-supported", 3: "exception",
             4: "halt/resume", 5: "bus", 7: "other"}
@@ -1275,7 +1275,7 @@ def diag_sweep(dap):
             cls, fail = f"{hx(idr)}(미응답)", fail + 1
         else:
             cls, live = "LIVE", live + 1
-        print(f"    {name:8}(0x{base:X}, {kind:7}) IDR={hx(idr):>12}  [{cls}]")
+        print(f"    {name:8}({kind:7}) IDR={hx(idr):>12}  [{cls}]")
     print(f"  [diag] sticky: {dap.sticky()}")
     print(f"  [diag] LIVE {live} / SUSPECT {susp} / 실패 {fail}")
     if live == 0:
@@ -1624,8 +1624,8 @@ def main():
             print("  ⚠ 도구가 .exe 인데 리눅스에서 런처 없이 직접 exec 하려 한다. "
                   "실행 안 되면 --tool-prefix wine 를 붙여라.", file=sys.stderr)
     if a.core_base not in DM_AP:
-        print(f"core_base 0x{a.core_base:X} 는 DM-AP 매핑에 없다 "
-              f"(가능: {', '.join(hex(k) for k in DM_AP)})", file=sys.stderr)
+        print(f"core_base 가 DM-AP 매핑에 없다 "
+              f"(가능: main/ncore — 주소는 sjtag_addrs.json)", file=sys.stderr)
         return EXIT_CONFIG
     if not valid_timeout(a.timeout):
         print(f"--timeout 은 유한한 양수여야 한다 (받음: {a.timeout})", file=sys.stderr)
@@ -1633,9 +1633,9 @@ def main():
 
     mode = "EXECUTE(쓰기)" if a.execute else "PROBE(read-only)"
     print(f"\n{'=' * 66}\n {VERSION}  [{mode}]\n{'=' * 66}")
-    print(f"  SJTAG_BASE=0x{base:X} (APBAP3 DP:0x{APBAP3_BASE:X})  tool={tool}"
+    print(f"  SJTAG_BASE·APBAP3 DP=(주소는 sjtag_addrs.json)  tool={tool}"
           + (f"  launcher={' '.join(tool_prefix)}" if tool_prefix else ""))
-    print(f"  DM 검증 CoreBase=0x{a.core_base:X}→AP DP:0x{DM_AP[a.core_base]:X}  "
+    print(f"  DM 검증 CoreBase→AP DP=(주소는 sjtag_addrs.json)  "
           f"power={a.power}  tif-init={a.tif_init}  tap={a.tap_script}  "
           f"word-order={a.word_order}")
 
@@ -1722,7 +1722,7 @@ def main():
                      else "→ AUTH_PASS 없음(미인증/리셋됨)"))
 
         before = read_dmstatus(dap, a.core_base)
-        print(f"  [before] dmstatus(추정) @0x{a.core_base + DMSTATUS_OFF:X} "
+        print(f"  [before] dmstatus(추정) @core_base+DMSTATUS "
               f"= {hx(before[0])}  {before[1]}")
 
         if not a.execute:
@@ -1784,7 +1784,7 @@ def main():
         dm_scan(dap, a.core_base, a.dm_window)
 
         after = read_dmstatus(dap, a.core_base)
-        print(f"  [after ] dmstatus(추정) @0x{a.core_base + DMSTATUS_OFF:X} "
+        print(f"  [after ] dmstatus(추정) @core_base+DMSTATUS "
               f"= {hx(after[0])}  {after[1]}")
 
         # ── 결과 분류 — status 별로 인과 표현을 분리한다(리뷰 #1) ────────
