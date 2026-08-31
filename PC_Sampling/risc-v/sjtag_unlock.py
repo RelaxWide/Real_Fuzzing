@@ -688,7 +688,14 @@ def _sba_fifo(dap, ap, cb, addr, nwords):
     return out, fails
 
 
-def trace_dump(dap, out_path, buf_size=0x7FFF):
+# 온칩 ETB 크기 = 32KB. Wptr byte 오프셋의 wrap 주기(= modulo). 전 트레이스 코드 공통 상수.
+ETB_SIZE = 0x8000
+# wrapped(full) 시 읽을 바이트 수 = size−1(마지막 워드 예약; NexusTracedatadump.cmm 이식값
+# 0x7FFF 과 동일). ★ 실기서 off-by-one 여부 확인 권장.
+ETB_FULL_BYTES = ETB_SIZE - 1
+
+
+def trace_dump(dap, out_path, buf_size=ETB_FULL_BYTES):
     """NexusTracedatadump.cmm 이식 — ETB(온칩 SRAM sink)의 raw Nexus 트레이스를 덤프.
     TE/TF disable → W/R 포인터로 유효구간 계산(wrap 처리) → Data 레지스터(+0x24)를
     반복 읽어 추출 → .bin 저장. Ozone 이 이 SiFive sink 를 못 읽을 때 우리가 직접 뽑는다.
@@ -705,7 +712,7 @@ def trace_dump(dap, out_path, buf_size=0x7FFF):
         print("  [trace-dump] SBA(시스템버스) 사용 불가 — 트레이스 레지스터 접근 못 함")
         return EXIT_CONFIG
     ap, cb = sb
-    print(f"\n  [trace-dump] SBA via DM(0x{cb:X}) sink=0x{sink:X}")
+    print("\n  [trace-dump] SBA via DM  (te/sink 주소는 sjtag_addrs.json)")
     # TE/TF disable (bit1) — 안정된 버퍼 읽기용.
     for reg in (te, funnel):
         if reg:
@@ -764,18 +771,19 @@ def trace_status(dap):
     ap, cb = sb
     tectrl = _sba_read(dap, ap, cb, te)
     if tectrl is None:
-        print(f"  [trace-status] TECTRL(0x{te:X}) SBA 읽기 실패")
+        print("  [trace-status] TECTRL SBA 읽기 실패 (주소는 sjtag_addrs.json)")
         return
     tfctrl = _sba_read(dap, ap, cb, funnel) if funnel else None
     wptr = _sba_read(dap, ap, cb, sink + 0x1C)
     rptr = _sba_read(dap, ap, cb, sink + 0x20)
     te_en = (tectrl >> 1) & 1
-    print(f"\n  [trace-status] SBA via DM(0x{cb:X}):")
-    print(f"    TECTRL(0x{te:X})={hx(tectrl)}  TE={'enabled' if te_en else 'DISABLED'}")
+    # ★ 콘솔에 절대주소 미출력(사내 Claude Code 에 보여도 안전). 레지스터 값/상대오프셋만.
+    print("\n  [trace-status] SBA via DM  (주소는 sjtag_addrs.json):")
+    print(f"    TECTRL={hx(tectrl)}  TE={'enabled' if te_en else 'DISABLED'}")
     if funnel:
-        print(f"    TFCTRL(0x{funnel:X})={hx(tfctrl)}  "
+        print(f"    TFCTRL={hx(tfctrl)}  "
               f"TF={'enabled' if (tfctrl and (tfctrl >> 1) & 1) else 'DISABLED'}")
-    print(f"    ETB Wptr(0x{sink + 0x1C:X})={hx(wptr)}  Rptr={hx(rptr)}"
+    print(f"    ETB Wptr(sink+0x1C)={hx(wptr)}  Rptr={hx(rptr)}"
           + (f"  wrap={wptr & 1}" if wptr is not None else ""))
     # 판정
     if not te_en:
@@ -790,7 +798,7 @@ def trace_status(dap):
 # ── Phase 0: 실현성 실측 (--trace-arm / --trace-delta) ────────────────
 #   목적: 명령어 1개가 만든 트레이스가 32KB ETB 에 들어오는가를 delta 로 확정.
 #   arm(버퍼 클리어 + TE enable + StallEna=0) → 동작 실행 → delta(생성 바이트/overflow).
-TRACE_BUF = 0x8000                 # 온칩 ETB 32KB
+TRACE_BUF = ETB_SIZE               # 단일 상수(trace_dump 와 동일 — 불일치 제거)
 TRACE_CORE_STRIDE = 0x1000         # 코어 n 의 TE = te_base + 0x1000*n
 TRACE_CORE_MAX = 8                 # 코어 TE 탐색 상한(유효한 것만 출력)
 TE_EN_BITS = (1 << 0) | (1 << 1) | (1 << 2)   # active|enable|instTracing (실측 0x69→0x6F)
@@ -822,7 +830,7 @@ def _probe_core_tes(dap, ap, cb, te_base):
             continue
         comptype = (impl >> 8) & 0xF
         ok = comptype == 0x1
-        print(f"      core{n} TE=0x{base:X}  trTeImpl={hx(impl)}  "
+        print(f"      core{n} (TE+0x{TRACE_CORE_STRIDE * n:X})  trTeImpl={hx(impl)}  "
               f"compType={comptype}{'  ✓TE' if ok else '  (TE 아님)'}")
         if ok:
             found.append(n)
@@ -847,7 +855,8 @@ def trace_arm(dap, core=0):
         return EXIT_CONFIG
     ap, cb = sb
     te = te_base + TRACE_CORE_STRIDE * core
-    print(f"\n  [trace-arm] SBA via DM(0x{cb:X})  대상 core{core} TE=0x{te:X}")
+    # ★ 콘솔에 절대주소(DM/te/sink) 미출력 — 이 출력을 사내 Claude Code 에 보여도 안전하게.
+    print(f"\n  [trace-arm] 대상 core{core} (TE+0x{TRACE_CORE_STRIDE * core:X})")
 
     valid = _probe_core_tes(dap, ap, cb, te_base)
     if valid and core not in valid:
@@ -899,8 +908,11 @@ def trace_arm(dap, core=0):
     # ★ 상태파일엔 기밀 절대주소(te/sink)를 넣지 않는다 — 이 파일은 런타임 산출물이라
     #   root-lock 대상(sjtag_addrs.json)이 아니어서 비루트가 읽을 수 있다. sink 는
     #   --trace-delta 가 json 에서 재로드. 여기엔 비-기밀(코어 인덱스·버퍼내 오프셋)만.
+    if not cleared:
+        print("    ⚠ 버퍼 클리어 미작동(Wptr RO 로 추정) — overflow 판정 정확도 저하. "
+              "wrap_at_arm=1 이면 --trace-delta 가 측정 무효로 처리.")
     state = {"core": core, "baseline_byte": base_byte, "wrap_at_arm": w_raw & 1,
-             "buf": TRACE_BUF, "ts": time.time()}
+             "cleared": cleared, "buf": TRACE_BUF, "ts": time.time()}
     try:
         with open(_TRACE_STATE, "w") as f:
             json.dump(state, f)
@@ -932,26 +944,34 @@ def trace_delta(dap):
         return EXIT_CONFIG
     ap, cb = sb
     base_byte, buf = st["baseline_byte"], st.get("buf", TRACE_BUF)
+    wrap_at_arm = st.get("wrap_at_arm", 0)
+    cleared = st.get("cleared", base_byte == 0 and wrap_at_arm == 0)
     w_raw = _sba_read(dap, ap, cb, sink + 0x1C)
     if w_raw is None:
         print("  [trace-delta] Wptr 읽기 실패")
         return EXIT_CONFIG
     now_byte = w_raw & 0xFFFFFFFE
     now_wrap = w_raw & 1
+    print(f"\n  [trace-delta] core{st.get('core')}  (주소는 sjtag_addrs.json)")
+    print(f"    baseline byte=0x{base_byte:X}  now Wptr={hx(w_raw)} "
+          f"(byte=0x{now_byte:X}, wrap={now_wrap})  arm클리어={cleared}")
 
-    # overflow 판정: arm 때 클리어(baseline≈0)했으므로 wrap=1 이면 버퍼 초과.
-    overflow = bool(now_wrap) or (st.get("wrap_at_arm", 0) == 0 and now_wrap)
-    if now_byte >= base_byte and not now_wrap:
-        delta = now_byte - base_byte
-    else:                                                    # 되돌아감/wrap → modulo
-        delta = (now_byte - base_byte) % buf
-        overflow = overflow or now_byte < base_byte
-    print(f"\n  [trace-delta] core{st.get('core')} sink=0x{sink:X}")
-    print(f"    baseline=0x{base_byte:X}  now Wptr={hx(w_raw)} (byte=0x{now_byte:X}, "
-          f"wrap={now_wrap})")
+    # arm 시점에 이미 wrap 이면(=클리어 no-op) wrap 플래그로 신규 overflow 를 못 가른다.
+    if wrap_at_arm:
+        print("    ⚠ arm 시점에 이미 buffer wrap(클리어 미작동) — 신규 overflow 판정 불가.")
+        print("  [trace-delta] 측정 무효 — arm 전 버퍼가 비어야 정확. 전원사이클/실제 리셋 후 "
+              "재-arm 하거나, ETB 클리어(Wptr 리셋)가 실기서 되는지 확인.")
+        return EXIT_OK
+    # 여기서 wrap_at_arm=0 이 확정 → now_wrap=1 이면 arm 이후 새로 찬 것(진짜 overflow).
+    if now_wrap:
+        overflow, delta = True, buf
+    elif now_byte < base_byte:                               # wrap 플래그 없이 후퇴 = 놓친 wrap 의심
+        overflow, delta = True, (now_byte - base_byte) % buf
+    else:
+        overflow, delta = False, now_byte - base_byte
 
     if overflow:
-        print(f"    ❌ overflow(버퍼 wrap) — 생성량 ≥ {buf} bytes(32KB), 정확값 불명.")
+        print(f"    ❌ overflow — 생성량 ≥ {buf} bytes(=ETB 32KB), 정확값 불명.")
         print("  [trace-delta] 판정: 명령 1개가 이미 버퍼를 넘김 → per-op 정확 캡처 불가. "
               "TE 트리거/주소필터로 창을 좁혀야 함(스펙 권장 정식 완화책) → 관심 함수/모듈 "
               "범위로 재시도.")
