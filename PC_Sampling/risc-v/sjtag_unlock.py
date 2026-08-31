@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import math
+import os
 import re
 import shlex
 import struct
@@ -785,6 +787,182 @@ def trace_status(dap):
         print("  → 버퍼에 데이터 있음(Wptr>0). Ozone No Data 면 디코드/버퍼읽기 문제.")
 
 
+# ── Phase 0: 실현성 실측 (--trace-arm / --trace-delta) ────────────────
+#   목적: 명령어 1개가 만든 트레이스가 32KB ETB 에 들어오는가를 delta 로 확정.
+#   arm(버퍼 클리어 + TE enable + StallEna=0) → 동작 실행 → delta(생성 바이트/overflow).
+TRACE_BUF = 0x8000                 # 온칩 ETB 32KB
+TRACE_CORE_STRIDE = 0x1000         # 코어 n 의 TE = te_base + 0x1000*n
+TRACE_CORE_MAX = 8                 # 코어 TE 탐색 상한(유효한 것만 출력)
+TE_EN_BITS = (1 << 0) | (1 << 1) | (1 << 2)   # active|enable|instTracing (실측 0x69→0x6F)
+TE_STALLENA_BIT = 1 << 13          # trTeInstStallEna — 0=lossy(무침습), 1=stall(침습)
+_TRACE_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".trace_state.json")
+
+
+def _trace_cfg():
+    """json trace 설정 로드 → (te_base, sink, funnel) 또는 None."""
+    tr = RISCV_ADDRS.get("trace", {})
+    te = _a(tr.get("te_base", 0))
+    sink = _a(tr.get("sram_sink_base", 0))
+    funnel = _a(tr.get("funnel_base") or 0)
+    if not te or not sink:
+        print("  [trace] json 에 trace(te_base/sram_sink_base) 설정 없음")
+        return None
+    return te, sink, funnel
+
+
+def _probe_core_tes(dap, ap, cb, te_base):
+    """코어별 TE 존재를 trTeImpl(+0x004) 의 trTeCompType[11:8]==0x1 로 검증(수정 #4/용어).
+    (te_base + 0x1000*n). 유효 코어 리스트 출력 — Phase A 대상 코어 선별 근거."""
+    print("    [core-TE 탐색] trTeImpl(+0x4) trTeCompType==0x1 검증:")
+    found = []
+    for n in range(TRACE_CORE_MAX):
+        base = te_base + TRACE_CORE_STRIDE * n
+        impl = _sba_read(dap, ap, cb, base + 0x004)
+        if impl is None or impl in (0, 0xFFFFFFFF):
+            continue
+        comptype = (impl >> 8) & 0xF
+        ok = comptype == 0x1
+        print(f"      core{n} TE=0x{base:X}  trTeImpl={hx(impl)}  "
+              f"compType={comptype}{'  ✓TE' if ok else '  (TE 아님)'}")
+        if ok:
+            found.append(n)
+    if not found:
+        print("      ⚠ 유효 TE 못 찾음 — te_base 가 trTeControl(+0x0) 이 아니거나 "
+              "코어 스트라이드가 0x1000 이 아닐 수 있음(코드리뷰/토폴로지 확인).")
+    return found
+
+
+def trace_arm(dap, core=0):
+    """Phase 0 arm: 선택 코어의 TE enable(StallEna=0=무침습) + 버퍼 클리어 + Wptr 베이스라인
+    을 상태파일에 기록. ★코어 실행에 무간섭(트레이스 레지스터 write 만). 인증 카운터 무관.
+    수정 반영: StallEna=0 명시 write(#1), 한 번에 1 TE 만 켜 단일소스(#3),
+    코어별 trTeImpl 탐색(#4), Wptr wrap 비트 마스킹(#2)."""
+    cfg = _trace_cfg()
+    if cfg is None:
+        return EXIT_CONFIG
+    te_base, sink, funnel = cfg
+    sb = _sba_ready(dap)
+    if sb is None:
+        print("  [trace-arm] SBA 사용 불가 — 트레이스 레지스터 접근 못 함")
+        return EXIT_CONFIG
+    ap, cb = sb
+    te = te_base + TRACE_CORE_STRIDE * core
+    print(f"\n  [trace-arm] SBA via DM(0x{cb:X})  대상 core{core} TE=0x{te:X}")
+
+    valid = _probe_core_tes(dap, ap, cb, te_base)
+    if valid and core not in valid:
+        print(f"    ⚠ core{core} 는 유효 TE 목록 {valid} 에 없음 — 그래도 진행(실측 확인용)")
+
+    # 단일소스 보장(#3): 다른 코어 TE 는 전부 끄고(bit1/2 clear) 선택 코어만 켠다.
+    for n in range(TRACE_CORE_MAX):
+        if n == core:
+            continue
+        other = te_base + TRACE_CORE_STRIDE * n
+        v = _sba_read(dap, ap, cb, other + 0x004)
+        if v is not None and ((v >> 8) & 0xF) == 0x1:        # 유효 TE 만
+            cur = _sba_read(dap, ap, cb, other)
+            if cur is not None:
+                _sba_write(dap, ap, cb, other, cur & ~((1 << 1) | (1 << 2)))
+
+    # 선택 TE enable + StallEna=0 (#1). before/after 출력.
+    before = _sba_read(dap, ap, cb, te)
+    if before is None:
+        print("  [trace-arm] TECTRL 읽기 실패")
+        return EXIT_CONFIG
+    want = (before | TE_EN_BITS) & ~TE_STALLENA_BIT
+    _sba_write(dap, ap, cb, te, want)
+    after = _sba_read(dap, ap, cb, te)
+    print(f"    TECTRL {hx(before)} → {hx(after)}  "
+          f"(enable bit1={(after or 0) >> 1 & 1}, StallEna bit13={(after or 0) >> 13 & 1})")
+    if after is not None and ((after >> 13) & 1):
+        print("    ⚠ StallEna=1 로 남음 — 이 칩의 TECTRL 은 bit13 이 StallEna 가 아닐 수 있다. "
+              "stall(침습) 위험 → 실기서 TECTRL 비트맵 확인 필요.")
+
+    # funnel enable(bit1) — 라우팅(수정 #3: 소스선택은 Phase A 과제, 여기선 기존 동작 유지)
+    if funnel:
+        fv = _sba_read(dap, ap, cb, funnel)
+        if fv is not None:
+            _sba_write(dap, ap, cb, funnel, fv | (1 << 1))
+
+    # 버퍼 클리어(best-effort): Rptr=0, Wptr=0 시도 후 리드백. Wptr RO 면 베이스라인으로 대체.
+    _sba_write(dap, ap, cb, sink + 0x20, 0)                   # Rptr
+    _sba_write(dap, ap, cb, sink + 0x1C, 0)                   # Wptr(가능하면)
+    w_raw = _sba_read(dap, ap, cb, sink + 0x1C)
+    if w_raw is None:
+        print("  [trace-arm] Wptr 읽기 실패")
+        return EXIT_CONFIG
+    base_byte = w_raw & 0xFFFFFFFE                            # bit0=wrap 마스킹(#2)
+    cleared = base_byte == 0 and (w_raw & 1) == 0
+    print(f"    ETB Wptr={hx(w_raw)}  baseline byte=0x{base_byte:X}  "
+          f"클리어={'성공' if cleared else '미지원→현재값을 베이스라인으로'}")
+
+    state = {"te": te, "sink": sink, "funnel": funnel, "core": core,
+             "baseline_byte": base_byte, "wrap_at_arm": w_raw & 1,
+             "buf": TRACE_BUF, "ts": time.time()}
+    try:
+        with open(_TRACE_STATE, "w") as f:
+            json.dump(state, f)
+    except OSError as e:
+        print(f"  [trace-arm] 상태 저장 실패({_TRACE_STATE}): {e}")
+        return EXIT_CONFIG
+    print(f"  [trace-arm] ✅ armed. 이제 대상 동작(명령 1개 등) 실행 후 --trace-delta.")
+    return EXIT_OK
+
+
+def trace_delta(dap):
+    """Phase 0 delta: arm 이후 생성된 트레이스 바이트 수(현재 Wptr − 베이스라인)와 overflow
+    여부를 리턴. wrap 비트 마스킹 + modulo-buffer(#2). 판정: delta << 32KB → per-op 정확
+    캡처 가능(→Phase A). overflow/과대 → 필터/트리거로 창 좁힘(스펙 권장 완화책)."""
+    try:
+        with open(_TRACE_STATE) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        print(f"  [trace-delta] 상태파일 없음/손상 — 먼저 --trace-arm 하라 ({_TRACE_STATE})")
+        return EXIT_CONFIG
+    sb = _sba_ready(dap)
+    if sb is None:
+        print("  [trace-delta] SBA 사용 불가")
+        return EXIT_CONFIG
+    ap, cb = sb
+    sink, base_byte, buf = st["sink"], st["baseline_byte"], st.get("buf", TRACE_BUF)
+    w_raw = _sba_read(dap, ap, cb, sink + 0x1C)
+    if w_raw is None:
+        print("  [trace-delta] Wptr 읽기 실패")
+        return EXIT_CONFIG
+    now_byte = w_raw & 0xFFFFFFFE
+    now_wrap = w_raw & 1
+
+    # overflow 판정: arm 때 클리어(baseline≈0)했으므로 wrap=1 이면 버퍼 초과.
+    overflow = bool(now_wrap) or (st.get("wrap_at_arm", 0) == 0 and now_wrap)
+    if now_byte >= base_byte and not now_wrap:
+        delta = now_byte - base_byte
+    else:                                                    # 되돌아감/wrap → modulo
+        delta = (now_byte - base_byte) % buf
+        overflow = overflow or now_byte < base_byte
+    print(f"\n  [trace-delta] core{st.get('core')} sink=0x{sink:X}")
+    print(f"    baseline=0x{base_byte:X}  now Wptr={hx(w_raw)} (byte=0x{now_byte:X}, "
+          f"wrap={now_wrap})")
+
+    if overflow:
+        print(f"    ❌ overflow(버퍼 wrap) — 생성량 ≥ {buf} bytes(32KB), 정확값 불명.")
+        print("  [trace-delta] 판정: 명령 1개가 이미 버퍼를 넘김 → per-op 정확 캡처 불가. "
+              "TE 트리거/주소필터로 창을 좁혀야 함(스펙 권장 정식 완화책) → 관심 함수/모듈 "
+              "범위로 재시도.")
+        return EXIT_OK
+    pct = 100.0 * delta / buf
+    fits = buf // delta if delta else 0
+    print(f"    생성 바이트 = {delta} bytes  (버퍼의 {pct:.1f}%, ≈ {fits} ops/buffer)")
+    if delta == 0:
+        print("  [trace-delta] ⚠ delta=0 — 트레이스 생성 안 됨(TE 미enable/대상 코어 아님/실행無). "
+              "arm 성공? 대상 코어 맞나? 실행 중이었나? 확인.")
+    elif pct < 50:
+        print("  [trace-delta] ✅ 판정: delta ≪ 32KB → per-op 정확 캡처 가능 → Phase A 진행.")
+    else:
+        print("  [trace-delta] ⚠ 판정: 여유 부족(>50%) — 창 좁히기(주소필터) 권장. "
+              "배경 활동 포함일 수 있으니 필터로 핸들러 영역만 격리 후 재측정.")
+    return EXIT_OK
+
+
 def dm_scan(dap, core_base, window=0x100):
     """DM 의 AP(APBAP1/2)로 core_base 주변을 훑어 RISC-V dmstatus(version 2/3)를 **실측**한다.
     dmstatus 는 [3:0]=version(2=0.13,3=1.0), [31:23]=reserved(0), [7]=authenticated 로
@@ -1333,6 +1511,15 @@ def main():
     ap.add_argument("--trace-dump", nargs="?", const="trace.bin", default=None, metavar="PATH",
                     help="온칩 트레이스 버퍼(ETB)를 직접 덤프해 raw Nexus .bin 저장 "
                          "(NexusTracedatadump.cmm 이식). 기본 trace.bin")
+    ap.add_argument("--trace-arm", action="store_true",
+                    help="Phase 0 arm: 선택 코어 TE enable(StallEna=0=무침습) + 버퍼 클리어 + "
+                         "Wptr 베이스라인 기록. 이후 대상 동작 실행하고 --trace-delta. 코어 실행 무간섭")
+    ap.add_argument("--trace-delta", action="store_true",
+                    help="Phase 0 delta: --trace-arm 이후 생성된 트레이스 바이트 수/overflow 리턴. "
+                         "delta ≪ 32KB 면 per-op 정확 캡처 가능(→Phase A), overflow 면 필터 필요")
+    ap.add_argument("--trace-core", type=int, default=0, metavar="N",
+                    help="--trace-arm 대상 코어(TE=te_base+0x1000*N). 기본 0. "
+                         "어느 코어가 명령 경로인지 코어별 delta 로 선별하는 데 사용")
     ap.add_argument("--dm-halt", action="store_true",
                     help="hart 를 halt 시도(dmcontrol.haltreq)→allhalted 확인 후 resume. "
                          "J-Link 'Failed to identify'가 J-Link 설정 문제인지 코어측 게이트인지 판별. "
@@ -1460,6 +1647,10 @@ def main():
             return EXIT_OK
         if a.trace_dump is not None:
             return trace_dump(dap, a.trace_dump)
+        if a.trace_arm:
+            return trace_arm(dap, a.trace_core)
+        if a.trace_delta:
+            return trace_delta(dap)
         if a.dm_halt:
             dm_activate(dap, a.core_base)
             dm_halt(dap, a.core_base, a.hart or 0)

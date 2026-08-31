@@ -386,3 +386,6 @@ output
 PC_Sampling/rag/bridge/
 # JLinkScript 실제값 파일(주소 채운 것) — 커밋 금지. .template 만 커밋.
 PC_Sampling/risc-v/sf_e76.JLinkScript
+# N-Trace Phase 0 런타임 산출물 — arm↔delta 베이스라인, raw 트레이스 덤프
+PC_Sampling/risc-v/.trace_state.json
+PC_Sampling/risc-v/*.bin
