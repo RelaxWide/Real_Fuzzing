@@ -896,12 +896,15 @@ def trace_arm(dap, core=0):
     print(f"    ETB Wptr={hx(w_raw)}  baseline byte=0x{base_byte:X}  "
           f"클리어={'성공' if cleared else '미지원→현재값을 베이스라인으로'}")
 
-    state = {"te": te, "sink": sink, "funnel": funnel, "core": core,
-             "baseline_byte": base_byte, "wrap_at_arm": w_raw & 1,
+    # ★ 상태파일엔 기밀 절대주소(te/sink)를 넣지 않는다 — 이 파일은 런타임 산출물이라
+    #   root-lock 대상(sjtag_addrs.json)이 아니어서 비루트가 읽을 수 있다. sink 는
+    #   --trace-delta 가 json 에서 재로드. 여기엔 비-기밀(코어 인덱스·버퍼내 오프셋)만.
+    state = {"core": core, "baseline_byte": base_byte, "wrap_at_arm": w_raw & 1,
              "buf": TRACE_BUF, "ts": time.time()}
     try:
         with open(_TRACE_STATE, "w") as f:
             json.dump(state, f)
+        os.chmod(_TRACE_STATE, 0o600)                         # 방어적: 소유자만
     except OSError as e:
         print(f"  [trace-arm] 상태 저장 실패({_TRACE_STATE}): {e}")
         return EXIT_CONFIG
@@ -919,12 +922,16 @@ def trace_delta(dap):
     except (OSError, ValueError):
         print(f"  [trace-delta] 상태파일 없음/손상 — 먼저 --trace-arm 하라 ({_TRACE_STATE})")
         return EXIT_CONFIG
+    cfg = _trace_cfg()                                        # sink 는 json(root-lock)에서 재로드
+    if cfg is None:
+        return EXIT_CONFIG
+    _te, sink, _funnel = cfg
     sb = _sba_ready(dap)
     if sb is None:
         print("  [trace-delta] SBA 사용 불가")
         return EXIT_CONFIG
     ap, cb = sb
-    sink, base_byte, buf = st["sink"], st["baseline_byte"], st.get("buf", TRACE_BUF)
+    base_byte, buf = st["baseline_byte"], st.get("buf", TRACE_BUF)
     w_raw = _sba_read(dap, ap, cb, sink + 0x1C)
     if w_raw is None:
         print("  [trace-delta] Wptr 읽기 실패")
