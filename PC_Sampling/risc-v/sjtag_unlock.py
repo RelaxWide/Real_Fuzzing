@@ -965,6 +965,94 @@ def dm_halt(dap, core_base, hart=0):
     return True
 
 
+def pc_probe(dap, core_base, n=64, hart=0):
+    """비침습 PC 샘플링 가능 여부 판정 — RISC-V Debug Spec §4.9.2:
+    'Access Register abstract command 이 hart **실행 중** dpc 읽기를 지원하면,
+    읽은 값은 최근 실행된 명령의 주소'. = ARM DWT PCSR 의 RISC-V 근사치(PM9M1 방식).
+    hart 를 **멈추지 않고** dpc(CSR 0x7b1)를 abstract 로 N회 읽어 가른다:
+      - cmderr=0 & 값이 변함 & hart 계속 running → 비침습 PC 샘플링 가능(원하던 그림)
+      - cmderr=2(not-supported)  → E76 미지원(misa 를 progbuf 로 읽던 이유) → halt 기반만
+      - cmderr=4(halt/resume)    → abstract 가 halt 요구 → 비침습 불가
+    ★ 코어를 멈추지 않는다(진짜 비침습인지 자체가 판정 대상). 인증 카운터 무관."""
+    dm_ap = DM_AP.get(core_base)
+    if dm_ap is None:
+        print(f"  [pc-probe] core_base 0x{core_base:X} AP 매핑 미상")
+        return False
+    ERRS = {0: "none", 1: "busy", 2: "not-supported", 3: "exception",
+            4: "halt/resume", 5: "bus", 7: "other"}
+    DMACTIVE, RESUMEREQ = 0x1, 1 << 30
+    hs = (hart & 0x3FF) << 16
+    ctl, sts = core_base + DMCONTROL_OFF, core_base + DMSTATUS_OFF
+    DPC = 0x7b1
+
+    def _run(v):     # 실행중=allrunning(bit11)/anyrunning(bit10), halt=allhalted(9)/anyhalted(8)
+        if v is None:
+            return "?"
+        return ("halted" if (v >> 9) & 1 else "running" if (v >> 11) & 1 else
+                "part-halt" if (v >> 8) & 1 else "part-run")
+
+    dap.clear_sticky()
+    dap.mem_write32(dm_ap, ctl, DMACTIVE | hs)          # DM 리셋해제(haltreq 안 함 = 안 멈춤)
+    st = dap.mem_read32(dm_ap, sts)
+    print(f"\n  [pc-probe] dmstatus={hx(st)} → hart {_run(st)}  "
+          f"(안 멈추고 dpc {n}회 abstract 읽기 — §4.9.2 판정)")
+    if st is not None and (st >> 9) & 1:                # halt 상태면 재개(실행 중이라야 유효한 판정)
+        print("    hart 가 halt 상태 → resume 후 probe (실행 중이라야 '실행 중 PC' 판정 유효)")
+        dap.mem_write32(dm_ap, ctl, RESUMEREQ | DMACTIVE | hs)
+        time.sleep(0.03)
+        dap.mem_write32(dm_ap, ctl, DMACTIVE | hs)
+
+    cmd = (2 << 20) | (1 << 17) | DPC                   # aarsize=32, transfer=1(read), regno=dpc
+    vals, errs = [], {}
+    t0 = time.time()
+    for _ in range(max(1, n)):
+        rc = _abstract_exec(dap, dm_ap, core_base, cmd)
+        if rc == 0:
+            v = dap.mem_read32(dm_ap, core_base + DM_DATA0_OFF)
+            if v is not None:
+                vals.append(v)
+        else:
+            errs[rc] = errs.get(rc, 0) + 1
+    dt = time.time() - t0
+    st_end = dap.mem_read32(dm_ap, sts)
+    dap.clear_sticky()
+
+    dead = set(DEAD_FINGERPRINTS) | {0, 0xFFFFFFFF}
+    live = [v for v in vals if v not in dead]
+    uniq = sorted(set(live))
+    rate = (len(vals) / dt) if dt > 0 else 0.0
+    print(f"    성공 읽기 {len(vals)}/{n}  live(비-dead) {len(live)}  고유값 {len(uniq)}  "
+          f"~{rate:.0f} samples/s")
+    if errs:
+        print("    cmderr: " + ", ".join(f"{ERRS.get(k, k)}×{c}"
+                                         for k, c in sorted(errs.items())))
+    for v in uniq[:8]:
+        print(f"      dpc=0x{v:08X}")
+    print(f"    probe 후 dmstatus={hx(st_end)} → hart {_run(st_end)}")
+
+    still_running = st_end is not None and not ((st_end >> 9) & 1)
+    if len(uniq) >= 2 and still_running:
+        print("  [pc-probe] ✅ 비침습 PC 샘플링 가능 — 실행 중 dpc 가 매번 유효/변화하고 "
+              "hart 는 계속 running. §4.9.2 지원. → --pc-sample(폴링, halt·decode 불필요) "
+              "구현 가능 = PM9M1 방식.")
+        return True
+    if errs.get(2):
+        print("  [pc-probe] ✗ not-supported(cmderr=2) — E76 은 abstract 레지스터 접근 미지원 "
+              "(우리가 misa 를 progbuf 로 읽던 것과 동일 원인). 비침습 dpc 불가 → "
+              "halt 기반 --pc-sample 또는 N-Trace.")
+        return False
+    if errs.get(4):
+        print("  [pc-probe] ✗ halt/resume(cmderr=4) — abstract dpc 읽기가 halt 를 요구 = "
+              "비침습 아님 → halt 기반 샘플링/N-Trace.")
+        return False
+    if len(vals) and len(uniq) <= 1:
+        print("  [pc-probe] ⚠ 읽기는 되나 값이 안 변함 — hart 가 tight loop/wfi 거나 dpc 가 "
+              "실행 중 갱신 안 됨. 실제 워크로드 돌리는 중 재시도(값 변하면 지원).")
+        return False
+    print("  [pc-probe] ⚠ 판정 불가 — 성공 읽기 없음/transport 불안정. power both + 재시도.")
+    return False
+
+
 # ── 세션 준비 — CMM 방식(prepare-only, connect 없음) ─────────────────
 def diag_sweep(dap):
     """현재 전원 상태로 6개 AP 의 IDR 을 훑는다 — '인증/디버그전원 없이 어디에 닿나'.
@@ -1249,6 +1337,10 @@ def main():
                     help="hart 를 halt 시도(dmcontrol.haltreq)→allhalted 확인 후 resume. "
                          "J-Link 'Failed to identify'가 J-Link 설정 문제인지 코어측 게이트인지 판별. "
                          "★코어 잠깐 멈춤(인증 무관)")
+    ap.add_argument("--pc-probe", type=int, default=0, metavar="N",
+                    help="비침습 PC 샘플 판정: hart 를 안 멈추고 dpc 를 N회 abstract 읽어 "
+                         "(§4.9.2) '실행 중 PC 읽기' 지원 여부 실측. 값이 변하고 계속 running 이면 "
+                         "비침습 폴링(PM9M1 방식) 가능. 예: --pc-probe 64")
     ap.add_argument("--scan", action="store_true",
                     help="probe 진단: base 기준 SJTAG 알려진 오프셋들을 읽어 "
                          "default-slave/live 분류. --scan-window 주면 base 주변도 스윕.")
@@ -1371,6 +1463,10 @@ def main():
         if a.dm_halt:
             dm_activate(dap, a.core_base)
             dm_halt(dap, a.core_base, a.hart or 0)
+            return EXIT_OK
+        if a.pc_probe:
+            dm_activate(dap, a.core_base)
+            pc_probe(dap, a.core_base, a.pc_probe, a.hart or 0)
             return EXIT_OK
         if a.dm_activate:
             dm_activate(dap, a.core_base)
