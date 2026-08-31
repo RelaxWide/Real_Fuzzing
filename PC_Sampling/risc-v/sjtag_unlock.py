@@ -650,31 +650,60 @@ def _sba_ready(dap):
     return ap, CORE_BASE_MAIN
 
 
+# SBCS 상태/에러 비트 (RISC-V Debug SBA)
+_SB_BUSY    = 1 << 21          # sbbusy
+_SB_ERR     = 0x7 << 12        # sberror(14:12) — W1C
+_SB_BUSYERR = 1 << 22          # sbbusyerror — busy 중 새 접근 시도 시 set, W1C
+_SB_ERRMASK = _SB_ERR | _SB_BUSYERR
+
+
+def _sba_clear_err(dap, ap, cb):
+    """sberror/sbbusyerror 가 서 있으면 W1C 로 지운다 → wedge 된 SBA 재기동.
+    (에러가 latch 되면 이후 접근이 무시돼 계속 죽으므로 op 전에 선제 클리어)."""
+    cs = dap.mem_read32(ap, cb + SBCS_OFF)
+    if cs is not None and (cs & _SB_ERRMASK):
+        dap.mem_write32(ap, cb + SBCS_OFF, _SB_ERRMASK)     # W1C(다른 제어비트는 다음 op 가 재설정)
+        return True
+    return False
+
+
 def _sba_wait(dap, ap, cb):
+    """sbbusy=0 될 때까지 폴링. 완료 시 sberror/sbbusyerror 검사 — 서 있으면 W1C 클리어 후
+    None(=실패) 리턴. 정상이면 cs 리턴. 타임아웃도 None."""
     for _ in range(200):
         cs = dap.mem_read32(ap, cb + SBCS_OFF)
-        if cs is not None and not ((cs >> 21) & 1):     # sbbusy=0
-            return cs
+        if cs is None:
+            continue
+        if cs & _SB_BUSY:                                   # 아직 busy → 대기
+            continue
+        if cs & _SB_ERRMASK:                                # 에러 → 클리어하고 실패
+            dap.mem_write32(ap, cb + SBCS_OFF, _SB_ERRMASK)
+            return None
+        return cs
     return None
 
 
 def _sba_read(dap, ap, cb, addr):
+    _sba_clear_err(dap, ap, cb)                            # 선제 클리어(이전 에러로 wedge 방지)
     dap.mem_write32(ap, cb + SBCS_OFF, _SB32 | (1 << 20))   # sbreadonaddr
     dap.mem_write32(ap, cb + SBADDR0_OFF, addr)                     # 주소 쓰면 자동 read
-    _sba_wait(dap, ap, cb)
+    if _sba_wait(dap, ap, cb) is None:                     # busy 안 풀림/에러 → 값 읽지 말 것
+        return None
     return dap.mem_read32(ap, cb + SBDATA0_OFF)
 
 
 def _sba_write(dap, ap, cb, addr, val):
+    _sba_clear_err(dap, ap, cb)
     dap.mem_write32(ap, cb + SBCS_OFF, _SB32)
     dap.mem_write32(ap, cb + SBADDR0_OFF, addr)
     dap.mem_write32(ap, cb + SBDATA0_OFF, val)                      # 데이터 쓰면 자동 write
-    _sba_wait(dap, ap, cb)
+    return _sba_wait(dap, ap, cb) is not None              # 성공=True, 실패=False
 
 
 def _sba_fifo(dap, ap, cb, addr, nwords):
     """같은 주소(FIFO Data 레지스터)를 nwords 회 연속 읽기. sbreadonaddr+sbreadondata 로
     파이프라인: 주소쓰기가 첫 read 트리거, sbdata0 읽을 때마다 다음 read 트리거."""
+    _sba_clear_err(dap, ap, cb)                                     # 선제 클리어(wedge 방지)
     dap.mem_write32(ap, cb + SBCS_OFF, _SB32 | (1 << 20) | (1 << 15))   # readonaddr+readondata
     dap.mem_write32(ap, cb + SBADDR0_OFF, addr)
     out = bytearray()
