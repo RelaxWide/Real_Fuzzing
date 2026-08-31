@@ -5810,6 +5810,11 @@ class NVMeFuzzer:
         added_s = added_q = 0
         # seeds — A: 중복 주입 방지, ③(3): 항목별 accept/dup 로그
         for item in (data.get('seeds') or [])[:RAG_MAX_SEEDS]:
+            if not isinstance(item, dict):
+                # LLM 이 seeds 원소를 dict 가 아닌 값으로 반환한 경우 방어
+                # (없으면 item.get('seed_class') 에서 AttributeError 로 죽는다).
+                self._llm_stats['dropped'] += 1
+                continue
             # LLM 라벨은 보존하되 계보 접두('llm')를 강제한다. LLM 이 seed_class 를
             # 'vendor_edge' 처럼 접두 없이 주면 _is_llm_seed 가 False 가 돼 크레딧/부스트/
             # cull 보호에서 누락됐다(단일 LLM 시드 계보 유실 버그). 'llm_vendor_edge' 로
@@ -5843,6 +5848,11 @@ class NVMeFuzzer:
                             f"cdw11={seed.cdw11} data={len(seed.data)}B")
         # sequences — 멤버 시그니처로 dedup
         for sq in (data.get('sequences') or [])[:RAG_MAX_SEQS]:
+            if not isinstance(sq, dict):
+                # LLM 이 sequences 원소를 dict 가 아닌 문자열 등으로 반환한 경우 방어
+                # (없으면 sq.get('commands') 에서 AttributeError 로 죽는다).
+                self._llm_stats['dropped'] += 1
+                continue
             seeds = []
             for citem in (sq.get('commands') or []):
                 s = self._llm_make_seed(citem, 'llm_seq')
