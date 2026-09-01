@@ -1,0 +1,10 @@
+# BM9K1 (SiFive E76, RISC-V 4코어) — v10 작업 대상. 아직 fuzzer_config.json 에 제품
+# 레코드가 없다(sjtag 샘플러 미구현 상태에서 추가하면 --product 로 선택은 되는데
+# 샘플러 분기가 없어 엉뚱한 OpenOCD 샘플러로 떨어진다).
+#
+# 여기 들어올 파일 (코어별 — tools/ghidra_export.py 확장분이 생성):
+#   basic_blocks_core0.txt  functions_core0.txt  callgraph_core0.txt   (HCORE)
+#   basic_blocks_core1.txt  functions_core1.txt  callgraph_core1.txt   (CMCore)
+#   basic_blocks_core2.txt  functions_core2.txt  callgraph_core2.txt   (Fcore)
+#   basic_blocks_core3.txt  functions_core3.txt  callgraph_core3.txt   (QCore)
+#   symbols.json            (코어→ELF→exec범위, 빌드ID, 추출 시각)

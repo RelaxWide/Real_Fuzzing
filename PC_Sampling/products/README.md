@@ -13,6 +13,20 @@
 
 형식: `basic_blocks.txt` = `0xSTART 0xEND`(END 미포함) / `functions.txt` = `0xENTRY <십진 size> <name>`
 
+### 파일명에 제품명을 붙이지 않는다
+
+폴더가 이미 제품을 구분하므로 `basic_blocks_PM9M1.txt` 처럼 **접미사를 붙이지 않는다**
+(`products/PM9M1/basic_blocks.txt`). 접미사는 폴더가 알려주지 못하는 것에만 쓴다 —
+즉 **멀티코어 제품의 코어 인덱스**:
+
+| 제품 | 파일명 |
+|---|---|
+| 단일코어 (PM9M1/BM9H1/P7/P9) | `basic_blocks.txt`, `functions.txt` |
+| **BM9K1 (4코어)** | `basic_blocks_core0.txt` … `_core3.txt`, `functions_core0.txt` … |
+
+이 규칙 덕에 `tools/ghidra_export.py` 산출물을 해당 폴더에 **그대로 떨어뜨리면 되고**
+수동 rename 이 필요 없다.
+
 ## 제품 현황
 
 | 제품 | 샘플러 | openocd.cfg | BB/func | 비고 |
@@ -21,6 +35,7 @@
 | `BM9H1` | pcsr (jtag) | ✅ | ❌ 배치 필요 | |
 | `P7` | jlink_halt | 불필요 | ❌ 배치 필요 | OpenOCD 미사용 |
 | `P9` | jlink_halt | ✅ (미참조) | ❌ 배치 필요 | `openocd.cfg` 는 `sampler_type='halt'` 시절 자산 — 되돌릴 때 사용 |
+| `BM9K1` | sjtag (예정) | 불필요 | ❌ v10 작업 | RISC-V 4코어. **config 레코드 아직 없음** — 샘플러 구현 후 추가 |
 
 `PM9M1_LNB` / `PM9M1_HP` 는 펌웨어가 같아 별도 폴더를 두지 않고 config 에서
 `products/PM9M1/...` 를 가리킨다.
