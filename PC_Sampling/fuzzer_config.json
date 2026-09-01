@@ -40,11 +40,11 @@
     "_comment": "파일명만 두면 fuzzer 스크립트 디렉토리 기준으로 해석됨. fw_bin=null 이면 더미 시드.",
     "fw_bin": null,
     "pmu_script": "pmu_4_1.py",
-    "ufas_binary": "ufas",
-    "debug_tool_binary": "Debug_Tool_v1.0.0.2",
+    "ufas_binary": "dump/ufas",
+    "debug_tool_binary": "dump/Debug_Tool_v1.0.0.2",
     "debug_tool_timeout_sec": 7200,
-    "jlink_dump_script": "run_smi_mem_dump_JLINK_USB.sh",
-    "debug_package_dir": "DebugPackage/smi_mem_parsing",
+    "jlink_dump_script": "dump/run_smi_mem_dump_JLINK_USB.sh",
+    "debug_package_dir": "dump/DebugPackage/smi_mem_parsing",
     "parser_script_sh": "customer_parsing_dump.sh",
     "parser_script_py": "customer_parsing_dump.py",
     "engine_errint_logs": [
@@ -1202,7 +1202,7 @@
         "verify": 20000
       },
       "interface": "jtag",
-      "openocd_config": "r8_pcsr_jtag.cfg",
+      "openocd_config": "products/BM9H1/r8_pcsr_jtag.cfg",
       "jlink_device": "Cortex-R8",
       "tcl_prefix": "r8",
       "pcsr_addrs": [
