@@ -1509,6 +1509,134 @@ def gen_jlinkscript(out_path, template="sf_e76.JLinkScript.template"):
     return EXIT_OK
 
 
+# ── CoreSight ROM table 워크 — 메모리맵 PC-샘플 레지스터(EDPCSR/PMPCSR/커스텀) 탐색 ──
+#   OpenOCD 의 비침습 PC 샘플링(riscv memory_sample)은 결국 "메모리맵된 PC 레지스터를
+#   SBA/APB 로 주기 읽기"다. 그런 레지스터가 이 SoC 에 있는지 ROM table 로 전수 열거해
+#   찾는다. 있으면 그 주소로 비침습 폴링 가능(=OpenOCD 와 동일). 없으면 없음이 확정.
+_CS_CIDR0, _CS_CIDR1 = 0xFF0, 0xFF4          # Component ID (preamble/class)
+_CS_PIDR0, _CS_PIDR1 = 0xFE0, 0xFE4          # Peripheral ID (part number)
+_CS_DEVTYPE, _CS_DEVARCH = 0xFCC, 0xFBC      # 컴포넌트 종류 식별
+_EDPCSR_OFF, _EDPCSRHI_OFF = 0x0A0, 0x0AC    # ARM proc-debug: PC Sample Reg
+_PMPCSR_OFF = 0x200                          # CoreSight PMU: PC Sample Reg
+
+
+def _cs_ident(dap, ap, base):
+    """CoreSight 컴포넌트 식별: (class, devtype, devarch, part) 또는 None(컴포넌트 아님).
+    CIDR preamble(CIDR0 low=0x0D) 로 유효성 확인, class=CIDR1[7:4]."""
+    c0 = dap.mem_read32(ap, base + _CS_CIDR0)
+    c1 = dap.mem_read32(ap, base + _CS_CIDR1)
+    if c0 is None or c1 is None or (c0 & 0xFF) != 0x0D:
+        return None
+    klass = (c1 >> 4) & 0xF
+    devtype = dap.mem_read32(ap, base + _CS_DEVTYPE)
+    devarch = dap.mem_read32(ap, base + _CS_DEVARCH)
+    p0 = dap.mem_read32(ap, base + _CS_PIDR0) or 0
+    p1 = dap.mem_read32(ap, base + _CS_PIDR1) or 0
+    part = ((p1 & 0xF) << 8) | (p0 & 0xFF)
+    return klass, devtype, devarch, part
+
+
+def _pc_candidate(ident):
+    """PC-샘플 가능한 컴포넌트인지 → (종류, PCSR오프셋) 또는 None.
+    ARM proc-debug(DEVTYPE major=5,sub=1)=EDPCSR@0xA0, PMU(major=6 or archid=0x0A16)=PMPCSR@0x200."""
+    if ident is None:
+        return None
+    klass, devtype, devarch, _ = ident
+    if klass != 0x9 or devtype is None:
+        return None
+    major, sub = devtype & 0xF, (devtype >> 4) & 0xF
+    archid = (devarch or 0) & 0xFFFF
+    if major == 0x5 and sub == 0x1:
+        return "proc-debug(EDPCSR)", _EDPCSR_OFF
+    if major == 0x6 or archid == 0x0A16:
+        return "PMU(PMPCSR)", _PMPCSR_OFF
+    return None
+
+
+def _pc_live_test(dap, ap, base, off, n=16):
+    """후보 PCSR 를 running 중 n회 읽어 live-PC 처럼 행동하는지 판정:
+    값이 변하고(비-static) dead 지문이 아니면 live-PC 후보. (실제 PC값은 마스킹, 통계만)"""
+    vals = []
+    for _ in range(n):
+        v = dap.mem_read32(ap, base + off)
+        if v is not None:
+            vals.append(v)
+    dead = {0, 0xFFFFFFFF}
+    live = [v for v in vals if v not in dead]
+    uniq = len(set(live))
+    if uniq >= 2:
+        return f"✅ 값 변화 {uniq}종/{len(vals)} — live-PC 후보 (여기에 SBA 샘플링 겨누면 비침습 PC)"
+    if live and uniq == 1:
+        return "⚠ 값 고정 — static(코어 정지/tight loop) 이거나 PC 아님. running 중 재시도"
+    return "✗ 유효값 없음(0/0xFFFFFFFF) — PC 샘플 무효/미지원"
+
+
+def _rom_walk(dap, ap, rom_base, depth, out, seen):
+    """ROM table 재귀 워크. out 에 (depth, comp_base, ident) 누적."""
+    if depth > 4 or rom_base in seen:
+        return
+    seen.add(rom_base)
+    for i in range(960):                              # 최대 0xF00/4 엔트리
+        e = dap.mem_read32(ap, rom_base + 4 * i)
+        if e is None or e == 0:                       # 읽기실패/테이블 끝
+            break
+        if not (e & 1):                               # entry not present
+            continue
+        off = e & 0xFFFFF000
+        if off & 0x80000000:                          # 음수 오프셋 부호확장
+            off -= 0x100000000
+        comp = (rom_base + off) & 0xFFFFFFFF
+        ident = _cs_ident(dap, ap, comp)
+        out.append((depth, comp, ident))
+        if ident is not None and ident[0] == 0x1:     # 중첩 ROM table → 재귀
+            _rom_walk(dap, ap, comp, depth + 1, out, seen)
+
+
+def rom_scan(dap):
+    """CoreSight ROM table 을 걸어 컴포넌트를 전수 열거하고 PC-샘플 후보를 실측한다.
+    ★ 콘솔에 절대주소 미출력(ROM 상대 오프셋만) — 사내 Claude Code 노출 안전."""
+    print("\n  [rom-scan] CoreSight ROM table 워크 — 메모리맵 PC-샘플 레지스터 탐색")
+    KLASS = {0x1: "ROM-table", 0x9: "CoreSight", 0xE: "generic-IP", 0xF: "primecell"}
+    any_cand = False
+    for name, apb, kind in AP_MAP:
+        if "APB" not in kind and "AHB" not in kind and "AXI" not in kind:
+            continue
+        base = dap.ap_read(apb, OFF_BASE)             # AP BASE = ROM table 포인터
+        if base is None or base in (0, 0xFFFFFFFF) or not (base & 1):
+            continue
+        rom = base & 0xFFFFF000
+        print(f"\n    {name}: ROM table 발견 (주소는 sjtag_addrs.json)")
+        out = []
+        _rom_walk(dap, apb, rom, 0, out, set())
+        if not out:
+            print("      (컴포넌트 없음/읽기 실패)")
+            continue
+        for depth, comp, ident in out:
+            rel = (comp - rom) & 0xFFFFFFFF
+            indent = "      " + "  " * depth
+            if ident is None:
+                print(f"{indent}ROM+0x{rel:X}: (컴포넌트 ID 무효)")
+                continue
+            klass, devtype, devarch, part = ident
+            kn = KLASS.get(klass, f"class{klass:X}")
+            dt = f" devtype={hx(devtype)}" if devtype else ""
+            da = f" archid={(devarch or 0) & 0xFFFF:#06x}" if devarch else ""
+            print(f"{indent}ROM+0x{rel:X}: {kn} part={part:#05x}{dt}{da}")
+            cand = _pc_candidate(ident)
+            if cand:
+                any_cand = True
+                kind_s, off = cand
+                verdict = _pc_live_test(dap, apb, comp, off)
+                print(f"{indent}  ★ PC-샘플 후보: {kind_s} @ +0x{off:X} → {verdict}")
+    if not any_cand:
+        print("\n  [rom-scan] PC-샘플 컴포넌트(EDPCSR/PMPCSR) 없음 — 이 SoC 엔 메모리맵 PC "
+              "레지스터가 없다(=OpenOCD 식 비침습 PC 폴링 불가). 비침습은 N-Trace, 아니면 halt-go.")
+    else:
+        print("\n  [rom-scan] ★ PC-샘플 후보 발견 — '값 변화' 판정이면 그 주소에 SBA 샘플링을 "
+              "겨눠 OpenOCD 처럼 비침습 PC 를 얻을 수 있다. 해당 base 를 sjtag_addrs.json 에 기록.")
+    return EXIT_OK
+
+
 # ── main ─────────────────────────────────────────────────────────────
 def main():
     ap = add_common_args(argparse.ArgumentParser(
@@ -1584,6 +1712,10 @@ def main():
                     help="비침습 PC 샘플 판정: hart 를 안 멈추고 dpc 를 N회 abstract 읽어 "
                          "(§4.9.2) '실행 중 PC 읽기' 지원 여부 실측. 값이 변하고 계속 running 이면 "
                          "비침습 폴링(PM9M1 방식) 가능. 예: --pc-probe 64")
+    ap.add_argument("--rom-scan", action="store_true",
+                    help="CoreSight ROM table 을 걸어 컴포넌트를 전수 열거하고 메모리맵 PC-샘플 "
+                         "레지스터(EDPCSR/PMPCSR/커스텀)를 탐색·실측. 있으면 OpenOCD 식 비침습 PC "
+                         "폴링 가능. read-only, 주소는 콘솔 마스킹")
     ap.add_argument("--scan", action="store_true",
                     help="probe 진단: base 기준 SJTAG 알려진 오프셋들을 읽어 "
                          "default-slave/live 분류. --scan-window 주면 base 주변도 스윕.")
@@ -1715,6 +1847,8 @@ def main():
             dm_activate(dap, a.core_base)
             pc_probe(dap, a.core_base, a.pc_probe, a.hart or 0)
             return EXIT_OK
+        if a.rom_scan:
+            return rom_scan(dap)
         if a.dm_activate:
             dm_activate(dap, a.core_base)
             dm_scan(dap, a.core_base, a.dm_window)
