@@ -128,6 +128,20 @@ def _early_config_path():
     return None
 
 
+def resolve_asset(value):
+    """config 의 자산 경로를 해석한다 — 지정 경로가 없으면 **구배치(스크립트 루트의 파일명)**
+    로 폴백. products/<제품>/ 이관 중에도 아직 안 옮긴 파일이 계속 동작하게 하는 안전망.
+    (이관 완료 후에도 무해 — 지정 경로가 있으면 그대로 쓴다.)"""
+    if not value:
+        return value
+    root = os.path.dirname(os.path.abspath(__file__))
+    primary = value if os.path.isabs(value) else os.path.join(root, value)
+    if os.path.exists(primary):
+        return primary
+    legacy = os.path.join(root, os.path.basename(value))
+    return legacy if os.path.exists(legacy) else primary
+
+
 def load_user_config(path=None):
     """fuzzer_config.json 로드 + hex 정규화. 없으면 명확한 fatal 종료."""
     _dir = Path(__file__).resolve().parent
@@ -2313,9 +2327,7 @@ class OpenOCDPCSampler:
 
     def _launch_openocd(self) -> bool:
         """OpenOCD 서브프로세스 시작 후 포트 대기."""
-        cfg_path = self.config.openocd_config
-        if not os.path.isabs(cfg_path):
-            cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), cfg_path)
+        cfg_path = resolve_asset(self.config.openocd_config)
         if not os.path.exists(cfg_path):
             log.error(f"[OpenOCD] 설정 파일 없음: {cfg_path}")
             return False
@@ -8172,8 +8184,8 @@ class NVMeFuzzer:
         파일이 없으면 아무것도 하지 않음. Ghidra ghidra_export.py 로 생성한 파일을 기대함.
         """
         script_dir = Path(__file__).parent.resolve()
-        bb_file   = script_dir / self.config.bb_file      # 제품별 (profile)
-        func_file = script_dir / self.config.func_file
+        bb_file   = Path(resolve_asset(self.config.bb_file))    # 제품별 (products/<P>/)
+        func_file = Path(resolve_asset(self.config.func_file))
 
         if not bb_file.exists() and not func_file.exists():
             return  # 파일 없음 — 로그 없이 조용히 넘어감

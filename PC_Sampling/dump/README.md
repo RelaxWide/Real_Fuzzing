@@ -19,8 +19,8 @@
 ## 아직 정리되지 않은 것
 
 - **`ufas_ini`** (`PM9M1_A815.ini`): UFAS 는 `cwd=script_dir` 로 실행되고 `--ini=<값>` 이
-  그대로 전달된다. 현재 config 값이 파일명뿐이라 **스크립트 루트**에서 찾는다.
-  이 폴더로 옮기려면 config 의 `ufas_ini` 를 `dump/PM9M1_A815.ini` 로 함께 바꿔야 한다.
+  그대로 전달된다. config 값을 `dump/PM9M1_A815.ini` 로 지정해 두었으니 **이 폴더에**
+  두면 된다(PM9M1 계열과 BM9H1 이 공유하므로 제품 폴더가 아니라 도구 옆에 둔다).
 - **덤프 산출물**(`*_UFAS_Dump.bin`, J-Link 덤프)은 지금 **스크립트 루트에 쌓인다**.
   `_find_latest_jlink_dump()` 의 탐색 기준이 `script_dir` 이라 코드 수정이 필요하다.
   (v10 Phase 1 항목)
