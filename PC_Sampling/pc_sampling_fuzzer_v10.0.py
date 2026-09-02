@@ -335,7 +335,7 @@ R8_DPIDR_VALS = tuple(_G['r8_dpidr_vals'])
 # 이 dict 에 레코드 하나만 추가하면 된다(코드 수정 불필요).
 #
 # 필드:
-#   interface         : 'swd' | 'jtag'
+#   interface         : 'swd' | 'jtag' | 'cjtag'
 #   openocd_config    : OpenOCD cfg 파일명 (스크립트 디렉토리 기준)
 #   jlink_device      : JLinkExe -device 문자열
 #   tcl_prefix        : OpenOCD cfg 가 만든 target object 접두사 (cfg 의 'r8'/'r5')
@@ -1215,7 +1215,10 @@ class FuzzConfig:
     openocd_host:    str   = OPENOCD_TELNET_HOST
     openocd_port:    int   = OPENOCD_TELNET_PORT
     openocd_timeout: float = OPENOCD_STARTUP_TIMEOUT
-    interface:       str   = 'swd'   # 'swd' | 'jtag'
+    interface:       str   = 'swd'   # 'swd' | 'jtag' | 'cjtag'
+    product:         str   = ''      # 제품명(products/<product>/ 자산 경로에 사용)
+    arch:            str   = 'arm'   # 'arm' | 'riscv' — riscv 는 per-core 커버리지
+    riscv:           dict  = field(default_factory=dict)  # BM9K1 전용(cores/sample_plan/…)
     jlink_device:    str   = JLINK_DEVICE
     # v8.0: product profile 에서 채워지는 target-specific 값들
     tcl_prefix:      str   = 'r8'                 # OpenOCD cfg target object 접두사
@@ -3441,6 +3444,245 @@ class JLinkHaltSampler(OpenOCDPCSampler):
 # v9.0: LLM-guided fuzzing — in-process 직접 호출 브리지
 # ══════════════════════════════════════════════════════════════════════════
 
+
+class RiscvPcsrSampler(OpenOCDPCSampler):
+    """BM9K1(RISC-V SiFive E76 4코어) 비침습 PC 샘플러.
+
+    연결은 **cJTAG**, 그 위에서 **SJTAG(secure JTAG) 인증**을 통과해야 디버그가 열린다.
+    샘플링은 코어별 PCSR 등가 레지스터를 **SBA 로 폴링**한다 — 코어를 멈추지 않는다.
+    (halt 하면 코어 간 클럭이 틀어져 거기서 나온 불량을 진짜 불량이라 할 수 없다.)
+
+    기존 로직 보호: 공용 _sampling_worker 는 _read_all_pcs() 를 '같은 시점의 다코어
+    튜플'로 해석하는데 우리는 **한 번에 한 코어씩 버스트**로 읽는다. 그래서 worker 를
+    통째로 override 한다 → 기존 샘플러 코드는 한 줄도 안 바뀐다.
+    """
+
+    INVASIVE = False                       # ★ 비침습 — 펌웨어시간 워치독이 붙으면 안 된다
+    REPORTS_HALT_STATS = False
+    USES_JLINK_USB = True                  # pylink 가 USB 점유 → 덤프 전 해제 필요
+    RECONNECT_ON_FW_COMMIT = True
+    SUPPORTS_CONCURRENT_SAMPLING = True    # 비침습이라 prefill 중에도 안전
+    LINK_LABEL = '[SJTAG/cJTAG]'
+    PER_CORE_COVERAGE = True               # _account_command 가 CoverageModel 경로를 탄다
+
+    def __init__(self, config: 'FuzzConfig') -> None:
+        super().__init__(config)
+        import riscv_cov as _rc
+        self._rc = _rc
+        rv = getattr(config, 'riscv', None) or {}
+        self._cores = {int(c['id']): c for c in (rv.get('cores') or [])}
+        plan = rv.get('sample_plan') or {}
+        self._weights = {int(k): int(v) for k, v in (plan.get('weights') or {}).items()} \
+            or {cid: 1 for cid in self._cores}
+        self._burst_len = int(plan.get('burst_len', 256))
+        self._seed = int(plan.get('seed', 0)) or random.randrange(1 << 30)
+        self._rng = random.Random(self._seed)        # ★ 재현용 — 세션 로그에 남긴다
+        self._valid_bit = int(plan.get('valid_bit', 1))
+        self.session = None
+        self.cov = None                              # CoverageModel (fuzzer 가 주입)
+        self._observations: list = []
+        self._ranges = {}                            # core_id -> elf_map.Ranges
+        self._invalid_streak = {}                    # core_id -> 연속 무효 수
+        self._all_invalid_since = None
+        self.collapse_count = 0
+        self.recover_ok = 0
+        self.recover_fail = 0
+        # 튜플 길이 회계가 코어 수를 따르도록(로그·saturation 계산이 이걸 본다)
+        self._pcsr_addrs = [0] * max(1, len(self._cores))
+
+    # ── 연결 / 인증 ──────────────────────────────────────────────────
+    def connect(self) -> bool:
+        rv = getattr(self.config, 'riscv', None) or {}
+        self.session = self._rc.PcsrSession(
+            cores=self._cores, power=rv.get('power', 'both'),
+            tap_script=bool(rv.get('tap_script', False)))
+        if not self.session.open():
+            log.error("[SJTAG] 세션 열기 실패 — 인증/전원 확인 (sudo 필요)")
+            return False
+        # ★ 코어 목록(ELF 경로 포함)은 기밀이라 fuzzer_config.json 이 아니라
+        #   risc-v/sjtag_addrs.json 의 pcsr.cores 에서 읽는다.
+        if not self._cores:
+            for c in (self.session._sj.RISCV_ADDRS.get('pcsr', {}).get('cores') or []):
+                self._cores[int(c['id'])] = c
+            if not self._cores:
+                log.error("[SJTAG] sjtag_addrs.json 에 pcsr.cores 가 없다 — "
+                          "{id,name,elf,load_offset} 를 채워야 한다")
+                return False
+            if not self._weights:
+                self._weights = {cid: 1 for cid in self._cores}
+            self._pcsr_addrs = [0] * len(self._cores)
+        log.warning(f"[SJTAG] 세션 OK. 버스트 seed={self._seed} "
+                    f"(재현하려면 sample_plan.seed 에 지정)")
+        ok_cores = []
+        for cid in sorted(self._cores):
+            if self.session.pin(cid):
+                ok_cores.append(cid)
+            else:
+                log.error(f"[SJTAG] core{cid} pin 실패 — 이 코어는 샘플링 제외")
+        if not ok_cores:
+            return False
+        self._weights = {c: w for c, w in self._weights.items() if c in ok_cores}
+        self._verify_ranges(ok_cores)
+        return True
+
+    def _verify_ranges(self, cores):
+        """코어별 free-run 샘플이 그 코어 ELF 의 실행영역에 드는지(정합성 게이트).
+        미달이면 그 코어의 심볼화를 신뢰하지 않는다 — 조용히 틀린 커버리지 방지."""
+        try:
+            import elf_map
+        except Exception as e:
+            log.warning(f"[SJTAG] elf_map 없음 — 정합성 게이트 생략: {e}")
+            return
+        thr = float((getattr(self.config, 'riscv', None) or {}).get('gate_threshold', 95.0))
+        for cid in cores:
+            elf = (self._cores.get(cid) or {}).get('elf')
+            if not elf or not os.path.exists(elf):
+                log.warning(f"[SJTAG] core{cid} ELF 없음 — 게이트 생략")
+                continue
+            obs = self.session.burst(cid, 200, self._valid_bit)
+            pcs = [o.pc for o in obs if o.valid and o.pc is not None]
+            off = int(str((self._cores.get(cid) or {}).get('load_offset', 0)), 0)
+            ok, info = elf_map.check_gate(pcs, elf, off, thr,
+                                          label=f"core{cid}", verbose=True)
+            if ok:
+                self._ranges[cid] = elf_map.Ranges(elf_map.exec_ranges(elf))
+            else:
+                log.error(f"[SJTAG] core{cid} 정합성 게이트 실패 — 심볼화 신뢰 불가. "
+                          f"load_offset 과 코어↔ELF 매칭을 확인하라. info={info.get('pct')}%")
+
+    # ── 샘플링 (버스트 전용 worker) ───────────────────────────────────
+    def _reset_window_extra(self):
+        self._observations = []
+
+    def take_observations(self):
+        return self._observations
+
+    def window_by_core(self):
+        d = {}
+        for o in self._observations:
+            if o.valid and o.pc is not None:
+                d.setdefault(o.core_id, set()).add(o.pc)
+        return d
+
+    def _in_core_range(self, core_id, pc):
+        r = self._ranges.get(core_id)
+        return True if r is None else (pc in r)
+
+    def _sampling_worker(self):
+        """★ 버스트 전용. 가중치는 '버스트 개수'로 펴고 **매 윈도우 셔플**한다 —
+        순서를 고정하면 코어가 명령 처리 단계(파싱→DMA→완료)와 결합돼 각 코어가 특정
+        단계만 관측하는 편향이 생긴다."""
+        cfg, total = self.config, 0
+        limit = max(1, int(cfg.max_samples_per_run))
+        try:
+            while not self.stop_event.is_set() and total < limit:
+                for core in self._rc.build_burst_schedule(self._weights, rng=self._rng):
+                    if self.stop_event.is_set() or total >= limit:
+                        break
+                    n = min(self._burst_len, limit - total)
+                    obs = self.session.burst(core, n, self._valid_bit)
+                    if not obs:
+                        continue
+                    total += len(obs)
+                    self._observations.extend(obs)
+                    self._track_collapse(core, obs)
+                    for o in obs:
+                        if o.valid and o.pc is not None:
+                            self._last_raw_pcs.append(o.pc)
+                            if self._in_core_range(o.core_id, o.pc):
+                                self.current_trace.add(o.pc)
+                            else:
+                                self._out_of_range_count += 1
+                self._maybe_recover()
+        except Exception as e:
+            self._stopped_reason = f'exception:{str(e)[:40]}'
+            log.warning(f"[SJTAG] 샘플링 예외: {e}")
+        else:
+            self._stopped_reason = self._stopped_reason or (
+                'max_samples' if total >= limit else 'stop_event')
+        self.total_samples += total
+
+    # ── 붕괴 감지 / 복구 ─────────────────────────────────────────────
+    def _track_collapse(self, core, obs):
+        """★ 단일 코어 연속 무효로 판정하면 오판한다 — 버스트+무지연이라 한 코어가 잠깐
+        halt/wfi 여도 수백 µs 만에 수백 회를 채운다. **전 코어 지속 무효**만 붕괴다."""
+        if any(o.valid for o in obs):
+            self._invalid_streak[core] = 0
+        else:
+            self._invalid_streak[core] = self._invalid_streak.get(core, 0) + 1
+        active = set(self._weights)
+        all_bad = active and all(self._invalid_streak.get(c, 0) >= 1 for c in active)
+        if all_bad:
+            self._all_invalid_since = self._all_invalid_since or time.time()
+        else:
+            self._all_invalid_since = None
+
+    def _maybe_recover(self):
+        sj = self._sj_mod()
+        if self._all_invalid_since is None:
+            return
+        cycles = min(self._invalid_streak.get(c, 0) for c in self._weights)
+        if (cycles < sj.PCSR_COLLAPSE_MIN_ALL_CORE_CYCLES
+                or time.time() - self._all_invalid_since < sj.PCSR_COLLAPSE_MIN_SECONDS):
+            return
+        self.collapse_count += 1
+        log.error(f"[SJTAG] 세션 붕괴 감지(전 코어 무효 {cycles}사이클) — 재생성 시도 "
+                  f"#{self.collapse_count}")
+        core = next(iter(sorted(self._weights)))
+        r = self.session.recover(core, verify_samples=64)
+        if r.ok:
+            self.recover_ok += 1
+            log.warning(f"[SJTAG] 복구 성공 {r.elapsed:.1f}s valid={r.valid_samples}")
+        else:
+            self.recover_fail += 1
+            log.error(f"[SJTAG] 복구 실패 stage={r.stage} {r.detail}")
+            self.openocd_error.set()      # 상위 루프가 세션 재초기화를 판단
+        self._invalid_streak = {}
+        self._all_invalid_since = None
+
+    def _sj_mod(self):
+        import sjtag_unlock
+        return sjtag_unlock
+
+    # ── 진단 경로 (레이트 무관 → 전 코어 라운드로빈 강제, 튜플 길이 고정) ──
+    def _read_all_pcs(self):
+        out = []
+        for cid in sorted(self._cores):
+            obs = self.session.burst(cid, 1, self._valid_bit) if self.session else []
+            out.append(obs[0].pc if obs and obs[0].valid and obs[0].pc is not None else 0)
+        return tuple(out) if any(out) else None
+
+    def _read_fail_needs_recovery(self) -> bool:
+        """valid=0 은 코어가 잠깐 무효인 것이지 링크 장애가 아니다 — transport 만 복구."""
+        return bool(self.session and self.session.last_fail_kind == 'transport')
+
+    # ── 라이프사이클 ─────────────────────────────────────────────────
+    def close(self):
+        try:
+            if self.session:
+                self.session.close()
+        except Exception:
+            pass
+
+    def _openocd_alive(self) -> bool:
+        return self.session is not None and self.session.lk is not None
+
+    def _reconnect(self) -> bool:
+        self.close()
+        return self.connect()
+
+    def _reinit_target(self) -> bool:
+        return self._reconnect()
+
+    # OpenOCD 전용 경로 무력화 (JLinkHaltSampler 와 동일 전략)
+    def _send_startup_tcl(self, *a, **k):   return True
+    def _open_telnet(self, *a, **k):        return True
+    def _close_telnet(self, *a, **k):       return None
+    def _telnet_cmd(self, *a, **k):         return ''
+    def _terminate_proc(self, *a, **k):     return None
+    def _launch_openocd(self, *a, **k):     return True
+
+
 def _llm_schema_dict() -> dict:
     """live CMD_SCHEMAS/NVME_COMMANDS/가드상수로 rag_schema.SchemaBridge.from_dict 용 dict 구성.
     검증 기준을 발송 기준과 완전 일치시키고 파일 의존(cmd_schemas.json export)을 제거한다(in-process).
@@ -3756,6 +3998,7 @@ class NVMeFuzzer:
         self._fw_commit_reset_pending = False  # FWCommit 성공(코어 리셋 가능) → 다음 회계 시 J-Link 재연결
         # v9.0: LLM-guided fuzzing 브리지 (비활성 시 모든 메서드 no-op = v8.8 동등).
         self.llm = LlmBridge(config)
+        self.cov = None                       # v10: RISC-V per-core CoverageModel
         self._llm_last_cov = 0                # plateau 감지용 직전 coverage 크기
         self._llm_plateau_since = 0           # coverage 정체 시작 exec
         self._llm_task_rr = 0                 # task 라운드로빈 인덱스
@@ -3779,6 +4022,8 @@ class NVMeFuzzer:
         # 그 외 → OpenOCDPCSampler(PCSR 비침습).
         if config.no_jlink or config.sampler_type == 'null':
             self.sampler = NullSampler(config)
+        elif config.sampler_type == 'riscv_pcsr':
+            self.sampler = RiscvPcsrSampler(config)
         elif config.sampler_type == 'jlink_halt':
             self.sampler = JLinkHaltSampler(config)
         elif config.sampler_type == 'halt':
@@ -3877,6 +4122,7 @@ class NVMeFuzzer:
         # 성장 곡선 이력: [(executions, elapsed_s, bb_pct, funcs_pct), ...]
         self._sa_cov_history: list = []
         self._load_static_analysis()
+        self._load_riscv_coverage()   # v10: arch=riscv 면 per-core 모델
 
         # v9.1: sc_hist/invalid_opcode/reached_fw/accepted 추가 — NVMe 상태 되먹임(LLM/에너지)용.
         def _cs_new():
@@ -6706,7 +6952,13 @@ class NVMeFuzzer:
         # coverage 평가
         is_interesting, new_pcs = self.sampler.evaluate_coverage()
 
-        if self._sa_loaded and self._sa_bb_starts:
+        if getattr(self.sampler, 'PER_CORE_COVERAGE', False) and self.cov is not None:
+            # RISC-V: 코어별 ELF 라 주소가 겹칠 수 있어 (core,bank,addr) 키로 집계한다.
+            #   기존 제품 경로(아래 elif)는 한 줄도 바뀌지 않는다.
+            _acct = self.cov.account(self.sampler.take_observations())
+            is_interesting, new_pcs = _acct.interesting, _acct.new_count
+            _seed_covered = _acct.seed_keys
+        elif self._sa_loaded and self._sa_bb_starts:
             _mask = self._sa_thumb_mask
             _cur_bbs: set = set()
             for _pc in self.sampler.current_trace:
@@ -8224,6 +8476,32 @@ class NVMeFuzzer:
     RC_TIMEOUT   = -1001   # NVMe 타임아웃 (의미 있는 이벤트)
     RC_ERROR     = -1002   # subprocess 에러 (내부 문제)
     RC_SKIP      = -1003   # 가드가 전송 차단 (가성 유발 admin opcode) — 회계 없이 다음 iteration
+
+    def _load_riscv_coverage(self) -> None:
+        """arch=riscv: products/<제품>/ 의 코어별 표를 CoverageModel 로 읽는다.
+        기존 제품의 _sa_* 경로는 건드리지 않는다(별도 분기)."""
+        if (self.config.arch or 'arm') != 'riscv':
+            return
+        try:
+            import riscv_cov
+        except Exception as e:
+            log.error(f"[StaticAnalysis] riscv_cov import 실패: {e}")
+            return
+        pdir = Path(__file__).parent / 'products' / (self.config.product or '')
+        if not pdir.is_dir():
+            log.error(f"[StaticAnalysis] 제품 디렉토리 없음: {pdir}")
+            return
+        try:
+            self.cov = riscv_cov.CoverageModel.load(str(pdir), self.config.product or '')
+        except Exception as e:
+            log.error(f"[StaticAnalysis] CoverageModel 로드 실패: {e}")
+            return
+        for w in self.cov.warnings:
+            log.warning(f"[StaticAnalysis] {w}")
+        st = self.cov.stats_by_core()
+        log.warning("[StaticAnalysis] RISC-V per-core: " + ", ".join(
+            f"{v['name']}(BB {v['bb_total']:,}/func {v['func_total']:,})"
+            for v in st.values()))
 
     def _load_static_analysis(self) -> None:
         """제품별 BB/func 파일(config.bb_file/func_file) 자동 탐지 후 로드.
@@ -15665,7 +15943,8 @@ class NVMeFuzzer:
                 import threading as _threading
                 import re as _re
 
-                _jlink_if = 'JTAG' if self.config.interface == 'jtag' else 'SWD'
+                _jlink_if = {'jtag': 'JTAG', 'cjtag': 'cJTAG'}.get(
+                    self.config.interface, 'SWD')
                 _jlink_dev = self.config.jlink_device
                 idle_pcs = self.sampler.idle_pcs
 
@@ -15824,10 +16103,10 @@ if __name__ == "__main__":
                         help=f'제품 선택 (interface/cfg 자동 설정). '
                              f'선택지: {", ".join(PRODUCT_CONFIGS.keys())}. '
                              f'--interface보다 우선 적용')
-    parser.add_argument('--interface', choices=['swd', 'jtag'], default='swd',
+    parser.add_argument('--interface', choices=['swd', 'jtag', 'cjtag'], default='swd',
                         help='디버그 transport (swd: r8_pcsr.cfg, jtag: r8_pcsr_jtag.cfg). '
                              '--product 지정 시 무시됨')
-    parser.add_argument('--sampler', choices=['pcsr', 'halt', 'jlink_halt', 'null'], default=None,
+    parser.add_argument('--sampler', choices=['pcsr', 'halt', 'jlink_halt', 'null', 'riscv_pcsr'], default=None,
                         help='coverage 수집 방식 override (기본: product profile 값). '
                              'pcsr=비침습 PCSR, halt=OpenOCD halt→reg pc→resume, '
                              'jlink_halt=pylink 직접 halt(P9 권장, telnet desync 없음), null=수집안함')
@@ -16019,6 +16298,13 @@ if __name__ == "__main__":
         # fw_addr_*(coverage 주소필터)는 없어도 동작(전부 카운트) → 경고만.
         _st = args.sampler or _profile.get('sampler_type', 'pcsr')
         if not args.no_jlink and _st != 'null':
+            if _st == 'riscv_pcsr' and _profile.get('arch') != 'riscv':
+                print(f"\n[ERROR] Product '{args.product}': sampler_type=riscv_pcsr 인데 "
+                      f"arch 가 'riscv' 가 아니다 ({_profile.get('arch')!r})")
+                sys.exit(2)
+            if _st == 'riscv_pcsr':
+                print(f"[BringUp] {args.product}: RISC-V per-core PCSR — 코어/ELF/주소는 "
+                      f"risc-v/sjtag_addrs.json 의 pcsr 섹션에서 읽는다(기밀 분리).")
             if _st == 'pcsr' and _profile.get('pcsr_addrs') is None:
                 print(f"\n[ERROR] Product '{args.product}' bring-up 미완: pcsr_addrs 비어 있음.")
                 print(f"        PRODUCT_PROFILES['{args.product}']['pcsr_addrs'] 를 채우거나 "
@@ -16100,6 +16386,9 @@ if __name__ == "__main__":
         ufas_ini=_profile.get('ufas_ini'),
         addr_range_start=_profile.get('fw_addr_start'),
         addr_range_end=_profile.get('fw_addr_end'),
+        product=args.product or '',
+        arch=_profile.get('arch', 'arm'),
+        riscv=_profile.get('riscv') or {},
         bb_file=_profile.get('bb_file', 'basic_blocks.txt'),
         func_file=_profile.get('func_file', 'functions.txt'),
         sampler_type=_resolved_sampler,

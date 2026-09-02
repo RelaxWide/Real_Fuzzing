@@ -1070,6 +1070,36 @@
     ]
   },
   "products": {
+    "BM9K1": {
+      "_comment": "SiFive E76 RISC-V 4코어. 연결=cJTAG, 인증=SJTAG(secure JTAG, 전원사이클마다). 비침습 PCSR 폴링(SBA). ★ 기밀 주소(te_base/pcsr offset/코어 ELF 경로)는 risc-v/sjtag_addrs.json 에만 — 여기엔 두지 않는다.",
+      "interface": "cjtag",
+      "sampler_type": "riscv_pcsr",
+      "arch": "riscv",
+      "jlink_device": "E76",
+      "jlink_speed": 10000,
+      "riscv": {
+        "_comment": "cores[].elf/load_offset 은 sjtag_addrs.json 의 pcsr.cores 를 우선 사용. 여기 값은 비기밀 구조·튜닝값만.",
+        "power": "both",
+        "tap_script": false,
+        "gate_threshold": 95.0,
+        "sample_plan": {
+          "_comment": "weights=버스트 개수(코드 크기 비례 초기값 H:F:CM:Q). 순서는 매 윈도우 셔플되므로 편향 없음. seed=0 이면 무작위(로그에 기록) — 재현하려면 고정값 지정.",
+          "weights": {"0": 8, "1": 1, "2": 4, "3": 1},
+          "burst_len": 256,
+          "valid_bit": 1,
+          "seed": 0
+        }
+      },
+      "invalid_pc_vals": [],
+      "bb_file": "products/BM9K1/basic_blocks.txt",
+      "func_file": "products/BM9K1/functions.txt",
+      "enable_ufas": false,
+      "enable_jlink_dump": false,
+      "enable_debug_tool_dump": false,
+      "state_fields": "r8",
+      "nvme_timeouts": {"command": 30000, "format": 300000, "flush": 30000,
+                        "selftest_short": 30000, "selftest_ext": 30000, "verify": 30000}
+    },
     "PM9M1": {
       "_comment_timeouts": "nvme_timeouts/nvme_passthru_timeout_ms/nvme_kernel_timeout_sec 는 제품별 override (global timeouts 위에 덮어씀). 제품마다 다르게 조정 가능. 생략 시 global 사용.",
       "nvme_timeouts": {

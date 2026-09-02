@@ -14,13 +14,15 @@
 실행: python3 -m unittest -v test_v10_sampler_flags
 """
 import ast
+import json
 import unittest
 from pathlib import Path
 
 SRC = Path(__file__).parent / "pc_sampling_fuzzer_v10.0.py"
 FLAGS = ("INVASIVE", "REPORTS_HALT_STATS", "USES_JLINK_USB",
          "RECONNECT_ON_FW_COMMIT", "SUPPORTS_CONCURRENT_SAMPLING", "LINK_LABEL")
-SAMPLERS = ("NullSampler", "OpenOCDPCSampler", "OpenOCDHaltSampler", "JLinkHaltSampler")
+SAMPLERS = ("NullSampler", "OpenOCDPCSampler", "OpenOCDHaltSampler",
+            "JLinkHaltSampler", "RiscvPcsrSampler")
 
 # v9.8 이 실제로 하던 동작. 이 표에서 벗어나면 기존 제품(PM9M1/BM9H1/P7/P9) 회귀다.
 EXPECTED = {
@@ -36,6 +38,11 @@ EXPECTED = {
     "JLinkHaltSampler":   dict(INVASIVE=True,  REPORTS_HALT_STATS=True,  USES_JLINK_USB=True,
                                RECONNECT_ON_FW_COMMIT=True, SUPPORTS_CONCURRENT_SAMPLING=False,
                                LINK_LABEL="[J-Link]"),
+    # BM9K1 — 비침습이라 INVASIVE=False 가 핵심. True 면 펌웨어시간 워치독이 붙어
+    # 실제 hang 을 정상으로 오인한다.
+    "RiscvPcsrSampler":   dict(INVASIVE=False, REPORTS_HALT_STATS=False, USES_JLINK_USB=True,
+                               RECONNECT_ON_FW_COMMIT=True, SUPPORTS_CONCURRENT_SAMPLING=True,
+                               LINK_LABEL="[SJTAG/cJTAG]"),
 }
 
 
@@ -121,6 +128,37 @@ class TestNoIsinstanceGates(unittest.TestCase):
         self.assertEqual(
             self.src.count("_pf_sample = self.sampler.SUPPORTS_CONCURRENT_SAMPLING"), 1,
             "prefill 동시샘플링 분기가 플래그 기반이어야 한다")
+
+
+class TestRiscvWiring(unittest.TestCase):
+    """BM9K1 배선 — 기존 제품 경로를 건드리지 않았는지 포함."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = SRC.read_text(encoding="utf-8")
+
+    def test_dispatch_branch_exists(self):
+        self.assertIn("elif config.sampler_type == 'riscv_pcsr':", self.src)
+        self.assertIn("self.sampler = RiscvPcsrSampler(config)", self.src)
+
+    def test_per_core_coverage_branch_is_first(self):
+        """per-core 분기가 **기존 분기 앞**이어야 기존 경로가 그대로 남는다."""
+        a = self.src.index("getattr(self.sampler, 'PER_CORE_COVERAGE', False)")
+        b = self.src.index("elif self._sa_loaded and self._sa_bb_starts:")
+        self.assertLess(a, b)
+
+    def test_owns_burst_worker(self):
+        """공용 worker 를 고치지 않고 자기 worker 를 갖는다(기존 제품 보호)."""
+        i = self.src.index("class RiscvPcsrSampler")
+        self.assertIn("def _sampling_worker(self):", self.src[i:i + 12000])
+
+    def test_secrets_not_in_product_config(self):
+        """ELF 경로·te_base 등 기밀은 fuzzer_config.json 이 아니라 sjtag_addrs.json 에."""
+        cfg = json.loads((SRC.parent / "fuzzer_config.json").read_text(encoding="utf-8"))
+        rv = cfg["products"]["BM9K1"]["riscv"]
+        self.assertNotIn("cores", rv, "코어/ELF 경로는 config 에 두지 않는다")
+        self.assertEqual(cfg["products"]["BM9K1"]["interface"], "cjtag")
+        self.assertEqual(cfg["products"]["BM9K1"]["sampler_type"], "riscv_pcsr")
 
 
 if __name__ == "__main__":
