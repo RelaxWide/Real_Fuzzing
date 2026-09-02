@@ -700,6 +700,65 @@ def _sba_write(dap, ap, cb, addr, val):
     return _sba_wait(dap, ap, cb) is not None              # 성공=True, 실패=False
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  PCSR 고속 폴링 — ★ 실기 검증된 패턴 (2026-09). 이 루프를 건드리지 말 것.
+# ══════════════════════════════════════════════════════════════════════
+#  I/O 부하 중에는 매 샘플 풀 셋업을 하는 방식이 무너졌다. 동작하는 유일한 형태는
+#  **FIFO 모드 셋업 1회 → DRW 반복 읽기**이고, 그 루프에 **아무것도 끼워넣지 않는 것**이
+#  조건이다. 실측으로 반증된 것들(넣으면 실패율 폭증 → 전부 제거해야 함):
+#     ✗ 주기적 sbcs(에러) 확인      ✗ clear_sticky() 복구      ✗ interval 지연(sleep)
+#  → 아래 read_pinned() 안에는 dap.ap_read(DRW) **단 한 줄**만 있어야 한다.
+#  일회성 읽기(_sba_read)는 핫루프가 아니므로 에러 검사를 유지한다 — 혼동하지 말 것.
+
+def sba_pin(dap, ap, cb, addr):
+    """PCSR 폴링 준비: SBA 를 FIFO 모드(sbreadonaddr+sbreadondata)로 세팅하고
+    MEM-AP TAR 을 sbdata0 에 고정한다. **코어(주소)당 1회만** 호출.
+    이후 read_pinned() 가 DRW 만 반복 읽으면 샘플당 USB 왕복 1회가 된다."""
+    _sba_clear_err(dap, ap, cb)                       # 셋업 시점 1회만 — 루프 안에서는 금지
+    dap.mem_write32(ap, cb + SBCS_OFF, _SB32 | (1 << 20) | (1 << 15))  # readonaddr+readondata
+    dap.mem_write32(ap, cb + SBADDR0_OFF, addr)       # 주소 기입이 첫 read 를 트리거
+    csw = dap.ap_read(ap, OFF_CSW)
+    if csw is not None:                               # 32bit, 주소 자동증가 없음
+        dap.ap_write(ap, OFF_CSW, (csw & ~0x37) | 0x02)
+    dap.ap_write(ap, OFF_TAR, cb + SBDATA0_OFF)       # TAR 고정 → 이후 DRW 만 읽는다
+    return True
+
+
+def sba_read_pinned(dap, ap):
+    """핀 고정된 PCSR 1샘플. ★ 여기에 어떤 검사·복구·지연도 추가하지 말 것(위 주석)."""
+    return dap.ap_read(ap, OFF_DRW)
+
+
+def sba_unpin(dap, ap, cb):
+    """FIFO 모드 해제(sbreadondata off). 폴링 종료 후 1회."""
+    dap.mem_write32(ap, cb + SBCS_OFF, _SB32)
+
+
+# 연속 무효 샘플이 이 횟수를 넘으면 '세션 붕괴'로 보고 재생성한다(실측 근거는 아래).
+PCSR_COLLAPSE_INVALIDS = 300
+
+
+def reopen_session(lk, power, tap_note="off", tif_init=True, strict=False):
+    """★ 붕괴 복구 — J-Link **DLL 세션 재생성**. 실패 시 None, 성공 시 새 MemDap.
+
+    실측(2026-09): 3만~11만 샘플 지점에서 PCSR 이 갑자기 **전부 무효**가 되고 스스로
+    회복하지 않는다. PCSR_COLLAPSE_INVALIDS(300) 연속 무효를 감지하면 이 함수로 세션을
+    통째로 새로 만들어야 회복된다. 반증된 것들 — 이것들로는 **회복 안 됨**:
+        ✗ cJTAG 재초기화만        ✗ prepare_session 재호출만        ✗ clear_sticky
+    → close() + open() + prepare_session 의 **전체 재생성**만 동작한다."""
+    try:
+        lk.close()
+    except Exception:
+        pass
+    try:
+        lk.open(tap_script=False)
+        prepare_session(lk, power, tap_note, tif_init=tif_init, strict=strict)
+    except Exception as e:
+        print(f"  [reopen] 세션 재생성 실패: {e}")
+        return None
+    return MemDap(lk.jl)
+
+
 def _sba_fifo(dap, ap, cb, addr, nwords):
     """같은 주소(FIFO Data 레지스터)를 nwords 회 연속 읽기. sbreadonaddr+sbreadondata 로
     파이프라인: 주소쓰기가 첫 read 트리거, sbdata0 읽을 때마다 다음 read 트리거."""
