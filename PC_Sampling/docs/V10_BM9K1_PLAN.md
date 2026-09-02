@@ -219,7 +219,7 @@ telnet 계열 no-op. **모듈 레벨에서 pylink를 import하지 않는다**(`c
 
 **② 3만~11만 샘플 지점의 세션 붕괴 → J-Link DLL 세션 재생성만이 복구**
 장시간 폴링 중 어느 순간 PCSR 이 **갑자기 전부 무효**가 되고 **스스로 회복하지 않는다**.
-**연속 무효 300회**를 감지하면 세션을 통째로 새로 만들어야 한다. 회복되지 않는 것들:
+세션을 통째로 새로 만들어야 한다. 회복되지 않는 것들:
 
 | 시도 | 결과 |
 |---|---|
@@ -227,12 +227,32 @@ telnet 계열 no-op. **모듈 레벨에서 pylink를 import하지 않는다**(`c
 | `prepare_session` 재호출만 | ❌ 회복 안 됨 |
 | **`lk.close()` → `open()` → `prepare_session`** | ✅ 회복 |
 
-**코드 반영 완료** (`risc-v/sjtag_unlock.py`):
-`sba_pin()` / `sba_read_pinned()` / `sba_unpin()` — 검증된 패턴을 헬퍼로 고정하고
-"이 루프에 무엇도 추가하지 말 것"을 주석으로 못박음.
-`PCSR_COLLAPSE_INVALIDS = 300` / `reopen_session()` — 붕괴 감지 임계와 재생성 복구.
-`SJTAGPCSampler` 는 이 헬퍼를 그대로 사용하고, 연속 무효 카운터가 임계를 넘으면
-`reopen_session()` 을 호출한다(= `_read_fail_needs_recovery` 의 SJTAG 판정 근거).
+**저수준 primitive 구현 완료** (`risc-v/sjtag_unlock.py`) — 감지·호출·재핀·복구검증은 **Phase 4/6 예정**:
+- `sba_pin()` — 셋업 **fail-closed**(모든 단계 검사 + SUSPECT CSW 거부 + TAR 리드백 확인).
+- `sba_read_pinned(dap)` — **raw fast-path**. `Dap.ap_read()` 를 쓰지 않는다: 그 안에 retry,
+  실패 시 `clear_sticky()`(=DP_ABORT + SELECT 무효화), 다음 시도의 SELECT 재기입 + priming
+  read 가 들어있어 **하필 세션이 흔들리는 순간에 금지된 동작이 핫루프로 끼어든다.**
+  → SELECT/retry/sticky 없이 DRW 를 정확히 1회.
+- `reopen_session()` — close→open→prepare 재생성. `strict=True` 기본(전원 ACK 실패 세션을
+  성공으로 돌려주면 재연결이 발산), 최초 `tap_script` 모드 보존, prepare 실패 시 handle close.
+- 테스트: `test_pcsr_fastpath.py` 14개(핫루프 순수성 / 셋업 fail-closed / 재생성 순서·정리).
+
+**아직 없는 것**(샘플러 몫): 붕괴 **감지 로직**, `reopen_session()` 호출, **재핀**,
+복구 후 valid 회복 확인. 이 4개가 다 되어야 '복구 완료'로 기록할 수 있다.
+
+**붕괴 감지 기준 — 단일 코어 일시 무효와 구분해야 한다**
+`PCSR_COLLAPSE_INVALIDS = 300` 을 **한 코어의 연속 무효**에 그대로 적용하면 오판한다:
+버스트 방식이라 한 코어만 halt/wfi 로 잠깐 무효여도 **지연이 없어 수백 µs 만에 300회**를
+채운다. 실제 현상은 "**전 코어**가 지속적으로 무효"이므로 판정은:
+
+```
+붕괴 = (모든 활성 코어가 완전한 스케줄 사이클 동안 연속 무효)
+       AND (경과 시간 >= T)          # 샘플 수만으로는 시간이 안 정해진다
+```
+코어별 invalid streak 을 따로 유지하고, 확정 진단(DPIDR/CTRL-STAT read-only 확인)은
+**반드시 버스트 밖**에서 한다(핫루프 제약). 이 구분이 아래 §필터의 "valid=0 은 transport
+실패가 아니다"와 모순되지 않는 이유다 — **일시적 단일 코어 무효**는 복구 대상이 아니고,
+**전 코어 지속 무효**만 세션 붕괴다.
 
 **설계에 미치는 영향**
 - 코어 전환은 **셋업 지점**이므로 버스트 경계에서만 일어난다 — 버스트 방식이 이 제약과
@@ -359,7 +379,7 @@ matplotlib 강제 실패시켜도 HTML/CSV가 나오는지.
 |---|---|
 | **인증 카운터/락아웃** — 캠페인당 POR 수십 회 × 인증. 하드웨어가 시도를 세면 **자기 디버그 접근을 스스로 막을 수 있다** | Phase 8 전 SoC 담당 확인. 설계상 probe-first로 불필요한 인증 회피 |
 | **호스트 안정성** — `os.fork()` 재부팅, always-on 샘플링 freeze 이력. kHz 폴링은 그 부류 부하 | Phase 6 30분 소크 필수. ⚠ **샘플 간 지연은 쓸 수 없다**(실기서 실패율 폭증) → 부하 조절은 **버스트 길이·버스트 간 휴지**로 |
-| **세션 붕괴(3만~11만 샘플)** — 실측 확인됨. 방치하면 이후 커버리지가 전부 사라진다 | 연속 무효 300회 → `reopen_session()`(DLL 세션 재생성). 구현 완료. Phase 6 소크에서 발생 빈도·복구 성공률 계측 |
+| **세션 붕괴(3만~11만 샘플)** — 실측 확인됨. 방치하면 이후 커버리지가 전부 사라진다 | primitive(`reopen_session`) 구현 완료, **감지·재핀·복구검증은 Phase 4/6**. 판정은 '전 코어 지속 무효 + 최소 경과시간'(단일 코어 일시 무효와 구분). Phase 6 소크에서 발생 빈도·복구 성공률·MTBF 계측 |
 | **`+0x17C`의 정체** — last-branch-target 래치일 가능성 | 코어 핀 고정 → `halt_checked` → `read_pc`와 대조. 래치여도 BB 귀속은 유효하나 분포가 edge 편향 |
 | **Ghidra RISC-V BB 품질 / 콜그래프 API** | Phase 2에서 BB 수·범위를 `.text`와 대조, `getCalledFunctions` 산출 확인 |
 | **코어 간 주소 겹침** | Phase 0에서 확인(이미 per-core 설계라 안전, 리포트 단순화 여지만 결정) |

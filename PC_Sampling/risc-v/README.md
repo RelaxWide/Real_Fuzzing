@@ -9,6 +9,26 @@ coverage-guided 루프에 **정확한 실행 커버리지**를 공급하는 것�
 
 ---
 
+## 0. 최신 상태 (2026-09) — 방향이 PCSR 폴링으로 바뀜 ★
+
+아래 §1 이후는 **2026-08 시점의 N-Trace 중심 기록**이다. 그 뒤 실측으로 방향이 바뀌었다:
+
+- **per-core PC 샘플 레지스터 발견**: `TE + 0x1000×core + 0x17C`, **bit0 = valid**,
+  PC = `value & ~1`. 4코어(HCORE/CMCore/Fcore/QCore) 모두 ELF 와 **offset=0, 100% 매칭**.
+  → **비침습 PC 폴링이 가능**하다. §1 의 "폴링할 PC 소스가 없다"는 결론은 **반증됨**.
+- **동작하는 폴링 형태는 하나뿐**(I/O 부하 중 검증): SBA FIFO 모드 **셋업 1회 + DRW 반복**.
+  루프에 주기적 sbcs 확인 / clear_sticky / interval 지연을 넣으면 **실패율 폭증**.
+  → `sba_pin()` / `sba_read_pinned()`(raw fast-path) / `sba_unpin()` 로 고정.
+- **세션 붕괴**: 3만~11만 샘플 지점에서 전 코어가 무효가 되고 스스로 회복하지 않음.
+  `close()+open()+prepare_session` 전체 재생성만 회복 → `reopen_session()`.
+  (cJTAG 재초기화·prepare_session 단독·clear_sticky 로는 회복 안 됨)
+- 테스트: `test_pcsr_fastpath.py`(14개) — 핫루프 순수성·셋업 fail-closed·재생성 계약.
+
+**전체 설계는 `../docs/V10_BM9K1_PLAN.md`** 를 볼 것. N-Trace 경로(`TRACE_COVERAGE_PLAN.md`)는
+기술 자료로만 유효하다.
+
+---
+
 ## 1. 현재 상태 (2026-08)
 
 ### ✅ 완료 — secure JTAG 해제 → 디버그 → 트레이스 캡처

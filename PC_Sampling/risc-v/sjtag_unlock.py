@@ -43,7 +43,7 @@ from collections import namedtuple
 from sfe76_link import (require_api, Link, LinkError, AP_MAP, add_common_args,
                         CORE_BASE_MAIN, CORE_BASE_NCORE, RISCV_ADDRS, ADDRS_REAL,
                         EXIT_OK, EXIT_CONNECT_FAIL, EXIT_INSUFFICIENT)
-from dap_access import (Dap, OFF_CSW, OFF_TAR, OFF_DRW, OFF_IDR,
+from dap_access import (Dap, OFF_CSW, OFF_TAR, OFF_DRW, OFF_IDR, AP_IDX_DRW,
                           csw_usable, hx)
 
 VERSION = "sjtag_unlock 2026-08-13.2"
@@ -713,20 +713,42 @@ def _sba_write(dap, ap, cb, addr, val):
 def sba_pin(dap, ap, cb, addr):
     """PCSR 폴링 준비: SBA 를 FIFO 모드(sbreadonaddr+sbreadondata)로 세팅하고
     MEM-AP TAR 을 sbdata0 에 고정한다. **코어(주소)당 1회만** 호출.
-    이후 read_pinned() 가 DRW 만 반복 읽으면 샘플당 USB 왕복 1회가 된다."""
+    이후 sba_read_pinned() 가 DRW 만 반복 읽으면 샘플당 USB 왕복 1회가 된다.
+
+    ★ 셋업은 fail-closed — 한 단계라도 실패하면 False. 핫루프에는 검사를 못 넣으므로
+      (실측 제약) 여기서 확실히 걸러야 한다. 핀이 안 됐는데 True 를 주면 이후 DRW 가
+      엉뚱한 주소/상태를 읽는다."""
     _sba_clear_err(dap, ap, cb)                       # 셋업 시점 1회만 — 루프 안에서는 금지
-    dap.mem_write32(ap, cb + SBCS_OFF, _SB32 | (1 << 20) | (1 << 15))  # readonaddr+readondata
-    dap.mem_write32(ap, cb + SBADDR0_OFF, addr)       # 주소 기입이 첫 read 를 트리거
+    if not dap.mem_write32(ap, cb + SBCS_OFF, _SB32 | (1 << 20) | (1 << 15)):
+        return False                                  # readonaddr+readondata
+    if not dap.mem_write32(ap, cb + SBADDR0_OFF, addr):
+        return False                                  # 주소 기입이 첫 read 를 트리거
     csw = dap.ap_read(ap, OFF_CSW)
-    if csw is not None:                               # 32bit, 주소 자동증가 없음
-        dap.ap_write(ap, OFF_CSW, (csw & ~0x37) | 0x02)
-    dap.ap_write(ap, OFF_TAR, cb + SBDATA0_OFF)       # TAR 고정 → 이후 DRW 만 읽는다
-    return True
+    if not csw_usable(csw):                           # None/SUSPECT 면 가공 금지
+        return False
+    if not dap.ap_write(ap, OFF_CSW, (csw & ~0x37) | 0x02):   # 32bit, 자동증가 off
+        return False
+    if not dap.ap_write(ap, OFF_TAR, cb + SBDATA0_OFF):       # TAR 고정
+        return False
+    back = dap.ap_read(ap, OFF_TAR)                   # 리드백으로 핀 확정
+    return back is not None and back == (cb + SBDATA0_OFF)
 
 
-def sba_read_pinned(dap, ap):
-    """핀 고정된 PCSR 1샘플. ★ 여기에 어떤 검사·복구·지연도 추가하지 말 것(위 주석)."""
-    return dap.ap_read(ap, OFF_DRW)
+def sba_read_pinned(dap):
+    """핀 고정된 PCSR 1샘플 — **raw fast-path**.
+
+    ★ Dap.ap_read() 를 쓰면 안 된다: 그 안에는 retry, 실패 시 clear_sticky()
+      (=DP_ABORT 쓰기 + SELECT 캐시 무효화), 다음 시도의 SELECT 재기입 + priming read 가
+      들어있다. 전부 실측으로 **금지된** 동작이고, 하필 세션이 흔들리기 시작하는 순간에
+      핫루프로 끼어들어 실패율을 더 키운다.
+    → 여기서는 SELECT/retry/sticky 없이 DRW 를 **정확히 한 번** 읽는다.
+      SELECT/TAR 은 sba_pin() 이 이미 맞춰뒀다는 전제.
+    반환: 유효값(int) 또는 None. 예외·음수·None 은 전부 None 으로 접는다."""
+    try:
+        v = dap.jl.coresight_read(AP_IDX_DRW, ap=True)
+    except Exception:
+        return None
+    return None if v is None or v < 0 else v & 0xFFFFFFFF
 
 
 def sba_unpin(dap, ap, cb):
@@ -738,23 +760,37 @@ def sba_unpin(dap, ap, cb):
 PCSR_COLLAPSE_INVALIDS = 300
 
 
-def reopen_session(lk, power, tap_note="off", tif_init=True, strict=False):
-    """★ 붕괴 복구 — J-Link **DLL 세션 재생성**. 실패 시 None, 성공 시 새 MemDap.
+def reopen_session(lk, power, tap_script=False, tif_init=True, strict=True):
+    """★ 붕괴 복구의 **저수준 primitive** — J-Link DLL 세션 재생성. 성공 시 새 MemDap, 실패 시 None.
 
     실측(2026-09): 3만~11만 샘플 지점에서 PCSR 이 갑자기 **전부 무효**가 되고 스스로
-    회복하지 않는다. PCSR_COLLAPSE_INVALIDS(300) 연속 무효를 감지하면 이 함수로 세션을
-    통째로 새로 만들어야 회복된다. 반증된 것들 — 이것들로는 **회복 안 됨**:
-        ✗ cJTAG 재초기화만        ✗ prepare_session 재호출만        ✗ clear_sticky
-    → close() + open() + prepare_session 의 **전체 재생성**만 동작한다."""
+    회복하지 않는다. 회복되지 않는 것들 — cJTAG 재초기화만 / prepare_session 재호출만 /
+    clear_sticky. **close() + open() + prepare_session 의 전체 재생성만** 동작한다.
+
+    ⚠ 이 함수는 '세션을 다시 만드는 것'까지만 한다. 복구 **완료** 판정은 호출자(샘플러)가
+      다음을 모두 통과시켜야 한다 — 재핀(sba_pin) → 제한된 샘플로 valid 회복 확인.
+      그 전에는 복구 성공으로 기록하면 안 된다.
+    ⚠ strict 기본값은 True — DAP 전원 ACK 가 안 잡힌 세션을 성공으로 돌려주면
+      이후 전 샘플이 무효가 되고 붕괴 감지가 무한 재연결로 발산한다.
+    ⚠ tap_script 는 **최초 open 과 동일한 모드**를 넘겨야 한다. 복구 후 transport 조건이
+      달라지면 원인 분석이 불가능해진다."""
     try:
         lk.close()
     except Exception:
         pass
     try:
-        lk.open(tap_script=False)
-        prepare_session(lk, power, tap_note, tif_init=tif_init, strict=strict)
+        lk.open(tap_script=tap_script)
     except Exception as e:
-        print(f"  [reopen] 세션 재생성 실패: {e}")
+        print(f"  [reopen] open 실패: {e}")
+        return None
+    try:
+        prepare_session(lk, power, "off", tif_init=tif_init, strict=strict)
+    except Exception as e:
+        print(f"  [reopen] prepare_session 실패: {e}")
+        try:
+            lk.close()                      # 열어둔 handle 을 흘리지 않는다
+        except Exception:
+            pass
         return None
     return MemDap(lk.jl)
 
