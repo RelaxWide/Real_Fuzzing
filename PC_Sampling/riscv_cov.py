@@ -200,10 +200,8 @@ class CoverageModel:
     def _verify_counts(self, cm, info):
         """symbols.json 의 개수와 실제 로드량 대조 — 파일이 잘렸거나 짝이 안 맞으면 경고."""
         c = info.get("counts") or {}
-        # 생산 쪽 오타('funtions') 관용 — 나중에 고쳐도 안 깨지게 양쪽 다 본다
-        want_fn = c.get("functions", c.get("funtions"))
         for label, want, got in (("basic_blocks", c.get("basic_blocks"), cm.total_bbs),
-                                 ("functions", want_fn, cm.total_funcs)):
+                                 ("functions", c.get("functions"), cm.total_funcs)):
             if want is not None and want != got:
                 self.warnings.append(
                     f"core{cm.name}: {label} 개수 불일치 symbols.json={want} 실제={got}")

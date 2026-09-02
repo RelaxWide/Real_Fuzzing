@@ -26,7 +26,7 @@ def write_product(d, cores):
         sym["cores"][name] = {
             "elf_sha256": c.get("sha", ""),
             "counts": {"basic_blocks": len(c.get("bb", [])),
-                       "funtions": len(c.get("fn", []))},   # ★ 생산 쪽 오타 그대로
+                       "functions": len(c.get("fn", []))},
         }
     Path(d, "symbols.json").write_text(json.dumps(sym))
 
@@ -85,18 +85,6 @@ class TestLoad(Base):
         p.write_text(json.dumps(s))
         m = rc.CoverageModel.load(self.d)
         self.assertTrue(any("불일치" in w for w in m.warnings))
-
-    def test_tolerates_funtions_typo(self):
-        """생산 쪽 'funtions' 오타를 관용 — 나중에 고쳐도 안 깨져야 한다."""
-        write_product(self.d, {"H": {"bb": [(0x100, 0x110)],
-                                     "fn": [(0x100, 0x10, "f")]}})
-        m = rc.CoverageModel.load(self.d)
-        self.assertEqual(m.warnings, [])
-        p = Path(self.d, "symbols.json")
-        s = json.loads(p.read_text())
-        s["cores"]["H"]["counts"]["functions"] = s["cores"]["H"]["counts"].pop("funtions")
-        p.write_text(json.dumps(s))
-        self.assertEqual(rc.CoverageModel.load(self.d).warnings, [])
 
     def test_multiword_function_name(self):
         Path(self.d, "basic_blocks_coreH.txt").write_text("0x100 0x110\n")
