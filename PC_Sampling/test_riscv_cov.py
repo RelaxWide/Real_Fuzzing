@@ -214,3 +214,134 @@ class TestSnapshot(Base):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  버스트 스케줄 / PcsrSession — 하드웨어 없이 검증되는 부분
+# ══════════════════════════════════════════════════════════════════════
+import random
+from types import SimpleNamespace
+
+
+class TestBurstSchedule(unittest.TestCase):
+    def test_weights_become_counts(self):
+        sch = rc.build_burst_schedule({0: 3, 1: 1, 2: 1, 3: 1}, shuffle=False)
+        self.assertEqual(sch.count(0), 3)
+        self.assertEqual(len(sch), 6)
+
+    def test_shuffle_changes_order_but_not_counts(self):
+        """★ 순서 고정은 계통 편향(코어↔명령 처리 단계 결합)을 만든다 → 섞어야 한다."""
+        w = {0: 3, 1: 1, 2: 1, 3: 1}
+        fixed = rc.build_burst_schedule(w, shuffle=False)
+        shuf = rc.build_burst_schedule(w, rng=random.Random(1), shuffle=True)
+        self.assertEqual(sorted(fixed), sorted(shuf), "가중치(관측량)는 보존")
+        orders = {tuple(rc.build_burst_schedule(w, rng=random.Random(s)))
+                  for s in range(20)}
+        self.assertGreater(len(orders), 1, "매번 같은 순서면 편향이 남는다")
+
+    def test_reproducible_with_seed(self):
+        """세션 로그에 seed 를 남기면 샘플링 조건을 재현할 수 있어야 한다."""
+        a = rc.build_burst_schedule({0: 2, 1: 2}, rng=random.Random(42))
+        b = rc.build_burst_schedule({0: 2, 1: 2}, rng=random.Random(42))
+        self.assertEqual(a, b)
+
+    def test_zero_weight_core_excluded(self):
+        self.assertNotIn(3, rc.build_burst_schedule({0: 2, 3: 0}, shuffle=False))
+
+
+class FakeSJ:
+    """sjtag_unlock 대역 — 폴링이 실제로 어떤 순서로 호출되는지까지 본다."""
+
+    def __init__(self, reads):
+        self._reads = list(reads)
+        self.calls = []
+
+    def sba_pin(self, dap, ap, cb, addr):
+        self.calls.append(("pin", addr)); return True
+
+    def sba_read_pinned(self, dap):
+        self.calls.append(("read",))
+        return self._reads.pop(0) if self._reads else None
+
+    def sba_unpin(self, dap, ap, cb):
+        self.calls.append(("unpin",))
+
+    RISCV_ADDRS = {"trace": {"te_base": "0x1000000"},
+                   "pcsr": {"offset": "0x17C", "core_stride": "0x1000"}}
+
+
+def make_session(reads):
+    s = rc.PcsrSession(cores={0: {"name": "H"}}, verbose=False)
+    s._sj = FakeSJ(reads)
+    s.dap, s._ap, s._cb = object(), 0x1000, 0x8000
+    return s
+
+
+class TestPcsrBurst(unittest.TestCase):
+    def test_valid_bit_and_mask(self):
+        """bit0=valid, PC = value & ~1."""
+        s = make_session([0x1235, 0x1234])      # 홀수=valid, 짝수=invalid
+        obs = s.burst(0, 2)
+        self.assertEqual((obs[0].valid, obs[0].pc), (True, 0x1234))
+        self.assertEqual((obs[1].valid, obs[1].pc), (False, None))
+
+    def test_fresh_false_on_repeat(self):
+        """같은 PC 반복 = stale. PCSR 이 last-retired 계열이라 stall 시 반복된다."""
+        s = make_session([0x1001, 0x1001, 0x2001])
+        obs = s.burst(0, 3)
+        self.assertTrue(obs[0].fresh)
+        self.assertFalse(obs[1].fresh, "직전과 같은 PC 는 stale")
+        self.assertTrue(obs[2].fresh)
+
+    def test_read_failure_is_invalid_observation(self):
+        s = make_session([None, 0x1001])
+        obs = s.burst(0, 2)
+        self.assertFalse(obs[0].valid)
+        self.assertIsNone(obs[0].pc)
+
+    def test_pins_once_then_reads_only(self):
+        """★ 핫루프 계약: 버스트당 pin 1회 + read n회. 그 사이에 아무것도 없어야 한다."""
+        s = make_session([0x1001] * 5)
+        s.burst(0, 5)
+        self.assertEqual(s._sj.calls[0][0], "pin")
+        self.assertEqual([c[0] for c in s._sj.calls[1:]], ["read"] * 5)
+
+    def test_repin_skipped_for_same_core(self):
+        s = make_session([0x1001] * 4)
+        s.burst(0, 2); s.burst(0, 2)
+        self.assertEqual(sum(1 for c in s._sj.calls if c[0] == "pin"), 1,
+                         "같은 코어 연속 버스트면 재핀 불필요")
+
+    def test_pcsr_address_from_json_only(self):
+        """주소는 sjtag_addrs.json 에서만 — 코드에 상수로 박히면 안 된다."""
+        s = make_session([])
+        self.assertEqual(s._pcsr_addr(0), 0x1000000 + 0x17C)
+        self.assertEqual(s._pcsr_addr(2), 0x1000000 + 0x2000 + 0x17C)
+
+
+class TestRecovery(unittest.TestCase):
+    def test_failure_stage_is_reported(self):
+        """복구 실패 시 어느 단계에서 막혔는지 남아야 원인 분석이 된다."""
+        s = make_session([])
+        s._sj.reopen_session = lambda *a, **k: None
+        r = s.recover(0)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stage, "open/prepare")
+
+    def test_not_ok_without_valid_recovery(self):
+        """재핀만 되고 유효 샘플이 안 나오면 복구 성공으로 치면 안 된다."""
+        s = make_session([0x1000] * 8)          # 전부 invalid(짝수)
+        s._sj.reopen_session = lambda *a, **k: object()
+        s._sj._sba_ready = lambda dap: (0x1000, 0x8000)
+        r = s.recover(0, verify_samples=8)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stage, "valid")
+
+    def test_ok_when_valid_returns(self):
+        s = make_session([0x1001] * 8)
+        s._sj.reopen_session = lambda *a, **k: object()
+        s._sj._sba_ready = lambda dap: (0x1000, 0x8000)
+        r = s.recover(0, verify_samples=8)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.stage, "ok")
+        self.assertEqual(r.valid_samples, 8)

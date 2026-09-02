@@ -17,6 +17,8 @@ import bisect
 import hashlib
 import json
 import os
+import random
+import threading
 import time
 from collections import namedtuple
 
@@ -378,6 +380,178 @@ class CoverageModel:
     @property
     def total_funcs(self):
         return sum(cm.total_funcs for cm in self.cores.values())
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  버스트 스케줄 — 순서를 고정하지 않는다
+# ══════════════════════════════════════════════════════════════════════
+def build_burst_schedule(weights, rng=None, shuffle=True):
+    """가중치를 '버스트 개수'로 펴고 **섞는다**. → [core_id, ...]
+
+    왜 섞는가: 순서를 고정하면(항상 core0 이 윈도우 앞, core3 이 뒤) 명령 처리 단계
+    (파싱→DMA→완료)와 코어가 결합돼 **각 코어가 특정 단계만 관측**하는 계통 편향이 생긴다.
+    가중치(=관측량)와 순서(=편향)를 분리한다.
+      weights: {core_id: 정수 가중치}   예 {0:3, 1:1, 2:1, 3:1}
+    """
+    seq = []
+    for cid, w in sorted(weights.items()):
+        seq.extend([cid] * max(0, int(w)))
+    if shuffle and seq:
+        (rng or random).shuffle(seq)
+    return seq
+
+
+RecoveryResult = namedtuple("RecoveryResult", "ok stage elapsed valid_samples detail")
+
+
+class PcsrSession:
+    """PCSR 폴링 전송 계층 — 인증·핀·버스트·붕괴복구를 **한 lock 안에** 묶는다.
+
+    ★ 핸들 독점: sba_read_pinned() 는 SELECT/TAR 을 확인하지 않는다(pin 이 맞춰둔 상태를
+      신뢰). 버스트 중 같은 J-Link handle 로 다른 DAP 접근이 한 번만 끼어들어도 다른 AP
+      bank 의 DRW 를 읽는다. 그래서 샘플링/진단/인증probe/덤프/재연결/코어전환이 전부
+      self.lock 을 거친다. (NVMe subprocess 동시 실행은 무관 — 동일 handle 접근이 문제)
+
+    pylink·sjtag_unlock 은 **open() 안에서 지연 import** 한다 → 이 모듈은 하드웨어 없이
+    import·테스트된다."""
+
+    def __init__(self, cores, power="both", tap_script=False, auth_wrapper=None,
+                 verbose=True):
+        self.cores = cores            # {core_id: {"name":…, "elf":…, "load_offset":…}}
+        self.power, self.tap_script = power, tap_script
+        self.auth_wrapper = auth_wrapper
+        self.verbose = verbose
+        self.lock = threading.RLock()
+        self.lk = self.dap = None
+        self._ap = self._cb = None
+        self._pinned = None           # 현재 핀된 core_id
+        self._authed_epoch = None
+        self.auth_ms = 0.0
+        self.last_fail_kind = None    # 'transport' | 'invalid' | None
+        self._sj = None               # sjtag_unlock 모듈(지연)
+
+    def _say(self, m):
+        if self.verbose:
+            print(m)
+
+    # ── 주소 (기밀은 sjtag_addrs.json 에만) ───────────────────────────
+    def _pcsr_addr(self, core_id):
+        tr = self._sj.RISCV_ADDRS.get("trace", {})
+        pc = self._sj.RISCV_ADDRS.get("pcsr", {})
+        te = int(str(tr.get("te_base", "0")), 0)
+        off = int(str(pc.get("offset", "0")), 0)
+        stride = int(str(pc.get("core_stride", "0x1000")), 0)
+        return te + stride * core_id + off
+
+    # ── 세션 ─────────────────────────────────────────────────────────
+    def open(self, power_epoch=0):
+        """지연 import → Link.open → prepare_session → 인증 확인."""
+        import importlib
+        import sys as _sys
+        from pathlib import Path as _P
+        rv = str(_P(__file__).resolve().parent / "risc-v")
+        if rv not in _sys.path:
+            _sys.path.insert(0, rv)          # 'risc-v' 는 하이픈이라 패키지 import 불가
+        self._sj = importlib.import_module("sjtag_unlock")
+        link_mod = importlib.import_module("sfe76_link")
+        with self.lock:
+            self.lk = link_mod.Link(core_base=link_mod.CORE_BASE_MAIN)
+            # README: 첫 connect 는 실패하고 2회차에 붙는다
+            for attempt in (1, 2):
+                try:
+                    self.lk.open(tap_script=self.tap_script)
+                    self._sj.prepare_session(self.lk, self.power,
+                                             "on" if self.tap_script else "off",
+                                             tif_init=True, strict=True)
+                    break
+                except Exception as e:
+                    self._say(f"  [pcsr] open 시도 {attempt} 실패: {str(e)[:80]}")
+                    try:
+                        self.lk.close()
+                    except Exception:
+                        pass
+                    if attempt == 2:
+                        return False
+            self.dap = self._sj.MemDap(self.lk.jl)
+            sb = self._sj._sba_ready(self.dap)
+            if sb is None:
+                self._say("  [pcsr] SBA 사용 불가 — 인증/전원 확인 필요")
+                return False
+            self._ap, self._cb = sb
+            self._authed_epoch = power_epoch
+            return True
+
+    def close(self):
+        with self.lock:
+            try:
+                if self.dap is not None and self._pinned is not None:
+                    self._sj.sba_unpin(self.dap, self._ap, self._cb)
+            except Exception:
+                pass
+            self._pinned = None
+            try:
+                if self.lk is not None:
+                    self.lk.close()
+            except Exception:
+                pass
+
+    # ── 핀 / 폴링 ────────────────────────────────────────────────────
+    def pin(self, core_id):
+        with self.lock:
+            if self._pinned == core_id:
+                return True
+            ok = self._sj.sba_pin(self.dap, self._ap, self._cb,
+                                  self._pcsr_addr(core_id))
+            self._pinned = core_id if ok else None
+            return ok
+
+    def burst(self, core_id, n, valid_bit=1):
+        """한 코어를 n회 연속 폴링 → [Observation].
+        ★ 루프 본체에 검사·복구·지연을 넣지 않는다(실측 제약)."""
+        obs = []
+        with self.lock:
+            if not self.pin(core_id):
+                self.last_fail_kind = "transport"
+                return obs
+            read = self._sj.sba_read_pinned
+            dap, prev = self.dap, None
+            for _ in range(n):
+                raw = read(dap)
+                if raw is None:
+                    obs.append(Observation(core_id, None, False, False))
+                    continue
+                valid = bool(raw & valid_bit)
+                pc = (raw & ~valid_bit) if valid else None
+                obs.append(Observation(core_id, pc, pc != prev, valid))
+                prev = pc
+        self.last_fail_kind = ("transport" if all(o.pc is None and not o.valid for o in obs)
+                               and obs else None)
+        return obs
+
+    # ── 복구 ─────────────────────────────────────────────────────────
+    def recover(self, core_id, verify_samples=64):
+        """붕괴 복구를 **단일 트랜잭션**으로. 재핀·valid 회복까지 통과해야 성공.
+        실패 단계(stage)를 남겨야 원인 분석이 된다."""
+        t0 = time.time()
+        with self.lock:
+            self._pinned = None
+            dap = self._sj.reopen_session(self.lk, self.power,
+                                          tap_script=self.tap_script, strict=True)
+            if dap is None:
+                return RecoveryResult(False, "open/prepare", time.time() - t0, 0, "")
+            self.dap = dap
+            sb = self._sj._sba_ready(dap)
+            if sb is None:
+                return RecoveryResult(False, "sba", time.time() - t0, 0, "")
+            self._ap, self._cb = sb
+            if not self.pin(core_id):
+                return RecoveryResult(False, "pin", time.time() - t0, 0, "")
+            obs = self.burst(core_id, verify_samples)
+            nv = sum(1 for o in obs if o.valid)
+            if nv == 0:
+                return RecoveryResult(False, "valid", time.time() - t0, 0,
+                                      "재핀은 됐으나 유효 샘플 0")
+            return RecoveryResult(True, "ok", time.time() - t0, nv, "")
 
 
 def sha256_of(path, chunk=1 << 20):
