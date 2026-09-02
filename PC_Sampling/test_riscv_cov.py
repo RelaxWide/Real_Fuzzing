@@ -268,12 +268,19 @@ class FakeSJ:
 
     RISCV_ADDRS = {"trace": {"te_base": "0x1000000"},
                    "pcsr": {"offset": "0x17C", "core_stride": "0x1000"}}
+    # 인증 관련(기본 경로는 '이미 인증됨'을 가정 — 상세는 TestEnsureAuth 에서)
+    SJTAG_BASE, SIGN_TOOL, TOOL_PREFIX = 0x1000, "/x/signer.exe", "wine"
+    APBAP3_BASE, OFF_STATE, AUTH_PASS = 0x50000, 0x4, 0x100
+
+    def unlock(self, *a, **k):
+        self.calls.append(("unlock",))
+        return None
 
 
 def make_session(reads):
     s = rc.PcsrSession(cores={0: {"name": "H"}}, verbose=False)
     s._sj = FakeSJ(reads)
-    s.dap, s._ap, s._cb = object(), 0x1000, 0x8000
+    s.dap, s._ap, s._cb = FakeDapAuth(FakeSJAuth.AUTH_PASS), 0x1000, 0x8000
     return s
 
 
@@ -331,7 +338,7 @@ class TestRecovery(unittest.TestCase):
     def test_not_ok_without_valid_recovery(self):
         """재핀만 되고 유효 샘플이 안 나오면 복구 성공으로 치면 안 된다."""
         s = make_session([0x1000] * 8)          # 전부 invalid(짝수)
-        s._sj.reopen_session = lambda *a, **k: object()
+        s._sj.reopen_session = lambda *a, **k: FakeDapAuth(FakeSJAuth.AUTH_PASS)
         s._sj._sba_ready = lambda dap: (0x1000, 0x8000)
         r = s.recover(0, verify_samples=8)
         self.assertFalse(r.ok)
@@ -339,9 +346,117 @@ class TestRecovery(unittest.TestCase):
 
     def test_ok_when_valid_returns(self):
         s = make_session([0x1001] * 8)
-        s._sj.reopen_session = lambda *a, **k: object()
+        s._sj.reopen_session = lambda *a, **k: FakeDapAuth(FakeSJAuth.AUTH_PASS)
         s._sj._sba_ready = lambda dap: (0x1000, 0x8000)
         r = s.recover(0, verify_samples=8)
         self.assertTrue(r.ok)
         self.assertEqual(r.stage, "ok")
         self.assertEqual(r.valid_samples, 8)
+
+
+class FakeDapAuth:
+    """STATE 레지스터를 흉내내는 dap — 인증 전/후 값을 바꿔가며 검증."""
+
+    def __init__(self, state=0):
+        self.state = state
+        self.reads = 0
+
+    def mem_read32(self, ap, addr):
+        self.reads += 1
+        return self.state
+
+
+class FakeSJAuth(FakeSJ):
+    SJTAG_BASE, SIGN_TOOL, TOOL_PREFIX = 0x1000, "/x/signer.exe", "wine"
+    APBAP3_BASE, OFF_STATE, AUTH_PASS = 0x50000, 0x4, 0x100
+
+    def __init__(self, reads=(), unlock_raises=None, state_after=None):
+        super().__init__(reads)
+        self.unlock_calls = 0
+        self._unlock_raises = unlock_raises
+        self._state_after = state_after
+
+    def unlock(self, dap, base, tool, word_order, timeout=60.0, tool_prefix=()):
+        self.unlock_calls += 1
+        if self._unlock_raises:
+            raise self._unlock_raises
+        if self._state_after is not None:
+            dap.state = self._state_after
+        return SimpleNamespace(status="ok")
+
+
+def auth_session(state=0, **kw):
+    s = rc.PcsrSession(cores={0: {"name": "H"}}, verbose=False)
+    s._sj = FakeSJAuth(**kw)
+    s.dap = FakeDapAuth(state)
+    s._ap, s._cb = 0x1000, 0x8000
+    return s
+
+
+class TestEnsureAuth(unittest.TestCase):
+    """★ probe-first: unlock() 은 쓰기라 인증 카운터를 소모한다. 하드웨어가 시도를 세거나
+    anti-hammering 이 있으면 캠페인 도중 자기 디버그 접근을 스스로 막을 수 있다."""
+
+    def test_skips_when_already_authed(self):
+        s = auth_session(state=0x100)          # AUTH_PASS 세워짐
+        ok, why = s.ensure_auth()
+        self.assertTrue(ok)
+        self.assertEqual(s._sj.unlock_calls, 0, "이미 인증됐으면 unlock 하지 않는다")
+
+    def test_authenticates_when_cleared(self):
+        """POR 로 전원이 내려가면 AUTH_PASS 가 꺼진다 → 자동 재인증."""
+        s = auth_session(state=0x000, state_after=0x100)
+        ok, why = s.ensure_auth()
+        self.assertTrue(ok, why)
+        self.assertEqual(s._sj.unlock_calls, 1)
+        self.assertEqual(s.auth_count, 1)
+
+    def test_force_reauths_even_if_authed(self):
+        s = auth_session(state=0x100, state_after=0x100)
+        s.ensure_auth(force=True)
+        self.assertEqual(s._sj.unlock_calls, 1)
+
+    def test_unlock_exception_reported(self):
+        s = auth_session(state=0, unlock_raises=RuntimeError("서명도구 죽음"))
+        ok, why = s.ensure_auth()
+        self.assertFalse(ok)
+        self.assertIn("unlock 실패", why)
+        self.assertEqual(s.auth_fail, 1)
+
+    def test_unlock_without_auth_pass_is_failure(self):
+        """unlock 이 끝나도 AUTH_PASS 가 안 서면 성공으로 치면 안 된다."""
+        s = auth_session(state=0, state_after=0)
+        ok, why = s.ensure_auth()
+        self.assertFalse(ok)
+        self.assertIn("AUTH_PASS", why)
+
+    def test_missing_config_gives_clear_reason(self):
+        for attr, key in (("SJTAG_BASE", "sjtag_base"), ("SIGN_TOOL", "sign_tool")):
+            with self.subTest(attr=attr):
+                s = auth_session(state=0)
+                setattr(s._sj, attr, None)
+                ok, why = s.ensure_auth()
+                self.assertFalse(ok)
+                self.assertIn(key, why)
+
+    def test_probe_is_read_only(self):
+        """probe 는 읽기만 — 카운터 무소모."""
+        s = auth_session(state=0x100)
+        s.ensure_auth()
+        self.assertGreater(s.dap.reads, 0)
+        self.assertEqual(s._sj.unlock_calls, 0)
+
+
+class TestRecoveryAuth(unittest.TestCase):
+    def test_auth_checked_before_sba(self):
+        """SBA(=DM)는 인증 후에만 열린다 → 인증 실패면 stage='auth' 로 정확히 보고."""
+        s = auth_session(state=0, unlock_raises=RuntimeError("no"))
+        s._sj.reopen_session = lambda *a, **k: s.dap
+        called = {"sba": False}
+        def _sba(dap):
+            called["sba"] = True; return (0x1000, 0x8000)
+        s._sj._sba_ready = _sba
+        r = s.recover(0)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stage, "auth")
+        self.assertFalse(called["sba"], "인증 실패면 SBA 를 시도하지 않는다")

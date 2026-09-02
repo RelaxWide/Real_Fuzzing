@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import random
+import shlex
 import threading
 import time
 from collections import namedtuple
@@ -416,7 +417,7 @@ class PcsrSession:
     import·테스트된다."""
 
     def __init__(self, cores, power="both", tap_script=False, auth_wrapper=None,
-                 verbose=True):
+                 verbose=True, auth_timeout=60.0, word_order=None):
         self.cores = cores            # {core_id: {"name":…, "elf":…, "load_offset":…}}
         self.power, self.tap_script = power, tap_script
         self.auth_wrapper = auth_wrapper
@@ -425,8 +426,11 @@ class PcsrSession:
         self.lk = self.dap = None
         self._ap = self._cb = None
         self._pinned = None           # 현재 핀된 core_id
-        self._authed_epoch = None
         self.auth_ms = 0.0
+        self.auth_count = 0
+        self.auth_fail = 0
+        self.auth_timeout = float(auth_timeout)
+        self.word_order = word_order or 't32-negative'
         self.last_fail_kind = None    # 'transport' | 'invalid' | None
         self._sj = None               # sjtag_unlock 모듈(지연)
 
@@ -442,6 +446,48 @@ class PcsrSession:
         off = int(str(pc.get("offset", "0")), 0)
         stride = int(str(pc.get("core_stride", "0x1000")), 0)
         return te + stride * core_id + off
+
+    # ── 인증 (SJTAG) ─────────────────────────────────────────────────
+    def auth_state(self):
+        """SJTAG STATE 레지스터 **read-only** 조회 → (raw, authed).
+        읽기만 하므로 인증 카운터를 소모하지 않는다."""
+        sj = self._sj
+        base = getattr(sj, "SJTAG_BASE", None)
+        if not base or self.dap is None:
+            return None, False
+        v = self.dap.mem_read32(sj.APBAP3_BASE, base + sj.OFF_STATE)
+        return v, bool(v is not None and (v & sj.AUTH_PASS))
+
+    def ensure_auth(self, force=False):
+        """★ probe-first 인증. → (ok, 사유)
+
+        레지스터가 ground truth다 — 전원이 내려갔으면 AUTH_PASS 가 꺼져 있고, 살아 있으면
+        굳이 다시 하지 않는다. unlock() 은 **쓰기**라 인증 카운터를 소모하고, 하드웨어가
+        시도를 세거나 anti-hammering 이 있으면 캠페인 도중 자기 디버그 접근을 스스로
+        막을 수 있다. 그래서 '필요할 때만' 이 원칙이다.
+        (POR 로 전원이 내려가면 자동으로 여기서 재인증된다.)"""
+        sj = self._sj
+        raw, authed = self.auth_state()
+        if authed and not force:
+            return True, f"이미 인증됨(STATE={raw:#010x})" if raw is not None else "이미 인증됨"
+        if not getattr(sj, "SJTAG_BASE", None):
+            return False, "sjtag_addrs.json runtime.sjtag_base 미설정"
+        if not getattr(sj, "SIGN_TOOL", None):
+            return False, "sjtag_addrs.json runtime.sign_tool 미설정"
+        t0 = time.time()
+        try:
+            prefix = shlex.split(getattr(sj, "TOOL_PREFIX", "") or "")
+            sj.unlock(self.dap, sj.SJTAG_BASE, sj.SIGN_TOOL, self.word_order,
+                      timeout=self.auth_timeout, tool_prefix=prefix)
+        except Exception as e:
+            self.auth_fail += 1
+            return False, f"unlock 실패: {str(e)[:120]}"
+        self.auth_ms = (time.time() - t0) * 1000.0
+        self.auth_count += 1
+        raw, authed = self.auth_state()
+        if not authed:
+            return False, "unlock 은 끝났으나 AUTH_PASS 미확인"
+        return True, f"인증 완료 {self.auth_ms:.0f}ms (누적 {self.auth_count}회)"
 
     # ── 세션 ─────────────────────────────────────────────────────────
     def open(self, power_epoch=0):
@@ -473,6 +519,11 @@ class PcsrSession:
                     if attempt == 2:
                         return False
             self.dap = self._sj.MemDap(self.lk.jl)
+            # ★ SBA(=DM)는 인증이 통과해야 열린다 → _sba_ready 보다 먼저.
+            ok, why = self.ensure_auth()
+            self._say(f"  [pcsr] 인증: {why}")
+            if not ok:
+                return False
             sb = self._sj._sba_ready(self.dap)
             if sb is None:
                 self._say("  [pcsr] SBA 사용 불가 — 인증/전원 확인 필요")
@@ -540,6 +591,9 @@ class PcsrSession:
             if dap is None:
                 return RecoveryResult(False, "open/prepare", time.time() - t0, 0, "")
             self.dap = dap
+            ok, why = self.ensure_auth()      # 붕괴 원인이 전원/인증일 수 있다. SBA 보다 먼저
+            if not ok:
+                return RecoveryResult(False, "auth", time.time() - t0, 0, why)
             sb = self._sj._sba_ready(dap)
             if sb is None:
                 return RecoveryResult(False, "sba", time.time() - t0, 0, "")

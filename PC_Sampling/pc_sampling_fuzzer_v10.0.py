@@ -3493,9 +3493,16 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
     # ── 연결 / 인증 ──────────────────────────────────────────────────
     def connect(self) -> bool:
         rv = getattr(self.config, 'riscv', None) or {}
+        if self.session is not None:          # POR/재연결 시 이전 세션을 흘리지 않는다
+            try:
+                self.session.close()
+            except Exception:
+                pass
         self.session = self._rc.PcsrSession(
             cores=self._cores, power=rv.get('power', 'both'),
-            tap_script=bool(rv.get('tap_script', False)))
+            tap_script=bool(rv.get('tap_script', False)),
+            auth_timeout=float(rv.get('auth_timeout', 60.0)),
+            word_order=rv.get('word_order'))
         if not self.session.open():
             log.error("[SJTAG] 세션 열기 실패 — 인증/전원 확인 (sudo 필요)")
             return False
@@ -3511,7 +3518,8 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             if not self._weights:
                 self._weights = {cid: 1 for cid in self._cores}
             self._pcsr_addrs = [0] * len(self._cores)
-        log.warning(f"[SJTAG] 세션 OK. 버스트 seed={self._seed} "
+        log.warning(f"[SJTAG] 세션 OK (인증 {self.session.auth_count}회, "
+                    f"{self.session.auth_ms:.0f}ms). 버스트 seed={self._seed} "
                     f"(재현하려면 sample_plan.seed 에 지정)")
         ok_cores = []
         for cid in sorted(self._cores):
