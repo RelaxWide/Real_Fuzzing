@@ -4815,9 +4815,18 @@ class NVMeFuzzer:
 
             # 2) id-ctrl 무조건 시도 — kernel 측 path 가 일시적으로 안 보여도
             # 다음 iteration 에서 다시 시도. v7.7 의 단순 hammer 방식.
-            r = subprocess.run(
+            #
+            # subprocess.run(timeout=) 은 timeout 뒤 kill()+communicate() 를 다시
+            # 수행한다. NVMe ioctl 이 D-state 에 빠지면 SIGKILL 도 처리되지 않아
+            # 여기서 퍼저가 영구 block 될 수 있다. 더구나 예전 코드는
+            # TimeoutExpired 를 잡지 않아 repro-opcode 의 POR 복구 중 예외가 run()
+            # 밖까지 전파되고, 정상적인 False 반환 대신 종료 루틴을 탄 뒤 죽었다.
+            # state 관측에 이미 쓰는 D-state 안전 Popen 래퍼로 통일한다.
+            remaining_before_probe = max(0.0, deadline - time.monotonic())
+            probe_timeout = max(0.1, min(10.0, remaining_before_probe))
+            r = _run_nvme_state_cmd(
                 ['nvme', 'id-ctrl', self.config.nvme_device],
-                capture_output=True, timeout=10)
+                timeout_sec=probe_timeout)
             if r.returncode == 0:
                 log.warning(f"[POR] NVMe 장치 응답 확인: {self.config.nvme_device} "
                             f"✓ (시도 {attempt}회)")
@@ -4825,6 +4834,8 @@ class NVMeFuzzer:
                 self._invalidate_device_caches("POR PCIe rescan 후 device 재열거")
                 return True
             _err = r.stderr.decode(errors='replace').strip()[:100]
+            if r.returncode == -1 and _err == 'timeout':
+                _err = f"id-ctrl timeout({probe_timeout:.1f}s; ROM/관리큐 무응답 가능)"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 log.warning(f"[POR] NVMe 미응답 — 시도 {attempt}회 모두 실패. 마지막 err: {_err}")
