@@ -709,6 +709,13 @@ def _sba_write(dap, ap, cb, addr, val):
 #     ✗ 주기적 sbcs(에러) 확인      ✗ clear_sticky() 복구      ✗ interval 지연(sleep)
 #  → 아래 read_pinned() 안에는 dap.ap_read(DRW) **단 한 줄**만 있어야 한다.
 #  일회성 읽기(_sba_read)는 핫루프가 아니므로 에러 검사를 유지한다 — 혼동하지 말 것.
+#
+#  ★ 핸들 독점 계약: sba_read_pinned() 는 SELECT/TAR 을 확인하지 않는다(sba_pin 이 맞춰둔
+#    상태를 신뢰). 따라서 **버스트 중에는 같은 J-Link handle 로 다른 DAP 접근이 단 한 번도
+#    들어오면 안 된다** — 한 번만 끼어들어도 다른 AP bank 의 DRW 를 읽게 된다.
+#    같은 lock/lifecycle 경계를 공유해야 하는 것: 샘플링 버스트 / 붕괴 진단 / 인증 상태
+#    probe / 덤프 / 재연결 / health check / 코어 전환.
+#    (NVMe subprocess 와의 동시 실행은 무관 — 문제는 동일 handle 의 동시 접근이다.)
 
 def sba_pin(dap, ap, cb, addr):
     """PCSR 폴링 준비: SBA 를 FIFO 모드(sbreadonaddr+sbreadondata)로 세팅하고
@@ -756,8 +763,12 @@ def sba_unpin(dap, ap, cb):
     dap.mem_write32(ap, cb + SBCS_OFF, _SB32)
 
 
-# 연속 무효 샘플이 이 횟수를 넘으면 '세션 붕괴'로 보고 재생성한다(실측 근거는 아래).
-PCSR_COLLAPSE_INVALIDS = 300
+# 붕괴 판정은 **단일 코어 연속 무효가 아니다.** 버스트 방식 + 핫루프 무지연이라 한 코어가
+# 잠깐 halt/wfi 로 무효여도 수백 µs 만에 수백 회를 채운다 → 그걸 임계로 쓰면 오판한다.
+# 실제 현상은 "**전 코어**가 지속적으로 무효". 아래 두 조건을 AND 로 본다.
+# ⚠ 둘 다 **잠정값** — Phase 6 소크에서 실측 확정할 대상(발생빈도·MTBF와 함께).
+PCSR_COLLAPSE_MIN_ALL_CORE_CYCLES = 3     # 전 활성코어가 연속 무효인 '완전 스케줄 사이클' 수
+PCSR_COLLAPSE_MIN_SECONDS = 0.5           # 그 상태가 최소 이만큼 지속돼야 붕괴로 확정
 
 
 def reopen_session(lk, power, tap_script=False, tif_init=True, strict=True):
@@ -782,9 +793,14 @@ def reopen_session(lk, power, tap_script=False, tif_init=True, strict=True):
         lk.open(tap_script=tap_script)
     except Exception as e:
         print(f"  [reopen] open 실패: {e}")
+        try:
+            lk.close()      # Link.open 은 self.jl 을 먼저 만들고 USB open 을 시도한다 —
+        except Exception:   # 도중 실패하면 부분 생성된 DLL 객체가 남으므로 best-effort 정리
+            pass
         return None
     try:
-        prepare_session(lk, power, "off", tif_init=tif_init, strict=strict)
+        prepare_session(lk, power, "on" if tap_script else "off",
+                        tif_init=tif_init, strict=strict)
     except Exception as e:
         print(f"  [reopen] prepare_session 실패: {e}")
         try:

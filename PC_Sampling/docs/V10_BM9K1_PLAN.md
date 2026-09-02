@@ -149,19 +149,39 @@ key = (core << 44) | (bank << 32) | addr        # bank=0 이 현재 기본값
 | 위치 | 변경 |
 |---|---|
 | `_sampling_worker` **2792** | `self._reset_window_extra()` 훅 추가(기본 no-op) |
-| `_sampling_worker` **2886** | **그대로.** `SJTAGPCSampler._read_all_pcs`가 `_win_by_core`를 자체 적재하고 튜플도 반환 → 상속된 saturation/idle/raw 로직 무수정 동작 |
+| `_sampling_worker` **2886** | ⚠ **전제 철회(리뷰 반영).** 기존 worker 는 `_read_all_pcs()` 결과를 **같은 시점의 다코어 튜플**로 해석하는데 버스트는 한 번에 한 코어만 읽는다 → 튜플 위치로 코어를 유추하는 saturation/idle/`_last_new_at` 판정이 전부 틀어진다. **Observation 계약 도입 필요**(아래) |
 | `_account_command` **6644-6667** | 인라인 bisect를 `self.cov.account(sampler.window_by_core())`로 교체. `_update_static_coverage`(8243)의 중복 bisect도 흡수(현재 트레이스를 2번 훑음) |
 | `_snapshot_chart_data` **12865** | `'cov': self.cov.snapshot()` 추가. `_CHART_SNAPSHOT_ATTRS`에 **객체를 넣지 않는다** — `_snap_copy`는 dict/set/list만 이해 |
 | `_render_charts_from_snapshot` **15733** | `inst.cov = CoverageModel.from_snapshot(snap['cov'])` |
 | `_sa_*` 뷰 | `CoverageModel`이 union 뷰를 노출 → **기존 차트 6종 무수정 동작** |
 | `_update_static_coverage` **8253-8281** | Thumb 자동감지를 `arch != 'riscv'`로 게이트(RISC-V는 bit0=0이라 로그 노이즈만 생김) |
 
+**Observation 계약 (버스트 방식의 필연)**
+```python
+Observation(core_id: int, pc: int | None, fresh: bool, valid: bool)
+```
+- `valid` — PCSR bit0. `False` 는 그 코어가 잠깐 halt/wfi 인 것이지 링크 장애가 아니다.
+- `fresh` — 이번 버스트에서 새로 읽은 값인가(직전 값 반복이 아닌가).
+- **코어별로** invalid streak / saturation / idle 을 계산한다. 튜플 위치로 코어를 유추하는
+  현재 로직은 버스트에서 성립하지 않는다.
+- **stale 샘플은 interesting/idle/saturation 판정에서 제외**한다.
+→ 공통 worker 를 Observation 기반으로 바꾸거나, SJTAG 전용 worker 를 두고 기존 샘플러는
+  `[Observation(0, pc, True, True), …]` 로 감싸 **기존 동작을 그대로 보존**한다(회귀 안전).
+
 **"interesting" 정책**: `(core,bank,bb)` 키라 union-new가 곧 코어별 신규성이다. 기본 **union**
 (§4의 셔플 버스트로 모든 코어가 매 윈도우 샘플되므로 비교 가능). `new_by_core`를 별도 집계해
 저duty 코어의 노이즈를 관측하고, `interesting_policy: "union"|"primary"` 로 전환 가능.
 
-**형식 호환**: `coverage.txt`(union raw PC) 유지 → `--resume-coverage` 그대로.
-`coverage_by_core.txt` 신규. `_sa_cov_history`에 5번째 원소 `{core:(bb%,func%)}` **추가**
+**형식 호환 — resume 은 versioned 파일이 authoritative**
+`coverage.txt` 에 raw PC union 만 쓰면 core/bank 가 소실되고, packed key 를 쓰면 v9.8 및
+기존 도구와 호환이 깨진다. 둘을 분리한다:
+| 파일 | 역할 |
+|---|---|
+| `coverage.txt` | 기존 도구 호환용 **raw PC union**(정보 손실 있음) |
+| **`coverage_v2.jsonl`** | **resume 의 authoritative source** — `(core, bank, addr)` + `schema_version` / `product` / **ELF 해시** |
+BM9K1 의 `--resume-coverage` 는 v2 를 읽는다. **ELF 해시가 다르면 stale 로 판단해 거부**한다
+(펌웨어가 바뀐 커버리지를 이어붙이면 조용히 틀린다). v2 가 없으면 core=0/bank=0 으로 강등해
+`coverage.txt` 를 읽는다(구 데이터 호환). `_sa_cov_history`에 5번째 원소 `{core:(bb%,func%)}` **추가**
 (차트는 `h[0]`~`h[3]`만 인덱싱 → 양방향 호환). `coverage_growth.jsonl`에 `bb_pct_by_core` 추가.
 
 ---
@@ -171,6 +191,13 @@ key = (core << 44) | (bank << 32) | addr        # bank=0 이 현재 기본값
 `class SJTAGPCSampler(OpenOCDPCSampler)` — `JLinkHaltSampler`(3115)와 같은 전략: worker /
 `diagnose` / `stop_sampling` / `evaluate_coverage`를 상속, 링크 계층과 `_read_all_pcs`만 교체,
 telnet 계열 no-op. **모듈 레벨에서 pylink를 import하지 않는다**(`connect()` 안에서 지연 import)
+
+⚠ **순환 import**: `SJTAGPCSampler` 가 메인 퍼저의 `OpenOCDPCSampler` 를 상속하면
+`riscv_cov.py` ↔ 퍼저 사이에 순환이 생긴다. 또 `risc-v/` 는 하이픈 때문에 패키지 import 가
+안 되므로 loader(한 곳에서 `sys.path` 삽입)가 필요하다. 택일 —
+① 공통 sampler base 를 별도 모듈로 분리, ② **`SJTAGPCSampler` 를 메인에 정의**하고
+`riscv_cov.py` 는 커버리지 모델·transport 헬퍼만 담당, ③ 지연 import.
+**②가 가장 단순**하고 회귀 위험이 낮다(샘플러 계층을 메인에 모아둠)
 → 커버리지 모델을 하드웨어 없이 테스트 가능.
 
 ### 4코어 읽기 — 비용
@@ -241,14 +268,15 @@ telnet 계열 no-op. **모듈 레벨에서 pylink를 import하지 않는다**(`c
 복구 후 valid 회복 확인. 이 4개가 다 되어야 '복구 완료'로 기록할 수 있다.
 
 **붕괴 감지 기준 — 단일 코어 일시 무효와 구분해야 한다**
-`PCSR_COLLAPSE_INVALIDS = 300` 을 **한 코어의 연속 무효**에 그대로 적용하면 오판한다:
+단일 숫자 임계(`PCSR_COLLAPSE_INVALIDS`)는 **코드에서 제거했다** — 한 코어의 연속 무효에 적용되기 쉬워서다:
 버스트 방식이라 한 코어만 halt/wfi 로 잠깐 무효여도 **지연이 없어 수백 µs 만에 300회**를
 채운다. 실제 현상은 "**전 코어**가 지속적으로 무효"이므로 판정은:
 
 ```
-붕괴 = (모든 활성 코어가 완전한 스케줄 사이클 동안 연속 무효)
-       AND (경과 시간 >= T)          # 샘플 수만으로는 시간이 안 정해진다
+붕괴 = (전 활성코어 연속 무효 사이클 >= PCSR_COLLAPSE_MIN_ALL_CORE_CYCLES)
+       AND (지속 시간 >= PCSR_COLLAPSE_MIN_SECONDS)   # 샘플 수만으로는 시간이 안 정해진다
 ```
+두 상수는 `sjtag_unlock.py` 에 있고 **잠정값** — Phase 6 소크에서 실측 확정.
 코어별 invalid streak 을 따로 유지하고, 확정 진단(DPIDR/CTRL-STAT read-only 확인)은
 **반드시 버스트 밖**에서 한다(핫루프 제약). 이 구분이 아래 §필터의 "valid=0 은 transport
 실패가 아니다"와 모순되지 않는 이유다 — **일시적 단일 코어 무효**는 복구 대상이 아니고,
@@ -269,6 +297,32 @@ telnet 계열 no-op. **모듈 레벨에서 pylink를 import하지 않는다**(`c
 관대한 상위집합으로 만들고, 정밀 필터는 `_read_all_pcs`에 둔다.
 `_read_fail_needs_recovery()`는 **transport 실패일 때만 True** — valid=0은 코어가 잠깐 무효
 상태인 것이지 링크 장애가 아니다(잘못하면 재연결 루프).
+
+### J-Link 핸들 독점 계약 ★
+
+`sba_read_pinned()` 는 SELECT/TAR 을 확인하지 않는다(`sba_pin` 이 맞춰둔 상태를 신뢰).
+따라서 **버스트 중 같은 J-Link handle 로 다른 DAP 접근이 한 번만 끼어들어도 다른 AP bank 의
+DRW 를 읽는다.** 다음은 모두 **같은 lock/lifecycle 경계**를 공유해야 한다:
+샘플링 버스트 / 붕괴 진단 / 인증 상태 probe / 덤프 / 재연결 / health check / **코어 전환**.
+코어 전환은 **버스트 종료 후에만**. (NVMe subprocess 동시 실행은 무관 — 문제는 동일 handle
+의 동시 접근이다.) v9.8 `JLinkHaltSampler` 의 `_jlink_lock` 과 같은 방식으로 명시한다.
+
+### 복구는 단일 트랜잭션 API 로
+
+`reopen_session()` 은 저수준 primitive 일 뿐이다. 샘플러는 이를 감싼 하나의 API 로 쓴다:
+```python
+recover_pcsr_session(core_id) -> RecoveryResult(ok, stage, elapsed, valid_samples)
+#   stage ∈ {stop, open, prepare, auth, pin, valid, gate}
+```
+단계: worker 정지 확인 → close/open → prepare(strict) → AUTH 확인 → `sba_pin(core)` →
+제한된 raw 샘플로 valid 회복 확인 → `elf_map` 범위 확인 → **여기까지 통과해야** 재개.
+실패 단계(`stage`)를 남겨야 원인 분석이 된다. 반복 실패 시 **backoff + 최대 재시도**로
+무한 재연결을 막는다.
+
+### 재현성
+
+버스트 셔플·지터의 **random seed 를 세션 로그에 남긴다.** 안 남기면 특정 커버리지나 붕괴가
+나온 샘플링 조건을 재현할 수 없다.
 
 ### 인증 — 켜질 때 자동
 - `_power_cycle_ssd()`(4698) 성공 시 `power_epoch += 1`.
@@ -370,6 +424,12 @@ matplotlib 강제 실패시켜도 HTML/CSV가 나오는지.
 **명령당 코어별 unique-PC 수확 → primary 코어 확정**, 30분 소크.
 
 **Phase 7 — 루프 투입(POR off)** → **Phase 8 — POR on(20회 재인증)** → **Phase 9 — LLM/리포트 마감**
+
+**Phase 6 소크에서 반드시 계측할 것** (붕괴 임계·버스트 길이를 실측으로 확정하기 위해):
+collapse 발생 샘플번호·wall-clock / 직전 정상 core·PC / **코어별 invalid streak** /
+reopen 소요시간·성공·실패·재시도 횟수 / 복구 후 첫 valid 까지 샘플 수 /
+세션당 collapse 간격 분포 / **버스트 길이별 throughput·collapse MTBF** /
+부하별(무부하·순차읽기·랜덤읽기·관리명령) 각각.
 
 ---
 

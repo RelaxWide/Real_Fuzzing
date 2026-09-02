@@ -44,9 +44,17 @@ class FakeDap:
         self._fail_on = set(fail_on)
         self.sticky_cleared = 0
 
+    def __init_fail_seq(self):
+        pass
+
     def mem_write32(self, ap, addr, val):
-        self.calls.append(('mem_write32', addr))
-        return 'mem_write32' not in self._fail_on
+        self.calls.append(('mem_write32', addr, val))
+        self._mw_n = getattr(self, '_mw_n', 0) + 1
+        if 'mem_write32' in self._fail_on:
+            return False
+        if f'mem_write32#{self._mw_n}' in self._fail_on:   # n번째만 실패 주입
+            return False
+        return True
 
     def mem_read32(self, ap, addr):
         self.calls.append(('mem_read32', addr))
@@ -61,7 +69,7 @@ class FakeDap:
         return 0
 
     def ap_write(self, ap, off, val):
-        self.calls.append(('ap_write', off))
+        self.calls.append(('ap_write', off, val))
         if off == sj.OFF_CSW and 'csw_write' in self._fail_on:
             return False
         if off == sj.OFF_TAR:
@@ -116,8 +124,9 @@ class TestPinSetup(unittest.TestCase):
     def test_success_pins_tar_and_disables_increment(self):
         dap = self._ok_dap()
         self.assertTrue(sj.sba_pin(dap, 0x1000, 0x8000, 0xFD00017C))
-        self.assertIn(('ap_write', sj.OFF_TAR), dap.calls)
-        self.assertIn(('ap_write', sj.OFF_CSW), dap.calls)
+        ops = [(c[0], c[1]) for c in dap.calls]
+        self.assertIn(('ap_write', sj.OFF_TAR), ops)
+        self.assertIn(('ap_write', sj.OFF_CSW), ops)
 
     def test_rejects_suspect_csw(self):
         """SUSPECT(0x80000000) CSW 를 정상값처럼 가공하면 안 된다."""
@@ -135,6 +144,67 @@ class TestPinSetup(unittest.TestCase):
         dap = FakeDap(csw=0x23)
         dap.ap_write = lambda ap, off, val: True     # TAR 이 실제로 안 박히는 상황
         self.assertFalse(sj.sba_pin(dap, 0x1000, 0x8000, 0xFD00017C))
+
+
+class TestPinExactValues(unittest.TestCase):
+    """설정값 자체를 고정한다 — 호출 유무만 보면 잘못된 값이 통과한다."""
+
+    CB, ADDR = 0x8000, 0xFD00017C
+
+    def _pin(self):
+        dap = FakeDap(csw=0x23)
+        ok = sj.sba_pin(dap, 0x1000, self.CB, self.ADDR)
+        return ok, dap
+
+    def test_sbcs_fifo_mode_bits(self):
+        """SBCS = 32bit access | sbreadonaddr(20) | sbreadondata(15)."""
+        ok, dap = self._pin(); self.assertTrue(ok)
+        w = [c for c in dap.calls if c[0] == 'mem_write32' and c[1] == self.CB + sj.SBCS_OFF]
+        self.assertTrue(w, "SBCS write 가 없다")
+        self.assertEqual(w[0][2], sj._SB32 | (1 << 20) | (1 << 15))
+
+    def test_sbaddr0_is_target_pcsr(self):
+        ok, dap = self._pin(); self.assertTrue(ok)
+        w = [c for c in dap.calls if c[0] == 'mem_write32' and c[1] == self.CB + sj.SBADDR0_OFF]
+        self.assertEqual(w[0][2], self.ADDR)
+
+    def test_csw_word_size_and_no_autoinc(self):
+        """Size=word(0b010), AddrInc=off — 0x37 마스크로 지우고 0x02 만 세운다."""
+        ok, dap = self._pin(); self.assertTrue(ok)
+        w = [c for c in dap.calls if c[0] == 'ap_write' and c[1] == sj.OFF_CSW]
+        val = w[0][2]
+        self.assertEqual(val & 0x07, 0x02, "Size 가 word(2)가 아니다")
+        self.assertEqual(val & 0x30, 0x00, "AddrInc 가 꺼져있지 않다")
+
+    def test_tar_points_at_sbdata0(self):
+        ok, dap = self._pin(); self.assertTrue(ok)
+        w = [c for c in dap.calls if c[0] == 'ap_write' and c[1] == sj.OFF_TAR]
+        self.assertEqual(w[0][2], self.CB + sj.SBDATA0_OFF)
+
+    def test_each_mem_write_failure_separately(self):
+        """SBCS write 실패와 SBADDR0 write 실패를 각각 주입."""
+        for n in (1, 2):
+            with self.subTest(write=n):
+                dap = FakeDap(csw=0x23, fail_on=(f'mem_write32#{n}',))
+                self.assertFalse(sj.sba_pin(dap, 0x1000, self.CB, self.ADDR))
+
+    def test_first_raw_read_after_pin(self):
+        """pin 직후 첫 raw DRW 가 정상 경로로 값을 준다."""
+        dap = FakeDap(FakeJL(reads=[0x0001234D]), csw=0x23)
+        self.assertTrue(sj.sba_pin(dap, 0x1000, self.CB, self.ADDR))
+        self.assertEqual(sj.sba_read_pinned(dap), 0x0001234D)
+
+
+class TestCollapseContract(unittest.TestCase):
+    """붕괴 임계는 '단일 코어 streak' 으로 오용되면 안 된다."""
+
+    def test_single_core_threshold_constant_removed(self):
+        self.assertFalse(hasattr(sj, 'PCSR_COLLAPSE_INVALIDS'),
+                         "단일 코어 연속무효 임계로 오용되기 쉬운 상수는 두지 않는다")
+
+    def test_two_part_contract_present(self):
+        self.assertGreater(sj.PCSR_COLLAPSE_MIN_ALL_CORE_CYCLES, 0)
+        self.assertGreater(sj.PCSR_COLLAPSE_MIN_SECONDS, 0)
 
 
 class FakeLink:
@@ -181,15 +251,23 @@ class TestReopenSession(unittest.TestCase):
             self.assertIsNone(sj.reopen_session(lk, 'both'))
         self.assertEqual(lk.events.count('close'), 2, "open 후 실패했으면 다시 close")
 
-    def test_open_failure_returns_none(self):
+    def test_open_failure_returns_none_and_cleans_up(self):
+        """Link.open 은 self.jl 을 먼저 만들고 USB open 을 시도한다 — 도중 실패해도
+        부분 생성된 DLL 객체가 남으므로 best-effort close 로 정리해야 한다."""
         lk = FakeLink(open_fail=True)
         with mock.patch.object(sj, 'prepare_session'):
             self.assertIsNone(sj.reopen_session(lk, 'both'))
+        self.assertEqual(lk.events.count('close'), 2,
+                         "open 실패 경로에서도 close 로 정리해야 한다")
 
-    def test_collapse_threshold_defined(self):
-        self.assertIsInstance(sj.PCSR_COLLAPSE_INVALIDS, int)
-        self.assertGreater(sj.PCSR_COLLAPSE_INVALIDS, 0)
-
+    def test_tap_note_matches_mode(self):
+        """진단 로그가 실제 TAP mode 와 어긋나면 원인 분석이 틀어진다."""
+        for tap, note in ((True, 'on'), (False, 'off')):
+            with self.subTest(tap=tap):
+                lk = FakeLink()
+                with mock.patch.object(sj, 'prepare_session') as ps:
+                    sj.reopen_session(lk, 'both', tap_script=tap)
+                self.assertEqual(ps.call_args.args[2], note)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
