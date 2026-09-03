@@ -12,7 +12,51 @@ import os
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+# 실기 기본 설치 위치. 다른 곳이면 PCSAMPLE_ROOT 환경변수나 --root 로 덮는다.
+DEFAULT_ROOT = "/home/ssd/pc_sample"
+
+
+def _find_root():
+    """퍼저 루트(= fuzzer_config.json / pc_sampling_fuzzer_v*.py 가 있는 곳)를 찾는다.
+    스크립트를 어디서 실행하든, 어디에 복사했든 동작하게 — 위치 추정에 의존하지 않는다.
+    --root 로 명시할 수도 있다."""
+    for i, a in enumerate(sys.argv):
+        if a == "--root" and i + 1 < len(sys.argv):
+            return Path(sys.argv[i + 1]).resolve()
+    env = os.environ.get("PCSAMPLE_ROOT")
+    if env:
+        return Path(env).resolve()
+    here = Path(__file__).resolve()
+    cands = [
+        Path(DEFAULT_ROOT),          # 실기 기본 설치 위치
+        here.parent.parent,          # tools/ 안에 있을 때
+        here.parent,                 # 퍼저 루트에 바로 있을 때
+        Path.cwd(), Path.cwd().parent,
+    ]
+    # 위쪽으로도 몇 단계 훑는다
+    for base in (here.parent, Path.cwd()):
+        p = base
+        for _ in range(4):
+            p = p.parent
+            cands.append(p)
+    seen = set()
+    for c in cands:
+        if c in seen:
+            continue
+        seen.add(c)
+        if (c / "fuzzer_config.json").exists() or list(c.glob("pc_sampling_fuzzer_v*.py")):
+            return c
+    return None
+
+
+ROOT = _find_root()
+if ROOT is None:
+    print("❌ 퍼저 루트를 못 찾았다 (fuzzer_config.json / pc_sampling_fuzzer_v*.py 기준).")
+    print(f"   기본값 {DEFAULT_ROOT} 에도 없다. --root <퍼저디렉토리> 또는")
+    print("   PCSAMPLE_ROOT 환경변수로 지정하라.")
+    print(f"   참고: 스크립트={Path(__file__).resolve()}  cwd={Path.cwd()}")
+    sys.exit(2)
+print(f"퍼저 루트: {ROOT}\n")
 RV = ROOT / "risc-v"
 PROD = ROOT / "products" / "BM9K1"
 CORES = ("H", "CM", "F", "Q")
