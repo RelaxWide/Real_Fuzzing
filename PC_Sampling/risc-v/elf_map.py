@@ -69,7 +69,28 @@ def exec_ranges(elf, readelf="readelf", why=None):
         _note(f"파일 없음: {elf}  (상대경로면 cwd={os.getcwd()} 기준으로 해석된다)")
         return []
     if not os.path.isfile(elf):
-        _note(f"파일이 아님(디렉토리?): {elf}")
+        if os.path.isdir(elf):
+            # 디렉토리를 넣는 실수가 잦다 — 안에 있는 ELF 후보를 찾아 알려준다.
+            found = []
+            try:
+                for n in sorted(os.listdir(elf))[:200]:
+                    fp = os.path.join(elf, n)
+                    if not os.path.isfile(fp):
+                        continue
+                    try:
+                        with open(fp, "rb") as f:
+                            if f.read(4) == b"\x7fELF":
+                                found.append(n)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            hint = (f" 이 안의 ELF: {found[:8]} — 코어에 맞는 **파일 하나**를 지정하라"
+                    if found else " 이 안에 ELF 파일이 없다")
+            _note(f"디렉토리를 지정했다: {elf} —"
+                  f" elf 에는 **파일 경로**를 넣어야 한다(코어마다 다른 ELF).{hint}")
+        else:
+            _note(f"파일이 아님: {elf}")
         return []
     try:
         with open(elf, "rb") as f:
