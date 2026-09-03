@@ -3649,6 +3649,11 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         self._all_invalid_since = None
 
     def _sj_mod(self):
+        """이미 세션이 올바른 경로로 import 해둔 모듈을 재사용한다.
+        맨 `import sjtag_unlock` 은 risc-v/ 가 sys.path 에 없으면 실패하고, 있더라도
+        다른 트리의 동명 모듈을 집을 수 있다(붕괴 복구 시점에 터진다)."""
+        if self.session is not None and getattr(self.session, '_sj', None) is not None:
+            return self.session._sj
         import sjtag_unlock
         return sjtag_unlock
 

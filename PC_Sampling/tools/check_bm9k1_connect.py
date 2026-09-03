@@ -76,6 +76,10 @@ if os.path.realpath(_runtime_json) != os.path.realpath(_checker_json):
     print("     → 퍼저가 쓰는 risc-v/ 트리에 값을 채워야 한다(또는 중복 트리 제거)")
 else:
     print("  ✅ 같은 파일")
+_rt = (sfe76_link.RISCV_ADDRS.get("runtime") or {})
+_raw = _rt.get("sjtag_base", "<키없음>")
+print(f"  runtime.sjtag_base 원시값: type={type(_raw).__name__} "
+      f"len={len(str(_raw))} 비어있음={str(_raw).strip()==''}")
 _b = getattr(sjtag_unlock, "SJTAG_BASE", None)
 _t = getattr(sjtag_unlock, "SIGN_TOOL", None)
 print(f"  SJTAG_BASE      : {'None(미설정)' if _b is None else f'설정됨({_b:#x})'}")
