@@ -56,6 +56,25 @@ def parse_readelf_l(text):
     return sorted(out)
 
 
+def _elf_candidates(d, limit=200):
+    """디렉토리 안에서 ELF 매직을 가진 파일명 목록. 경로 오타 안내용."""
+    out = []
+    try:
+        for n in sorted(os.listdir(d))[:limit]:
+            fp = os.path.join(d, n)
+            if not os.path.isfile(fp):
+                continue
+            try:
+                with open(fp, "rb") as f:
+                    if f.read(4) == b"\x7fELF":
+                        out.append(n)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return out
+
+
 def exec_ranges(elf, readelf="readelf", why=None):
     """ELF 의 실행 세그먼트 범위. 실패 시 [].
 
@@ -66,25 +85,14 @@ def exec_ranges(elf, readelf="readelf", why=None):
         if why is not None:
             why.append(m)
     if not os.path.exists(elf):
-        _note(f"파일 없음: {elf}  (상대경로면 cwd={os.getcwd()} 기준으로 해석된다)")
+        # 파일명 오타가 잦다 — 같은 디렉토리의 ELF 후보를 함께 알려준다.
+        cand = _elf_candidates(os.path.dirname(elf) or ".")
+        hint = f"  같은 폴더의 ELF: {cand[:8]}" if cand else ""
+        _note(f"파일 없음: {elf}  (상대경로면 cwd={os.getcwd()} 기준){hint}")
         return []
     if not os.path.isfile(elf):
         if os.path.isdir(elf):
-            # 디렉토리를 넣는 실수가 잦다 — 안에 있는 ELF 후보를 찾아 알려준다.
-            found = []
-            try:
-                for n in sorted(os.listdir(elf))[:200]:
-                    fp = os.path.join(elf, n)
-                    if not os.path.isfile(fp):
-                        continue
-                    try:
-                        with open(fp, "rb") as f:
-                            if f.read(4) == b"\x7fELF":
-                                found.append(n)
-                    except OSError:
-                        pass
-            except OSError:
-                pass
+            found = _elf_candidates(elf)
             hint = (f" 이 안의 ELF: {found[:8]} — 코어에 맞는 **파일 하나**를 지정하라"
                     if found else " 이 안에 ELF 파일이 없다")
             _note(f"디렉토리를 지정했다: {elf} —"

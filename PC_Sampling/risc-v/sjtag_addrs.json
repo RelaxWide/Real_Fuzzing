@@ -43,10 +43,10 @@
     "core_stride": "0x1000",
     "valid_bit": 1,
     "cores": [
-      {"id": 0, "name": "H",  "elf": "", "load_offset": "0x0"},
-      {"id": 1, "name": "CM", "elf": "", "load_offset": "0x0"},
-      {"id": 2, "name": "F",  "elf": "", "load_offset": "0x0"},
-      {"id": 3, "name": "Q",  "elf": "", "load_offset": "0x0"}
+      {"id": 0, "name": "H",  "elf": "/home/ssd/pc_sample/products/BM9K1/FW_HCore.elf", "load_offset": "0x0"},
+      {"id": 1, "name": "CM", "elf": "/home/ssd/pc_sample/products/BM9K1/FW_CMCore.elf", "load_offset": "0x0"},
+      {"id": 2, "name": "F",  "elf": "/home/ssd/pc_sample/products/BM9K1/FW_FCore.elf", "load_offset": "0x0"},
+      {"id": 3, "name": "Q",  "elf": "/home/ssd/pc_sample/products/BM9K1/FW_QCore.elf", "load_offset": "0x0"}
     ]
   }
 }
