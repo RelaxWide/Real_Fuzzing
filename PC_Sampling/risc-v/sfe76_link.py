@@ -139,6 +139,7 @@ APB_INDEX   = 0          # DMI 가 붙은 AP (AddAP 의 Index)
 #   (placeholder — import/테스트만 됨). 실기 실행은 ADDRS_REAL 로 real JSON 유무를 확인한다.
 def _load_riscv_addrs():
     import json as _j
+    _err = None
     _dir = os.path.dirname(os.path.abspath(__file__))
     for _name, _real in (("sjtag_addrs.json", True), ("sjtag_addrs.example.json", False)):
         _p = os.path.join(_dir, _name)
@@ -147,10 +148,29 @@ def _load_riscv_addrs():
                 with open(_p) as _f:
                     _d = _j.load(_f)
                 _d["_is_real"] = _real
+                if _err:            # 실제 파일이 깨져서 여기로 내려온 경우를 기록
+                    _d["_load_error"] = _err
                 return _d
             except Exception as _e:
-                print(f"[addrs] {_name} 로드 실패: {_e}")
-    return {"_is_real": False}
+                # ★ 실제 파일이 있는데 파싱만 실패하면 example(placeholder)로 조용히
+                #   내려앉는다 → sjtag_base 가 "0x0" 이라 '미설정'처럼 보이고 원인을
+                #   못 찾는다. 실기서 실제 겪은 실패라 크게 알린다.
+                if _real:
+                    print("=" * 70)
+                    print(f"[addrs] ★ {_name} 파싱 실패 — placeholder 로 fallback 한다!")
+                    print(f"[addrs]   {_e}")
+                    print("[addrs]   증상: 'sjtag_base 미설정' 처럼 보인다. 쉼표/괄호 확인.")
+                    print("[addrs]   점검: sudo python3 tools/check_bm9k1_setup.py")
+                    print("=" * 70)
+                    _err = str(_e)
+                else:
+                    _err = None
+    _d = {"_is_real": False}
+    try:
+        _d["_load_error"] = _err
+    except NameError:
+        pass
+    return _d
 
 
 def _addr_int(v, default=0):

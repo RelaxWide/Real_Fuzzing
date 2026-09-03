@@ -471,7 +471,13 @@ class PcsrSession:
         if authed and not force:
             return True, f"이미 인증됨(STATE={raw:#010x})" if raw is not None else "이미 인증됨"
         if not getattr(sj, "SJTAG_BASE", None):
-            return False, "sjtag_addrs.json runtime.sjtag_base 미설정"
+            # 값을 넣었는데도 이게 뜨면 대개 JSON 파싱 실패로 placeholder 에 내려앉은 것
+            err = (getattr(sj, "RISCV_ADDRS", {}) or {}).get("_load_error")
+            if err:
+                return False, (f"sjtag_addrs.json 파싱 실패로 placeholder 사용 중 → {err} "
+                               f"(점검: sudo python3 tools/check_bm9k1_setup.py)")
+            return False, ("sjtag_addrs.json runtime.sjtag_base 미설정 "
+                           "(점검: sudo python3 tools/check_bm9k1_setup.py)")
         if not getattr(sj, "SIGN_TOOL", None):
             return False, "sjtag_addrs.json runtime.sign_tool 미설정"
         t0 = time.time()
