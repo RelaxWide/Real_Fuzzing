@@ -93,9 +93,17 @@ else:
 
 if j:
     rt, pc = j.get("runtime") or {}, j.get("pcsr") or {}
-    base = str(rt.get("sjtag_base", "")).strip()
-    (good if base and base not in ("0x0", "0", "") else bad)(
-        "runtime.sjtag_base", "채워짐" if base and base not in ("0x0", "0") else "비어있음/0")
+    # ★ '미설정'과 '값이 0'은 다르다. 0 도 유효 주소일 수 있으므로 있는 그대로 보고하되,
+    #   example placeholder 와 같은 값이면 주의만 준다(단정하지 않는다).
+    raw_base = rt.get("sjtag_base", None)
+    base = str(raw_base).strip() if raw_base is not None else ""
+    if base == "":
+        bad("runtime.sjtag_base", "비어있음(키 없음/빈 문자열)")
+    elif base in ("0", "0x0"):
+        good("runtime.sjtag_base", "0 — 유효 주소로 취급함. "
+                                   "단 example placeholder 도 0x0 이니 실제 값인지 확인")
+    else:
+        good("runtime.sjtag_base", "채워짐")
     tool = str(rt.get("sign_tool", "")).strip()
     if tool and tool != "/path/to/signer.exe":
         (good if os.path.exists(tool) else bad)(

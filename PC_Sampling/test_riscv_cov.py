@@ -430,6 +430,23 @@ class TestEnsureAuth(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("AUTH_PASS", why)
 
+    def test_zero_base_is_not_treated_as_unset(self):
+        """★ '미설정'과 '값이 0'은 다르다. valid_base() 가 0 을 유효 주소로 허용하므로
+        falsy 검사로 걸러내면 실제 base 가 0 인 SoC 에서 인증 자체가 불가능해진다."""
+        s = auth_session(state=0, state_after=0x100)
+        s._sj.SJTAG_BASE = 0
+        ok, why = s.ensure_auth()
+        self.assertNotIn("미설정", why)
+        self.assertEqual(s._sj.unlock_calls, 1, "base=0 이어도 인증을 시도해야 한다")
+        self.assertTrue(ok, why)
+
+    def test_none_base_is_unset(self):
+        s = auth_session(state=0)
+        s._sj.SJTAG_BASE = None
+        ok, why = s.ensure_auth()
+        self.assertFalse(ok)
+        self.assertIn("sjtag_base", why)
+
     def test_missing_config_gives_clear_reason(self):
         for attr, key in (("SJTAG_BASE", "sjtag_base"), ("SIGN_TOOL", "sign_tool")):
             with self.subTest(attr=attr):

@@ -453,7 +453,7 @@ class PcsrSession:
         읽기만 하므로 인증 카운터를 소모하지 않는다."""
         sj = self._sj
         base = getattr(sj, "SJTAG_BASE", None)
-        if not base or self.dap is None:
+        if base is None or self.dap is None:   # ★ base==0 도 유효 주소다(falsy 검사 금지)
             return None, False
         v = self.dap.mem_read32(sj.APBAP3_BASE, base + sj.OFF_STATE)
         return v, bool(v is not None and (v & sj.AUTH_PASS))
@@ -470,7 +470,8 @@ class PcsrSession:
         raw, authed = self.auth_state()
         if authed and not force:
             return True, f"이미 인증됨(STATE={raw:#010x})" if raw is not None else "이미 인증됨"
-        if not getattr(sj, "SJTAG_BASE", None):
+        # ★ 0 은 유효한 주소일 수 있다(valid_base 가 허용). None 만 '미설정'으로 본다.
+        if getattr(sj, "SJTAG_BASE", None) is None:
             # 값을 넣었는데도 이게 뜨면 대개 JSON 파싱 실패로 placeholder 에 내려앉은 것
             err = (getattr(sj, "RISCV_ADDRS", {}) or {}).get("_load_error")
             if err:

@@ -81,7 +81,9 @@ def _a(v, default=0):
 # runtime 기본값 — sjtag_addrs.json 의 "runtime" 에서 base/tool/prefix/word-order 를 받는다.
 # (CLI 로 주면 CLI 우선; json 에 있으면 인자 없이도 동작 → 오케스트레이터가 간단해진다.)
 _RT = RISCV_ADDRS.get("runtime", {})
-if _RT.get("sjtag_base"):
+# ★ '미설정'과 '값이 0'을 구분한다. falsy 검사(if _RT.get(...))를 쓰면 base 가 실제로
+#   0 일 때 로드조차 안 된다. valid_base() 는 0 을 유효 주소로 허용한다.
+if _RT.get("sjtag_base") not in (None, ""):
     SJTAG_BASE = _a(_RT["sjtag_base"])
 if _RT.get("sign_tool"):
     SIGN_TOOL = _RT["sign_tool"]
