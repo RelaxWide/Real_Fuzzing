@@ -523,14 +523,28 @@ class PcsrSession:
             ok, why = self.ensure_auth()
             self._say(f"  [pcsr] 인증: {why}")
             if not ok:
+                self._abort_open()      # ★ 핸들을 남기면 종료 시 DLL 소멸에서 segfault
                 return False
             sb = self._sj._sba_ready(self.dap)
             if sb is None:
                 self._say("  [pcsr] SBA 사용 불가 — 인증/전원 확인 필요")
+                self._abort_open()
                 return False
             self._ap, self._cb = sb
             self._authed_epoch = power_epoch
             return True
+
+    def _abort_open(self):
+        """open() 실패 경로 공통 정리. ★ 살아있는 pylink 핸들을 남기면 인터프리터 종료 시
+        J-Link DLL 소멸 과정에서 segfault 가 난다(실제 발생). 반드시 닫는다."""
+        self.dap = None
+        self._pinned = None
+        try:
+            if self.lk is not None:
+                self.lk.close()
+        except Exception:
+            pass
+        self.lk = None
 
     def close(self):
         with self.lock:

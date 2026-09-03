@@ -5243,8 +5243,19 @@ class NVMeFuzzer:
             if r.returncode == 0:
                 found.update(_parse_active_nsids_json(json.loads(r.stdout)))
             else:
-                log.warning(f"[NSID] nvme list-ns 실패 rc={r.returncode}: "
-                            f"{r.stderr.strip()[:160]}")
+                # 구버전 nvme-cli 는 --output-format 을 모른다
+                #   ("unrecognized option") → text 출력으로 폴백.
+                #   형식: "[   0]:0x1"  (NSID 는 16진)
+                r2 = subprocess.run(['nvme', 'list-ns', ctrl],
+                                    capture_output=True, text=True, timeout=5)
+                if r2.returncode == 0:
+                    found.update(int(m.group(1), 16) for m in
+                                 re.finditer(r'\]\s*:\s*0x([0-9a-fA-F]+)', r2.stdout))
+                    log.info(f"[NSID] list-ns text 폴백 사용 "
+                             f"(구버전 nvme-cli) → {sorted(found)}")
+                else:
+                    log.warning(f"[NSID] nvme list-ns 실패 rc={r.returncode}/"
+                                f"{r2.returncode}: {(r2.stderr or r.stderr).strip()[:160]}")
         except Exception as e:
             log.warning(f"[NSID] nvme list-ns 조회 실패: {e}")
 
@@ -14673,6 +14684,11 @@ class NVMeFuzzer:
         if self.config.addr_range_start is not None:
             log.warning(f"Addr filter : {hex(self.config.addr_range_start)}"
                      f" - {hex(self.config.addr_range_end)}")
+        elif (self.config.arch or 'arm') == 'riscv':
+            # ELF 의 코어별 exec 범위로 필터하므로(elf_map 게이트) 전역 필터가 없어도
+            # noisy 하지 않다 — 기존 경고를 그대로 내면 오해를 부른다.
+            log.warning("Addr filter : 코어별 ELF exec 범위 (elf_map 게이트) — "
+                        "전역 fw_addr_* 불필요")
         else:
             log.warning("Addr filter : NONE (all PCs collected - noisy!)")
         _samp_mode = ('PCSR, no-halt' if self.config.sampler_type == 'pcsr'
@@ -16297,10 +16313,18 @@ if __name__ == "__main__":
         # v8.2: OpenOCD/PCSR 전용 키(openocd_config/tcl_prefix/pcsr_addrs/power_*/ufas_ini)는
         # J-Link halt 제품(P9)에선 N/A → profile 에서 생략 가능. 읽기는 .get(기본값)으로 관용.
         resolved_cfg = _profile.get('openocd_config', OPENOCD_CONFIG)
-        _ncore = len(_profile.get('pcsr_addrs') or []) or '?'
-        print(f"Product={args.product}: interface={resolved_interface}, "
-              f"cfg={resolved_cfg}, jlink={_profile.get('jlink_device', JLINK_DEVICE)}, "
-              f"cores={_ncore}")
+        if _profile.get('arch') == 'riscv':
+            # OpenOCD 미사용 + pcsr_addrs 미사용 → 기본값을 그대로 찍으면 다른 제품의
+            # cfg 가 보이고 cores=? 가 떠서 오해를 부른다. 실제 출처를 표시한다.
+            print(f"Product={args.product}: interface={resolved_interface}, "
+                  f"jlink={_profile.get('jlink_device', JLINK_DEVICE)}, "
+                  f"cfg=N/A(OpenOCD 미사용), "
+                  f"cores=risc-v/sjtag_addrs.json pcsr.cores")
+        else:
+            _ncore = len(_profile.get('pcsr_addrs') or []) or '?'
+            print(f"Product={args.product}: interface={resolved_interface}, "
+                  f"cfg={resolved_cfg}, jlink={_profile.get('jlink_device', JLINK_DEVICE)}, "
+                  f"cores={_ncore}")
         # bring-up 검증: PCSR 샘플러(sampler_type='pcsr')만 pcsr_addrs 필수.
         # halt 샘플러는 reg pc 로 읽어 pcsr_addrs 불필요. --no-jlink/null 도 통과.
         # fw_addr_*(coverage 주소필터)는 없어도 동작(전부 카운트) → 경고만.
@@ -16318,7 +16342,9 @@ if __name__ == "__main__":
                 print(f"        PRODUCT_PROFILES['{args.product}']['pcsr_addrs'] 를 채우거나 "
                       "--no-jlink / --sampler halt 로 테스트하세요. (SESSION_HANDOFF_v8.8.md)")
                 sys.exit(2)
-            _soft = [k for k in ('fw_addr_start', 'fw_addr_end') if _profile.get(k) is None]
+            _soft = ([] if _profile.get('arch') == 'riscv'   # ELF exec 범위로 코어별 필터
+                     else [k for k in ('fw_addr_start', 'fw_addr_end')
+                           if _profile.get(k) is None])
             if _soft:
                 print(f"[WARN] {args.product}: {', '.join(_soft)} 미지정 → "
                       "coverage 주소필터 없이 전체 PC 카운트 (bring-up 후 .text 범위 입력 권장).")
