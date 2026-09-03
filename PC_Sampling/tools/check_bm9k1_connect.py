@@ -62,6 +62,29 @@ if not sfe76_link.ADDRS_REAL:
         "sudo 로 실행했는지, JSON 문법이 맞는지 확인")
 print("  ✅ sjtag_addrs.json 실제 값 로드")
 
+stage("★ 런타임이 실제로 읽은 값 (체커와 대조)")
+# 체커는 <루트>/risc-v/sjtag_addrs.json 을 직접 읽지만, 런타임은 sfe76_link.py 가
+# **자기 위치 기준**으로 읽는다. 둘이 다른 파일이면 '체커는 통과, 퍼저는 미설정'이 된다.
+_mod_dir = os.path.dirname(os.path.abspath(sfe76_link.__file__))
+_runtime_json = os.path.join(_mod_dir, "sjtag_addrs.json")
+_checker_json = str(ROOT / "risc-v" / "sjtag_addrs.json")
+print(f"  sfe76_link.py   : {sfe76_link.__file__}")
+print(f"  런타임이 읽는 json: {_runtime_json}")
+print(f"  체커가 읽는 json  : {_checker_json}")
+if os.path.realpath(_runtime_json) != os.path.realpath(_checker_json):
+    print("  ❌ ★ 서로 다른 파일이다 — 체커 통과와 퍼저 실패가 동시에 나는 원인")
+    print("     → 퍼저가 쓰는 risc-v/ 트리에 값을 채워야 한다(또는 중복 트리 제거)")
+else:
+    print("  ✅ 같은 파일")
+_b = getattr(sjtag_unlock, "SJTAG_BASE", None)
+_t = getattr(sjtag_unlock, "SIGN_TOOL", None)
+print(f"  SJTAG_BASE      : {'None(미설정)' if _b is None else f'설정됨({_b:#x})'}")
+print(f"  SIGN_TOOL       : {'None(미설정)' if not _t else '설정됨'}")
+if _b is None:
+    die("런타임 SJTAG_BASE 가 None — 위 json 경로/내용을 확인하라",
+        "체커가 통과했다면 퍼저가 다른 json 을 읽고 있거나, "
+        "sjtag_unlock.py 가 구버전(0 을 falsy 로 거르던 것)일 수 있다")
+
 stage("pcsr 설정 확인")
 pc = (sjtag_unlock.RISCV_ADDRS.get("pcsr") or {})
 cores = {int(c["id"]): c for c in (pc.get("cores") or [])}
