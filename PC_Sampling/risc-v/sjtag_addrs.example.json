@@ -36,5 +36,17 @@
     "funnel_base": "0xF0080000",
     "sram_sink_base": "0xF0080000",
     "mem_type": 2
+  },
+  "pcsr": {
+    "_comment": "TEMPLATE. 주소 = trace.te_base + core_stride*id + offset. cores[].id 고정(H=0 CM=1 F=2 Q=3) — 커버리지 키와 PCSR 주소에 박힌다. elf 는 절대경로.",
+    "offset": "0x0",
+    "core_stride": "0x1000",
+    "valid_bit": 1,
+    "cores": [
+      {"id": 0, "name": "H",  "elf": "/path/to/HCORE.elf",  "load_offset": "0x0"},
+      {"id": 1, "name": "CM", "elf": "/path/to/CMCore.elf", "load_offset": "0x0"},
+      {"id": 2, "name": "F",  "elf": "/path/to/Fcore.elf",  "load_offset": "0x0"},
+      {"id": 3, "name": "Q",  "elf": "/path/to/QCore.elf",  "load_offset": "0x0"}
+    ]
   }
 }

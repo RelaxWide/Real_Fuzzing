@@ -36,5 +36,17 @@
     "funnel_base": "0xFD180000",
     "sram_sink_base": "0xFD180000",
     "mem_type": 2
+  },
+  "pcsr": {
+    "_comment": "v10 비침습 PC 샘플링. 주소 = trace.te_base + core_stride*id + offset (실측 확인). cores[].id 는 커버리지 키와 PCSR 주소에 모두 박히므로 **고정**(하드웨어 코어 순서와 일치해야 함). elf 는 절대경로 — 정합성 게이트(elf_map)와 심볼화에 쓴다. load_offset 은 실측 4코어 모두 0.",
+    "offset": "0x17C",
+    "core_stride": "0x1000",
+    "valid_bit": 1,
+    "cores": [
+      {"id": 0, "name": "H",  "elf": "", "load_offset": "0x0"},
+      {"id": 1, "name": "CM", "elf": "", "load_offset": "0x0"},
+      {"id": 2, "name": "F",  "elf": "", "load_offset": "0x0"},
+      {"id": 3, "name": "Q",  "elf": "", "load_offset": "0x0"}
+    ]
   }
 }
