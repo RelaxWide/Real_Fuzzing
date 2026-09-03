@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import bisect
+import os
 import re
 import subprocess
 
@@ -55,16 +56,48 @@ def parse_readelf_l(text):
     return sorted(out)
 
 
-def exec_ranges(elf, readelf="readelf"):
-    """ELF 의 실행 세그먼트 범위. 실패 시 [] (게이트에서 '검증 불가'로 처리)."""
+def exec_ranges(elf, readelf="readelf", why=None):
+    """ELF 의 실행 세그먼트 범위. 실패 시 [].
+
+    why 에 list 를 주면 **실패 이유**를 담아준다 — 그냥 [] 만 돌려주면 호출부가
+    'readelf 실패/ELF 아님' 같은 뭉뚱그린 메시지밖에 못 낸다(실기서 원인 파악에 시간을
+    버린 지점)."""
+    def _note(m):
+        if why is not None:
+            why.append(m)
+    if not os.path.exists(elf):
+        _note(f"파일 없음: {elf}  (상대경로면 cwd={os.getcwd()} 기준으로 해석된다)")
+        return []
+    if not os.path.isfile(elf):
+        _note(f"파일이 아님(디렉토리?): {elf}")
+        return []
+    try:
+        with open(elf, "rb") as f:
+            magic = f.read(4)
+        if magic != b"\x7fELF":
+            _note(f"ELF 매직이 아님(앞 4바이트={magic!r}) — 이 파일은 ELF 가 아니다: {elf}")
+            return []
+    except OSError as e:
+        _note(f"읽기 실패: {e}")
+        return []
     try:
         r = subprocess.run([readelf, "-lW", elf], capture_output=True,
                            text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
+    except FileNotFoundError:
+        _note(f"'{readelf}' 실행 파일을 못 찾음 — binutils 설치/PATH 확인 "
+              f"(sudo 는 secure_path 를 쓰므로 PATH 가 다를 수 있다)")
+        return []
+    except (OSError, subprocess.SubprocessError) as e:
+        _note(f"readelf 실행 실패: {e}")
         return []
     if r.returncode != 0:
+        _note(f"readelf rc={r.returncode}: {(r.stderr or '').strip()[:160]}")
         return []
-    return parse_readelf_l(r.stdout)
+    out = parse_readelf_l(r.stdout)
+    if not out:
+        _note("readelf 는 성공했으나 실행(PT_LOAD+E) 세그먼트가 없다 "
+              "— 링크 스크립트/섹션 구성 확인")
+    return out
 
 
 class Ranges:
@@ -128,13 +161,15 @@ def check_gate(pcs, elf, offset=0, threshold=DEFAULT_THRESHOLD, label="",
     """심볼화 전 강제 게이트. → (ok: bool, info: dict)
 
     ok=False 면 심볼화하지 말 것 — offset 이 틀렸거나 ELF 가 이 코어 것이 아니다."""
-    rr = Ranges(exec_ranges(elf, readelf))
+    why: list = []
+    rr = Ranges(exec_ranges(elf, readelf, why=why))
     tag = f"[{label}] " if label else ""
     if not rr:
         if verbose:
-            print(f"  {tag}⚠ 실행영역을 못 읽음(readelf 실패/ELF 아님) — 정합성 검증 불가. "
-                  f"심볼화 보류: {elf}")
-        return False, {"error": "no-exec-ranges", "elf": elf}
+            print(f"  {tag}⚠ 실행영역을 못 읽음 — 정합성 검증 불가, 심볼화 보류")
+            for m in why:
+                print(f"  {tag}  원인: {m}")
+        return False, {"error": "no-exec-ranges", "elf": elf, "why": why}
     info = validate_pcs(pcs, rr, offset)
     info["elf"] = elf
     ok = info["pct"] >= threshold and info["total"] > 0

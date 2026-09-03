@@ -41,6 +41,35 @@ class TestParse(unittest.TestCase):
         self.assertEqual(em.parse_readelf_l("garbage\nLOAD nope\n"), [])
 
 
+class TestFailureReasons(unittest.TestCase):
+    """실패 이유를 삼키면 '실행영역을 못 읽음' 만 보이고 원인 파악에 시간을 버린다."""
+
+    def test_missing_file(self):
+        why = []
+        self.assertEqual(em.exec_ranges("/no/such.elf", why=why), [])
+        self.assertTrue(any("파일 없음" in m for m in why))
+        self.assertTrue(any("cwd=" in m for m in why), "상대경로 힌트가 있어야 한다")
+
+    def test_not_an_elf(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d, "x.elf"); p.write_text("not an elf")
+            why = []
+            self.assertEqual(em.exec_ranges(str(p), why=why), [])
+            self.assertTrue(any("ELF 매직" in m for m in why))
+
+    def test_readelf_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d, "x.elf"); p.write_bytes(b"\x7fELF" + b"\0" * 60)
+            why = []
+            em.exec_ranges(str(p), readelf="definitely_not_readelf", why=why)
+            self.assertTrue(any("못 찾음" in m for m in why))
+
+    def test_gate_prints_reason(self):
+        ok, info = em.check_gate([0x1000], "/no/such.elf", verbose=False)
+        self.assertFalse(ok)
+        self.assertTrue(info.get("why"), "check_gate 가 이유를 info 에 담아야 한다")
+
+
 class TestRanges(unittest.TestCase):
     def setUp(self):
         self.rr = em.Ranges([(0x1000, 0x2000), (0x5000, 0x5100)])

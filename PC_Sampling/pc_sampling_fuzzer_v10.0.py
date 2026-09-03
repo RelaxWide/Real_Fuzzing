@@ -3490,6 +3490,24 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         # 튜플 길이 회계가 코어 수를 따르도록(로그·saturation 계산이 이걸 본다)
         self._pcsr_addrs = [0] * max(1, len(self._cores))
 
+    @staticmethod
+    def _resolve_elf(path):
+        """상대경로 ELF 를 실행 위치와 무관하게 푼다.
+
+        cwd 기준으로 두면 체커(루트에서 실행)는 찾고 퍼저(다른 cwd)는 못 찾는
+        엇갈림이 난다. 퍼저 디렉토리 → risc-v/ → products/BM9K1/ → cwd 순으로 찾는다."""
+        if not path:
+            return path
+        p = Path(path)
+        if p.is_absolute():
+            return str(p)
+        root = Path(__file__).resolve().parent
+        for base in (root, root / 'risc-v', root / 'products' / 'BM9K1', Path.cwd()):
+            cand = base / p
+            if cand.exists():
+                return str(cand.resolve())
+        return str((root / p))      # 못 찾으면 퍼저 기준 절대경로로 (에러 메시지가 명확해짐)
+
     # ── 연결 / 인증 ──────────────────────────────────────────────────
     def connect(self) -> bool:
         rv = getattr(self.config, 'riscv', None) or {}
@@ -3510,6 +3528,8 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         #   risc-v/sjtag_addrs.json 의 pcsr.cores 에서 읽는다.
         if not self._cores:
             for c in (self.session._sj.RISCV_ADDRS.get('pcsr', {}).get('cores') or []):
+                c = dict(c)
+                c['elf'] = self._resolve_elf(c.get('elf', ''))
                 self._cores[int(c['id'])] = c
             if not self._cores:
                 log.error("[SJTAG] sjtag_addrs.json 에 pcsr.cores 가 없다 — "
