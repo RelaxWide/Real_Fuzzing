@@ -272,9 +272,16 @@ class FakeSJ:
     SJTAG_BASE, SIGN_TOOL, TOOL_PREFIX = 0x1000, "/x/signer.exe", "wine"
     APBAP3_BASE, OFF_STATE, AUTH_PASS = 0x50000, 0x4, 0x100
 
+    CORE_BASE_MAIN = 0x8000
+
     def unlock(self, *a, **k):
         self.calls.append(("unlock",))
         return None
+
+    def dm_activate(self, dap, core_base):
+        """DM 활성 — SBA 는 DM 안의 레지스터라 이게 먼저 성공해야 한다."""
+        self.calls.append(("dm_activate",))
+        return True
 
 
 def make_session(reads):
@@ -334,6 +341,15 @@ class TestRecovery(unittest.TestCase):
         r = s.recover(0)
         self.assertFalse(r.ok)
         self.assertEqual(r.stage, "open/prepare")
+
+    def test_dm_activate_failure_reported(self):
+        """복구 시 DM 활성이 실패하면 그 단계로 보고해야 한다(SBA 탓으로 오인 금지)."""
+        s = make_session([])
+        s._sj.reopen_session = lambda *a, **k: FakeDapAuth(FakeSJAuth.AUTH_PASS)
+        s._sj.dm_activate = lambda dap, cb: False
+        r = s.recover(0)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stage, "dm_activate")
 
     def test_not_ok_without_valid_recovery(self):
         """재핀만 되고 유효 샘플이 안 나오면 복구 성공으로 치면 안 된다."""

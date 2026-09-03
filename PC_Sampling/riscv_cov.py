@@ -554,9 +554,18 @@ class PcsrSession:
             if not ok:
                 self._abort_open()      # ★ 핸들을 남기면 종료 시 DLL 소멸에서 segfault
                 return False
+            # ★ DM 활성 — SBA(sbcs/sbaddr/sbdata)는 DM 안의 레지스터라, DM 이
+            #   dmactive=0(리셋 상태)이면 전부 0 으로 읽혀 'SBA 미구현'처럼 보인다.
+            #   동작 체인이 인증 → **DM 활성** → SBA 인데 이 단계가 빠져 있었다.
+            #   dmactive write 는 코어를 멈추지 않는 표준 기동(인증 카운터 무관).
+            if not self._sj.dm_activate(self.dap, self._sj.CORE_BASE_MAIN):
+                self._say("  [pcsr] DM 활성화 실패 — 위 [dm-activate] 로그 참조")
+                self._abort_open()
+                return False
             sb = self._sj._sba_ready(self.dap)
             if sb is None:
-                self._say("  [pcsr] SBA 사용 불가 — 인증/전원 확인 필요")
+                self._say("  [pcsr] SBA 사용 불가 — DM 은 열렸으나 sbcs 가 0 "
+                          "(sbasize=0). DM base/AP 또는 SBA 미구현 확인")
                 self._abort_open()
                 return False
             self._ap, self._cb = sb
@@ -637,6 +646,8 @@ class PcsrSession:
             ok, why = self.ensure_auth()      # 붕괴 원인이 전원/인증일 수 있다. SBA 보다 먼저
             if not ok:
                 return RecoveryResult(False, "auth", time.time() - t0, 0, why)
+            if not self._sj.dm_activate(dap, self._sj.CORE_BASE_MAIN):
+                return RecoveryResult(False, "dm_activate", time.time() - t0, 0, "")
             sb = self._sj._sba_ready(dap)
             if sb is None:
                 return RecoveryResult(False, "sba", time.time() - t0, 0, "")
