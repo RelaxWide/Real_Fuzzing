@@ -17,23 +17,25 @@ DEFAULT_ROOT = "/home/ssd/pc_sample"
 
 
 def _find_root():
-    """퍼저 루트(= fuzzer_config.json / pc_sampling_fuzzer_v*.py 가 있는 곳)를 찾는다.
-    스크립트를 어디서 실행하든, 어디에 복사했든 동작하게 — 위치 추정에 의존하지 않는다.
-    --root 로 명시할 수도 있다."""
+    """퍼저 루트를 정한다.
+
+    ★ 명시 경로(--root / PCSAMPLE_ROOT / DEFAULT_ROOT)는 **디렉토리이기만 하면 그대로 쓴다.**
+      내용물(fuzzer_config.json 등)로 검증하면 안 된다 — 그 파일이 없는 걸 **찾아내는 게
+      이 도구의 일**이라, 검증에 실패해 엉뚱한 상위 디렉토리로 떨어지면 전부 '없음'이 된다.
+      (실기서 /home/ssd 를 루트로 잡아 모든 항목이 없다고 나온 원인)
+    자동 탐색으로 내려갈 때만 내용물로 검증한다."""
     for i, a in enumerate(sys.argv):
         if a == "--root" and i + 1 < len(sys.argv):
-            return Path(sys.argv[i + 1]).resolve()
+            return Path(sys.argv[i + 1]).resolve(), "--root"
     env = os.environ.get("PCSAMPLE_ROOT")
     if env:
-        return Path(env).resolve()
+        return Path(env).resolve(), "PCSAMPLE_ROOT"
+    d = Path(DEFAULT_ROOT)
+    if d.is_dir():
+        return d.resolve(), "기본 설치 경로"
+
     here = Path(__file__).resolve()
-    cands = [
-        Path(DEFAULT_ROOT),          # 실기 기본 설치 위치
-        here.parent.parent,          # tools/ 안에 있을 때
-        here.parent,                 # 퍼저 루트에 바로 있을 때
-        Path.cwd(), Path.cwd().parent,
-    ]
-    # 위쪽으로도 몇 단계 훑는다
+    cands = [here.parent.parent, here.parent, Path.cwd(), Path.cwd().parent]
     for base in (here.parent, Path.cwd()):
         p = base
         for _ in range(4):
@@ -45,18 +47,19 @@ def _find_root():
             continue
         seen.add(c)
         if (c / "fuzzer_config.json").exists() or list(c.glob("pc_sampling_fuzzer_v*.py")):
-            return c
-    return None
-
-
-ROOT = _find_root()
-if ROOT is None:
-    print("❌ 퍼저 루트를 못 찾았다 (fuzzer_config.json / pc_sampling_fuzzer_v*.py 기준).")
-    print(f"   기본값 {DEFAULT_ROOT} 에도 없다. --root <퍼저디렉토리> 또는")
-    print("   PCSAMPLE_ROOT 환경변수로 지정하라.")
-    print(f"   참고: 스크립트={Path(__file__).resolve()}  cwd={Path.cwd()}")
+            return c, "자동 탐색"
+    print(f"❌ 퍼저 루트를 못 찾았다. 기본값 {DEFAULT_ROOT} 도 없다.")
+    print("   --root <퍼저디렉토리> 또는 PCSAMPLE_ROOT 환경변수로 지정하라.")
+    print(f"   시도한 후보: {[str(c) for c in list(seen)[:6]]}")
     sys.exit(2)
-print(f"퍼저 루트: {ROOT}\n")
+
+
+ROOT, _why = _find_root()
+print(f"퍼저 루트: {ROOT}   (출처: {_why})")
+if not (ROOT / "fuzzer_config.json").exists():
+    print(f"  ⚠ 이 경로에 fuzzer_config.json 이 없다 — 루트가 맞는지 확인하라"
+          f" (--root / PCSAMPLE_ROOT 로 지정 가능)")
+print()
 RV = ROOT / "risc-v"
 PROD = ROOT / "products" / "BM9K1"
 CORES = ("H", "CM", "F", "Q")
@@ -154,8 +157,11 @@ except Exception as e:
     bad("pylink", f"import 실패 {e}")
 for name, path in (("fuzzer_config.json", ROOT / "fuzzer_config.json"),
                    ("riscv_cov.py", ROOT / "riscv_cov.py"),
-                   ("elf_map.py", RV / "elf_map.py")):
-    (good if path.exists() else bad)(name, "있음" if path.exists() else "없음")
+                   ("pc_sampling_fuzzer_v10.0.py", ROOT / "pc_sampling_fuzzer_v10.0.py"),
+                   ("elf_map.py", RV / "elf_map.py"),
+                   ("sjtag_unlock.py", RV / "sjtag_unlock.py")):
+    # 없을 때는 **어디를 봤는지** 절대경로로 보여준다 — 루트 오인을 바로 알 수 있게
+    (good if path.exists() else bad)(name, "있음" if path.exists() else f"없음: {path}")
 try:
     cfg = json.loads((ROOT / "fuzzer_config.json").read_text())
     p9 = cfg["products"]["BM9K1"]
