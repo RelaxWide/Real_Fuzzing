@@ -458,6 +458,33 @@ class PcsrSession:
         v = self.dap.mem_read32(sj.APBAP3_BASE, base + sj.OFF_STATE)
         return v, bool(v is not None and (v & sj.AUTH_PASS))
 
+    def _addr_diag(self, key):
+        """★ '설정했는데 미설정이라고 나온다'를 한 번에 가르는 자가 진단.
+        런타임이 **실제로 읽은 파일과 값 상태**를 보고한다(값 자체는 찍지 않는다).
+        별도 도구를 또 돌리지 않아도 이 메시지만으로 원인이 좁혀지도록."""
+        sj = self._sj
+        try:
+            import sfe76_link as _L
+            src = os.path.abspath(_L.__file__)
+            jpath = os.path.join(os.path.dirname(src), "sjtag_addrs.json")
+            real = bool(getattr(_L, "ADDRS_REAL", False))
+            addrs = getattr(_L, "RISCV_ADDRS", {}) or {}
+        except Exception:
+            jpath, real, addrs = "(sfe76_link 미상)", False, {}
+        err = addrs.get("_load_error")
+        raw = (addrs.get("runtime") or {}).get(key.split(".")[-1], "<키없음>")
+        parts = [f"{key} 미설정"]
+        parts.append(f"런타임이 읽은 json={jpath}")
+        parts.append(f"실제값파일={real} (False 면 example placeholder 사용 중)")
+        parts.append(f"원시값: type={type(raw).__name__} len={len(str(raw))} "
+                     f"공백={str(raw).strip() == ''}")
+        if err:
+            parts.append(f"★ JSON 파싱 실패 → {err}")
+        if not os.path.exists(jpath):
+            parts.append("★ 이 경로에 파일이 없다 — risc-v/ 트리가 둘인지 확인")
+        parts.append("점검: sudo python3 tools/check_bm9k1_connect.py")
+        return " | ".join(parts)
+
     def ensure_auth(self, force=False):
         """★ probe-first 인증. → (ok, 사유)
 
@@ -472,15 +499,10 @@ class PcsrSession:
             return True, f"이미 인증됨(STATE={raw:#010x})" if raw is not None else "이미 인증됨"
         # ★ 0 은 유효한 주소일 수 있다(valid_base 가 허용). None 만 '미설정'으로 본다.
         if getattr(sj, "SJTAG_BASE", None) is None:
-            # 값을 넣었는데도 이게 뜨면 대개 JSON 파싱 실패로 placeholder 에 내려앉은 것
-            err = (getattr(sj, "RISCV_ADDRS", {}) or {}).get("_load_error")
-            if err:
-                return False, (f"sjtag_addrs.json 파싱 실패로 placeholder 사용 중 → {err} "
-                               f"(점검: sudo python3 tools/check_bm9k1_setup.py)")
-            return False, ("sjtag_addrs.json runtime.sjtag_base 미설정 "
-                           "(점검: sudo python3 tools/check_bm9k1_setup.py)")
+            return False, self._addr_diag("runtime.sjtag_base")
         if not getattr(sj, "SIGN_TOOL", None):
-            return False, "sjtag_addrs.json runtime.sign_tool 미설정"
+            return False, self._addr_diag("runtime.sign_tool")
+
         t0 = time.time()
         try:
             prefix = shlex.split(getattr(sj, "TOOL_PREFIX", "") or "")
