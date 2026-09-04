@@ -195,5 +195,29 @@ class TestWorkerWindowReset(unittest.TestCase):
         self.assertIn("max_samples_per_run", self.worker)
 
 
+class TestNoPerExecScans(unittest.TestCase):
+    """매 실행 경로에 O(커버리지) 스캔이 들어가면 캠페인이 진행될수록 느려지다 멈춘
+    것처럼 보인다. 실기서 실제로 겪은 지점."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = SRC.read_text(encoding="utf-8")
+
+    def test_cov_totals_defaults_to_cheap(self):
+        """기본은 by_core=False — len() 만 쓰므로 O(1)."""
+        self.assertIn("def _cov_totals(self, by_core=False):", self.src)
+
+    def test_by_core_only_at_periodic_sites(self):
+        """by_core=True 는 주기 통계/성장곡선(100 exec 마다)에서만."""
+        self.assertEqual(self.src.count("_cov_totals(by_core=True)"), 2)
+
+    def test_riscv_owns_diagnose(self):
+        """공용 diagnose 는 샘플마다 _read_all_pcs() → 우리 구현은 매번 4코어 재핀이라
+        수백 초가 걸린다. 버스트 기반 override 가 있어야 한다."""
+        i = self.src.index("class RiscvPcsrSampler")
+        j = self.src.index("class ", i + 10) if "class " in self.src[i + 10:] else len(self.src)
+        self.assertIn("def diagnose(self", self.src[i:j])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

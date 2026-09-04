@@ -3646,6 +3646,37 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                 'max_samples' if total >= limit else 'stop_event')
         self.total_samples += total
 
+    def diagnose(self, count: int = 20) -> bool:
+        """idle 유니버스 수집 — **코어별 버스트**로.
+
+        공용 구현은 샘플마다 _read_all_pcs() 를 부르는데, 우리 _read_all_pcs 는 그때마다
+        4코어를 전부 재핀한다(코어 전환 ~8 USB 왕복). diagnose_max=10000, 간격 10ms 면
+        수백 초가 걸려 **로그가 멈춘 것처럼** 보인다(실기서 관측).
+        코어당 pin 1회 + 연속 읽기로 같은 집합을 훨씬 싸게 모은다."""
+        total = max(500, int(getattr(self.config, 'diagnose_max', 2000)))
+        per = max(200, total // max(1, len(self._cores)))
+        log.warning(f"[Diagnose] idle 유니버스 수집 — 코어별 버스트 {per}샘플 "
+                    f"× {len(self._cores)}코어")
+        uni, hist = set(), {}
+        for cid in sorted(self._cores):
+            nm = (self._cores[cid].get('name') or str(cid))
+            obs = self.session.burst(cid, per, self._valid_bit)
+            n_ok = 0
+            for o in obs:
+                if o.valid and o.pc is not None and self._in_core_range(o.core_id, o.pc):
+                    uni.add(o.pc)
+                    hist[o.pc] = hist.get(o.pc, 0) + 1
+                    n_ok += 1
+            log.warning(f"  [Diagnose] core{nm}: 유효 {n_ok}/{len(obs)}, "
+                        f"누적 idle PC {len(uni)}")
+        self.idle_pcs = set(uni)
+        self.idle_pc = max(hist, key=hist.get) if hist else None
+        if not uni:
+            log.error("[Diagnose] idle PC 를 하나도 못 모았다 — pin/오프셋 확인")
+            return False
+        log.warning(f"[Diagnose] 완료: idle PC {len(uni)}개")
+        return True
+
     # ── 붕괴 감지 / 복구 ─────────────────────────────────────────────
     def _track_collapse(self, core, obs):
         """★ 단일 코어 연속 무효로 판정하면 오판한다 — 버스트+무지연이라 한 코어가 잠깐
@@ -7307,7 +7338,7 @@ class NVMeFuzzer:
             _elapsed_snap = (datetime.now() - self.start_time).total_seconds() \
                             if self.start_time else 0
             _bbpct = _fpct = None
-            _bbc, _bbt, _fnc, _fnt, _by_core = self._cov_totals()
+            _bbc, _bbt, _fnc, _fnt, _by_core = self._cov_totals(by_core=True)
             if _bbt > 0 or _fnt > 0:
                 _bbpct = 100.0 * _bbc / _bbt if _bbt > 0 else 0.0
                 _fpct  = 100.0 * _fnc / _fnt if _fnt > 0 else 0.0
@@ -8541,7 +8572,7 @@ class NVMeFuzzer:
     RC_ERROR     = -1002   # subprocess 에러 (내부 문제)
     RC_SKIP      = -1003   # 가드가 전송 차단 (가성 유발 admin opcode) — 회계 없이 다음 iteration
 
-    def _cov_totals(self):
+    def _cov_totals(self, by_core=False):
         """커버리지 집계를 한 곳에서 — RISC-V(CoverageModel)와 기존 제품(_sa_*) 양쪽.
         → (bb_covered, bb_total, fn_covered, fn_total, by_core|None)
 
@@ -8549,8 +8580,10 @@ class NVMeFuzzer:
         커버리지 줄이 통째로 안 찍힌다(판정은 되는데 표시가 안 되는 상태)."""
         cov = getattr(self, 'cov', None)
         if cov is not None and getattr(cov, 'loaded', False):
+            # by_core 는 전체를 훑는다 → 매 실행 경로에서는 부르지 않는다(기본 off)
             return (len(cov.covered_bbs), cov.total_bbs,
-                    len(cov.entered_funcs), cov.total_funcs, cov.stats_by_core())
+                    len(cov.entered_funcs), cov.total_funcs,
+                    cov.stats_by_core() if by_core else None)
         if self._sa_loaded:
             return (len(self._sa_covered_bbs), self._sa_total_bbs,
                     len(self._sa_entered_funcs), self._sa_total_funcs, None)
@@ -14272,7 +14305,7 @@ class NVMeFuzzer:
                  f"{ps_tag}{state_tag}")
         # 시작 배너를 놓쳐도 알 수 있게 주기 통계마다 재알림(정상 버전이면 아무것도 안 찍힘).
         _nvme_cli_warn(log, brief=True)
-        _bbc, _bbt, _fnc, _fnt, _by_core = self._cov_totals()
+        _bbc, _bbt, _fnc, _fnt, _by_core = self._cov_totals(by_core=True)
         if _bbt > 0 or _fnt > 0:
             sa_parts = []
             if _bbt > 0:

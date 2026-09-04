@@ -252,10 +252,18 @@ class CoverageModel:
 
     # ── 통계 / 리포트 ──────────────────────────────────────────────────
     def stats_by_core(self):
+        """코어별 집계. ★ 단일 패스 — 코어마다 전체를 훑으면 O(covered × cores) 라
+        커버리지가 커질수록 눈에 띄게 느려진다(5만 커버 × 4코어 = 72ms)."""
+        bb_by, fn_by = {}, {}
+        for k in self.covered_bbs:
+            c = k >> _CORE_SHIFT
+            bb_by[c] = bb_by.get(c, 0) + 1
+        for k in self.entered_funcs:
+            c = k >> _CORE_SHIFT
+            fn_by[c] = fn_by.get(c, 0) + 1
         out = {}
         for cid, cm in self.cores.items():
-            cb = sum(1 for k in self.covered_bbs if unpack(k)[0] == cid)
-            cf = sum(1 for k in self.entered_funcs if unpack(k)[0] == cid)
+            cb, cf = bb_by.get(cid, 0), fn_by.get(cid, 0)
             out[cid] = {
                 "name": cm.name,
                 "bb": cb, "bb_total": cm.total_bbs,
