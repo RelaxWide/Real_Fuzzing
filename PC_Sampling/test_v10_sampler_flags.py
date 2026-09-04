@@ -273,5 +273,45 @@ class TestInterestingIsGated(unittest.TestCase):
         self.assertIn("primary_core", rv["sample_plan"])
 
 
+class TestFailClosed(unittest.TestCase):
+    """검증 안 된 것을 조용히 쓰지 않는다 — 커버리지 오염/무커버리지 방지."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = SRC.read_text(encoding="utf-8")
+
+    def test_gate_failure_excludes_core(self):
+        """게이트 실패 코어를 계속 쓰면 오매칭 시 가짜 신규 BB 가 인정된다."""
+        self.assertIn("bad = self._verify_ranges(ok_cores)", self.src)
+        self.assertIn("if c not in bad", self.src)
+
+    def test_range_check_is_fail_closed(self):
+        """범위 없음을 True 로 두면 게이트가 무력해진다."""
+        self.assertIn("return bool(r) and (pc in r)", self.src)
+
+    def test_observations_are_range_filtered(self):
+        """CoverageModel 판정의 입력도 range 를 거쳐야 한다(legacy 경로만이 아니라)."""
+        i = self.src.index("def _sampling_worker(self):")
+        w = self.src[i:self.src.index("def _track_collapse", i)]
+        self.assertNotIn("self._observations.extend(obs)", w,
+                         "필터 없이 통째로 넣으면 range 가 판정에 안 걸린다")
+
+    def test_missing_assets_aborts(self):
+        self.assertIn("커버리지 자산이 없다", self.src)
+        self.assertIn("raise SystemExit(2)", self.src)
+
+    def test_worker_failure_requests_recovery(self):
+        """worker 가 죽어도 복구를 요청하지 않으면 커버리지 없이 캠페인이 계속된다."""
+        i = self.src.index("def _sampling_worker(self):")
+        w = self.src[i:self.src.index("def _track_collapse", i)]
+        self.assertGreaterEqual(w.count("self.openocd_error.set()"), 2)
+
+    def test_alive_checks_dap_too(self):
+        self.assertIn("s.lk is not None and s.dap is not None", self.src)
+
+    def test_empty_schedule_guarded(self):
+        self.assertIn("no_schedule", self.src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

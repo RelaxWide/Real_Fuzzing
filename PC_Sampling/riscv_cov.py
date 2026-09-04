@@ -605,6 +605,11 @@ class PcsrSession:
                     self.lk.close()
             except Exception:
                 pass
+            # ★ 닫았으면 비운다 — 남겨두면 'lk is not None' 생존판정이 죽은 세션을
+            #   살아있다고 오판해 샘플링 없이 캠페인이 계속된다.
+            self.lk = None
+            self.dap = None
+            self._ap = self._cb = None
 
     # ── 핀 / 폴링 ────────────────────────────────────────────────────
     def pin(self, core_id):
@@ -619,7 +624,7 @@ class PcsrSession:
     def burst(self, core_id, n, valid_bit=1):
         """한 코어를 n회 연속 폴링 → [Observation].
         ★ 루프 본체에 검사·복구·지연을 넣지 않는다(실측 제약)."""
-        obs = []
+        obs, raw_fail = [], 0
         with self.lock:
             if not self.pin(core_id):
                 self.last_fail_kind = "transport"
@@ -629,14 +634,16 @@ class PcsrSession:
             for _ in range(n):
                 raw = read(dap)
                 if raw is None:
+                    raw_fail += 1          # ★ 읽기 자체 실패 = transport
                     obs.append(Observation(core_id, None, False, False))
                     continue
                 valid = bool(raw & valid_bit)
                 pc = (raw & ~valid_bit) if valid else None
                 obs.append(Observation(core_id, pc, pc != prev, valid))
                 prev = pc
-        self.last_fail_kind = ("transport" if all(o.pc is None and not o.valid for o in obs)
-                               and obs else None)
+        # ★ valid=0 은 코어가 halt/wfi 인 **정상** 상태다 — transport 실패가 아니다.
+        #   둘을 뭉뚱그리면 정상 WFI 구간에서 불필요한 재연결이 돈다.
+        self.last_fail_kind = "transport" if (obs and raw_fail == len(obs)) else None
         return obs
 
     # ── 복구 ─────────────────────────────────────────────────────────

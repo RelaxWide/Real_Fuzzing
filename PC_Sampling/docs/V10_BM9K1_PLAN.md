@@ -69,8 +69,8 @@ PC_Sampling/
   products/                                         # 제품별 자산
     PM9M1/  PM9M1_LNB/  PM9M1_HP/  BM9H1/  P7/  P9/
         basic_blocks.txt  functions.txt  <openocd>.cfg  <ufas>.ini
-    BM9K1/  basic_blocks_core0..3.txt  functions_core0..3.txt
-            callgraph_core0..3.txt     symbols.json
+    BM9K1/  basic_blocks_core<H|CM|F|Q>.txt  functions_core<H|CM|F|Q>.txt
+            callgraph_core<H|CM|F|Q>.txt   symbols.json  ← 파일명은 코어 **이름** 기준
   dump/                                             # ★ 덤프 도구 + 산출물
     ufas                        SnapShot/PM9M1_A815.ini
     Debug_Tool_v1.0.0.2         run_smi_mem_dump_JLINK_USB.sh

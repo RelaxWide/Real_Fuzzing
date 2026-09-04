@@ -3557,22 +3557,36 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         if not ok_cores:
             return False
         self._weights = {c: w for c, w in self._weights.items() if c in ok_cores}
-        self._verify_ranges(ok_cores)
+        bad = self._verify_ranges(ok_cores)
+        if bad:
+            self._weights = {c: w for c, w in self._weights.items() if c not in bad}
+            log.error(f"[SJTAG] 정합성 미확인 코어 제외: {sorted(bad)} — "
+                      f"남은 코어: {sorted(self._weights)}")
+        if not self._weights:
+            log.error("[SJTAG] 샘플링 가능한 코어가 없다 — 연결 실패로 처리")
+            return False
+        if self._primary not in self._weights:
+            self._primary = max(self._weights, key=self._weights.get)
+            log.warning(f"[SJTAG] primary 코어를 {self._primary} 로 재선정")
         return True
 
     def _verify_ranges(self, cores):
-        """코어별 free-run 샘플이 그 코어 ELF 의 실행영역에 드는지(정합성 게이트).
-        미달이면 그 코어의 심볼화를 신뢰하지 않는다 — 조용히 틀린 커버리지 방지."""
+        """코어별 free-run 샘플이 그 코어 ELF 실행영역에 드는지(정합성 게이트).
+        → 검증 실패/불가한 core_id 목록. 호출부가 그 코어를 **샘플링에서 제외**한다.
+        검증 안 된 코어를 계속 쓰면 코어↔ELF 오매칭 시 주소가 우연히 BB 표에 들어가
+        **가짜 신규 BB** 가 인정된다."""
+        bad = []
         try:
             import elf_map
         except Exception as e:
-            log.warning(f"[SJTAG] elf_map 없음 — 정합성 게이트 생략: {e}")
-            return
+            log.error(f"[SJTAG] elf_map 없음 — 정합성 검증 불가, 전 코어 제외: {e}")
+            return list(cores)
         thr = float((getattr(self.config, 'riscv', None) or {}).get('gate_threshold', 95.0))
         for cid in cores:
             elf = (self._cores.get(cid) or {}).get('elf')
             if not elf or not os.path.exists(elf):
-                log.warning(f"[SJTAG] core{cid} ELF 없음 — 게이트 생략")
+                bad.append(cid)
+                log.error(f"[SJTAG] core{cid} ELF 없음 — 검증 불가로 제외: {elf}")
                 continue
             obs = self.session.burst(cid, 200, self._valid_bit)
             pcs = [o.pc for o in obs if o.valid and o.pc is not None]
@@ -3580,10 +3594,16 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             ok, info = elf_map.check_gate(pcs, elf, off, thr,
                                           label=f"core{cid}", verbose=True)
             if ok:
-                self._ranges[cid] = elf_map.Ranges(elf_map.exec_ranges(elf))
+                # ★ 범위를 **런타임 주소계**로 옮겨 저장(runtime = elf + offset).
+                #   ELF 범위 그대로 두면 load_offset≠0 일 때 게이트는 통과하는데
+                #   필터가 유효 PC 를 out-of-range 로 버리는 모순이 생긴다.
+                self._ranges[cid] = elf_map.Ranges(
+                    [(a + off, b + off) for a, b in elf_map.exec_ranges(elf)])
             else:
-                log.error(f"[SJTAG] core{cid} 정합성 게이트 실패 — 심볼화 신뢰 불가. "
-                          f"load_offset 과 코어↔ELF 매칭을 확인하라. info={info.get('pct')}%")
+                bad.append(cid)
+                log.error(f"[SJTAG] core{cid} 정합성 게이트 실패({info.get('pct')}%) — "
+                          f"코어↔ELF 매칭과 load_offset 을 확인하라")
+        return bad
 
     # ── 샘플링 (버스트 전용 worker) ───────────────────────────────────
     def _reset_window_extra(self):
@@ -3604,8 +3624,10 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         return d
 
     def _in_core_range(self, core_id, pc):
+        """★ fail-closed — 검증된 범위가 없는 코어의 PC 는 받지 않는다.
+        범위 없음을 True 로 두면 게이트가 사실상 무력해진다."""
         r = self._ranges.get(core_id)
-        return True if r is None else (pc in r)
+        return bool(r) and (pc in r)
 
     def _sampling_worker(self):
         """★ 버스트 전용. 가중치는 '버스트 개수'로 펴고 **매 윈도우 셔플**한다 —
@@ -3631,7 +3653,15 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         limit = max(1, int(cfg.max_samples_per_run))
         try:
             while not self.stop_event.is_set() and total < limit and not bail:
-                for core in self._rc.build_burst_schedule(self._weights, rng=self._rng):
+                sched = self._rc.build_burst_schedule(self._weights, rng=self._rng)
+                if not sched:
+                    # ★ weights 가 비었거나 전부 0 이면 for 본문이 안 돌아 빈-burst
+                    #   방어가 걸리지 않는다 → 진행 없는 무한루프.
+                    self._stopped_reason = 'no_schedule'
+                    log.error("[SJTAG] 버스트 스케줄이 비었다(weights 확인) — 샘플링 중단")
+                    self.openocd_error.set()
+                    break
+                for core in sched:
                     if self.stop_event.is_set() or total >= limit:
                         break
                     n = min(self._burst_len, limit - total)
@@ -3647,23 +3677,30 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                             log.error(f"[SJTAG] 빈 버스트 {empty}회 연속(pin 실패) — "
                                       f"샘플링 중단. 세션/오프셋 확인")
                             bail = True
+                            self.openocd_error.set()   # 상위 루프가 재연결 판단
                             break
                         continue
                     empty = 0
                     total += len(obs)
-                    self._observations.extend(obs)
                     self._track_collapse(core, obs)
                     for o in obs:
-                        if o.valid and o.pc is not None:
-                            self._last_raw_pcs.append(o.pc)
-                            if self._in_core_range(o.core_id, o.pc):
-                                self.current_trace.add(o.pc)
-                            else:
-                                self._out_of_range_count += 1
+                        if not (o.valid and o.pc is not None):
+                            self._observations.append(o)   # 무효 샘플도 판정엔 필요
+                            continue
+                        self._last_raw_pcs.append(o.pc)
+                        if self._in_core_range(o.core_id, o.pc):
+                            self.current_trace.add(o.pc)
+                            self._observations.append(o)
+                        else:
+                            # ★ range 밖 PC 는 CoverageModel 에도 넣지 않는다.
+                            #   예전엔 _observations 를 필터 없이 채워, range 필터가
+                            #   legacy current_trace 에만 걸리고 v10 판정은 그대로 통과했다.
+                            self._out_of_range_count += 1
                 self._maybe_recover()
         except Exception as e:
             self._stopped_reason = f'exception:{str(e)[:40]}'
-            log.warning(f"[SJTAG] 샘플링 예외: {e}")
+            log.error(f"[SJTAG] 샘플링 예외: {e}")
+            self.openocd_error.set()    # 예외를 삼키면 커버리지 없이 캠페인이 계속된다
         else:
             self._stopped_reason = self._stopped_reason or (
                 'max_samples' if total >= limit else 'stop_event')
@@ -3770,7 +3807,10 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             pass
 
     def _openocd_alive(self) -> bool:
-        return self.session is not None and self.session.lk is not None
+        """세션이 실제로 쓸 수 있는 상태인지. lk 만 보면 close() 된 세션을 살아있다고
+        오판해 샘플링 없이 캠페인이 계속된다."""
+        s = self.session
+        return bool(s is not None and s.lk is not None and s.dap is not None)
 
     def _reconnect(self) -> bool:
         self.close()
@@ -8638,6 +8678,24 @@ class NVMeFuzzer:
             return
         for w in self.cov.warnings:
             log.warning(f"[StaticAnalysis] {w}")
+        # ★ C3: 자산이 없거나 비면 빈 CoverageModel 로 **조용히** 진행하게 된다.
+        #   per-core 분기가 선택되므로 신규 BB 가 영원히 0 — 정상처럼 보이는 무커버리지.
+        #   여기서 끊는다.
+        _need = {c['name'] for c in ((self.config.riscv or {}).get('cores') or [])} or None
+        _have = {cm.name for cm in self.cov.cores.values()}
+        if not self.cov.loaded or self.cov.total_bbs <= 0:
+            log.error("=" * 70)
+            log.error(f"[StaticAnalysis] BM9K1 커버리지 자산이 없다: {pdir}")
+            log.error("  필요: basic_blocks_core<H|CM|F|Q>.txt / functions_core*.txt /")
+            log.error("        callgraph_core*.txt / symbols.json  (Ghidra 산출물)")
+            log.error("  ※ 파일명은 코어 **이름** 기준이다(core0..3 아님).")
+            log.error("  이대로 두면 커버리지 없이 캠페인이 도니 여기서 중단한다.")
+            log.error("=" * 70)
+            raise SystemExit(2)
+        if _need and not _need.issubset(_have):
+            log.error(f"[StaticAnalysis] 코어 자산 누락: 설정={sorted(_need)} "
+                      f"로드됨={sorted(_have)} — 파일명 확인 후 재시도")
+            raise SystemExit(2)
         st = self.cov.stats_by_core()
         log.warning("[StaticAnalysis] RISC-V per-core: " + ", ".join(
             f"{v['name']}(BB {v['bb_total']:,}/func {v['func_total']:,})"
