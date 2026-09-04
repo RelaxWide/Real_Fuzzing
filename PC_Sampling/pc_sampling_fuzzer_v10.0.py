@@ -3464,6 +3464,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
     SUPPORTS_CONCURRENT_SAMPLING = True    # 비침습이라 prefill 중에도 안전
     LINK_LABEL = '[SJTAG/cJTAG]'
     PER_CORE_COVERAGE = True               # _account_command 가 CoverageModel 경로를 탄다
+    _EMPTY_BURST_LIMIT = 8                 # 연속 빈 버스트 허용치(무한 루프 방지)
 
     def __init__(self, config: 'FuzzConfig') -> None:
         super().__init__(config)
@@ -3616,17 +3617,29 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         self._stopped_reason = ""
         self._reset_window_extra()          # _observations 비움
         self._invalid_streak = {}
-        cfg, total = self.config, 0
+        cfg, total, empty, bail = self.config, 0, 0, False
         limit = max(1, int(cfg.max_samples_per_run))
         try:
-            while not self.stop_event.is_set() and total < limit:
+            while not self.stop_event.is_set() and total < limit and not bail:
                 for core in self._rc.build_burst_schedule(self._weights, rng=self._rng):
                     if self.stop_event.is_set() or total >= limit:
                         break
                     n = min(self._burst_len, limit - total)
                     obs = self.session.burst(core, n, self._valid_bit)
                     if not obs:
+                        # ★ 빈 버스트(=pin 실패)에 continue 만 하면 total 이 안 늘어
+                        #   while 조건이 영원히 참 → **무한 루프**. 로그도 없이 스레드가
+                        #   돌며 세션 lock 을 물어 다음 윈도우까지 막는다(실기서 관측:
+                        #   시작 로그 뒤 아무것도 안 찍힘). 진행이 없으면 빠져나온다.
+                        empty += 1
+                        if empty >= self._EMPTY_BURST_LIMIT:
+                            self._stopped_reason = 'pin_fail'
+                            log.error(f"[SJTAG] 빈 버스트 {empty}회 연속(pin 실패) — "
+                                      f"샘플링 중단. 세션/오프셋 확인")
+                            bail = True
+                            break
                         continue
+                    empty = 0
                     total += len(obs)
                     self._observations.extend(obs)
                     self._track_collapse(core, obs)

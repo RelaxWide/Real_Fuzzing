@@ -219,5 +219,31 @@ class TestNoPerExecScans(unittest.TestCase):
         self.assertIn("def diagnose(self", self.src[i:j])
 
 
+class TestWorkerCannotSpin(unittest.TestCase):
+    """★ 진행 없는 루프 금지. burst 가 빈 리스트를 계속 반환하면(pin 실패) total 이
+    안 늘어 while 조건이 영원히 참 → 로그 없이 스레드가 돌며 세션 lock 을 물어
+    전체가 멈춘 것처럼 보인다(실기서 실제 발생)."""
+
+    @classmethod
+    def setUpClass(cls):
+        src = SRC.read_text(encoding="utf-8")
+        i = src.index("class RiscvPcsrSampler")
+        w = src.index("def _sampling_worker(self):", i)
+        cls.worker = src[w:src.index("def _track_collapse", w)]
+
+    def test_empty_burst_has_exit(self):
+        self.assertIn("_EMPTY_BURST_LIMIT", self.worker,
+                      "빈 버스트 연속 시 탈출 조건이 있어야 한다")
+
+    def test_no_bare_continue_without_counter(self):
+        """continue 만 하고 카운터가 없으면 진행 없이 도는 구조가 된다."""
+        self.assertIn("empty += 1", self.worker)
+
+    def test_exit_uses_normal_path(self):
+        """return 으로 빠지면 total_samples 누적 등 마무리가 건너뛰어진다."""
+        self.assertNotIn("            return\n", self.worker)
+        self.assertIn("bail = True", self.worker)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
