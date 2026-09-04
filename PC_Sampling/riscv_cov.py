@@ -616,6 +616,15 @@ class PcsrSession:
         with self.lock:
             if self._pinned == core_id:
                 return True
+            if self._pinned is not None:
+                # 마지막 SBDATA0 read 가 다음 SBA read 를 trigger한 상태일 수 있다.
+                # 코어 전환은 핫루프 밖이므로 여기서 busy 완료+FIFO off 를 확인한다.
+                # 실패한 상태로 새 SBADDR를 쓰면 sbbusyerror가 연쇄되어 이후 모든
+                # burst가 빈 리스트가 되므로 fail-closed 한다.
+                if not self._sj.sba_unpin(self.dap, self._ap, self._cb):
+                    self._pinned = None
+                    return False
+                self._pinned = None
             ok = self._sj.sba_pin(self.dap, self._ap, self._cb,
                                   self._pcsr_addr(core_id))
             self._pinned = core_id if ok else None

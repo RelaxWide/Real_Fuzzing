@@ -264,7 +264,7 @@ class FakeSJ:
         return self._reads.pop(0) if self._reads else None
 
     def sba_unpin(self, dap, ap, cb):
-        self.calls.append(("unpin",))
+        self.calls.append(("unpin",)); return True
 
     RISCV_ADDRS = {"trace": {"te_base": "0x1000000"},
                    "pcsr": {"offset": "0x17C", "core_stride": "0x1000"}}
@@ -325,6 +325,22 @@ class TestPcsrBurst(unittest.TestCase):
         s.burst(0, 2); s.burst(0, 2)
         self.assertEqual(sum(1 for c in s._sj.calls if c[0] == "pin"), 1,
                          "같은 코어 연속 버스트면 재핀 불필요")
+
+    def test_core_switch_quiesces_fifo_before_repin(self):
+        """A코어 마지막 read가 만든 outstanding SBA read를 정리한 뒤 B코어를 pin."""
+        s = make_session([0x1001, 0x2001])
+        s.burst(0, 1)
+        s.burst(1, 1)
+        self.assertEqual([c[0] for c in s._sj.calls],
+                         ["pin", "read", "unpin", "pin", "read"])
+
+    def test_core_switch_stops_when_unpin_fails(self):
+        """FIFO를 못 끈 상태에서 새 SBADDR를 쓰면 안 된다."""
+        s = make_session([0x1001])
+        s.burst(0, 1)
+        s._sj.sba_unpin = lambda *a: False
+        self.assertEqual(s.burst(1, 1), [])
+        self.assertIsNone(s._pinned)
 
     def test_pcsr_address_from_json_only(self):
         """주소는 sjtag_addrs.json 에서만 — 코드에 상수로 박히면 안 된다."""

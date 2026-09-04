@@ -1421,7 +1421,8 @@ class _FuzzingTerminalFilter(logging.Filter):
         r'|\[IO-WL\]'                   # v8.4: IO 워크로드 블록/검증 로그
         r'|\[DevInfo\]'                 # Device Information(주기 출력) 터미널 노출
         r'|\[Taint\]'                   # v8.6: kernel taint 진단(시작/변화). [VMon] 은 파일만(터미널 제외)
-        r'|\[Sampler\]'                 # 샘플러 halt 실패→복구 알림 (커버리지 측정 정상 재개 확인)
+        r'|\[Sampler\]'                 # 샘플러 실패→복구 알림 (커버리지 측정 정상 재개 확인)
+        r'|\[cJTAG/SBA\]'               # BM9K1 transport/SBA 진단·복구
         r'|\[J-Link DLL\]'              # JLinkARM DLL 메시지 중 halt 노이즈 외 실제 경고/에러
         r'|\[LLM'                       # v9.0: RAG 관련(주입/활성/raw/parse/item/stats) 터미널 노출.
                                         #       raw/parse/item 은 rag.debug=true 일 때만 생성되므로
@@ -3462,7 +3463,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
     USES_JLINK_USB = True                  # pylink 가 USB 점유 → 덤프 전 해제 필요
     RECONNECT_ON_FW_COMMIT = True
     SUPPORTS_CONCURRENT_SAMPLING = True    # 비침습이라 prefill 중에도 안전
-    LINK_LABEL = '[SJTAG/cJTAG]'
+    LINK_LABEL = '[cJTAG/SBA]'
     PER_CORE_COVERAGE = True               # _account_command 가 CoverageModel 경로를 탄다
     _EMPTY_BURST_LIMIT = 8                 # 연속 빈 버스트 허용치(무한 루프 방지)
 
@@ -3529,7 +3530,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             auth_timeout=float(rv.get('auth_timeout', 60.0)),
             word_order=rv.get('word_order'))
         if not self.session.open():
-            log.error("[SJTAG] 세션 열기 실패 — 인증/전원 확인 (sudo 필요)")
+            log.error("[cJTAG/SBA] 세션 열기 실패 — SJTAG 인증/전원 확인 (sudo 필요)")
             return False
         # ★ 코어 목록(ELF 경로 포함)은 기밀이라 fuzzer_config.json 이 아니라
         #   risc-v/sjtag_addrs.json 의 pcsr.cores 에서 읽는다.
@@ -3539,13 +3540,13 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                 c['elf'] = self._resolve_elf(c.get('elf', ''))
                 self._cores[int(c['id'])] = c
             if not self._cores:
-                log.error("[SJTAG] sjtag_addrs.json 에 pcsr.cores 가 없다 — "
+                log.error("[cJTAG/SBA] sjtag_addrs.json 에 pcsr.cores 가 없다 — "
                           "{id,name,elf,load_offset} 를 채워야 한다")
                 return False
             if not self._weights:
                 self._weights = {cid: 1 for cid in self._cores}
             self._pcsr_addrs = [0] * len(self._cores)
-        log.warning(f"[SJTAG] 세션 OK (인증 {self.session.auth_count}회, "
+        log.warning(f"[cJTAG/SBA] 세션 OK (SJTAG 인증 {self.session.auth_count}회, "
                     f"{self.session.auth_ms:.0f}ms). 버스트 seed={self._seed} "
                     f"(재현하려면 sample_plan.seed 에 지정)")
         ok_cores = []
@@ -3553,21 +3554,21 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             if self.session.pin(cid):
                 ok_cores.append(cid)
             else:
-                log.error(f"[SJTAG] core{cid} pin 실패 — 이 코어는 샘플링 제외")
+                log.error(f"[cJTAG/SBA] core{cid} pin 실패 — 이 코어는 샘플링 제외")
         if not ok_cores:
             return False
         self._weights = {c: w for c, w in self._weights.items() if c in ok_cores}
         bad = self._verify_ranges(ok_cores)
         if bad:
             self._weights = {c: w for c, w in self._weights.items() if c not in bad}
-            log.error(f"[SJTAG] 정합성 미확인 코어 제외: {sorted(bad)} — "
+            log.error(f"[cJTAG/SBA] 정합성 미확인 코어 제외: {sorted(bad)} — "
                       f"남은 코어: {sorted(self._weights)}")
         if not self._weights:
-            log.error("[SJTAG] 샘플링 가능한 코어가 없다 — 연결 실패로 처리")
+            log.error("[cJTAG/SBA] 샘플링 가능한 코어가 없다 — 연결 실패로 처리")
             return False
         if self._primary not in self._weights:
             self._primary = max(self._weights, key=self._weights.get)
-            log.warning(f"[SJTAG] primary 코어를 {self._primary} 로 재선정")
+            log.warning(f"[cJTAG/SBA] primary 코어를 {self._primary} 로 재선정")
         return True
 
     def _verify_ranges(self, cores):
@@ -3579,14 +3580,14 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         try:
             import elf_map
         except Exception as e:
-            log.error(f"[SJTAG] elf_map 없음 — 정합성 검증 불가, 전 코어 제외: {e}")
+            log.error(f"[cJTAG/SBA] elf_map 없음 — 정합성 검증 불가, 전 코어 제외: {e}")
             return list(cores)
         thr = float((getattr(self.config, 'riscv', None) or {}).get('gate_threshold', 95.0))
         for cid in cores:
             elf = (self._cores.get(cid) or {}).get('elf')
             if not elf or not os.path.exists(elf):
                 bad.append(cid)
-                log.error(f"[SJTAG] core{cid} ELF 없음 — 검증 불가로 제외: {elf}")
+                log.error(f"[cJTAG/SBA] core{cid} ELF 없음 — 검증 불가로 제외: {elf}")
                 continue
             obs = self.session.burst(cid, 200, self._valid_bit)
             pcs = [o.pc for o in obs if o.valid and o.pc is not None]
@@ -3601,7 +3602,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                     [(a + off, b + off) for a, b in elf_map.exec_ranges(elf)])
             else:
                 bad.append(cid)
-                log.error(f"[SJTAG] core{cid} 정합성 게이트 실패({info.get('pct')}%) — "
+                log.error(f"[cJTAG/SBA] core{cid} 정합성 게이트 실패({info.get('pct')}%) — "
                           f"코어↔ELF 매칭과 load_offset 을 확인하라")
         return bad
 
@@ -3658,7 +3659,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                     # ★ weights 가 비었거나 전부 0 이면 for 본문이 안 돌아 빈-burst
                     #   방어가 걸리지 않는다 → 진행 없는 무한루프.
                     self._stopped_reason = 'no_schedule'
-                    log.error("[SJTAG] 버스트 스케줄이 비었다(weights 확인) — 샘플링 중단")
+                    log.error("[cJTAG/SBA] 버스트 스케줄이 비었다(weights 확인) — 샘플링 중단")
                     self.openocd_error.set()
                     break
                 for core in sched:
@@ -3674,7 +3675,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                         empty += 1
                         if empty >= self._EMPTY_BURST_LIMIT:
                             self._stopped_reason = 'pin_fail'
-                            log.error(f"[SJTAG] 빈 버스트 {empty}회 연속(pin 실패) — "
+                            log.error(f"[cJTAG/SBA] 빈 버스트 {empty}회 연속(pin 실패) — "
                                       f"샘플링 중단. 세션/오프셋 확인")
                             bail = True
                             self.openocd_error.set()   # 상위 루프가 재연결 판단
@@ -3699,7 +3700,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                 self._maybe_recover()
         except Exception as e:
             self._stopped_reason = f'exception:{str(e)[:40]}'
-            log.error(f"[SJTAG] 샘플링 예외: {e}")
+            log.error(f"[cJTAG/SBA] 샘플링 예외: {e}")
             self.openocd_error.set()    # 예외를 삼키면 커버리지 없이 캠페인이 계속된다
         else:
             self._stopped_reason = self._stopped_reason or (
@@ -3763,16 +3764,16 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                 or time.time() - self._all_invalid_since < sj.PCSR_COLLAPSE_MIN_SECONDS):
             return
         self.collapse_count += 1
-        log.error(f"[SJTAG] 세션 붕괴 감지(전 코어 무효 {cycles}사이클) — 재생성 시도 "
+        log.error(f"[cJTAG/SBA] 세션 붕괴 감지(전 코어 무효 {cycles}사이클) — 재생성 시도 "
                   f"#{self.collapse_count}")
         core = next(iter(sorted(self._weights)))
         r = self.session.recover(core, verify_samples=64)
         if r.ok:
             self.recover_ok += 1
-            log.warning(f"[SJTAG] 복구 성공 {r.elapsed:.1f}s valid={r.valid_samples}")
+            log.warning(f"[cJTAG/SBA] 복구 성공 {r.elapsed:.1f}s valid={r.valid_samples}")
         else:
             self.recover_fail += 1
-            log.error(f"[SJTAG] 복구 실패 stage={r.stage} {r.detail}")
+            log.error(f"[cJTAG/SBA] 복구 실패 stage={r.stage} {r.detail}")
             self.openocd_error.set()      # 상위 루프가 세션 재초기화를 판단
         self._invalid_streak = {}
         self._all_invalid_since = None
@@ -4175,6 +4176,9 @@ class NVMeFuzzer:
             self.sampler = OpenOCDHaltSampler(config)
         else:
             self.sampler = OpenOCDPCSampler(config)
+        # 어떤 sampling 호출 경로에서든 복구가 끝내 실패하면 coverage 없이 명령을
+        # 계속 보내지 않는다. 공통 _stop_sampling_checked()가 설정한다.
+        self._sampler_recovery_failed = False
 
         if config.enabled_commands:
             # --commands 지정 시: NVME_COMMANDS 전체에서 이름 매칭
@@ -4519,10 +4523,14 @@ class NVMeFuzzer:
             # 여기서 별도로 start_sampling()을 호출하면 두 개의 sampling thread가
             # 동시에 실행되어 zombie thread가 누적된다.
             rc = self._send_nvme_command(seed.data, seed)
-            self.sampler.stop_sampling()
+            _, _sampler_ok = self._stop_sampling_checked(
+                f"calibration:{seed.cmd.name}:{run_i + 1}")
             self.executions += 1
             actual_runs += 1
             self._cal_last_rc = rc
+            if not _sampler_ok:
+                self._cal_last_rc = self.RC_ERROR
+                break
 
             for pc in self.sampler.current_trace:
                 pc_appearances[pc] = pc_appearances.get(pc, 0) + 1
@@ -4735,7 +4743,9 @@ class NVMeFuzzer:
                 log.warning(f"[FW-Preload] 슬롯{slot} 기록 완료 (FWCommit CA=0 rc={_rc})")
             else:
                 log.warning(f"[FW-Preload] 슬롯{slot} FWDownload 실패 — skip")
-            self.sampler.stop_sampling()
+            _, _sampler_ok = self._stop_sampling_checked(f"fw-preload:slot{slot}")
+            if not _sampler_ok:
+                return
 
     def _log_smart(self):
         """v4.3: NVMe SMART / Health 로그를 읽어 INFO 레벨로 기록.
@@ -6869,7 +6879,10 @@ class NVMeFuzzer:
             # record_history=True: replay 명령도 실제 실행되므로 crash replay.sh가
             # 그대로 재현하도록 _cmd_history에 기록 (last-100 window 안에서 완전).
             rc = self._send_nvme_command(_data, _seed, record_history=True)
-            last_samples = self.sampler.stop_sampling()
+            last_samples, _sampler_ok = self._stop_sampling_checked(
+                f"state-replay:{_cmd.name}")
+            if not _sampler_ok:
+                return False
             # PM rotation은 replay 정확도를 위해 의도적으로 제외 (main loop 전용)
             _interesting, _new_pcs, _action = self._account_command(
                 _seed, _data, rc, last_samples, source='c2')
@@ -6991,9 +7004,53 @@ class NVMeFuzzer:
         self._csfuzz_c1_rewards.clear()
         self._csfuzz_c2_rewards.clear()
 
+    def _stop_sampling_checked(self, context: str = "command") -> tuple[int, bool]:
+        """sampling worker를 정지하고 transport 오류가 있으면 즉시 복구한다.
+
+        _send_nvme_command(), PM, calibration, workload, replay가 모두 sampling을 열 수
+        있는데 예전에는 일반 main-loop만 openocd_error를 소비했다. 이 함수만
+        stop_sampling()을 직접 호출하게 해서 새 경로가 복구를 빠뜨리지 않도록 한다.
+        → (이번 window unique PC 수, 세션 사용 가능 여부)
+        """
+        last_samples = self.sampler.stop_sampling()
+        err = getattr(self.sampler, 'openocd_error', None)
+        if err is None or not err.is_set():
+            return last_samples, True
+
+        err.clear()
+        label = getattr(self.sampler, 'LINK_LABEL', '[Sampler]')
+        log.warning(f"[Sampler] {label} sampling 장애 감지(context={context}) — "
+                    "타겟 재초기화 시도")
+        try:
+            ok = self.sampler._reinit_target()
+        except Exception as e:
+            ok = False
+            log.warning(f"[Sampler] {label} 타겟 재초기화 예외: {e}")
+        if not ok:
+            log.warning(f"[Sampler] {label} 타겟 재초기화 실패 — 전체 재연결 재시도")
+            try:
+                ok = self.sampler._reconnect()
+            except Exception as e:
+                ok = False
+                log.warning(f"[Sampler] {label} 재연결 예외: {e}")
+        if ok:
+            self._sampler_recovery_failed = False
+            log.warning(f"[Sampler] {label} 복구 성공 — sampling 재개 가능 "
+                        f"(context={context})")
+            return last_samples, True
+
+        self._sampler_recovery_failed = True
+        log.error(f"[Sampler] {label} 복구 실패 — coverage 없이 진행하지 않음 "
+                  f"(context={context})")
+        try:
+            self.sampler.close()
+        except Exception:
+            pass
+        return last_samples, False
+
     # ------------------------------------------------------------------
     # v7.3: per-command 회계 helper
-    # _send_nvme_command() + stop_sampling() 이후 호출.
+    # _send_nvme_command() + _stop_sampling_checked() 이후 호출.
     # 반환: (is_interesting, new_pcs, action)
     #   action = 'ok' | 'break' | 'continue'
     # ------------------------------------------------------------------
@@ -10750,7 +10807,10 @@ class NVMeFuzzer:
         )
         self._current_mutations = []   # MOpt 무오염
         rc = self._send_nvme_command(data, seed, record_history=True)
-        last_samples = self.sampler.stop_sampling()
+        last_samples, _sampler_ok = self._stop_sampling_checked(
+            f"io-workload:{op}")
+        if not _sampler_ok:
+            return self.RC_ERROR
         _i, _np, _action = self._account_command(seed, data, rc, last_samples, source='workload')
         return rc if _action != 'break' else self.RC_TIMEOUT
 
@@ -10768,6 +10828,8 @@ class NVMeFuzzer:
         for base, span in targets:
             covered = 0
             while covered < span:
+                if self._sampler_recovery_failed:
+                    return
                 this = min(lim['max_nlb'] + 1, span - covered)
                 slba = base + covered
                 if slba + this > nsze:
@@ -10805,16 +10867,19 @@ class NVMeFuzzer:
         if (pattern in ('read_disturb', 'pingpong_read')
                 and not self.config.prefill and not self._wl_read_target_written):
             self._wl_prewrite_read_targets(lim, pattern)
+            if self._sampler_recovery_failed:
+                self._wl_active_pattern = None
+                return
             self._wl_read_target_written = True
 
         cmds = self._gen_workload_block(pattern, lim)
         n_ok = 0
         for (op, slba, nlb) in cmds:
-            if self._timeout_crash:
+            if self._timeout_crash or self._sampler_recovery_failed:
                 break
             if self._wl_send_one(op, slba, nlb, lim['lba']) == 0:
                 n_ok += 1
-            if self._timeout_crash:
+            if self._timeout_crash or self._sampler_recovery_failed:
                 break
         self._wl_blocks_done += 1
         self._wl_active_pattern = None
@@ -10883,6 +10948,9 @@ class NVMeFuzzer:
                 and not self.config.prefill and not self._wl_read_target_written):
             self._wl_prewrite_read_targets(lim, pattern,
                                            seed_class='llm_io', prov_id=_wl_prov)
+            if self._sampler_recovery_failed:
+                self._wl_active_pattern = None
+                return
             self._wl_read_target_written = True
 
         _snap_start = self._state_capture_safe()      # 전체 telemetry 스냅(전)
@@ -10898,29 +10966,32 @@ class NVMeFuzzer:
         t_start = time.monotonic()
         stop_reason = 'ceiling'
         while blocks < IO_WL_BURST_BLOCKS_MAX:
-            if self._timeout_crash:
-                stop_reason = 'timeout'
+            if self._timeout_crash or self._sampler_recovery_failed:
+                stop_reason = ('timeout' if self._timeout_crash
+                               else 'sampler_recovery_failed')
                 break
             # SNAP_BLOCKS block 실행 후 FFM 1회 관측
             for _ in range(IO_WL_BURST_SNAP_BLOCKS):
-                if blocks >= IO_WL_BURST_BLOCKS_MAX or self._timeout_crash:
+                if (blocks >= IO_WL_BURST_BLOCKS_MAX or self._timeout_crash
+                        or self._sampler_recovery_failed):
                     break
                 cmds = self._gen_workload_block(pattern, lim, desc)
                 for (op, slba, nlb) in cmds:
-                    if self._timeout_crash:
+                    if self._timeout_crash or self._sampler_recovery_failed:
                         break
                     # seed_class='llm_io' → LLM 이 이 워크로드를 지시했으므로 발견 커버리지를
                     #   LLM 기여(new_cov)로 크레딧. source='workload' 는 유지(C1/C2 에너지 무오염).
                     if self._wl_send_one(op, slba, nlb, lim['lba'],
                                          seed_class='llm_io', prov_id=_wl_prov) == 0:
                         n_ok += 1
-                    if self._timeout_crash:
+                    if self._timeout_crash or self._sampler_recovery_failed:
                         break
                 blocks += 1
                 self._wl_blocks_done += 1
-            if self._timeout_crash:
+            if self._timeout_crash or self._sampler_recovery_failed:
                 # 크래시 중엔 FFM capture(죽은 디바이스 상대 최대 60s 서브프로세스) 생략하고 즉시 종료.
-                stop_reason = 'timeout'
+                stop_reason = ('timeout' if self._timeout_crash
+                               else 'sampler_recovery_failed')
                 break
             if time.monotonic() - t_start > IO_WL_BURST_WALLTIME_S:
                 stop_reason = 'walltime'
@@ -15259,6 +15330,9 @@ class NVMeFuzzer:
             log.warning("[Calibration] FormatNVM 1회 실행 (SES=0, FTL 리셋) ...")
             _fmt_seed = Seed(data=b'', cmd=_fmt_cmd, cdw10=0x0000)
             _fmt_rc = self._send_nvme_command(b'', _fmt_seed)
+            _, _sampler_ok = self._stop_sampling_checked("startup:FormatNVM")
+            if not _sampler_ok:
+                return
             log.warning(f"[Calibration] FormatNVM 완료 (rc={_fmt_rc})")
             _san_cmd = next((c for c in NVME_COMMANDS if c.name == "Sanitize"), None)
             if _san_cmd:
@@ -15275,6 +15349,9 @@ class NVMeFuzzer:
                             "— 소거 아님, sanitize-failed 래치 해제) ...")
                 _san_seed = Seed(data=b'', cmd=_san_cmd, cdw10=0x01)
                 _san_rc = self._send_nvme_command(b'', _san_seed)
+                _, _sampler_ok = self._stop_sampling_checked("startup:Sanitize")
+                if not _sampler_ok:
+                    return
                 log.warning(f"[Calibration] Sanitize(Exit Failure Mode) 전송 완료 (rc={_san_rc})")
             # 메인 루프에서 재실행되지 않도록 제거
             self.commands = [c for c in self.commands if c.name not in ("FormatNVM", "Sanitize")]
@@ -15284,6 +15361,9 @@ class NVMeFuzzer:
         # 활성화(CA=2/3)해도 같은 이미지 → 다른 FW 활성화 방지. FWCommit fuzz + fw_bin 있을 때만.
         if self._fw_chunks and any(c.name == 'FWCommit' for c in self.commands):
             self._preload_fw_slots()
+            if self._sampler_recovery_failed:
+                log.error("[FW] sampler 복구 실패 — prefill/calibration/퍼징 중단")
+                return
 
         # Prefill: FormatNVM/Sanitize 이후 드라이브 전체 쓰기 (Verify 등이 참조할 데이터 확보)
         # FormatNVM이 LBA 맵핑을 초기화하므로 prefill은 반드시 format 완료 후 실행해야 의미 있음.
@@ -15315,6 +15395,10 @@ class NVMeFuzzer:
                         calibrated_corpus.append(seed)
                         continue
                     seed = self._calibrate_seed(seed)
+                    if self._sampler_recovery_failed:
+                        os.dup2(saved_stderr_fd, 2)
+                        log.error("[Calibration] sampler 복구 실패 — calibration/퍼징 중단")
+                        return
                     calibrated_corpus.append(seed)
                     stable_cnt = len(seed.stable_pcs) if seed.stable_pcs else 0
                     all_cnt    = len(seed.covered_pcs) if seed.covered_pcs else 0
@@ -15395,7 +15479,7 @@ class NVMeFuzzer:
 
         try:
             while True:
-                if self._timeout_crash:
+                if self._timeout_crash or self._sampler_recovery_failed:
                     break
 
                 elapsed = (datetime.now() - self.start_time).total_seconds()
@@ -15417,7 +15501,7 @@ class NVMeFuzzer:
                     self._pending_workload = None
                     self._run_llm_workload_burst(_desc)
                     self._fuzz_since_workload = 0
-                    if self._timeout_crash:
+                    if self._timeout_crash or self._sampler_recovery_failed:
                         break
                     continue
 
@@ -15427,7 +15511,7 @@ class NVMeFuzzer:
                         and self._fuzz_since_workload >= IO_WL_FUZZ_GAP):
                     self._run_io_workload_block()
                     self._fuzz_since_workload = 0
-                    if self._timeout_crash:
+                    if self._timeout_crash or self._sampler_recovery_failed:
                         break
                     continue
                 self._fuzz_since_workload += 1
@@ -15463,7 +15547,9 @@ class NVMeFuzzer:
                         if _apst_ok:
                             self.sampler.start_sampling()
                             time.sleep(_idle_total_s)     # 자율 PS3 → PS4 진입 대기
-                            self.sampler.stop_sampling()
+                            _, _sampler_ok = self._stop_sampling_checked("pm:forced-idle")
+                            if not _sampler_ok:
+                                break
                             _pm_new_set = self.sampler.current_trace - self.sampler.global_coverage
                             _pm_new_cnt = len(_pm_new_set)
                             self.sampler.global_coverage.update(self.sampler.current_trace)
@@ -15486,7 +15572,9 @@ class NVMeFuzzer:
                     elif _pm_slot == 'pcie_bit':
                         self.sampler.start_sampling()
                         self._pm_perturb_pcie_bit()
-                        self.sampler.stop_sampling()
+                        _, _sampler_ok = self._stop_sampling_checked("pm:pcie-bit")
+                        if not _sampler_ok:
+                            break
                         _pm_new_set = self.sampler.current_trace - self.sampler.global_coverage
                         _pm_new_cnt = len(_pm_new_set)
                         self.sampler.global_coverage.update(self.sampler.current_trace)
@@ -15499,7 +15587,9 @@ class NVMeFuzzer:
                     elif _pm_slot == 'clkreq':
                         self.sampler.start_sampling()
                         self._pm_perturb_clkreq()
-                        self.sampler.stop_sampling()
+                        _, _sampler_ok = self._stop_sampling_checked("pm:clkreq")
+                        if not _sampler_ok:
+                            break
                         _pm_new_set = self.sampler.current_trace - self.sampler.global_coverage
                         _pm_new_cnt = len(_pm_new_set)
                         self.sampler.global_coverage.update(self.sampler.current_trace)
@@ -15521,7 +15611,10 @@ class NVMeFuzzer:
                         _set_ok = self._set_power_combo(_next_combo)
                         if not _set_ok:
                             log.warning(f"[PM] {_next_combo.label} 진입 실패 — _current_combo 유지")
-                        self.sampler.stop_sampling()
+                        _, _sampler_ok = self._stop_sampling_checked(
+                            f"pm:combo:{_next_combo.label}")
+                        if not _sampler_ok:
+                            break
                         _pm_new_set = self.sampler.current_trace - self.sampler.global_coverage
                         _pm_new_cnt = len(_pm_new_set)
                         self.sampler.global_coverage.update(self.sampler.current_trace)
@@ -15796,25 +15889,14 @@ class NVMeFuzzer:
                         if rc in (self.RC_TIMEOUT, self.RC_ERROR):
                             _acct_seed, _acct_data = _chunk_seed, _chunk_seed.data
                             break
-                    last_samples = self.sampler.stop_sampling()
+                    last_samples, _sampler_ok = self._stop_sampling_checked(
+                        f"command:{_acct_seed.cmd.name}")
                 else:
                     rc = self._send_nvme_command(fuzz_data, mutated_seed)
-                    last_samples = self.sampler.stop_sampling()
-
-                # 샘플러 링크 손실 감지 → 2단계 복구. halt(J-Link) 샘플러는
-                # _read_fail_needs_recovery() 가 링크 죽음일 때만 openocd_error 를
-                # 세우므로, 무해 WFI 로는 이 경로에 들어오지 않는다. 라벨은 샘플러별로.
-                if self.sampler.openocd_error.is_set():
-                    self.sampler.openocd_error.clear()
-                    _lk = self.sampler.LINK_LABEL
-                    if not self.sampler._reinit_target():
-                        log.warning(f"{_lk} 타겟 재초기화 실패 — 재연결 시도...")
-                        if not self.sampler._reconnect():
-                            log.error(f"{_lk} 재연결 실패 — 퍼저를 종료합니다.")
-                            break
-                        log.warning(f"{_lk} 재연결 성공 — 퍼징 재개")
-                    else:
-                        log.warning(f"{_lk} 타겟 재초기화 성공 — 퍼징 재개")
+                    last_samples, _sampler_ok = self._stop_sampling_checked(
+                        f"command:{mutated_seed.cmd.name}")
+                if not _sampler_ok:
+                    break
 
                 is_interesting, new_pcs, _action = self._account_command(
                     _acct_seed, _acct_data, rc, last_samples,

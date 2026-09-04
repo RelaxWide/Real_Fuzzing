@@ -165,7 +165,7 @@ Observation(core_id: int, pc: int | None, fresh: bool, valid: bool)
 - **코어별로** invalid streak / saturation / idle 을 계산한다. 튜플 위치로 코어를 유추하는
   현재 로직은 버스트에서 성립하지 않는다.
 - **stale 샘플은 interesting/idle/saturation 판정에서 제외**한다.
-→ 공통 worker 를 Observation 기반으로 바꾸거나, SJTAG 전용 worker 를 두고 기존 샘플러는
+→ 공통 worker 를 Observation 기반으로 바꾸거나, cJTAG/SBA PCSR 전용 worker 를 두고 기존 샘플러는
   `[Observation(0, pc, True, True), …]` 로 감싸 **기존 동작을 그대로 보존**한다(회귀 안전).
 
 **"interesting" 정책**: `(core,bank,bb)` 키라 union-new가 곧 코어별 신규성이다. 기본 **union**
@@ -186,16 +186,16 @@ BM9K1 의 `--resume-coverage` 는 v2 를 읽는다. **ELF 해시가 다르면 st
 
 ---
 
-## 4. 샘플러 `SJTAGPCSampler` (`riscv_cov.py`)
+## 4. 샘플러 `RiscvPcsrSampler` (`riscv_cov.py`)
 
-`class SJTAGPCSampler(OpenOCDPCSampler)` — `JLinkHaltSampler`(3115)와 같은 전략: worker /
+`class RiscvPcsrSampler(OpenOCDPCSampler)` — `JLinkHaltSampler`(3115)와 같은 전략: worker /
 `diagnose` / `stop_sampling` / `evaluate_coverage`를 상속, 링크 계층과 `_read_all_pcs`만 교체,
 telnet 계열 no-op. **모듈 레벨에서 pylink를 import하지 않는다**(`connect()` 안에서 지연 import)
 
-⚠ **순환 import**: `SJTAGPCSampler` 가 메인 퍼저의 `OpenOCDPCSampler` 를 상속하면
+⚠ **순환 import**: `RiscvPcsrSampler` 가 메인 퍼저의 `OpenOCDPCSampler` 를 상속하면
 `riscv_cov.py` ↔ 퍼저 사이에 순환이 생긴다. 또 `risc-v/` 는 하이픈 때문에 패키지 import 가
 안 되므로 loader(한 곳에서 `sys.path` 삽입)가 필요하다. 택일 —
-① 공통 sampler base 를 별도 모듈로 분리, ② **`SJTAGPCSampler` 를 메인에 정의**하고
+① 공통 sampler base 를 별도 모듈로 분리, ② **`RiscvPcsrSampler` 를 메인에 정의**하고
 `riscv_cov.py` 는 커버리지 모델·transport 헬퍼만 담당, ③ 지연 import.
 **②가 가장 단순**하고 회귀 위험이 낮다(샘플러 계층을 메인에 모아둠)
 → 커버리지 모델을 하드웨어 없이 테스트 가능.
@@ -342,14 +342,14 @@ v9.8엔 `isinstance(self.sampler, JLinkHaltSampler)` 9곳 + `sampler_type` 문�
 **halt 전용 동작**이 묶여 있고, 이런 플래그는 **전혀 없다**. `NullSampler`(사실상의 계약 베이스)에
 클래스 상수로 기본값 선언 후 override:
 
-| 플래그 | 기본 | JLinkHalt | SJTAG | 걸린 동작 |
+| 플래그 | 기본 | JLinkHalt | cJTAG/SBA PCSR | 걸린 동작 |
 |---|---|---|---|---|
 | `INVASIVE` | False | True | **False** | 펌웨어시간 워치독(`halt_freeze_accum`) — 10797, 14576. **비침습인데 적용하면 실제 hang을 가린다** |
 | `REPORTS_HALT_STATS` | False | True | False | halt 실패율·health check — 6983, 7000 |
 | `USES_JLINK_USB` | False | True | **True** | 덤프 전 USB 해제·복구 안내 — 12443, 12670, 12717, 15613 |
 | `RECONNECT_ON_FW_COMMIT` | False | True | **True** | FWCommit 후 재연결 — 10853 |
 | `SUPPORTS_CONCURRENT_SAMPLING` | True | False | **True** | prefill 동시 샘플링 — 4584 |
-| `LINK_LABEL` | `[OpenOCD]` | `[J-Link]` | `[SJTAG]` | 로그 — 15255 |
+| `LINK_LABEL` | `[OpenOCD]` | `[J-Link]` | `[cJTAG/SBA]` | 로그 — 15255 |
 
 플래그 값이 **현재 동작을 그대로 재현**하므로 이 리팩터는 RISC-V 코드 없이 먼저 랜딩·회귀검증할 수 있다.
 

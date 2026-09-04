@@ -42,7 +42,7 @@ EXPECTED = {
     # 실제 hang 을 정상으로 오인한다.
     "RiscvPcsrSampler":   dict(INVASIVE=False, REPORTS_HALT_STATS=False, USES_JLINK_USB=True,
                                RECONNECT_ON_FW_COMMIT=True, SUPPORTS_CONCURRENT_SAMPLING=True,
-                               LINK_LABEL="[SJTAG/cJTAG]"),
+                               LINK_LABEL="[cJTAG/SBA]"),
 }
 
 
@@ -243,6 +243,29 @@ class TestWorkerCannotSpin(unittest.TestCase):
         """return 으로 빠지면 total_samples 누적 등 마무리가 건너뛰어진다."""
         self.assertNotIn("            return\n", self.worker)
         self.assertIn("bail = True", self.worker)
+
+
+class TestSamplingRecoveryWiring(unittest.TestCase):
+    """모든 sampling 종료가 공통 복구 게이트를 통과해야 한다."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = SRC.read_text(encoding="utf-8")
+
+    def test_only_helper_calls_stop_sampling_directly(self):
+        self.assertEqual(self.src.count("self.sampler.stop_sampling()"), 1)
+        self.assertIn("def _stop_sampling_checked(self", self.src)
+
+    def test_recovery_logs_are_terminal_visible(self):
+        self.assertIn("[Sampler] {label} 복구 성공", self.src)
+        self.assertIn(r"\[cJTAG/SBA\]", self.src)
+
+    def test_riscv_transport_label_is_not_auth_label(self):
+        i = self.src.index("class RiscvPcsrSampler")
+        j = self.src.index("class ", i + 10)
+        body = self.src[i:j]
+        self.assertNotIn('log.error("[SJTAG]', body)
+        self.assertNotIn('log.warning(f"[SJTAG]', body)
 
 
 class TestInterestingIsGated(unittest.TestCase):

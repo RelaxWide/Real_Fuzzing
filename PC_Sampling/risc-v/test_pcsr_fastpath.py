@@ -146,6 +146,29 @@ class TestPinSetup(unittest.TestCase):
         self.assertFalse(sj.sba_pin(dap, 0x1000, 0x8000, 0xFD00017C))
 
 
+class TestUnpinBoundary(unittest.TestCase):
+    """코어 전환 경계만 SBA busy를 기다린다 — raw DRW 핫루프에는 영향 없음."""
+
+    def test_waits_for_outstanding_read_then_disables_fifo(self):
+        dap = FakeDap()
+        states = iter([sj._SB_BUSY, sj._SB_BUSY, 0, 0])
+
+        def read_state(ap, addr):
+            dap.calls.append(('mem_read32', addr))
+            return next(states, 0)
+
+        dap.mem_read32 = read_state
+        self.assertTrue(sj.sba_unpin(dap, 0x1000, 0x8000))
+        writes = [c for c in dap.calls
+                  if c[0] == 'mem_write32' and c[1] == 0x8000 + sj.SBCS_OFF]
+        self.assertEqual(writes[-1][2], sj._SB32)
+
+    def test_fails_closed_when_busy_never_clears(self):
+        dap = FakeDap()
+        dap.mem_read32 = lambda ap, addr: sj._SB_BUSY
+        self.assertFalse(sj.sba_unpin(dap, 0x1000, 0x8000))
+
+
 class TestPinExactValues(unittest.TestCase):
     """설정값 자체를 고정한다 — 호출 유무만 보면 잘못된 값이 통과한다."""
 

@@ -761,8 +761,24 @@ def sba_read_pinned(dap):
 
 
 def sba_unpin(dap, ap, cb):
-    """FIFO 모드 해제(sbreadondata off). 폴링 종료 후 1회."""
-    dap.mem_write32(ap, cb + SBCS_OFF, _SB32)
+    """FIFO 모드 해제(sbreadondata off). 성공 여부를 반환한다.
+
+    마지막 SBDATA0 읽기는 ``sbreadondata`` 때문에 다음 system-bus read 를 하나 더
+    시작한다. 그 직후 다른 코어 주소로 다시 pin 하면 아직 ``sbbusy`` 인 SBA 에
+    SBCS/SBADDR0 를 써서 sbbusyerror/sticky 연쇄가 날 수 있다. 핫루프는 그대로 두고
+    **버스트 경계에서만** outstanding read 완료를 기다린 뒤 FIFO 를 끈다.
+    """
+    cs = _sba_wait(dap, ap, cb)
+    if cs is None:
+        # _sba_wait 는 오류비트를 W1C 한 뒤 None 을 반환한다. 한 번 더 확인해
+        # clear 된 정상 idle 상태라면 전환을 계속하고, 실제 busy/transport 장애만 실패한다.
+        _sba_clear_err(dap, ap, cb)
+        cs = _sba_wait(dap, ap, cb)
+    if cs is None:
+        return False
+    if not dap.mem_write32(ap, cb + SBCS_OFF, _SB32):
+        return False
+    return _sba_wait(dap, ap, cb) is not None
 
 
 # 붕괴 판정은 **단일 코어 연속 무효가 아니다.** 버스트 방식 + 핫루프 무지연이라 한 코어가
