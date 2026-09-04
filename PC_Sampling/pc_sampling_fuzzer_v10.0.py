@@ -7227,9 +7227,9 @@ class NVMeFuzzer:
             # LLM 계보가 뚫은 새 커버리지 누적 ("얼마나 잘 뚫나" 지표)
             if new_pcs > 0 and self._is_llm_seed(new_seed):
                 self._llm_stats['new_cov'] += new_pcs
-            _cov_label = "BB" if (self._sa_loaded and self._sa_bb_starts) else "PC"
-            _total_cov = (len(self._sa_covered_bbs) if (self._sa_loaded and self._sa_bb_starts)
-                          else len(self.sampler.global_coverage))
+            _bbc, _bbt, _fnc, _fnt, _ = self._cov_totals()
+            _cov_label = "BB" if _bbt > 0 else "PC"
+            _total_cov = _bbc if _bbt > 0 else len(self.sampler.global_coverage)
             _edge_src = self._cov_src_tag(new_seed, source)   # v9.4: origin/form
             if new_pcs > 0:
                 self._cov_credit(_edge_src, 'edge', new_pcs)  # v9.4: 소스별 edge 누적
@@ -7291,13 +7291,14 @@ class NVMeFuzzer:
             _elapsed_snap = (datetime.now() - self.start_time).total_seconds() \
                             if self.start_time else 0
             _bbpct = _fpct = None
-            if self._sa_loaded:
-                _bbpct = (100.0 * len(self._sa_covered_bbs) / self._sa_total_bbs
-                          if self._sa_total_bbs > 0 else 0.0)
-                _fpct  = (100.0 * len(self._sa_entered_funcs) / self._sa_total_funcs
-                          if self._sa_total_funcs > 0 else 0.0)
+            _bbc, _bbt, _fnc, _fnt, _by_core = self._cov_totals()
+            if _bbt > 0 or _fnt > 0:
+                _bbpct = 100.0 * _bbc / _bbt if _bbt > 0 else 0.0
+                _fpct  = 100.0 * _fnc / _fnt if _fnt > 0 else 0.0
+                # v10: 코어별 %를 5번째 원소로 추가(차트는 h[0]~h[3]만 인덱싱 → 호환)
                 self._sa_cov_history.append(
-                    (self.executions, _elapsed_snap, _bbpct, _fpct))
+                    (self.executions, _elapsed_snap, _bbpct, _fpct,
+                     {c: (v["bb_pct"], v["func_pct"]) for c, v in (_by_core or {}).items()}))
             # v9.4: 3축 성장 스냅샷 + 디스크 persist. static 없어도 sc/state 는 기록.
             #   edge=% (BB/func, 분모 있음), sc=discovery count(안 A), state=discovery count.
             #   별도 그래프 파일 coverage_growth_plot.py 가 이 jsonl 을 읽어 렌더한다.
@@ -7306,6 +7307,9 @@ class NVMeFuzzer:
                 'exec': self.executions, 'elapsed_s': round(_elapsed_snap, 1),
                 'bb_pct': round(_bbpct, 3) if _bbpct is not None else None,
                 'func_pct': round(_fpct, 3) if _fpct is not None else None,
+                # v10 RISC-V: 코어별 % (플로터는 알려진 키만 읽으므로 추가는 무해)
+                'bb_pct_by_core': ({v['name']: round(v['bb_pct'], 3)
+                                    for v in _by_core.values()} if _by_core else None),
                 'sc_count': len(self._sc_seen),
                 # v9.4 fix: 누적 distinct state discovery(cull 로 안 줄어듦). 구현은 len(state_corpus)
                 #   였는데 cull(dedup+cap50)로 감소·톱니가 나서 "누적 discovery-count" 문서와 어긋났음.
@@ -8520,6 +8524,21 @@ class NVMeFuzzer:
     RC_TIMEOUT   = -1001   # NVMe 타임아웃 (의미 있는 이벤트)
     RC_ERROR     = -1002   # subprocess 에러 (내부 문제)
     RC_SKIP      = -1003   # 가드가 전송 차단 (가성 유발 admin opcode) — 회계 없이 다음 iteration
+
+    def _cov_totals(self):
+        """커버리지 집계를 한 곳에서 — RISC-V(CoverageModel)와 기존 제품(_sa_*) 양쪽.
+        → (bb_covered, bb_total, fn_covered, fn_total, by_core|None)
+
+        이게 없으면 통계·성장곡선이 _sa_* 만 보고, arch=riscv 는 _sa_loaded=False 라
+        커버리지 줄이 통째로 안 찍힌다(판정은 되는데 표시가 안 되는 상태)."""
+        cov = getattr(self, 'cov', None)
+        if cov is not None and getattr(cov, 'loaded', False):
+            return (len(cov.covered_bbs), cov.total_bbs,
+                    len(cov.entered_funcs), cov.total_funcs, cov.stats_by_core())
+        if self._sa_loaded:
+            return (len(self._sa_covered_bbs), self._sa_total_bbs,
+                    len(self._sa_entered_funcs), self._sa_total_funcs, None)
+        return (0, 0, 0, 0, None)
 
     def _load_riscv_coverage(self) -> None:
         """arch=riscv: products/<제품>/ 의 코어별 표를 CoverageModel 로 읽는다.
@@ -14237,28 +14256,28 @@ class NVMeFuzzer:
                  f"{ps_tag}{state_tag}")
         # 시작 배너를 놓쳐도 알 수 있게 주기 통계마다 재알림(정상 버전이면 아무것도 안 찍힘).
         _nvme_cli_warn(log, brief=True)
-        if self._sa_loaded:
+        _bbc, _bbt, _fnc, _fnt, _by_core = self._cov_totals()
+        if _bbt > 0 or _fnt > 0:
             sa_parts = []
-            if self._sa_total_bbs > 0:
-                n_bb = len(self._sa_covered_bbs)
-                pct  = 100.0 * n_bb / self._sa_total_bbs
-                sa_parts.append(f"BB: {pct:.1f}% ({n_bb:,}/{self._sa_total_bbs:,})")
-            if self._sa_total_funcs > 0:
-                n_f  = len(self._sa_entered_funcs)
-                fpct = 100.0 * n_f / self._sa_total_funcs
-                sa_parts.append(f"funcs: {n_f}/{self._sa_total_funcs} ({fpct:.1f}%)")
+            if _bbt > 0:
+                sa_parts.append(f"BB: {100.0*_bbc/_bbt:.1f}% ({_bbc:,}/{_bbt:,})")
+            if _fnt > 0:
+                sa_parts.append(f"funcs: {_fnc:,}/{_fnt:,} ({100.0*_fnc/_fnt:.1f}%)")
             # v9.2: LLM 기여율 — LLM 계보가 '처음 발견'한 커버리지(new_cov)가 전체 발견 커버리지에서
             #   차지하는 비율. 분모=커버된 것(SA면 BB, 아니면 global PC). SA 모드에서 new_cov 는 대부분
             #   new-BB(정확)이나 calibration 발견분은 PC 단위라 근사치.
             if self.llm.enabled:
                 _nc  = self._llm_stats.get('new_cov', 0)
-                _tot = (len(self._sa_covered_bbs) if self._sa_total_bbs > 0
-                        else len(self.sampler.global_coverage))
+                _tot = _bbc if _bbt > 0 else len(self.sampler.global_coverage)
                 _pct = (100.0 * _nc / _tot) if _tot > 0 else 0.0
                 sa_parts.append(f"LLM기여: {_pct:.1f}% ({_nc}/{_tot}, "
                                 f"depth_adv={self._llm_stats.get('depth_adv', 0)})")
             if sa_parts:
                 log.warning(f"[StatCov] {' | '.join(sa_parts)}")
+            if _by_core:      # v10 RISC-V: 코어별 내역 (어느 코어가 도는지 한눈에)
+                log.warning("[StatCov] " + " | ".join(
+                    f"{v['name']} BB {v['bb']:,}/{v['bb_total']:,}({v['bb_pct']:.1f}%)"
+                    for _, v in sorted(_by_core.items())))
 
     def _run_pm_openocdless_test(self):
         """OpenOCD 없이 PCIe/NVMe PM 조합만 독립 검증한다."""
