@@ -3479,7 +3479,13 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         self._seed = int(plan.get('seed', 0)) or random.randrange(1 << 30)
         self._rng = random.Random(self._seed)        # ★ 재현용 — 세션 로그에 남긴다
         self._valid_bit = int(plan.get('valid_bit', 1))
+        # interesting 판정에 표를 행사할 코어. 'primary' 면 최대 가중치 코어만 —
+        # 배경 작업만 하는 코어의 신규 블록이 입력을 interesting 으로 만들지 않게.
+        self._policy = str(rv.get('interesting_policy', 'primary'))
+        self._primary = int(plan.get('primary_core')) if plan.get('primary_core') is not None \
+            else (max(self._weights, key=self._weights.get) if self._weights else 0)
         self.session = None
+        self._idle_obs: list = []
         self.cov = None                              # CoverageModel (fuzzer 가 주입)
         self._observations: list = []
         self._ranges = {}                            # core_id -> elf_map.Ranges
@@ -3586,6 +3592,10 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
     def take_observations(self):
         return self._observations
 
+    def credit_cores(self):
+        """interesting 판정에 표를 행사할 코어 집합. None 이면 전 코어(union)."""
+        return None if self._policy == 'union' else {self._primary}
+
     def window_by_core(self):
         d = {}
         for o in self._observations:
@@ -3671,9 +3681,11 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         log.warning(f"[Diagnose] idle 유니버스 수집 — 코어별 버스트 {per}샘플 "
                     f"× {len(self._cores)}코어")
         uni, hist = set(), {}
+        self._idle_obs = []        # 배경(무명령) 커버리지 선반영용
         for cid in sorted(self._cores):
             nm = (self._cores[cid].get('name') or str(cid))
             obs = self.session.burst(cid, per, self._valid_bit)
+            self._idle_obs.extend(obs)
             n_ok = 0
             for o in obs:
                 if o.valid and o.pc is not None and self._in_core_range(o.core_id, o.pc):
@@ -7059,7 +7071,10 @@ class NVMeFuzzer:
         if getattr(self.sampler, 'PER_CORE_COVERAGE', False) and self.cov is not None:
             # RISC-V: 코어별 ELF 라 주소가 겹칠 수 있어 (core,bank,addr) 키로 집계한다.
             #   기존 제품 경로(아래 elif)는 한 줄도 바뀌지 않는다.
-            _acct = self.cov.account(self.sampler.take_observations())
+            _acct = self.cov.account(
+                self.sampler.take_observations(),
+                credit_cores=(self.sampler.credit_cores()
+                              if hasattr(self.sampler, 'credit_cores') else None))
             is_interesting, new_pcs = _acct.interesting, _acct.new_count
             _seed_covered = _acct.seed_keys
         elif self._sa_loaded and self._sa_bb_starts:
@@ -15138,7 +15153,18 @@ class NVMeFuzzer:
         # 가장 깨끗한 idle 상태에서 수집. PM preflight (30 PowerCombo + 17 S1/S2
         # perturb) 직후엔 firmware cleanup/recovery PC 가 idle universe 에 오염
         # 들어갈 수 있으므로 이 시점이 적절.
-        if not self.sampler.diagnose():
+        _diag_ok = self.sampler.diagnose()
+        # ★ 배경(무명령) 커버리지를 **미리** 반영한다. 안 하면 idle 루프·인터럽트·타
+        #   코어 housekeeping 이 밟는 블록이 매 윈도우 '새 커버리지' 로 잡혀 모든 입력이
+        #   interesting 이 된다(1000 exec 에 corpus 1000). 총계에는 정직하게 포함된다.
+        if (self.cov is not None and _diag_ok
+                and getattr(self.sampler, '_idle_obs', None)):
+            _before = len(self.cov.covered_bbs)
+            self.cov.update(self.sampler._idle_obs)
+            log.warning(f"[Diagnose] 배경 커버리지 선반영: "
+                        f"{len(self.cov.covered_bbs) - _before:,} 블록 "
+                        f"(이후 이 블록들은 '새 커버리지'로 치지 않는다)")
+        if not _diag_ok:
             log.error("J-Link PC read diagnosis failed, aborting")
             return
 

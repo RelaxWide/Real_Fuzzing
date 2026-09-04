@@ -245,5 +245,33 @@ class TestWorkerCannotSpin(unittest.TestCase):
         self.assertIn("bail = True", self.worker)
 
 
+class TestInterestingIsGated(unittest.TestCase):
+    """★ corpus 가 실행 수만큼 자라면(1000 exec 에 corpus 1000) 커버리지 가이드가
+    사실상 없는 것이다. 배경 코드(idle 루프·인터럽트·타 코어 housekeeping)가 매 윈도우
+    새 블록을 내놓기 때문 — 두 장치로 막는다."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = SRC.read_text(encoding="utf-8")
+        cls.cfg = json.loads((SRC.parent / "fuzzer_config.json").read_text(encoding="utf-8"))
+
+    def test_credit_cores_is_passed(self):
+        """account() 에 credit_cores 를 넘겨야 배경 코어의 신규가 표를 못 던진다."""
+        self.assertIn("credit_cores=(self.sampler.credit_cores()", self.src)
+
+    def test_sampler_exposes_credit_cores(self):
+        i = self.src.index("class RiscvPcsrSampler")
+        self.assertIn("def credit_cores(self)", self.src[i:i + 20000])
+
+    def test_idle_coverage_preseeded(self):
+        """diagnose 로 모은 배경 커버리지를 미리 반영해야 '새 커버리지'로 안 잡힌다."""
+        self.assertIn("self.cov.update(self.sampler._idle_obs)", self.src)
+
+    def test_config_sets_primary_policy(self):
+        rv = self.cfg["products"]["BM9K1"]["riscv"]
+        self.assertEqual(rv["interesting_policy"], "primary")
+        self.assertIn("primary_core", rv["sample_plan"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1082,10 +1082,12 @@
         "power": "both",
         "tap_script": false,
         "gate_threshold": 95.0,
+        "interesting_policy": "primary",
         "sample_plan": {
           "_comment": "weights=버스트 개수(코드 크기 비례 초기값 H:F:CM:Q). 순서는 매 윈도우 셔플되므로 편향 없음. seed=0 이면 무작위(로그에 기록) — 재현하려면 고정값 지정.",
           "weights": {"0": 8, "1": 1, "2": 4, "3": 1},
           "burst_len": 256,
+          "primary_core": 0,
           "valid_bit": 1,
           "seed": 0
         }
