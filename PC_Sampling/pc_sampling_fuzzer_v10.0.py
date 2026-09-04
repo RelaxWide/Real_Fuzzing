@@ -3600,6 +3600,22 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         """★ 버스트 전용. 가중치는 '버스트 개수'로 펴고 **매 윈도우 셔플**한다 —
         순서를 고정하면 코어가 명령 처리 단계(파싱→DMA→완료)와 결합돼 각 코어가 특정
         단계만 관측하는 편향이 생긴다."""
+        # ★ 윈도우 초기화 — 기존 worker(2833~)가 하던 것을 그대로 해야 한다.
+        #   빠뜨리면 _last_raw_pcs/_observations/current_trace 가 **영원히 누적**되어
+        #   (a) 메모리가 실행 수에 비례해 늘고
+        #   (b) _account_command 가 매 실행마다 _last_raw_pcs 전체를 다시 필터링해
+        #       실행이 느려지며(2차 증가)
+        #   (c) current_trace 가 '이번 명령이 밟은 곳' 이라는 의미를 잃는다.
+        #   실기서 5000 exec 부근(차트 스냅샷+fork 로 메모리가 한 번 더 뜨는 지점)에
+        #   호스트가 내려간 원인.
+        self.current_trace = set()
+        self._last_raw_pcs = []
+        self._out_of_range_count = 0
+        self._last_new_at = 0
+        self._unique_at_intervals = {}
+        self._stopped_reason = ""
+        self._reset_window_extra()          # _observations 비움
+        self._invalid_streak = {}
         cfg, total = self.config, 0
         limit = max(1, int(cfg.max_samples_per_run))
         try:

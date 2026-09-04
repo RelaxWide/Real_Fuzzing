@@ -161,5 +161,39 @@ class TestRiscvWiring(unittest.TestCase):
         self.assertEqual(cfg["products"]["BM9K1"]["sampler_type"], "riscv_pcsr")
 
 
+class TestWorkerWindowReset(unittest.TestCase):
+    """★ RISC-V worker 가 윈도우마다 누적 필드를 초기화하는지.
+
+    공용 worker 를 override 하면서 이 초기화를 빠뜨리면 _last_raw_pcs/_observations/
+    current_trace 가 **영원히 누적**된다. 메모리가 실행 수에 비례해 늘고,
+    _account_command 가 매 실행마다 _last_raw_pcs 전체를 재필터링해 2차로 느려진다.
+    수천 exec 뒤에야 드러나 놓치기 쉬우므로 소스 수준에서 고정한다.
+    (실기서 5000 exec 부근에 호스트가 내려간 실제 원인)"""
+
+    RESET_FIELDS = ("current_trace", "_last_raw_pcs", "_out_of_range_count",
+                    "_last_new_at", "_unique_at_intervals", "_stopped_reason")
+
+    @classmethod
+    def setUpClass(cls):
+        src = SRC.read_text(encoding="utf-8")
+        i = src.index("class RiscvPcsrSampler")
+        j = src.index("def _track_collapse", i)
+        w = src.index("def _sampling_worker(self):", i)
+        cls.worker = src[w:j]
+
+    def test_resets_all_accumulators(self):
+        for f in self.RESET_FIELDS:
+            self.assertIn(f"self.{f} =", self.worker,
+                          f"worker 가 self.{f} 를 초기화하지 않는다 — 무한 누적")
+
+    def test_resets_observations(self):
+        self.assertIn("_reset_window_extra()", self.worker,
+                      "_observations 를 비우지 않으면 account() 가 매번 전체를 재처리한다")
+
+    def test_respects_sample_limit(self):
+        """한 윈도우의 샘플 수가 max_samples_per_run 으로 묶여야 한다."""
+        self.assertIn("max_samples_per_run", self.worker)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
