@@ -824,7 +824,7 @@
     ]
   },
   "review_notes": [
-    "This is a standards master denominator, not a resolved BM9K1 denominator. A product capability snapshot is required before a numeric total is valid.",
+    "This is a product-independent standards master denominator, not a resolved product denominator. Every registered product requires its own immutable capability snapshot before a numeric total is valid.",
     "The current fuzzer command list contains 41 names, but TelemetryHostInitiated is an alias of GetLogPage/LID=0x07 and is intentionally not double-counted.",
     "The fuzzer does not validate whether a response is semantically correct for the generated input. Coverage therefore records observation only.",
     "Command-local and global status tables conflict for two Revision 2.3 values captured in spec_disputed_outcomes. They are excluded until clarified by an erratum or product specification."

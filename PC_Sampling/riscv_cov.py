@@ -401,6 +401,14 @@ class CoverageModel:
                     if not os.path.exists(bb_b):
                         continue          # 표 없으면 effective_bank 가 0 으로 접는다
                     bs, be = _read_bb(bb_b)
+                    if not bs:
+                        # 0바이트/파싱불가 표를 등록하면 그 오버레이 샘플이 bank N 으로
+                        # 태깅된 뒤 BB 를 못 찾아 **조용히 버려진다**. 등록하지 않고
+                        # bank 0 으로 접어 최소한 관측이 사라지지는 않게 한다.
+                        m.warnings.append(
+                            f"core{name}: {os.path.basename(bb_b)} 가 비었다 — "
+                            f"bank {_n} 을 등록하지 않는다(추출 실패 가능성)")
+                        continue
                     fe, fen, fnm = ([], [], [])
                     if os.path.exists(fn_b):
                         fe, fen, fnm = _read_funcs(fn_b)

@@ -258,3 +258,43 @@ class TestBuildFilenames(unittest.TestCase):
             m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
             w = ' '.join(m.warnings)
             self.assertIn('HCore-overlaymap.json', w)
+
+
+class TestEmptyTables(unittest.TestCase):
+    """★ 추출기가 0바이트 파일을 남기면 (실제로 겪음):
+    · 오버레이 없는 코어가 있는 것처럼 보이고
+    · 런타임엔 그 bank 로 태깅된 샘플이 BB 를 못 찾아 **조용히 버려진다**
+    """
+
+    def test_empty_bank_table_not_registered(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_assets(d, banks=3)
+            Path(d, 'basic_blocks_coreH_ovl1.txt').write_text("")
+            m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
+            self.assertNotIn(1 + rc.OVL_BANK_OFFSET, m.cores[0].banks)
+            self.assertTrue(any('비었다' in w for w in m.warnings))
+
+    def test_other_banks_unaffected(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_assets(d, banks=3)
+            Path(d, 'basic_blocks_coreH_ovl1.txt').write_text("")
+            cm = rc.CoverageModel.load(d, product='BM9K1',
+                                       core_ids={'H': 0}).cores[0]
+            self.assertEqual(sorted(cm.banks),
+                             [0 + rc.OVL_BANK_OFFSET, 2 + rc.OVL_BANK_OFFSET])
+
+    def test_empty_bank_folds_to_zero(self):
+        """등록 안 된 bank 는 0 으로 접혀야 한다 — 관측이 사라지면 안 된다."""
+        with tempfile.TemporaryDirectory() as d:
+            write_assets(d, banks=3)
+            Path(d, 'basic_blocks_coreH_ovl1.txt').write_text("")
+            cm = rc.CoverageModel.load(d, product='BM9K1',
+                                       core_ids={'H': 0}).cores[0]
+            self.assertEqual(cm.effective_bank(BASE + 4, 1 + rc.OVL_BANK_OFFSET), 0)
+
+    def test_denominator_excludes_empty_bank(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_assets(d, banks=3)
+            Path(d, 'basic_blocks_coreH_ovl1.txt').write_text("")
+            m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
+            self.assertEqual(m.total_bbs, 2 + 2 * 2)     # 본체 2 + bank 2개분

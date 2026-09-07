@@ -189,16 +189,35 @@ else:
             bad(f"core{c} 파일명",
                 f"단수형 {len(wrong)}개 발견 — 'basic_blocks_'(복수)여야 로드된다"
                 f" 예: {wrong[0].name}")
-        bbs = sorted(PROD.glob(f"basic_blocks_core{c}_ovl*.txt"))
-        fns = sorted(PROD.glob(f"functions_core{c}_ovl*.txt"))
+        # ★ 0바이트 파일은 '있는 표' 가 아니다. 추출기가 내용 없는 파일을 남기면
+        #   오버레이 없는 코어가 오버레이 있는 것처럼 보이고, 런타임에는 그 bank 의
+        #   샘플이 BB 를 못 찾아 조용히 버려진다. (실제로 겪음)
+        _empty = sorted(f.name for f in
+                        list(PROD.glob(f"basic_blocks_core{c}_ovl*.txt"))
+                        + list(PROD.glob(f"functions_core{c}_ovl*.txt"))
+                        if f.stat().st_size == 0)
+        if _empty:
+            bad(f"core{c} 빈 표 파일",
+                f"{len(_empty)}개가 0바이트 — 추출 실패다. 지우거나 다시 뽑아라: "
+                f"{_empty[:4]}{'…' if len(_empty) > 4 else ''}")
+        bbs = sorted(f for f in PROD.glob(f"basic_blocks_core{c}_ovl*.txt")
+                     if f.stat().st_size > 0)
+        fns = sorted(f for f in PROD.glob(f"functions_core{c}_ovl*.txt")
+                     if f.stat().st_size > 0)
         if not (bbs or fns or omap.exists() or olay):
-            continue                       # 이 코어는 오버레이 없음 — 정상
+            # 아무 줄도 안 찍으면 "왜 이 코어는 없지?" 로 오해한다 — 정상임을 명시.
+            good(f"core{c} 오버레이", "없음 (이 코어는 오버레이 미사용 — 정상)")
+            continue
         _any_ovl = True
         if not (omap.exists() or olay):
             _cands = _rc.overlay_layout_candidates(c)[:3] if _rc else []
+            # ★ 무슨 파일 때문에 이 코어를 오버레이로 판단했는지 보여준다.
+            #   "이 코어는 오버레이 없는데?" 일 때 그 파일들이 잘못 생긴 것이다.
+            _found = sorted(f.name for f in (bbs + fns))
             bad(f"core{c} 오버레이 설정",
-                f"빌드 레이아웃 맵 없음 (찾는 이름: {_cands}) — 없으면 bank 표가"
-                f" 있어도 전부 bank 0 으로 접힌다")
+                f"오버레이 표 {len(_found)}개가 있는데 레이아웃 맵이 없다. "
+                f"발견: {_found[:4]}{'…' if len(_found) > 4 else ''} | "
+                f"찾는 맵 이름: {_cands}")
             continue
         try:
             if omap.exists():
@@ -244,8 +263,12 @@ else:
                 f"(있는 것: BB {len(idx_bb)}개 / 함수 {len(idx_fn)}개, 맵 {n_map}개 "
                 f"= ovl0~{n_map - 1}). 누락 bank 는 bank 0 으로 접혀 분모에서 빠진다")
         elif extra:
+            _ex = sorted(f.name for f in (bbs + fns)
+                         if int(f.stem.rsplit("_ovl", 1)[1]) in set(extra))
             bad(f"core{c} 오버레이 표",
-                f"맵에 없는 ovl 번호 {extra[:5]} — 맵과 표가 다른 빌드일 수 있다")
+                f"맵에 없는 ovl 번호 {extra[:8]} — 맵은 {n_map}개(ovl0~{n_map-1})인데 "
+                f"표가 더 많다. 해당 파일: {_ex[:4]}{'…' if len(_ex) > 4 else ''} | "
+                f"추출 스크립트가 코어별로 걸러내지 못했거나 맵이 옛 빌드다")
         else:
             good(f"core{c} 오버레이 표", f"{n_map}개 bank 전부 (BB/함수 짝 맞음)")
     if not _any_ovl:
