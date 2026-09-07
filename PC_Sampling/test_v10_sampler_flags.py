@@ -296,6 +296,75 @@ class TestInterestingIsGated(unittest.TestCase):
         self.assertIn("primary_core", rv["sample_plan"])
 
 
+class TestRiscvGuidanceAndReports(unittest.TestCase):
+    """v10 산출물/LLM/calibration이 RISC-V BB 단위를 끝까지 유지하는지."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = SRC.read_text(encoding="utf-8")
+
+    def test_calibration_projects_per_core_basic_blocks(self):
+        a = self.src.index("def _calibrate_seed(self")
+        b = self.src.index("def _deterministic_stage", a)
+        body = self.src[a:b]
+        self.assertIn("self.cov.project(_run_obs)", body)
+        self.assertIn("self.cov.account(cal_observations)", body)
+        self.assertIn("bb_appearances", body)
+        self.assertIn("_cal_static_bb", body)
+        self.assertIn("affect_boost=_runtime_cal", body)
+
+    def test_prefill_deliberately_does_not_consume_guidance_coverage(self):
+        """prefill I/O의 BB를 선점하지 않아 이후 fuzz command가 신규로 받을 수 있어야 한다."""
+        a = self.src.index("def _prefill_drive(self")
+        b = self.src.index("\n    def ", a + 20)
+        body = self.src[a:b]
+        self.assertNotIn("self.cov.account", body)
+        self.assertNotIn("self.cov.update", body)
+
+    def test_llm_uses_riscv_frontier_without_addresses(self):
+        a = self.src.index("def _llm_coverage_context(self")
+        b = self.src.index("def _llm_exercised_names", a)
+        body = self.src[a:b]
+        self.assertIn("_cov.frontier_functions(cid)", body)
+        self.assertIn("core={core}", body)
+        self.assertNotIn("{_entry:", body,
+                         "내부 함수 주소를 LLM 프롬프트에 넣지 않는다")
+
+    def test_llm_links_commands_to_frontier_and_subtracts_background(self):
+        a = self.src.index("def _llm_command_frontier_hints")
+        b = self.src.index("def _llm_exercised_names", a)
+        body = self.src[a:b]
+        self.assertIn("_idle_cov_keys", body)
+        self.assertIn("math.ceil(len(per_cmd) * 0.8)", body)
+        self.assertIn("cm.callees.get(caller", body)
+        self.assertIn("if cmd not in _NAME_TO_CMD", body)
+        self.assertIn("_llm_command_frontier_hints()", self.src)
+
+    def test_llm_plateau_uses_same_bb_metric(self):
+        self.assertIn("def _llm_cov_count(self)", self.src)
+        self.assertIn("cov_now = self._llm_cov_count()", self.src)
+
+    def test_llm_low_yield_ranking_uses_new_coverage_count(self):
+        a = self.src.index("def _llm_build_request(self")
+        b = self.src.index("def _llm_maybe_submit", a)
+        body = self.src[a:b]
+        self.assertIn("gained = st.get('new_cov', 0)", body)
+        self.assertIn("cov/exec={_yield:.4f}", body)
+        self.assertNotIn("cov+={self.cmd_stats.get(n, {}).get('interesting'", body)
+
+    def test_report_outputs_and_snapshot_wiring(self):
+        for name in ("coverage_by_core.txt", "function_coverage.csv", "report.html"):
+            self.assertIn(name, self.src)
+        self.assertIn("'riscv_cov': (self.cov.snapshot()", self.src)
+        self.assertIn("CoverageModel.from_snapshot(_cov_snap)", self.src)
+        self.assertIn("'cmd_cov_keys'", self.src)
+        self.assertIn("[CoverageReport] 초기 보고서 생성 실패", self.src)
+
+    def test_riscv_resume_is_explicitly_ignored(self):
+        self.assertIn("--resume-coverage 무시, BB 0부터 측정", self.src)
+        self.assertIn("if self.cov is not None and getattr(self.cov, 'loaded', False):", self.src)
+
+
 class TestFailClosed(unittest.TestCase):
     """검증 안 된 것을 조용히 쓰지 않는다 — 커버리지 오염/무커버리지 방지."""
 

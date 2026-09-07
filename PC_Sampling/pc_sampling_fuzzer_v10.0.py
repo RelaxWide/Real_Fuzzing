@@ -67,6 +67,8 @@ import random
 import logging
 import math
 import re
+import csv
+import html as html_lib
 from collections import defaultdict, deque
 from typing import Set, List, Optional, Tuple, Dict, Union
 from dataclasses import dataclass, field
@@ -220,7 +222,7 @@ RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 
 RAG_BOOST_LR          = float(_RAG.get('boost_lr', 0.3))          # 갱신 학습률
 RAG_BOOST_MIN         = float(_RAG.get('boost_min', 0.5))         # 하한(0 금지 — 아래 주석)
 RAG_BOOST_MAX         = float(_RAG.get('boost_max', 3.0))         # 상한(mutation 고사 방지)
-RAG_BOOST_MIN_SAMPLES = int(_RAG.get('boost_min_samples', 50))    # 양 arm 최소 **선택** 횟수
+RAG_BOOST_MIN_SAMPLES = int(_RAG.get('boost_min_samples', 50))    # 양 arm 최소 **명령 실행** 횟수
 # 최소 총 발견 수. 선택 횟수만으로는 부족하다 — 후반 yield 는 선택당 0.001 수준이라 50번
 #   선택해도 기대 edge 가 0.05 개다. 이때 edge 1개 대 0개면 r=±1 로 튀어 부스트가 근거 없이
 #   크게 흔들린다. '비교할 만한 발견이 실제로 있었나' 를 따로 본다.
@@ -4277,7 +4279,8 @@ class NVMeFuzzer:
         def _cs_new():
             return {"exec": 0, "interesting": 0, "sc_hist": {},
                     "invalid_opcode": 0, "reached_fw": 0, "accepted": [],
-                    "best_depth": -1}   # v9.2 Tier1: 이 명령의 최대 SC-depth
+                    "best_depth": -1,
+                    "cal_exec": 0, "new_cov": 0}  # calibration 포함 신규 BB/PC 수
         self.cmd_stats: dict[str, dict] = defaultdict(_cs_new)
         for c in self.commands:
             self.cmd_stats[c.name] = _cs_new()
@@ -4391,10 +4394,15 @@ class NVMeFuzzer:
 
         # 명령어별 PC/trace 추적 (그래프 시각화용)
         self.cmd_pcs: dict[str, Set[int]] = defaultdict(set)
+        # v10: RISC-V 명령별 packed BB 키. raw PC만 저장하면 코어가 사라져 동일 주소의
+        # 서로 다른 ELF를 구분할 수 없으므로 report.html은 이 authoritative 뷰를 쓴다.
+        self.cmd_cov_keys: dict[str, Set[int]] = defaultdict(set)
+        self._idle_cov_keys: Set[int] = set()  # LLM 명령→함수 힌트에서 배경 함수 차감
         self.cmd_traces: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
         # 기본 명령어 키 초기화
         for c in self.commands:
             self.cmd_pcs[c.name] = set()
+            self.cmd_cov_keys[c.name] = set()
             self.cmd_traces[c.name] = deque(maxlen=200)
 
         self._nvme_input_path: Optional[str] = None
@@ -4499,10 +4507,11 @@ class NVMeFuzzer:
         )
 
     def _calibrate_seed(self, seed: Seed) -> Seed:
-        """시드를 N번 실행하여 PC 주소 안정성 측정 (PC 기반).
+        """시드를 N번 실행하여 커버리지 안정성 측정.
 
-        각 실행에서 방문된 PC 주소를 추적하고 과반수 실행에서 등장한 PC를
-        stable_pcs로 분류한다. global_coverage에는 관측된 전체 PC 합집합을 반영한다.
+        RISC-V는 코어가 보존된 BB 키, 기존 제품은 PC 주소를 사용한다. 각 실행에서
+        방문된 키를 추적하고 과반수 실행에서 등장한 키를 stable_pcs로 분류한다.
+        legacy global_coverage에는 양쪽 모두 raw PC 합집합을 계속 반영한다.
         """
         total_runs = self.config.calibration_runs
         if total_runs <= 0:
@@ -4514,7 +4523,13 @@ class NVMeFuzzer:
         #   '첫' 직접 coverage/timeout 이 여기서 측정되지만 ledger 커버리지 밖 — 소급분석 시
         #   executions 총합과 ledger record 수의 차이는 이 calibration 실행 때문이다(v9.5 에서
         #   calibration 요약 record 추가 고려).
-        pc_appearances: Dict[int, int] = {}          # PC → 등장 횟수
+        pc_appearances: Dict[int, int] = {}          # legacy raw PC → 등장 횟수
+        bb_appearances: Dict[int, int] = {}          # BB 키 → 등장 실행 수
+        cal_observations = []                        # 마지막에 한 번만 account
+        _cal_per_core = bool(getattr(self.sampler, 'PER_CORE_COVERAGE', False)
+                             and self.cov is not None)
+        _cal_static_bb = bool(not _cal_per_core and self._sa_loaded
+                              and self._sa_bb_starts)
         actual_runs = 0
         self._cal_last_rc = 0  # 호출자에게 마지막 rc 전달용
 
@@ -4535,6 +4550,23 @@ class NVMeFuzzer:
             for pc in self.sampler.current_trace:
                 pc_appearances[pc] = pc_appearances.get(pc, 0) + 1
 
+            if _cal_per_core:
+                _run_obs = list(self.sampler.take_observations())
+                cal_observations.extend(_run_obs)
+                # 한 실행 안에서 같은 BB가 여러 번 보여도 appearance는 1회다.
+                _projected = self.cov.project(_run_obs)
+                for _key in _projected.seed_keys:
+                    bb_appearances[_key] = bb_appearances.get(_key, 0) + 1
+            elif _cal_static_bb:
+                _run_bbs = set()
+                for _pc in self.sampler.current_trace:
+                    _pk = (_pc & ~1) if self._sa_thumb_mask else _pc
+                    _idx = bisect.bisect_right(self._sa_bb_starts, _pk) - 1
+                    if _idx >= 0 and _pk < self._sa_bb_ends[_idx]:
+                        _run_bbs.add(self._sa_bb_starts[_idx])
+                for _key in _run_bbs:
+                    bb_appearances[_key] = bb_appearances.get(_key, 0) + 1
+
             if rc == self.RC_TIMEOUT:
                 log.error(f"[Calibration] {seed.cmd.name} timeout at run {run_i+1} — treating as crash")
                 self._handle_timeout_crash(seed, seed.data)
@@ -4545,32 +4577,68 @@ class NVMeFuzzer:
                 log.warning(f"[Calibration] {seed.cmd.name} rc={rc} at run {run_i+1} — stopping early")
                 break
 
-        # PC 안정성 계산 (과반수 기준)
+        # 안정성 계산 (과반수 기준). RISC-V는 raw PC가 아니라 packed BB를 사용해
+        # 코어 충돌과 PC-vs-BB 단위 혼합을 막는다.
         all_seen_pcs = set(pc_appearances.keys())
         stable_threshold = actual_runs / 2.0
-        stable_pcs = {pc for pc, cnt in pc_appearances.items() if cnt > stable_threshold}
-        stability = len(stable_pcs) / max(len(all_seen_pcs), 1)
+        if _cal_per_core:
+            _acct = self.cov.account(cal_observations)
+            all_seen_keys = set(_acct.seed_keys)
+            stable_keys = {key for key, cnt in bb_appearances.items()
+                           if cnt > stable_threshold}
+            _new_count = _acct.new_count
+        elif _cal_static_bb:
+            all_seen_keys = set(bb_appearances)
+            stable_keys = {key for key, cnt in bb_appearances.items()
+                           if cnt > stable_threshold}
+            _new_count = len(all_seen_keys - self._sa_covered_bbs)
+        else:
+            all_seen_keys = all_seen_pcs
+            stable_keys = {pc for pc, cnt in pc_appearances.items()
+                           if cnt > stable_threshold}
+            _new_count = len(all_seen_pcs - self.sampler.global_coverage)
+        stability = len(stable_keys) / max(len(all_seen_keys), 1)
 
         seed.is_calibrated = True
         seed.stability = stability
-        seed.stable_pcs = stable_pcs
-        seed.covered_pcs = all_seen_pcs
+        seed.stable_pcs = stable_keys
+        seed.covered_pcs = all_seen_keys
 
         # LLM 계보 시드가 calibration 중 '새' 커버리지를 발견하면 new_cov 에 반영(favored 원천).
         # (기존엔 변이 파생만 셌음 → 원본 LLM 시드의 직접 발견을 놓쳐 favored↑ 인데 new_cov=0 이 됨.)
-        _new = all_seen_pcs - self.sampler.global_coverage   # global 반영 전 = 신규분
-        if _new and self._is_llm_seed(seed):
-            self._llm_stats['new_cov'] += len(_new)
-            seed.new_pcs = len(_new)
+        if _new_count and self._is_llm_seed(seed):
+            self._llm_stats['new_cov'] += _new_count
+            seed.new_pcs = _new_count
             # calibration 발견은 mutation 경로가 아니라 [+][Edge-Cov]가 안 찍힌다 → 여기서 명시.
-            log.warning(f"[LLM/cov] {seed.cmd.name} calibration +{len(_new)} new PCs "
+            _unit = "BBs" if (_cal_per_core or _cal_static_bb) else "PCs"
+            log.warning(f"[LLM/cov] {seed.cmd.name} calibration +{_new_count} new {_unit} "
                         f"→ 누적 new_cov={self._llm_stats['new_cov']}")
+
+        if _cal_per_core and all_seen_keys:
+            self.cmd_cov_keys[self._tracking_label(seed.cmd, seed)].update(all_seen_keys)
+
+        # calibration도 실제 장치 실행이며 새 BB/PC의 최초 발견자다. 소스별 산출물에는
+        # 빠짐없이 귀속한다. 단 startup calibration은 corpus 선택기가 고른 실행이 아니므로
+        # adaptive boost 학습에는 넣지 않는다. 런타임 LLM 시드의 lazy calibration만
+        # 실행 수와 gain을 함께 넣어, calibration에서 BB를 먼저 소진해 LLM yield가 0으로
+        # 보이던 편향을 없앤다.
+        _cal_src = self._cov_src_tag(seed, 'c1')
+        _runtime_cal = self.start_time is not None
+        if _runtime_cal and actual_runs > 0:
+            _origin = _cal_src.partition('/')[0]
+            self._boost_exec[_origin] = self._boost_exec.get(_origin, 0) + actual_runs
+        if _new_count:
+            self._cov_credit(_cal_src, 'edge', _new_count,
+                             affect_boost=_runtime_cal)
+        _cal_stat = self.cmd_stats[self._tracking_label(seed.cmd, seed)]
+        _cal_stat['cal_exec'] = _cal_stat.get('cal_exec', 0) + actual_runs
+        _cal_stat['new_cov'] = _cal_stat.get('new_cov', 0) + _new_count
 
         # v9.4 ledger: calibration 은 _account_command 를 우회하므로 개별 outcome 이 안 남는다.
         #   LLM 제안(prov_id 보유) 또는 신규 발견/timeout 인 경우 '요약 outcome' 을 한 줄 남겨
         #   proposal 평가 데이터가 구조적으로 누락되지 않게 한다(kind='calibration').
         _cal_timeout = (self._cal_last_rc == self.RC_TIMEOUT)
-        if getattr(seed, 'prov_id', None) is not None or _new or _cal_timeout:
+        if getattr(seed, 'prov_id', None) is not None or _new_count or _cal_timeout:
             self._ledger_write({
                 'run_id': self._run_id_get(),
                 'exec': self.executions,
@@ -4585,7 +4653,7 @@ class NVMeFuzzer:
                 'rc': self._cal_last_rc,
                 'runs': actual_runs,
                 'stability': round(stability, 3),
-                'new_pcs': len(_new),
+                'new_pcs': _new_count,
                 'cal_timeout': _cal_timeout,
             })
 
@@ -5653,10 +5721,71 @@ class NVMeFuzzer:
         return "\n\n".join(out)
 
     def _llm_coverage_context(self) -> str:
-        """미접촉 함수 상위 N개 텍스트(정적분석 로드된 경우). 없거나 실패 시 빈 문자열.
+        """미접촉 함수 상위 N개 텍스트. 없거나 실패 시 빈 문자열.
+
+        RISC-V는 코어별 frontier(도달 함수의 직접 미도달 callee)를 먼저 주고, 남는
+        예산에 큰 미도달 함수를 코어 round-robin으로 넣는다. 주소는 프롬프트에 싣지 않는다.
         _collect_uncov_funcs 반환은 튜플: not_entered=[(name,size,entry)],
         partial=[(name,size,entry,bb_pct)]. (dict 아님 — 튜플 인덱스로 접근)"""
         try:
+            _cov = getattr(self, 'cov', None)
+            if _cov is not None and getattr(_cov, 'loaded', False):
+                def _is_rv_symbol(nm) -> bool:
+                    # FUN_/sub_ 형태만 거른다. 제품 심볼에 흔한 default/handler 같은
+                    # 단어까지 제거하던 legacy keyword 필터는 실제 frontier를 숨긴다.
+                    return not _AUTONAME_RE.match(str(nm))
+
+                _budget = max(0, RAG_MAX_UNCOV_FUNCS)
+                _core_ids = sorted(_cov.cores)
+
+                def _round_robin(per_core, limit):
+                    out, pos = [], {cid: 0 for cid in _core_ids}
+                    while len(out) < limit:
+                        progressed = False
+                        for cid in _core_ids:
+                            rows = per_core.get(cid, ())
+                            i = pos[cid]
+                            if i < len(rows) and len(out) < limit:
+                                out.append((cid, rows[i]))
+                                pos[cid] = i + 1
+                                progressed = True
+                        if not progressed:
+                            break
+                    return out
+
+                _frontier = {}
+                _frontier_keys = set()
+                for cid in _core_ids:
+                    rows = [r for r in _cov.frontier_functions(cid)
+                            if _is_rv_symbol(r[0])]
+                    _frontier[cid] = rows
+                    _frontier_keys.update((cid, r[2]) for r in rows)
+                chosen_frontier = _round_robin(_frontier, _budget)
+
+                _uncovered = {}
+                for cid in _core_ids:
+                    _uncovered[cid] = [
+                        r for r in _cov.uncovered_functions(cid)
+                        if _is_rv_symbol(r[0]) and (cid, r[2]) not in _frontier_keys
+                    ]
+                chosen_uncovered = _round_robin(
+                    _uncovered, max(0, _budget - len(chosen_frontier)))
+
+                lines = []
+                for cid, (name, callers, _entry) in chosen_frontier:
+                    core = _cov.cores[cid].name
+                    lines.append(f"  - core={core} {name} "
+                                 f"(FRONTIER, reached_callers={callers})")
+                for cid, (name, size, _entry) in chosen_uncovered:
+                    core = _cov.cores[cid].name
+                    lines.append(f"  - core={core} {name} (size={size}, NEVER entered)")
+                if lines:
+                    return "\n".join(lines)
+                _remaining = sum(len(_cov.uncovered_functions(cid)) for cid in _core_ids)
+                return (f"  ({_remaining} firmware functions still unreached, but available "
+                        f"names are autogenerated — rely on command coverage below)" if _remaining
+                        else "")
+
             if not getattr(self, '_sa_loaded', False):
                 return ""
             not_entered, partial = self._collect_uncov_funcs()
@@ -5682,8 +5811,93 @@ class NVMeFuzzer:
                 log.warning(f"[LLM] coverage context 생성 실패(무시): {e}")
             return ""
 
+    def _llm_cov_count(self) -> int:
+        """LLM plateau 판단 단위. RISC-V에서는 raw PC가 아닌 신규 판정과 같은 BB 수."""
+        cov = getattr(self, 'cov', None)
+        if cov is not None and getattr(cov, 'loaded', False):
+            return len(cov.covered_bbs)
+        return len(self.sampler.global_coverage)
+
+    def _llm_command_frontier_hints(self, max_commands: int = 12,
+                                    max_targets: int = 4) -> str:
+        """실측 ``명령 → frontier 바로 앞 호출자`` 관계를 주소 없이 요약한다.
+
+        모든 명령에서 보이는 dispatch/idle 함수는 조준 신호가 아니므로 idle에서 본 함수와
+        관측 명령의 80% 이상에 공통인 함수를 뺀다. 남은 호출자가 직접 부르는 미도달 함수만
+        보여줘 LLM이 함수 이름만 보고 NVMe 명령을 추측해야 하는 부담을 줄인다.
+        """
+        cov = getattr(self, 'cov', None)
+        if cov is None or not getattr(cov, 'loaded', False):
+            return ""
+        try:
+            import riscv_cov as _riscv_cov
+
+            def _functions(keys):
+                funcs = set()
+                for key in keys:
+                    cid, _bank, addr = _riscv_cov.unpack(key)
+                    cm = cov.cores.get(cid)
+                    if cm is None:
+                        continue
+                    entry = cm.func_of(addr)
+                    if entry is not None:
+                        funcs.add(_riscv_cov.pack(cid, 0, entry))
+                return funcs
+
+            idle_funcs = _functions(getattr(self, '_idle_cov_keys', set()))
+            per_cmd = {}
+            for cmd, keys in getattr(self, 'cmd_cov_keys', {}).items():
+                if cmd not in _NAME_TO_CMD:
+                    continue  # unknown opcode 라벨은 LLM schema에 없으므로 조준 힌트에서 제외
+                fs = _functions(keys) - idle_funcs
+                if fs:
+                    per_cmd[str(cmd)] = fs
+            if not per_cmd:
+                return ""
+
+            freq = defaultdict(int)
+            for funcs in per_cmd.values():
+                for key in funcs:
+                    freq[key] += 1
+            common_at = max(2, math.ceil(len(per_cmd) * 0.8))
+            common = {key for key, count in freq.items() if count >= common_at}
+
+            rows = []
+            for cmd, funcs in per_cmd.items():
+                targets = set()
+                for key in funcs - common:
+                    cid, _bank, caller = _riscv_cov.unpack(key)
+                    cm = cov.cores.get(cid)
+                    if cm is None:
+                        continue
+                    for callee in cm.callees.get(caller, ()):
+                        callee_key = _riscv_cov.pack(cid, 0, callee)
+                        if callee_key in cov.entered_funcs:
+                            continue
+                        name = cm.func_name(callee)
+                        if name and not _AUTONAME_RE.match(str(name)):
+                            targets.add((cm.name, str(name)))
+                if targets:
+                    rows.append((len(targets), cmd, sorted(targets)))
+            if not rows:
+                return ""
+            rows.sort(key=lambda r: (-r[0], r[1]))
+            lines = [
+                "Empirical command-to-frontier hints (this device; command reached a direct caller):"
+            ]
+            for _count, cmd, targets in rows[:max_commands]:
+                shown = ", ".join(f"core={core} {name}"
+                                  for core, name in targets[:max_targets])
+                lines.append(f"  {cmd} -> {shown}")
+            return "\n".join(lines)
+        except Exception as e:
+            if RAG_DEBUG:
+                log.warning(f"[LLM] command-frontier hint 생성 실패(무시): {e}")
+            return ""
+
     def _llm_exercised_names(self):
-        return {n for n, st in self.cmd_stats.items() if st.get('exec', 0) > 0}
+        return {n for n, st in self.cmd_stats.items()
+                if st.get('exec', 0) + st.get('cal_exec', 0) > 0}
 
     # v9.1: LLM digest 용 NVMe status 이름(요약). full=SCT<<8|SC (flags 무시).
     _SC_KNOWN = {0x01: "Invalid Opcode", 0x02: "Invalid Field", 0x03: "CID Conflict",
@@ -5789,6 +6003,9 @@ class NVMeFuzzer:
                 lines.append("  active NSID allowlist: "
                              + ", ".join(str(n) for n in self._active_nsids)
                              + " (if emitting nsid, use ONLY one of these)")
+            _frontier_hints = self._llm_command_frontier_hints()
+            if _frontier_hints:
+                lines.append("\n" + _frontier_hints)
             # 되먹임 + few-shot: 실제 커버리지 뚫은 LLM 계보 시드
             prod = [s for s in self.corpus
                     if isinstance(s, Seed)
@@ -5990,7 +6207,7 @@ class NVMeFuzzer:
         if task == 'new_group_seeds':
             # ① opcode-이진("안 쐈나") 만으로는 캘리브레이션 후 전부 exercised 되어 신호가 죽는다.
             #   → coverage-gap(미접촉 함수)을 주 타깃으로, 명령은 never-sent + under-explored
-            #     (쐈지만 새 커버리지 수확 낮은=interesting 오름차순)로 랭킹해 넘긴다.
+            #     (쐈지만 실행당 신규 BB/PC 수확이 낮은 순)로 랭킹해 넘긴다.
             sb = self.llm.schema_bridge
             # v9.1: 확정 미구현(SC=0x01) 제외 — 죽은 명령이 후보 top 을 점거해 다른 명령을
             #   밀어내던 고착 제거(#1 digest 와도 일관). 스키마는 [:20] 캡 제거로 구현된 전부 노출
@@ -5998,15 +6215,20 @@ class NVMeFuzzer:
             known = [c.name for c in NVME_COMMANDS
                      if c.name in sb.commands and c.name not in self._unimpl_cmds]
             never = [n for n in known if n not in exercised]
-            explored = sorted(
-                [n for n in known if n in exercised],
-                key=lambda n: (self.cmd_stats.get(n, {}).get('interesting', 0),
-                               self.cmd_stats.get(n, {}).get('exec', 0)))
+            def _cmd_yield(name):
+                st = self.cmd_stats.get(name, {})
+                runs = st.get('exec', 0) + st.get('cal_exec', 0)
+                gained = st.get('new_cov', 0)
+                return gained / max(1, runs), gained, runs
+
+            explored = sorted([n for n in known if n in exercised], key=_cmd_yield)
             candidates = never + explored            # never-entered 우선, 그다음 low-yield
             schema = self._llm_schema_summary(candidates[:RAG_SCHEMA_MAX])
-            _low_lbl = [f"{n}(exec={self.cmd_stats.get(n, {}).get('exec', 0)},"
-                        f"cov+={self.cmd_stats.get(n, {}).get('interesting', 0)})"
-                        for n in explored[:15]]
+            _low_lbl = []
+            for n in explored[:15]:
+                _yield, _gain, _runs = _cmd_yield(n)
+                _low_lbl.append(
+                    f"{n}(exec={_runs},new_cov={_gain},cov/exec={_yield:.4f})")
             _contrast = self._llm_contrastive_block()   # v9.5: field-relation 대조 예시
             _cb = (_contrast + "\n\n") if _contrast else ""
             user = (_gp + _cb
@@ -6123,7 +6345,7 @@ class NVMeFuzzer:
         for t in active:
             weighted += [t] * max(1, int(RAG_TASK_WEIGHTS.get(t, 1)))
         # plateau 감지: coverage 정체가 임계 초과면 상태의존 경로(시퀀스/신규군) 우선.
-        cov_now = len(self.sampler.global_coverage)
+        cov_now = self._llm_cov_count()
         if cov_now > self._llm_last_cov:
             self._llm_last_cov = cov_now
             self._llm_plateau_since = self.executions
@@ -6468,7 +6690,8 @@ class NVMeFuzzer:
             form = 'cmd'
         return f'{origin}/{form}'
 
-    def _cov_credit(self, src: str, axis: str, n: int = 1) -> None:
+    def _cov_credit(self, src: str, axis: str, n: int = 1,
+                    affect_boost: bool = True) -> None:
         """v9.4: 소스별 커버리지 누적(스택 그래프용). axis ∈ {'edge','sc','state'}."""
         d = self._cov_by_src.setdefault(src, {'edge': 0, 'sc': 0, 'state': 0})
         d[axis] = d.get(axis, 0) + n
@@ -6480,7 +6703,7 @@ class NVMeFuzzer:
         #      가중치가 관여하지 않는 경로다. 이들은 _select_seed 를 안 거쳐 분모가 안 늘므로,
         #      분자에만 넣으면 y_llm 이 부풀어 부스트가 근거 없이 올라간다. 더 근본적으로는
         #      **부스트가 제어하지 않는 성과로 부스트를 조정하는 것**이라 범주 오류다.
-        if axis == 'edge':
+        if axis == 'edge' and affect_boost:
             _o, _, _f = src.partition('/')
             if _f in ('cmd', 'seq'):
                 self._boost_gain[_o] = self._boost_gain.get(_o, 0) + n
@@ -6944,9 +7167,12 @@ class NVMeFuzzer:
                      f"(LLM {e_llm:,}회 / mutation {e_mut:,}회, 각 {RAG_BOOST_MIN_SAMPLES}회 필요). "
                      f"계속 누적 중")
             return
+        _cov_unit = ("BB" if ((self.cov is not None and getattr(self.cov, 'loaded', False))
+                              or (self._sa_loaded and self._sa_bb_starts)) else "PC")
         if (g_llm + g_mut) < RAG_BOOST_MIN_GAIN:
             log.info(f"[LLM-boost] 갱신 보류 — 발견이 적어 비교 불가 "
-                     f"(새 edge 합계 {g_llm + g_mut}개, {RAG_BOOST_MIN_GAIN}개 필요). 계속 누적 중")
+                     f"(신규 {_cov_unit} 합계 {g_llm + g_mut}개, "
+                     f"{RAG_BOOST_MIN_GAIN}개 필요). 계속 누적 중")
             return
         y_llm, y_mut = g_llm / e_llm, g_mut / e_mut
         r = (y_llm - y_mut) / (y_llm + y_mut + 1e-12)
@@ -6968,7 +7194,7 @@ class NVMeFuzzer:
                                     ("mutation", e_mut, s_mut, g_mut, y_mut)):
             _avg = (f"평균 {_e / _s:.1f}명령/선택" if _s else "선택 기록 없음")
             log.warning(f"[LLM-boost]   {_nm} : 명령 {_e:>7,}회(선택 {_s:,}회, {_avg}) "
-                        f"→ 새 edge {_g}개 = 100명령당 {_y * 100:.2f}개")
+                        f"→ 신규 {_cov_unit} {_g}개 = 100명령당 {_y * 100:.2f}개")
         self._llm_boost_hist.append(
             (self.executions, self._llm_boost, y_llm, y_mut, e_llm, e_mut))
         self._boost_exec.clear()
@@ -7215,6 +7441,12 @@ class NVMeFuzzer:
         if self._last_depth_adv:
             is_interesting = True
 
+        # 명령별 수확량은 interesting 실행 횟수가 아니라 실제 신규 BB/PC 개수로 누적한다.
+        # SC-depth만 전진한 corpus 진입(new_pcs=0)은 코드 커버리지 수확으로 세지 않는다.
+        if is_interesting and new_pcs > 0:
+            self.cmd_stats[track_key]['new_cov'] = (
+                self.cmd_stats[track_key].get('new_cov', 0) + new_pcs)
+
         # v9.2 staleness: 이 실행이 새 코드 커버리지를 냈으면 그 실행의 **실제 소스** corpus 시드의
         #   last_gain 갱신(energy staleness 감쇠 리셋). 새 코드 못 내면 갱신 안 됨 → staleness 누적 → 감쇠.
         # v9.4 fix(궤적 변경): 전역 _last_selected → iteration 소스 _credit_seed. 기존엔 workload/c2/
@@ -7225,6 +7457,9 @@ class NVMeFuzzer:
             self._credit_seed.last_gain_exec = getattr(self._credit_seed, 'exec_count', 0)
 
         self.cmd_pcs[track_key].update(self.sampler.current_trace)
+        if (getattr(self.sampler, 'PER_CORE_COVERAGE', False)
+                and self.cov is not None and self._last_cmd_submitted):
+            self.cmd_cov_keys[track_key].update(_seed_covered)
         if self.sampler._last_raw_pcs:
             raw_in_range = [pc for pc in self.sampler._last_raw_pcs
                             if self.sampler._in_range(pc)]
@@ -13396,10 +13631,170 @@ class NVMeFuzzer:
             log.info(f"[Graph] matplotlib 선import 실패(차트 비활성 가능): {_e}")
             self._mpl_warmed = True   # 재시도 안 함
 
+    def _generate_riscv_reports(self) -> None:
+        """BM9K1 코어/함수 커버리지 산출물 3종을 원자적으로 갱신한다.
+
+        coverage_by_core.txt는 빠른 확인용, function_coverage.csv는 후처리용,
+        report.html은 외부 자산 없이 브라우저에서 필터 가능한 상세 보고서다.
+        """
+        cov = getattr(self, 'cov', None)
+        if cov is None or not getattr(cov, 'loaded', False):
+            return
+
+        import riscv_cov as _riscv_cov
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        stats = cov.stats_by_core()
+        rows = cov.function_rows()
+
+        # packed BB → 함수 → 그 BB를 관측한 명령 목록. 코어가 키에 포함되므로
+        # 서로 다른 ELF의 동일 주소가 한 함수로 합쳐지지 않는다.
+        func_commands = defaultdict(set)
+        for cmd, keys in getattr(self, 'cmd_cov_keys', {}).items():
+            for key in keys:
+                cid, _bank, addr = _riscv_cov.unpack(key)
+                cm = cov.cores.get(cid)
+                if cm is None:
+                    continue
+                entry = cm.func_of(addr)
+                if entry is not None:
+                    func_commands[(cid, entry)].add(str(cmd))
+
+        def _status(row):
+            if row['total_bbs'] and row['covered_bbs'] >= row['total_bbs']:
+                return 'covered'
+            if row['covered_bbs']:
+                return 'partial'
+            if row['entered']:
+                return 'entered'
+            if row['frontier_callers']:
+                return 'frontier'
+            return 'unreached'
+
+        for row in rows:
+            row['status'] = _status(row)
+            row['commands'] = sorted(func_commands.get((row['core_id'], row['entry']), ()))
+
+        def _atomic_text(path, content):
+            tmp = Path(str(path) + '.tmp')
+            try:
+                tmp.write_text(content, encoding='utf-8')
+                os.replace(tmp, path)
+            finally:
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
+
+        total_bb = sum(v['bb_total'] for v in stats.values())
+        covered_bb = sum(v['bb'] for v in stats.values())
+        total_fn = sum(v['func_total'] for v in stats.values())
+        covered_fn = sum(v['func'] for v in stats.values())
+        text_lines = [
+            f"product={cov.product}",
+            f"generated={datetime.now().isoformat(timespec='seconds')}",
+            f"basic_blocks={covered_bb}/{total_bb} "
+            f"({100.0 * covered_bb / total_bb if total_bb else 0.0:.2f}%)",
+            f"functions={covered_fn}/{total_fn} "
+            f"({100.0 * covered_fn / total_fn if total_fn else 0.0:.2f}%)",
+            "",
+        ]
+        for cid, st in sorted(stats.items()):
+            text_lines.append(
+                f"core={st['name']} id={cid} "
+                f"BB={st['bb']}/{st['bb_total']} ({st['bb_pct']:.2f}%) "
+                f"functions={st['func']}/{st['func_total']} ({st['func_pct']:.2f}%)")
+        _atomic_text(self.output_dir / 'coverage_by_core.txt', '\n'.join(text_lines) + '\n')
+
+        csv_path = self.output_dir / 'function_coverage.csv'
+        csv_tmp = Path(str(csv_path) + '.tmp')
+        try:
+            with open(csv_tmp, 'w', newline='', encoding='utf-8') as fh:
+                fields = ('core_id', 'core', 'function', 'entry', 'size', 'status',
+                          'covered_bbs', 'total_bbs', 'bb_pct', 'frontier_callers',
+                          'commands')
+                writer = csv.DictWriter(fh, fieldnames=fields)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({
+                        'core_id': row['core_id'], 'core': row['core'],
+                        'function': row['name'], 'entry': f"0x{row['entry']:08x}",
+                        'size': row['size'], 'status': row['status'],
+                        'covered_bbs': row['covered_bbs'], 'total_bbs': row['total_bbs'],
+                        'bb_pct': f"{row['bb_pct']:.2f}",
+                        'frontier_callers': row['frontier_callers'],
+                        'commands': ';'.join(row['commands']),
+                    })
+            os.replace(csv_tmp, csv_path)
+        finally:
+            try:
+                if csv_tmp.exists():
+                    csv_tmp.unlink()
+            except OSError:
+                pass
+
+        e = html_lib.escape
+        core_cards = ''.join(
+            '<div class="card"><b>core {}</b><span>BB {:,}/{:,} ({:.2f}%)</span>'
+            '<span>Functions {:,}/{:,} ({:.2f}%)</span></div>'.format(
+                e(st['name']), st['bb'], st['bb_total'], st['bb_pct'],
+                st['func'], st['func_total'], st['func_pct'])
+            for _cid, st in sorted(stats.items()))
+        options = ''.join(f'<option value="{e(st["name"])}">{e(st["name"])}</option>'
+                          for _cid, st in sorted(stats.items()))
+        body_rows = []
+        for row in sorted(rows, key=lambda r: (r['core_id'], r['entry'])):
+            commands = ', '.join(row['commands'])
+            body_rows.append(
+                '<tr data-core="{}" data-status="{}"><td>{}</td><td>{}</td>'
+                '<td>{}</td><td>{}</td><td>{:,}</td><td>{:,}/{:,}</td>'
+                '<td>{:.2f}%</td><td>{}</td><td>{}</td></tr>'.format(
+                    e(row['core']), row['status'], e(row['core']),
+                    e(row['name']), f"0x{row['entry']:08x}", row['status'],
+                    row['size'], row['covered_bbs'], row['total_bbs'], row['bb_pct'],
+                    row['frontier_callers'], e(commands)))
+        html_doc = f'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><title>RISC-V Coverage Report</title>
+<style>
+body{{font:14px system-ui,sans-serif;margin:24px;color:#1f2937}}h1{{margin-bottom:4px}}
+.muted{{color:#6b7280}}.cards{{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}}
+.card{{border:1px solid #d1d5db;border-radius:8px;padding:10px 14px;min-width:190px}}
+.card span{{display:block;margin-top:5px}}.filters{{display:flex;gap:10px;margin:14px 0}}
+input,select{{padding:7px;border:1px solid #9ca3af;border-radius:5px}}
+table{{border-collapse:collapse;width:100%}}th,td{{border-bottom:1px solid #e5e7eb;padding:6px;text-align:left}}
+th{{position:sticky;top:0;background:#f3f4f6}}tr[data-status="frontier"]{{background:#fff7d6}}
+tr[data-status="partial"]{{background:#eef6ff}}code{{font-size:12px}}
+</style></head><body>
+<h1>{e(cov.product or 'RISC-V')} coverage report</h1>
+<div class="muted">Generated {e(datetime.now().isoformat(timespec='seconds'))} ·
+BB {covered_bb:,}/{total_bb:,} · Functions {covered_fn:,}/{total_fn:,}</div>
+<div class="cards">{core_cards}</div>
+<div class="filters"><input id="q" placeholder="function or command">
+<select id="core"><option value="">all cores</option>{options}</select>
+<select id="status"><option value="">all states</option><option>frontier</option>
+<option>unreached</option><option>partial</option><option>covered</option><option>entered</option></select>
+<span id="shown" class="muted"></span></div>
+<table><thead><tr><th>Core</th><th>Function</th><th>Entry</th><th>Status</th><th>Size</th>
+<th>BB</th><th>BB %</th><th>Frontier callers</th><th>Observed commands</th></tr></thead>
+<tbody>{''.join(body_rows)}</tbody></table>
+<script>
+const rows=[...document.querySelectorAll('tbody tr')],q=document.querySelector('#q'),
+core=document.querySelector('#core'),status=document.querySelector('#status'),shown=document.querySelector('#shown');
+function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{const ok=(!s||r.textContent.toLowerCase().includes(s))&&(!core.value||r.dataset.core===core.value)&&(!status.value||r.dataset.status===status.value);r.hidden=!ok;if(ok)n++;}}shown.textContent=n+' / '+rows.length;}}
+[q,core,status].forEach(x=>x.addEventListener('input',filter));filter();
+</script></body></html>'''
+        _atomic_text(self.output_dir / 'report.html', html_doc)
+        log.info("[CoverageReport] coverage_by_core.txt / function_coverage.csv / report.html 갱신")
+
     def _generate_all_charts(self) -> None:
         """5종 차트를 순서대로 생성(인프로세스 본체). fork 자식 또는 종료 시 직접 호출."""
         _gdir = self.output_dir / 'graphs'
         _gdir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._generate_riscv_reports()
+        except Exception as _e:
+            log.warning(f"[CoverageReport] 생성 실패(차트는 계속): {_e}")
         self._generate_comparison_chart(_gdir)
         self._generate_static_coverage_graphs()
         self._generate_heatmaps()
@@ -13445,7 +13840,7 @@ class NVMeFuzzer:
     _CHART_SNAPSHOT_ATTRS = (
         '_csfuzz_history', '_sa_bb_starts', '_sa_cov_history', '_sa_covered_bbs',
         '_sa_entered_funcs', '_sa_func_ends', '_sa_func_entries', '_sa_func_names',
-        '_sa_loaded', '_sa_total_bbs', '_sa_total_funcs', 'cmd_pcs', 'cmd_stats',
+        '_sa_loaded', '_sa_total_bbs', '_sa_total_funcs', 'cmd_pcs', 'cmd_cov_keys', 'cmd_stats',
         'cmd_traces', 'executions', 'mopt_finds', 'mopt_uses', 'mutation_stats',
         'rc_stats', 'NUM_MUTATION_OPS',
     )
@@ -13480,6 +13875,9 @@ class NVMeFuzzer:
         return {
             'attrs': attrs,
             'output_dir': str(self.output_dir),
+            'riscv_cov': (self.cov.snapshot()
+                          if self.cov is not None and getattr(self.cov, 'loaded', False)
+                          else None),
             'sampler_global_coverage': self._snap_copy(self.sampler.global_coverage),
             'config': {
                 'addr_range_start': self.config.addr_range_start,
@@ -14469,9 +14867,8 @@ class NVMeFuzzer:
                 sa_parts.append(f"BB: {100.0*_bbc/_bbt:.1f}% ({_bbc:,}/{_bbt:,})")
             if _fnt > 0:
                 sa_parts.append(f"funcs: {_fnc:,}/{_fnt:,} ({100.0*_fnc/_fnt:.1f}%)")
-            # v9.2: LLM 기여율 — LLM 계보가 '처음 발견'한 커버리지(new_cov)가 전체 발견 커버리지에서
-            #   차지하는 비율. 분모=커버된 것(SA면 BB, 아니면 global PC). SA 모드에서 new_cov 는 대부분
-            #   new-BB(정확)이나 calibration 발견분은 PC 단위라 근사치.
+            # v9.2/v10: LLM 기여율 — LLM 계보가 처음 발견한 커버리지가 전체 발견분에서
+            #   차지하는 비율. RISC-V/SA는 신규 BB, 정적분석 없는 제품은 신규 PC 단위다.
             if self.llm.enabled:
                 _nc  = self._llm_stats.get('new_cov', 0)
                 _tot = _bbc if _bbt > 0 else len(self.sampler.global_coverage)
@@ -14980,7 +15377,10 @@ class NVMeFuzzer:
             log.warning(f"PM Rotate   : interval={PM_ROTATE_INTERVAL}cmds, "
                         f"combos={len(POWER_COMBOS)}개(PS0~4×L0/L1/L1.2×D0/D3), "
                         f"timeout_margin=+{PS_ENTRY_EXIT_MARGIN_MS}ms(entry/exit latency)")
-        if self._sa_loaded:
+        if self.cov is not None and getattr(self.cov, 'loaded', False):
+            log.warning(f"StaticAnalysis: RISC-V per-core basic_blocks={self.cov.total_bbs:,}, "
+                        f"funcs={self.cov.total_funcs:,}")
+        elif self._sa_loaded:
             sa_info = []
             if self._sa_total_bbs > 0:
                 sa_info.append(f"basic_blocks={self._sa_total_bbs:,}")
@@ -15008,6 +15408,15 @@ class NVMeFuzzer:
                 shutil.rmtree(target)
                 log.info(f"[Cleanup] {_logname(target)} 삭제 완료")
             target.mkdir(parents=True, exist_ok=True)
+        # 루트에 놓이는 RISC-V 보고서도 새 run 시작 시 제거한다. 첫 주기 보고서가
+        # 생성되기 전까지 이전 run 결과를 현재 결과로 오인하는 일을 막는다.
+        for name in ('coverage_by_core.txt', 'function_coverage.csv', 'report.html'):
+            try:
+                (self.output_dir / name).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as _e:
+                log.warning(f"[Cleanup] 이전 {name} 삭제 실패: {_e}")
 
         # v9.x: LLM 브리지 drop-box 도 비운다. 시작 시점에 남아 있는 파일은 **전부 이전 run 의
         # 것**이라 쓸모가 없다 — rid 가 안 맞아 현재 퍼저는 그 응답을 절대 못 읽고, 남은 요청은
@@ -15038,7 +15447,7 @@ class NVMeFuzzer:
         # v9.0: LLM 브리지 워커 기동 + (옵션) 초기 시딩 요청 1건. 비활성이면 no-op.
         if self.llm.enabled:
             self.llm.start()
-            self._llm_last_cov = len(self.sampler.global_coverage)
+            self._llm_last_cov = self._llm_cov_count()
             self._llm_plateau_since = 0
             if RAG_SEED_AT_STARTUP and RAG_TASKS.get('new_group_seeds', True):
                 _built = self._llm_build_request('new_group_seeds')
@@ -15171,9 +15580,15 @@ class NVMeFuzzer:
         # 컨트롤러 정보 스냅샷 (CNTLID=NS 재부착용, OACS=NS Mgmt 지원 여부)
         self._snapshot_ctrl_info()
 
-        # 이전 커버리지 로드 (resume)
+        # 이전 커버리지 로드 (legacy 제품만). RISC-V packed BB는 캠페인마다 새로 측정한다.
+        # raw PC만 복원하면 core 정보는 없는데 sampler saturation에는 영향을 줘, 새 BB를
+        # 놓칠 수 있으므로 BM9K1에서는 옵션이 남아 있어도 명시적으로 무시한다.
         if self.config.resume_coverage:
-            self.sampler.load_coverage(self.config.resume_coverage)
+            if self.cov is not None and getattr(self.cov, 'loaded', False):
+                log.warning("[Coverage] RISC-V는 캠페인 간 resume을 사용하지 않음 — "
+                            "--resume-coverage 무시, BB 0부터 측정")
+            else:
+                self.sampler.load_coverage(self.config.resume_coverage)
 
         # POR: OpenOCD 연결 전에 SSD 전원 사이클 수행
         # (이전 실행의 디버그 도메인 전원이 SSD PM 상태에 영향을 줄 수 있음)
@@ -15289,6 +15704,8 @@ class NVMeFuzzer:
         if (self.cov is not None and _diag_ok
                 and getattr(self.sampler, '_idle_obs', None)):
             _before = len(self.cov.covered_bbs)
+            self._idle_cov_keys = set(
+                self.cov.project(self.sampler._idle_obs).seed_keys)
             self.cov.update(self.sampler._idle_obs)
             log.warning(f"[Diagnose] 배경 커버리지 선반영: "
                         f"{len(self.cov.covered_bbs) - _before:,} 블록 "
@@ -15374,6 +15791,9 @@ class NVMeFuzzer:
 
         if self.config.calibration_runs > 0:
             total_seeds = len(self.corpus)
+            _cal_unit = ('bbs' if (getattr(self.sampler, 'PER_CORE_COVERAGE', False)
+                                    or (self._sa_loaded and self._sa_bb_starts))
+                         else 'pcs')
             log.warning(f"[Calibration] {total_seeds} seeds × "
                         f"{self.config.calibration_runs} runs each ...")
             calibrated_corpus = []
@@ -15418,7 +15838,7 @@ class NVMeFuzzer:
                         f"{seed.cmd.name:<20} "
                         f"cdw10=0x{seed.cdw10:08x}  "
                         f"stab={seed.stability*100:3.0f}%  "
-                        f"pcs={all_cnt:5}  "
+                        f"{_cal_unit}={all_cnt:5}  "
                         f"{_rc_str}{_tag}"
                     )
                     os.dup2(devnull_fd, 2)        # 다시 억제
@@ -15460,6 +15880,13 @@ class NVMeFuzzer:
             log.warning("[Calibration] Complete. Starting fuzzing...\n")
         else:
             log.info("[Calibration] Disabled (calibration_runs=0)")
+
+        # 첫 주기 차트 전에 프로세스가 중단돼도 baseline 산출물이 남도록, idle/calibration
+        # 회계가 끝난 시점에 HTML/CSV/코어 요약을 한 번 생성한다(matplotlib 무관).
+        try:
+            self._generate_riscv_reports()
+        except Exception as _e:
+            log.warning(f"[CoverageReport] 초기 보고서 생성 실패(퍼징은 계속): {_e}")
 
         self.start_time = datetime.now()
         self._window_t0 = self.start_time          # 구간별 exec/s 계산용
@@ -16088,7 +16515,24 @@ class NVMeFuzzer:
                             f"  {combo.label:<18}: 실행 {cnt}회 ({pct:.1f}%), "
                             f"진입 {enters}회")
 
-                if self._sa_loaded:
+                if self.cov is not None and getattr(self.cov, 'loaded', False):
+                    _rv_stats = self.cov.stats_by_core()
+                    _rv_bb = len(self.cov.covered_bbs)
+                    _rv_fn = len(self.cov.entered_funcs)
+                    summary_lines.append(
+                        f"BB Coverage      : {100.0 * _rv_bb / self.cov.total_bbs if self.cov.total_bbs else 0.0:.2f}%"
+                        f" ({_rv_bb:,} / {self.cov.total_bbs:,} basic blocks)")
+                    summary_lines.append(
+                        f"Func Coverage    : {100.0 * _rv_fn / self.cov.total_funcs if self.cov.total_funcs else 0.0:.2f}%"
+                        f" ({_rv_fn:,} / {self.cov.total_funcs:,} functions)")
+                    for _cid, _st in sorted(_rv_stats.items()):
+                        summary_lines.append(
+                            f"  core {_st['name']}: BB {_st['bb']:,}/{_st['bb_total']:,} "
+                            f"({_st['bb_pct']:.2f}%), functions "
+                            f"{_st['func']:,}/{_st['func_total']:,} ({_st['func_pct']:.2f}%)")
+                    summary_lines.append(
+                        "Coverage reports : coverage_by_core.txt / function_coverage.csv / report.html")
+                elif self._sa_loaded:
                     if self._sa_total_bbs > 0:
                         n_bb = len(self._sa_covered_bbs)
                         pct  = 100.0 * n_bb / self._sa_total_bbs
@@ -16202,6 +16646,11 @@ class NVMeFuzzer:
 
             # 진행 중이던 주기 차트 fork 자식 회수(좀비 방지 + 비정상 종료 로그)
             self._reap_graph_child(block=True)
+
+            try:
+                self._generate_riscv_reports()
+            except Exception as e:
+                log.error(f"RISC-V coverage report generation failed: {e}")
 
             try:
                 self._save_per_command_data()
@@ -16366,6 +16815,12 @@ def _render_charts_from_snapshot(snapshot_path: str) -> int:
     inst = NVMeFuzzer.__new__(NVMeFuzzer)        # __init__ 우회 — 데이터만 주입
     for _k, _v in snap.get('attrs', {}).items():
         setattr(inst, _k, _v)
+    _cov_snap = snap.get('riscv_cov')
+    if _cov_snap:
+        import riscv_cov as _riscv_cov
+        inst.cov = _riscv_cov.CoverageModel.from_snapshot(_cov_snap)
+    else:
+        inst.cov = None
     inst.output_dir = Path(snap['output_dir'])
     inst.sampler = _NS(global_coverage=snap.get('sampler_global_coverage', set()))
     inst.config = _NS(**snap.get('config', {}))

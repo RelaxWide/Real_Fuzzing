@@ -4,7 +4,6 @@
 
 하드웨어·실제 ELF 없이 전부 검증된다(합성 표 사용)."""
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -147,6 +146,15 @@ class TestAccount(Base):
         self.assertEqual(st["bb"], 1)
         self.assertAlmostEqual(st["bb_pct"], 50.0)
 
+    def test_project_preserves_core_and_does_not_account(self):
+        """calibration용 projection은 packed BB를 주되 전역 상태를 선점하지 않는다."""
+        p = self.m.project([Ob(self.H, 0x104, True, True),
+                            Ob(self.F, 0x104, True, True)])
+        self.assertEqual(p.seed_keys,
+                         {rc.pack(self.H, 0, 0x100), rc.pack(self.F, 0, 0x100)})
+        self.assertEqual(self.m.covered_bbs, set())
+        self.assertEqual(self.m.entered_funcs, set())
+
     def test_uncovered_functions(self):
         self.assertEqual(len(self.m.uncovered_functions(self.H)), 1)
         self.m.account([Ob(self.H, 0x104, True, True)])
@@ -168,39 +176,31 @@ class TestFrontier(Base):
         m.account([Ob(0, 0x204, True, True)])          # b 도 도달
         self.assertEqual(m.frontier_functions(0), [])
 
-
-class TestPersist(Base):
-    def setUp(self):
-        super().setUp()
-        write_product(self.d, {"H": {"bb": [(0x100, 0x110)], "sha": "AAA"}})
-        self.m = rc.CoverageModel.load(self.d)
-
-    def test_save_load_roundtrip(self):
-        self.m.account([Ob(0, 0x104, True, True)])
-        p = os.path.join(self.d, "coverage_v2.jsonl")
-        self.m.save_v2(p)
-        m2 = rc.CoverageModel.load(self.d)
-        ok, why = m2.load_v2(p)
-        self.assertTrue(ok, why)
-        self.assertEqual(m2.covered_bbs, self.m.covered_bbs)
-
-    def test_rejects_stale_elf(self):
-        """★ 펌웨어가 바뀐 커버리지를 이어붙이면 조용히 틀린다 → 거부해야 한다."""
-        self.m.account([Ob(0, 0x104, True, True)])
-        p = os.path.join(self.d, "coverage_v2.jsonl")
-        self.m.save_v2(p)
-        write_product(self.d, {"H": {"bb": [(0x100, 0x110)], "sha": "BBB"}})  # ELF 교체
-        m2 = rc.CoverageModel.load(self.d)
-        ok, why = m2.load_v2(p)
-        self.assertFalse(ok)
-        self.assertIn("해시", why)
-        self.assertEqual(m2.covered_bbs, set(), "거부했으면 아무것도 안 실려야 한다")
+    def test_function_rows_reports_partial_and_frontier(self):
+        write_product(self.d, {"H": {
+            "bb": [(0x100, 0x110), (0x110, 0x120), (0x200, 0x210)],
+            "fn": [(0x100, 0x20, "caller"), (0x200, 0x10, "callee")],
+            "cg": [(0x100, 0x200)],
+        }})
+        m = rc.CoverageModel.load(self.d)
+        m.account([Ob(0, 0x104, True, True)])
+        by_name = {r["name"]: r for r in m.function_rows()}
+        self.assertEqual(by_name["caller"]["covered_bbs"], 1)
+        self.assertEqual(by_name["caller"]["total_bbs"], 2)
+        self.assertAlmostEqual(by_name["caller"]["bb_pct"], 50.0)
+        self.assertEqual(by_name["callee"]["frontier_callers"], 1)
 
 
 class TestSnapshot(Base):
+    def test_resume_api_is_not_part_of_runtime_model(self):
+        self.assertFalse(hasattr(rc.CoverageModel, "save_v2"))
+        self.assertFalse(hasattr(rc.CoverageModel, "load_v2"))
+
     def test_snapshot_is_plain_and_faithful(self):
-        write_product(self.d, {"H": {"bb": [(0x100, 0x110)],
-                                     "fn": [(0x100, 0x10, "m")]}})
+        write_product(self.d, {"H": {"bb": [(0x100, 0x110), (0x200, 0x210)],
+                                     "fn": [(0x100, 0x10, "m"),
+                                            (0x200, 0x10, "next")],
+                                     "cg": [(0x100, 0x200)]}})
         m = rc.CoverageModel.load(self.d)
         m.account([Ob(0, 0x104, True, True)])
         snap = m.snapshot()
@@ -210,6 +210,8 @@ class TestSnapshot(Base):
         self.assertEqual(m2.covered_bbs, m.covered_bbs)
         self.assertEqual(m2.entered_funcs, m.entered_funcs)
         self.assertEqual(m2.stats_by_core(), m.stats_by_core())
+        self.assertEqual(m2.frontier_functions(0), m.frontier_functions(0),
+                         "차트 자식에서도 callgraph/frontier가 보존돼야 한다")
 
 
 if __name__ == "__main__":

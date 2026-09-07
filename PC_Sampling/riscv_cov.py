@@ -57,6 +57,8 @@ Observation = namedtuple("Observation", "core_id pc fresh valid")
 
 AccountResult = namedtuple(
     "AccountResult", "interesting new_count seed_keys new_by_core considered dropped")
+ProjectionResult = namedtuple(
+    "ProjectionResult", "seed_keys func_keys considered dropped")
 
 
 class CoreMap:
@@ -210,12 +212,13 @@ class CoverageModel:
                     f"core{cm.name}: {label} 개수 불일치 symbols.json={want} 실제={got}")
 
     # ── 판정 ──────────────────────────────────────────────────────────
-    def account(self, observations, credit_cores=None) -> AccountResult:
-        """관측 → 커버리지 반영 + interesting 판정. 판정의 단일 진입점.
+    def project(self, observations) -> ProjectionResult:
+        """관측을 packed BB/함수 키로 변환하되 전역 커버리지는 변경하지 않는다.
 
-        credit_cores 가 주어지면 그 코어의 신규만 interesting 을 세운다(저duty 코어의
-        샘플링 운으로 생기는 노이즈를 배제하고 싶을 때)."""
-        cur, considered, dropped = set(), 0, 0
+        calibration 처럼 여러 실행의 출현 빈도를 계산한 뒤 한 번만 account 해야 하는
+        경로에서 사용한다. raw PC 로 되돌아가면 코어가 사라지고 PC 수와 BB 수가 섞인다.
+        """
+        cur, funcs, considered, dropped = set(), set(), 0, 0
         for ob in observations:
             if not ob.valid or ob.pc is None:
                 dropped += 1
@@ -234,7 +237,17 @@ class CoverageModel:
             cur.add(pack(ob.core_id, 0, bb))
             fe = cm.func_of(ob.pc)
             if fe is not None:
-                self.entered_funcs.add(pack(ob.core_id, 0, fe))
+                funcs.add(pack(ob.core_id, 0, fe))
+        return ProjectionResult(cur, funcs, considered, dropped)
+
+    def account(self, observations, credit_cores=None) -> AccountResult:
+        """관측 → 커버리지 반영 + interesting 판정. 판정의 단일 변경 진입점.
+
+        credit_cores 가 주어지면 그 코어의 신규만 interesting 을 세운다(저duty 코어의
+        샘플링 운으로 생기는 노이즈를 배제하고 싶을 때)."""
+        p = self.project(observations)
+        cur, considered, dropped = p.seed_keys, p.considered, p.dropped
+        self.entered_funcs |= p.func_keys
         new = cur - self.covered_bbs
         self.covered_bbs |= cur
         by_core = {}
@@ -303,49 +316,57 @@ class CoverageModel:
         rows.sort(key=lambda t: -t[1])
         return rows[:limit] if limit else rows
 
-    # ── 저장 / 재개 ────────────────────────────────────────────────────
-    def save_v2(self, path):
-        """resume 의 authoritative source. ELF 해시를 같이 적어 stale 을 검출한다."""
-        hdr = {"schema_version": SCHEMA_VERSION, "product": self.product,
-               "saved": time.strftime("%Y-%m-%dT%H:%M:%S"),
-               "cores": {cm.name: {"id": cid, "elf_sha256": cm.elf_sha256}
-                         for cid, cm in self.cores.items()}}
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(json.dumps({"header": hdr}) + "\n")
-            for k in sorted(self.covered_bbs):
-                c, b, a = unpack(k)
-                f.write(json.dumps({"c": c, "b": b, "a": a}) + "\n")
-        os.replace(tmp, path)
+    def function_rows(self):
+        """리포트용 함수별 BB 커버리지 행.
 
-    def load_v2(self, path, strict=True):
-        """→ (ok, reason). ELF 해시가 다르면 **거부**한다 — 펌웨어가 바뀐 커버리지를
-        이어붙이면 조용히 틀린 결과가 누적된다."""
-        with open(path) as f:
-            lines = f.read().splitlines()
-        if not lines:
-            return False, "빈 파일"
-        hdr = json.loads(lines[0]).get("header", {})
-        if hdr.get("schema_version") != SCHEMA_VERSION:
-            return False, f"schema_version 불일치 ({hdr.get('schema_version')})"
-        for name, info in (hdr.get("cores") or {}).items():
-            cid = info.get("id")
-            cm = self.cores.get(cid)
-            if cm is None:
-                continue
-            old, new = info.get("elf_sha256", ""), cm.elf_sha256
-            if strict and old and new and old != new:
-                return False, f"core{name} ELF 해시 불일치 — 펌웨어가 바뀌었다(stale)"
-        n = 0
-        for ln in lines[1:]:
-            if not ln.strip():
-                continue
-            d = json.loads(ln)
-            self.covered_bbs.add(pack(d["c"], d["b"], d["a"]))
-            n += 1
-        return True, f"{n}개 복원"
+        반환 행은 주소 정렬이며, ``frontier_callers`` 는 이미 도달한 직접 호출자 수다.
+        전체 BB를 함수마다 다시 훑지 않고 코어별 정렬 목록에 bisect 한다.
+        """
+        covered_by_core = {}
+        entered_by_core = {}
+        for key in self.covered_bbs:
+            cid, _bank, addr = unpack(key)
+            covered_by_core.setdefault(cid, []).append(addr)
+        for key in self.entered_funcs:
+            cid, _bank, entry = unpack(key)
+            entered_by_core.setdefault(cid, set()).add(entry)
+        for addrs in covered_by_core.values():
+            addrs.sort()
 
-    # ── 스냅샷 (차트 서브프로세스용 — plain dict/list/set 만) ───────────
+        rows = []
+        for cid, cm in sorted(self.cores.items()):
+            covered = covered_by_core.get(cid, [])
+            entered = entered_by_core.get(cid, set())
+            frontier = {}
+            for caller in entered:
+                for callee in cm.callees.get(caller, ()):
+                    if callee not in entered:
+                        frontier[callee] = frontier.get(callee, 0) + 1
+            for i, entry in enumerate(cm.fn_entries):
+                end = cm.fn_ends[i]
+                bb_lo = bisect.bisect_left(cm.bb_starts, entry)
+                bb_hi = bisect.bisect_left(cm.bb_starts, end)
+                cov_lo = bisect.bisect_left(covered, entry)
+                cov_hi = bisect.bisect_left(covered, end)
+                total_bbs = bb_hi - bb_lo
+                covered_bbs = cov_hi - cov_lo
+                rows.append({
+                    "core_id": cid,
+                    "core": cm.name,
+                    "name": cm.fn_names[i],
+                    "entry": entry,
+                    "end": end,
+                    "size": end - entry,
+                    "entered": entry in entered,
+                    "covered_bbs": covered_bbs,
+                    "total_bbs": total_bbs,
+                    "bb_pct": (100.0 * covered_bbs / total_bbs
+                               if total_bbs else 0.0),
+                    "frontier_callers": frontier.get(entry, 0),
+                })
+        return rows
+
+    # ── 스냅샷 (차트 서브프로세스용 — resume 용도가 아님) ──────────────
     def snapshot(self):
         return {
             "schema_version": SCHEMA_VERSION, "product": self.product,
@@ -355,7 +376,9 @@ class CoverageModel:
                             "bb_ends": list(cm.bb_ends),
                             "fn_entries": list(cm.fn_entries),
                             "fn_ends": list(cm.fn_ends),
-                            "fn_names": list(cm.fn_names)}
+                            "fn_names": list(cm.fn_names),
+                            "callees": {caller: set(callees)
+                                        for caller, callees in cm.callees.items()}}
                       for cid, cm in self.cores.items()},
         }
 
@@ -371,6 +394,8 @@ class CoverageModel:
             cm.bb_starts, cm.bb_ends = list(c["bb_starts"]), list(c["bb_ends"])
             cm.fn_entries = list(c["fn_entries"])
             cm.fn_ends, cm.fn_names = list(c["fn_ends"]), list(c["fn_names"])
+            cm.callees = {int(caller): set(callees)
+                          for caller, callees in (c.get("callees") or {}).items()}
             m.cores[cid] = cm
         m.loaded = bool(m.cores)
         return m

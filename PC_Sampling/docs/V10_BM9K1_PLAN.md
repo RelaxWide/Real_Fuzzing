@@ -172,17 +172,23 @@ Observation(core_id: int, pc: int | None, fresh: bool, valid: bool)
 (§4의 셔플 버스트로 모든 코어가 매 윈도우 샘플되므로 비교 가능). `new_by_core`를 별도 집계해
 저duty 코어의 노이즈를 관측하고, `interesting_policy: "union"|"primary"` 로 전환 가능.
 
-**형식 호환 — resume 은 versioned 파일이 authoritative**
+**형식 호환 — 현재 운영 결정(2026-09-04): 캠페인 간 resume 하지 않음**
 `coverage.txt` 에 raw PC union 만 쓰면 core/bank 가 소실되고, packed key 를 쓰면 v9.8 및
-기존 도구와 호환이 깨진다. 둘을 분리한다:
+기존 도구와 호환이 깨진다. 현재 런타임은 다음처럼 분리한다:
 | 파일 | 역할 |
 |---|---|
 | `coverage.txt` | 기존 도구 호환용 **raw PC union**(정보 손실 있음) |
-| **`coverage_v2.jsonl`** | **resume 의 authoritative source** — `(core, bank, addr)` + `schema_version` / `product` / **ELF 해시** |
-BM9K1 의 `--resume-coverage` 는 v2 를 읽는다. **ELF 해시가 다르면 stale 로 판단해 거부**한다
-(펌웨어가 바뀐 커버리지를 이어붙이면 조용히 틀린다). v2 가 없으면 core=0/bank=0 으로 강등해
-`coverage.txt` 를 읽는다(구 데이터 호환). `_sa_cov_history`에 5번째 원소 `{core:(bb%,func%)}` **추가**
-(차트는 `h[0]`~`h[3]`만 인덱싱 → 양방향 호환). `coverage_growth.jsonl`에 `bb_pct_by_core` 추가.
+| per-core packed coverage | 프로세스 메모리의 `CoverageModel`이 현재 run 동안만 보유 |
+
+resume 전용 `save_v2/load_v2` 코드와 테스트는 제거했다. 재시작하면 BB 커버리지는 0에서 다시
+측정하며 `coverage_v2.jsonl`도 런타임 산출물이 아니다. 차트 자식 전달용 `snapshot/from_snapshot`은
+프로세스 간 렌더 입력일 뿐 캠페인 재개 기능이 아니다. 공용 CLI의 `--resume-coverage`는 기존
+ARM 제품 호환을 위해 남기되 RISC-V에서는 raw PC가 saturation을 오염시키지 않도록 명시적으로 무시한다.
+
+**회계 경계**: idle diagnose는 background 오탐 방지를 위해 먼저 `CoverageModel`에 넣는다.
+prefill 중 수집 PC는 의도적으로 guidance에 넣지 않아, 이후 fuzz command가 같은 I/O/GC 경로를
+재도달했을 때 신규 BB credit을 받을 수 있게 한다. calibration은 그 이후부터 코어가 보존된
+packed BB로 안정성·신규 수·LLM/mutation 소스 기여를 계산한다(raw PC는 호환 통계만 유지).
 
 ---
 
@@ -367,10 +373,13 @@ auth_wrapper, addr2line}`. `openocd_config`/`tcl_prefix`/`pcsr_addrs`/`power_*` 
 
 유지: `coverage.txt`, `ledger/`, `corpus/`, `crashes/`+`replay_*.sh`, 기존 PNG 6종.
 
-신규: `report.html`(자체완결 — 코어별 요약, **함수 커버리지 표**, 모듈 롤업, 미도달 Top-N,
-frontier, 명령→함수 귀속), `function_coverage.csv`, `module_coverage.csv`(`STT_FILE` 심볼로
-오브젝트 단위 롤업 — 소스·DWARF 없이도 "모듈 커버리지"), `coverage_by_core.txt`,
-`firmware_map.png` 코어별 4패널.
+구현: `report.html`(자체완결 — 코어별 요약, **함수 커버리지 표**, frontier 상태,
+명령→함수 귀속, 코어/상태/문자열 필터), `function_coverage.csv`, `coverage_by_core.txt`.
+세 파일은 현재 run 시작 시 이전 결과를 지우고 idle/calibration 직후 baseline, 주기 스냅샷,
+정상 종료에서 원자적으로 갱신한다.
+
+보류: `module_coverage.csv`(`STT_FILE` 또는 별도 모듈 매핑 필요), `firmware_map.png` 코어별 4패널.
+현재 Ghidra 산출물에는 신뢰할 모듈 소유권이 없으므로 함수 주소를 임의로 모듈화하지 않는다.
 
 **렌더 격리 준수**: `os.fork()`가 호스트를 재부팅시킨 이력이 있어 차트는 별도 인터프리터에서
 그린다. HTML/CSV 생성기는 **matplotlib을 import하지 않고** `_render_charts_from_snapshot`(15713)
@@ -387,9 +396,10 @@ frontier, 명령→함수 귀속), `function_coverage.csv`, `module_coverage.csv
 2. **코어 라벨**: `- nvme_admin_get_log (core=HCORE, size=812, NEVER entered)`
 3. **frontier 함수(최대 신규 신호)**: 콜그래프로 *커버된 함수가 직접 호출하는 미도달 함수*를
    호출자 수 순으로. "가장 큰 미도달"보다 **실행 가능**하다 — 이미 도달한 지점에서 한 걸음이므로.
-4. **명령→함수 귀속**: `cmd_pcs[cmd]`(6697)는 이미 명령별 PC를 모으나 함수 환산이 없다.
-   `_llm_grounding_block()`(5294)에 추가. **배경 차감 필수** — idle/dispatch 함수는 모든 명령에
-   나타나 신호를 덮으므로 80% 이상 명령에 등장하는 함수와 `idle_pcs` 유래 함수를 뺀다.
+4. **명령→함수 귀속**: 코어가 보존된 `cmd_cov_keys[cmd]`를 함수로 환산한다.
+   `_llm_grounding_block()`에는 **명령이 실제 도달한 호출자 → 직접 미도달 frontier** 관계만 추가한다.
+   **배경 차감 필수** — idle 함수와 관측 명령의 80% 이상에 등장하는 공통 함수를 뺀다.
+   프롬프트에는 내부 주소를 싣지 않고 코어명·함수명만 전달한다.
 5. 예산: `RAG_BRIDGE_TIMEOUT`(180s)/`RAG_CALL_TIMEOUT`(150s) → 기존 상한 유지 + frontier 별도 상한.
 
 ---
