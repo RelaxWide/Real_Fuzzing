@@ -786,3 +786,94 @@ class TestWorkerExceptionGuard(unittest.TestCase):
         self.assertIn('openocd_error.set()', tail)
         self.assertIn('worker_exception', tail)
         self.assertIn('traceback', tail)
+
+
+class TestLogCoverage(unittest.TestCase):
+    """텍스트 로그가 전부를 담고, 터미널은 그 부분집합이어야 한다."""
+
+    def _src(self):
+        import pathlib
+        return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
+            encoding='utf-8')
+
+    # 파일 로그에도 같은 내용이 가는 것이 확인된 print — 터미널 화이트리스트를
+    # 우회해 최종 요약을 보여주기 위한 의도된 예외.
+    ALLOWED_PRINTS = {'print(line)'}
+
+    def test_no_runtime_print_bypassing_log(self):
+        """print() 는 파일 로그를 건너뛴다 — 실행 중 경로에 있으면 안 된다.
+        (배너/명령목록 등 setup_logging 이전 출력은 클래스 밖이라 대상 아님)"""
+        import re
+        src = self._src()
+        i = src.index('class NVMeFuzzer')
+        j = src.index("if __name__ ==", i)
+        bad = [l.strip()[:70] for l in src[i:j].split('\n')
+               if re.match(r'^\s+print\(', l)
+               and l.strip() not in self.ALLOWED_PRINTS]
+        self.assertEqual(bad, [], f"클래스 내부 print(): {bad}")
+
+    def test_allowed_print_is_mirrored_to_log(self):
+        """예외로 둔 print 는 같은 내용이 파일 로그에도 가야 한다."""
+        src = self._src()
+        i = src.index('for line in summary_lines:')
+        seg = src[i:i + 300]
+        self.assertIn('print(line)', seg)
+        self.assertIn('log.info(line)', seg)
+
+    def test_early_records_replayed_to_file(self):
+        """setup_logging 은 run() 안에서 불리는데 __init__ 은 그 전에 끝난다 →
+        버퍼가 없으면 정적분석·커버리지 로드 경고가 파일에 안 남는다."""
+        src = self._src()
+        self.assertIn('class _EarlyBuffer', src)
+        i = src.index('logger.addHandler(fh)')
+        self.assertIn('_early_buffer.records', src[i:i + 400])
+
+    def test_early_buffer_bounded(self):
+        """폭주 시 메모리를 먹으면 안 된다."""
+        src = self._src()
+        i = src.index('class _EarlyBuffer')
+        self.assertIn('< 2000', src[i:i + 900])
+
+    def test_new_tags_visible_on_terminal(self):
+        src = self._src()
+        i = src.index('_ALLOW = _re.compile(')
+        seg = src[i:i + 2000]
+        for tag in ('Overlay', 'StaticAnalysis'):
+            self.assertIn(tag, seg, f"[{tag}] 가 터미널 화이트리스트에 없다")
+
+
+class TestOverlayReachedLog(unittest.TestCase):
+    """오버레이는 35개가 한 주소를 공유한다 — '어느 것을 처음 밟았나' 가
+    터미널에 보여야 진행이 눈에 들어온다."""
+
+    def _src(self):
+        import pathlib
+        return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
+            encoding='utf-8')
+
+    def test_logs_on_first_reach_only(self):
+        src = self._src()
+        self.assertIn('새 오버레이 도달', src)
+        i = src.index('새 오버레이 도달')
+        seg = src[max(0, i - 900):i]
+        self.assertIn('_fresh = sorted(_bks - _seen)', seg)
+        self.assertIn('if not _fresh:', seg)
+
+    def test_tracks_per_core(self):
+        src = self._src()
+        self.assertIn('self._ovl_seen', src)
+        i = src.index('_seen = self._ovl_seen.setdefault(_cid, set())')
+        self.assertGreater(i, 0)
+
+    def test_ignores_bank_zero(self):
+        """본체(bank 0)는 오버레이가 아니다 — 매 명령마다 찍히면 안 된다."""
+        src = self._src()
+        i = src.index('for _cid, _bk, _ in _nb:')
+        self.assertIn('if _bk:', src[i:i + 120])
+
+    def test_shows_progress_and_command(self):
+        src = self._src()
+        i = src.index('새 오버레이 도달')
+        seg = src[i:i + 300]
+        self.assertIn('누적', seg)
+        self.assertIn('track_key', seg)

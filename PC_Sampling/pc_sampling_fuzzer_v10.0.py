@@ -1425,6 +1425,8 @@ class _FuzzingTerminalFilter(logging.Filter):
         r'|\[Taint\]'                   # v8.6: kernel taint 진단(시작/변화). [VMon] 은 파일만(터미널 제외)
         r'|\[Sampler\]'                 # 샘플러 실패→복구 알림 (커버리지 측정 정상 재개 확인)
         r'|\[cJTAG/SBA\]'               # BM9K1 transport/SBA 진단·복구
+        r'|\[Overlay\]'                # 코드 오버레이 판별·신규 달성
+        r'|\[StaticAnalysis\]'         # BB/함수 표 로드 결과·불일치 경고
         r'|\[J-Link DLL\]'              # JLinkARM DLL 메시지 중 halt 노이즈 외 실제 경고/에러
         r'|\[LLM'                       # v9.0: RAG 관련(주입/활성/raw/parse/item/stats) 터미널 노출.
                                         #       raw/parse/item 은 rag.debug=true 일 때만 생성되므로
@@ -1510,6 +1512,12 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
+
+    # __init__ 구간(정적분석·커버리지 로드)의 레코드를 파일에 되살린다.
+    for _r in _early_buffer.records:
+        if _r.levelno >= fh.level:
+            fh.emit(_r)
+    _early_buffer.records.clear()
 
     # LLM 전용 로그: 모든 [LLM* 레코드를 output/llm/ 하위폴더에 별도로 모은다(검증 편의).
     # 요청/응답 원본 아카이브(llm_io.jsonl)도 이 폴더에 쌓임 → RAG 관련은 전부 llm/ 에서 확인.
@@ -1619,6 +1627,28 @@ def _logname(p) -> str:
 
 # 모듈 레벨 로거 (setup_logging 호출 전까지 콘솔만 사용)
 log = logging.getLogger('pcfuzz')
+
+
+class _EarlyBuffer(logging.Handler):
+    """setup_logging 전에 나온 레코드를 담아뒀다가 파일 핸들러에 다시 흘린다.
+
+    ★ setup_logging 은 run() 안에서 불리는데 __init__(정적분석/커버리지 로드)은
+    그보다 먼저 끝난다. 그래서 그 구간의 경고들이 파일 로그에 **안 남고** 터미널
+    (logging lastResort)로만 샜다. "텍스트 로그가 전부를 담는다" 는 기조가 깨진다.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        if len(self.records) < 2000:        # 폭주 방지
+            self.records.append(record)
+
+
+_early_buffer = _EarlyBuffer()
+log.setLevel(logging.DEBUG)
+log.addHandler(_early_buffer)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -4506,6 +4536,8 @@ class NVMeFuzzer:
         #   cost=그 명령 윈도우에서 그 코어에 쓴 샘플 수(무효 포함 — 읽기 비용은 동일).
         # 심볼 있는 ELF(RISC-V)면 키워드 기반 자동생성명 필터를 끈다(플랜 §6-1).
         self._autoname_kw_off = ((self.config.arch or 'arm') == 'riscv')
+        # 코어별로 지금까지 도달한 오버레이 bank — '처음 밟은 순간' 만 알리기 위해
+        self._ovl_seen: dict = {}
         self.cmd_core_yield: dict = defaultdict(lambda: defaultdict(int))
         self.cmd_core_samples: dict = defaultdict(lambda: defaultdict(int))
         self.cmd_traces: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
@@ -7525,6 +7557,27 @@ class NVMeFuzzer:
             for _o in _win_obs:
                 _s[_o.core_id] += 1
             self._adaptive_weights_step(_acct.new_by_core, _win_obs)
+            # ── 오버레이 신규 달성 알림 ──
+            #   35개가 한 주소를 공유하므로 "어느 오버레이를 처음 밟았나" 는
+            #   터미널에서 바로 보여야 값이 있다(리포트는 사후 확인용).
+            _nb = [_riscv_cov.unpack(_k) for _k in _acct.seed_keys]
+            _newbank = {}
+            for _cid, _bk, _ in _nb:
+                if _bk:
+                    _newbank.setdefault(_cid, set()).add(_bk)
+            for _cid, _bks in sorted(_newbank.items()):
+                _seen = self._ovl_seen.setdefault(_cid, set())
+                _fresh = sorted(_bks - _seen)
+                if not _fresh:
+                    continue
+                _seen |= _bks
+                _cm = self.cov.cores.get(_cid)
+                _nm = _cm.name if _cm else _cid
+                _tot = len(_cm.banks) if _cm and _cm.banks else 0
+                log.warning(
+                    f"[Overlay] {_nm}: 새 오버레이 도달 "
+                    f"ovl{[b - _riscv_cov.OVL_BANK_OFFSET for b in _fresh]} "
+                    f"(누적 {len(_seen)}/{_tot}) ← {track_key}")
         elif self._sa_loaded and self._sa_bb_starts:
             _mask = self._sa_thumb_mask
             _cur_bbs: set = set()
@@ -9203,7 +9256,7 @@ class NVMeFuzzer:
                 self._sa_bb_starts = [p[0] for p in sorted_pairs]
                 self._sa_bb_ends   = [p[1] for p in sorted_pairs]
                 self._sa_total_bbs = len(self._sa_bb_starts)
-                print(f"[StaticAnalysis] {self.config.bb_file}: {self._sa_total_bbs:,}개 BB "
+                log.warning(f"[StaticAnalysis] {self.config.bb_file}: {self._sa_total_bbs:,}개 BB "
                       f"(0x{self._sa_bb_starts[0]:08x} ~ 0x{self._sa_bb_ends[-1]:08x})")
 
         # --- functions.txt ---
@@ -9233,12 +9286,12 @@ class NVMeFuzzer:
                 self._sa_func_ends    = [t[1] for t in sorted_tuples]
                 self._sa_func_names   = [t[2] for t in sorted_tuples]
                 self._sa_total_funcs  = len(self._sa_func_entries)
-                print(f"[StaticAnalysis] {self.config.func_file}: {self._sa_total_funcs:,}개 함수")
+                log.warning(f"[StaticAnalysis] {self.config.func_file}: {self._sa_total_funcs:,}개 함수")
 
         self._sa_loaded = self._sa_total_bbs > 0 or self._sa_total_funcs > 0
 
         if self._sa_func_entries:
-            print(f"[StaticAnalysis] 함수 주소 범위: "
+            log.warning(f"[StaticAnalysis] 함수 주소 범위: "
                   f"0x{self._sa_func_entries[0]:08x} ~ 0x{self._sa_func_entries[-1]:08x}")
 
         self._sa_diag_done = False   # 첫 update 시 1회만 진단 로그 출력
@@ -16971,7 +17024,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                 for line in summary_lines:
                     log.info(line)
             except Exception as e:
-                print(f"\n[Summary error] {e}")
+                log.error(f"[Summary error] {e}")
 
             try:
                 self.sampler.save_coverage(str(self.output_dir))
