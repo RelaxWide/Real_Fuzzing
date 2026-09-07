@@ -407,3 +407,66 @@ class TestFailClosed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestCommandCoreYield(unittest.TestCase):
+    """명령 × 코어 수확량 — primary_core/weights 를 실측으로 정하는 유일한 근거.
+    이 표가 조용히 비면 '측정했다'고 착각한 채 추정 가중치로 계속 돌게 된다."""
+
+    def _fuzzer_src(self):
+        import pathlib
+        return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
+            encoding='utf-8')
+
+    def test_new_by_core_is_consumed(self):
+        """account() 의 new_by_core 가 실제로 명령별 누적으로 흘러가는지.
+        (계산만 하고 아무도 안 쓰던 회귀를 막는다)"""
+        src = self._fuzzer_src()
+        self.assertIn('_acct.new_by_core', src)
+        self.assertIn('self.cmd_core_yield[track_key]', src)
+        self.assertIn('self.cmd_core_samples[track_key]', src)
+
+    def test_take_observations_called_once(self):
+        """윈도우 관측을 두 번 꺼내면 두 번째는 이미 소비돼 샘플 비용이 0 이 된다."""
+        src = self._fuzzer_src()
+        i = src.index("if getattr(self.sampler, 'PER_CORE_COVERAGE', False) "
+                      "and self.cov is not None:")
+        seg = src[i:i + 1200]
+        self.assertEqual(seg.count('self.sampler.take_observations()'), 1,
+                         "_account_command 에서 take_observations() 는 1회만")
+
+    def test_snapshot_carries_yield(self):
+        """리포트는 렌더 자식 프로세스에서 생성된다 → 스냅샷에 없으면 표가 빈다."""
+        src = self._fuzzer_src()
+        j = src.index('_CHART_SNAPSHOT_ATTRS = (')
+        seg = src[j:j + 900]
+        self.assertIn("'cmd_core_yield'", seg)
+        self.assertIn("'cmd_core_samples'", seg)
+
+    def test_stale_cleanup_includes_csv(self):
+        """이전 run 의 CSV 가 남으면 현재 결과로 오인한다."""
+        src = self._fuzzer_src()
+        k = src.index('루트에 놓이는 RISC-V 보고서도')
+        self.assertIn('command_core_yield.csv', src[k:k + 400])
+
+    def test_nested_counters_survive_snap_copy(self):
+        """_snap_copy 는 바깥 dict 만 평탄화한다 → lambda 팩토리가 pickle 되면 안 된다."""
+        import pickle
+        from collections import defaultdict
+        cy = defaultdict(lambda: defaultdict(int))
+        cy['read'][0] += 3
+        cy['write'][2] += 1
+        snapped = {k: (set(v) if isinstance(v, set)
+                       else list(v) if isinstance(v, list) else v)
+                   for k, v in list(cy.items())}
+        back = pickle.loads(pickle.dumps(snapped))
+        self.assertEqual(back['read'][0], 3)
+        self.assertEqual(back['write'][2], 1)
+        with self.assertRaises(Exception):
+            pickle.dumps(cy)      # 평탄화 없이 그대로 넘기면 실패한다는 사실 고정
+
+    def test_per1k_zero_samples_no_divzero(self):
+        """샘플 0 인 코어(가중치 0 또는 미관측)에서 표가 죽으면 안 된다."""
+        src = self._fuzzer_src()
+        i = src.index('def _per1k(')
+        self.assertIn('if n else 0.0', src[i:i + 160])

@@ -4398,6 +4398,11 @@ class NVMeFuzzer:
         # 서로 다른 ELF를 구분할 수 없으므로 report.html은 이 authoritative 뷰를 쓴다.
         self.cmd_cov_keys: dict[str, Set[int]] = defaultdict(set)
         self._idle_cov_keys: Set[int] = set()  # LLM 명령→함수 힌트에서 배경 함수 차감
+        # v10: 명령 × 코어 수확량 — primary_core / sample_plan.weights 를 추정이 아니라
+        #   실측으로 정하기 위한 유일한 근거. yield=그 명령이 **최초 발견**한 BB 수,
+        #   cost=그 명령 윈도우에서 그 코어에 쓴 샘플 수(무효 포함 — 읽기 비용은 동일).
+        self.cmd_core_yield: dict = defaultdict(lambda: defaultdict(int))
+        self.cmd_core_samples: dict = defaultdict(lambda: defaultdict(int))
         self.cmd_traces: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
         # 기본 명령어 키 초기화
         for c in self.commands:
@@ -7394,12 +7399,21 @@ class NVMeFuzzer:
         if getattr(self.sampler, 'PER_CORE_COVERAGE', False) and self.cov is not None:
             # RISC-V: 코어별 ELF 라 주소가 겹칠 수 있어 (core,bank,addr) 키로 집계한다.
             #   기존 제품 경로(아래 elif)는 한 줄도 바뀌지 않는다.
+            _win_obs = self.sampler.take_observations()
             _acct = self.cov.account(
-                self.sampler.take_observations(),
+                _win_obs,
                 credit_cores=(self.sampler.credit_cores()
                               if hasattr(self.sampler, 'credit_cores') else None))
             is_interesting, new_pcs = _acct.interesting, _acct.new_count
             _seed_covered = _acct.seed_keys
+            # ★ new_by_core 를 명령별로 누적 — 어느 코어가 이 명령에서 실제로
+            #   새 코드를 내는지가 가중치 재배분의 근거다.
+            _y = self.cmd_core_yield[track_key]
+            for _cid, _n in (_acct.new_by_core or {}).items():
+                _y[_cid] += _n
+            _s = self.cmd_core_samples[track_key]
+            for _o in _win_obs:
+                _s[_o.core_id] += 1
         elif self._sa_loaded and self._sa_bb_starts:
             _mask = self._sa_thumb_mask
             _cur_bbs: set = set()
@@ -13705,6 +13719,71 @@ class NVMeFuzzer:
                 f"core={st['name']} id={cid} "
                 f"BB={st['bb']}/{st['bb_total']} ({st['bb_pct']:.2f}%) "
                 f"functions={st['func']}/{st['func_total']} ({st['func_pct']:.2f}%)")
+        # ── 명령 × 코어 수확량 ────────────────────────────────
+        # primary_core / sample_plan.weights 를 추정이 아니라 실측으로 정하기 위한 표.
+        #   new_bb = 그 명령이 그 코어에서 **최초 발견**한 BB 수(= 가치)
+        #   samples = 그 명령 윈도우에서 그 코어를 읽은 횟수(= 비용, 무효 포함)
+        #   per1k  = 1000 샘플당 신규 BB — 가중치는 이 값에 비례해 재배분한다.
+        _cy = getattr(self, 'cmd_core_yield', None) or {}
+        _cs = getattr(self, 'cmd_core_samples', None) or {}
+        if _cy or _cs:
+            _cids = sorted(stats.keys())
+            _nm = {c: stats[c]['name'] for c in _cids}
+            _ty = {c: 0 for c in _cids}
+            _ts = {c: 0 for c in _cids}
+            _cmds = sorted(set(_cy) | set(_cs))
+            for _c in _cmds:
+                for _i in _cids:
+                    _ty[_i] += (_cy.get(_c) or {}).get(_i, 0)
+                    _ts[_i] += (_cs.get(_c) or {}).get(_i, 0)
+
+            def _per1k(y, n):
+                return (1000.0 * y / n) if n else 0.0
+
+            text_lines += ["", "=" * 64,
+                           "코어별 수확 총계 — primary_core / weights 판단 근거",
+                           "=" * 64]
+            for _i in _cids:
+                text_lines.append(
+                    f"core={_nm[_i]:<6} id={_i}  new_bb={_ty[_i]:>7,}  "
+                    f"samples={_ts[_i]:>10,}  per1k={_per1k(_ty[_i], _ts[_i]):>8.3f}")
+            _ranked = sorted(_cids, key=lambda c: _per1k(_ty[c], _ts[c]), reverse=True)
+            if _ranked and _ts.get(_ranked[0]):
+                text_lines.append("")
+                text_lines.append(
+                    "  효율순: " + " > ".join(
+                        f"{_nm[c]}({_per1k(_ty[c], _ts[c]):.3f})" for c in _ranked))
+                text_lines.append(
+                    "  ※ per1k 가 높은 코어에 weights 를 더 준다. samples 가 0 이거나 "
+                    "극단적으로 적은 코어는 아직 판단 불가.")
+
+            text_lines += ["", "=" * 64,
+                           "명령 × 코어  (new_bb/samples, per1k)",
+                           "=" * 64,
+                           "command".ljust(22)
+                           + "".join(_nm[i].ljust(22) for i in _cids)]
+            _by_tot = sorted(
+                _cmds, key=lambda c: sum((_cy.get(c) or {}).values()), reverse=True)
+            for _c in _by_tot[:40]:
+                _cells = []
+                for _i in _cids:
+                    _y = (_cy.get(_c) or {}).get(_i, 0)
+                    _n = (_cs.get(_c) or {}).get(_i, 0)
+                    _cells.append(f"{_y}/{_n} ({_per1k(_y, _n):.2f})".ljust(22))
+                text_lines.append(str(_c)[:21].ljust(22) + "".join(_cells))
+            if len(_by_tot) > 40:
+                text_lines.append(f"... ({len(_by_tot) - 40}개 명령 생략 — "
+                                  f"전체는 command_core_yield.csv)")
+
+            _yr = [["command", "core_id", "core", "new_bb", "samples", "new_bb_per_1k"]]
+            for _c in _cmds:
+                for _i in _cids:
+                    _y = (_cy.get(_c) or {}).get(_i, 0)
+                    _n = (_cs.get(_c) or {}).get(_i, 0)
+                    _yr.append([str(_c), _i, _nm[_i], _y, _n, f"{_per1k(_y, _n):.4f}"])
+            _atomic_text(self.output_dir / 'command_core_yield.csv',
+                         "\n".join(",".join(str(_v) for _v in _r) for _r in _yr) + "\n")
+
         _atomic_text(self.output_dir / 'coverage_by_core.txt', '\n'.join(text_lines) + '\n')
 
         csv_path = self.output_dir / 'function_coverage.csv'
@@ -13785,7 +13864,8 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
 [q,core,status].forEach(x=>x.addEventListener('input',filter));filter();
 </script></body></html>'''
         _atomic_text(self.output_dir / 'report.html', html_doc)
-        log.info("[CoverageReport] coverage_by_core.txt / function_coverage.csv / report.html 갱신")
+        log.info("[CoverageReport] coverage_by_core.txt / function_coverage.csv / "
+                 "command_core_yield.csv / report.html 갱신")
 
     def _generate_all_charts(self) -> None:
         """5종 차트를 순서대로 생성(인프로세스 본체). fork 자식 또는 종료 시 직접 호출."""
@@ -13840,7 +13920,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
     _CHART_SNAPSHOT_ATTRS = (
         '_csfuzz_history', '_sa_bb_starts', '_sa_cov_history', '_sa_covered_bbs',
         '_sa_entered_funcs', '_sa_func_ends', '_sa_func_entries', '_sa_func_names',
-        '_sa_loaded', '_sa_total_bbs', '_sa_total_funcs', 'cmd_pcs', 'cmd_cov_keys', 'cmd_stats',
+        '_sa_loaded', '_sa_total_bbs', '_sa_total_funcs', 'cmd_pcs', 'cmd_cov_keys', 'cmd_core_yield', 'cmd_core_samples', 'cmd_stats',
         'cmd_traces', 'executions', 'mopt_finds', 'mopt_uses', 'mutation_stats',
         'rc_stats', 'NUM_MUTATION_OPS',
     )
@@ -15410,7 +15490,8 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             target.mkdir(parents=True, exist_ok=True)
         # 루트에 놓이는 RISC-V 보고서도 새 run 시작 시 제거한다. 첫 주기 보고서가
         # 생성되기 전까지 이전 run 결과를 현재 결과로 오인하는 일을 막는다.
-        for name in ('coverage_by_core.txt', 'function_coverage.csv', 'report.html'):
+        for name in ('coverage_by_core.txt', 'function_coverage.csv', 'report.html',
+                     'command_core_yield.csv'):
             try:
                 (self.output_dir / name).unlink()
             except FileNotFoundError:
@@ -16531,7 +16612,8 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                             f"({_st['bb_pct']:.2f}%), functions "
                             f"{_st['func']:,}/{_st['func_total']:,} ({_st['func_pct']:.2f}%)")
                     summary_lines.append(
-                        "Coverage reports : coverage_by_core.txt / function_coverage.csv / report.html")
+                        "Coverage reports : coverage_by_core.txt / function_coverage.csv / "
+                        "command_core_yield.csv / report.html")
                 elif self._sa_loaded:
                     if self._sa_total_bbs > 0:
                         n_bb = len(self._sa_covered_bbs)
