@@ -109,6 +109,16 @@ def export_core(core, elf, ovl_map, outdir, objdump=None):
             edges.setdefault(c, set()).update(cs)
     all_fns.sort()
     all_bbs.sort()
+
+    # filemap_core<X>.txt — 함수 주소 → 소스 파일 (호스트 스크립트와 같은 형식:
+    #   "0x<8자리 zero-pad 주소> <소스파일>"). 파일/모듈 단위 커버리지 롤업의 입력.
+    fmap = oe.file_map(syms)
+    with open(os.path.join(outdir, f"filemap_core{core}.txt"), 'w') as f:
+        for addr, src in fmap:
+            f.write(f"0x{addr:08x} {src}\n")
+    _fn_addrs = {a for a, _s, _n in all_fns}
+    _hit = sum(1 for a, _s in fmap if a in _fn_addrs)
+    info["filemap"] = {"entries": len(fmap), "files": len({s for _a, s in fmap})}
     _write_funcs(os.path.join(outdir, f"functions_core{core}.txt"), all_fns)
     _write_bbs(os.path.join(outdir, f"basic_blocks_core{core}.txt"), all_bbs)
     with open(os.path.join(outdir, f"callgraph_core{core}.txt"), 'w') as f:
@@ -124,6 +134,13 @@ def export_core(core, elf, ovl_map, outdir, objdump=None):
                  "exec_sections": len(secs)})
     print(f"  [{core}] 본체 함수 {len(all_fns):5} / BB {len(all_bbs):6} / "
           f"콜그래프 간선 {info['callgraph_edges']:5}")
+    _tot_fns = len(all_fns) or 1
+    print(f"  [{core}] filemap {len(fmap):5} 항목 / 소스파일 "
+          f"{info['filemap']['files']:4}개  (본체 함수의 {100.0*_hit/_tot_fns:.0f}% 귀속)")
+    if fmap and _hit < len(all_fns) * 0.5:
+        print(f"  ⚠ [{core}] 귀속률이 낮다 — STT_FILE 관례는 **LOCAL(static) 함수만** "
+              f"덮는다. 전역 함수까지 하려면 DWARF(decodedline)가 필요하다",
+              file=sys.stderr)
     # 오버레이에만 함수가 있는 코어도 있으므로, 본체가 비었다고 바로 경고하지 않는다.
     if not all_fns and not info.get("overlay", {}).get("banks"):
         print(f"  ⚠ [{core}] STT_FUNC 심볼이 없다 — strip 된 ELF 면 Ghidra 가 필요하다",

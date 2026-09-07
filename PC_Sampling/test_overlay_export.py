@@ -135,18 +135,18 @@ class TestSymbolFilter(unittest.TestCase):
     """함수표는 심볼 테이블만으로 정확히 나온다 — 추측이 없다."""
 
     def test_filters_by_section_and_type(self):
-        syms = [("f_ovl0", 0xAE000, 32, 15, oe.STT_FUNC),
-                ("f_ovl1", 0xAE000, 48, 16, oe.STT_FUNC),
-                ("data", 0xAE100, 4, 15, 1),                  # STT_OBJECT
-                ("zero_size", 0xAE200, 0, 15, oe.STT_FUNC),   # 크기 0 → 제외
-                ("", 0xAE300, 8, 15, oe.STT_FUNC)]            # 이름 없음 → 제외
+        syms = [("f_ovl0", 0xAE000, 32, 15, oe.STT_FUNC, 0),
+                ("f_ovl1", 0xAE000, 48, 16, oe.STT_FUNC, 0),
+                ("data", 0xAE100, 4, 15, 1, 0),                  # STT_OBJECT
+                ("zero_size", 0xAE200, 0, 15, oe.STT_FUNC, 0),   # 크기 0 → 제외
+                ("", 0xAE300, 8, 15, oe.STT_FUNC, 0)]            # 이름 없음 → 제외
         self.assertEqual(oe.funcs_of_section(syms, 15), [(0xAE000, 32, "f_ovl0")])
         self.assertEqual(oe.funcs_of_section(syms, 16), [(0xAE000, 48, "f_ovl1")])
 
     def test_same_address_different_sections(self):
         """오버레이의 핵심 — 같은 주소가 섹션별로 다른 함수다."""
-        syms = [("a", 0xAE000, 10, 15, oe.STT_FUNC),
-                ("b", 0xAE000, 20, 16, oe.STT_FUNC)]
+        syms = [("a", 0xAE000, 10, 15, oe.STT_FUNC, 0),
+                ("b", 0xAE000, 20, 16, oe.STT_FUNC, 0)]
         self.assertNotEqual(oe.funcs_of_section(syms, 15),
                             oe.funcs_of_section(syms, 16))
 
@@ -238,3 +238,53 @@ class TestSymbolsJsonContract(unittest.TestCase):
         cm.fn_entries, cm.fn_ends, cm.fn_names = [0x1000], [0x1010], ['f']
         m._verify_counts(cm, {"counts": {"basic_blocks": 1, "functions": 1}})
         self.assertEqual(m.warnings, [])
+
+
+class TestFileMap(unittest.TestCase):
+    """filemap_core<X>.txt — 함수 주소 → 소스 파일. 파일/모듈 단위 롤업의 입력.
+
+    관례: STT_FILE 심볼 뒤에 오는 LOCAL 함수들이 그 파일 것.
+    """
+
+    F, U = oe.STT_FILE, oe.STT_FUNC
+    L, G = oe.STB_LOCAL, 1
+
+    def test_groups_after_file_symbol(self):
+        syms = [("a.c", 0, 0, 0xFFF1, self.F, self.L),
+                ("s1", 0x1000, 16, 1, self.U, self.L),
+                ("s2", 0x1010, 16, 1, self.U, self.L),
+                ("b.c", 0, 0, 0xFFF1, self.F, self.L),
+                ("s3", 0x2000, 16, 1, self.U, self.L)]
+        self.assertEqual(oe.file_map(syms),
+                         [(0x1000, "a.c"), (0x1010, "a.c"), (0x2000, "b.c")])
+
+    def test_global_functions_unattributed(self):
+        """★ 이 방법의 한계 — GLOBAL(non-static)은 파일 표시 뒤에 안 묶인다.
+        C 펌웨어는 non-static 이 보통 다수라 귀속률이 낮게 나올 수 있다."""
+        syms = [("a.c", 0, 0, 0xFFF1, self.F, self.L),
+                ("stat_fn", 0x1000, 16, 1, self.U, self.L),
+                ("glob_fn", 0x1010, 16, 1, self.U, self.G)]
+        self.assertEqual(oe.file_map(syms), [(0x1000, "a.c")])
+
+    def test_before_any_file_symbol_skipped(self):
+        syms = [("orphan", 0x1000, 16, 1, self.U, self.L),
+                ("a.c", 0, 0, 0xFFF1, self.F, self.L),
+                ("s1", 0x2000, 16, 1, self.U, self.L)]
+        self.assertEqual(oe.file_map(syms), [(0x2000, "a.c")])
+
+    def test_sorted_by_address(self):
+        syms = [("a.c", 0, 0, 0xFFF1, self.F, self.L),
+                ("s2", 0x2000, 16, 1, self.U, self.L),
+                ("s1", 0x1000, 16, 1, self.U, self.L)]
+        self.assertEqual([a for a, _f in oe.file_map(syms)], [0x1000, 0x2000])
+
+    def test_non_func_ignored(self):
+        syms = [("a.c", 0, 0, 0xFFF1, self.F, self.L),
+                ("var", 0x1000, 4, 1, 1, self.L)]          # STT_OBJECT
+        self.assertEqual(oe.file_map(syms), [])
+
+    def test_output_format_zero_padded(self):
+        """호스트 스크립트와 같은 형식이어야 한다: 0x + 8자리 zero-pad."""
+        src = Path(__file__).with_name('tools').joinpath('fw_export.py').read_text(
+            encoding='utf-8')
+        self.assertIn('f"0x{addr:08x} {src}', src)

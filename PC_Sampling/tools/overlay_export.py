@@ -40,6 +40,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import overlay_probe as op          # noqa: E402  (ELF 파서·맵 로더 재사용)
 
 STT_FUNC = 2
+STT_FILE = 4
+STB_LOCAL = 0
 
 
 # ── 심볼 테이블 ─────────────────────────────
@@ -72,14 +74,14 @@ def read_symbols(path):
             continue
         end = strtab.find(b'\0', st_name)
         name = strtab[st_name:end].decode('utf-8', 'replace')
-        out.append((name, st_value, st_size, st_shndx, st_info & 0xF))
+        out.append((name, st_value, st_size, st_shndx, st_info & 0xF, st_info >> 4))
     return out
 
 
 def funcs_of_section(syms, shndx):
     """그 섹션에 속한 STT_FUNC 만. 크기 0(별칭/thunk)은 버린다 — 범위가 없으면
     bisect 조회에서 무의미하다."""
-    rows = [(v, s, n) for (n, v, s, sh, t) in syms
+    rows = [(v, s, n) for (n, v, s, sh, t, _b) in syms
             if sh == shndx and t == STT_FUNC and s > 0 and n]
     rows.sort()
     return rows
@@ -173,6 +175,27 @@ def scan_blocks(body, base, func_entries):
         if end > a:
             blocks.append((a, end))
     return blocks
+
+
+def file_map(syms):
+    """함수 주소 → 소스 파일. STT_FILE 심볼 뒤에 오는 **LOCAL** 함수들이 그 파일 것.
+
+    이게 심볼 테이블의 관례다: 각 오브젝트 파일의 지역 심볼들이 그 파일의 STT_FILE
+    항목 뒤에 묶여 나온다. 그래서 **GLOBAL(=non-static) 함수는 귀속되지 않는다** —
+    지역 심볼 뒤에 파일 표시 없이 나오기 때문이다. C 펌웨어에서 non-static 이
+    보통 다수라, 이 방법의 커버율은 static 함수 비중이 결정한다.
+    (전역까지 하려면 DWARF: readelf --debug-dump=decodedline / DW_AT_decl_file)
+
+    반환: [(addr, file)] — 주소 오름차순.
+    """
+    cur, out = None, []
+    for name, val, _sz, _sh, typ, bind in syms:
+        if typ == STT_FILE:
+            cur = name or None
+        elif typ == STT_FUNC and bind == STB_LOCAL and cur and name:
+            out.append((val, cur))
+    out.sort()
+    return out
 
 
 def scan_blocks_bounded(body, base, funcs):
