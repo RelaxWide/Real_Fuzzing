@@ -750,3 +750,57 @@ class TestRuntimeBankResolution(unittest.TestCase):
         m.update([rc.Observation(0, self.BASE + 8, True, True, 1),
                   rc.Observation(0, self.BASE + 8, True, True, 1)])
         self.assertEqual(len(m.covered_bbs), 1)
+
+
+class TestFlatView(unittest.TestCase):
+    """firmware_map.png 어댑터 — RISC-V 에서 차트가 아예 안 나오던 것을 고친다."""
+
+    def _model(self):
+        m = rc.CoverageModel()
+        a = rc.CoreMap(0, 'H')
+        a.fn_entries = [0x1000, 0x2000]
+        a.fn_ends = [0x1100, 0x2100]
+        a.fn_names = ['fa', 'fb']
+        a.bb_starts = [0x1000, 0x1080, 0x2000]
+        a.bb_ends = [0x1080, 0x1100, 0x2100]
+        b = rc.CoreMap(2, 'F')
+        b.fn_entries = [0x9000]
+        b.fn_ends = [0x9100]
+        b.fn_names = ['fc']
+        b.bb_starts = [0x9000]
+        b.bb_ends = [0x9100]
+        m.cores = {0: a, 2: b}
+        m.loaded = True
+        return m
+
+    def test_picks_core_with_most_functions(self):
+        self.assertEqual(self._model().flat_view()['name'], 'H')
+
+    def test_explicit_core(self):
+        self.assertEqual(self._model().flat_view(2)['name'], 'F')
+
+    def test_only_selected_core_data(self):
+        m = self._model()
+        m.covered_bbs |= {rc.pack(0, 0, 0x1000), rc.pack(2, 0, 0x9000)}
+        fv = m.flat_view(0)
+        self.assertEqual(fv['covered_bbs'], {0x1000}, '다른 코어 주소가 섞이면 안 된다')
+
+    def test_excludes_nonzero_bank(self):
+        """오버레이는 같은 주소에 여러 코드가 겹쳐 한 축에 못 그린다 → 제외."""
+        m = self._model()
+        m.covered_bbs |= {rc.pack(0, 0, 0x1000), rc.pack(0, 3, 0x1000)}
+        self.assertEqual(m.flat_view(0)['covered_bbs'], {0x1000})
+
+    def test_skips_cores_without_body(self):
+        """모든 함수가 오버레이에만 있는 코어를 골라놓고 포기하면 안 된다."""
+        m = self._model()
+        m.cores[0].fn_entries = []
+        m.cores[0].fn_names = []
+        m.cores[0].fn_ends = []
+        self.assertEqual(m.flat_view()['name'], 'F')
+
+    def test_none_when_no_bodies(self):
+        m = self._model()
+        for c in m.cores.values():
+            c.fn_entries = []
+        self.assertIsNone(m.flat_view())

@@ -115,7 +115,11 @@ def export_core(core, elf, ovl_map, outdir, objdump=None):
         for c in sorted(edges):
             for e in sorted(edges[c]):
                 f.write(f"0x{c:x} 0x{e:x}\n")
-    info.update({"functions": len(all_fns), "basic_blocks": len(all_bbs),
+    # ★ counts 는 **중첩**이어야 한다 — CoverageModel._verify_counts 가
+    #   info["counts"]["basic_blocks"] 를 본다. 최상위에 쓰면 개수 대조가
+    #   조용히 건너뛰어져(파일 잘림·짝 안 맞음 탐지가 목적인데) 무력화된다.
+    info.update({"counts": {"functions": len(all_fns),
+                            "basic_blocks": len(all_bbs)},
                  "callgraph_edges": sum(len(v) for v in edges.values()),
                  "exec_sections": len(secs)})
     print(f"  [{core}] 본체 함수 {len(all_fns):5} / BB {len(all_bbs):6} / "

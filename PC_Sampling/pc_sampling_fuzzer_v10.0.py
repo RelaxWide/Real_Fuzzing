@@ -17059,6 +17059,24 @@ def _render_charts_from_snapshot(snapshot_path: str) -> int:
     if _cov_snap:
         import riscv_cov as _riscv_cov
         inst.cov = _riscv_cov.CoverageModel.from_snapshot(_cov_snap)
+        # firmware_map.png 는 _sa_* 를 직접 읽는데 RISC-V 는 그 필드가 비어 있어
+        # 차트가 **아예 생성되지 않았다**. 차트 코드를 건드리지 않고 데이터만
+        # 채운다. 코어 하나(코드가 가장 많은 코어)의 비오버레이 본체만 쓴다 —
+        # 코어마다 주소공간이 독립이라 합치면 주소축이 뒤섞이고, 오버레이는
+        # 같은 주소에 여러 코드가 겹쳐 한 축에 그릴 수 없다.
+        if not snap.get('attrs', {}).get('_sa_loaded'):
+            _fv = inst.cov.flat_view()
+            if _fv:
+                inst._sa_func_entries = _fv['fn_entries']
+                inst._sa_func_ends = _fv['fn_ends']
+                inst._sa_func_names = _fv['fn_names']
+                inst._sa_entered_funcs = _fv['entered_funcs']
+                inst._sa_bb_starts = _fv['bb_starts']
+                inst._sa_bb_ends = [0] * len(_fv['bb_starts'])
+                inst._sa_covered_bbs = _fv['covered_bbs']
+                inst._sa_total_bbs = _fv['total_bbs']
+                inst._sa_total_funcs = _fv['total_funcs']
+                inst._fm_core = _fv['name']
     else:
         inst.cov = None
     inst.output_dir = Path(snap['output_dir'])

@@ -200,3 +200,41 @@ class TestBoundedScanAndCallgraph(unittest.TestCase):
         """함수 내부로 뛰는 것은 호출이 아니라 분기다."""
         body = struct.pack('<I', jal(1, 8)) + struct.pack('<I', 0x00100093) * 3
         self.assertEqual(oe.extract_callgraph(body, BASE, [(BASE, 16, 'a')]), {})
+
+
+class TestSymbolsJsonContract(unittest.TestCase):
+    """★ symbols.json 은 CoverageModel._verify_counts 가 읽는 형식이어야 한다.
+
+    counts 를 최상위에 쓰면 info.get("counts") 가 {} 라 개수 대조가 **조용히
+    건너뛰어진다** — 파일 잘림·짝 안 맞음 탐지가 목적인데 무력화된다.
+    """
+
+    def test_counts_are_nested(self):
+        src = Path(__file__).with_name('tools').joinpath('fw_export.py').read_text(
+            encoding='utf-8')
+        self.assertIn('"counts": {"functions"', src)
+
+    def test_verify_counts_reads_nested(self):
+        """CoverageModel 쪽 계약을 같이 고정한다(한쪽만 바뀌면 조용히 깨진다)."""
+        rc_src = Path(__file__).with_name('riscv_cov.py').read_text(encoding='utf-8')
+        i = rc_src.index('def _verify_counts')
+        self.assertIn('info.get("counts")', rc_src[i:i + 400])
+
+    def test_roundtrip_detects_mismatch(self):
+        import riscv_cov as rc
+        m = rc.CoverageModel()
+        cm = rc.CoreMap(0, 'H')
+        cm.bb_starts, cm.bb_ends = [0x1000], [0x1010]
+        cm.fn_entries, cm.fn_ends, cm.fn_names = [0x1000], [0x1010], ['f']
+        m._verify_counts(cm, {"counts": {"basic_blocks": 99, "functions": 1}})
+        self.assertTrue(any('basic_blocks' in w for w in m.warnings),
+                        "개수가 다르면 경고가 나와야 한다")
+
+    def test_roundtrip_silent_when_match(self):
+        import riscv_cov as rc
+        m = rc.CoverageModel()
+        cm = rc.CoreMap(0, 'H')
+        cm.bb_starts, cm.bb_ends = [0x1000], [0x1010]
+        cm.fn_entries, cm.fn_ends, cm.fn_names = [0x1000], [0x1010], ['f']
+        m._verify_counts(cm, {"counts": {"basic_blocks": 1, "functions": 1}})
+        self.assertEqual(m.warnings, [])

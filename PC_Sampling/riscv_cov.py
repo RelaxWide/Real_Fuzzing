@@ -389,6 +389,38 @@ class CoverageModel:
         out.sort(key=lambda t: -t[1])
         return out[:limit] if limit else out
 
+    def flat_view(self, core_id=None):
+        """한 코어를 기존 차트가 기대하는 _sa_* 모양으로 평탄화한다.
+
+        firmware_map.png 는 _sa_func_entries/_sa_bb_starts 를 직접 읽는데 RISC-V 는
+        그 필드가 비어 있어 **차트가 아예 생성되지 않았다**. matplotlib 코드를
+        건드리지 않고 데이터만 채워 넣기 위한 어댑터.
+
+        코어를 하나만 쓰는 이유: 코어마다 주소공간이 독립이라 합치면 주소축이
+        뒤섞여 지도가 거짓말을 한다. bank 0(비오버레이 본체)만 쓰는 것도 같은
+        이유다 — 오버레이는 같은 주소에 여러 코드가 겹쳐 한 축에 못 그린다.
+        """
+        if core_id is None:
+            # 본체(비오버레이) 함수가 **있는** 코어 중에서 고른다. 코드가 가장 많은
+            # 코어를 먼저 고르고 나서 비었다고 포기하면, 다른 코어로는 그릴 수
+            # 있는데도 지도가 통째로 안 나온다.
+            cand = [c for c, m in self.cores.items() if m.fn_entries]
+            if not cand:
+                return None
+            core_id = max(cand, key=lambda c: self.cores[c].total_funcs)
+        cm = self.cores.get(core_id)
+        if cm is None or not cm.fn_entries:
+            return None
+        ent = {unpack(k)[2] for k in self.entered_funcs
+               if unpack(k)[0] == core_id and unpack(k)[1] == 0}
+        cov = {unpack(k)[2] for k in self.covered_bbs
+               if unpack(k)[0] == core_id and unpack(k)[1] == 0}
+        return {"core_id": core_id, "name": cm.name,
+                "fn_entries": list(cm.fn_entries), "fn_ends": list(cm.fn_ends),
+                "fn_names": list(cm.fn_names), "entered_funcs": ent,
+                "bb_starts": list(cm.bb_starts), "covered_bbs": cov,
+                "total_bbs": cm.total_bbs, "total_funcs": cm.total_funcs}
+
     def frontier_functions(self, core_id, limit=None):
         """★ 도달한 함수가 **직접 호출하는데** 아직 안 간 함수 — 호출자 수 많은 순.
         '가장 큰 미도달'보다 실행 가능하다: 퍼저가 이미 있는 지점에서 한 걸음 거리."""
