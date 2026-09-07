@@ -169,7 +169,12 @@ else:
     _any_ovl = False
     for c in CORES:
         omap = PROD / f"overlay_probe_core{c}.json"      # 실측 판별표(선택)
-        olay = PROD / f"overlay_core{c}.json"             # 빌드 레이아웃 맵(권장)
+        olay = None                                       # 빌드 레이아웃 맵
+        if _rc is not None:
+            for _cand in _rc.overlay_layout_candidates(c):
+                if (PROD / _cand).exists():
+                    olay = PROD / _cand
+                    break
         # 파일명 오타를 잡는다 — 단수형(basic_block_)이면 로더가 조용히 무시한다
         wrong = sorted(PROD.glob(f"basic_block_core{c}_ovl*.txt"))
         if wrong:
@@ -178,12 +183,13 @@ else:
                 f" 예: {wrong[0].name}")
         bbs = sorted(PROD.glob(f"basic_blocks_core{c}_ovl*.txt"))
         fns = sorted(PROD.glob(f"functions_core{c}_ovl*.txt"))
-        if not (bbs or fns or omap.exists() or olay.exists()):
+        if not (bbs or fns or omap.exists() or olay):
             continue                       # 이 코어는 오버레이 없음 — 정상
         _any_ovl = True
-        if not (omap.exists() or olay.exists()):
+        if not (omap.exists() or olay):
+            _cands = _rc.overlay_layout_candidates(c)[:3] if _rc else []
             bad(f"core{c} 오버레이 설정",
-                f"overlay_core{c}.json(빌드 레이아웃 맵) 없음 — 없으면 bank 표가"
+                f"빌드 레이아웃 맵 없음 (찾는 이름: {_cands}) — 없으면 bank 표가"
                 f" 있어도 전부 bank 0 으로 접힌다")
             continue
         try:
@@ -202,7 +208,7 @@ else:
                 n_map = len(om.get("bank_sizes") or {})
                 om = {"base": om["base"], "probe_offsets": om["probe_offsets"],
                       "header": {"magic": hex(om["magic"])}}
-                src = "빌드 레이아웃 맵(규약 유도)"
+                src = f"{olay.name} (규약 유도)"
         except Exception as e:
             bad(f"core{c} 오버레이 설정", f"파싱 실패 {e}")
             continue

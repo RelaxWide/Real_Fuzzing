@@ -215,3 +215,46 @@ class TestLayoutMapIsEnough(unittest.TestCase):
             json.dump({"nonsense": 1}, open(Path(d, 'overlay_coreH.json'), 'w'))
             m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
             self.assertTrue(any('레이아웃 맵 스키마' in w for w in m.warnings))
+
+
+class TestBuildFilenames(unittest.TestCase):
+    """빌드가 내는 이름(FW_<X>Core_overlay_map.json)을 그대로 받아야 한다.
+    산출물 이름을 퍼저에 맞추라고 요구하면 매 빌드마다 손이 간다."""
+
+    LAY = {f".OVL_REGION_{n:02d}": {"section_index": 19 + n, "addr": BASE,
+                                    "size": 4096} for n in range(3)}
+
+    def test_build_name_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_assets(d, banks=3)
+            Path(d, 'overlay_probe_coreH.json').unlink()
+            json.dump(self.LAY, open(Path(d, 'FW_HCore_overlay_map.json'), 'w'))
+            cm = rc.CoverageModel.load(d, product='BM9K1',
+                                       core_ids={'H': 0}).cores[0]
+            self.assertEqual(cm.overlay['layout_file'], 'FW_HCore_overlay_map.json')
+            self.assertEqual(len(cm.banks), 3)
+
+    def test_core_letter_glob_would_misfire(self):
+        """★ 'FW_HCore_overlay_map.json' 에는 FW 의 F 가 있다 — 코어 문자로
+        글롭하면 F코어 파일로 오인한다. 명시적 후보만 써야 하는 이유."""
+        self.assertIn('F', 'FW_HCore_overlay_map.json')
+        self.assertNotIn('FW_HCore_overlay_map.json',
+                         rc.overlay_layout_candidates('F'))
+
+    def test_candidates_are_core_specific(self):
+        for c in ('H', 'CM', 'F', 'Q'):
+            for cand in rc.overlay_layout_candidates(c):
+                for other in ('H', 'CM', 'F', 'Q'):
+                    if other != c:
+                        self.assertNotIn(cand, rc.overlay_layout_candidates(other),
+                                         f"{cand} 가 {c}/{other} 양쪽에 걸린다")
+
+    def test_near_miss_names_reported(self):
+        """이름만 다를 때 디렉토리의 비슷한 파일을 알려줘야 원인을 바로 안다."""
+        with tempfile.TemporaryDirectory() as d:
+            write_assets(d, banks=3)
+            Path(d, 'overlay_probe_coreH.json').unlink()
+            json.dump(self.LAY, open(Path(d, 'HCore-overlaymap.json'), 'w'))  # 안 맞는 이름
+            m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
+            w = ' '.join(m.warnings)
+            self.assertIn('HCore-overlaymap.json', w)

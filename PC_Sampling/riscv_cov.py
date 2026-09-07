@@ -44,6 +44,21 @@ OVL_HDR_MASK = 0xFFFFFF00
 OVL_HDR_ID_MASK = 0x000000FF
 
 
+def overlay_layout_candidates(name):
+    """코어 <name> 의 빌드 레이아웃 맵 후보 파일명(우선순위 순).
+
+    ★ 코어 문자로 글롭하면 안 된다 — "FW_HCore_overlay_map.json" 에는 FW 의 F 가
+    들어 있어 F코어 파일로 오인된다. 명시적 후보만 쓴다.
+    """
+    return [
+        f"overlay_core{name}.json",              # 이 저장소 규약
+        f"overlay_map_core{name}.json",          # 구 이름(호환)
+        f"FW_{name}Core_overlay_map.json",       # 빌드 산출물 규약
+        f"{name}Core_overlay_map.json",
+        f"FW_{name}Core.overlay_map.json",
+    ]
+
+
 def overlay_from_layout(doc, offset=OVL_HDR_OFFSET, magic=OVL_HDR_MAGIC,
                         mask=OVL_HDR_MASK, id_mask=OVL_HDR_ID_MASK):
     """빌드 레이아웃 맵(.OVL_REGION_NN: section_index/addr/size) → 런타임 판별 설정.
@@ -331,7 +346,12 @@ class CoverageModel:
             #      탈출구이며, 있으면 ① 보다 우선한다(측정값이 가정을 이긴다).
             cm.overlay = None
             probe_p = os.path.join(product_dir, f"overlay_probe_core{name}.json")
-            layout_p = os.path.join(product_dir, f"overlay_core{name}.json")
+            layout_p = None
+            for _cand in overlay_layout_candidates(name):
+                _p = os.path.join(product_dir, _cand)
+                if os.path.exists(_p):
+                    layout_p = _p
+                    break
             if os.path.exists(probe_p):
                 with open(probe_p, encoding="utf-8") as f:
                     o = json.load(f)
@@ -348,21 +368,29 @@ class CoverageModel:
                                       for k, v in (o.get("probe_to_bank") or {}).items()},
                     "source": "probe",
                 }
-            elif os.path.exists(layout_p):
+            elif layout_p:
                 with open(layout_p, encoding="utf-8") as f:
                     cm.overlay = overlay_from_layout(json.load(f))
                 if cm.overlay is None:
                     m.warnings.append(
-                        f"core{name}: overlay_core{name}.json 이 레이아웃 맵 스키마가"
-                        f" 아니다(.OVL_REGION_NN: section_index/addr/size 필요)")
+                        f"core{name}: {os.path.basename(layout_p)} 이 레이아웃 맵"
+                        f" 스키마가 아니다(.OVL_REGION_NN: section_index/addr/size 필요)")
+                else:
+                    cm.overlay["layout_file"] = os.path.basename(layout_p)
             else:
                 import glob as _glob
                 _orph = _glob.glob(os.path.join(
                     product_dir, f"basic_blocks_core{name}_ovl*.txt"))
                 if _orph:
+                    # 비슷한 이름이 있으면 같이 알려준다 — 이름만 다른 경우가 많다.
+                    _near = sorted(os.path.basename(x) for x in
+                                   _glob.glob(os.path.join(product_dir, "*overlay*")) +
+                                   _glob.glob(os.path.join(product_dir, "*ovl*.json")))
                     m.warnings.append(
-                        f"core{name}: 오버레이 표 {len(_orph)}개가 있는데 "
-                        f"overlay_core{name}.json(빌드 레이아웃 맵)이 없어 **무시**한다")
+                        f"core{name}: 오버레이 표 {len(_orph)}개가 있는데 레이아웃 맵을"
+                        f" 못 찾아 **무시**한다. 찾는 이름: "
+                        f"{overlay_layout_candidates(name)[:3]}"
+                        + (f" | 디렉토리에 있는 비슷한 파일: {_near[:6]}" if _near else ""))
             if cm.overlay:
                 for bank in sorted(cm.overlay["bank_sizes"]):
                     _n = bank - OVL_BANK_OFFSET        # 파일명은 오버레이 순번
