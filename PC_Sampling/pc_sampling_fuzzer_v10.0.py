@@ -15019,12 +15019,20 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                      if self.config.state_enabled else "")
         _seq_cnt = sum(1 for s in self.corpus if isinstance(s, SequenceSeed))
         _seq_run = self.mutation_stats.get('seq_builtin', 0)
+        # 세션 붕괴/복구는 지금까지 error 로그에만 남아, 로그를 뒤지지 않으면
+        # 보이지 않았다. 붕괴가 **감지되지 않은 채** 진행되면 커버리지가 조용히
+        # 멈추므로, 카운터를 주기 통계에 노출해 눈에 띄게 한다.
+        _col = getattr(self.sampler, 'collapse_count', 0)
+        _col_tag = ""
+        if _col:
+            _col_tag = (f" | collapse: {_col}"
+                        f"(복구 {getattr(self.sampler, 'recover_ok', 0)})")
         log.warning(f"[Stats] exec: {stats['executions']:,} | "
                  f"corpus: {stats['corpus_size']}(seq:{_seq_cnt}) | "
                  f"pcs: {stats['coverage_unique_pcs']:,} | "
                  f"exec/s: {window_eps:.1f} | "
                  f"seq_run: {_seq_run}"
-                 f"{ps_tag}{state_tag}")
+                 f"{_col_tag}{ps_tag}{state_tag}")
         # 시작 배너를 놓쳐도 알 수 있게 주기 통계마다 재알림(정상 버전이면 아무것도 안 찍힘).
         _nvme_cli_warn(log, brief=True)
         _bbc, _bbt, _fnc, _fnt, _by_core = self._cov_totals(by_core=True)
