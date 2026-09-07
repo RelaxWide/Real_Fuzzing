@@ -235,20 +235,34 @@ class CoreMap:
                                           for t in self.banks.values())
 
 
-def _read_bb(path):
+def _read_bb(path, dropped=None):
+    """`0xSTART 0xEND` → (starts, ends). END 는 exclusive.
+
+    dropped 리스트를 주면 **버린 줄의 이유**를 담아준다. 개수 불일치를 볼 때
+    "표가 잘렸나 / 형식이 다른가 / 계약이 어긋났나" 를 가르는 유일한 근거다.
+    """
     starts, ends = [], []
+    n_short = n_parse = n_range = 0
     with open(path) as f:
         for line in f:
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
             p = line.split()
             if len(p) < 2:
+                n_short += 1
                 continue
             try:
                 s, e = int(p[0], 16), int(p[1], 16)
             except ValueError:
+                n_parse += 1
                 continue
             if e > s:                      # END 는 exclusive → 반드시 s < e
                 starts.append(s)
                 ends.append(e)
+            else:
+                n_range += 1               # END <= START — 빈 BB 는 조회 불가
+    if dropped is not None and (n_short or n_parse or n_range):
+        dropped.append((os.path.basename(path), n_short, n_parse, n_range))
     pairs = sorted(zip(starts, ends))
     return [p[0] for p in pairs], [p[1] for p in pairs]
 
@@ -324,9 +338,10 @@ class CoverageModel:
             cg = os.path.join(product_dir, f"callgraph_core{name}.txt")
             if not os.path.exists(bb) and not os.path.exists(fn):
                 continue
+            _drop = []
             cm = CoreMap(cid, name)
             if os.path.exists(bb):
-                cm.bb_starts, cm.bb_ends = _read_bb(bb)
+                cm.bb_starts, cm.bb_ends = _read_bb(bb, _drop)
             if os.path.exists(fn):
                 cm.fn_entries, cm.fn_ends, cm.fn_names = _read_funcs(fn)
             if os.path.exists(cg):
@@ -400,7 +415,7 @@ class CoverageModel:
                                         f"functions_core{name}_ovl{_n}.txt")
                     if not os.path.exists(bb_b):
                         continue          # 표 없으면 effective_bank 가 0 으로 접는다
-                    bs, be = _read_bb(bb_b)
+                    bs, be = _read_bb(bb_b, _drop)
                     if not bs:
                         # 0바이트/파싱불가 표를 등록하면 그 오버레이 샘플이 bank N 으로
                         # 태깅된 뒤 BB 를 못 찾아 **조용히 버려진다**. 등록하지 않고
@@ -417,6 +432,11 @@ class CoverageModel:
                                       "fn_names": fnm}
             info = (sym.get("cores") or {}).get(name, {})
             cm.elf_sha256 = info.get("elf_sha256", "")
+            for _fn, _short, _parse, _rng in _drop:
+                # 개수가 안 맞을 때 "왜 줄었나" 를 가르는 유일한 근거.
+                m.warnings.append(
+                    f"core{name}: {_fn} 에서 버린 줄 — "
+                    f"토큰부족 {_short} / 16진아님 {_parse} / END<=START {_rng}")
             m._verify_counts(cm, info)
             m.cores[cid] = cm
         m.loaded = bool(m.cores)
@@ -431,8 +451,23 @@ class CoverageModel:
         오버레이 개수를 검증하려면 counts.overlay_{basic_blocks,functions} 를 쓴다.
         """
         c = info.get("counts") or {}
-        checks = [("basic_blocks", c.get("basic_blocks"), len(cm.bb_starts)),
-                  ("functions", c.get("functions"), len(cm.fn_entries))]
+        # ★ 추출기가 counts 를 '본체만' 으로 쓰는지 '오버레이 합산 총계' 로 쓰는지
+        #   규약이 갈린다. 어느 쪽이든 맞으면 통과시킨다 — 헛경고가 나면 사람이
+        #   경고 자체를 무시하게 되어 이 검사의 목적(잘림 탐지)이 사라진다.
+        _bb_base, _fn_base = len(cm.bb_starts), len(cm.fn_entries)
+        _bb_all = _bb_base + sum(len(t["bb_starts"]) for t in cm.banks.values())
+        _fn_all = _fn_base + sum(len(t["fn_entries"]) for t in cm.banks.values())
+        for label, want, base_v, all_v in (
+                ("basic_blocks", c.get("basic_blocks"), _bb_base, _bb_all),
+                ("functions", c.get("functions"), _fn_base, _fn_all)):
+            if want is None or want in (base_v, all_v):
+                continue
+            self.warnings.append(
+                f"core{cm.name}: {label} 개수 불일치 symbols.json={want} "
+                f"실제 본체={base_v}"
+                + (f" / 오버레이 합산={all_v}" if all_v != base_v else "")
+                + " — 표가 잘렸거나 ELF 와 짝이 안 맞는다")
+        checks = []
         if cm.banks:
             checks += [
                 ("overlay_basic_blocks", c.get("overlay_basic_blocks"),

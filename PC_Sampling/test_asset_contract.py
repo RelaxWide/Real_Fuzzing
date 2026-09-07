@@ -298,3 +298,62 @@ class TestEmptyTables(unittest.TestCase):
             Path(d, 'basic_blocks_coreH_ovl1.txt').write_text("")
             m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
             self.assertEqual(m.total_bbs, 2 + 2 * 2)     # 본체 2 + bank 2개분
+
+
+class TestCountMismatchDiagnostics(unittest.TestCase):
+    """개수 불일치를 볼 때 '왜 줄었나' 를 가를 수 있어야 한다.
+    실기: symbols.json 5만 vs 실제 3만 — 계약 차이인지 표 잘림인지 구분 불가였다."""
+
+    def _cm(self, base=30000, bank=20000):
+        cm = rc.CoreMap(0, 'H')
+        cm.bb_starts = [1] * base
+        cm.fn_entries = [1] * (base // 10)
+        if bank:
+            cm.banks = {1: {"bb_starts": [1] * bank, "bb_ends": [],
+                            "fn_entries": [1] * (bank // 10), "fn_ends": [],
+                            "fn_names": []}}
+        return cm
+
+    def test_base_only_convention_passes(self):
+        m = rc.CoverageModel()
+        m._verify_counts(self._cm(), {"counts": {"basic_blocks": 30000}})
+        self.assertEqual(m.warnings, [])
+
+    def test_total_convention_passes(self):
+        """추출기가 오버레이 합산 총계를 쓰더라도 헛경고가 나면 안 된다."""
+        m = rc.CoverageModel()
+        m._verify_counts(self._cm(), {"counts": {"basic_blocks": 50000}})
+        self.assertEqual(m.warnings, [])
+
+    def test_真_mismatch_still_caught(self):
+        """둘 다 아니면 진짜 문제다 — 잡아야 한다."""
+        m = rc.CoverageModel()
+        m._verify_counts(self._cm(), {"counts": {"basic_blocks": 41234}})
+        self.assertTrue(m.warnings)
+        self.assertIn('본체=30000', m.warnings[0])
+        self.assertIn('오버레이 합산=50000', m.warnings[0])
+
+    def test_dropped_lines_reported_with_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, 'basic_blocks_coreH.txt').write_text(
+                "0x10000 0x10010\n"      # 정상
+                "0x10010 0x10010\n"      # END==START
+                "0x10020 0x10018\n"      # END<START
+                "0x10030\n"              # 토큰 부족
+                "zzzz qqqq\n")           # 16진 아님
+            Path(d, 'functions_coreH.txt').write_text("0x10000 16 m\n")
+            m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
+            self.assertEqual(len(m.cores[0].bb_starts), 1)
+            w = ' '.join(m.warnings)
+            self.assertIn('버린 줄', w)
+            self.assertIn('END<=START 2', w)
+            self.assertIn('토큰부족 1', w)
+            self.assertIn('16진아님 1', w)
+
+    def test_clean_file_no_drop_warning(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, 'basic_blocks_coreH.txt').write_text(
+                "# comment\n\n0x10000 0x10010\n0x10010 0x10020\n")
+            Path(d, 'functions_coreH.txt').write_text("0x10000 16 m\n")
+            m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
+            self.assertEqual(m.warnings, [], "주석·빈 줄은 '버림' 이 아니다")
