@@ -84,6 +84,27 @@ class CoreMap:
         o = self.overlay
         return bool(o) and o["base"] <= pc < o["window_end"]
 
+    def overlay_probe_addr(self):
+        """런타임에 읽을 주소. 오버레이가 없거나 프로브를 못 찾았으면 None."""
+        o = self.overlay
+        if not o or not o.get("probe_offsets"):
+            return None
+        return o["base"] + o["probe_offsets"][0]
+
+    def resolve_bank(self, word):
+        """프로브 워드 → bank. 해석 불가면 None(그 버스트는 못 믿는다).
+
+        매직 불일치는 오버레이 미탑재 / 복사 중 / 읽기 실패 중 하나다. 어느 쪽이든
+        지금 그 자리에 뭐가 있는지 모른다는 뜻이라 bank 를 찍으면 안 된다.
+        """
+        o = self.overlay
+        if not o or word is None:
+            return None
+        mm, mg = o.get("magic_mask"), o.get("magic")
+        if mm and mg is not None and (word & mm) != mg:
+            return None
+        return (o.get("probe_to_bank") or {}).get(word)
+
     def effective_bank(self, pc, bank):
         """키에 쓸 bank. ★ 부풀림 방지 —
 
@@ -243,6 +264,10 @@ class CoverageModel:
                     "id_mask": int(hdr.get("id_mask", "0"), 0) if hdr else None,
                     "bank_sizes": {int(k): int(v)
                                    for k, v in (o.get("bank_sizes") or {}).items()},
+                    # ★ 워드 → bank 는 이 표가 권위다. header.id_mask 로 뽑은 ID 를
+                    #   bank 로 그대로 쓰면 안 된다(ID 가 0 부터라는 보장이 없다).
+                    "probe_to_bank": {int(k, 0): int(v)
+                                      for k, v in (o.get("probe_to_bank") or {}).items()},
                 }
                 for bank in sorted(cm.overlay["bank_sizes"]):
                     bb_b = os.path.join(product_dir,
@@ -624,7 +649,7 @@ def _handle_locked(fn):
     """
     @functools.wraps(fn)
     def _w(self, *a, **kw):
-        with self._hlock:
+        with self.lock:                 # RLock — recover() 가 pin/auth 를 재진입한다
             return fn(self, *a, **kw)
     return _w
 
@@ -657,13 +682,6 @@ class PcsrSession:
         self.word_order = word_order or 't32-negative'
         self.last_fail_kind = None    # 'transport' | 'invalid' | None
         self._sj = None               # sjtag_unlock 모듈(지연)
-        # ★ J-Link 핸들 독점 계약(플랜 §4). sba_read_pinned() 는 SELECT/TAR 을 확인하지
-        #   않고 sba_pin() 이 맞춰둔 상태를 신뢰한다 → 버스트 중 같은 handle 로 다른
-        #   DAP 접근이 **한 번만** 끼어들어도 다른 AP bank 의 DRW 를 읽는다. 에러가 아니라
-        #   **조용히 틀린 PC** 가 나오므로 로그로는 절대 안 보인다.
-        #   버스트 / 복구 / 인증 probe / 코어 전환 / 진단 / close 가 모두 이 경계를 공유한다.
-        #   RLock: recover() 가 내부에서 pin()·auth 를 다시 부른다.
-        self._hlock = threading.RLock()
 
     def _say(self, m):
         if self.verbose:

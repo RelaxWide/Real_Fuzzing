@@ -3500,6 +3500,10 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         self._ranges = {}                            # core_id -> elf_map.Ranges
         self._invalid_streak = {}                    # core_id -> 연속 무효 수
         self._all_invalid_since = None
+        # 코드 오버레이 — {core_id: 프로브 주소}. connect 에서 실제 읽기가 되는
+        # 코어만 채운다(SBA 가 코드 메모리에 못 닿을 수 있다).
+        self._ovl_probe = {}
+        self._ovl_dropped = 0
         self.collapse_count = 0
         self.recover_ok = 0
         self.recover_fail = 0
@@ -3577,6 +3581,8 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         if self._primary not in self._weights:
             self._primary = max(self._weights, key=self._weights.get)
             log.warning(f"[cJTAG/SBA] primary 코어를 {self._primary} 로 재선정")
+        # 오버레이 프로브는 세션이 살아 있는 지금 확인한다(재연결마다 다시).
+        self._init_overlay_probe()
         return True
 
     def _verify_ranges(self, cores):
@@ -3637,6 +3643,41 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         if self._primary not in self._weights:
             self._primary = max(self._weights, key=self._weights.get)
         return True
+
+    def _resolve_bank(self, core_id, word):
+        cm = self.cov.cores.get(core_id) if self.cov is not None else None
+        return cm.resolve_bank(word) if cm is not None else None
+
+    def _init_overlay_probe(self):
+        """오버레이가 있는 코어마다 프로브를 **실제로 한 번 읽어** 본다.
+
+        SBA 로 PCSR 레지스터가 읽힌다고 코드 메모리도 읽힌다는 보장이 없다. 여기서
+        확인하지 않으면 매 버스트마다 실패하면서 조용히 bank 없이 돌게 된다.
+        읽히더라도 매직이 안 맞으면 해석할 수 없으므로 역시 끈다.
+        """
+        self._ovl_probe = {}
+        if self.cov is None or self.session is None:
+            return
+        for cid, cm in (self.cov.cores or {}).items():
+            addr = cm.overlay_probe_addr()
+            if addr is None:
+                continue
+            w = self.session.read_word(addr)
+            bank = cm.resolve_bank(w)
+            if w is None:
+                log.error(f"[Overlay] {cm.name}: 0x{addr:X} SBA 읽기 실패 — "
+                          f"bank 판별 불가. 오버레이 창의 PC 는 bank 0 으로 합쳐진다")
+            elif bank is None:
+                log.error(f"[Overlay] {cm.name}: 0x{addr:X}=0x{w:08X} 가 매직과 "
+                          f"불일치 — 맵이 이 펌웨어 것이 아닐 수 있다. bank 판별 끔")
+            else:
+                self._ovl_probe[cid] = addr
+                log.warning(f"[Overlay] {cm.name}: 프로브 0x{addr:X} OK "
+                            f"(현재 bank={bank}, 오버레이 {len(cm.overlay['bank_sizes'])}개, "
+                            f"bank 표 {len(cm.banks)}개)")
+                if not cm.banks:
+                    log.warning(f"[Overlay] {cm.name}: bank 별 BB 표가 없다 — "
+                                f"fw_export.py 로 만들기 전까지는 bank 0 으로 접힌다")
 
     def credit_cores(self):
         """interesting 판정에 표를 행사할 코어 집합. None 이면 전 코어(union)."""
@@ -3699,7 +3740,23 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                         _j = int(n * self._jitter_pct / 100.0)
                         if _j:
                             n = max(1, min(n + self._rng.randint(-_j, _j), limit - total))
+                    # ── 코드 오버레이: 지금 그 자리에 몇 번이 올라와 있나 ──
+                    #   같은 PC 라도 오버레이가 다르면 다른 코드다. 버스트 **경계**
+                    #   에서만 읽는다(핫루프에 넣으면 실측 폴링 제약을 깬다).
+                    _pa = self._ovl_probe.get(core)
+                    _bank = None
+                    if _pa is not None:
+                        _bank = self._resolve_bank(core, self.session.read_word(_pa))
                     obs = self.session.burst(core, n, self._valid_bit)
+                    if _pa is not None and obs:
+                        # 버스트 도중 스왑이 일어났으면 이 샘플들이 어느 오버레이의
+                        # 것인지 알 수 없다 → 틀린 귀속보다 버리는 게 낫다.
+                        _after = self._resolve_bank(core, self.session.read_word(_pa))
+                        if _bank is None or _after != _bank:
+                            self._ovl_dropped += len(obs)
+                            total += len(obs)      # 진행은 시켜야 무한루프가 안 난다
+                            continue
+                        obs = [o._replace(bank=_bank) for o in obs]
                     if not obs:
                         # ★ 빈 버스트(=pin 실패)에 continue 만 하면 total 이 안 늘어
                         #   while 조건이 영원히 참 → **무한 루프**. 로그도 없이 스레드가
@@ -4305,6 +4362,10 @@ class NVMeFuzzer:
         self._sa_cov_history: list = []
         self._load_static_analysis()
         self._load_riscv_coverage()   # v10: arch=riscv 면 per-core 모델
+        # 샘플러가 오버레이 bank 를 해석하려면 CoverageModel 이 필요하다
+        # (프로브 주소·매직·워드→bank 표가 전부 거기 들어 있다).
+        if self.cov is not None:
+            self.sampler.cov = self.cov
 
         # v9.1: sc_hist/invalid_opcode/reached_fw/accepted 추가 — NVMe 상태 되먹임(LLM/에너지)용.
         def _cs_new():
@@ -15022,6 +15083,8 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         # 세션 붕괴/복구는 지금까지 error 로그에만 남아, 로그를 뒤지지 않으면
         # 보이지 않았다. 붕괴가 **감지되지 않은 채** 진행되면 커버리지가 조용히
         # 멈추므로, 카운터를 주기 통계에 노출해 눈에 띄게 한다.
+        _ovd = getattr(self.sampler, '_ovl_dropped', 0)
+        _ovd_tag = f" | ovl-drop: {_ovd:,}" if _ovd else ""
         _col = getattr(self.sampler, 'collapse_count', 0)
         _col_tag = ""
         if _col:
@@ -15032,7 +15095,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                  f"pcs: {stats['coverage_unique_pcs']:,} | "
                  f"exec/s: {window_eps:.1f} | "
                  f"seq_run: {_seq_run}"
-                 f"{_col_tag}{ps_tag}{state_tag}")
+                 f"{_col_tag}{_ovd_tag}{ps_tag}{state_tag}")
         # 시작 배너를 놓쳐도 알 수 있게 주기 통계마다 재알림(정상 버전이면 아무것도 안 찍힘).
         _nvme_cli_warn(log, brief=True)
         _bbc, _bbt, _fnc, _fnt, _by_core = self._cov_totals(by_core=True)

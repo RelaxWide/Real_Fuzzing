@@ -173,6 +173,8 @@ def main():
     p.add_argument('--core', default='?', help='코어 이름(H/CM/F/Q)')
     p.add_argument('--out', help='overlay_map_core<X>.json 출력 경로')
     p.add_argument('--coverage', help='0단계 측정용 coverage.txt')
+    p.add_argument('--bb-file', dest='bb_file',
+                   help='기존 basic_blocks_core<X>.txt — 오버레이 창의 분모 상태 점검')
     a = p.parse_args()
 
     rows = load_map(a.map)
@@ -256,6 +258,41 @@ def main():
         with open(a.out, 'w', encoding='utf-8') as f:
             json.dump(doc, f, indent=2, ensure_ascii=False)
         print(f"[ovl] 저장: {a.out}")
+
+    if a.bb_file:
+        # 분모 점검 — 관측(0단계)보다 이쪽이 크다. 35개 코드 본체가 한 주소에
+        # 겹쳐 있으면 BB 표는 둘 중 하나다: (a) 한 오버레이 분량만 있고 나머지가
+        # 통째로 분모에서 빠졌거나, (b) 전부 있어 같은 주소에 중복 항목이 쌓였고
+        # bisect 가 아무거나 고른다. 어느 쪽이든 그 창의 커버리지 %는 틀렸다.
+        starts, inwin, dup = [], 0, 0
+        seen = set()
+        with open(a.bb_file) as f:
+            for line in f:
+                q = line.split()
+                if len(q) < 2:
+                    continue
+                try:
+                    s0 = int(q[0], 16)
+                except ValueError:
+                    continue
+                starts.append(s0)
+                if base <= s0 < end:
+                    inwin += 1
+                    if s0 in seen:
+                        dup += 1
+                    seen.add(s0)
+        print(f"[ovl] ── 분모 점검 ── {os.path.basename(a.bb_file)}: 전체 BB {len(starts):,}개, "
+              f"오버레이 창 안 {inwin:,}개 (중복 시작주소 {dup:,}개)")
+        n_ovl = len(rows)
+        if inwin == 0:
+            print("      → 창 안에 BB 가 하나도 없다. 오버레이 코드 전체가 분모에서 빠졌다.")
+        elif dup == 0:
+            print(f"      → 중복이 없다 = **한 오버레이 분량만** 있다. 나머지 {n_ovl - 1}개"
+                  f"({sum(r[3] for r in rows) - max(r[3] for r in rows):,}B)가 분모에서 빠졌다.")
+        else:
+            print(f"      → 중복이 있다 = 여러 오버레이가 겹쳐 들어갔다. bisect 는 그중"
+                  f" 하나만 고르므로 함수 귀속이 틀리고 분모도 부풀어 있다.")
+        print("      → fw_export.py 로 bank 별 표를 만들면 양쪽 다 해결된다.")
 
     if a.coverage:
         tot, ins = stage0(a.coverage, base, end)

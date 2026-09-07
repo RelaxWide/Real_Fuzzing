@@ -682,3 +682,71 @@ class TestOverlayBanks(unittest.TestCase):
         """기존 4인자 호출이 전부 그대로 동작해야 한다."""
         o = rc.Observation(2, 0x1000, True, True)
         self.assertEqual(o.bank, 0)
+
+
+class TestRuntimeBankResolution(unittest.TestCase):
+    """런타임: 프로브 워드 → bank. '오버레이가 바뀌면 같은 PC 를 다른 커버리지로
+    센다' 는 목적이 실제로 성립하는지."""
+
+    BASE = 0x56000
+
+    def _cm(self, banks=(0, 1, 2)):
+        import tempfile as _tf
+        d = self.tmp = _tf.TemporaryDirectory()
+        p = d.name
+        with open(os.path.join(p, 'basic_blocks_coreH.txt'), 'w') as f:
+            f.write(f"0x{self.BASE:x} 0x{self.BASE+16:x}\n")
+        json.dump({"core": "H", "base": self.BASE, "window_end": self.BASE + 16214,
+                   "probe_offsets": [4],
+                   "probe_to_bank": {"0x4F564C00": 0, "0x4F564C01": 1, "0x4F564C02": 2},
+                   "header": {"magic": "0x4F564C00", "magic_mask": "0xFFFFFF00",
+                              "id_mask": "0x000000FF"},
+                   "bank_sizes": {str(b): 4096 for b in (0, 1, 2)}},
+                  open(os.path.join(p, 'overlay_map_coreH.json'), 'w'))
+        for b in banks:
+            with open(os.path.join(p, f'basic_blocks_coreH_ovl{b}.txt'), 'w') as f:
+                f.write(f"0x{self.BASE:x} 0x{self.BASE+16:x}\n")
+        return rc.CoverageModel.load(p, product='BM9K1', core_ids={"H": 0}).cores[0]
+
+    def tearDown(self):
+        if hasattr(self, 'tmp'):
+            self.tmp.cleanup()
+
+    def test_probe_addr(self):
+        self.assertEqual(self._cm().overlay_probe_addr(), self.BASE + 4)
+
+    def test_resolve_known_words(self):
+        cm = self._cm()
+        for w, b in ((0x4F564C00, 0), (0x4F564C01, 1), (0x4F564C02, 2)):
+            self.assertEqual(cm.resolve_bank(w), b)
+
+    def test_magic_mismatch_is_none(self):
+        """미탑재/복사중/읽기실패 — 지금 뭐가 있는지 모르므로 bank 를 찍으면 안 된다."""
+        cm = self._cm()
+        self.assertIsNone(cm.resolve_bank(0xDEADBEEF))
+        self.assertIsNone(cm.resolve_bank(0x00000000))
+        self.assertIsNone(cm.resolve_bank(None))
+
+    def test_known_magic_unknown_id_is_none(self):
+        """매직은 맞지만 표에 없는 ID → 맵이 이 펌웨어 것이 아니다."""
+        self.assertIsNone(self._cm().resolve_bank(0x4F564C09))
+
+    def test_same_pc_different_bank_counts_separately(self):
+        """★ 이 기능의 목적 그 자체."""
+        cm = self._cm()
+        m = rc.CoverageModel()
+        m.cores[0] = cm
+        m.loaded = True
+        m.update([rc.Observation(0, self.BASE + 8, True, True, 0),
+                  rc.Observation(0, self.BASE + 8, True, True, 2)])
+        self.assertEqual(len(m.covered_bbs), 2,
+                         "같은 PC 라도 오버레이가 다르면 다른 커버리지여야 한다")
+
+    def test_same_pc_same_bank_counts_once(self):
+        cm = self._cm()
+        m = rc.CoverageModel()
+        m.cores[0] = cm
+        m.loaded = True
+        m.update([rc.Observation(0, self.BASE + 8, True, True, 1),
+                  rc.Observation(0, self.BASE + 8, True, True, 1)])
+        self.assertEqual(len(m.covered_bbs), 1)

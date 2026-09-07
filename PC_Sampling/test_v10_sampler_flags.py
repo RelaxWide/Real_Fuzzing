@@ -595,3 +595,68 @@ class TestPlanGapsClosed(unittest.TestCase):
         self.assertIn("== 'riscv'", src[i:i + 120])
         j = src.index('if self._autoname_kw_off:')
         self.assertIn('return not _AUTONAME_RE.match(nm)', src[j:j + 160])
+
+
+class TestOverlayRuntimeWiring(unittest.TestCase):
+    """런타임 배선 — 버스트 경계에서만 읽고, 스왑되면 버린다."""
+
+    def _src(self):
+        import pathlib
+        return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
+            encoding='utf-8')
+
+    def test_cov_is_injected_into_sampler(self):
+        """sampler.cov 가 비어 있으면 bank 해석이 통째로 죽는다(주입이 없었다)."""
+        src = self._src()
+        self.assertIn('self.sampler.cov = self.cov', src)
+
+    def test_probe_read_at_burst_boundary_only(self):
+        """핫루프(DRW 반복) 안에 넣으면 실측 폴링 제약을 깬다."""
+        src = self._src()
+        i = src.index('_pa = self._ovl_probe.get(core)')
+        j = src.index('obs = self.session.burst(core, n, self._valid_bit)', i)
+        self.assertLess(i, j, '프로브 읽기는 burst 호출 앞')
+        seg = src[i:j]
+        self.assertIn('read_word', seg)
+
+    def test_discards_burst_on_swap(self):
+        """버스트 도중 스왑되면 어느 오버레이 것인지 알 수 없다 → 폐기."""
+        src = self._src()
+        i = src.index('_after = self._resolve_bank')
+        seg = src[i:i + 400]
+        self.assertIn('_after != _bank', seg)
+        self.assertIn('_ovl_dropped', seg)
+
+    def test_discard_still_advances_total(self):
+        """폐기하면서 total 을 안 올리면 while 조건이 영원히 참 → 무한 루프."""
+        src = self._src()
+        i = src.index('self._ovl_dropped += len(obs)')
+        self.assertIn('total += len(obs)', src[i:i + 200])
+
+    def test_bank_tagged_onto_observations(self):
+        src = self._src()
+        self.assertIn("o._replace(bank=_bank)", src)
+
+    def test_probe_verified_at_connect(self):
+        """SBA 가 코드 메모리에 못 닿을 수 있다 — 확인 없이 켜면 매 버스트 실패."""
+        src = self._src()
+        self.assertIn('def _init_overlay_probe', src)
+        i = src.index('def _init_overlay_probe')
+        seg = src[i:i + 1800]
+        self.assertIn('read_word', seg)
+        self.assertIn('SBA 읽기 실패', seg)
+
+    def test_probe_init_called_from_connect(self):
+        src = self._src()
+        i = src.index('primary 코어를')
+        self.assertIn('self._init_overlay_probe()', src[i:i + 400])
+
+    def test_no_bank_tables_warns(self):
+        """표가 없으면 bank 를 읽어도 0 으로 접힌다 — 조용하면 안 된다."""
+        src = self._src()
+        i = src.index('def _init_overlay_probe')
+        self.assertIn('bank 0 으로 접힌다', src[i:i + 1800])
+
+    def test_drop_counter_surfaced(self):
+        src = self._src()
+        self.assertIn('ovl-drop:', src)
