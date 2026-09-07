@@ -316,10 +316,25 @@ class CoverageModel:
         return m
 
     def _verify_counts(self, cm, info):
-        """symbols.json 의 개수와 실제 로드량 대조 — 파일이 잘렸거나 짝이 안 맞으면 경고."""
+        """symbols.json 의 개수와 실제 로드량 대조 — 파일이 잘렸거나 짝이 안 맞는 것을 잡는다.
+
+        ★ counts 는 **본체(비오버레이) 표 기준**이다. 오버레이는 파일이 따로이므로
+        추출기가 자연히 세는 단위도 그쪽이다. 총계와 비교하면 오버레이가 있는 코어
+        마다 매번 헛경고가 나고, 그러면 사람들이 경고를 무시하게 된다.
+        오버레이 개수를 검증하려면 counts.overlay_{basic_blocks,functions} 를 쓴다.
+        """
         c = info.get("counts") or {}
-        for label, want, got in (("basic_blocks", c.get("basic_blocks"), cm.total_bbs),
-                                 ("functions", c.get("functions"), cm.total_funcs)):
+        checks = [("basic_blocks", c.get("basic_blocks"), len(cm.bb_starts)),
+                  ("functions", c.get("functions"), len(cm.fn_entries))]
+        if cm.banks:
+            checks += [
+                ("overlay_basic_blocks", c.get("overlay_basic_blocks"),
+                 sum(len(t["bb_starts"]) for t in cm.banks.values())),
+                ("overlay_functions", c.get("overlay_functions"),
+                 sum(len(t["fn_entries"]) for t in cm.banks.values())),
+                ("overlay_banks", c.get("overlay_banks"), len(cm.banks)),
+            ]
+        for label, want, got in checks:
             if want is not None and want != got:
                 self.warnings.append(
                     f"core{cm.name}: {label} 개수 불일치 symbols.json={want} 실제={got}")

@@ -62,6 +62,7 @@ def export_core(core, elf, ovl_map, outdir, objdump=None):
     info = {"elf": os.path.abspath(elf),
             "elf_sha256": hashlib.sha256(open(elf, 'rb').read()).hexdigest()}
 
+    _ovl_fn_total = _ovl_bb_total = 0
     if ovl_map:
         rows = op.load_map(ovl_map)
         bodies = op.extract(elf, rows)
@@ -94,10 +95,17 @@ def export_core(core, elf, ovl_map, outdir, objdump=None):
             _write_funcs(os.path.join(outdir, f"functions_core{core}_ovl{bank}.txt"), fns)
             blk = oe.scan_blocks_bounded(bodies[idx], b0, fns)
             _write_bbs(os.path.join(outdir, f"basic_blocks_core{core}_ovl{bank}.txt"), blk)
+            _ovl_fn_total += len(fns)
+            _ovl_bb_total += len(blk)
             print(f"  [{core}] ovl{bank} (idx={idx}) 함수 {len(fns):5} / BB {len(blk):6}")
 
     # ── 비오버레이 본체 ──
     all_fns, all_bbs, edges = [], [], {}
+    _ovl_counts = {}
+    if ovl_map:
+        _ovl_counts = {"overlay_banks": len(rows),
+                       "overlay_functions": _ovl_fn_total,
+                       "overlay_basic_blocks": _ovl_bb_total}
     for idx, addr, off, size in secs:
         if idx in ovl_idx:
             continue                     # 오버레이는 위에서 bank 별로 처리했다
@@ -129,7 +137,8 @@ def export_core(core, elf, ovl_map, outdir, objdump=None):
     #   info["counts"]["basic_blocks"] 를 본다. 최상위에 쓰면 개수 대조가
     #   조용히 건너뛰어져(파일 잘림·짝 안 맞음 탐지가 목적인데) 무력화된다.
     info.update({"counts": {"functions": len(all_fns),
-                            "basic_blocks": len(all_bbs)},
+                            "basic_blocks": len(all_bbs),
+                            **_ovl_counts},
                  "callgraph_edges": sum(len(v) for v in edges.values()),
                  "exec_sections": len(secs)})
     print(f"  [{core}] 본체 함수 {len(all_fns):5} / BB {len(all_bbs):6} / "
