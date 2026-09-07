@@ -537,7 +537,7 @@ class TestPorStrapControl(unittest.TestCase):
             encoding='utf-8')
 
     def test_shlex_imported(self):
-        """shlex 가 없으면 _run_strap_cmd 가 NameError → except 에 먹혀 '스킵'으로
+        """shlex 가 없으면 _run_por_hook 가 NameError → except 에 먹혀 '스킵'으로
         조용히 넘어가고, 스트랩이 안 잡힌 채 POR 이 나간다."""
         src = self._src()
         self.assertRegex(src, r'(?m)^import shlex$')
@@ -547,7 +547,7 @@ class TestPorStrapControl(unittest.TestCase):
         src = self._src()
         i = src.index('    def _power_cycle_ssd(self)')
         seg = src[i:src.index('\n    def ', i + 10)]
-        self.assertLess(seg.index('por_strap_boot_cmd'), seg.index("'7', '1'"))
+        self.assertLess(seg.index('por_pre_cmd'), seg.index("'7', '1'"))
 
     def test_release_after_settle(self):
         """래치가 끝나기 전에 중립으로 되돌리면 잡아둔 의미가 없다."""
@@ -555,19 +555,19 @@ class TestPorStrapControl(unittest.TestCase):
         i = src.index('    def _power_cycle_ssd(self)')
         seg = src[i:src.index('\n    def ', i + 10)]
         self.assertLess(seg.index('por_strap_settle_wait'),
-                        seg.index('por_strap_release_cmd'))
+                        seg.index('por_post_cmd'))
 
     def test_settle_applies_without_link_release(self):
         """스트랩만 쓰고 링크 해제는 안 하는 구성에서도 대기해야 한다
         (_por_link_released 에만 걸어두면 래치 전에 중립 복귀한다)."""
         src = self._src()
         i = src.index('_need_settle')
-        self.assertIn('por_strap_boot_cmd', src[i:i + 200])
+        self.assertIn('por_pre_cmd', src[i:i + 200])
 
     def test_strap_failure_does_not_abort_por(self):
         """스트랩 실패로 POR 이 죽으면 시료가 전원 없는 상태로 남는다."""
         src = self._src()
-        i = src.index('def _run_strap_cmd')
+        i = src.index('def _run_por_hook')
         seg = src[i:i + 1400]
         self.assertIn('except subprocess.TimeoutExpired', seg)
         self.assertIn('return False', seg)
@@ -580,8 +580,8 @@ class TestPorStrapControl(unittest.TestCase):
     def test_defaults_are_off(self):
         import json, pathlib
         cfg = json.loads(pathlib.Path(__file__).with_name('fuzzer_config.json').read_text())
-        self.assertEqual(cfg['power']['por_strap_boot_cmd'], "")
-        self.assertEqual(cfg['power']['por_strap_release_cmd'], "")
+        self.assertEqual(cfg['power']['por_pre_cmd'], "")
+        self.assertEqual(cfg['power']['por_post_cmd'], "")
 
 
 class TestJlinkGpioTool(unittest.TestCase):

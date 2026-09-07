@@ -132,8 +132,8 @@
     "por_rescan_delay": 10.0,
     "por_release_link": false,
     "por_strap_settle_wait": 2.0,
-    "por_strap_boot_cmd": "",
-    "por_strap_release_cmd": ""
+    "por_pre_cmd": "",
+    "por_post_cmd": ""
   },
   "visualization": {
     "graph_refresh_interval": 5000
