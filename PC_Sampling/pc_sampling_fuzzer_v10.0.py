@@ -3482,6 +3482,12 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         self._seed = int(plan.get('seed', 0)) or random.randrange(1 << 30)
         self._rng = random.Random(self._seed)        # ★ 재현용 — 세션 로그에 남긴다
         self._valid_bit = int(plan.get('valid_bit', 1))
+        self._jitter_pct = float(plan.get('jitter_pct', 20.0))
+        # 플랜 §4 재현성: 셔플·지터 seed 를 남기지 않으면 특정 커버리지나 세션 붕괴가
+        #   나온 샘플링 조건을 재현할 수 없다. seed 는 config 에 고정값을 넣어 재현한다.
+        log.warning(f"[cJTAG/SBA] 샘플링 seed={self._seed} "
+                    f"(재현하려면 sample_plan.seed 에 이 값을 넣어라) | "
+                    f"burst_len={self._burst_len} jitter=±{self._jitter_pct:.0f}%")
         # interesting 판정에 표를 행사할 코어. 'primary' 면 최대 가중치 코어만 —
         # 배경 작업만 하는 코어의 신규 블록이 입력을 interesting 으로 만들지 않게.
         self._policy = str(rv.get('interesting_policy', 'primary'))
@@ -3685,6 +3691,14 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                     if self.stop_event.is_set() or total >= limit:
                         break
                     n = min(self._burst_len, limit - total)
+                    # 플랜 §4: 버스트 **길이**에 지터. 펌웨어의 주기적 루프와 샘플링
+                    #   주기가 맞아떨어지면 특정 코드가 체계적으로 안 잡힌다(aliasing).
+                    #   ⚠ 지터는 버스트 경계에서만 — 버스트 안쪽 DRW 루프에 지연을
+                    #   넣으면 실기서 실패율이 폭증한다(§4 실기 검증된 폴링 제약).
+                    if self._jitter_pct and n > 1:
+                        _j = int(n * self._jitter_pct / 100.0)
+                        if _j:
+                            n = max(1, min(n + self._rng.randint(-_j, _j), limit - total))
                     obs = self.session.burst(core, n, self._valid_bit)
                     if not obs:
                         # ★ 빈 버스트(=pin 실패)에 continue 만 하면 total 이 안 늘어
@@ -4418,6 +4432,8 @@ class NVMeFuzzer:
         # v10: 명령 × 코어 수확량 — primary_core / sample_plan.weights 를 추정이 아니라
         #   실측으로 정하기 위한 유일한 근거. yield=그 명령이 **최초 발견**한 BB 수,
         #   cost=그 명령 윈도우에서 그 코어에 쓴 샘플 수(무효 포함 — 읽기 비용은 동일).
+        # 심볼 있는 ELF(RISC-V)면 키워드 기반 자동생성명 필터를 끈다(플랜 §6-1).
+        self._autoname_kw_off = ((self.config.arch or 'arm') == 'riscv')
         self.cmd_core_yield: dict = defaultdict(lambda: defaultdict(int))
         self.cmd_core_samples: dict = defaultdict(lambda: defaultdict(int))
         self.cmd_traces: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
@@ -5814,6 +5830,11 @@ class NVMeFuzzer:
             # 심볼 없는 자동생성명(FUN_/sub_ 등)은 LLM 에 무의미 → 제외. 실제 심볼명만 전달.
             def _is_symbol(nm) -> bool:
                 nm = str(nm)
+                # 플랜 §6-1: (default|thunk|switch) 키워드 필터는 **진짜 심볼도
+                #   먹는다**(set_default_mode 등). 심볼 있는 ELF(RISC-V)에서는 끈다.
+                #   FUN_/sub_ 패턴(_AUTONAME_RE)은 자동생성명이 확실하므로 유지.
+                if self._autoname_kw_off:
+                    return not _AUTONAME_RE.match(nm)
                 return not (_AUTONAME_RE.match(nm) or _AUTONAME_KW.search(nm))
             named   = [f for f in (not_entered or []) if _is_symbol(f[0])]
             named_p = [f for f in (partial or [])     if _is_symbol(f[0])]

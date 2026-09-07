@@ -14,6 +14,7 @@ pylink 도 모듈 레벨에서 import 하지 않는다 → 하드웨어 없이 �
 from __future__ import annotations
 
 import bisect
+import functools
 import hashlib
 import json
 import os
@@ -549,6 +550,20 @@ def build_burst_schedule(weights, rng=None, shuffle=True):
 RecoveryResult = namedtuple("RecoveryResult", "ok stage elapsed valid_samples detail")
 
 
+def _handle_locked(fn):
+    """J-Link 핸들 직렬화(플랜 §4 '핸들 독점 계약').
+
+    같은 handle 에 대한 동시 접근은 예외가 아니라 **조용히 틀린 값**을 만든다
+    (sba_read_pinned 가 SELECT/TAR 을 재확인하지 않으므로 다른 AP bank 의 DRW 를
+    읽는다). 그래서 실패가 로그에 안 남고 커버리지 노이즈로만 보인다.
+    """
+    @functools.wraps(fn)
+    def _w(self, *a, **kw):
+        with self._hlock:
+            return fn(self, *a, **kw)
+    return _w
+
+
 class PcsrSession:
     """PCSR 폴링 전송 계층 — 인증·핀·버스트·붕괴복구를 **한 lock 안에** 묶는다.
 
@@ -577,6 +592,13 @@ class PcsrSession:
         self.word_order = word_order or 't32-negative'
         self.last_fail_kind = None    # 'transport' | 'invalid' | None
         self._sj = None               # sjtag_unlock 모듈(지연)
+        # ★ J-Link 핸들 독점 계약(플랜 §4). sba_read_pinned() 는 SELECT/TAR 을 확인하지
+        #   않고 sba_pin() 이 맞춰둔 상태를 신뢰한다 → 버스트 중 같은 handle 로 다른
+        #   DAP 접근이 **한 번만** 끼어들어도 다른 AP bank 의 DRW 를 읽는다. 에러가 아니라
+        #   **조용히 틀린 PC** 가 나오므로 로그로는 절대 안 보인다.
+        #   버스트 / 복구 / 인증 probe / 코어 전환 / 진단 / close 가 모두 이 경계를 공유한다.
+        #   RLock: recover() 가 내부에서 pin()·auth 를 다시 부른다.
+        self._hlock = threading.RLock()
 
     def _say(self, m):
         if self.verbose:
@@ -592,6 +614,7 @@ class PcsrSession:
         return te + stride * core_id + off
 
     # ── 인증 (SJTAG) ─────────────────────────────────────────────────
+    @_handle_locked
     def auth_state(self):
         """SJTAG STATE 레지스터 **read-only** 조회 → (raw, authed).
         읽기만 하므로 인증 카운터를 소모하지 않는다."""
@@ -602,6 +625,7 @@ class PcsrSession:
         v = self.dap.mem_read32(sj.APBAP3_BASE, base + sj.OFF_STATE)
         return v, bool(v is not None and (v & sj.AUTH_PASS))
 
+    @_handle_locked
     def _addr_diag(self, key):
         """★ '설정했는데 미설정이라고 나온다'를 한 번에 가르는 자가 진단.
         런타임이 **실제로 읽은 파일과 값 상태**를 보고한다(값 자체는 찍지 않는다).
@@ -629,6 +653,7 @@ class PcsrSession:
         parts.append("점검: sudo python3 tools/check_bm9k1_connect.py")
         return " | ".join(parts)
 
+    @_handle_locked
     def ensure_auth(self, force=False):
         """★ probe-first 인증. → (ok, 사유)
 
@@ -663,6 +688,7 @@ class PcsrSession:
         return True, f"인증 완료 {self.auth_ms:.0f}ms (누적 {self.auth_count}회)"
 
     # ── 세션 ─────────────────────────────────────────────────────────
+    @_handle_locked
     def open(self, power_epoch=0):
         """지연 import → Link.open → prepare_session → 인증 확인."""
         import importlib
@@ -728,6 +754,7 @@ class PcsrSession:
             pass
         self.lk = None
 
+    @_handle_locked
     def close(self):
         with self.lock:
             try:
@@ -748,6 +775,7 @@ class PcsrSession:
             self._ap = self._cb = None
 
     # ── 핀 / 폴링 ────────────────────────────────────────────────────
+    @_handle_locked
     def pin(self, core_id):
         with self.lock:
             if self._pinned == core_id:
@@ -766,6 +794,7 @@ class PcsrSession:
             self._pinned = core_id if ok else None
             return ok
 
+    @_handle_locked
     def burst(self, core_id, n, valid_bit=1):
         """한 코어를 n회 연속 폴링 → [Observation].
         ★ 루프 본체에 검사·복구·지연을 넣지 않는다(실측 제약)."""
@@ -792,6 +821,7 @@ class PcsrSession:
         return obs
 
     # ── 복구 ─────────────────────────────────────────────────────────
+    @_handle_locked
     def recover(self, core_id, verify_samples=64):
         """붕괴 복구를 **단일 트랜잭션**으로. 재핀·valid 회복까지 통과해야 성공.
         실패 단계(stage)를 남겨야 원인 분석이 된다."""

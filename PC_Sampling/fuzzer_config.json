@@ -1104,7 +1104,8 @@
             "max_step": 2.0,
             "exponent": 2.0,
             "prior_samples": 2000
-          }
+          },
+          "jitter_pct": 20.0
         }
       },
       "invalid_pc_vals": [],

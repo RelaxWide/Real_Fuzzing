@@ -529,3 +529,69 @@ class TestSetWeightsAndAdaptiveWiring(unittest.TestCase):
         # 공유하지 않아 배분이 튄다(실측: H 8→6→3→4).
         self.assertGreaterEqual(1.0 / (1.0 - ad['decay']), ad['period'])
         self.assertNotIn('min_samples', ad, '하드 게이트는 제거됐다(수축으로 대체)')
+
+
+class TestPlanGapsClosed(unittest.TestCase):
+    """플랜(V10_BM9K1_PLAN.md)에 명시됐으나 누락돼 있던 항목들의 회귀 방지."""
+
+    def _fz(self):
+        import pathlib
+        return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
+            encoding='utf-8')
+
+    def _rc(self):
+        import pathlib
+        return pathlib.Path(__file__).with_name('riscv_cov.py').read_text(encoding='utf-8')
+
+    # §4 J-Link 핸들 독점 계약
+    def test_session_methods_are_handle_locked(self):
+        """동시 접근은 예외가 아니라 **조용히 틀린 PC** 를 만든다(다른 AP bank 의 DRW).
+        버스트/복구/인증probe/코어전환/진단/close 가 같은 경계를 공유해야 한다."""
+        src = self._rc()
+        for name in ('auth_state', 'ensure_auth', 'open', 'close',
+                     'pin', 'burst', 'recover', '_addr_diag'):
+            i = src.index("    def %s(self" % name)
+            self.assertIn('@_handle_locked', src[max(0, i - 80):i],
+                          f"{name} 이 핸들 락 밖에 있다")
+
+    def test_lock_is_reentrant(self):
+        """recover() 가 내부에서 pin()/auth 를 다시 부른다 → Lock 이면 자기 교착."""
+        self.assertIn('threading.RLock()', self._rc())
+
+    # §4 버스트 지터
+    def test_burst_jitter_applied(self):
+        """주기적 펌웨어 루프와 샘플링이 aliasing 되면 특정 코드가 체계적으로 안 잡힌다."""
+        src = self._fz()
+        self.assertIn('_jitter_pct', src)
+        i = src.index('obs = self.session.burst(core, n, self._valid_bit)')
+        self.assertIn('_jitter_pct', src[i - 700:i], '지터가 버스트 길이에 적용돼야')
+
+    def test_no_delay_inside_burst(self):
+        """실기 검증된 제약: 버스트 안쪽 DRW 루프에 지연을 넣으면 실패율이 폭증한다."""
+        src = self._rc()
+        i = src.index('    def burst(self')
+        seg = src[i:i + 1500]
+        self.assertNotIn('time.sleep', seg, '버스트 핫루프에 sleep 이 있으면 안 된다')
+
+    def test_jitter_never_exceeds_remaining(self):
+        """지터가 limit 을 넘기면 total 이 limit 을 건너뛰어 윈도우가 안 끝난다."""
+        src = self._fz()
+        i = src.index('_j = int(n * self._jitter_pct')
+        self.assertIn('limit - total', src[i:i + 260])
+
+    # §4 재현성
+    def test_sampling_seed_is_logged(self):
+        """seed 를 안 남기면 특정 커버리지·붕괴가 나온 조건을 재현할 수 없다."""
+        src = self._fz()
+        self.assertIn('샘플링 seed=', src)
+
+    # §6-1 autoname 키워드 필터
+    def test_autoname_kw_disabled_for_riscv(self):
+        """(default|thunk|switch) 는 set_default_mode 같은 **진짜 심볼도** 먹는다.
+        심볼 있는 ELF 에서는 꺼야 한다."""
+        src = self._fz()
+        self.assertIn('_autoname_kw_off', src)
+        i = src.index('self._autoname_kw_off =')
+        self.assertIn("== 'riscv'", src[i:i + 120])
+        j = src.index('if self._autoname_kw_off:')
+        self.assertIn('return not _AUTONAME_RE.match(nm)', src[j:j + 160])
