@@ -1090,6 +1090,24 @@ class PcsrSession:
 
     # ── 복구 ─────────────────────────────────────────────────────────
     @_handle_locked
+    def read_word(self, addr):
+        """일회성 SBA 읽기(에러검사 있는 경로) — 오버레이 판별용.
+
+        ★ 반드시 **버스트 경계**에서만 부른다. 버스트 핀은 PCSR 주소에 걸려 있어
+        여기서 먼저 풀어야 하고, 핫루프(DRW 반복) 안에 넣으면 실측 폴링 제약을 깬다.
+        실패는 None 으로 돌려준다 — 호출부가 그 버스트를 버린다.
+        """
+        if self._pinned is not None:
+            if not self._sj.sba_unpin(self.dap, self._ap, self._cb):
+                self._pinned = None
+                return None
+            self._pinned = None
+        try:
+            return self._sj._sba_read(self.dap, self._ap, self._cb, addr)
+        except Exception:
+            return None
+
+    @_handle_locked
     def recover(self, core_id, verify_samples=64):
         """붕괴 복구를 **단일 트랜잭션**으로. 재핀·valid 회복까지 통과해야 성공.
         실패 단계(stage)를 남겨야 원인 분석이 된다."""

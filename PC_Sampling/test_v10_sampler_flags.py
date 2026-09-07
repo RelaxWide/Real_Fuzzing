@@ -721,3 +721,68 @@ class TestOverlayVisibility(unittest.TestCase):
         src = self._src()
         i = src.index('_c, _b, _ = _rcv.unpack(_k)')
         self.assertIn('if _b:', src[i:i + 120])
+
+
+class TestSessionApiContract(unittest.TestCase):
+    """★ 퍼저가 session 에 부르는 메서드가 PcsrSession 에 실제로 있어야 한다.
+
+    실기에서 read_word 가 없어 AttributeError 로 죽었다. 편집 스크립트의 문자열
+    치환이 조용히 no-op 됐는데도 '있는 줄' 알고 넘어간 결과다. 이름 목록을
+    소스에서 뽑아 실제 클래스와 대조해 같은 일이 반복되지 않게 한다.
+    """
+
+    def test_all_called_methods_exist(self):
+        import pathlib
+        import re
+        import riscv_cov as rc
+        src = pathlib.Path(__file__).with_name(
+            'pc_sampling_fuzzer_v10.0.py').read_text(encoding='utf-8')
+        called = sorted(set(re.findall(r'self\.session\.([a-z_]+)\(', src)))
+        self.assertTrue(called, "session 호출을 하나도 못 찾았다 — 정규식 확인")
+        missing = [m for m in called if not hasattr(rc.PcsrSession, m)]
+        self.assertEqual(missing, [], f"PcsrSession 에 없는 메서드: {missing}")
+
+    def test_read_word_present_and_locked(self):
+        """오버레이 판별의 유일한 진입점 — 없으면 기능 전체가 죽는다."""
+        import inspect
+        import riscv_cov as rc
+        self.assertTrue(hasattr(rc.PcsrSession, 'read_word'))
+        cls_src = inspect.getsource(rc.PcsrSession)
+        i = cls_src.index('def read_word')
+        self.assertIn('@_handle_locked', cls_src[max(0, i - 60):i],
+                      "핸들 락 밖에서 읽으면 버스트와 충돌한다")
+
+    def test_read_word_unpins_first(self):
+        """버스트 핀은 PCSR 주소에 걸려 있다 — 안 풀고 읽으면 엉뚱한 값이다."""
+        import inspect
+        import riscv_cov as rc
+        src = inspect.getsource(rc.PcsrSession.read_word)
+        self.assertIn('sba_unpin', src)
+        self.assertIn('return None', src)
+
+
+class TestWorkerExceptionGuard(unittest.TestCase):
+    """워커에서 예외가 새면 스레드만 죽고 퍼저는 **커버리지 0 으로 계속 돈다**.
+    실기에서 겪은 read_word AttributeError 가 그 경로였다."""
+
+    def _worker_src(self):
+        import pathlib
+        src = pathlib.Path(__file__).with_name(
+            'pc_sampling_fuzzer_v10.0.py').read_text(encoding='utf-8')
+        i = src.index("class RiscvPcsrSampler")
+        j = src.index("    def _sampling_worker(self):", i)
+        k = src.index("\n    def diagnose(", j)
+        return src[j:k]
+
+    def test_worker_catches_exceptions(self):
+        seg = self._worker_src()
+        self.assertIn('except Exception as _e:', seg)
+
+    def test_worker_signals_upper_loop(self):
+        """조용히 죽으면 안 된다 — 상위 루프가 알아야 재연결/중단을 판단한다."""
+        seg = self._worker_src()
+        i = seg.index('except Exception as _e:')
+        tail = seg[i:]
+        self.assertIn('openocd_error.set()', tail)
+        self.assertIn('worker_exception', tail)
+        self.assertIn('traceback', tail)

@@ -3700,102 +3700,113 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         """★ 버스트 전용. 가중치는 '버스트 개수'로 펴고 **매 윈도우 셔플**한다 —
         순서를 고정하면 코어가 명령 처리 단계(파싱→DMA→완료)와 결합돼 각 코어가 특정
         단계만 관측하는 편향이 생긴다."""
-        # ★ 윈도우 초기화 — 기존 worker(2833~)가 하던 것을 그대로 해야 한다.
-        #   빠뜨리면 _last_raw_pcs/_observations/current_trace 가 **영원히 누적**되어
-        #   (a) 메모리가 실행 수에 비례해 늘고
-        #   (b) _account_command 가 매 실행마다 _last_raw_pcs 전체를 다시 필터링해
-        #       실행이 느려지며(2차 증가)
-        #   (c) current_trace 가 '이번 명령이 밟은 곳' 이라는 의미를 잃는다.
-        #   실기서 5000 exec 부근(차트 스냅샷+fork 로 메모리가 한 번 더 뜨는 지점)에
-        #   호스트가 내려간 원인.
-        self.current_trace = set()
-        self._last_raw_pcs = []
-        self._out_of_range_count = 0
-        self._last_new_at = 0
-        self._unique_at_intervals = {}
-        self._stopped_reason = ""
-        self._reset_window_extra()          # _observations 비움
-        self._invalid_streak = {}
-        cfg, total, empty, bail = self.config, 0, 0, False
-        limit = max(1, int(cfg.max_samples_per_run))
+        # ★ 워커에서 예외가 새면 스레드만 조용히 죽고 퍼저는 커버리지 0 으로
+        #   계속 돈다(실제로 겪음: read_word 누락 AttributeError). 잡아서
+        #   로그를 남기고 openocd_error 를 세워 상위 루프가 알게 한다.
         try:
-            while not self.stop_event.is_set() and total < limit and not bail:
-                sched = self._rc.build_burst_schedule(self._weights, rng=self._rng)
-                if not sched:
-                    # ★ weights 가 비었거나 전부 0 이면 for 본문이 안 돌아 빈-burst
-                    #   방어가 걸리지 않는다 → 진행 없는 무한루프.
-                    self._stopped_reason = 'no_schedule'
-                    log.error("[cJTAG/SBA] 버스트 스케줄이 비었다(weights 확인) — 샘플링 중단")
-                    self.openocd_error.set()
-                    break
-                for core in sched:
-                    if self.stop_event.is_set() or total >= limit:
+            # ★ 윈도우 초기화 — 기존 worker(2833~)가 하던 것을 그대로 해야 한다.
+            #   빠뜨리면 _last_raw_pcs/_observations/current_trace 가 **영원히 누적**되어
+            #   (a) 메모리가 실행 수에 비례해 늘고
+            #   (b) _account_command 가 매 실행마다 _last_raw_pcs 전체를 다시 필터링해
+            #       실행이 느려지며(2차 증가)
+            #   (c) current_trace 가 '이번 명령이 밟은 곳' 이라는 의미를 잃는다.
+            #   실기서 5000 exec 부근(차트 스냅샷+fork 로 메모리가 한 번 더 뜨는 지점)에
+            #   호스트가 내려간 원인.
+            self.current_trace = set()
+            self._last_raw_pcs = []
+            self._out_of_range_count = 0
+            self._last_new_at = 0
+            self._unique_at_intervals = {}
+            self._stopped_reason = ""
+            self._reset_window_extra()          # _observations 비움
+            self._invalid_streak = {}
+            cfg, total, empty, bail = self.config, 0, 0, False
+            limit = max(1, int(cfg.max_samples_per_run))
+            try:
+                while not self.stop_event.is_set() and total < limit and not bail:
+                    sched = self._rc.build_burst_schedule(self._weights, rng=self._rng)
+                    if not sched:
+                        # ★ weights 가 비었거나 전부 0 이면 for 본문이 안 돌아 빈-burst
+                        #   방어가 걸리지 않는다 → 진행 없는 무한루프.
+                        self._stopped_reason = 'no_schedule'
+                        log.error("[cJTAG/SBA] 버스트 스케줄이 비었다(weights 확인) — 샘플링 중단")
+                        self.openocd_error.set()
                         break
-                    n = min(self._burst_len, limit - total)
-                    # 플랜 §4: 버스트 **길이**에 지터. 펌웨어의 주기적 루프와 샘플링
-                    #   주기가 맞아떨어지면 특정 코드가 체계적으로 안 잡힌다(aliasing).
-                    #   ⚠ 지터는 버스트 경계에서만 — 버스트 안쪽 DRW 루프에 지연을
-                    #   넣으면 실기서 실패율이 폭증한다(§4 실기 검증된 폴링 제약).
-                    if self._jitter_pct and n > 1:
-                        _j = int(n * self._jitter_pct / 100.0)
-                        if _j:
-                            n = max(1, min(n + self._rng.randint(-_j, _j), limit - total))
-                    # ── 코드 오버레이: 지금 그 자리에 몇 번이 올라와 있나 ──
-                    #   같은 PC 라도 오버레이가 다르면 다른 코드다. 버스트 **경계**
-                    #   에서만 읽는다(핫루프에 넣으면 실측 폴링 제약을 깬다).
-                    _pa = self._ovl_probe.get(core)
-                    _bank = None
-                    if _pa is not None:
-                        _bank = self._resolve_bank(core, self.session.read_word(_pa))
-                    obs = self.session.burst(core, n, self._valid_bit)
-                    if _pa is not None and obs:
-                        # 버스트 도중 스왑이 일어났으면 이 샘플들이 어느 오버레이의
-                        # 것인지 알 수 없다 → 틀린 귀속보다 버리는 게 낫다.
-                        _after = self._resolve_bank(core, self.session.read_word(_pa))
-                        if _bank is None or _after != _bank:
-                            self._ovl_dropped += len(obs)
-                            total += len(obs)      # 진행은 시켜야 무한루프가 안 난다
-                            continue
-                        obs = [o._replace(bank=_bank) for o in obs]
-                    if not obs:
-                        # ★ 빈 버스트(=pin 실패)에 continue 만 하면 total 이 안 늘어
-                        #   while 조건이 영원히 참 → **무한 루프**. 로그도 없이 스레드가
-                        #   돌며 세션 lock 을 물어 다음 윈도우까지 막는다(실기서 관측:
-                        #   시작 로그 뒤 아무것도 안 찍힘). 진행이 없으면 빠져나온다.
-                        empty += 1
-                        if empty >= self._EMPTY_BURST_LIMIT:
-                            self._stopped_reason = 'pin_fail'
-                            log.error(f"[cJTAG/SBA] 빈 버스트 {empty}회 연속(pin 실패) — "
-                                      f"샘플링 중단. 세션/오프셋 확인")
-                            bail = True
-                            self.openocd_error.set()   # 상위 루프가 재연결 판단
+                    for core in sched:
+                        if self.stop_event.is_set() or total >= limit:
                             break
-                        continue
-                    empty = 0
-                    total += len(obs)
-                    self._track_collapse(core, obs)
-                    for o in obs:
-                        if not (o.valid and o.pc is not None):
-                            self._observations.append(o)   # 무효 샘플도 판정엔 필요
+                        n = min(self._burst_len, limit - total)
+                        # 플랜 §4: 버스트 **길이**에 지터. 펌웨어의 주기적 루프와 샘플링
+                        #   주기가 맞아떨어지면 특정 코드가 체계적으로 안 잡힌다(aliasing).
+                        #   ⚠ 지터는 버스트 경계에서만 — 버스트 안쪽 DRW 루프에 지연을
+                        #   넣으면 실기서 실패율이 폭증한다(§4 실기 검증된 폴링 제약).
+                        if self._jitter_pct and n > 1:
+                            _j = int(n * self._jitter_pct / 100.0)
+                            if _j:
+                                n = max(1, min(n + self._rng.randint(-_j, _j), limit - total))
+                        # ── 코드 오버레이: 지금 그 자리에 몇 번이 올라와 있나 ──
+                        #   같은 PC 라도 오버레이가 다르면 다른 코드다. 버스트 **경계**
+                        #   에서만 읽는다(핫루프에 넣으면 실측 폴링 제약을 깬다).
+                        _pa = self._ovl_probe.get(core)
+                        _bank = None
+                        if _pa is not None:
+                            _bank = self._resolve_bank(core, self.session.read_word(_pa))
+                        obs = self.session.burst(core, n, self._valid_bit)
+                        if _pa is not None and obs:
+                            # 버스트 도중 스왑이 일어났으면 이 샘플들이 어느 오버레이의
+                            # 것인지 알 수 없다 → 틀린 귀속보다 버리는 게 낫다.
+                            _after = self._resolve_bank(core, self.session.read_word(_pa))
+                            if _bank is None or _after != _bank:
+                                self._ovl_dropped += len(obs)
+                                total += len(obs)      # 진행은 시켜야 무한루프가 안 난다
+                                continue
+                            obs = [o._replace(bank=_bank) for o in obs]
+                        if not obs:
+                            # ★ 빈 버스트(=pin 실패)에 continue 만 하면 total 이 안 늘어
+                            #   while 조건이 영원히 참 → **무한 루프**. 로그도 없이 스레드가
+                            #   돌며 세션 lock 을 물어 다음 윈도우까지 막는다(실기서 관측:
+                            #   시작 로그 뒤 아무것도 안 찍힘). 진행이 없으면 빠져나온다.
+                            empty += 1
+                            if empty >= self._EMPTY_BURST_LIMIT:
+                                self._stopped_reason = 'pin_fail'
+                                log.error(f"[cJTAG/SBA] 빈 버스트 {empty}회 연속(pin 실패) — "
+                                          f"샘플링 중단. 세션/오프셋 확인")
+                                bail = True
+                                self.openocd_error.set()   # 상위 루프가 재연결 판단
+                                break
                             continue
-                        self._last_raw_pcs.append(o.pc)
-                        if self._in_core_range(o.core_id, o.pc):
-                            self.current_trace.add(o.pc)
-                            self._observations.append(o)
-                        else:
-                            # ★ range 밖 PC 는 CoverageModel 에도 넣지 않는다.
-                            #   예전엔 _observations 를 필터 없이 채워, range 필터가
-                            #   legacy current_trace 에만 걸리고 v10 판정은 그대로 통과했다.
-                            self._out_of_range_count += 1
-                self._maybe_recover()
-        except Exception as e:
-            self._stopped_reason = f'exception:{str(e)[:40]}'
-            log.error(f"[cJTAG/SBA] 샘플링 예외: {e}")
-            self.openocd_error.set()    # 예외를 삼키면 커버리지 없이 캠페인이 계속된다
-        else:
-            self._stopped_reason = self._stopped_reason or (
-                'max_samples' if total >= limit else 'stop_event')
-        self.total_samples += total
+                        empty = 0
+                        total += len(obs)
+                        self._track_collapse(core, obs)
+                        for o in obs:
+                            if not (o.valid and o.pc is not None):
+                                self._observations.append(o)   # 무효 샘플도 판정엔 필요
+                                continue
+                            self._last_raw_pcs.append(o.pc)
+                            if self._in_core_range(o.core_id, o.pc):
+                                self.current_trace.add(o.pc)
+                                self._observations.append(o)
+                            else:
+                                # ★ range 밖 PC 는 CoverageModel 에도 넣지 않는다.
+                                #   예전엔 _observations 를 필터 없이 채워, range 필터가
+                                #   legacy current_trace 에만 걸리고 v10 판정은 그대로 통과했다.
+                                self._out_of_range_count += 1
+                    self._maybe_recover()
+            except Exception as e:
+                self._stopped_reason = f'exception:{str(e)[:40]}'
+                log.error(f"[cJTAG/SBA] 샘플링 예외: {e}")
+                self.openocd_error.set()    # 예외를 삼키면 커버리지 없이 캠페인이 계속된다
+            else:
+                self._stopped_reason = self._stopped_reason or (
+                    'max_samples' if total >= limit else 'stop_event')
+            self.total_samples += total
+        except Exception as _e:
+            import traceback
+            self._stopped_reason = "worker_exception"
+            log.error(f"[cJTAG/SBA] 샘플링 워커 예외 — 커버리지 수집 중단: "
+                      f"{type(_e).__name__}: {_e}")
+            log.error(traceback.format_exc())
+            self.openocd_error.set()
 
     def diagnose(self, count: int = 20) -> bool:
         """idle 유니버스 수집 — **코어별 버스트**로.
