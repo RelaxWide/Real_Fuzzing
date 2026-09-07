@@ -648,10 +648,13 @@ class TestOverlayBanks(unittest.TestCase):
                 self.assertEqual(cm.effective_bank(self.BASE + 4, b), 0)
 
     def test_bank_used_when_table_exists(self):
+        """파일명은 오버레이 순번(_ovl2), 내부 bank 는 순번+1 (bank 0 은 본체 전용)."""
         with tempfile.TemporaryDirectory() as d:
             cm = self._model(with_bank_tables=(2,), tmp=d).cores[2]
-            self.assertEqual(cm.effective_bank(self.BASE + 4, 2), 2)
-            self.assertEqual(cm.effective_bank(self.BASE + 4, 1), 0)  # 표 없는 bank
+            _ib = 2 + rc.OVL_BANK_OFFSET
+            self.assertEqual(cm.effective_bank(self.BASE + 4, _ib), _ib)
+            self.assertEqual(cm.effective_bank(self.BASE + 4,
+                                               1 + rc.OVL_BANK_OFFSET), 0)  # 표 없음
 
     def test_outside_window_never_banked(self):
         """오버레이 창 밖 주소는 모호하지 않다 — bank 를 붙이면 안 된다."""
@@ -716,9 +719,10 @@ class TestRuntimeBankResolution(unittest.TestCase):
         self.assertEqual(self._cm().overlay_probe_addr(), self.BASE + 4)
 
     def test_resolve_known_words(self):
+        """워드 → 내부 bank. JSON 의 오버레이 순번에 OVL_BANK_OFFSET 이 더해진다."""
         cm = self._cm()
-        for w, b in ((0x4F564C00, 0), (0x4F564C01, 1), (0x4F564C02, 2)):
-            self.assertEqual(cm.resolve_bank(w), b)
+        for w, n in ((0x4F564C00, 0), (0x4F564C01, 1), (0x4F564C02, 2)):
+            self.assertEqual(cm.resolve_bank(w), n + rc.OVL_BANK_OFFSET)
 
     def test_magic_mismatch_is_none(self):
         """미탑재/복사중/읽기실패 — 지금 뭐가 있는지 모르므로 bank 를 찍으면 안 된다."""
@@ -804,3 +808,82 @@ class TestFlatView(unittest.TestCase):
         for c in m.cores.values():
             c.fn_entries = []
         self.assertIsNone(m.flat_view())
+
+
+class TestOverlayAccounting(unittest.TestCase):
+    """★ 오버레이별 표(functions_coreH_ovl3.txt 등)를 넣었을 때 퍼저가 실제로
+    제대로 세는가. 표만 만들면 되는 게 아니라 모델이 bank 를 끝까지 들고 가야 한다.
+
+    수정 전 실측: 커버리지 300%, 리포트에 오버레이 함수 없음, 이름은 본체 것,
+    오버레이에서 밟은 BB 가 본체 함수 커버리지로 오귀속.
+    """
+    BASE = 0x56000
+
+    def _model(self, nbank=3):
+        cm = rc.CoreMap(0, 'H')
+        cm.bb_starts, cm.bb_ends = [self.BASE], [self.BASE + 16]
+        cm.fn_entries, cm.fn_ends, cm.fn_names = [self.BASE], [self.BASE + 16], ['base_fn']
+        cm.overlay = {"base": self.BASE, "window_end": self.BASE + 16214,
+                      "probe_offsets": [4], "magic": 0x4F564C00,
+                      "magic_mask": 0xFFFFFF00, "id_mask": 0xFF,
+                      "bank_sizes": {b + rc.OVL_BANK_OFFSET: 100 for b in range(nbank)},
+                      "probe_to_bank": {0x4F564C00 + b: b + rc.OVL_BANK_OFFSET
+                                        for b in range(nbank)}}
+        for b in range(nbank):
+            ib = b + rc.OVL_BANK_OFFSET
+            cm.banks[ib] = {"bb_starts": [self.BASE, self.BASE + 16],
+                            "bb_ends": [self.BASE + 16, self.BASE + 32],
+                            "fn_entries": [self.BASE], "fn_ends": [self.BASE + 32],
+                            "fn_names": [f'ovl{b}_fn']}
+        m = rc.CoverageModel()
+        m.cores = {0: cm}
+        m.loaded = True
+        return m, cm
+
+    def test_denominator_includes_banks(self):
+        """분모에 오버레이가 없으면 커버리지가 100% 를 넘는다(실측 300%)."""
+        m, cm = self._model()
+        self.assertEqual(m.total_bbs, 1 + 3 * 2)
+        self.assertEqual(m.total_funcs, 1 + 3)
+
+    def test_coverage_never_exceeds_total(self):
+        m, _ = self._model()
+        m.update([rc.Observation(0, self.BASE + 4, True, True,
+                                 b + rc.OVL_BANK_OFFSET) for b in range(3)])
+        self.assertLessEqual(len(m.covered_bbs), m.total_bbs)
+
+    def test_overlay_functions_in_report(self):
+        m, _ = self._model()
+        names = {r['name'] for r in m.function_rows()}
+        self.assertEqual(names, {'base_fn', 'ovl0_fn', 'ovl1_fn', 'ovl2_fn'})
+
+    def test_func_name_respects_bank(self):
+        _m, cm = self._model()
+        self.assertEqual(cm.func_name(self.BASE, 0), 'base_fn')
+        self.assertEqual(cm.func_name(self.BASE, 1 + rc.OVL_BANK_OFFSET), 'ovl1_fn')
+
+    def test_no_misattribution_to_base(self):
+        """오버레이에서 밟은 BB 가 같은 주소의 본체 함수 것으로 세어지면 안 된다."""
+        m, _ = self._model()
+        m.update([rc.Observation(0, self.BASE + 4, True, True,
+                                 b + rc.OVL_BANK_OFFSET) for b in range(3)])
+        base = [r for r in m.function_rows() if r['name'] == 'base_fn'][0]
+        self.assertEqual(base['covered_bbs'], 0)
+
+    def test_bank_zero_reserved_for_non_overlay(self):
+        """★ bank 0 을 오버레이 0 번과 공유하면 본체가 오버레이 커버리지를 삼킨다."""
+        self.assertEqual(rc.OVL_BANK_OFFSET, 1)
+        _m, cm = self._model()
+        self.assertNotIn(0, cm.banks, 'bank 0 은 본체 전용이어야 한다')
+
+    def test_resolve_bank_applies_offset(self):
+        _m, cm = self._model()
+        self.assertEqual(cm.resolve_bank(0x4F564C00), rc.OVL_BANK_OFFSET)
+        self.assertEqual(cm.resolve_bank(0x4F564C02), 2 + rc.OVL_BANK_OFFSET)
+
+    def test_each_overlay_counted_separately(self):
+        """이 기능의 목적 — 같은 PC, 다른 오버레이 = 다른 커버리지."""
+        m, _ = self._model()
+        m.update([rc.Observation(0, self.BASE + 4, True, True,
+                                 b + rc.OVL_BANK_OFFSET) for b in range(3)])
+        self.assertEqual(len(m.covered_bbs), 3)

@@ -13814,13 +13814,15 @@ class NVMeFuzzer:
         func_commands = defaultdict(set)
         for cmd, keys in getattr(self, 'cmd_cov_keys', {}).items():
             for key in keys:
-                cid, _bank, addr = _riscv_cov.unpack(key)
+                cid, bank, addr = _riscv_cov.unpack(key)
                 cm = cov.cores.get(cid)
                 if cm is None:
                     continue
-                entry = cm.func_of(addr)
+                # ★ bank 를 키에 넣는다. 빼면 같은 주소의 오버레이 함수들이 한
+                #   덩어리로 뭉쳐 명령 귀속이 전부 섞인다.
+                entry = cm.func_of(addr, bank)
                 if entry is not None:
-                    func_commands[(cid, entry)].add(str(cmd))
+                    func_commands[(cid, bank, entry)].add(str(cmd))
 
         def _status(row):
             if row['total_bbs'] and row['covered_bbs'] >= row['total_bbs']:
@@ -13835,7 +13837,8 @@ class NVMeFuzzer:
 
         for row in rows:
             row['status'] = _status(row)
-            row['commands'] = sorted(func_commands.get((row['core_id'], row['entry']), ()))
+            row['commands'] = sorted(
+                func_commands.get((row['core_id'], row['bank'], row['entry']), ()))
 
         def _atomic_text(path, content):
             tmp = Path(str(path) + '.tmp')
@@ -13938,14 +13941,16 @@ class NVMeFuzzer:
         csv_tmp = Path(str(csv_path) + '.tmp')
         try:
             with open(csv_tmp, 'w', newline='', encoding='utf-8') as fh:
-                fields = ('core_id', 'core', 'function', 'entry', 'size', 'status',
-                          'covered_bbs', 'total_bbs', 'bb_pct', 'frontier_callers',
-                          'commands')
+                fields = ('core_id', 'core', 'bank', 'function', 'entry', 'size',
+                          'status', 'covered_bbs', 'total_bbs', 'bb_pct',
+                          'frontier_callers', 'commands')
                 writer = csv.DictWriter(fh, fieldnames=fields)
                 writer.writeheader()
                 for row in rows:
                     writer.writerow({
                         'core_id': row['core_id'], 'core': row['core'],
+                        # bank 0 = 비오버레이 본체, N>0 = 오버레이 N-1
+                        'bank': row['bank'],
                         'function': row['name'], 'entry': f"0x{row['entry']:08x}",
                         'size': row['size'], 'status': row['status'],
                         'covered_bbs': row['covered_bbs'], 'total_bbs': row['total_bbs'],
@@ -13977,7 +13982,11 @@ class NVMeFuzzer:
                 '<tr data-core="{}" data-status="{}"><td>{}</td><td>{}</td>'
                 '<td>{}</td><td>{}</td><td>{:,}</td><td>{:,}/{:,}</td>'
                 '<td>{:.2f}%</td><td>{}</td><td>{}</td></tr>'.format(
-                    e(row['core']), row['status'], e(row['core']),
+                    e(row['core']), row['status'],
+                    # 오버레이 함수는 코어 라벨에 표시한다 — 주소가 같아서
+                    # 라벨 없이는 표에서 서로 구분되지 않는다.
+                    e(row['core'] if not row['bank']
+                      else f"{row['core']}/ovl{row['bank'] - 1}"),
                     e(row['name']), f"0x{row['entry']:08x}", row['status'],
                     row['size'], row['covered_bbs'], row['total_bbs'], row['bb_pct'],
                     row['frontier_callers'], e(commands)))

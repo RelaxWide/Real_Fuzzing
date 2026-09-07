@@ -26,6 +26,13 @@ from collections import namedtuple
 
 SCHEMA_VERSION = 1
 
+# ★ bank 0 은 **비오버레이 본체** 전용이다. 오버레이 N 번은 내부적으로 bank N+1.
+#   둘을 같은 0 으로 두면 본체 함수가 오버레이 0 번에서 밟은 커버리지를 자기 것으로
+#   센다(실측으로 확인). 파일명(_ovl<N>)과 프로브 표는 **오버레이 순번 N** 을
+#   그대로 쓰고, 이 오프셋은 로더에서 한 번만 적용한다.
+BANK_BASE = 0            # 비오버레이
+OVL_BANK_OFFSET = 1      # 오버레이 순번 → 내부 bank
+
 # ── 코어 식별자 ────────────────────────────────────────────────────────
 # ★ 한 번 정하면 못 바꾼다 — 저장된 커버리지 키·코퍼스가 이 번호에 묶인다.
 #   PCSR 주소도 te_base + stride*id 라 **하드웨어 코어 순서와 일치해야** 한다.
@@ -137,19 +144,36 @@ class CoreMap:
             return ent[i]
         return None
 
-    def func_name(self, entry):
-        i = bisect.bisect_left(self.fn_entries, entry)
-        if i < len(self.fn_entries) and self.fn_entries[i] == entry:
-            return self.fn_names[i]
+    def func_name(self, entry, bank=0):
+        """★ bank 를 받아야 한다 — 오버레이는 같은 주소에 다른 함수가 온다.
+        bank 를 무시하면 오버레이 함수 이름이 전부 본체 이름으로 나온다."""
+        t = self._tbl(bank)
+        ent, nms = (t["fn_entries"], t["fn_names"]) if t else (self.fn_entries,
+                                                               self.fn_names)
+        i = bisect.bisect_left(ent, entry)
+        if i < len(ent) and ent[i] == entry:
+            return nms[i]
         return None
+
+    def iter_tables(self):
+        """(bank, fn_entries, fn_ends, fn_names, bb_starts) — 본체 + 오버레이 전부.
+        리포트가 오버레이 함수를 빠뜨리지 않게 한 곳에서 순회한다."""
+        yield (0, self.fn_entries, self.fn_ends, self.fn_names, self.bb_starts)
+        for b in sorted(self.banks):
+            t = self.banks[b]
+            yield (b, t["fn_entries"], t["fn_ends"], t["fn_names"], t["bb_starts"])
 
     @property
     def total_bbs(self):
-        return len(self.bb_starts)
+        # ★ bank 표를 더한다. 안 더하면 covered 에는 bank!=0 키가 들어가는데
+        #   분모는 본체뿐이라 커버리지가 100% 를 넘는다(실측 300%).
+        return len(self.bb_starts) + sum(len(t["bb_starts"])
+                                         for t in self.banks.values())
 
     @property
     def total_funcs(self):
-        return len(self.fn_entries)
+        return len(self.fn_entries) + sum(len(t["fn_entries"])
+                                          for t in self.banks.values())
 
 
 def _read_bb(path):
@@ -262,18 +286,19 @@ class CoverageModel:
                     "magic": int(hdr.get("magic", "0"), 0) if hdr else None,
                     "magic_mask": int(hdr.get("magic_mask", "0"), 0) if hdr else None,
                     "id_mask": int(hdr.get("id_mask", "0"), 0) if hdr else None,
-                    "bank_sizes": {int(k): int(v)
+                    "bank_sizes": {int(k) + OVL_BANK_OFFSET: int(v)
                                    for k, v in (o.get("bank_sizes") or {}).items()},
                     # ★ 워드 → bank 는 이 표가 권위다. header.id_mask 로 뽑은 ID 를
                     #   bank 로 그대로 쓰면 안 된다(ID 가 0 부터라는 보장이 없다).
-                    "probe_to_bank": {int(k, 0): int(v)
+                    "probe_to_bank": {int(k, 0): int(v) + OVL_BANK_OFFSET
                                       for k, v in (o.get("probe_to_bank") or {}).items()},
                 }
                 for bank in sorted(cm.overlay["bank_sizes"]):
+                    _n = bank - OVL_BANK_OFFSET        # 파일명은 오버레이 순번
                     bb_b = os.path.join(product_dir,
-                                        f"basic_blocks_core{name}_ovl{bank}.txt")
+                                        f"basic_blocks_core{name}_ovl{_n}.txt")
                     fn_b = os.path.join(product_dir,
-                                        f"functions_core{name}_ovl{bank}.txt")
+                                        f"functions_core{name}_ovl{_n}.txt")
                     if not os.path.exists(bb_b):
                         continue          # 표 없으면 effective_bank 가 0 으로 접는다
                     bs, be = _read_bb(bb_b)
@@ -447,46 +472,52 @@ class CoverageModel:
         """
         covered_by_core = {}
         entered_by_core = {}
+        # ★ (core, bank) 로 나눈다. bank 를 버리면 오버레이에서 밟은 BB 가 같은
+        #   주소의 **본체 함수** 커버리지로 잘못 들어간다(실측: base 함수가
+        #   오버레이 3개분을 자기 것으로 셌다).
         for key in self.covered_bbs:
-            cid, _bank, addr = unpack(key)
-            covered_by_core.setdefault(cid, []).append(addr)
+            cid, bank, addr = unpack(key)
+            covered_by_core.setdefault((cid, bank), []).append(addr)
         for key in self.entered_funcs:
-            cid, _bank, entry = unpack(key)
-            entered_by_core.setdefault(cid, set()).add(entry)
+            cid, bank, entry = unpack(key)
+            entered_by_core.setdefault((cid, bank), set()).add(entry)
         for addrs in covered_by_core.values():
             addrs.sort()
 
         rows = []
         for cid, cm in sorted(self.cores.items()):
-            covered = covered_by_core.get(cid, [])
-            entered = entered_by_core.get(cid, set())
-            frontier = {}
-            for caller in entered:
-                for callee in cm.callees.get(caller, ()):
-                    if callee not in entered:
-                        frontier[callee] = frontier.get(callee, 0) + 1
-            for i, entry in enumerate(cm.fn_entries):
-                end = cm.fn_ends[i]
-                bb_lo = bisect.bisect_left(cm.bb_starts, entry)
-                bb_hi = bisect.bisect_left(cm.bb_starts, end)
-                cov_lo = bisect.bisect_left(covered, entry)
-                cov_hi = bisect.bisect_left(covered, end)
-                total_bbs = bb_hi - bb_lo
-                covered_bbs = cov_hi - cov_lo
-                rows.append({
-                    "core_id": cid,
-                    "core": cm.name,
-                    "name": cm.fn_names[i],
-                    "entry": entry,
-                    "end": end,
-                    "size": end - entry,
-                    "entered": entry in entered,
-                    "covered_bbs": covered_bbs,
-                    "total_bbs": total_bbs,
-                    "bb_pct": (100.0 * covered_bbs / total_bbs
-                               if total_bbs else 0.0),
-                    "frontier_callers": frontier.get(entry, 0),
-                })
+            for bank, fn_entries, fn_ends, fn_names, bb_starts in cm.iter_tables():
+                covered = covered_by_core.get((cid, bank), [])
+                entered = entered_by_core.get((cid, bank), set())
+                frontier = {}
+                if bank == 0:          # 콜그래프는 아직 본체만 있다(오버레이별 미제공)
+                    for caller in entered:
+                        for callee in cm.callees.get(caller, ()):
+                            if callee not in entered:
+                                frontier[callee] = frontier.get(callee, 0) + 1
+                for i, entry in enumerate(fn_entries):
+                    end = fn_ends[i]
+                    bb_lo = bisect.bisect_left(bb_starts, entry)
+                    bb_hi = bisect.bisect_left(bb_starts, end)
+                    cov_lo = bisect.bisect_left(covered, entry)
+                    cov_hi = bisect.bisect_left(covered, end)
+                    total_bbs = bb_hi - bb_lo
+                    covered_bbs = cov_hi - cov_lo
+                    rows.append({
+                        "core_id": cid,
+                        "core": cm.name,
+                        "bank": bank,
+                        "name": fn_names[i],
+                        "entry": entry,
+                        "end": end,
+                        "size": end - entry,
+                        "entered": entry in entered,
+                        "covered_bbs": covered_bbs,
+                        "total_bbs": total_bbs,
+                        "bb_pct": (100.0 * covered_bbs / total_bbs
+                                   if total_bbs else 0.0),
+                        "frontier_callers": frontier.get(entry, 0),
+                    })
         return rows
 
     # ── 스냅샷 (차트 서브프로세스용 — resume 용도가 아님) ──────────────

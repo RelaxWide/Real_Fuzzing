@@ -660,3 +660,32 @@ class TestOverlayRuntimeWiring(unittest.TestCase):
     def test_drop_counter_surfaced(self):
         src = self._src()
         self.assertIn('ovl-drop:', src)
+
+
+class TestOverlayReport(unittest.TestCase):
+    """리포트가 오버레이 함수를 구분하는가. 모델이 bank 를 들고 가도 리포트가
+    떨어뜨리면 같은 주소의 35개 함수가 표에서 한 줄로 뭉친다."""
+
+    def _src(self):
+        import pathlib
+        return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
+            encoding='utf-8')
+
+    def test_command_attribution_keyed_by_bank(self):
+        src = self._src()
+        self.assertIn("func_commands[(cid, bank, entry)]", src)
+        self.assertIn("cm.func_of(addr, bank)", src)
+
+    def test_row_lookup_uses_bank(self):
+        src = self._src()
+        self.assertIn("func_commands.get((row['core_id'], row['bank'], row['entry'])", src)
+
+    def test_csv_has_bank_column(self):
+        src = self._src()
+        i = src.index("fields = ('core_id', 'core',")
+        self.assertIn("'bank'", src[i:i + 200])
+
+    def test_html_labels_overlay(self):
+        """주소가 같아서 라벨이 없으면 표에서 서로 구분되지 않는다."""
+        src = self._src()
+        self.assertIn("f\"{row['core']}/ovl{row['bank'] - 1}\"", src)
