@@ -301,3 +301,48 @@ class TestNonZeroHeaderIds(unittest.TestCase):
         """연속이 아니면 헤더로 보지 않는다(우연히 갈린 코드 바이트일 수 있다)."""
         self.assertIsNone(op.detect_header(
             {9: 0x4F564C04, 10: 0x4F564C05, 11: 0x4F564C09}))
+
+
+class TestManyOverlays(unittest.TestCase):
+    """H코어 실측: 오버레이 35개(REGION_00~34, section 19~53)가 0x56000 을 공유하고
+    총 471KB 가 16KB 창을 29.7배로 돌려 쓴다. 4개짜리 F 와 규모가 다르다."""
+
+    H_SIZES = [3370, 12896, 14326, 15464, 16006, 16178, 12080, 14982, 14490,
+               15218, 10496, 14042, 16180, 15904, 11888, 16214, 13916, 15594,
+               13290, 15228, 13868, 15544, 16130, 13838, 11108, 15762, 14158,
+               14632, 15762, 15112, 13560, 11480, 13880, 12558, 7058]
+    H_BASE = 352256
+
+    def test_map_geometry(self):
+        """플랜의 전제(35개 / section 19~53 / 같은 주소)를 고정한다."""
+        self.assertEqual(len(self.H_SIZES), 35)
+        self.assertEqual(19 + len(self.H_SIZES) - 1, 53)
+        self.assertEqual(self.H_BASE, 0x56000)
+
+    def test_probe_offset_fits_smallest_overlay(self):
+        """가장 작은 오버레이(3,370B)보다 앞에서 판별돼야 한다 — 넘으면 그 오버레이가
+        올라와 있을 때 인접 데이터를 읽는다."""
+        vals = {19 + n: 0x4F564C00 | n for n in range(35)}
+        self.assertEqual(len(set(vals.values())), 35)
+        self.assertLess(4 + 4, min(self.H_SIZES))
+
+    def test_header_detected_for_35(self):
+        vals = {19 + n: 0x4F564C00 | n for n in range(35)}
+        got = op.detect_header(vals)
+        self.assertIsNotNone(got)
+        _m, magic, id_to_idx, _t = got
+        self.assertEqual(magic, 0x4F564C00)
+        self.assertEqual(len(id_to_idx), 35)
+        self.assertEqual(id_to_idx[34], 53)
+
+    def test_bank_fits_key_field(self):
+        """bank 필드 폭이 모자라면 키가 조용히 뭉개진다."""
+        import riscv_cov as rc
+        for b in range(35):
+            k = rc.pack(0, b, self.H_BASE + 8)
+            self.assertEqual(rc.unpack(k), (0, b, self.H_BASE + 8))
+
+    def test_window_is_max_size(self):
+        mx = max(self.H_SIZES)
+        self.assertEqual(mx, 16214)
+        self.assertEqual(self.H_BASE + mx, 0x59F56)

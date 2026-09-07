@@ -186,9 +186,14 @@ def main():
 
     print(f"[ovl] core={a.core}  base=0x{base:X}  창=0x{base:X}~0x{end:X} "
           f"({max(sizes.values()):,}B)  오버레이 {len(rows)}개")
-    for name, idx, _addr, size in rows:
+    _MAXL = 8
+    for name, idx, _addr, size in rows[:_MAXL]:
         print(f"      idx={idx:<3} {name:<18} size={size:,} "
               f"(끝=0x{base + size:X})")
+    if len(rows) > _MAXL:
+        _sz = [r[3] for r in rows]
+        print(f"      ... {len(rows) - _MAXL}개 더 (크기 {min(_sz):,}~{max(_sz):,}B, "
+              f"총 {sum(_sz):,}B = 창의 {sum(_sz) / max(_sz):.1f}배가 같은 자리를 쓴다)")
 
     # ★ bank 는 **오버레이 순번**(0..3)이다 — 섹션 인덱스가 아니다.
     #   런타임이 헤더에서 뽑는 값(word & 0xFF)이 순번이고, 파일명도 _ovl<순번> 이라
@@ -206,8 +211,11 @@ def main():
         probe = list(pair)
         table = {f"0x{v[0]:08X},0x{v[1]:08X}": idx_to_ord[idx] for idx, v in combo.items()}
         print(f"[ovl] 판별 오프셋 = +0x{pair[0]:X},+0x{pair[1]:X} (2워드)")
-    for key, idx in sorted(table.items(), key=lambda kv: kv[1]):
+    _items = sorted(table.items(), key=lambda kv: kv[1])
+    for key, idx in _items[:6]:
         print(f"      {key} → bank {idx}")
+    if len(_items) > 6:
+        print(f"      ... {len(_items) - 6}개 더 (전체는 출력 JSON 의 probe_to_bank)")
 
     hdr = detect_header(vals) if k is not None else None
     if hdr:
@@ -215,8 +223,15 @@ def main():
         print(f"[ovl] ★ 구조화된 헤더 감지 — 매직 0x{magic:08X}(\"{txt}\") + 순번 ID")
         print(f"      런타임 검증: (word & 0x{mask:08X}) == 0x{magic:08X} 이어야 유효")
         id_to_bank = {i: idx_to_ord[j] for i, j in id_to_idx.items()}
-        print(f"      헤더 ID = word & 0x{~mask & 0xFFFFFFFF:08X}  "
-              f"→ bank: {', '.join(f'ID{i}→bank{b}' for i, b in sorted(id_to_bank.items()))}")
+        _bad = [(i, b) for i, b in sorted(id_to_bank.items()) if i != b]
+        if _bad:
+            print(f"      헤더 ID = word & 0x{~mask & 0xFFFFFFFF:08X} → bank "
+                  f"(ID != bank 인 것 {len(_bad)}개): "
+                  + ", ".join(f"ID{i}→bank{b}" for i, b in _bad[:8])
+                  + (" ..." if len(_bad) > 8 else ""))
+        else:
+            print(f"      헤더 ID = word & 0x{~mask & 0xFFFFFFFF:08X} = bank "
+                  f"(ID 0~{max(id_to_bank)} 이 bank 와 그대로 일치)")
         if any(i != b for i, b in id_to_bank.items()):
             print("      ⚠ 헤더 ID 가 bank 순번과 다르다 — 런타임은 반드시 probe_to_bank "
                   "표로 변환해야 한다(ID 를 bank 로 그대로 쓰면 표가 로드되지 않는다)",
