@@ -54,7 +54,8 @@ def unpack(key: int):
 #   유추할 수 없다. 코어를 명시적으로 들고 다닌다.
 #     valid : PCSR bit0. False = 그 코어가 잠깐 halt/wfi (링크 장애 아님)
 #     fresh : 직전 값의 반복이 아닌가 (last-retired 계열이라 stall 시 같은 PC 가 반복됨)
-Observation = namedtuple("Observation", "core_id pc fresh valid")
+Observation = namedtuple("Observation", "core_id pc fresh valid bank")
+Observation.__new__.__defaults__ = (0,)      # bank 기본 0 = 오버레이 아님/미확정
 
 AccountResult = namedtuple(
     "AccountResult", "interesting new_count seed_keys new_by_core considered dropped")
@@ -71,18 +72,48 @@ class CoreMap:
         self.fn_entries, self.fn_ends, self.fn_names = [], [], []
         self.callees = {}          # caller_entry -> set(callee_entry)
         self.elf_sha256 = ""
+        # ── 코드 오버레이 ──
+        #   같은 주소에 여러 코드가 번갈아 올라온다(F코어: 0xAE000 에 4개).
+        #   overlay: {"base","window_end","probe_offsets","magic","magic_mask","id_mask"}
+        #   banks:   {bank: CoreMap 유사 테이블} — 오버레이별 BB/함수.
+        self.overlay = None
+        self.banks = {}
+
+    # ── 오버레이 ──
+    def in_overlay(self, pc):
+        o = self.overlay
+        return bool(o) and o["base"] <= pc < o["window_end"]
+
+    def effective_bank(self, pc, bank):
+        """키에 쓸 bank. ★ 부풀림 방지 —
+
+        bank 별 BB 테이블이 아직 없는데 bank 를 그대로 키에 넣으면, **같은 BB** 가
+        bank 0..3 으로 각각 세어져 covered_bbs 가 최대 4배가 되고 total_bbs 는
+        그대로라 커버리지가 100% 를 넘는다. 테이블이 있는 bank 에만 bank 를 쓰고,
+        없으면 0 으로 접는다(정보는 잃지만 숫자는 정직하다).
+        """
+        if not bank or not self.in_overlay(pc):
+            return 0
+        return bank if bank in self.banks else 0
+
+    def _tbl(self, bank):
+        return self.banks.get(bank) if bank else None
 
     # ── 조회 ──
-    def bb_of(self, pc):
-        i = bisect.bisect_right(self.bb_starts, pc) - 1
-        if i >= 0 and pc < self.bb_ends[i]:
-            return self.bb_starts[i]
+    def bb_of(self, pc, bank=0):
+        t = self._tbl(bank)
+        starts, ends = (t["bb_starts"], t["bb_ends"]) if t else (self.bb_starts, self.bb_ends)
+        i = bisect.bisect_right(starts, pc) - 1
+        if i >= 0 and pc < ends[i]:
+            return starts[i]
         return None
 
-    def func_of(self, pc):
-        i = bisect.bisect_right(self.fn_entries, pc) - 1
-        if i >= 0 and pc < self.fn_ends[i]:
-            return self.fn_entries[i]
+    def func_of(self, pc, bank=0):
+        t = self._tbl(bank)
+        ent, ends = (t["fn_entries"], t["fn_ends"]) if t else (self.fn_entries, self.fn_ends)
+        i = bisect.bisect_right(ent, pc) - 1
+        if i >= 0 and pc < ends[i]:
+            return ent[i]
         return None
 
     def func_name(self, entry):
@@ -196,6 +227,37 @@ class CoverageModel:
                 cm.fn_entries, cm.fn_ends, cm.fn_names = _read_funcs(fn)
             if os.path.exists(cg):
                 cm.callees = _read_callgraph(cg)
+            # ── 코드 오버레이(있는 코어만) ──
+            #   overlay_map_core<X>.json = tools/overlay_probe.py 산출물.
+            #   bank 별 BB/함수 표는 basic_blocks_core<X>_ovl<N>.txt 규약.
+            om = os.path.join(product_dir, f"overlay_map_core{name}.json")
+            if os.path.exists(om):
+                with open(om, encoding="utf-8") as f:
+                    o = json.load(f)
+                hdr = o.get("header") or {}
+                cm.overlay = {
+                    "base": int(o["base"]), "window_end": int(o["window_end"]),
+                    "probe_offsets": list(o.get("probe_offsets") or []),
+                    "magic": int(hdr.get("magic", "0"), 0) if hdr else None,
+                    "magic_mask": int(hdr.get("magic_mask", "0"), 0) if hdr else None,
+                    "id_mask": int(hdr.get("id_mask", "0"), 0) if hdr else None,
+                    "bank_sizes": {int(k): int(v)
+                                   for k, v in (o.get("bank_sizes") or {}).items()},
+                }
+                for bank in sorted(cm.overlay["bank_sizes"]):
+                    bb_b = os.path.join(product_dir,
+                                        f"basic_blocks_core{name}_ovl{bank}.txt")
+                    fn_b = os.path.join(product_dir,
+                                        f"functions_core{name}_ovl{bank}.txt")
+                    if not os.path.exists(bb_b):
+                        continue          # 표 없으면 effective_bank 가 0 으로 접는다
+                    bs, be = _read_bb(bb_b)
+                    fe, fen, fnm = ([], [], [])
+                    if os.path.exists(fn_b):
+                        fe, fen, fnm = _read_funcs(fn_b)
+                    cm.banks[bank] = {"bb_starts": bs, "bb_ends": be,
+                                      "fn_entries": fe, "fn_ends": fen,
+                                      "fn_names": fnm}
             info = (sym.get("cores") or {}).get(name, {})
             cm.elf_sha256 = info.get("elf_sha256", "")
             m._verify_counts(cm, info)
@@ -232,13 +294,16 @@ class CoverageModel:
                 dropped += 1
                 continue
             considered += 1
-            bb = cm.bb_of(ob.pc)
+            # 오버레이 창 안이면 관측된 bank 로 조회한다. bank 별 테이블이 없으면
+            # effective_bank 가 0 으로 접어 부풀림을 막는다(§오버레이).
+            bank = cm.effective_bank(ob.pc, ob.bank)
+            bb = cm.bb_of(ob.pc, bank)
             if bb is None:
                 continue                     # 표에 없는 PC (매핑 실패)
-            cur.add(pack(ob.core_id, 0, bb))
-            fe = cm.func_of(ob.pc)
+            cur.add(pack(ob.core_id, bank, bb))
+            fe = cm.func_of(ob.pc, bank)
             if fe is not None:
-                funcs.add(pack(ob.core_id, 0, fe))
+                funcs.add(pack(ob.core_id, bank, fe))
         return ProjectionResult(cur, funcs, considered, dropped)
 
     def account(self, observations, credit_cores=None) -> AccountResult:

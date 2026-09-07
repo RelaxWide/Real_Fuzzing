@@ -4,6 +4,7 @@
 
 하드웨어·실제 ELF 없이 전부 검증된다(합성 표 사용)."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -597,3 +598,87 @@ class TestAdaptiveWeights(unittest.TestCase):
         aw.observe({0: 4, 1: 4}, {0: 1000, 1: 1000})
         aw.maybe_update(1)
         self.assertIsNone(aw.maybe_update(2))
+
+
+class TestOverlayBanks(unittest.TestCase):
+    """코드 오버레이 — 같은 주소에 여러 코드가 번갈아 올라온다(F코어 0xAE000 ×4).
+
+    가장 위험한 실수: bank 별 BB 표가 없는데 bank 를 키에 넣는 것.
+    같은 BB 가 bank 0..3 으로 4번 세어져 covered_bbs 가 total_bbs 를 넘는다.
+    """
+    BASE = 0xAE000
+    END = 0xAE000 + 15970
+
+    def _model(self, with_bank_tables=(), tmp=None):
+        import json as _json
+        d = tmp
+        # 베이스 표: 오버레이 창을 덮는 BB 3개
+        with open(os.path.join(d, 'basic_blocks_coreF.txt'), 'w') as f:
+            f.write(f"0x{self.BASE:x} 0x{self.BASE+16:x}\n")
+            f.write(f"0x{self.BASE+16:x} 0x{self.BASE+32:x}\n")
+            f.write(f"0x{self.BASE+32:x} 0x{self.BASE+48:x}\n")
+        with open(os.path.join(d, 'functions_coreF.txt'), 'w') as f:
+            f.write(f"0x{self.BASE:x} 48 ovl_fn\n")
+        _json.dump({"core": "F", "base": self.BASE, "window_end": self.END,
+                    "probe_offsets": [4],
+                    "header": {"magic": "0x4F564C00", "magic_mask": "0xFFFFFF00",
+                               "id_mask": "0x000000FF"},
+                    "bank_sizes": {"0": 11758, "1": 15970, "2": 10914, "3": 5010}},
+                   open(os.path.join(d, 'overlay_map_coreF.json'), 'w'))
+        for b in with_bank_tables:
+            with open(os.path.join(d, f'basic_blocks_coreF_ovl{b}.txt'), 'w') as f:
+                f.write(f"0x{self.BASE:x} 0x{self.BASE+16:x}\n")
+        return rc.CoverageModel.load(d, product='BM9K1', core_ids={"F": 2})
+
+    def test_overlay_map_loaded(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = self._model(tmp=d)
+            cm = m.cores[2]
+            self.assertIsNotNone(cm.overlay)
+            self.assertEqual(cm.overlay['base'], self.BASE)
+            self.assertEqual(cm.overlay['magic'], 0x4F564C00)
+            self.assertTrue(cm.in_overlay(self.BASE + 8))
+            self.assertFalse(cm.in_overlay(self.END))
+
+    def test_no_bank_table_folds_to_zero(self):
+        """★ 부풀림 방지의 핵심 — 표가 없으면 bank 를 0 으로 접는다."""
+        with tempfile.TemporaryDirectory() as d:
+            cm = self._model(tmp=d).cores[2]
+            for b in (0, 1, 2, 3):
+                self.assertEqual(cm.effective_bank(self.BASE + 4, b), 0)
+
+    def test_bank_used_when_table_exists(self):
+        with tempfile.TemporaryDirectory() as d:
+            cm = self._model(with_bank_tables=(2,), tmp=d).cores[2]
+            self.assertEqual(cm.effective_bank(self.BASE + 4, 2), 2)
+            self.assertEqual(cm.effective_bank(self.BASE + 4, 1), 0)  # 표 없는 bank
+
+    def test_outside_window_never_banked(self):
+        """오버레이 창 밖 주소는 모호하지 않다 — bank 를 붙이면 안 된다."""
+        with tempfile.TemporaryDirectory() as d:
+            cm = self._model(with_bank_tables=(2,), tmp=d).cores[2]
+            self.assertEqual(cm.effective_bank(0x20000, 2), 0)
+
+    def test_coverage_not_inflated_without_tables(self):
+        """★ 회귀 오라클: bank 가 섞인 관측이 들어와도 covered_bbs 가
+        total_bbs 를 넘으면 안 된다(넘으면 커버리지 %가 100% 초과)."""
+        with tempfile.TemporaryDirectory() as d:
+            m = self._model(tmp=d)
+            obs = [rc.Observation(2, self.BASE + 4, True, True, b)
+                   for b in (0, 1, 2, 3)]
+            m.update(obs)
+            self.assertEqual(len(m.covered_bbs), 1, "같은 BB 는 한 번만 세어야")
+            self.assertLessEqual(len(m.covered_bbs), m.total_bbs)
+
+    def test_distinct_banks_counted_separately_with_tables(self):
+        """표가 있으면 같은 주소라도 오버레이별로 **다른 코드**이므로 따로 센다."""
+        with tempfile.TemporaryDirectory() as d:
+            m = self._model(with_bank_tables=(1, 2), tmp=d)
+            m.update([rc.Observation(2, self.BASE + 4, True, True, 1),
+                      rc.Observation(2, self.BASE + 4, True, True, 2)])
+            self.assertEqual(len(m.covered_bbs), 2)
+
+    def test_observation_bank_defaults_to_zero(self):
+        """기존 4인자 호출이 전부 그대로 동작해야 한다."""
+        o = rc.Observation(2, 0x1000, True, True)
+        self.assertEqual(o.bank, 0)
