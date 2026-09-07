@@ -261,3 +261,43 @@ class TestBankIsOrdinal(unittest.TestCase):
         doc = self._run()
         self.assertEqual(int(doc['bank_sizes']['0']), SIZES[15])
         self.assertEqual(int(doc['bank_sizes']['3']), SIZES[18])
+
+
+class TestNonZeroHeaderIds(unittest.TestCase):
+    """★ 헤더 ID 가 0 부터 시작한다는 보장이 없다.
+
+    H코어 실측 가정: 오버레이 3개인데 헤더 ID 가 4~6(코어간 전역 번호매김).
+    런타임이 `bank = word & 0xFF` 를 그대로 쓰면 4,5,6 이 나와 _ovl0~2 표와
+    어긋나고 bank 표가 **조용히** 로드되지 않는다. probe_to_bank 가 권위다.
+    """
+
+    IDS = (4, 5, 6)
+    SZ = {9: 1024, 10: 2048, 11: 768}
+
+    def _vals(self):
+        return {9 + n: 0x4F564C00 | i for n, i in enumerate(self.IDS)}
+
+    def test_header_still_detected(self):
+        got = op.detect_header(self._vals())
+        self.assertIsNotNone(got, "ID 가 0 부터가 아니어도 연속이면 헤더다")
+        _mask, magic, id_to_idx, _t = got
+        self.assertEqual(magic, 0x4F564C00)
+        self.assertEqual(sorted(id_to_idx), [4, 5, 6])
+
+    def test_ids_map_to_ordinal_banks(self):
+        """ID 4/5/6 → bank 0/1/2 로 변환돼야 한다."""
+        _m, _mg, id_to_idx, _t = op.detect_header(self._vals())
+        idx_to_ord = {idx: n for n, idx in enumerate(sorted(self.SZ))}
+        id_to_bank = {i: idx_to_ord[j] for i, j in id_to_idx.items()}
+        self.assertEqual(id_to_bank, {4: 0, 5: 1, 6: 2})
+
+    def test_raw_id_would_be_wrong(self):
+        """ID 를 bank 로 그대로 쓰면 표 범위를 벗어난다는 것을 고정한다."""
+        banks = set(range(len(self.SZ)))
+        self.assertFalse(set(self.IDS) <= banks,
+                         "이 테스트의 전제(ID != bank)가 깨졌다")
+
+    def test_gap_in_ids_not_a_header(self):
+        """연속이 아니면 헤더로 보지 않는다(우연히 갈린 코드 바이트일 수 있다)."""
+        self.assertIsNone(op.detect_header(
+            {9: 0x4F564C04, 10: 0x4F564C05, 11: 0x4F564C09}))

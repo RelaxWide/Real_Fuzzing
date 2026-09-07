@@ -78,9 +78,12 @@ def export_core(core, elf, ovl_map, outdir, objdump=None):
                "bank_sizes": {str(n): s for n, (_nm, _i, _a, s) in enumerate(rows)}}
         if hdr:
             mask, magic, id_to_idx, _t = hdr
-            doc["header"] = {"magic_mask": f"0x{mask:08X}", "magic": f"0x{magic:08X}",
-                             "id_mask": f"0x{~mask & 0xFFFFFFFF:08X}",
-                             "id_to_section": {str(a): b for a, b in id_to_idx.items()}}
+            doc["header"] = {
+                "magic_mask": f"0x{mask:08X}", "magic": f"0x{magic:08X}",
+                "id_mask": f"0x{~mask & 0xFFFFFFFF:08X}",
+                "id_to_section": {str(a): b for a, b in id_to_idx.items()},
+                # ID 가 0 부터 시작한다는 보장이 없다(H코어 실측 ID 4~6, bank 0~2)
+                "id_to_bank": {str(a): idx_to_ord[b] for a, b in id_to_idx.items()}}
         with open(os.path.join(outdir, f"overlay_map_core{core}.json"), 'w',
                   encoding='utf-8') as f:
             json.dump(doc, f, indent=2, ensure_ascii=False)

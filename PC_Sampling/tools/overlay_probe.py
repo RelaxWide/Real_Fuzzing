@@ -214,14 +214,19 @@ def main():
         mask, magic, id_to_idx, txt = hdr
         print(f"[ovl] ★ 구조화된 헤더 감지 — 매직 0x{magic:08X}(\"{txt}\") + 순번 ID")
         print(f"      런타임 검증: (word & 0x{mask:08X}) == 0x{magic:08X} 이어야 유효")
-        print(f"      bank = word & 0x{~mask & 0xFFFFFFFF:08X}  "
-              f"→ {', '.join(f'bank{i}=idx{j}' for i, j in sorted(id_to_idx.items()))}")
-        if {idx_to_ord[j] for j in id_to_idx.values()} != set(id_to_idx):
-            print("      ⚠ 헤더 ID 와 섹션 순번이 어긋난다 — 파일명 규약 확인 필요",
+        id_to_bank = {i: idx_to_ord[j] for i, j in id_to_idx.items()}
+        print(f"      헤더 ID = word & 0x{~mask & 0xFFFFFFFF:08X}  "
+              f"→ bank: {', '.join(f'ID{i}→bank{b}' for i, b in sorted(id_to_bank.items()))}")
+        if any(i != b for i, b in id_to_bank.items()):
+            print("      ⚠ 헤더 ID 가 bank 순번과 다르다 — 런타임은 반드시 probe_to_bank "
+                  "표로 변환해야 한다(ID 를 bank 로 그대로 쓰면 표가 로드되지 않는다)",
                   file=sys.stderr)
         doc_hdr = {"magic_mask": f"0x{mask:08X}", "magic": f"0x{magic:08X}",
                    "id_mask": f"0x{~mask & 0xFFFFFFFF:08X}",
-                   "id_to_section": {str(i): j for i, j in id_to_idx.items()}}
+                   "id_to_section": {str(i): j for i, j in id_to_idx.items()},
+                   # ★ 런타임은 이 표로 ID→bank 변환한다. ID 가 0 부터 시작한다는
+                   #   보장이 없다(H코어 실측: ID 4~6, bank 0~2).
+                   "id_to_bank": {str(i): b for i, b in id_to_bank.items()}}
     else:
         doc_hdr = None
 
