@@ -56,6 +56,7 @@ import time
 import threading
 import queue
 import importlib
+import shlex
 import subprocess
 import os
 import sys
@@ -660,6 +661,12 @@ POR_RESCAN_DELAY  = _PW.get('por_rescan_delay', 3.0)
 # (인증은 어차피 전원 사이클마다 재수행하므로 추가 비용이 없다.)
 POR_RELEASE_LINK  = _PW.get('por_release_link', False)
 POR_STRAP_SETTLE  = _PW.get('por_strap_settle_wait', 2.0)
+# 부트모드 스트랩을 POR 구간에만 정상부팅 레벨로 잡는 외부 명령. 스트랩은 리셋 해제
+# 시점에만 래치되므로, POR 직전에 boot 레벨로 잡고 부팅 후 중립으로 놓으면 부팅과
+# JTAG 이 양립한다. 예) tools/jlink_gpio.py --set GP15_ROM_BOOT=low,GP12_ROM_DEBUG=hiz
+# J-Link EMU GPIO 는 J-Link 자체 핀이라 타깃 인증이 필요 없다(ROM 모드에서도 동작).
+POR_STRAP_BOOT_CMD    = _PW.get('por_strap_boot_cmd', '')
+POR_STRAP_RELEASE_CMD = _PW.get('por_strap_release_cmd', '')
 
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
 # 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
@@ -1308,6 +1315,8 @@ class FuzzConfig:
     por_poweroff_wait: float = POR_POWEROFF_WAIT
     por_release_link: bool = POR_RELEASE_LINK
     por_strap_settle_wait: float = POR_STRAP_SETTLE
+    por_strap_boot_cmd: str = POR_STRAP_BOOT_CMD
+    por_strap_release_cmd: str = POR_STRAP_RELEASE_CMD
     por_boot_wait:     float = POR_BOOT_WAIT   # PCIe rescan 후 NVMe 응답 최대 대기 (초)
     por_rescan_delay:  float = POR_RESCAN_DELAY  # 전원 ON → 첫 rescan 대기 (초). 이 값이
                                                # 0 이면 link training 전에 rescan 이 돌아
@@ -5229,6 +5238,30 @@ class NVMeFuzzer:
             return self._pcie_topmost_bdf() or self._pcie_root_bdf or self._pcie_bdf
         return v or self._pcie_bdf
 
+    def _run_strap_cmd(self, cmd: str, what: str) -> bool:
+        """부트모드 스트랩 제어 외부 명령 실행. 실패해도 POR 은 계속한다 —
+        여기서 죽으면 시료가 전원 없는 상태로 남는다.
+
+        스트랩 도구는 J-Link USB 를 잡으므로 **링크 해제 이후**에 불려야 한다
+        (power.por_release_link). 그래서 호출 순서가 close() → strap → power off 다.
+        """
+        if not cmd:
+            return False
+        try:
+            r = subprocess.run(shlex.split(cmd), capture_output=True,
+                               text=True, timeout=20)
+            _out = (r.stdout or r.stderr or '').strip().splitlines()
+            log.warning(f"[POR/strap] {what}: rc={r.returncode}"
+                        + (f" | {_out[-1][:120]}" if _out else ""))
+            if r.returncode != 0:
+                log.error(f"[POR/strap] {what} 실패 — 부팅 모드가 의도와 다를 수 있다")
+            return r.returncode == 0
+        except subprocess.TimeoutExpired:
+            log.error(f"[POR/strap] {what} 20초 timeout — 스킵")
+        except Exception as _e:
+            log.error(f"[POR/strap] {what} 예외: {_e} — 스킵")
+        return False
+
     def _power_cycle_ssd(self) -> bool:
         """PMU 보드를 이용한 SSD POR Phase 1: 전원 사이클 + SWD 준비 대기.
 
@@ -5270,6 +5303,12 @@ class NVMeFuzzer:
                 log.warning("[POR] 디버그 링크 해제 — 부트 스트랩 구간 동안 핀 high-Z 시도")
             except Exception as _e:
                 log.warning(f"[POR] 링크 해제 실패({_e}) — 그대로 진행")
+        # 스트랩은 리셋 해제 시점에 래치된다 → 전원을 내리기 전에 잡아둔다.
+        if (self.config.por_strap_boot_cmd and not self._por_link_released
+                and getattr(self.sampler, 'USES_JLINK_USB', False)):
+            log.error("[POR/strap] 스트랩 도구가 J-Link USB 를 열어야 하는데 퍼저가 "
+                      "세션을 점유 중이다 — power.por_release_link=true 로 켜라")
+        self._run_strap_cmd(self.config.por_strap_boot_cmd, "부팅 레벨 설정")
 
         # 1. 전원 OFF — PCIe remove 보다 **먼저**(위 docstring 참조).
         _off_cmd = ['python3', self.config.pmu_script, '7', '1']
@@ -5316,13 +5355,18 @@ class NVMeFuzzer:
         log.warning(f"[POR] PowerOnAll rc={r.returncode} "
                     f"stdout={r.stdout.decode(errors='replace').strip()!r} "
                     f"stderr={r.stderr.decode(errors='replace').strip()!r}")
-        if (getattr(self, '_por_link_released', False)
-                and self.config.por_strap_settle_wait > 0):
-            # 스트랩은 리셋 해제 시점에 래치된다 → 그 창이 지나기 전에 링크를 다시
-            # 물면 해제한 의미가 없다. 여기서만 기다리고 재연결은 호출자에 맡긴다.
+        _need_settle = (getattr(self, '_por_link_released', False)
+                        or bool(self.config.por_strap_boot_cmd))
+        if _need_settle and self.config.por_strap_settle_wait > 0:
+            # 스트랩은 리셋 해제 시점에 래치된다. 그 창이 지나기 전에 링크를 다시
+            # 물거나 스트랩을 중립으로 되돌리면 해제/설정한 의미가 없다.
+            # ★ 스트랩만 쓰고 링크 해제는 안 하는 구성에서도 반드시 기다려야 한다.
             log.warning(f"[POR] 부트 스트랩 확정 대기 "
-                        f"{self.config.por_strap_settle_wait:.1f}초 (링크 해제 유지)")
+                        f"{self.config.por_strap_settle_wait:.1f}초")
             time.sleep(self.config.por_strap_settle_wait)
+        # 스트랩 래치가 끝났으므로 중립으로 되돌린다. 잡아둔 채로 두면 다음 리셋뿐
+        # 아니라 그 핀을 쓰는 정상 동작까지 영향받을 수 있다.
+        self._run_strap_cmd(self.config.por_strap_release_cmd, "중립 복귀")
         log.warning("[POR] 전원 ON — OpenOCD 즉시 연결 시도 (boot_sweep_s 내 재시도)")
         return True
 

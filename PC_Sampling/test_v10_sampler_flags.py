@@ -481,6 +481,12 @@ class TestPorLinkRelease(unittest.TestCase):
         return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
             encoding='utf-8')
 
+    def _por_body(self):
+        """_power_cycle_ssd 본문만 — 고정 길이 윈도우는 코드가 늘면 조용히 빗나간다."""
+        src = self._src()
+        i = src.index('    def _power_cycle_ssd(self)')
+        return src[i:src.index('\n    def ', i + 10)]
+
     def test_default_off(self):
         """켜는 것은 명시적 선택이어야 한다(다른 제품 회귀 방지)."""
         import json, pathlib
@@ -490,18 +496,14 @@ class TestPorLinkRelease(unittest.TestCase):
 
     def test_release_before_power_off(self):
         """전원을 내리기 **전에** 닫아야 리셋 구간 내내 high-Z 다."""
-        src = self._src()
-        i = src.index('def _power_cycle_ssd')
-        seg = src[i:i + 4000]
+        seg = self._por_body()
         rel = seg.index('self.sampler.close()')
         off = seg.index("'7', '1'")          # PowerOffAll
         self.assertLess(rel, off, "close() 는 PowerOffAll 보다 앞서야 한다")
 
     def test_settle_wait_before_return(self):
         """스트랩은 리셋 해제 시점에 래치된다 → 전원 ON 후 대기가 있어야 의미가 있다."""
-        src = self._src()
-        i = src.index('def _power_cycle_ssd')
-        seg = src[i:i + 5000]
+        seg = self._por_body()
         on = seg.index("'4', '1'")           # PowerOnAll
         wait = seg.index('por_strap_settle_wait')
         self.assertLess(on, wait, "대기는 PowerOnAll 이후여야 한다")
@@ -523,3 +525,91 @@ class TestPorLinkRelease(unittest.TestCase):
         src = self._src()
         i = src.index('self.sampler.close()')
         self.assertIn('except Exception', src[i - 200:i + 400])
+
+
+class TestPorStrapControl(unittest.TestCase):
+    """부트모드 스트랩 제어 — POR 구간에만 정상부팅 레벨로 잡는 훅.
+    스트랩은 리셋 해제 시점에만 래치되므로 '언제' 부르는지가 전부다."""
+
+    def _src(self):
+        import pathlib
+        return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
+            encoding='utf-8')
+
+    def test_shlex_imported(self):
+        """shlex 가 없으면 _run_strap_cmd 가 NameError → except 에 먹혀 '스킵'으로
+        조용히 넘어가고, 스트랩이 안 잡힌 채 POR 이 나간다."""
+        src = self._src()
+        self.assertRegex(src, r'(?m)^import shlex$')
+
+    def test_boot_level_before_power_off(self):
+        """전원을 내리기 전에 잡아야 리셋 해제 시점에 유효하다."""
+        src = self._src()
+        i = src.index('    def _power_cycle_ssd(self)')
+        seg = src[i:src.index('\n    def ', i + 10)]
+        self.assertLess(seg.index('por_strap_boot_cmd'), seg.index("'7', '1'"))
+
+    def test_release_after_settle(self):
+        """래치가 끝나기 전에 중립으로 되돌리면 잡아둔 의미가 없다."""
+        src = self._src()
+        i = src.index('    def _power_cycle_ssd(self)')
+        seg = src[i:src.index('\n    def ', i + 10)]
+        self.assertLess(seg.index('por_strap_settle_wait'),
+                        seg.index('por_strap_release_cmd'))
+
+    def test_settle_applies_without_link_release(self):
+        """스트랩만 쓰고 링크 해제는 안 하는 구성에서도 대기해야 한다
+        (_por_link_released 에만 걸어두면 래치 전에 중립 복귀한다)."""
+        src = self._src()
+        i = src.index('_need_settle')
+        self.assertIn('por_strap_boot_cmd', src[i:i + 200])
+
+    def test_strap_failure_does_not_abort_por(self):
+        """스트랩 실패로 POR 이 죽으면 시료가 전원 없는 상태로 남는다."""
+        src = self._src()
+        i = src.index('def _run_strap_cmd')
+        seg = src[i:i + 1400]
+        self.assertIn('except subprocess.TimeoutExpired', seg)
+        self.assertIn('return False', seg)
+
+    def test_usb_contention_warned(self):
+        """스트랩 도구는 J-Link USB 를 연다 → 퍼저가 점유 중이면 못 연다."""
+        src = self._src()
+        self.assertIn('por_release_link=true 로 켜라', src)
+
+    def test_defaults_are_off(self):
+        import json, pathlib
+        cfg = json.loads(pathlib.Path(__file__).with_name('fuzzer_config.json').read_text())
+        self.assertEqual(cfg['power']['por_strap_boot_cmd'], "")
+        self.assertEqual(cfg['power']['por_strap_release_cmd'], "")
+
+
+class TestJlinkGpioTool(unittest.TestCase):
+    """스트랩 도구 — 하드웨어 없이도 오타를 잡아야 한다(POR 한복판에서 죽으면 곤란)."""
+
+    def setUp(self):
+        import sys, pathlib
+        sys.path.insert(0, str(pathlib.Path(__file__).with_name('tools')))
+        import jlink_gpio
+        self.g = jlink_gpio
+
+    def test_aliases(self):
+        self.assertEqual(self.g.parse_set('A=gnd,B=vcc,C=중립'),
+                         [('A', 'low'), ('B', 'high'), ('C', 'hiz')])
+
+    def test_bad_state_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.g.parse_set('A=bogus')
+
+    def test_missing_equals_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.g.parse_set('A')
+
+    def test_empty_name_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.g.parse_set('=low')
+
+    def test_tristate_covered(self):
+        """VCC/중립/GND 3단 토글이 전부 매핑돼야 스위치를 대체할 수 있다."""
+        for k in ('high', 'hiz', 'low'):
+            self.assertIn(k, self.g.STATE_CODES)
