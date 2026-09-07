@@ -14015,6 +14015,176 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         log.info("[CoverageReport] coverage_by_core.txt / function_coverage.csv / "
                  "command_core_yield.csv / report.html 갱신")
 
+    def _render_firmware_map(self, entries, ends, names, entered,
+                             bb_starts, covered_bbs, total_bbs, map_file, label=''):
+        """펌웨어 함수 맵 1장. 원래 _generate_all_charts 안에 인라인이라 _sa_* 만
+        그릴 수 있었다 → RISC-V 는 그 필드가 비어 아예 안 나왔고, 코어별로 여러 장을
+        그릴 수도 없었다. 데이터를 인자로 받게 분리해 코어별 호출이 가능해진다.
+
+        ★ 한 장에 한 코어만 그린다. 코어마다 주소공간이 독립이라 합치면 주소축이
+        뒤섞이고, 오버레이는 같은 주소에 여러 코드가 겹쳐 선형 축에 못 그린다.
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import bisect as _bisect_fm
+        import numpy as _np_fm
+        from matplotlib import cm as _cm_fm
+        from matplotlib.colors import LinearSegmentedColormap as _LSC
+
+        # --- 함수별 BB 커버율 계산 ---
+        # 0.0 = not entered  /  0.0~1.0 = partial  /  1.0 = full
+        # BB 파일 없으면 진입 여부만으로 0/1 fallback
+        # 동시에 BB-weighted 평균을 위한 함수 내 total/covered BB 수도 누적.
+        func_cov_pct: list = []
+        _total_bbs_in_funcs = 0
+        _cov_bbs_in_funcs   = 0
+        _has_bb = bb_starts is not None and total_bbs > 0
+        for i in range(len(entries)):
+            entry = entries[i]
+            end   = ends[i]
+            _is_entered = entry in entered
+
+            if _has_bb:
+                lo = _bisect_fm.bisect_left(bb_starts, entry)
+                hi = _bisect_fm.bisect_left(bb_starts, end)
+                _n_total = hi - lo
+                _n_cov = sum(1 for bb in bb_starts[lo:hi]
+                             if bb in covered_bbs)
+            else:
+                _n_total = 0
+                _n_cov = 0
+
+            _total_bbs_in_funcs += _n_total
+            _cov_bbs_in_funcs   += _n_cov
+
+            if not _is_entered:
+                func_cov_pct.append(0.0)
+            elif not _has_bb:
+                func_cov_pct.append(1.0)            # BB 정보 없음 → 진입=full
+            elif _n_total == 0:
+                func_cov_pct.append(1.0)            # BB 0개 함수 → 진입=full
+            else:
+                func_cov_pct.append(_n_cov / _n_total)
+
+        n_funcs = len(entries)
+
+        # --- treemap 격자: 전체 함수를 cols × rows 배치 ---
+        # 함수 수에 따라 적응형 cols 선택 — 가로세로 비율 ~2:1 유지
+        cols = max(20, int(_np_fm.ceil(_np_fm.sqrt(n_funcs * 2))))
+        rows = (n_funcs + cols - 1) // cols
+
+        # cell 크기 (인치) — 함수 1000개 이상이면 작게
+        _cell = 0.20 if n_funcs > 1500 else (0.28 if n_funcs > 500 else 0.42)
+        fig_w = max(8.0, cols * _cell + 1.0)
+        fig_h = max(4.0, rows * _cell + 1.5)
+
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        ax.set_xlim(0, cols)
+        ax.set_ylim(0, rows)
+        ax.set_aspect('equal')
+        ax.axis('off')
+
+        fig.patch.set_facecolor('#1a1a2e')
+        ax.set_facecolor('#1a1a2e')
+
+        # 색상 그라데이션: 미진입(어두운 보라) → 부분(노랑) → 풀(밝은 초록)
+        cmap_fm = _LSC.from_list(
+            'cov_grad',
+            ['#444466', '#e07a3a', '#e9c46a', '#52b788', '#00c875'])
+
+        # 각 함수 cell 그리기 (entry 순으로 좌→우, 위→아래)
+        for func_i in range(n_funcs):
+            row = func_i // cols
+            col = func_i % cols
+            y   = rows - 1 - row
+
+            pct = func_cov_pct[func_i]
+            if pct == 0.0:
+                color = '#444466'      # 미진입 — 어두운 회보라
+            elif pct >= 0.999:
+                color = '#00c875'      # 완전 커버 — 밝은 초록
+            else:
+                color = cmap_fm(0.1 + 0.85 * pct)   # partial: 그라데이션
+
+            # cell 크기는 함수 크기와 약간 비례(가독성 유지 위해 변동 작게)
+            func_size = ends[func_i] - entries[func_i]
+            w = 0.92
+            h = 0.5 + min(0.42, func_size / 4096.0)
+            rect = mpatches.Rectangle(
+                (col + (1 - w) / 2, y + (1 - h) / 2), w, h,
+                facecolor=color, edgecolor='none', alpha=0.92,
+                linewidth=0)
+            ax.add_patch(rect)
+
+        # --- Top-N 라벨: 가장 큰 미진입 + 가장 큰 진입 (각 5개) ---
+        _top_n = 5 if n_funcs < 800 else 4
+        # 미진입 중 사이즈 상위
+        _unentered = [(i, ends[i] - entries[i]) for i in range(n_funcs)
+                      if func_cov_pct[i] == 0.0]
+        _unentered.sort(key=lambda x: x[1], reverse=True)
+        for rank, (func_i, sz) in enumerate(_unentered[:_top_n]):
+            row = func_i // cols
+            col = func_i % cols
+            y   = rows - 1 - row
+            _short_name = names[func_i][:18]
+            ax.annotate(
+                f'{_short_name}\n({sz}B)',
+                xy=(col + 0.5, y + 0.5),
+                xytext=(min(cols + 1, col + 1.2),
+                        max(0, min(rows - 1, y - 0.8 - rank * 0.4))),
+                fontsize=6.5, color='#ffb4b4',
+                arrowprops=dict(arrowstyle='-', color='#ffb4b4',
+                                lw=0.5, alpha=0.6))
+
+        # 진입했으나 사이즈 크고 BB 커버 낮은 함수 상위
+        _partial = [(i, ends[i] - entries[i], func_cov_pct[i])
+                    for i in range(n_funcs)
+                    if 0.0 < func_cov_pct[i] < 0.5]
+        _partial.sort(key=lambda x: x[1], reverse=True)
+        for rank, (func_i, sz, pct) in enumerate(_partial[:_top_n]):
+            row = func_i // cols
+            col = func_i % cols
+            y   = rows - 1 - row
+            _short_name = names[func_i][:18]
+            ax.annotate(
+                f'{_short_name}\n({sz}B, {int(pct*100)}%)',
+                xy=(col + 0.5, y + 0.5),
+                xytext=(max(-2, col - 4.2),
+                        max(0, min(rows - 1, y + 0.8 + rank * 0.4))),
+                fontsize=6.5, color='#ffe4a3',
+                arrowprops=dict(arrowstyle='-', color='#ffe4a3',
+                                lw=0.5, alpha=0.6))
+
+        n_cov   = len(entered)
+        n_uncov = n_funcs - n_cov
+        cov_pct = 100.0 * n_cov / n_funcs
+        # 함수 내 전체 BB 대비 커버된 BB 비율 — 진짜 BB-weighted.
+        # (함수별 % 단순 평균이 아닌 Σ covered / Σ total 가중 평균)
+        _avg_bb_pct = (100.0 * _cov_bbs_in_funcs / _total_bbs_in_funcs
+                       if _total_bbs_in_funcs > 0 else 0.0)
+
+        # 그라데이션 범례
+        _sm = _cm_fm.ScalarMappable(cmap=cmap_fm,
+                                    norm=plt.Normalize(vmin=0.0, vmax=1.0))
+        _sm.set_array([])
+        cbar = fig.colorbar(_sm, ax=ax, shrink=0.4, pad=0.01,
+                            orientation='vertical')
+        cbar.set_label('BB coverage / func', color='white', fontsize=8)
+        cbar.ax.tick_params(colors='white', labelsize=7)
+        cbar.outline.set_edgecolor('gray')
+
+        ax.set_title(
+            f'Firmware Function Map{label}  —  '
+            f'entered {cov_pct:.1f}% ({n_cov}/{n_funcs})  '
+            f'·  BB-weighted {_avg_bb_pct:.1f}%',
+            color='white', fontsize=11, pad=8)
+
+        plt.savefig(map_file, dpi=160, bbox_inches='tight',
+                    facecolor=fig.get_facecolor())
+        plt.close()
+        log.info(f"[StatGraph] 펌웨어 맵 → {_logname(map_file)} "
+                 f"({n_funcs} funcs / {cols}×{rows} grid)")
+
     def _generate_all_charts(self) -> None:
         """5종 차트를 순서대로 생성(인프로세스 본체). fork 자식 또는 종료 시 직접 호출."""
         _gdir = self.output_dir / 'graphs'
@@ -14513,170 +14683,28 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         # ------------------------------------------------------------------ #
         # 2. Firmware address-space map  (v7.6: BB gradient + 전체 함수 + Top-N)
         # ------------------------------------------------------------------ #
-        if self._sa_func_entries and self._sa_total_funcs > 0:
-            entries = self._sa_func_entries
-            ends    = self._sa_func_ends
-            names   = self._sa_func_names
-            entered = self._sa_entered_funcs
-            import bisect as _bisect_fm
-            import numpy as _np_fm
-            from matplotlib import cm as _cm_fm
-            from matplotlib.colors import LinearSegmentedColormap as _LSC
-
-            # --- 함수별 BB 커버율 계산 ---
-            # 0.0 = not entered  /  0.0~1.0 = partial  /  1.0 = full
-            # BB 파일 없으면 진입 여부만으로 0/1 fallback
-            # 동시에 BB-weighted 평균을 위한 함수 내 total/covered BB 수도 누적.
-            func_cov_pct: list = []
-            _total_bbs_in_funcs = 0
-            _cov_bbs_in_funcs   = 0
-            _has_bb = self._sa_bb_starts is not None and self._sa_total_bbs > 0
-            for i in range(len(entries)):
-                entry = entries[i]
-                end   = ends[i]
-                _is_entered = entry in entered
-
-                if _has_bb:
-                    lo = _bisect_fm.bisect_left(self._sa_bb_starts, entry)
-                    hi = _bisect_fm.bisect_left(self._sa_bb_starts, end)
-                    _n_total = hi - lo
-                    _n_cov = sum(1 for bb in self._sa_bb_starts[lo:hi]
-                                 if bb in self._sa_covered_bbs)
-                else:
-                    _n_total = 0
-                    _n_cov = 0
-
-                _total_bbs_in_funcs += _n_total
-                _cov_bbs_in_funcs   += _n_cov
-
-                if not _is_entered:
-                    func_cov_pct.append(0.0)
-                elif not _has_bb:
-                    func_cov_pct.append(1.0)            # BB 정보 없음 → 진입=full
-                elif _n_total == 0:
-                    func_cov_pct.append(1.0)            # BB 0개 함수 → 진입=full
-                else:
-                    func_cov_pct.append(_n_cov / _n_total)
-
-            n_funcs = len(entries)
-
-            # --- treemap 격자: 전체 함수를 cols × rows 배치 ---
-            # 함수 수에 따라 적응형 cols 선택 — 가로세로 비율 ~2:1 유지
-            cols = max(20, int(_np_fm.ceil(_np_fm.sqrt(n_funcs * 2))))
-            rows = (n_funcs + cols - 1) // cols
-
-            # cell 크기 (인치) — 함수 1000개 이상이면 작게
-            _cell = 0.20 if n_funcs > 1500 else (0.28 if n_funcs > 500 else 0.42)
-            fig_w = max(8.0, cols * _cell + 1.0)
-            fig_h = max(4.0, rows * _cell + 1.5)
-
-            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-            ax.set_xlim(0, cols)
-            ax.set_ylim(0, rows)
-            ax.set_aspect('equal')
-            ax.axis('off')
-
-            fig.patch.set_facecolor('#1a1a2e')
-            ax.set_facecolor('#1a1a2e')
-
-            # 색상 그라데이션: 미진입(어두운 보라) → 부분(노랑) → 풀(밝은 초록)
-            cmap_fm = _LSC.from_list(
-                'cov_grad',
-                ['#444466', '#e07a3a', '#e9c46a', '#52b788', '#00c875'])
-
-            # 각 함수 cell 그리기 (entry 순으로 좌→우, 위→아래)
-            for func_i in range(n_funcs):
-                row = func_i // cols
-                col = func_i % cols
-                y   = rows - 1 - row
-
-                pct = func_cov_pct[func_i]
-                if pct == 0.0:
-                    color = '#444466'      # 미진입 — 어두운 회보라
-                elif pct >= 0.999:
-                    color = '#00c875'      # 완전 커버 — 밝은 초록
-                else:
-                    color = cmap_fm(0.1 + 0.85 * pct)   # partial: 그라데이션
-
-                # cell 크기는 함수 크기와 약간 비례(가독성 유지 위해 변동 작게)
-                func_size = ends[func_i] - entries[func_i]
-                w = 0.92
-                h = 0.5 + min(0.42, func_size / 4096.0)
-                rect = mpatches.Rectangle(
-                    (col + (1 - w) / 2, y + (1 - h) / 2), w, h,
-                    facecolor=color, edgecolor='none', alpha=0.92,
-                    linewidth=0)
-                ax.add_patch(rect)
-
-            # --- Top-N 라벨: 가장 큰 미진입 + 가장 큰 진입 (각 5개) ---
-            _top_n = 5 if n_funcs < 800 else 4
-            # 미진입 중 사이즈 상위
-            _unentered = [(i, ends[i] - entries[i]) for i in range(n_funcs)
-                          if func_cov_pct[i] == 0.0]
-            _unentered.sort(key=lambda x: x[1], reverse=True)
-            for rank, (func_i, sz) in enumerate(_unentered[:_top_n]):
-                row = func_i // cols
-                col = func_i % cols
-                y   = rows - 1 - row
-                _short_name = names[func_i][:18]
-                ax.annotate(
-                    f'{_short_name}\n({sz}B)',
-                    xy=(col + 0.5, y + 0.5),
-                    xytext=(min(cols + 1, col + 1.2),
-                            max(0, min(rows - 1, y - 0.8 - rank * 0.4))),
-                    fontsize=6.5, color='#ffb4b4',
-                    arrowprops=dict(arrowstyle='-', color='#ffb4b4',
-                                    lw=0.5, alpha=0.6))
-
-            # 진입했으나 사이즈 크고 BB 커버 낮은 함수 상위
-            _partial = [(i, ends[i] - entries[i], func_cov_pct[i])
-                        for i in range(n_funcs)
-                        if 0.0 < func_cov_pct[i] < 0.5]
-            _partial.sort(key=lambda x: x[1], reverse=True)
-            for rank, (func_i, sz, pct) in enumerate(_partial[:_top_n]):
-                row = func_i // cols
-                col = func_i % cols
-                y   = rows - 1 - row
-                _short_name = names[func_i][:18]
-                ax.annotate(
-                    f'{_short_name}\n({sz}B, {int(pct*100)}%)',
-                    xy=(col + 0.5, y + 0.5),
-                    xytext=(max(-2, col - 4.2),
-                            max(0, min(rows - 1, y + 0.8 + rank * 0.4))),
-                    fontsize=6.5, color='#ffe4a3',
-                    arrowprops=dict(arrowstyle='-', color='#ffe4a3',
-                                    lw=0.5, alpha=0.6))
-
-            n_cov   = len(entered)
-            n_uncov = n_funcs - n_cov
-            cov_pct = 100.0 * n_cov / n_funcs
-            # 함수 내 전체 BB 대비 커버된 BB 비율 — 진짜 BB-weighted.
-            # (함수별 % 단순 평균이 아닌 Σ covered / Σ total 가중 평균)
-            _avg_bb_pct = (100.0 * _cov_bbs_in_funcs / _total_bbs_in_funcs
-                           if _total_bbs_in_funcs > 0 else 0.0)
-
-            # 그라데이션 범례
-            _sm = _cm_fm.ScalarMappable(cmap=cmap_fm,
-                                        norm=plt.Normalize(vmin=0.0, vmax=1.0))
-            _sm.set_array([])
-            cbar = fig.colorbar(_sm, ax=ax, shrink=0.4, pad=0.01,
-                                orientation='vertical')
-            cbar.set_label('BB coverage / func', color='white', fontsize=8)
-            cbar.ax.tick_params(colors='white', labelsize=7)
-            cbar.outline.set_edgecolor('gray')
-
-            ax.set_title(
-                f'Firmware Function Map  —  '
-                f'entered {cov_pct:.1f}% ({n_cov}/{n_funcs})  '
-                f'·  BB-weighted {_avg_bb_pct:.1f}%',
-                color='white', fontsize=11, pad=8)
-
-            map_file = graph_dir / 'firmware_map.png'
-            plt.savefig(map_file, dpi=160, bbox_inches='tight',
-                        facecolor=fig.get_facecolor())
-            plt.close()
-            log.info(f"[StatGraph] 펌웨어 맵 → {_logname(map_file)} "
-                     f"({n_funcs} funcs / {cols}×{rows} grid)")
+        # 펌웨어 맵 — RISC-V 는 코어별로 한 장씩(주소공간이 독립이라 합칠 수 없다).
+        _cov_fm = getattr(self, 'cov', None)
+        if _cov_fm is not None and getattr(_cov_fm, 'loaded', False):
+            _drawn = 0
+            for _cid in sorted(_cov_fm.cores):
+                _fv = _cov_fm.flat_view(_cid)
+                if not _fv or not _fv['fn_entries']:
+                    continue          # 본체 함수가 없는 코어(전부 오버레이)는 건너뜀
+                self._render_firmware_map(
+                    _fv['fn_entries'], _fv['fn_ends'], _fv['fn_names'],
+                    _fv['entered_funcs'], _fv['bb_starts'], _fv['covered_bbs'],
+                    _fv['total_bbs'],
+                    graph_dir / f"firmware_map_core{_fv['name']}.png",
+                    label=f"  [core {_fv['name']}]")
+                _drawn += 1
+            if not _drawn:
+                log.info("[StatGraph] 펌웨어 맵 생략 — 본체 함수가 있는 코어가 없다")
+        elif self._sa_func_entries and self._sa_total_funcs > 0:
+            self._render_firmware_map(
+                self._sa_func_entries, self._sa_func_ends, self._sa_func_names,
+                self._sa_entered_funcs, self._sa_bb_starts, self._sa_covered_bbs,
+                self._sa_total_bbs, graph_dir / 'firmware_map.png')
 
         # v7.6: uncovered_funcs.png 제거. firmware_map의 Top-N 라벨 + 그라데이션이
         # 같은 정보를 더 효율적으로 보여주고, 우선순위 분석은 텍스트 로그가 더 효과적.
