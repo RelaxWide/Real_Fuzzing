@@ -236,9 +236,13 @@ else:
         missing_fn = sorted(want - idx_fn)
         extra = sorted((idx_bb | idx_fn) - want)
         if missing_bb or missing_fn:
+            # 누락 **번호**를 앞에 낸다 — 개수만 보면 어느 파일인지 몰라 못 고친다.
+            _mi = sorted(set(missing_bb) | set(missing_fn))
+            _tail = "" if len(_mi) <= 8 else f" 외 {len(_mi) - 8}개"
             bad(f"core{c} 오버레이 표",
-                f"맵 {n_map}개 중 BB 누락 {len(missing_bb)} 함수 누락 {len(missing_fn)}"
-                f" (누락 bank 는 bank 0 으로 접혀 분모에서 빠진다) {missing_bb[:5]}")
+                f"누락 ovl 번호 {_mi[:8]}{_tail}  "
+                f"(있는 것: BB {len(idx_bb)}개 / 함수 {len(idx_fn)}개, 맵 {n_map}개 "
+                f"= ovl0~{n_map - 1}). 누락 bank 는 bank 0 으로 접혀 분모에서 빠진다")
         elif extra:
             bad(f"core{c} 오버레이 표",
                 f"맵에 없는 ovl 번호 {extra[:5]} — 맵과 표가 다른 빌드일 수 있다")
