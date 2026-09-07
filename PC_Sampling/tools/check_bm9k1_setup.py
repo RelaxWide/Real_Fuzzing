@@ -163,6 +163,14 @@ try:
     import riscv_cov as _rc
 except Exception as _e:
     _rc = None
+    bad("riscv_cov import", f"{_e}")
+# 오래된 사본을 물면 여기서 AttributeError 로 죽는 대신 이유를 말한다.
+# (실제로 겪음: 호스트가 pull 전이라 함수가 없어 체커가 터졌다)
+if _rc is not None and not hasattr(_rc, "overlay_layout_candidates"):
+    bad("riscv_cov 버전",
+        f"오버레이 지원 없는 옛 사본이다 — git pull 필요. "
+        f"로드된 파일: {getattr(_rc, '__file__', '?')}")
+    _rc = None
 if not PROD.is_dir():
     bad("오버레이", "products 디렉토리 없음")
 else:
