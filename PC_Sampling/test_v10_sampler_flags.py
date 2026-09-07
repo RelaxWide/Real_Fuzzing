@@ -525,3 +525,7 @@ class TestSetWeightsAndAdaptiveWiring(unittest.TestCase):
         self.assertTrue(ad['enabled'])
         self.assertEqual(ad['exponent'], 2.0)
         self.assertGreaterEqual(ad['min_weight'], 1)
+        # 감쇠창(1/(1-decay))이 갱신주기보다 짧으면 연속 갱신이 데이터를 거의
+        # 공유하지 않아 배분이 튄다(실측: H 8→6→3→4).
+        self.assertGreaterEqual(1.0 / (1.0 - ad['decay']), ad['period'])
+        self.assertNotIn('min_samples', ad, '하드 게이트는 제거됐다(수축으로 대체)')

@@ -438,7 +438,7 @@ class AdaptiveWeights:
     """
 
     def __init__(self, weights, decay=0.995, min_weight=1, max_step=2.0,
-                 period=500, min_samples=5000, exponent=2.0):
+                 period=500, prior_samples=2000, exponent=2.0):
         self.weights = {int(c): max(int(min_weight), int(w))
                         for c, w in dict(weights).items()}
         self.total = sum(self.weights.values())
@@ -446,7 +446,12 @@ class AdaptiveWeights:
         self.min_weight = int(min_weight)
         self.max_step = float(max_step)
         self.period = int(period)
-        self.min_samples = int(min_samples)   # 이만큼도 안 본 코어는 판단 보류
+        # 표본이 적은 코어의 rate 는 노이즈다. 예전엔 min_samples 미만이면 판단에서
+        # **제외**했는데, 가중치가 낮은 코어는 그 문턱을 영영 못 넘어 아무리 생산적
+        # 이어도 예산을 못 받는 상태로 고정됐다(실측: CM 의 per1k 가 네 코어 중
+        # 최고인 갱신에서도 1 에 묶임). → 제외 대신 **전체 평균 쪽으로 수축**한다.
+        # 표본이 쌓이면 자기 실제 rate 로 수렴하고, 적으면 평균 대접을 받는다.
+        self.prior_samples = float(prior_samples)
         # rate 에 그대로 비례배분하면 저수확 코어로 예산이 샌다. 실측 예: 전체
         # 발견의 7% 뿐인 두 코어가 rate 비례로는 예산의 28% 를 가져갔다. rate**e
         # 로 승자 쪽을 날카롭게 하되, floor 가 있어 관측은 끊기지 않는다.
@@ -463,9 +468,20 @@ class AdaptiveWeights:
             self.dnew[c] = self.dnew[c] * d + float((new_by_core or {}).get(c, 0))
             self.dsamp[c] = self.dsamp[c] * d + float((samples_by_core or {}).get(c, 0))
 
-    def rates(self):
-        """1000 샘플당 신규 BB (감쇠 기준)."""
-        return {c: (1000.0 * self.dnew[c] / self.dsamp[c]) if self.dsamp[c] > 0 else 0.0
+    def rates(self, raw=False):
+        """1000 샘플당 신규 BB (감쇠 기준).
+
+        raw=True 면 관측 그대로, 기본은 전체 평균으로 수축한 추정치를 준다.
+        수축은 표본이 적은 코어를 배제하지 않으면서 노이즈로 예산이 튀는 것을 막는다.
+        """
+        if raw:
+            return {c: (1000.0 * self.dnew[c] / self.dsamp[c]) if self.dsamp[c] > 0 else 0.0
+                    for c in self.weights}
+        tot_n = sum(self.dnew.values())
+        tot_s = sum(self.dsamp.values())
+        pooled = (tot_n / tot_s) if tot_s > 0 else 0.0
+        m = self.prior_samples
+        return {c: 1000.0 * (self.dnew[c] + m * pooled) / (self.dsamp[c] + m)
                 for c in self.weights}
 
     def should_update(self, executions):
@@ -474,12 +490,12 @@ class AdaptiveWeights:
     def compute(self):
         """새 가중치를 계산해 반환. 바꿀 이유가 없으면 None."""
         r = self.rates()
-        # 아직 표본이 부족한 코어가 있으면 그 코어는 현 가중치를 유지한다.
-        judged = [c for c in self.weights if self.dsamp[c] >= self.min_samples]
+        # ★ 전 코어를 판단한다. 표본 부족은 제외가 아니라 수축으로 다룬다 —
+        #   제외하면 저가중치 코어가 문턱을 못 넘어 영원히 후보에서 빠진다.
+        judged = [c for c in self.weights if self.dsamp[c] > 0]
         if not judged or sum(r[c] for c in judged) <= 0:
             return None
 
-        # 판단 가능한 코어들끼리만 예산을 재배분한다(보류 코어의 몫은 건드리지 않음).
         pool = sum(self.weights[c] for c in judged)
         sharp = {c: r[c] ** self.exponent for c in judged}
         rsum = sum(sharp.values())

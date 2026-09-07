@@ -559,14 +559,27 @@ class TestAdaptiveWeights(unittest.TestCase):
         aw.observe({0: 10}, {0: 1000})
         self.assertIsNone(aw.maybe_update(499))
 
-    def test_holds_undersampled_core(self):
-        """표본이 min_samples 에 못 미치는 코어는 판단을 보류한다
-        (샘플 몇 개로 예산을 뺏으면 관측이 더 줄어 영영 회복 못 한다)."""
-        aw = rc.AdaptiveWeights({0: 8, 1: 1}, period=10, min_samples=10 ** 9)
-        for ex in range(1, 101):
-            aw.observe({0: 5, 1: 0}, {0: 1000, 1: 10})
+    def test_low_sample_core_is_shrunk_not_excluded(self):
+        """★ 실측 회귀: 표본 적은 코어를 '판단에서 제외' 하면, 가중치가 낮은 코어는
+        문턱을 영영 못 넘어 아무리 생산적이어도 예산을 못 받는다(CM 의 per1k 가
+        네 코어 중 최고인 갱신에서도 1 에 묶였다). 제외 대신 수축이어야 한다."""
+        aw = rc.AdaptiveWeights({0: 8, 1: 1, 2: 4, 3: 1}, decay=0.999, period=500)
+        for ex in range(1, 8001):
+            samp = {c: aw.weights[c] * 25 for c in aw.weights}
+            r = {0: 0.5, 1: 4.0, 2: 0.5, 3: 0.2}      # CM(1) 만 생산적
+            aw.observe({c: (samp[c] / 1000.0) * r[c] for c in aw.weights}, samp)
             aw.maybe_update(ex)
-        self.assertEqual(aw.weights, {0: 8, 1: 1})
+        self.assertGreater(aw.weights[1], 5,
+                           "생산적인 저가중치 코어가 예산을 받아야 한다")
+
+    def test_shrinkage_damps_noise(self):
+        """표본이 거의 없는 코어의 튀는 rate 가 배분을 흔들면 안 된다."""
+        aw = rc.AdaptiveWeights({0: 8, 1: 1}, decay=0.999, period=500)
+        for _ in range(200):
+            aw.observe({0: 20, 1: 5}, {0: 10000, 1: 5})   # 1번은 표본 5개뿐
+        shrunk, raw = aw.rates(), aw.rates(raw=True)
+        self.assertLess(shrunk[1], raw[1], "표본 부족 코어는 평균 쪽으로 당겨져야")
+        self.assertAlmostEqual(shrunk[0], raw[0], delta=0.2)   # 표본 많으면 거의 그대로
 
     def test_recent_beats_stale(self):
         """감쇠가 없으면 과거가 지배해 변화를 못 따라간다."""

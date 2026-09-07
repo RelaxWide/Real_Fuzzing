@@ -1096,14 +1096,14 @@
           "valid_bit": 1,
           "seed": 0,
           "adaptive": {
-            "_comment": "weights 는 출발점. 최근 수확률(감쇠 per1k)로 캠페인 중 예산을 옮긴다. enabled=false 면 weights 고정.",
+            "_comment": "weights 는 출발점. 최근 수확률(감쇠 per1k)로 캠페인 중 예산을 옮긴다. 표본 적은 코어는 배제가 아니라 전체 평균으로 수축(prior_samples) — 배제하면 저가중치 코어가 문턱을 못 넘어 영원히 후보에서 빠진다. enabled=false 면 weights 고정.",
             "enabled": true,
             "period": 500,
-            "decay": 0.995,
+            "decay": 0.999,
             "min_weight": 1,
             "max_step": 2.0,
-            "min_samples": 5000,
-            "exponent": 2.0
+            "exponent": 2.0,
+            "prior_samples": 2000
           }
         }
       },

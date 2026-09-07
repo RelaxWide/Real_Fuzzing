@@ -8988,11 +8988,11 @@ class NVMeFuzzer:
             #   통과 못 한 코어가 이미 빠져 있어, json 원본을 쓰면 죽은 코어가 되살아난다.
             self._aw = aw = _riscv_cov.AdaptiveWeights(
                 dict(self.sampler._weights),
-                decay=float(cfg.get('decay', 0.995)),
+                decay=float(cfg.get('decay', 0.999)),
                 min_weight=int(cfg.get('min_weight', 1)),
                 max_step=float(cfg.get('max_step', 2.0)),
                 period=int(cfg.get('period', 500)),
-                min_samples=int(cfg.get('min_samples', 5000)),
+                prior_samples=float(cfg.get('prior_samples', 2000)),
                 exponent=float(cfg.get('exponent', 2.0)))
             log.warning(f"[가중치] 적응 배분 on — 시작 {dict(self.sampler._weights)} "
                         f"(period={aw.period}, exponent={aw.exponent})")
