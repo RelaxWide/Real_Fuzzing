@@ -137,6 +137,34 @@ def stage0(cov_path, base, end):
     return pcs, inside
 
 
+def detect_header(vals):
+    """프로브 워드가 '매직 + 순번 ID' 구조인지 본다.
+
+    F코어 실측: 0x4F564C00/01/02/03 — 상위 3바이트가 'OVL'(0x4F564C) 로 고정이고
+    하위 바이트가 오버레이 번호다. 즉 펌웨어가 심어둔 **의도된 헤더**지 우연히
+    다른 코드 바이트가 아니다. 이러면 두 가지가 공짜로 생긴다:
+      ① 상위 바이트로 읽은 값의 **유효성 검증**(매직 불일치 = 미탑재/복사중/읽기실패)
+      ② 하위 바이트가 곧 bank 번호 → 표 없이도 해석 가능
+    반환: (mask, magic, {id: section_index}) 또는 None.
+    """
+    if len(vals) < 2:
+        return None
+    for shift, mask in ((8, 0xFFFFFF00), (0, 0x00FFFFFF)):
+        hi = {v & mask for v in vals.values()}
+        if len(hi) != 1:
+            continue
+        ids = {idx: (v & ~mask) >> (0 if shift else 24) for idx, v in vals.items()}
+        if len(set(ids.values())) != len(ids):
+            continue
+        seq = sorted(ids.values())
+        if seq == list(range(seq[0], seq[0] + len(seq))):
+            magic = hi.pop()
+            txt = bytes((magic >> (8 * i)) & 0xFF for i in range(4))
+            txt = b''.join(bytes([c]) for c in txt if 32 <= c < 127).decode() or '?'
+            return mask, magic, {i: idx for idx, i in ids.items()}, txt
+    return None
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -177,11 +205,26 @@ def main():
     for key, idx in sorted(table.items(), key=lambda kv: kv[1]):
         print(f"      {key} → bank {idx}")
 
+    hdr = detect_header(vals) if k is not None else None
+    if hdr:
+        mask, magic, id_to_idx, txt = hdr
+        print(f"[ovl] ★ 구조화된 헤더 감지 — 매직 0x{magic:08X}(\"{txt}\") + 순번 ID")
+        print(f"      런타임 검증: (word & 0x{mask:08X}) == 0x{magic:08X} 이어야 유효")
+        print(f"      bank = word & 0x{~mask & 0xFFFFFFFF:08X}  "
+              f"→ {', '.join(f'{i}=idx{j}' for i, j in sorted(id_to_idx.items()))}")
+        doc_hdr = {"magic_mask": f"0x{mask:08X}", "magic": f"0x{magic:08X}",
+                   "id_mask": f"0x{~mask & 0xFFFFFFFF:08X}",
+                   "id_to_section": {str(i): j for i, j in id_to_idx.items()}}
+    else:
+        doc_hdr = None
+
     doc = {"core": a.core, "base": base, "window_end": end,
            "probe_offsets": probe, "probe_to_bank": table,
            "bank_sizes": {str(i): s for i, s in sizes.items()},
+           "header": doc_hdr,
            "note": "런타임: 버스트 경계에서 base+probe 를 읽어 bank 확정. "
-                   "버스트 전후 값이 다르면 그 버스트는 폐기."}
+                   "버스트 전후 값이 다르면 그 버스트는 폐기. header 가 있으면 "
+                   "매직 불일치는 '미탑재/복사중/읽기실패' 로 보고 샘플을 버린다."}
     if a.out:
         with open(a.out, 'w', encoding='utf-8') as f:
             json.dump(doc, f, indent=2, ensure_ascii=False)

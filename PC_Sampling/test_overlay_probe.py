@@ -187,3 +187,35 @@ class TestStage0(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestHeaderDetect(unittest.TestCase):
+    """F코어 실측: 프로브 워드가 'OVL' 매직 + 순번 ID 구조였다.
+    이걸 인식하면 런타임에 **유효성 검증**이 공짜로 생긴다(매직 불일치 = 버릴 샘플)."""
+
+    def test_real_values(self):
+        vals = {15: 0x4F564C00, 16: 0x4F564C01, 17: 0x4F564C02, 18: 0x4F564C03}
+        got = op.detect_header(vals)
+        self.assertIsNotNone(got)
+        mask, magic, id_to_idx, _txt = got
+        self.assertEqual(mask, 0xFFFFFF00)
+        self.assertEqual(magic, 0x4F564C00)
+        self.assertEqual(id_to_idx, {0: 15, 1: 16, 2: 17, 3: 18})
+
+    def test_validation_rejects_foreign_word(self):
+        """매직이 안 맞는 값은 bank 로 해석하면 안 된다(미탑재/복사중/읽기실패)."""
+        _mask, magic, _m, _t = op.detect_header(
+            {15: 0x4F564C00, 16: 0x4F564C01, 17: 0x4F564C02, 18: 0x4F564C03})
+        self.assertNotEqual(0xDEADBEEF & 0xFFFFFF00, magic)
+
+    def test_non_sequential_ids_not_treated_as_header(self):
+        """하위 바이트가 순번이 아니면 그냥 우연히 다른 코드 바이트다."""
+        self.assertIsNone(op.detect_header(
+            {15: 0x4F564C00, 16: 0x4F564C09, 17: 0x4F564C40, 18: 0x4F564CF1}))
+
+    def test_random_words_not_treated_as_header(self):
+        self.assertIsNone(op.detect_header(
+            {15: 0x2F0F10D8, 16: 0x5958D650, 17: 0xA203B73C, 18: 0x6A48099D}))
+
+    def test_single_overlay_no_header(self):
+        self.assertIsNone(op.detect_header({15: 0x4F564C00}))
