@@ -33,6 +33,50 @@ SCHEMA_VERSION = 1
 BANK_BASE = 0            # 비오버레이
 OVL_BANK_OFFSET = 1      # 오버레이 순번 → 내부 bank
 
+# 헤더 규약 — 펌웨어가 각 오버레이 앞머리에 심어둔 표식.
+#   F/H 코어 실측: base+4 의 워드가 0x4F564C(='OVL') << 8 | 오버레이순번.
+#   이 규약이 성립하면 **빌드의 레이아웃 맵만으로** 런타임 판별이 된다
+#   (별도 판별표 파일 불필요). 규약이 깨지면 런타임 매직 검사가 즉시
+#   불일치를 내고 그 샘플을 버리므로 조용히 틀리지는 않는다.
+OVL_HDR_OFFSET = 4
+OVL_HDR_MAGIC = 0x4F564C00
+OVL_HDR_MASK = 0xFFFFFF00
+OVL_HDR_ID_MASK = 0x000000FF
+
+
+def overlay_from_layout(doc, offset=OVL_HDR_OFFSET, magic=OVL_HDR_MAGIC,
+                        mask=OVL_HDR_MASK, id_mask=OVL_HDR_ID_MASK):
+    """빌드 레이아웃 맵(.OVL_REGION_NN: section_index/addr/size) → 런타임 판별 설정.
+
+    레이아웃 맵은 이미 빌드가 내주고 Ghidra 추출에도 쓰이므로, 규약을 아는 이상
+    판별표를 따로 생성할 이유가 없다. 순번은 section_index 오름차순이며,
+    헤더 ID 가 곧 순번이라는 규약을 쓴다(실측: F 0~3, H 0~34).
+    """
+    rows = []
+    for name, v in (doc or {}).items():
+        if not str(name).upper().startswith(".OVL"):
+            return None                    # 레이아웃 맵 스키마가 아니다
+        try:
+            rows.append((int(v["section_index"]), int(v["addr"]), int(v["size"])))
+        except (KeyError, TypeError, ValueError):
+            return None
+    if not rows:
+        return None
+    rows.sort()
+    base = rows[0][1]
+    if len({r[1] for r in rows}) != 1:
+        return None                        # 주소가 제각각 = 진짜 오버레이가 아니다
+    return {
+        "base": base,
+        "window_end": base + max(r[2] for r in rows),
+        "probe_offsets": [offset],
+        "magic": magic, "magic_mask": mask, "id_mask": id_mask,
+        "bank_sizes": {n + OVL_BANK_OFFSET: r[2] for n, r in enumerate(rows)},
+        "probe_to_bank": {(magic | n): n + OVL_BANK_OFFSET
+                          for n in range(len(rows))},
+        "source": "layout",
+    }
+
 # ── 코어 식별자 ────────────────────────────────────────────────────────
 # ★ 한 번 정하면 못 바꾼다 — 저장된 커버리지 키·코퍼스가 이 번호에 묶인다.
 #   PCSR 주소도 te_base + stride*id 라 **하드웨어 코어 순서와 일치해야** 한다.
@@ -280,21 +324,16 @@ class CoverageModel:
             #       (워드값 → bank). ELF 오버레이 섹션의 실제 바이트를 봐야 나오므로
             #       tools/overlay_probe.py 로 만든다(Ghidra 추출로는 안 나온다).
             #   bank 별 BB/함수 표는 basic_blocks_core<X>_ovl<N>.txt 규약.
-            om = os.path.join(product_dir, f"overlay_probe_core{name}.json")
-            if not os.path.exists(om):
-                # _ovl 표가 있는데 판별표가 없으면 표를 못 쓴다. 조용히 넘어가면
-                # "표를 다 넣었는데 왜 그대로지?" 로 시간을 버린다.
-                import glob as _glob
-                _orph = _glob.glob(os.path.join(
-                    product_dir, f"basic_blocks_core{name}_ovl*.txt"))
-                if _orph:
-                    m.warnings.append(
-                        f"core{name}: 오버레이 표 {len(_orph)}개가 있는데 "
-                        f"overlay_probe_core{name}.json 이 없어 **무시**한다. "
-                        f"tools/overlay_probe.py 로 판별표를 만들어라 "
-                        f"(빌드의 .OVL_REGION 레이아웃 맵과는 다른 파일이다)")
-            if os.path.exists(om):
-                with open(om, encoding="utf-8") as f:
+            # ── 오버레이 판별 설정 ──
+            #   ① overlay_core<X>.json = **빌드 레이아웃 맵**(.OVL_REGION_NN).
+            #      헤더 규약(OVL 매직 + 순번)이 성립하면 이것만으로 충분하다.
+            #   ② overlay_probe_core<X>.json = 실측 판별표. 규약이 안 맞는 펌웨어용
+            #      탈출구이며, 있으면 ① 보다 우선한다(측정값이 가정을 이긴다).
+            cm.overlay = None
+            probe_p = os.path.join(product_dir, f"overlay_probe_core{name}.json")
+            layout_p = os.path.join(product_dir, f"overlay_core{name}.json")
+            if os.path.exists(probe_p):
+                with open(probe_p, encoding="utf-8") as f:
                     o = json.load(f)
                 hdr = o.get("header") or {}
                 cm.overlay = {
@@ -305,11 +344,26 @@ class CoverageModel:
                     "id_mask": int(hdr.get("id_mask", "0"), 0) if hdr else None,
                     "bank_sizes": {int(k) + OVL_BANK_OFFSET: int(v)
                                    for k, v in (o.get("bank_sizes") or {}).items()},
-                    # ★ 워드 → bank 는 이 표가 권위다. header.id_mask 로 뽑은 ID 를
-                    #   bank 로 그대로 쓰면 안 된다(ID 가 0 부터라는 보장이 없다).
                     "probe_to_bank": {int(k, 0): int(v) + OVL_BANK_OFFSET
                                       for k, v in (o.get("probe_to_bank") or {}).items()},
+                    "source": "probe",
                 }
+            elif os.path.exists(layout_p):
+                with open(layout_p, encoding="utf-8") as f:
+                    cm.overlay = overlay_from_layout(json.load(f))
+                if cm.overlay is None:
+                    m.warnings.append(
+                        f"core{name}: overlay_core{name}.json 이 레이아웃 맵 스키마가"
+                        f" 아니다(.OVL_REGION_NN: section_index/addr/size 필요)")
+            else:
+                import glob as _glob
+                _orph = _glob.glob(os.path.join(
+                    product_dir, f"basic_blocks_core{name}_ovl*.txt"))
+                if _orph:
+                    m.warnings.append(
+                        f"core{name}: 오버레이 표 {len(_orph)}개가 있는데 "
+                        f"overlay_core{name}.json(빌드 레이아웃 맵)이 없어 **무시**한다")
+            if cm.overlay:
                 for bank in sorted(cm.overlay["bank_sizes"]):
                     _n = bank - OVL_BANK_OFFSET        # 파일명은 오버레이 순번
                     bb_b = os.path.join(product_dir,

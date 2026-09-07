@@ -158,12 +158,18 @@ else:
         bad("symbols.json", "없음")
 
 print("\n=== ②-b 코드 오버레이 자산 ===")
+try:
+    sys.path.insert(0, str(ROOT))
+    import riscv_cov as _rc
+except Exception as _e:
+    _rc = None
 if not PROD.is_dir():
     bad("오버레이", "products 디렉토리 없음")
 else:
     _any_ovl = False
     for c in CORES:
-        omap = PROD / f"overlay_probe_core{c}.json"
+        omap = PROD / f"overlay_probe_core{c}.json"      # 실측 판별표(선택)
+        olay = PROD / f"overlay_core{c}.json"             # 빌드 레이아웃 맵(권장)
         # 파일명 오타를 잡는다 — 단수형(basic_block_)이면 로더가 조용히 무시한다
         wrong = sorted(PROD.glob(f"basic_block_core{c}_ovl*.txt"))
         if wrong:
@@ -172,20 +178,35 @@ else:
                 f" 예: {wrong[0].name}")
         bbs = sorted(PROD.glob(f"basic_blocks_core{c}_ovl*.txt"))
         fns = sorted(PROD.glob(f"functions_core{c}_ovl*.txt"))
-        if not (bbs or fns or omap.exists()):
+        if not (bbs or fns or omap.exists() or olay.exists()):
             continue                       # 이 코어는 오버레이 없음 — 정상
         _any_ovl = True
-        if not omap.exists():
-            bad(f"core{c} overlay_map",
-                f"없음 — Ghidra 가 아니라 tools/overlay_probe.py 가 만든다."
-                f" 없으면 bank 표가 있어도 전부 bank 0 으로 접힌다")
+        if not (omap.exists() or olay.exists()):
+            bad(f"core{c} 오버레이 설정",
+                f"overlay_core{c}.json(빌드 레이아웃 맵) 없음 — 없으면 bank 표가"
+                f" 있어도 전부 bank 0 으로 접힌다")
             continue
         try:
-            om = json.loads(omap.read_text())
+            if omap.exists():
+                om = json.loads(omap.read_text())
+                n_map = len(om.get("bank_sizes") or {})
+                src = "실측 판별표"
+            else:
+                _lay = json.loads(olay.read_text())
+                om = _rc.overlay_from_layout(_lay) or {}
+                if not om:
+                    bad(f"core{c} 레이아웃 맵",
+                        ".OVL_REGION_NN: section_index/addr/size 스키마가 아니거나"
+                        " 주소가 제각각이다(진짜 오버레이가 아님)")
+                    continue
+                n_map = len(om.get("bank_sizes") or {})
+                om = {"base": om["base"], "probe_offsets": om["probe_offsets"],
+                      "header": {"magic": hex(om["magic"])}}
+                src = "빌드 레이아웃 맵(규약 유도)"
         except Exception as e:
-            bad(f"core{c} overlay_map", f"파싱 실패 {e}")
+            bad(f"core{c} 오버레이 설정", f"파싱 실패 {e}")
             continue
-        n_map = len(om.get("bank_sizes") or {})
+        good(f"core{c} 오버레이 설정", "%s, bank %d개" % (src, n_map))
         idx_bb = {int(f.stem.rsplit("_ovl", 1)[1]) for f in bbs}
         idx_fn = {int(f.stem.rsplit("_ovl", 1)[1]) for f in fns}
         want = set(range(n_map))

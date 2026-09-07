@@ -121,20 +121,17 @@ if __name__ == '__main__':
 
 
 class TestProbeMapRequired(unittest.TestCase):
-    """★ 빌드의 레이아웃 맵(.OVL_REGION_NN)과 런타임 판별표는 **다른 파일**이다.
-
-    레이아웃 맵은 "어디에 몇 개" 만 말한다. 지금 뭐가 올라와 있는지는 오버레이
-    섹션의 실제 바이트를 봐야 알 수 있고, 그건 Ghidra 추출로 안 나온다.
-    판별표가 없으면 _ovl 표를 넣어도 쓸 수 없으므로 **소리 내어** 알려야 한다.
-    """
+    """오버레이 설정이 **하나도** 없으면 _ovl 표를 쓸 수 없다 → 소리 내어 알린다.
+    표를 35개 넣고도 아무 변화가 없어 원인을 찾는 데 시간을 버리는 상황을 막는다."""
 
     def test_orphan_tables_warn(self):
         with tempfile.TemporaryDirectory() as d:
             write_assets(d, banks=3)
-            Path(d, 'overlay_probe_coreH.json').unlink()
+            Path(d, 'overlay_probe_coreH.json').unlink()      # 판별표도
+            self.assertFalse(Path(d, 'overlay_coreH.json').exists())  # 레이아웃도 없음
             m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
-            self.assertTrue(any('overlay_probe_coreH.json' in w for w in m.warnings),
-                            "판별표 없이 표만 있으면 경고해야 한다")
+            self.assertTrue(any('overlay_coreH.json' in w for w in m.warnings),
+                            "오버레이 설정이 없으면 경고해야 한다")
             self.assertEqual(m.cores[0].banks, {})
 
     def test_denominator_unchanged_without_probe_map(self):
@@ -152,3 +149,69 @@ class TestProbeMapRequired(unittest.TestCase):
             Path(d, 'overlay_probe_coreH.json').unlink()
             m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
             self.assertEqual(m.warnings, [])
+
+
+class TestLayoutMapIsEnough(unittest.TestCase):
+    """★ 빌드 레이아웃 맵만으로 런타임 판별이 되어야 한다.
+
+    헤더 규약(OVL 매직 + 순번)이 성립하면 필요한 건 base(맵에 있음) + 상수 두 개
+    뿐이다. 판별표를 따로 생성하게 만들면 불필요한 단계와 어긋날 위험만 는다.
+    """
+    LAYOUT = {f".OVL_REGION_{n:02d}": {"section_index": 19 + n, "addr": BASE,
+                                       "size": 3370 + n * 100} for n in range(35)}
+
+    def _dir(self, d):
+        write_assets(d, banks=35)
+        Path(d, 'overlay_probe_coreH.json').unlink()      # 판별표 없음
+        json.dump(self.LAYOUT, open(Path(d, 'overlay_coreH.json'), 'w'))
+        doc = json.load(open(Path(d, 'symbols.json')))
+        doc['cores']['H']['counts'].update(
+            {"overlay_banks": 35, "overlay_basic_blocks": 70, "overlay_functions": 35})
+        json.dump(doc, open(Path(d, 'symbols.json'), 'w'))
+
+    def test_derives_probe_from_layout(self):
+        o = rc.overlay_from_layout(self.LAYOUT)
+        self.assertEqual(o['base'], BASE)
+        self.assertEqual(o['probe_offsets'], [rc.OVL_HDR_OFFSET])
+        self.assertEqual(len(o['bank_sizes']), 35)
+        self.assertEqual(o['window_end'], BASE + max(
+            v['size'] for v in self.LAYOUT.values()))
+
+    def test_loads_and_resolves(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._dir(d)
+            m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
+            cm = m.cores[0]
+            self.assertEqual(m.warnings, [])
+            self.assertEqual(cm.overlay['source'], 'layout')
+            self.assertEqual(len(cm.banks), 35)
+            self.assertEqual(cm.overlay_probe_addr(), BASE + rc.OVL_HDR_OFFSET)
+            for n in (0, 12, 34):
+                self.assertEqual(cm.resolve_bank(rc.OVL_HDR_MAGIC | n),
+                                 n + rc.OVL_BANK_OFFSET)
+
+    def test_bad_magic_still_rejected(self):
+        """규약이 깨지면 조용히 틀리는 게 아니라 매직 검사에서 걸려야 한다."""
+        with tempfile.TemporaryDirectory() as d:
+            self._dir(d)
+            cm = rc.CoverageModel.load(d, product='BM9K1',
+                                       core_ids={'H': 0}).cores[0]
+            self.assertIsNone(cm.resolve_bank(0xDEADBEEF))
+            self.assertIsNone(cm.resolve_bank(rc.OVL_HDR_MAGIC | 99))   # 범위 밖 ID
+
+    def test_probe_map_overrides_layout(self):
+        """실측 판별표가 있으면 그쪽이 이긴다(측정값이 가정을 이긴다)."""
+        with tempfile.TemporaryDirectory() as d:
+            write_assets(d, banks=3)
+            json.dump(self.LAYOUT, open(Path(d, 'overlay_coreH.json'), 'w'))
+            cm = rc.CoverageModel.load(d, product='BM9K1',
+                                       core_ids={'H': 0}).cores[0]
+            self.assertEqual(cm.overlay['source'], 'probe')
+
+    def test_non_layout_schema_warns(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_assets(d, banks=3)
+            Path(d, 'overlay_probe_coreH.json').unlink()
+            json.dump({"nonsense": 1}, open(Path(d, 'overlay_coreH.json'), 'w'))
+            m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
+            self.assertTrue(any('레이아웃 맵 스키마' in w for w in m.warnings))
