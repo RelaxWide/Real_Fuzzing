@@ -689,3 +689,35 @@ class TestOverlayReport(unittest.TestCase):
         """주소가 같아서 라벨이 없으면 표에서 서로 구분되지 않는다."""
         src = self._src()
         self.assertIn("f\"{row['core']}/ovl{row['bank'] - 1}\"", src)
+
+
+class TestOverlayVisibility(unittest.TestCase):
+    """"오버레이를 정말 구분해서 보고 있나" 를 사람이 확인할 수 있어야 한다.
+    코드가 맞게 돌아도 그걸 볼 수 없으면 신뢰할 근거가 없다."""
+
+    def _src(self):
+        import pathlib
+        return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
+            encoding='utf-8')
+
+    def test_per_bank_section_exists(self):
+        src = self._src()
+        self.assertIn('오버레이 bank 별 — core', src)
+        self.assertIn('관측된 bank', src)
+
+    def test_warns_when_single_bank(self):
+        """한 bank 에만 몰리면 판별이 굳었을 수 있다 — 그냥 넘어가면 안 된다."""
+        src = self._src()
+        i = src.index('if len(_seen) <= 1:')
+        self.assertIn('프로브가 굳었거나', src[i:i + 300])
+
+    def test_lists_unobserved_banks(self):
+        """미관측 오버레이 = 아직 안 밟은 코드 = 퍼징 타겟."""
+        src = self._src()
+        self.assertIn('미관측 ovl:', src)
+
+    def test_counts_only_nonzero_banks(self):
+        """bank 0(본체)을 오버레이 통계에 넣으면 '구분되고 있다' 가 왜곡된다."""
+        src = self._src()
+        i = src.index('_c, _b, _ = _rcv.unpack(_k)')
+        self.assertIn('if _b:', src[i:i + 120])

@@ -13870,6 +13870,52 @@ class NVMeFuzzer:
                 f"core={st['name']} id={cid} "
                 f"BB={st['bb']}/{st['bb_total']} ({st['bb_pct']:.2f}%) "
                 f"functions={st['func']}/{st['func_total']} ({st['func_pct']:.2f}%)")
+        # ── 오버레이 bank 별 커버리지 ──────────────────────
+        #   "오버레이를 정말 구분해서 보고 있나" 에 대한 직접 증거. 여러 bank 에
+        #   커버리지가 흩어져 있으면 판별이 동작하는 것이고, 한 bank 에만 몰려
+        #   있으면 판별이 굳었거나 펌웨어가 그 오버레이만 쓰는 것이다.
+        _ovl_cores = [(cid, cm) for cid, cm in sorted(cov.cores.items()) if cm.banks]
+        if _ovl_cores:
+            import riscv_cov as _rcv
+            _by_bank = {}
+            for _k in cov.covered_bbs:
+                _c, _b, _ = _rcv.unpack(_k)
+                if _b:
+                    _by_bank[(_c, _b)] = _by_bank.get((_c, _b), 0) + 1
+            for cid, cm in _ovl_cores:
+                _o = cm.overlay or {}
+                _tot = {b: len(t["bb_starts"]) for b, t in cm.banks.items()}
+                _seen = sorted(b for b in cm.banks if _by_bank.get((cid, b)))
+                text_lines += ["", "=" * 64,
+                               f"오버레이 bank 별 — core {cm.name} "
+                               f"(창 0x{_o.get('base', 0):X}~0x{_o.get('window_end', 0):X})",
+                               "=" * 64,
+                               f"관측된 bank {len(_seen)}/{len(cm.banks)}개"
+                               f"  ← 여러 bank 에 흩어져야 판별이 동작하는 것이다"]
+                if len(_seen) <= 1:
+                    text_lines.append(
+                        "  ⚠ bank 가 하나뿐이다 — 프로브가 굳었거나 그 오버레이만 쓰는 중."
+                        " 시작 로그의 [Overlay] 줄과 ovl-drop 수치를 확인하라")
+                _rows = sorted(cm.banks, key=lambda b: -_by_bank.get((cid, b), 0))
+                text_lines.append("  ovl   covered/total       %      함수")
+                for _b in _rows[:12]:
+                    _cv = _by_bank.get((cid, _b), 0)
+                    _tt = _tot.get(_b, 0)
+                    _fn = sum(1 for _k in cov.entered_funcs
+                              if _rcv.unpack(_k)[0] == cid and _rcv.unpack(_k)[1] == _b)
+                    text_lines.append(
+                        f"  {_b - _rcv.OVL_BANK_OFFSET:<5} {_cv:>6}/{_tt:<10} "
+                        f"{(100.0 * _cv / _tt if _tt else 0.0):>6.2f}  {_fn:>6}")
+                if len(_rows) > 12:
+                    _rest = sum(_by_bank.get((cid, b), 0) for b in _rows[12:])
+                    text_lines.append(f"  ... {len(_rows) - 12}개 더 (합계 {_rest} BB)")
+                _never = [b - _rcv.OVL_BANK_OFFSET for b in sorted(cm.banks)
+                          if not _by_bank.get((cid, b))]
+                if _never:
+                    text_lines.append(
+                        f"  미관측 ovl: {_never[:16]}{'…' if len(_never) > 16 else ''}"
+                        f"  ← 아직 안 밟은 코드(퍼징 타겟)")
+
         # ── 명령 × 코어 수확량 ────────────────────────────────
         # primary_core / sample_plan.weights 를 추정이 아니라 실측으로 정하기 위한 표.
         #   new_bb = 그 명령이 그 코어에서 **최초 발견**한 BB 수(= 가치)
