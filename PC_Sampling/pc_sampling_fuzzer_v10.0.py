@@ -653,6 +653,13 @@ POR_POWEROFF_WAIT = _PW['por_poweroff_wait']
 POR_BOOT_WAIT     = _PW['por_boot_wait']
 # 전원 ON 후 첫 PCIe rescan 까지의 대기. 구버전 config 호환 위해 .get 사용.
 POR_RESCAN_DELAY  = _PW.get('por_rescan_delay', 3.0)
+# BM9K1(RISC-V): JTAG 핀 일부가 부트모드 스트랩과 공유돼, 리셋 해제 시점에 디버거가
+# 그 선을 구동하면 샘플이 ROM 부팅 모드로 들어간다. 케이블은 뽑을 수 없으므로
+# **POR 구간 동안 pylink 세션을 놓아** 핀을 high-Z 로 만들 수 있는지 시험하는 스위치.
+# 기본 off — 켜면 POR 전에 close(), 전원 ON 후 스트랩 확정 시간을 기다린 뒤 재연결한다.
+# (인증은 어차피 전원 사이클마다 재수행하므로 추가 비용이 없다.)
+POR_RELEASE_LINK  = _PW.get('por_release_link', False)
+POR_STRAP_SETTLE  = _PW.get('por_strap_settle_wait', 2.0)
 
 # SWD에서 WFI wake로 주기적 인터럽트 핸들러까지 idle_pcs에 포함되도록
 # 새 PC가 N회 연속 나오지 않을 때까지 충분히 샘플링한다.
@@ -1299,6 +1306,8 @@ class FuzzConfig:
     por_remove_bdf:    Optional[str] = None   # POR PCIe remove 대상 BDF override
                                               # (제품별; P9: topology 최상단 root port)
     por_poweroff_wait: float = POR_POWEROFF_WAIT
+    por_release_link: bool = POR_RELEASE_LINK
+    por_strap_settle_wait: float = POR_STRAP_SETTLE
     por_boot_wait:     float = POR_BOOT_WAIT   # PCIe rescan 후 NVMe 응답 최대 대기 (초)
     por_rescan_delay:  float = POR_RESCAN_DELAY  # 전원 ON → 첫 rescan 대기 (초). 이 값이
                                                # 0 이면 link training 전에 rescan 이 돌아
@@ -5249,6 +5258,18 @@ class NVMeFuzzer:
 
         log.warning("[POR] SSD 전원 사이클 시작...")
         self.sampler._stop_worker()   # 샘플링 스레드 정지(POR 중 소켓 경합 방지; 다음 명령에서 재가동)
+        # JTAG 핀이 부트모드 스트랩과 공유된 보드: 리셋 해제 순간 디버거가 그 선을
+        # 구동하면 ROM 부팅 모드로 빠진다. 케이블을 뽑을 수 없으므로 세션을 놓아
+        # 핀을 high-Z 로 만든다. close() 는 jlink=None 로 두고 이후 경로는 lazy
+        # _reconnect() 로 자가복구한다(재인증은 전원 사이클마다 어차피 필요).
+        self._por_link_released = False
+        if self.config.por_release_link and hasattr(self.sampler, 'close'):
+            try:
+                self.sampler.close()
+                self._por_link_released = True
+                log.warning("[POR] 디버그 링크 해제 — 부트 스트랩 구간 동안 핀 high-Z 시도")
+            except Exception as _e:
+                log.warning(f"[POR] 링크 해제 실패({_e}) — 그대로 진행")
 
         # 1. 전원 OFF — PCIe remove 보다 **먼저**(위 docstring 참조).
         _off_cmd = ['python3', self.config.pmu_script, '7', '1']
@@ -5295,6 +5316,13 @@ class NVMeFuzzer:
         log.warning(f"[POR] PowerOnAll rc={r.returncode} "
                     f"stdout={r.stdout.decode(errors='replace').strip()!r} "
                     f"stderr={r.stderr.decode(errors='replace').strip()!r}")
+        if (getattr(self, '_por_link_released', False)
+                and self.config.por_strap_settle_wait > 0):
+            # 스트랩은 리셋 해제 시점에 래치된다 → 그 창이 지나기 전에 링크를 다시
+            # 물면 해제한 의미가 없다. 여기서만 기다리고 재연결은 호출자에 맡긴다.
+            log.warning(f"[POR] 부트 스트랩 확정 대기 "
+                        f"{self.config.por_strap_settle_wait:.1f}초 (링크 해제 유지)")
+            time.sleep(self.config.por_strap_settle_wait)
         log.warning("[POR] 전원 ON — OpenOCD 즉시 연결 시도 (boot_sweep_s 내 재시도)")
         return True
 

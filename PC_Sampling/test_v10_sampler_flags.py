@@ -470,3 +470,56 @@ class TestCommandCoreYield(unittest.TestCase):
         src = self._fuzzer_src()
         i = src.index('def _per1k(')
         self.assertIn('if n else 0.0', src[i:i + 160])
+
+
+class TestPorLinkRelease(unittest.TestCase):
+    """POR 구간 디버그 링크 해제 — JTAG 핀이 부트모드 스트랩과 공유된 보드 대응.
+    기본 off 여야 기존 제품(P9 등)의 POR 동작이 한 줄도 안 바뀐다."""
+
+    def _src(self):
+        import pathlib
+        return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
+            encoding='utf-8')
+
+    def test_default_off(self):
+        """켜는 것은 명시적 선택이어야 한다(다른 제품 회귀 방지)."""
+        import json, pathlib
+        cfg = json.loads(pathlib.Path(__file__).with_name('fuzzer_config.json').read_text())
+        self.assertIs(cfg['power']['por_release_link'], False)
+        self.assertIn("_PW.get('por_release_link', False)", self._src())
+
+    def test_release_before_power_off(self):
+        """전원을 내리기 **전에** 닫아야 리셋 구간 내내 high-Z 다."""
+        src = self._src()
+        i = src.index('def _power_cycle_ssd')
+        seg = src[i:i + 4000]
+        rel = seg.index('self.sampler.close()')
+        off = seg.index("'7', '1'")          # PowerOffAll
+        self.assertLess(rel, off, "close() 는 PowerOffAll 보다 앞서야 한다")
+
+    def test_settle_wait_before_return(self):
+        """스트랩은 리셋 해제 시점에 래치된다 → 전원 ON 후 대기가 있어야 의미가 있다."""
+        src = self._src()
+        i = src.index('def _power_cycle_ssd')
+        seg = src[i:i + 5000]
+        on = seg.index("'4', '1'")           # PowerOnAll
+        wait = seg.index('por_strap_settle_wait')
+        self.assertLess(on, wait, "대기는 PowerOnAll 이후여야 한다")
+
+    def test_settle_only_when_released(self):
+        """해제하지 않았으면 기다릴 이유가 없다 — 기존 POR 시간이 늘면 안 된다."""
+        src = self._src()
+        i = src.index("getattr(self, '_por_link_released', False)")
+        self.assertIn('por_strap_settle_wait > 0', src[i:i + 200])
+
+    def test_reconnect_happens_after_por(self):
+        """닫아놓고 아무도 안 열면 POR 이후 영구 무샘플이 된다."""
+        src = self._src()
+        i = src.index('por_ok = self._power_cycle_ssd()')
+        self.assertIn('self.sampler.connect()', src[i:i + 4000])
+
+    def test_close_failure_is_not_fatal(self):
+        """링크 해제 실패로 POR 자체가 죽으면 안 된다."""
+        src = self._src()
+        i = src.index('self.sampler.close()')
+        self.assertIn('except Exception', src[i - 200:i + 400])
