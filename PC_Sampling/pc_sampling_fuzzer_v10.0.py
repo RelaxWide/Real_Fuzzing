@@ -3615,6 +3615,23 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
     def take_observations(self):
         return self._observations
 
+    def set_weights(self, weights):
+        """버스트 가중치를 런타임에 교체. 스케줄은 매 윈도우 self._weights 를 다시
+        읽으므로(build_burst_schedule) 즉시 반영된다.
+
+        알 수 없는 코어나 0 이하는 받지 않는다 — 0 이 되면 그 코어는 영영 관측되지
+        않아, 나중에 일을 시작해도 알 방법이 없다."""
+        if not weights:
+            return False
+        new = {int(c): max(1, int(w)) for c, w in weights.items()
+               if int(c) in self._weights}
+        if not new or set(new) != set(self._weights):
+            return False
+        self._weights = new
+        if self._primary not in self._weights:
+            self._primary = max(self._weights, key=self._weights.get)
+        return True
+
     def credit_cores(self):
         """interesting 판정에 표를 행사할 코어 집합. None 이면 전 코어(union)."""
         return None if self._policy == 'union' else {self._primary}
@@ -7414,6 +7431,7 @@ class NVMeFuzzer:
             _s = self.cmd_core_samples[track_key]
             for _o in _win_obs:
                 _s[_o.core_id] += 1
+            self._adaptive_weights_step(_acct.new_by_core, _win_obs)
         elif self._sa_loaded and self._sa_bb_starts:
             _mask = self._sa_thumb_mask
             _cur_bbs: set = set()
@@ -8945,6 +8963,54 @@ class NVMeFuzzer:
     RC_TIMEOUT   = -1001   # NVMe 타임아웃 (의미 있는 이벤트)
     RC_ERROR     = -1002   # subprocess 에러 (내부 문제)
     RC_SKIP      = -1003   # 가드가 전송 차단 (가성 유발 admin opcode) — 회계 없이 다음 iteration
+
+    def _adaptive_weights_step(self, new_by_core, win_obs) -> None:
+        """코어별 샘플 예산을 최근 수확률에 맞춰 자동 재배분.
+
+        json 의 weights 는 **출발점**일 뿐이다. 코드 크기 비례 추정으로 시작해서,
+        실제로 어느 코어가 샘플당 새 코드를 내는지에 따라 캠페인 중에 옮긴다.
+        끄면(adaptive.enabled=false) json 값이 그대로 고정된다.
+        """
+        aw = getattr(self, '_aw', None)
+        if aw is False:                      # 비활성 확정 — 매번 재검사하지 않는다
+            return
+        if aw is None:
+            cfg = {}
+            try:
+                cfg = ((self.config.riscv or {}).get('sample_plan') or {}).get('adaptive') or {}
+            except Exception:
+                cfg = {}
+            if not cfg.get('enabled', False) or not hasattr(self.sampler, 'set_weights'):
+                self._aw = False
+                return
+            import riscv_cov as _riscv_cov
+            # ★ sampler._weights 를 출발점으로 삼는다 — connect 단계에서 게이트를
+            #   통과 못 한 코어가 이미 빠져 있어, json 원본을 쓰면 죽은 코어가 되살아난다.
+            self._aw = aw = _riscv_cov.AdaptiveWeights(
+                dict(self.sampler._weights),
+                decay=float(cfg.get('decay', 0.995)),
+                min_weight=int(cfg.get('min_weight', 1)),
+                max_step=float(cfg.get('max_step', 2.0)),
+                period=int(cfg.get('period', 500)),
+                min_samples=int(cfg.get('min_samples', 5000)),
+                exponent=float(cfg.get('exponent', 2.0)))
+            log.warning(f"[가중치] 적응 배분 on — 시작 {dict(self.sampler._weights)} "
+                        f"(period={aw.period}, exponent={aw.exponent})")
+
+        _samples = {}
+        for _o in win_obs:
+            _samples[_o.core_id] = _samples.get(_o.core_id, 0) + 1
+        aw.observe(new_by_core, _samples)
+
+        _new = aw.maybe_update(self.executions)
+        if _new and self.sampler.set_weights(_new):
+            _names = {int(c): (v.get('name') or c)
+                      for c, v in (getattr(self.sampler, '_cores', {}) or {}).items()}
+            _r = aw.rates()
+            log.warning("[가중치] 재배분 #%d → %s | 최근 per1k=%s" % (
+                aw.updates,
+                ", ".join(f"{_names.get(c, c)}={_new[c]}" for c in sorted(_new)),
+                ", ".join(f"{_names.get(c, c)}={_r[c]:.3f}" for c in sorted(_r))))
 
     def _cov_totals(self, by_core=False):
         """커버리지 집계를 한 곳에서 — RISC-V(CoverageModel)와 기존 제품(_sa_*) 양쪽.

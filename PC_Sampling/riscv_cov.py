@@ -419,6 +419,101 @@ class CoverageModel:
 # ══════════════════════════════════════════════════════════════════════
 #  버스트 스케줄 — 순서를 고정하지 않는다
 # ══════════════════════════════════════════════════════════════════════
+class AdaptiveWeights:
+    """코어별 샘플 예산을 **최근** 수확률에 맞춰 재배분한다.
+
+    누적 per1k 로는 적응이 안 된다 — 캠페인이 길어질수록 과거가 지배해서, 이미
+    포화된 코어의 옛 성과가 계속 예산을 잡고 새로 열린 코어를 못 따라간다.
+    그래서 지수감쇠 합(decayed sum)으로 최근 구간의 수확률만 본다.
+
+        rate[c] = decayed_new[c] / decayed_samples[c]
+
+    측정이 배분에 종속된다는 점도 감안한다. 적게 샘플링된 코어는 매 샘플이 새
+    코드에 떨어져 rate 가 높게 나오고, 많이 본 코어는 포화돼 낮게 나온다.
+    그대로 비례배분하면 매 주기 반대로 튄다 → **step 상한**으로 한 번에 움직일 수
+    있는 폭을 묶고, **floor** 로 어떤 코어도 관측이 끊기지 않게 한다(끊기면 그
+    코어가 다시 일을 시작해도 영영 모른다).
+
+    총 예산(가중치 합)은 보존한다 — 샘플레이트는 하드웨어가 정하는 상수다.
+    """
+
+    def __init__(self, weights, decay=0.995, min_weight=1, max_step=2.0,
+                 period=500, min_samples=5000, exponent=2.0):
+        self.weights = {int(c): max(int(min_weight), int(w))
+                        for c, w in dict(weights).items()}
+        self.total = sum(self.weights.values())
+        self.decay = float(decay)
+        self.min_weight = int(min_weight)
+        self.max_step = float(max_step)
+        self.period = int(period)
+        self.min_samples = int(min_samples)   # 이만큼도 안 본 코어는 판단 보류
+        # rate 에 그대로 비례배분하면 저수확 코어로 예산이 샌다. 실측 예: 전체
+        # 발견의 7% 뿐인 두 코어가 rate 비례로는 예산의 28% 를 가져갔다. rate**e
+        # 로 승자 쪽을 날카롭게 하되, floor 가 있어 관측은 끊기지 않는다.
+        self.exponent = float(exponent)
+        self.dnew = {c: 0.0 for c in self.weights}
+        self.dsamp = {c: 0.0 for c in self.weights}
+        self._last_update = 0
+        self.updates = 0
+
+    def observe(self, new_by_core, samples_by_core):
+        """명령 1건의 결과를 반영. 두 dict 모두 {core_id: count}."""
+        d = self.decay
+        for c in self.weights:
+            self.dnew[c] = self.dnew[c] * d + float((new_by_core or {}).get(c, 0))
+            self.dsamp[c] = self.dsamp[c] * d + float((samples_by_core or {}).get(c, 0))
+
+    def rates(self):
+        """1000 샘플당 신규 BB (감쇠 기준)."""
+        return {c: (1000.0 * self.dnew[c] / self.dsamp[c]) if self.dsamp[c] > 0 else 0.0
+                for c in self.weights}
+
+    def should_update(self, executions):
+        return (executions - self._last_update) >= self.period
+
+    def compute(self):
+        """새 가중치를 계산해 반환. 바꿀 이유가 없으면 None."""
+        r = self.rates()
+        # 아직 표본이 부족한 코어가 있으면 그 코어는 현 가중치를 유지한다.
+        judged = [c for c in self.weights if self.dsamp[c] >= self.min_samples]
+        if not judged or sum(r[c] for c in judged) <= 0:
+            return None
+
+        # 판단 가능한 코어들끼리만 예산을 재배분한다(보류 코어의 몫은 건드리지 않음).
+        pool = sum(self.weights[c] for c in judged)
+        sharp = {c: r[c] ** self.exponent for c in judged}
+        rsum = sum(sharp.values())
+        if rsum <= 0:
+            return None
+        new = dict(self.weights)
+        for c in judged:
+            target = pool * sharp[c] / rsum
+            lo = self.weights[c] / self.max_step
+            hi = self.weights[c] * self.max_step
+            new[c] = int(round(min(hi, max(lo, target))))
+        for c in new:
+            new[c] = max(self.min_weight, new[c])
+
+        # 총 예산 보존 — 반올림/floor 로 어긋난 만큼을 가장 큰 코어에서 정산한다.
+        drift = self.total - sum(new.values())
+        if drift:
+            big = max(new, key=lambda c: new[c])
+            new[big] = max(self.min_weight, new[big] + drift)
+        return new if new != self.weights else None
+
+    def maybe_update(self, executions):
+        """주기가 됐으면 갱신하고 새 가중치를 반환, 아니면 None."""
+        if not self.should_update(executions):
+            return None
+        self._last_update = executions
+        new = self.compute()
+        if new is None:
+            return None
+        self.weights = new
+        self.updates += 1
+        return dict(new)
+
+
 def build_burst_schedule(weights, rng=None, shuffle=True):
     """가중치를 '버스트 개수'로 펴고 **섞는다**. → [core_id, ...]
 

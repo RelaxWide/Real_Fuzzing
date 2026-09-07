@@ -1085,11 +1085,26 @@
         "interesting_policy": "primary",
         "sample_plan": {
           "_comment": "weights=버스트 개수(코드 크기 비례 초기값 H:F:CM:Q). 순서는 매 윈도우 셔플되므로 편향 없음. seed=0 이면 무작위(로그에 기록) — 재현하려면 고정값 지정.",
-          "weights": {"0": 8, "1": 1, "2": 4, "3": 1},
+          "weights": {
+            "0": 8,
+            "1": 1,
+            "2": 4,
+            "3": 1
+          },
           "burst_len": 256,
           "primary_core": 0,
           "valid_bit": 1,
-          "seed": 0
+          "seed": 0,
+          "adaptive": {
+            "_comment": "weights 는 출발점. 최근 수확률(감쇠 per1k)로 캠페인 중 예산을 옮긴다. enabled=false 면 weights 고정.",
+            "enabled": true,
+            "period": 500,
+            "decay": 0.995,
+            "min_weight": 1,
+            "max_step": 2.0,
+            "min_samples": 5000,
+            "exponent": 2.0
+          }
         }
       },
       "invalid_pc_vals": [],
@@ -1099,8 +1114,14 @@
       "enable_jlink_dump": false,
       "enable_debug_tool_dump": false,
       "state_fields": "r8",
-      "nvme_timeouts": {"command": 30000, "format": 300000, "flush": 30000,
-                        "selftest_short": 30000, "selftest_ext": 30000, "verify": 30000}
+      "nvme_timeouts": {
+        "command": 30000,
+        "format": 300000,
+        "flush": 30000,
+        "selftest_short": 30000,
+        "selftest_ext": 30000,
+        "verify": 30000
+      }
     },
     "PM9M1": {
       "_comment_timeouts": "nvme_timeouts/nvme_passthru_timeout_ms/nvme_kernel_timeout_sec 는 제품별 override (global timeouts 위에 덮어씀). 제품마다 다르게 조정 가능. 생략 시 global 사용.",

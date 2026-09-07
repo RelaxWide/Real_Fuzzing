@@ -511,3 +511,76 @@ class TestRecoveryAuth(unittest.TestCase):
         self.assertFalse(r.ok)
         self.assertEqual(r.stage, "auth")
         self.assertFalse(called["sba"], "인증 실패면 SBA 를 시도하지 않는다")
+
+
+class TestAdaptiveWeights(unittest.TestCase):
+    """예산 재배분 — json 값을 고정하지 않고 최근 수확률로 옮긴다."""
+
+    def setUp(self):
+        self.w0 = {0: 8, 1: 1, 2: 4, 3: 1}
+
+    def _run(self, per1k, execs=20000, **kw):
+        aw = rc.AdaptiveWeights(dict(self.w0), period=500, **kw)
+        for ex in range(1, execs + 1):
+            samp = {c: aw.weights[c] * 32 for c in aw.weights}
+            new = {c: (samp[c] / 1000.0) * per1k[c] for c in aw.weights}
+            aw.observe(new, samp)
+            aw.maybe_update(ex)
+        return aw
+
+    def test_budget_preserved(self):
+        """샘플레이트는 하드웨어 상수 — 총 예산이 늘거나 줄면 안 된다."""
+        aw = self._run({0: 1.135, 1: 0.501, 2: 1.346, 3: 0.534})
+        self.assertEqual(sum(aw.weights.values()), sum(self.w0.values()))
+
+    def test_shifts_to_higher_rate(self):
+        """실측값: F(2) 가 per1k 최고 → F 가 늘고 H(0) 가 준다."""
+        aw = self._run({0: 1.135, 1: 0.501, 2: 1.346, 3: 0.534})
+        self.assertGreater(aw.weights[2], self.w0[2])
+        self.assertLess(aw.weights[0], self.w0[0])
+
+    def test_floor_keeps_every_core_observed(self):
+        """0 이 되면 그 코어가 나중에 일을 시작해도 영영 모른다."""
+        aw = self._run({0: 5.0, 1: 0.0, 2: 5.0, 3: 0.0})
+        for c in self.w0:
+            self.assertGreaterEqual(aw.weights[c], 1)
+
+    def test_exponent_sharpens(self):
+        """rate 비례(e=1)는 저수확 코어로 예산이 샌다 — 실측서 발견 6.9% 가
+        예산 28% 를 가져갔다. e=2 는 그걸 floor 로 눌러야 한다."""
+        r = {0: 1.135, 1: 0.501, 2: 1.346, 3: 0.534}
+        flat = self._run(r, exponent=1.0)
+        sharp = self._run(r, exponent=2.0)
+        self.assertGreater(flat.weights[1] + flat.weights[3],
+                           sharp.weights[1] + sharp.weights[3])
+
+    def test_no_update_before_period(self):
+        aw = rc.AdaptiveWeights(dict(self.w0), period=500)
+        aw.observe({0: 10}, {0: 1000})
+        self.assertIsNone(aw.maybe_update(499))
+
+    def test_holds_undersampled_core(self):
+        """표본이 min_samples 에 못 미치는 코어는 판단을 보류한다
+        (샘플 몇 개로 예산을 뺏으면 관측이 더 줄어 영영 회복 못 한다)."""
+        aw = rc.AdaptiveWeights({0: 8, 1: 1}, period=10, min_samples=10 ** 9)
+        for ex in range(1, 101):
+            aw.observe({0: 5, 1: 0}, {0: 1000, 1: 10})
+            aw.maybe_update(ex)
+        self.assertEqual(aw.weights, {0: 8, 1: 1})
+
+    def test_recent_beats_stale(self):
+        """감쇠가 없으면 과거가 지배해 변화를 못 따라간다."""
+        aw = rc.AdaptiveWeights({0: 4, 1: 4}, period=500, decay=0.99)
+        for ex in range(1, 3001):          # 전반: 0 번만 생산
+            aw.observe({0: 5, 1: 0}, {0: 1000, 1: 1000}); aw.maybe_update(ex)
+        early = dict(aw.weights)
+        for ex in range(3001, 12001):      # 후반: 1 번으로 역전
+            aw.observe({0: 0, 1: 5}, {0: 1000, 1: 1000}); aw.maybe_update(ex)
+        self.assertGreater(aw.weights[1], early[1])
+        self.assertLess(aw.weights[0], early[0])
+
+    def test_none_when_nothing_to_change(self):
+        aw = rc.AdaptiveWeights({0: 4, 1: 4}, period=1)
+        aw.observe({0: 4, 1: 4}, {0: 1000, 1: 1000})
+        aw.maybe_update(1)
+        self.assertIsNone(aw.maybe_update(2))

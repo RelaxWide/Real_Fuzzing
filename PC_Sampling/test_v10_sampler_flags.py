@@ -470,3 +470,58 @@ class TestCommandCoreYield(unittest.TestCase):
         src = self._fuzzer_src()
         i = src.index('def _per1k(')
         self.assertIn('if n else 0.0', src[i:i + 160])
+
+
+class TestSetWeightsAndAdaptiveWiring(unittest.TestCase):
+    """런타임 가중치 교체가 실제로 스케줄에 반영되는지 + 배선 회귀 방지."""
+
+    def _src(self):
+        import pathlib
+        return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
+            encoding='utf-8')
+
+    def test_schedule_reads_weights_each_window(self):
+        """가중치를 바꿔도 스케줄이 캐시돼 있으면 아무 일도 안 일어난다."""
+        src = self._src()
+        self.assertIn('build_burst_schedule(self._weights', src)
+
+    def test_adaptive_starts_from_sampler_weights(self):
+        """connect 게이트에서 탈락한 코어가 json 원본을 통해 되살아나면 안 된다."""
+        src = self._src()
+        i = src.index('def _adaptive_weights_step')
+        seg = src[i:i + 2500]
+        self.assertIn('dict(self.sampler._weights)', seg)
+
+    def test_disabled_is_sticky(self):
+        """매 명령마다 config 를 다시 파싱하면 핫패스에 부담이 된다."""
+        src = self._src()
+        i = src.index('def _adaptive_weights_step')
+        seg = src[i:i + 2500]
+        self.assertIn('if aw is False:', seg)
+
+    def test_set_weights_rejects_zero_and_unknown(self):
+        """0 가중치는 그 코어의 관측을 영영 끊는다."""
+        src = self._src()
+        i = src.index('def set_weights')
+        seg = src[i:i + 1200]
+        self.assertIn('max(1, int(w))', seg)
+        self.assertIn('if int(c) in self._weights', seg)
+
+    def test_set_weights_keeps_primary_valid(self):
+        src = self._src()
+        i = src.index('def set_weights')
+        self.assertIn('self._primary', src[i:i + 1200])
+
+    def test_adaptive_default_off_without_config(self):
+        """다른 제품/구버전 config 에서 조용히 켜지면 안 된다."""
+        src = self._src()
+        i = src.index('def _adaptive_weights_step')
+        self.assertIn("cfg.get('enabled', False)", src[i:i + 2500])
+
+    def test_bm9k1_enables_adaptive(self):
+        import json, pathlib
+        cfg = json.loads(pathlib.Path(__file__).with_name('fuzzer_config.json').read_text())
+        ad = cfg['products']['BM9K1']['riscv']['sample_plan']['adaptive']
+        self.assertTrue(ad['enabled'])
+        self.assertEqual(ad['exponent'], 2.0)
+        self.assertGreaterEqual(ad['min_weight'], 1)
