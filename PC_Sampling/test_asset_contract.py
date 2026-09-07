@@ -34,7 +34,7 @@ def write_assets(d, banks=3, counts=True):
                "header": {"magic": "0x4F564C00", "magic_mask": "0xFFFFFF00",
                           "id_mask": "0x000000FF"},
                "bank_sizes": {str(n): 4096 for n in range(banks)}},
-              open(d / 'overlay_map_coreH.json', 'w'))
+              open(d / 'overlay_probe_coreH.json', 'w'))
     if counts:
         json.dump({"product": "BM9K1", "bb_end_convention": "exclusive",
                    "cores": {"H": {"counts": {"basic_blocks": 2, "functions": 1,
@@ -118,3 +118,37 @@ class TestAssetContract(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestProbeMapRequired(unittest.TestCase):
+    """★ 빌드의 레이아웃 맵(.OVL_REGION_NN)과 런타임 판별표는 **다른 파일**이다.
+
+    레이아웃 맵은 "어디에 몇 개" 만 말한다. 지금 뭐가 올라와 있는지는 오버레이
+    섹션의 실제 바이트를 봐야 알 수 있고, 그건 Ghidra 추출로 안 나온다.
+    판별표가 없으면 _ovl 표를 넣어도 쓸 수 없으므로 **소리 내어** 알려야 한다.
+    """
+
+    def test_orphan_tables_warn(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_assets(d, banks=3)
+            Path(d, 'overlay_probe_coreH.json').unlink()
+            m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
+            self.assertTrue(any('overlay_probe_coreH.json' in w for w in m.warnings),
+                            "판별표 없이 표만 있으면 경고해야 한다")
+            self.assertEqual(m.cores[0].banks, {})
+
+    def test_denominator_unchanged_without_probe_map(self):
+        """판별표가 없으면 분모도 안 부풀어야 한다 — 못 쓰는 표를 분모에만 넣으면
+        커버리지가 이유 없이 낮게 보인다."""
+        with tempfile.TemporaryDirectory() as d:
+            write_assets(d, banks=3)
+            Path(d, 'overlay_probe_coreH.json').unlink()
+            m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
+            self.assertEqual(m.total_bbs, 2)
+
+    def test_no_warning_when_no_overlay_at_all(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_assets(d, banks=0)
+            Path(d, 'overlay_probe_coreH.json').unlink()
+            m = rc.CoverageModel.load(d, product='BM9K1', core_ids={'H': 0})
+            self.assertEqual(m.warnings, [])

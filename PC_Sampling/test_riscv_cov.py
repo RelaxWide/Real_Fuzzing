@@ -624,7 +624,7 @@ class TestOverlayBanks(unittest.TestCase):
                     "header": {"magic": "0x4F564C00", "magic_mask": "0xFFFFFF00",
                                "id_mask": "0x000000FF"},
                     "bank_sizes": {"0": 11758, "1": 15970, "2": 10914, "3": 5010}},
-                   open(os.path.join(d, 'overlay_map_coreF.json'), 'w'))
+                   open(os.path.join(d, 'overlay_probe_coreF.json'), 'w'))
         for b in with_bank_tables:
             with open(os.path.join(d, f'basic_blocks_coreF_ovl{b}.txt'), 'w') as f:
                 f.write(f"0x{self.BASE:x} 0x{self.BASE+16:x}\n")
@@ -705,7 +705,7 @@ class TestRuntimeBankResolution(unittest.TestCase):
                    "header": {"magic": "0x4F564C00", "magic_mask": "0xFFFFFF00",
                               "id_mask": "0x000000FF"},
                    "bank_sizes": {str(b): 4096 for b in (0, 1, 2)}},
-                  open(os.path.join(p, 'overlay_map_coreH.json'), 'w'))
+                  open(os.path.join(p, 'overlay_probe_coreH.json'), 'w'))
         for b in banks:
             with open(os.path.join(p, f'basic_blocks_coreH_ovl{b}.txt'), 'w') as f:
                 f.write(f"0x{self.BASE:x} 0x{self.BASE+16:x}\n")

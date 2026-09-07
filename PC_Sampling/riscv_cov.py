@@ -273,9 +273,26 @@ class CoverageModel:
             if os.path.exists(cg):
                 cm.callees = _read_callgraph(cg)
             # ── 코드 오버레이(있는 코어만) ──
-            #   overlay_map_core<X>.json = tools/overlay_probe.py 산출물.
+            #   ★ 두 파일을 혼동하지 말 것:
+            #     · 빌드의 **레이아웃 맵**(.OVL_REGION_NN: section_index/addr/size)은
+            #       "어디에 몇 개" 를 말할 뿐 런타임 판별에 못 쓴다.
+            #     · 여기서 읽는 overlay_probe_core<X>.json 은 **판별표**다
+            #       (워드값 → bank). ELF 오버레이 섹션의 실제 바이트를 봐야 나오므로
+            #       tools/overlay_probe.py 로 만든다(Ghidra 추출로는 안 나온다).
             #   bank 별 BB/함수 표는 basic_blocks_core<X>_ovl<N>.txt 규약.
-            om = os.path.join(product_dir, f"overlay_map_core{name}.json")
+            om = os.path.join(product_dir, f"overlay_probe_core{name}.json")
+            if not os.path.exists(om):
+                # _ovl 표가 있는데 판별표가 없으면 표를 못 쓴다. 조용히 넘어가면
+                # "표를 다 넣었는데 왜 그대로지?" 로 시간을 버린다.
+                import glob as _glob
+                _orph = _glob.glob(os.path.join(
+                    product_dir, f"basic_blocks_core{name}_ovl*.txt"))
+                if _orph:
+                    m.warnings.append(
+                        f"core{name}: 오버레이 표 {len(_orph)}개가 있는데 "
+                        f"overlay_probe_core{name}.json 이 없어 **무시**한다. "
+                        f"tools/overlay_probe.py 로 판별표를 만들어라 "
+                        f"(빌드의 .OVL_REGION 레이아웃 맵과는 다른 파일이다)")
             if os.path.exists(om):
                 with open(om, encoding="utf-8") as f:
                     o = json.load(f)

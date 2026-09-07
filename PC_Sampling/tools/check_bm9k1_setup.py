@@ -163,7 +163,7 @@ if not PROD.is_dir():
 else:
     _any_ovl = False
     for c in CORES:
-        omap = PROD / f"overlay_map_core{c}.json"
+        omap = PROD / f"overlay_probe_core{c}.json"
         # 파일명 오타를 잡는다 — 단수형(basic_block_)이면 로더가 조용히 무시한다
         wrong = sorted(PROD.glob(f"basic_block_core{c}_ovl*.txt"))
         if wrong:

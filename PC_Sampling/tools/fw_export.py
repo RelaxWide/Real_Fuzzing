@@ -11,7 +11,7 @@
 산출(코어별):
     basic_blocks_core<X>.txt      functions_core<X>.txt
     callgraph_core<X>.txt         symbols.json (전 코어 합본)
-    + 오버레이 맵을 준 코어는 overlay_map_core<X>.json 과
+    + 오버레이 맵을 준 코어는 overlay_probe_core<X>.json 과
       basic_blocks/functions_core<X>_ovl<N>.txt
 
 왜 ELF 가 Ghidra 보다 나은가(이 제품 한정):
@@ -85,7 +85,7 @@ def export_core(core, elf, ovl_map, outdir, objdump=None):
                 "id_to_section": {str(a): b for a, b in id_to_idx.items()},
                 # ID 가 0 부터 시작한다는 보장이 없다(H코어 실측 ID 4~6, bank 0~2)
                 "id_to_bank": {str(a): idx_to_ord[b] for a, b in id_to_idx.items()}}
-        with open(os.path.join(outdir, f"overlay_map_core{core}.json"), 'w',
+        with open(os.path.join(outdir, f"overlay_probe_core{core}.json"), 'w',
                   encoding='utf-8') as f:
             json.dump(doc, f, indent=2, ensure_ascii=False)
         info["overlay"] = {"base": base, "window_end": end, "banks": len(rows),

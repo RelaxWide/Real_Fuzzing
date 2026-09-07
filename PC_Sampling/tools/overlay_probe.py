@@ -10,11 +10,11 @@
       → 오프라인에서 N개 바이트를 전부 꺼내, 값이 서로 다른 워드 오프셋 k 를 찾는다.
       런타임에는 `base+k` 를 **1워드만** SBA 로 읽어 bank 를 확정한다(버스트 경계에서).
 
-산출: overlay_map_core<X>.json — base / probe_offset / {워드값 → bank} / bank별 size.
+산출: overlay_probe_core<X>.json — base / probe_offset / {워드값 → bank} / bank별 size.
 
 사용:
     python3 tools/overlay_probe.py --elf FW_FCore.elf --map ovl_F.json --core F \\
-            --out products/BM9K1/overlay_map_coreF.json
+            --out products/BM9K1/overlay_probe_coreF.json
     # 0단계: 지금 커버리지의 몇 %가 오버레이 창에 떨어지는지
     python3 tools/overlay_probe.py --elf ... --map ... --coverage output/.../coverage.txt
 """
@@ -171,7 +171,7 @@ def main():
     p.add_argument('--elf', required=True)
     p.add_argument('--map', required=True, help='오버레이 맵 JSON')
     p.add_argument('--core', default='?', help='코어 이름(H/CM/F/Q)')
-    p.add_argument('--out', help='overlay_map_core<X>.json 출력 경로')
+    p.add_argument('--out', help='overlay_probe_core<X>.json 출력 경로')
     p.add_argument('--coverage', help='0단계 측정용 coverage.txt')
     p.add_argument('--bb-file', dest='bb_file',
                    help='기존 basic_blocks_core<X>.txt — 오버레이 창의 분모 상태 점검')
