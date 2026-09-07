@@ -219,3 +219,45 @@ class TestHeaderDetect(unittest.TestCase):
 
     def test_single_overlay_no_header(self):
         self.assertIsNone(op.detect_header({15: 0x4F564C00}))
+
+
+class TestBankIsOrdinal(unittest.TestCase):
+    """★ bank 는 오버레이 **순번**(0..3)이어야 한다 — 섹션 인덱스가 아니다.
+
+    런타임이 헤더에서 뽑는 값(word & 0xFF)이 순번이고 파일명도 _ovl<순번> 이라,
+    여기서 섹션 인덱스를 쓰면 bank 표가 **조용히 로드되지 않는다**(실제로 겪었다).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.elf = os.path.join(self.tmp.name, 'f.elf')
+        self.map = os.path.join(self.tmp.name, 'ovl.json')
+        self.out = os.path.join(self.tmp.name, 'm.json')
+        write_map(self.map)
+        build_elf(self.elf)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self):
+        import subprocess
+        tool = str(Path(__file__).with_name('tools') / 'overlay_probe.py')
+        r = subprocess.run([sys.executable, tool, '--elf', self.elf, '--map', self.map,
+                            '--core', 'F', '--out', self.out],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.load(open(self.out))
+
+    def test_bank_sizes_keyed_by_ordinal(self):
+        doc = self._run()
+        self.assertEqual(sorted(doc['bank_sizes']), ['0', '1', '2', '3'])
+
+    def test_probe_maps_to_ordinal(self):
+        doc = self._run()
+        self.assertEqual(sorted(doc['probe_to_bank'].values()), [0, 1, 2, 3])
+
+    def test_sizes_match_section_order(self):
+        """순번 0 은 section_index 가 가장 작은 것(=.OVL_REGION_00)이어야 한다."""
+        doc = self._run()
+        self.assertEqual(int(doc['bank_sizes']['0']), SIZES[15])
+        self.assertEqual(int(doc['bank_sizes']['3']), SIZES[18])

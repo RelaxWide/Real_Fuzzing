@@ -190,17 +190,21 @@ def main():
         print(f"      idx={idx:<3} {name:<18} size={size:,} "
               f"(끝=0x{base + size:X})")
 
+    # ★ bank 는 **오버레이 순번**(0..3)이다 — 섹션 인덱스가 아니다.
+    #   런타임이 헤더에서 뽑는 값(word & 0xFF)이 순번이고, 파일명도 _ovl<순번> 이라
+    #   여기서 어긋나면 bank 표가 조용히 로드되지 않는다(실제로 겪음).
+    idx_to_ord = {idx: n for n, (_nm, idx, _a, _s) in enumerate(rows)}
     k, vals = find_probe(bodies)
     if k is not None:
         probe = [k]
-        table = {f"0x{v:08X}": idx for idx, v in vals.items()}
+        table = {f"0x{v:08X}": idx_to_ord[idx] for idx, v in vals.items()}
         print(f"[ovl] 판별 오프셋 = +0x{k:X} (1워드) → 런타임에 0x{base + k:X} 를 읽는다")
     else:
         pair, combo = find_probe_pair(bodies)
         if pair is None:
             raise SystemExit("[ovl] 두 워드로도 판별 불가 — 오버레이 내용이 겹친다")
         probe = list(pair)
-        table = {f"0x{v[0]:08X},0x{v[1]:08X}": idx for idx, v in combo.items()}
+        table = {f"0x{v[0]:08X},0x{v[1]:08X}": idx_to_ord[idx] for idx, v in combo.items()}
         print(f"[ovl] 판별 오프셋 = +0x{pair[0]:X},+0x{pair[1]:X} (2워드)")
     for key, idx in sorted(table.items(), key=lambda kv: kv[1]):
         print(f"      {key} → bank {idx}")
@@ -211,7 +215,10 @@ def main():
         print(f"[ovl] ★ 구조화된 헤더 감지 — 매직 0x{magic:08X}(\"{txt}\") + 순번 ID")
         print(f"      런타임 검증: (word & 0x{mask:08X}) == 0x{magic:08X} 이어야 유효")
         print(f"      bank = word & 0x{~mask & 0xFFFFFFFF:08X}  "
-              f"→ {', '.join(f'{i}=idx{j}' for i, j in sorted(id_to_idx.items()))}")
+              f"→ {', '.join(f'bank{i}=idx{j}' for i, j in sorted(id_to_idx.items()))}")
+        if {idx_to_ord[j] for j in id_to_idx.values()} != set(id_to_idx):
+            print("      ⚠ 헤더 ID 와 섹션 순번이 어긋난다 — 파일명 규약 확인 필요",
+                  file=sys.stderr)
         doc_hdr = {"magic_mask": f"0x{mask:08X}", "magic": f"0x{magic:08X}",
                    "id_mask": f"0x{~mask & 0xFFFFFFFF:08X}",
                    "id_to_section": {str(i): j for i, j in id_to_idx.items()}}
@@ -220,7 +227,7 @@ def main():
 
     doc = {"core": a.core, "base": base, "window_end": end,
            "probe_offsets": probe, "probe_to_bank": table,
-           "bank_sizes": {str(i): s for i, s in sizes.items()},
+           "bank_sizes": {str(idx_to_ord[i]): s for i, s in sizes.items()},
            "header": doc_hdr,
            "note": "런타임: 버스트 경계에서 base+probe 를 읽어 bank 확정. "
                    "버스트 전후 값이 다르면 그 버스트는 폐기. header 가 있으면 "

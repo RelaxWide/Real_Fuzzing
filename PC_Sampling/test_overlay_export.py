@@ -153,3 +153,50 @@ class TestSymbolFilter(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestBoundedScanAndCallgraph(unittest.TestCase):
+    """심볼 경계 스캔 + 직접호출 콜그래프 — Ghidra 대체의 핵심 두 조각."""
+
+    def test_data_between_functions_not_decoded(self):
+        """함수 사이 데이터를 명령으로 오독하면 그 뒤 스트림 전체가 어긋난다."""
+        body = (struct.pack('<I', 0x00100093) + struct.pack('<I', jal(1, 28)) +
+                struct.pack('<I', 0x00100093) * 2 +
+                b'\xff\xff\xff\xff' * 4 +                    # 데이터 구간
+                struct.pack('<I', 0x00100093) + struct.pack('<H', 0x8082) + b'\x00\x00')
+        got = oe.scan_blocks_bounded(body, BASE, [(BASE, 16, 'f0'), (BASE + 32, 8, 'f1')])
+        for s, _e in got:
+            self.assertFalse(BASE + 16 <= s < BASE + 32, "데이터 구간에 BB 가 생겼다")
+
+    def test_bounded_covers_only_function_bodies(self):
+        body = struct.pack('<I', 0x00100093) * 8
+        got = oe.scan_blocks_bounded(body, BASE, [(BASE, 8, 'a')])
+        self.assertEqual(got, [(BASE, BASE + 8)])
+
+    def test_falls_back_when_no_symbols(self):
+        """심볼이 없으면 선형 스캔으로 떨어져야 한다(아무것도 안 내면 안 된다)."""
+        body = struct.pack('<I', 0x00100093) * 4
+        self.assertTrue(oe.scan_blocks_bounded(body, BASE, []))
+
+    def test_callgraph_direct_call(self):
+        body = (struct.pack('<I', 0x00100093) + struct.pack('<I', jal(1, 28)) +
+                struct.pack('<I', 0x00100093) * 2 + b'\x00' * 16 +
+                struct.pack('<H', 0x8082) + b'\x00' * 6)
+        cg = oe.extract_callgraph(body, BASE, [(BASE, 16, 'a'), (BASE + 32, 8, 'b')])
+        self.assertEqual(cg.get(BASE), {BASE + 32})
+
+    def test_callgraph_tail_call(self):
+        """rd=x0 인 JAL(꼬리호출)도 간선이다."""
+        body = (struct.pack('<I', jal(0, 32)) + struct.pack('<I', 0x00100093) * 3 +
+                b'\x00' * 16 + struct.pack('<H', 0x8082) + b'\x00' * 6)
+        cg = oe.extract_callgraph(body, BASE, [(BASE, 16, 'a'), (BASE + 32, 8, 'b')])
+        self.assertEqual(cg.get(BASE), {BASE + 32})
+
+    def test_callgraph_excludes_self_recursion(self):
+        body = struct.pack('<I', jal(1, 0)) + struct.pack('<I', 0x00100093) * 3
+        self.assertEqual(oe.extract_callgraph(body, BASE, [(BASE, 16, 'a')]), {})
+
+    def test_callgraph_ignores_non_entry_targets(self):
+        """함수 내부로 뛰는 것은 호출이 아니라 분기다."""
+        body = struct.pack('<I', jal(1, 8)) + struct.pack('<I', 0x00100093) * 3
+        self.assertEqual(oe.extract_callgraph(body, BASE, [(BASE, 16, 'a')]), {})

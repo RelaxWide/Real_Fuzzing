@@ -175,6 +175,65 @@ def scan_blocks(body, base, func_entries):
     return blocks
 
 
+def scan_blocks_bounded(body, base, funcs):
+    """★ 심볼 경계 안에서만 디코드한다.
+
+    섹션을 통째로 선형 스캔하면 함수 사이에 낀 데이터(정렬 패딩, 점프테이블,
+    상수)를 명령으로 오독하고, 한 번 어긋나면 그 뒤 스트림 전체가 틀어진다.
+    심볼 테이블이 함수 본문의 정확한 범위를 주므로 **그 안에서만** 해독한다.
+    함수 밖 바이트는 애초에 실행되지 않으니 BB 도 필요 없다.
+
+    funcs: [(addr, size, name)]
+    """
+    if not funcs:
+        return scan_blocks(body, base, [])          # 심볼 없으면 기존 선형 스캔
+    n = len(body)
+    out = []
+    for addr, size, _nm in funcs:
+        off = addr - base
+        if off < 0 or off >= n or size <= 0:
+            continue
+        end = min(off + size, n)
+        sub = body[off:end]
+        # 함수 안의 리더/종결만 계산 — 타겟이 함수 밖이면 무시된다(scan_blocks 규칙)
+        out.extend(scan_blocks(sub, addr, [addr]))
+    out.sort()
+    return out
+
+
+def extract_callgraph(body, base, funcs):
+    """직접 호출(JAL) 로 caller→callee 를 만든다.
+
+    Ghidra 의 getCalledFunctions 를 대체하는 부분. 간접 호출(함수 포인터)은 못 잡지만
+    frontier 분석이 쓰는 건 '도달한 함수가 **직접** 부르는 미도달 함수' 라 직접
+    호출만으로 충분하다. JAL 은 rd 와 무관하게 타겟이 다른 함수 진입점이면 간선으로
+    본다(rd=x0 는 tail call).
+    """
+    entries = {a for a, _s, _n in funcs}
+    edges = {}
+    for addr, size, _nm in funcs:
+        off = addr - base
+        if off < 0 or size <= 0 or off >= len(body):
+            continue
+        end = min(off + size, len(body))
+        pc = off
+        while pc + 1 < end:
+            h = struct.unpack_from('<H', body, pc)[0]
+            ln = _ilen(h)
+            if pc + ln > end:
+                break
+            if ln == 4:
+                w = struct.unpack_from('<I', body, pc)[0]
+                if (w & 0x7F) == 0x6F:                   # JAL
+                    _t, d = _term32(w)
+                    if d is not None:
+                        tgt = base + pc + d
+                        if tgt in entries and tgt != addr:
+                            edges.setdefault(addr, set()).add(tgt)
+            pc += ln
+    return edges
+
+
 def blocks_via_objdump(tool, elf, section, base, size):
     """외부 디스어셈블러 경로. 실패하면 None 을 돌려 내장 스캐너로 넘어간다."""
     for args in ([tool, '-d', '--section', section, elf],
@@ -223,8 +282,8 @@ def main():
                           for i in range(len(addrs))]
                 src = f"objdump({a.objdump})"
         if blocks is None:
-            blocks = scan_blocks(bodies[idx], base, [v for v, _s, _n in fns])
-            src = "내장 RV32 스캐너"
+            blocks = scan_blocks_bounded(bodies[idx], base, fns)
+            src = "내장 RV32 스캐너(심볼 경계)"
         bpath = os.path.join(a.outdir, f"basic_blocks_core{a.core}_ovl{bank}.txt")
         with open(bpath, 'w') as f:
             for s0, e0 in blocks:
