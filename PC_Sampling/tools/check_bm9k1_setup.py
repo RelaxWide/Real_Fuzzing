@@ -157,6 +157,61 @@ else:
     else:
         bad("symbols.json", "없음")
 
+print("\n=== ②-b 코드 오버레이 자산 ===")
+if not PROD.is_dir():
+    bad("오버레이", "products 디렉토리 없음")
+else:
+    _any_ovl = False
+    for c in CORES:
+        omap = PROD / f"overlay_map_core{c}.json"
+        # 파일명 오타를 잡는다 — 단수형(basic_block_)이면 로더가 조용히 무시한다
+        wrong = sorted(PROD.glob(f"basic_block_core{c}_ovl*.txt"))
+        if wrong:
+            bad(f"core{c} 파일명",
+                f"단수형 {len(wrong)}개 발견 — 'basic_blocks_'(복수)여야 로드된다"
+                f" 예: {wrong[0].name}")
+        bbs = sorted(PROD.glob(f"basic_blocks_core{c}_ovl*.txt"))
+        fns = sorted(PROD.glob(f"functions_core{c}_ovl*.txt"))
+        if not (bbs or fns or omap.exists()):
+            continue                       # 이 코어는 오버레이 없음 — 정상
+        _any_ovl = True
+        if not omap.exists():
+            bad(f"core{c} overlay_map",
+                f"없음 — Ghidra 가 아니라 tools/overlay_probe.py 가 만든다."
+                f" 없으면 bank 표가 있어도 전부 bank 0 으로 접힌다")
+            continue
+        try:
+            om = json.loads(omap.read_text())
+        except Exception as e:
+            bad(f"core{c} overlay_map", f"파싱 실패 {e}")
+            continue
+        n_map = len(om.get("bank_sizes") or {})
+        idx_bb = {int(f.stem.rsplit("_ovl", 1)[1]) for f in bbs}
+        idx_fn = {int(f.stem.rsplit("_ovl", 1)[1]) for f in fns}
+        want = set(range(n_map))
+        probe = om.get("probe_offsets") or []
+        hdr = om.get("header") or {}
+        if not probe:
+            bad(f"core{c} probe", "판별 오프셋 없음 — overlay_probe.py 가 실패했다")
+        else:
+            good(f"core{c} probe",
+                 f"0x{int(om['base']) + probe[0]:X} 읽기 1워드"
+                 + (f", 매직 {hdr.get('magic')}" if hdr else ", 매직 없음(표만 사용)"))
+        missing_bb = sorted(want - idx_bb)
+        missing_fn = sorted(want - idx_fn)
+        extra = sorted((idx_bb | idx_fn) - want)
+        if missing_bb or missing_fn:
+            bad(f"core{c} 오버레이 표",
+                f"맵 {n_map}개 중 BB 누락 {len(missing_bb)} 함수 누락 {len(missing_fn)}"
+                f" (누락 bank 는 bank 0 으로 접혀 분모에서 빠진다) {missing_bb[:5]}")
+        elif extra:
+            bad(f"core{c} 오버레이 표",
+                f"맵에 없는 ovl 번호 {extra[:5]} — 맵과 표가 다른 빌드일 수 있다")
+        else:
+            good(f"core{c} 오버레이 표", f"{n_map}개 bank 전부 (BB/함수 짝 맞음)")
+    if not _any_ovl:
+        good("오버레이", "자산 없음 — 오버레이 미사용으로 동작(정상)")
+
 print("\n=== ③ 실행 의존성 ===")
 try:
     import pylink  # noqa

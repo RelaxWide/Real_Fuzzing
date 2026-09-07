@@ -1,0 +1,832 @@
+{
+  "schema_version": 1,
+  "name": "v10.1 NVMe spec-derived command/response observation denominator",
+  "specifications": {
+    "base": "NVM Express Base Specification Revision 2.3 (2025-08-01)",
+    "nvm_command_set": "NVM Express NVM Command Set Specification Revision 1.2 (2025-08-01)"
+  },
+  "semantics": {
+    "claim": "A target pair is covered when the normalized SCT/SC pair is observed at least once under the canonical command/subcategory key.",
+    "not_claimed": [
+      "NVMe conformance",
+      "correctness of the response for the generated input",
+      "firmware code coverage",
+      "exhaustiveness of vendor-specific responses"
+    ],
+    "coverage_key": [
+      "queue",
+      "opcode",
+      "subcategory",
+      "sct",
+      "sc"
+    ],
+    "ignored_status_bits": [
+      "DNR",
+      "M",
+      "CRD"
+    ],
+    "host_errno_timeout_and_unsubmitted_are_not_cqe_outcomes": true
+  },
+  "denominator_policy": {
+    "fixed_for_campaign": true,
+    "supported_command": "Use supported_outcomes. Resolve command support from mandatory requirements, Identify OACS/ONCS, and Commands Supported and Effects CSUPP when available.",
+    "unsupported_command": "Use only SCT=0/SC=0x01 Invalid Command Opcode for that queue/opcode.",
+    "supported_subcategory": "Use supported_outcomes inherited from its command plus extra_outcomes on the subcategory.",
+    "unsupported_subcategory": "Use unsupported_outcomes on the command or subcategory.",
+    "unknown_capability": "Do not guess. Mark unresolved and exclude from the numeric denominator until the product profile is frozen.",
+    "default_exclusions": [
+      "SCT=2 Media and Data Integrity outcomes requiring controlled media/data faults",
+      "SCT=3 Path outcomes requiring ANA or multipath topology",
+      "SCT=7 and SC=0xC0..0xFF vendor-specific outcomes without a product response specification",
+      "abort, queue deletion, power-loss notification, and other externally induced completion outcomes",
+      "status values disputed between tables in the cited revision"
+    ]
+  },
+  "common_outcomes": {
+    "unsupported_command": [
+      {"sct": 0, "sc": 1, "name": "Invalid Command Opcode"}
+    ],
+    "selector_supported": [
+      {"sct": 0, "sc": 0, "name": "Successful Completion"},
+      {"sct": 0, "sc": 2, "name": "Invalid Field in Command"}
+    ],
+    "selector_unsupported_invalid_field": [
+      {"sct": 0, "sc": 2, "name": "Invalid Field in Command"}
+    ],
+    "log_page_unsupported": [
+      {"sct": 1, "sc": 9, "name": "Invalid Log Page"}
+    ]
+  },
+  "commands": {
+    "Identify": {
+      "queue": "admin",
+      "opcode": 6,
+      "support": "mandatory",
+      "selector": "CNS",
+      "supported_outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 44, "name": "Invalid I/O Command Set"}
+      ],
+      "unsupported_outcomes_ref": "selector_unsupported_invalid_field",
+      "subcategories": [
+        {"value": 0, "name": "Identify Namespace", "support": "mandatory_nvm"},
+        {"value": 1, "name": "Identify Controller", "support": "mandatory"},
+        {"value": 2, "name": "Active Namespace ID List", "support": "mandatory"},
+        {"value": 3, "name": "Namespace Identification Descriptor List", "support": "mandatory"},
+        {"value": 4, "name": "NVM Set List", "support": "runtime_optional"},
+        {"value": 5, "name": "I/O Command Set Specific Identify Namespace", "support": "mandatory"},
+        {"value": 6, "name": "I/O Command Set Specific Identify Controller", "support": "mandatory"},
+        {"value": 7, "name": "Active NSID List for I/O Command Set", "support": "mandatory"},
+        {"value": 8, "name": "I/O Command Set Independent Identify Namespace", "support": "mandatory"},
+        {"value": 9, "name": "Identify Namespace for Format Index", "support": "runtime_optional"},
+        {"value": 10, "name": "I/O Command Set Specific Identify Namespace for Format Index", "support": "runtime_optional"},
+        {"range": [11, 15], "name": "Reserved CNS", "support": "reserved", "default_denominator": false},
+        {"value": 16, "name": "Allocated Namespace ID List", "support": "namespace_management"},
+        {"value": 17, "name": "Identify Allocated Namespace", "support": "namespace_management"},
+        {"value": 18, "name": "Controller List for Namespace", "support": "namespace_management"},
+        {"value": 19, "name": "Controller List in NVM Subsystem", "support": "namespace_management"},
+        {"value": 20, "name": "Primary Controller Capabilities", "support": "virtualization"},
+        {"value": 21, "name": "Secondary Controller List", "support": "virtualization"},
+        {"value": 22, "name": "Namespace Granularity List", "support": "runtime_optional"},
+        {"value": 23, "name": "UUID List", "support": "runtime_optional"},
+        {"value": 24, "name": "Domain List", "support": "capacity_management_multi_domain"},
+        {"value": 25, "name": "Endurance Group List", "support": "variable_capacity_management"},
+        {"value": 26, "name": "Allocated NSID List for I/O Command Set", "support": "namespace_management"},
+        {"value": 27, "name": "I/O Command Set Specific Identify Allocated Namespace", "support": "namespace_management"},
+        {"value": 28, "name": "I/O Command Set Data Structure", "support": "runtime_optional"},
+        {"value": 29, "name": "Underlying Namespace List", "support": "message_transport_only", "default_denominator": false},
+        {"value": 30, "name": "Ports List", "support": "runtime_optional"},
+        {"value": 31, "name": "I/O Command Set Independent Identify Allocated Namespace", "support": "namespace_management"},
+        {"value": 32, "name": "Supported Controller State Formats", "support": "runtime_optional"},
+        {"range": [33, 255], "name": "Reserved CNS", "support": "reserved", "default_denominator": false}
+      ],
+      "source": "Base 2.3 section 5.2.13, Figure 326"
+    },
+    "GetLogPage": {
+      "queue": "admin",
+      "opcode": 2,
+      "support": "mandatory",
+      "selector": "LID",
+      "supported_outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"}
+      ],
+      "unsupported_outcomes": [
+        {"sct": 1, "sc": 9, "name": "Invalid Log Page"}
+      ],
+      "subcategories": [
+        {"value": 0, "name": "Supported Log Pages", "support": "mandatory"},
+        {"value": 1, "name": "Error Information", "support": "mandatory"},
+        {"value": 2, "name": "SMART / Health Information", "support": "mandatory"},
+        {"value": 3, "name": "Firmware Slot Information", "support": "mandatory"},
+        {"value": 4, "name": "Changed Attached Namespace List", "support": "runtime_optional"},
+        {"value": 5, "name": "Commands Supported and Effects", "support": "mandatory"},
+        {"value": 6, "name": "Device Self-test", "support": "device_self_test"},
+        {"value": 7, "name": "Telemetry Host-Initiated", "support": "telemetry"},
+        {"value": 8, "name": "Telemetry Controller-Initiated", "support": "telemetry"},
+        {"value": 9, "name": "Endurance Group Information", "support": "runtime_optional"},
+        {"value": 10, "name": "Predictable Latency Per NVM Set", "support": "runtime_optional"},
+        {"value": 11, "name": "Predictable Latency Event Aggregate", "support": "runtime_optional"},
+        {"value": 12, "name": "Asymmetric Namespace Access", "support": "ana"},
+        {"value": 13, "name": "Persistent Event", "support": "runtime_optional"},
+        {"value": 14, "name": "LBA Status Information", "support": "nvm_runtime_optional"},
+        {"value": 15, "name": "Endurance Group Event Aggregate", "support": "runtime_optional"},
+        {"value": 16, "name": "Media Unit Status", "support": "runtime_optional"},
+        {"value": 17, "name": "Supported Capacity Configuration List", "support": "capacity_management"},
+        {"value": 18, "name": "Feature Identifiers Supported and Effects", "support": "mandatory_if_set_features"},
+        {"value": 19, "name": "NVMe-MI Commands Supported and Effects", "support": "runtime_optional"},
+        {"value": 20, "name": "Command and Feature Lockdown", "support": "lockdown"},
+        {"value": 21, "name": "Boot Partition", "support": "runtime_optional"},
+        {"value": 22, "name": "Rotational Media Information", "support": "rotational_media"},
+        {"value": 23, "name": "Dispersed Namespace Participating NVM Subsystems", "support": "dispersed_namespace"},
+        {"value": 24, "name": "Management Address List", "support": "runtime_optional"},
+        {"value": 25, "name": "Physical Interface Receiver Eye Opening Measurement", "support": "pcie_transport_optional"},
+        {"value": 26, "name": "Reachability Groups", "support": "runtime_optional"},
+        {"value": 27, "name": "Reachability Associations", "support": "runtime_optional"},
+        {"value": 28, "name": "Changed Allocated Namespace List", "support": "namespace_management"},
+        {"value": 29, "name": "Device Personalities", "support": "device_personality"},
+        {"value": 30, "name": "Cross-Controller Reset", "support": "message_transport_only", "default_denominator": false},
+        {"value": 31, "name": "Lost Host Communication", "support": "message_transport_only", "default_denominator": false},
+        {"value": 32, "name": "FDP Configurations", "support": "fdp"},
+        {"value": 33, "name": "Reclaim Unit Handle Usage", "support": "fdp"},
+        {"value": 34, "name": "FDP Statistics", "support": "fdp"},
+        {"value": 35, "name": "FDP Events", "support": "fdp"},
+        {"value": 36, "name": "Reserved LID", "support": "reserved", "default_denominator": false},
+        {"value": 37, "name": "Power Measurement", "support": "power_measurement"},
+        {"range": [38, 111], "name": "Reserved LID", "support": "reserved", "default_denominator": false},
+        {"value": 112, "name": "Discovery", "support": "message_transport_only", "default_denominator": false},
+        {"value": 113, "name": "Host Discovery", "support": "message_transport_only", "default_denominator": false},
+        {"value": 114, "name": "AVE Discovery", "support": "message_transport_only", "default_denominator": false},
+        {"value": 115, "name": "Pull Model DDC Request", "support": "message_transport_only", "default_denominator": false},
+        {"range": [116, 126], "name": "Reserved LID", "support": "reserved", "default_denominator": false},
+        {"value": 127, "name": "Sanitize Namespace Status List", "support": "sanitize_namespace"},
+        {"value": 128, "name": "Reservation Notification", "support": "reservations"},
+        {"value": 129, "name": "Sanitize Status", "support": "sanitize"},
+        {"range": [130, 191], "name": "Other I/O Command Set LID", "support": "other_io_command_set", "default_denominator": false},
+        {"range": [192, 255], "name": "Vendor Specific LID", "support": "vendor_specific", "default_denominator": false}
+      ],
+      "source": "Base 2.3 section 5.2.12, Figures 206 and 321; NVM CS 1.2 LID 0x0E"
+    },
+    "GetFeatures": {
+      "queue": "admin",
+      "opcode": 10,
+      "support": "mandatory_for_io_controller",
+      "selector": "FID",
+      "supported_outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"}
+      ],
+      "unsupported_outcomes_ref": "selector_unsupported_invalid_field",
+      "subcategories_ref": "feature_identifiers"
+    },
+    "SetFeatures": {
+      "queue": "admin",
+      "opcode": 9,
+      "support": "mandatory_for_io_controller",
+      "selector": "FID",
+      "supported_outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 13, "name": "Feature Identifier Not Saveable", "include_when": "SV=1 and feature is not saveable"},
+        {"sct": 1, "sc": 14, "name": "Feature Not Changeable", "include_when": "feature is not changeable"},
+        {"sct": 1, "sc": 15, "name": "Feature Not Namespace Specific", "include_when": "non-zero NSID used for non-namespace-specific feature"},
+        {"sct": 1, "sc": 20, "name": "Overlapping Range", "include_when": "applicable I/O command set feature"},
+        {"sct": 1, "sc": 55, "name": "Invalid Controller Data Queue", "include_when": "FID=0x21"},
+        {"sct": 1, "sc": 62, "name": "Invalid Power Limit", "include_when": "FID=0x23"}
+      ],
+      "unsupported_outcomes_ref": "selector_unsupported_invalid_field",
+      "subcategories_ref": "feature_identifiers",
+      "spec_disputed_outcomes": [
+        {"sct": 1, "sc": 21, "name": "I/O Command Set Combination Rejected", "source": "Figure 485"},
+        {"sct": 1, "sc": 43, "name": "I/O Command Set Combination Rejected", "source": "Figure 103"}
+      ],
+      "source": "Base 2.3 section 5.2.26, Figures 103, 403, and 485"
+    },
+    "Read": {
+      "queue": "io",
+      "opcode": 2,
+      "support": "mandatory_nvm",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 128, "name": "LBA Out of Range"},
+        {"sct": 1, "sc": 128, "name": "Conflicting Attributes"},
+        {"sct": 1, "sc": 129, "name": "Invalid Protection Information"}
+      ],
+      "source": "NVM CS 1.2 sections 3 and 3.3.4, Figures 17, 18, and 58"
+    },
+    "Write": {
+      "queue": "io",
+      "opcode": 1,
+      "support": "mandatory_nvm",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 20, "name": "Atomic Write Unit Exceeded"},
+        {"sct": 0, "sc": 32, "name": "Namespace is Write Protected"},
+        {"sct": 0, "sc": 128, "name": "LBA Out of Range"},
+        {"sct": 0, "sc": 129, "name": "Capacity Exceeded", "include_when": "thin-provisioned namespace may require allocation"},
+        {"sct": 1, "sc": 128, "name": "Conflicting Attributes"},
+        {"sct": 1, "sc": 129, "name": "Invalid Protection Information"},
+        {"sct": 1, "sc": 130, "name": "Attempted Write to Read Only Range"}
+      ],
+      "source": "NVM CS 1.2 sections 3 and 3.3.6, Figures 17, 18, and 75"
+    },
+    "FWDownload": {
+      "queue": "admin",
+      "opcode": 17,
+      "support": "identify_oacs_fwds",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 20, "name": "Overlapping Range"}
+      ],
+      "source": "Base 2.3 section 5.2.9, Figure 191"
+    },
+    "FWCommit": {
+      "queue": "admin",
+      "opcode": 16,
+      "support": "identify_oacs_fwds",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 6, "name": "Invalid Firmware Slot"},
+        {"sct": 1, "sc": 7, "name": "Invalid Firmware Image"},
+        {"sct": 1, "sc": 11, "name": "Firmware Activation Requires Conventional Reset"},
+        {"sct": 1, "sc": 16, "name": "Firmware Activation Requires NVM Subsystem Reset"},
+        {"sct": 1, "sc": 17, "name": "Firmware Activation Requires Controller Level Reset"},
+        {"sct": 1, "sc": 18, "name": "Firmware Activation Requires Maximum Time Violation"},
+        {"sct": 1, "sc": 19, "name": "Firmware Activation Prohibited"},
+        {"sct": 1, "sc": 20, "name": "Overlapping Range"},
+        {"sct": 1, "sc": 30, "name": "Boot Partition Write Prohibited"}
+      ],
+      "spec_disputed_outcomes": [
+        {"sct": 1, "sc": 31, "name": "Manufacturing Default Personality Required", "source": "Figure 187"},
+        {"sct": 1, "sc": 61, "name": "Manufacturing Default Personality Required", "source": "Figure 103"}
+      ],
+      "source": "Base 2.3 section 5.2.8, Figures 103 and 187"
+    },
+    "FormatNVM": {
+      "queue": "admin",
+      "opcode": 128,
+      "support": "identify_oacs_fnvms",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 1, "sc": 10, "name": "Invalid Format"},
+        {"sct": 1, "sc": 130, "name": "Attempted Write to Read Only Range"}
+      ],
+      "safety": "destructive",
+      "source": "Base 2.3 section 5.2.10, Figure 194; NVM CS 1.2 Figure 18"
+    },
+    "Sanitize": {
+      "queue": "admin",
+      "opcode": 132,
+      "support": "identify_sanicap",
+      "selector": "SANACT",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 11, "name": "Firmware Activation Requires Conventional Reset"},
+        {"sct": 1, "sc": 16, "name": "Firmware Activation Requires NVM Subsystem Reset"},
+        {"sct": 1, "sc": 17, "name": "Firmware Activation Requires Controller Level Reset"},
+        {"sct": 1, "sc": 35, "name": "Sanitize Prohibited While Persistent Memory Region is Enabled"},
+        {"sct": 1, "sc": 57, "name": "Controller Suspended"}
+      ],
+      "subcategories": [
+        {"value": 1, "name": "Exit Failure Mode", "support": "mandatory_if_sanitize"},
+        {"value": 2, "name": "Start Block Erase", "support": "runtime_optional", "safety": "destructive"},
+        {"value": 3, "name": "Start Overwrite", "support": "runtime_optional", "safety": "destructive"},
+        {"value": 4, "name": "Start Crypto Erase", "support": "runtime_optional", "safety": "destructive"},
+        {"value": 5, "name": "Exit Media Verification State", "support": "runtime_optional"}
+      ],
+      "safety": "profile_gated",
+      "source": "Base 2.3 section 5.2.22, Figure 390"
+    },
+    "Flush": {
+      "queue": "io",
+      "opcode": 0,
+      "support": "mandatory_nvm",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 1, "sc": 130, "name": "Attempted Write to Read Only Range"}
+      ],
+      "source": "Base 2.3 section 7.2; NVM CS 1.2 Figure 18"
+    },
+    "DatasetManagement": {
+      "queue": "io",
+      "opcode": 9,
+      "support": "identify_oncs_dataset_management",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 128, "name": "LBA Out of Range"},
+        {"sct": 1, "sc": 128, "name": "Conflicting Attributes"},
+        {"sct": 1, "sc": 130, "name": "Attempted Write to Read Only Range"},
+        {"sct": 1, "sc": 131, "name": "Command Size Limit Exceeded"}
+      ],
+      "source": "NVM CS 1.2 section 3.3.3, Figures 18 and 48"
+    },
+    "WriteZeroes": {
+      "queue": "io",
+      "opcode": 8,
+      "support": "identify_oncs_write_zeroes",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 32, "name": "Namespace is Write Protected"},
+        {"sct": 0, "sc": 128, "name": "LBA Out of Range"},
+        {"sct": 0, "sc": 129, "name": "Capacity Exceeded", "include_when": "thin-provisioned namespace and DEAC=0 may require allocation"},
+        {"sct": 1, "sc": 129, "name": "Invalid Protection Information"},
+        {"sct": 1, "sc": 130, "name": "Attempted Write to Read Only Range"}
+      ],
+      "source": "NVM CS 1.2 section 3.3.8, Figures 18 and 88"
+    },
+    "Compare": {
+      "queue": "io",
+      "opcode": 5,
+      "support": "identify_oncs_compare",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 128, "name": "LBA Out of Range"},
+        {"sct": 1, "sc": 129, "name": "Invalid Protection Information"}
+      ],
+      "source": "NVM CS 1.2 section 3.3.1, Figures 18 and 30"
+    },
+    "WriteUncorrectable": {
+      "queue": "io",
+      "opcode": 4,
+      "support": "identify_oncs_write_uncorrectable",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 32, "name": "Namespace is Write Protected"},
+        {"sct": 0, "sc": 128, "name": "LBA Out of Range"},
+        {"sct": 0, "sc": 129, "name": "Capacity Exceeded", "include_when": "thin-provisioned namespace may require allocation"},
+        {"sct": 1, "sc": 130, "name": "Attempted Write to Read Only Range"}
+      ],
+      "source": "NVM CS 1.2 section 3.3.7, Figures 17, 18, and 79"
+    },
+    "Verify": {
+      "queue": "io",
+      "opcode": 12,
+      "support": "identify_oncs_verify",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 128, "name": "LBA Out of Range"},
+        {"sct": 1, "sc": 129, "name": "Invalid Protection Information"}
+      ],
+      "source": "NVM CS 1.2 section 3.3.5, Figures 18 and 65"
+    },
+    "DeviceSelfTest": {
+      "queue": "admin",
+      "opcode": 20,
+      "support": "identify_oacs_dsts",
+      "selector": "STC",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 1, "sc": 29, "name": "Device Self-test in Progress"}
+      ],
+      "subcategories": [
+        {"value": 1, "name": "Short"},
+        {"value": 2, "name": "Extended"},
+        {"value": 3, "name": "Host-Initiated Refresh"},
+        {"value": 14, "name": "Vendor Specific", "default_denominator": false},
+        {"value": 15, "name": "Abort"}
+      ],
+      "source": "Base 2.3 section 5.2.5, Figure 178"
+    },
+    "SecuritySend": {
+      "queue": "admin",
+      "opcode": 129,
+      "support": "identify_oacs_ssrs",
+      "selector": "SECP",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 12, "name": "Command Sequence Error"}
+      ],
+      "subcategory_policy": "Create protocol subcategories only from the product-approved SECP allowlist; do not enumerate credential-changing protocols by default.",
+      "source": "Base 2.3 section 5.2.25"
+    },
+    "SecurityReceive": {
+      "queue": "admin",
+      "opcode": 130,
+      "support": "identify_oacs_ssrs",
+      "selector": "SECP",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 12, "name": "Command Sequence Error"}
+      ],
+      "subcategory_policy": "Create protocol subcategories from the product-supported SECP list.",
+      "source": "Base 2.3 section 5.2.24"
+    },
+    "GetLBAStatus": {
+      "queue": "admin",
+      "opcode": 134,
+      "support": "commands_supported_and_effects_csupp",
+      "selector": "ATYPE",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 128, "name": "LBA Out of Range"}
+      ],
+      "subcategories": [
+        {"value": 2, "name": "Return Tracked Allocated LBAs", "support": "runtime_optional"},
+        {"value": 16, "name": "Scan and Return Untracked/Tracked LBAs", "support": "runtime_optional"},
+        {"value": 17, "name": "Return Tracked LBAs", "support": "runtime_optional"}
+      ],
+      "source": "NVM CS 1.2 section 4.2.1, Figure 130"
+    },
+    "NamespaceManagement": {
+      "queue": "admin",
+      "opcode": 13,
+      "support": "identify_oacs_nms",
+      "selector": "SEL",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 10, "name": "Invalid Format"},
+        {"sct": 1, "sc": 21, "name": "Namespace Insufficient Capacity"},
+        {"sct": 1, "sc": 22, "name": "Namespace Identifier Unavailable"},
+        {"sct": 1, "sc": 27, "name": "Thin Provisioning Not Supported"},
+        {"sct": 1, "sc": 36, "name": "ANA Group Identifier Invalid"},
+        {"sct": 1, "sc": 41, "name": "I/O Command Set Not Supported"}
+      ],
+      "subcategories": [
+        {"value": 0, "name": "Create"},
+        {"value": 1, "name": "Delete", "safety": "destructive"}
+      ],
+      "source": "Base 2.3 section 5.2.21, Figure 386"
+    },
+    "NamespaceAttachment": {
+      "queue": "admin",
+      "opcode": 21,
+      "support": "identify_oacs_nms",
+      "selector": "SEL",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 1, "sc": 24, "name": "Namespace Already Attached"},
+        {"sct": 1, "sc": 25, "name": "Namespace Is Private"},
+        {"sct": 1, "sc": 26, "name": "Namespace Not Attached"},
+        {"sct": 1, "sc": 28, "name": "Controller List Invalid"},
+        {"sct": 1, "sc": 37, "name": "ANA Attach Failed"},
+        {"sct": 1, "sc": 39, "name": "Namespace Attachment Limit Exceeded"},
+        {"sct": 1, "sc": 41, "name": "I/O Command Set Not Supported"},
+        {"sct": 1, "sc": 42, "name": "I/O Command Set Not Enabled"}
+      ],
+      "subcategories": [
+        {"value": 0, "name": "Attach"},
+        {"value": 1, "name": "Detach"}
+      ],
+      "source": "Base 2.3 section 5.2.20, Figure 381"
+    },
+    "KeepAlive": {
+      "queue": "admin",
+      "opcode": 24,
+      "support": "commands_supported_and_effects_csupp",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"}
+      ],
+      "source": "Base 2.3 section 5.2.14"
+    },
+    "DirectiveSend": {
+      "queue": "admin",
+      "opcode": 25,
+      "support": "identify_oacs_dirs",
+      "selector": "DTYPE/DOPER",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 1, "sc": 127, "name": "Stream Resource Allocation Failed"}
+      ],
+      "source": "Base 2.3 sections 5.2.7 and 8.1.9, Figures 650 and 654"
+    },
+    "DirectiveReceive": {
+      "queue": "admin",
+      "opcode": 26,
+      "support": "identify_oacs_dirs",
+      "selector": "DTYPE/DOPER",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"}
+      ],
+      "source": "Base 2.3 sections 5.2.6 and 8.1.9"
+    },
+    "VirtMgmt": {
+      "canonical_name": "Virtualization Management",
+      "queue": "admin",
+      "opcode": 28,
+      "support": "identify_oacs_vms",
+      "selector": "ACT/RT",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 31, "name": "Invalid Controller Identifier"},
+        {"sct": 1, "sc": 32, "name": "Invalid Secondary Controller State"},
+        {"sct": 1, "sc": 33, "name": "Invalid Number of Controller Resources"},
+        {"sct": 1, "sc": 34, "name": "Invalid Resource Identifier"}
+      ],
+      "source": "Base 2.3 section 5.3.6, Figure 520"
+    },
+    "CapacityMgmt": {
+      "canonical_name": "Capacity Management",
+      "queue": "admin",
+      "opcode": 32,
+      "support": "commands_supported_and_effects_csupp",
+      "selector": "OP",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 38, "name": "Insufficient Capacity"},
+        {"sct": 1, "sc": 45, "name": "Identifier Unavailable"}
+      ],
+      "source": "Base 2.3 section 5.2.3, Figure 163"
+    },
+    "Lockdown": {
+      "queue": "admin",
+      "opcode": 36,
+      "support": "identify_oacs_cfls",
+      "selector": "SCP/OFI",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 40, "name": "Prohibition of Command Execution Not Supported"}
+      ],
+      "safety": "profile_gated",
+      "source": "Base 2.3 section 5.2.15, Figure 355"
+    },
+    "MigrationSend": {
+      "queue": "admin",
+      "opcode": 65,
+      "support": "identify_oacs_hmlms",
+      "selector": "SEL",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 31, "name": "Invalid Controller Identifier"},
+        {"sct": 1, "sc": 55, "name": "Invalid Controller Data Queue"},
+        {"sct": 1, "sc": 56, "name": "Not Enough Resources"},
+        {"sct": 1, "sc": 58, "name": "Controller Not Suspended"}
+      ],
+      "source": "Base 2.3 section 5.2.17, Figure 378"
+    },
+    "MigrationReceive": {
+      "queue": "admin",
+      "opcode": 66,
+      "support": "identify_oacs_hmlms",
+      "selector": "SEL",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 31, "name": "Invalid Controller Identifier"}
+      ],
+      "source": "Base 2.3 section 5.2.16, Figure 364"
+    },
+    "ControllerDataQueue": {
+      "queue": "admin",
+      "opcode": 69,
+      "support": "commands_supported_and_effects_csupp",
+      "selector": "OP",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 31, "name": "Invalid Controller Identifier"},
+        {"sct": 1, "sc": 55, "name": "Invalid Controller Data Queue"},
+        {"sct": 1, "sc": 56, "name": "Not Enough Resources"}
+      ],
+      "source": "Base 2.3 section 5.2.4, Figures 103 and 173"
+    },
+    "Abort": {
+      "queue": "admin",
+      "opcode": 8,
+      "support": "mandatory",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 1, "sc": 3, "name": "Abort Command Limit Exceeded"}
+      ],
+      "source": "Base 2.3 section 5.2.1, Figure 148"
+    },
+    "Copy": {
+      "queue": "io",
+      "opcode": 25,
+      "support": "identify_oncs_copy",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 20, "name": "Atomic Write Unit Exceeded"},
+        {"sct": 0, "sc": 32, "name": "Namespace is Write Protected"},
+        {"sct": 0, "sc": 128, "name": "LBA Out of Range"},
+        {"sct": 0, "sc": 129, "name": "Capacity Exceeded", "include_when": "thin-provisioned destination namespace may require allocation"},
+        {"sct": 1, "sc": 129, "name": "Invalid Protection Information"},
+        {"sct": 1, "sc": 130, "name": "Attempted Write to Read Only Range"},
+        {"sct": 1, "sc": 131, "name": "Command Size Limit Exceeded"},
+        {"sct": 1, "sc": 133, "name": "Incompatible Namespace or Format"},
+        {"sct": 1, "sc": 134, "name": "Fast Copy Not Possible"},
+        {"sct": 1, "sc": 135, "name": "Overlapping I/O Range"},
+        {"sct": 1, "sc": 136, "name": "Namespace Not Reachable", "include_when": "reachability reporting is supported"},
+        {"sct": 1, "sc": 137, "name": "Insufficient Resources"}
+      ],
+      "source": "NVM CS 1.2 section 3.3.2, Figures 18 and 42"
+    },
+    "ReservationRegister": {
+      "queue": "io",
+      "opcode": 13,
+      "support": "identify_rescap",
+      "selector": "RREGA",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 131, "name": "Reservation Conflict"},
+        {"sct": 1, "sc": 46, "name": "Namespace Is Dispersed"}
+      ],
+      "source": "Base 2.3 sections 7.6 and 8.1.24, Figure 103"
+    },
+    "ReservationReport": {
+      "queue": "io",
+      "opcode": 14,
+      "support": "identify_rescap",
+      "selector": "EDS",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 24, "name": "Host Identifier Inconsistent Format"},
+        {"sct": 1, "sc": 46, "name": "Namespace Is Dispersed"}
+      ],
+      "source": "Base 2.3 section 7.8, Figure 103"
+    },
+    "ReservationAcquire": {
+      "queue": "io",
+      "opcode": 17,
+      "support": "identify_rescap",
+      "selector": "RACQA",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 131, "name": "Reservation Conflict"},
+        {"sct": 1, "sc": 46, "name": "Namespace Is Dispersed"}
+      ],
+      "source": "Base 2.3 sections 7.5 and 8.1.24, Figure 103"
+    },
+    "ReservationRelease": {
+      "queue": "io",
+      "opcode": 21,
+      "support": "identify_rescap",
+      "selector": "RRELA",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 131, "name": "Reservation Conflict"},
+        {"sct": 1, "sc": 46, "name": "Namespace Is Dispersed"}
+      ],
+      "source": "Base 2.3 sections 7.7 and 8.1.24, Figure 103"
+    },
+    "Cancel": {
+      "queue": "io",
+      "opcode": 24,
+      "support": "commands_supported_and_effects_csupp",
+      "selector": "CA",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 1, "sc": 132, "name": "Invalid Command ID"}
+      ],
+      "source": "Base 2.3 section 7.1, Figure 592"
+    },
+    "IOMgmtReceive": {
+      "canonical_name": "I/O Management Receive",
+      "queue": "io",
+      "opcode": 18,
+      "support": "identify_fdps",
+      "selector": "MO",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 41, "name": "FDP Disabled"}
+      ],
+      "subcategories": [
+        {"value": 0, "name": "No Action"},
+        {"value": 1, "name": "Reclaim Unit Handle Status", "support": "fdp"}
+      ],
+      "source": "Base 2.3 section 7.3, Figure 595"
+    },
+    "IOMgmtSend": {
+      "canonical_name": "I/O Management Send",
+      "queue": "io",
+      "opcode": 29,
+      "support": "identify_fdps",
+      "selector": "MO",
+      "outcomes": [
+        {"sct": 0, "sc": 0, "name": "Successful Completion"},
+        {"sct": 0, "sc": 2, "name": "Invalid Field in Command"},
+        {"sct": 0, "sc": 11, "name": "Invalid Namespace or Format"},
+        {"sct": 0, "sc": 41, "name": "FDP Disabled"}
+      ],
+      "subcategories": [
+        {"value": 0, "name": "No Action"},
+        {"value": 1, "name": "Reclaim Unit Handle Update", "support": "fdp"}
+      ],
+      "source": "Base 2.3 section 7.4, Figure 599"
+    }
+  },
+  "aliases": {
+    "TelemetryHostInitiated": {
+      "canonical_command": "GetLogPage",
+      "subcategory": {"LID": 7},
+      "reason": "The fuzzer models this seed family separately, but on wire it is Get Log Page opcode 0x02 with LID 0x07. It must not create a second denominator entry."
+    }
+  },
+  "shared_subcategory_catalogs": {
+    "feature_identifiers": [
+      {"value": 0, "name": "Reserved FID", "support": "reserved", "default_denominator": false},
+      {"value": 1, "name": "Arbitration", "support": "mandatory"},
+      {"value": 2, "name": "Power Management", "support": "mandatory"},
+      {"value": 3, "name": "LBA Range Type", "support": "nvm_runtime_optional"},
+      {"value": 4, "name": "Temperature Threshold", "support": "mandatory"},
+      {"value": 5, "name": "Error Recovery", "support": "nvm_mandatory"},
+      {"value": 6, "name": "Volatile Write Cache", "support": "runtime_optional"},
+      {"value": 7, "name": "Number of Queues", "support": "mandatory_pcie"},
+      {"value": 8, "name": "Interrupt Coalescing", "support": "mandatory_pcie"},
+      {"value": 9, "name": "Interrupt Vector Configuration", "support": "mandatory_pcie"},
+      {"value": 10, "name": "Write Atomicity Normal", "support": "nvm_mandatory"},
+      {"value": 11, "name": "Asynchronous Event Configuration", "support": "runtime_optional"},
+      {"value": 12, "name": "Autonomous Power State Transition", "support": "runtime_optional"},
+      {"value": 13, "name": "Host Memory Buffer", "support": "runtime_optional"},
+      {"value": 14, "name": "Timestamp", "support": "runtime_optional"},
+      {"value": 15, "name": "Keep Alive Timer", "support": "runtime_optional"},
+      {"value": 16, "name": "Host Controlled Thermal Management", "support": "runtime_optional"},
+      {"value": 17, "name": "Non-Operational Power State Config", "support": "runtime_optional"},
+      {"value": 18, "name": "Read Recovery Level Config", "support": "nvm_runtime_optional"},
+      {"value": 19, "name": "Predictable Latency Mode Config", "support": "runtime_optional"},
+      {"value": 20, "name": "Predictable Latency Mode Window", "support": "runtime_optional"},
+      {"value": 21, "name": "LBA Status Information Report Interval", "support": "nvm_runtime_optional"},
+      {"value": 22, "name": "Host Behavior Support", "support": "runtime_optional"},
+      {"value": 23, "name": "Sanitize Config", "support": "sanitize"},
+      {"value": 24, "name": "Endurance Group Event Configuration", "support": "runtime_optional"},
+      {"value": 25, "name": "I/O Command Set Profile", "support": "runtime_optional"},
+      {"value": 26, "name": "Spinup Control", "support": "runtime_optional"},
+      {"value": 27, "name": "Power Loss Signaling Config", "support": "runtime_optional"},
+      {"value": 28, "name": "Performance Characteristics", "support": "nvm_runtime_optional"},
+      {"value": 29, "name": "Flexible Data Placement", "support": "fdp"},
+      {"value": 30, "name": "Flexible Data Placement Events", "support": "fdp"},
+      {"value": 31, "name": "Namespace Admin Label", "support": "runtime_optional"},
+      {"value": 32, "name": "Key Value Configuration", "support": "other_io_command_set", "default_denominator": false},
+      {"value": 33, "name": "Controller Data Queue", "support": "controller_data_queue"},
+      {"value": 34, "name": "Configurable Device Personality", "support": "device_personality"},
+      {"value": 35, "name": "Power Limit", "support": "runtime_optional"},
+      {"value": 36, "name": "Power Threshold", "support": "runtime_optional"},
+      {"value": 37, "name": "Power Measurement", "support": "power_measurement"},
+      {"range": [38, 119], "name": "Reserved FID", "support": "reserved", "default_denominator": false},
+      {"value": 120, "name": "Embedded Management Controller Address", "support": "runtime_optional"},
+      {"value": 121, "name": "Host Management Agent Address", "support": "runtime_optional"},
+      {"range": [122, 124], "name": "Reserved Management FID", "support": "reserved", "default_denominator": false},
+      {"value": 125, "name": "Enhanced Controller Metadata", "support": "runtime_optional"},
+      {"value": 126, "name": "Controller Metadata", "support": "runtime_optional"},
+      {"value": 127, "name": "Namespace Metadata", "support": "runtime_optional"},
+      {"value": 128, "name": "Software Progress Marker", "support": "runtime_optional"},
+      {"value": 129, "name": "Host Identifier", "support": "runtime_optional"},
+      {"value": 130, "name": "Reservation Notification Mask", "support": "reservations"},
+      {"value": 131, "name": "Reservation Persistence", "support": "reservations"},
+      {"value": 132, "name": "Namespace Write Protection Config", "support": "runtime_optional"},
+      {"value": 133, "name": "Boot Partition Write Protection Config", "support": "runtime_optional"},
+      {"range": [134, 191], "name": "Reserved FID", "support": "reserved", "default_denominator": false},
+      {"range": [192, 255], "name": "Vendor Specific FID", "support": "vendor_specific", "default_denominator": false}
+    ]
+  },
+  "review_notes": [
+    "This is a standards master denominator, not a resolved BM9K1 denominator. A product capability snapshot is required before a numeric total is valid.",
+    "The current fuzzer command list contains 41 names, but TelemetryHostInitiated is an alias of GetLogPage/LID=0x07 and is intentionally not double-counted.",
+    "The fuzzer does not validate whether a response is semantically correct for the generated input. Coverage therefore records observation only.",
+    "Command-local and global status tables conflict for two Revision 2.3 values captured in spec_disputed_outcomes. They are excluded until clarified by an erratum or product specification."
+  ]
+}
