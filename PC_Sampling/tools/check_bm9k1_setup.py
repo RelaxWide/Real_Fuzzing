@@ -176,7 +176,7 @@ if not PROD.is_dir():
 else:
     _any_ovl = False
     for c in CORES:
-        omap = PROD / f"overlay_probe_core{c}.json"      # 실측 판별표(선택)
+        omap = PROD / f"overlay_probe_core{c}.json"      # 실측 판별표(수동, 선택)
         olay = None                                       # 빌드 레이아웃 맵
         if _rc is not None:
             for _cand in _rc.overlay_layout_candidates(c):
@@ -246,7 +246,7 @@ else:
         probe = om.get("probe_offsets") or []
         hdr = om.get("header") or {}
         if not probe:
-            bad(f"core{c} probe", "판별 오프셋 없음 — overlay_probe.py 가 실패했다")
+            bad(f"core{c} probe", "판별 오프셋 없음 — 레이아웃 맵의 addr/size 를 확인하라")
         else:
             good(f"core{c} probe",
                  f"0x{int(om['base']) + probe[0]:X} 읽기 1워드"

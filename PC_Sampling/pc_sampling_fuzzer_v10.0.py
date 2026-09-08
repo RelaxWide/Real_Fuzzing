@@ -191,7 +191,7 @@ _DEFAULT_STATE_FIELDS = STATE_FIELD_SETS.get('r8', [])
 # v9.0: LLM-guided fuzzing 설정 (rag 섹션). 섹션 없어도 fatal 아님(.get) — 없으면 비활성=v8.8 동등.
 _RAG = _CFG.get('rag', {})
 RAG_ENABLED          = bool(_RAG.get('enabled', False))
-RAG_MODULE_PATH      = str(_RAG.get('module_path', 'rag.mock_llm'))
+RAG_MODULE_PATH      = str(_RAG.get('module_path', 'rag.rag_bridge_client'))
 RAG_FUNC_NAME        = str(_RAG.get('func_name', 'ask'))
 RAG_PASS_SYSTEM      = bool(_RAG.get('pass_system_prompt', True))  # False=단일인자 func(system+user)
 RAG_REQUEST_CADENCE  = int(_RAG.get('request_cadence', 5000))

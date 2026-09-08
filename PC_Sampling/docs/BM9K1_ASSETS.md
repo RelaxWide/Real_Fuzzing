@@ -65,8 +65,9 @@ FW_<X>Core.overlay_map.json
 퍼저는 여기서 base·창 크기·bank 수를 얻고, 런타임 판별은 헤더 규약
 (`base+4` 의 워드 = `0x4F564C` `"OVL"` + 순번)으로 처리한다. **별도 판별표 불필요.**
 
-> 규약이 안 맞는 펌웨어가 나오면 `tools/overlay_probe.py` 로
-> `overlay_probe_core<X>.json` 을 만들어 두면 그쪽이 우선한다.
+> 규약(`base+4` 의 `"OVL"` 매직 + 순번)이 안 맞는 펌웨어가 나오면
+> `overlay_probe_core<X>.json`(워드값 → bank 표)을 직접 두면 그쪽이 우선한다.
+> 그 값은 ELF 오버레이 섹션의 바이트를 읽어야 나온다.
 
 ## 4. `symbols.json` (선택, 권장)
 

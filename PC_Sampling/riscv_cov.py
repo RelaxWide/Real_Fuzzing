@@ -352,12 +352,13 @@ class CoverageModel:
             #       "어디에 몇 개" 를 말할 뿐 런타임 판별에 못 쓴다.
             #     · 여기서 읽는 overlay_probe_core<X>.json 은 **판별표**다
             #       (워드값 → bank). ELF 오버레이 섹션의 실제 바이트를 봐야 나오므로
-            #       tools/overlay_probe.py 로 만든다(Ghidra 추출로는 안 나온다).
+            #       ELF 오버레이 섹션의 바이트를 읽어야 나오므로 정적 추출로는
+            #       안 나온다. 지금은 아래 ②(레이아웃 맵 + 헤더 규약)로 충분하다.
             #   bank 별 BB/함수 표는 basic_blocks_core<X>_ovl<N>.txt 규약.
             # ── 오버레이 판별 설정 ──
             #   ① overlay_core<X>.json = **빌드 레이아웃 맵**(.OVL_REGION_NN).
             #      헤더 규약(OVL 매직 + 순번)이 성립하면 이것만으로 충분하다.
-            #   ② overlay_probe_core<X>.json = 실측 판별표. 규약이 안 맞는 펌웨어용
+            #   ② overlay_probe_core<X>.json = 실측 판별표(수동 작성). 규약이 안 맞는 펌웨어용
             #      탈출구이며, 있으면 ① 보다 우선한다(측정값이 가정을 이긴다).
             cm.overlay = None
             probe_p = os.path.join(product_dir, f"overlay_probe_core{name}.json")
