@@ -1,13 +1,11 @@
-# SF-E76 Secure JTAG unlock → 디버그 → 트레이스 커버리지
+# Ghidra headless를 이용해서 ELF 파일을 이용해서 코드 커버리지 정보 추출 (코드 오버레이 포함)
+## 사용법
+overlay_map의 {label} 부분은 자동적으로 각 코어별로 교체되니 안 건드려도 됨. <PC_DIR>은 없어도 됨
+.sh의 인자는 다음과 같은 순서 <ELF_DIR> all <OUTDIR> <PC_DIR>
 
-SiFive **E76** 기반 SSD 컨트롤러(4-hart, RV32 IMAC+U+X)를 대상으로:
-**secure JTAG(PKC/ECDSA) 잠금 해제 → J-Link 디버그 접근 → 온칩 N-Trace 캡처**까지
-J-Link Plus(V13.00) + pylink 로 수행한다. 상위 `PC_Sampling/` SSD 펌웨어 fuzzer 의
-coverage-guided 루프에 **정확한 실행 커버리지**를 공급하는 것이 최종 목표.
+아래와 같이 실행하면 현재 폴더에 코어별 Basic_Block, Functions, FileMap, CallGraph, Symbols 정보가 전부 추출되어 생성된다
+MAXMEM=16G OVL_MAP="/home/ssd/pc_sample/products/BM9K1/FW_{label}Core_overlay_map.json" ./run_ghidra_export.sh /home/ssd/pc_sample/products/BM9K1 all ./
 
-이 문서는 **핸드오버용 정리**다. "어디까지 됐고 / 각 파일이 뭘 하고 / 다음에 뭘 해야 하는지".
-
----
 
 ## 0. 최신 상태 (2026-09) — 방향이 PCSR 폴링으로 바뀜 ★
 
