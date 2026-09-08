@@ -199,6 +199,18 @@ RAG_PLATEAU_EXECS    = int(_RAG.get('plateau_exec_threshold', 20000))
 RAG_MAX_SEEDS        = int(_RAG.get('max_seeds_per_round', 8))
 RAG_MAX_SEQS         = int(_RAG.get('max_seq_per_round', 4))
 RAG_MAX_UNCOV_FUNCS  = int(_RAG.get('max_uncov_funcs', 40))
+# 미도달 함수 중 **명령으로 겨냥할 수 없는** 것들 — 예산(위 40개)을 이런 것으로
+# 채우면 LLM 이 쓸 수 있는 타겟이 그만큼 줄어든다. 지우지 않고 **후순위로 민다**:
+#   · 부팅/리셋 경로 — 우리가 붙기 전에 이미 지나갔다. 명령으로 다시 못 간다.
+#   · 인터럽트/예외 핸들러 — 하드웨어 이벤트로 진입한다. CDW 로 겨냥 불가.
+#   · 컴파일러/libc 런타임 — 부수적으로 밟힐 뿐 겨냥 대상이 아니다.
+# 제품마다 다르므로 config 로 바꿀 수 있게 둔다.
+RAG_DEPRIO_PATTERNS  = _RAG.get('deprioritize_patterns', [
+    r'^(boot|reset|startup|crt0|_start)', r'_(init|deinit|shutdown)$',
+    r'(isr|irq|trap|exception|fault|nmi)', r'^__(aeabi|udiv|divsi|muldi|gnu)',
+    r'^(memcpy|memset|memmove|memcmp|strlen|strcpy|strcmp|abort|exit)$',
+])
+RAG_DEPRIO_MIN_SIZE  = int(_RAG.get('deprioritize_min_size', 16))   # 이하 = thunk/stub
 RAG_SEED_AT_STARTUP  = bool(_RAG.get('seed_at_startup', True))
 RAG_ENERGY_BOOST     = float(_RAG.get('llm_energy_boost', 1.5))
 # corpus_eval 자기점수(llm_score)가 이 값 **미만**일 때만 에너지 페널티(*0.5).
@@ -5874,6 +5886,21 @@ class NVMeFuzzer:
         try:
             _cov = getattr(self, 'cov', None)
             if _cov is not None and getattr(_cov, 'loaded', False):
+                _deprio_re = getattr(self, '_llm_deprio_re', None)
+                if _deprio_re is None:
+                    _deprio_re = re.compile('|'.join(RAG_DEPRIO_PATTERNS), re.I) \
+                        if RAG_DEPRIO_PATTERNS else None
+                    self._llm_deprio_re = _deprio_re
+
+                def _targetable(nm, size):
+                    """명령으로 겨냥 가능한가 — 0 이 우선, 1 은 후순위.
+                    지우지 않는 이유: 패턴이 틀렸을 때 진짜 타겟을 조용히 잃는다."""
+                    if size <= RAG_DEPRIO_MIN_SIZE:
+                        return 1
+                    if _deprio_re is not None and _deprio_re.search(str(nm)):
+                        return 1
+                    return 0
+
                 def _is_rv_symbol(nm) -> bool:
                     # FUN_/sub_ 형태만 거른다. 제품 심볼에 흔한 default/handler 같은
                     # 단어까지 제거하던 legacy keyword 필터는 실제 frontier를 숨긴다.
@@ -5907,11 +5934,21 @@ class NVMeFuzzer:
                 chosen_frontier = _round_robin(_frontier, _budget)
 
                 _uncovered = {}
+                _deprio_n = 0
                 for cid in _core_ids:
-                    _uncovered[cid] = [
-                        r for r in _cov.uncovered_functions(cid)
-                        if _is_rv_symbol(r[0]) and (cid, r[2]) not in _frontier_keys
-                    ]
+                    _rows = [r for r in _cov.uncovered_functions(cid)
+                             if _is_rv_symbol(r[0]) and (cid, r[2]) not in _frontier_keys]
+                    # 겨냥 가능한 것 먼저, 그 안에서 큰 것 먼저. 후순위도 목록에는
+                    # 남아 예산이 남으면 나간다(정보 손실 없음).
+                    _ranked = [(_targetable(r[0], r[1]), r) for r in _rows]
+                    _deprio_n += sum(1 for t, _ in _ranked if t)
+                    _ranked.sort(key=lambda t: (t[0], -t[1][1]))
+                    _uncovered[cid] = [r for _t, r in _ranked]
+                if _deprio_n and not getattr(self, '_llm_deprio_logged', False):
+                    self._llm_deprio_logged = True
+                    log.info(f"[LLM/cov] 미도달 {sum(len(v) for v in _uncovered.values())}개 중 "
+                             f"{_deprio_n}개를 후순위로 (부팅/ISR/런타임/stub) — "
+                             f"프롬프트 예산 {RAG_MAX_UNCOV_FUNCS}개를 겨냥 가능한 것으로 채운다")
                 chosen_uncovered = _round_robin(
                     _uncovered, max(0, _budget - len(chosen_frontier)))
 
