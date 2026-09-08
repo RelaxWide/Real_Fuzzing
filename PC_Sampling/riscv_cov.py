@@ -538,6 +538,32 @@ class CoverageModel:
         self.account(observations)
 
     # ── 통계 / 리포트 ──────────────────────────────────────────────────
+    def overlay_stats(self):
+        """코어별 오버레이 진행 — {cid: {banks_seen, banks_total, bbs, bbs_total}}.
+
+        주기 통계에 낼 용도. 오버레이는 35개가 한 주소를 공유해 전체 BB% 만 보면
+        진행이 안 보인다(본체에 묻힌다). 한 번만 훑는다.
+        """
+        seen, cov = {}, {}
+        for k in self.covered_bbs:
+            cid = k >> _CORE_SHIFT
+            bank = (k >> _BANK_SHIFT) & _BANK_MASK
+            if bank:
+                seen.setdefault(cid, set()).add(bank)
+                cov[cid] = cov.get(cid, 0) + 1
+        out = {}
+        for cid, cm in self.cores.items():
+            if not cm.banks:
+                continue
+            out[cid] = {
+                "name": cm.name,
+                "banks_seen": len(seen.get(cid, ())),
+                "banks_total": len(cm.banks),
+                "bbs": cov.get(cid, 0),
+                "bbs_total": sum(len(t["bb_starts"]) for t in cm.banks.values()),
+            }
+        return out
+
     def stats_by_core(self):
         """코어별 집계. ★ 단일 패스 — 코어마다 전체를 훑으면 O(covered × cores) 라
         커버리지가 커질수록 눈에 띄게 느려진다(5만 커버 × 4코어 = 72ms)."""

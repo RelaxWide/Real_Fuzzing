@@ -15245,6 +15245,18 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         # 세션 붕괴/복구는 지금까지 error 로그에만 남아, 로그를 뒤지지 않으면
         # 보이지 않았다. 붕괴가 **감지되지 않은 채** 진행되면 커버리지가 조용히
         # 멈추므로, 카운터를 주기 통계에 노출해 눈에 띄게 한다.
+        # 오버레이 진행 — 35개가 한 주소를 공유해 전체 BB% 만 보면 본체에 묻힌다.
+        _ovl_tag = ""
+        _covm = getattr(self, 'cov', None)
+        if _covm is not None and getattr(_covm, 'loaded', False):
+            try:
+                _os = _covm.overlay_stats()
+            except Exception:
+                _os = {}
+            _parts = [f"{v['name']} {v['banks_seen']}/{v['banks_total']}bank "
+                      f"{v['bbs']:,}/{v['bbs_total']:,}BB" for v in _os.values()]
+            if _parts:
+                _ovl_tag = " | ovl: " + ", ".join(_parts)
         _ovd = getattr(self.sampler, '_ovl_dropped', 0)
         _ovd_tag = f" | ovl-drop: {_ovd:,}" if _ovd else ""
         _col = getattr(self.sampler, 'collapse_count', 0)
@@ -15257,7 +15269,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                  f"pcs: {stats['coverage_unique_pcs']:,} | "
                  f"exec/s: {window_eps:.1f} | "
                  f"seq_run: {_seq_run}"
-                 f"{_col_tag}{_ovd_tag}{ps_tag}{state_tag}")
+                 f"{_col_tag}{_ovl_tag}{_ovd_tag}{ps_tag}{state_tag}")
         # 시작 배너를 놓쳐도 알 수 있게 주기 통계마다 재알림(정상 버전이면 아무것도 안 찍힘).
         _nvme_cli_warn(log, brief=True)
         _bbc, _bbt, _fnc, _fnt, _by_core = self._cov_totals(by_core=True)
