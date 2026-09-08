@@ -4364,6 +4364,8 @@ class NVMeFuzzer:
         # 어떤 sampling 호출 경로에서든 복구가 끝내 실패하면 coverage 없이 명령을
         # 계속 보내지 않는다. 공통 _stop_sampling_checked()가 설정한다.
         self._sampler_recovery_failed = False
+        # 유형 C(펌웨어 행: 노드는 있으나 컨트롤러 not-ready) 덤프를 한 캠페인에 1회만.
+        self._fw_hang_captured = False
 
         if config.enabled_commands:
             # --commands 지정 시: NVME_COMMANDS 전체에서 이름 매칭
@@ -7482,7 +7484,90 @@ class NVMeFuzzer:
             self.sampler.close()
         except Exception:
             pass
+        # 유형 C(펌웨어 행) 판정 시: POR/reset/추가 재인증 없이 덤프+증거 수거 후 현상 유지.
+        try:
+            self._capture_firmware_hang_if_stuck(context)
+        except Exception as _fh_exc:
+            log.warning(f"[HANG] 처리 예외: {_fh_exc}")
         return last_samples, False
+
+    def _capture_firmware_hang_if_stuck(self, context: str) -> bool:
+        """샘플러 복구가 끝내 실패했을 때, 컨트롤러 생존을 확인해 **유형 C(펌웨어 행)**
+        이면 증거만 남기고 현상 유지한다.
+
+        유형 C = /dev/nvme* 노드는 있으나 id-ctrl 이 EAGAIN/timeout(컨트롤러 not-ready)
+        + 디버그 링크 복구 실패(AUTH_PASS 풀림). 이 환경에선 ctrl-reset 으로 안 되고
+        POR 만 컨트롤러를 되살리는데, POR 은 pin→ROM 부팅이라 테스트 재개용으로 못 쓴다.
+        그래서 **POR/reset/추가 재인증을 더 하지 않고** UFAS 덤프(+로그/dmesg)로 행 상태를
+        캡처한 뒤 캠페인을 끝낸다(현상 유지).
+
+        컨트롤러가 정상(유형 B: 순수 링크 장애)이면 아무 것도 하지 않는다. 한 캠페인에
+        1회만 수행. 반환: 유형 C 로 캡처했으면 True.
+        """
+        if self._fw_hang_captured:
+            return True
+        # 컨트롤러 생존 프로브 — EAGAIN/timeout/실패면 not-ready(행). POR rescan 과 동일하게
+        # config.nvme_device 로 id-ctrl.
+        try:
+            _d, _err, _rc = self._nvme_id_dict(['nvme', 'id-ctrl', self.config.nvme_device])
+        except Exception as _e:
+            _d, _err, _rc = {}, str(_e)[:80], -1
+        if _rc == 0 and _d:
+            log.warning(f"[HANG] 컨트롤러는 응답함(id-ctrl OK) — 순수 디버그 링크 장애로 "
+                        f"판단, 덤프 없이 종료 (context={context})")
+            return False
+        self._fw_hang_captured = True
+        log.error(f"[HANG] 컨트롤러 미응답(id-ctrl rc={_rc}: {_err[:60]}) + 디버그 복구 실패 "
+                  f"= 펌웨어 행(유형 C). POR/reset/재인증 없이 덤프+현상유지 후 종료 "
+                  f"(context={context}).")
+        _t = datetime.now()
+        _crash_dir = self.crashes_dir / f"crash_{_t.strftime('%Y%m%d_%H%M%S')}"
+        try:
+            _crash_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as _e:
+            log.warning(f"[HANG] crash 폴더 생성 실패: {_e}")
+        # 마커 — timeout 크래시와 구분되게 원인 기록.
+        try:
+            (_crash_dir / "FW_HANG.marker").write_text(
+                f"captured_at : {_t.isoformat()}\n"
+                f"reason      : firmware hang (controller not-ready)\n"
+                f"id_ctrl_rc  : {_rc}\n"
+                f"id_ctrl_err : {_err[:200]}\n"
+                f"context     : {context}\n"
+                f"recovery    : none (ctrl-reset 무효, POR 은 pin→ROM 이라 불가). state preserved.\n")
+        except OSError:
+            pass
+        # 증거 선저장(로그/dmesg) — 덤프가 hang 해도 남게.
+        try:
+            self._snapshot_crash_context(_crash_dir, _t)
+        except Exception as _e:
+            log.warning(f"[HANG] context 스냅샷 예외: {_e}")
+        # 재현 스크립트(직전 명령들)
+        try:
+            self._generate_replay_sh(_crash_dir, f"fwhang_{_t.strftime('%H%M%S')}")
+        except Exception as _e:
+            log.debug(f"[HANG] replay 생성 예외: {_e}")
+        # UFAS 덤프 — PCIe/BAR 접근이라 admin EAGAIN 이어도 행 상태 메모리를 잡을 수 있다.
+        if self.config.enable_ufas:
+            if getattr(self.sampler, 'USES_JLINK_USB', False):
+                try:
+                    self.sampler.close()   # pylink/USB 해제(이미 닫혔을 수 있음 — 방어적)
+                except Exception:
+                    pass
+            try:
+                self._run_ufas_dump(dest_dir=_crash_dir)
+            except Exception as _e:
+                log.warning(f"[HANG] UFAS 덤프 예외: {_e}")
+        else:
+            log.warning("[HANG] enable_ufas=False — 덤프 생략, 로그/dmesg 만 남김")
+        # 최종 artifact 수거(같은 crash_<ts>/ 로 모임)
+        try:
+            self._collect_crash_artifacts(_t)
+        except Exception as _e:
+            log.warning(f"[HANG] artifact 수거 예외: {_e}")
+        log.error("[HANG] SSD 펌웨어 현상 유지(POR/reset/재인증 없음). "
+                  f"crash 폴더의 덤프로 분석하세요 → {_logname(_crash_dir)}/  캠페인 종료.")
+        return True
 
     # ------------------------------------------------------------------
     # v7.3: per-command 회계 helper
