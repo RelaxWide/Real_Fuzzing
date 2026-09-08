@@ -587,14 +587,21 @@ class CoverageModel:
         return out
 
     def uncovered_functions(self, core_id, limit=None):
-        """미도달 함수 (name, size, entry), 큰 것부터."""
+        """미도달 함수 (name, size, entry), 큰 것부터.
+
+        ★ 오버레이 표(bank>0)까지 순회한다. bank 0 만 보면 오버레이에 있는 코드가
+        통째로 빠진다 — H 코어는 471KB 가 오버레이라 미도달 목록이 사실상 반쪽이
+        된다. 오버레이는 **우리가 측정하는 방식의 구현 세부사항**이므로 호출자
+        (LLM 프롬프트)에는 노출하지 않는다. 이름만 정확하면 된다.
+        """
         cm = self.cores.get(core_id)
         if cm is None:
             return []
         out = []
-        for i, e in enumerate(cm.fn_entries):
-            if pack(core_id, 0, e) not in self.entered_funcs:
-                out.append((cm.fn_names[i], cm.fn_ends[i] - e, e))
+        for bank, fn_entries, fn_ends, fn_names, _bb in cm.iter_tables():
+            for i, e in enumerate(fn_entries):
+                if pack(core_id, bank, e) not in self.entered_funcs:
+                    out.append((fn_names[i], fn_ends[i] - e, e))
         out.sort(key=lambda t: -t[1])
         return out[:limit] if limit else out
 
@@ -636,11 +643,13 @@ class CoverageModel:
         cm = self.cores.get(core_id)
         if cm is None or not cm.callees:
             return []
+        # 도달 판정은 bank 무관 — 어느 오버레이에서든 그 함수에 갔으면 갔다.
         hit = {unpack(k)[2] for k in self.entered_funcs if unpack(k)[0] == core_id}
+        reached_addrs = hit
         cnt = {}
         for caller in hit:
             for callee in cm.callees.get(caller, ()):
-                if pack(core_id, 0, callee) in self.entered_funcs:
+                if callee in reached_addrs:
                     continue
                 cnt[callee] = cnt.get(callee, 0) + 1
         rows = [(cm.func_name(e) or "FUN_%08x" % e, n, e)
