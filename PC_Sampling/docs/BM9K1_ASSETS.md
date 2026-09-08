@@ -1,5 +1,8 @@
 # BM9K1 커버리지 자산 규격
 
+> 진행 상황·설계 배경: `SESSION_HANDOFF_v10.0_overlay.md`
+
+
 퍼저가 `products/BM9K1/` 에서 읽는 파일 전부. 추출 도구가 무엇이든(Ghidra/objdump/직접)
 이 규격이면 동작한다. 검증: `python3 tools/check_bm9k1_setup.py`, `test_asset_contract.py`.
 

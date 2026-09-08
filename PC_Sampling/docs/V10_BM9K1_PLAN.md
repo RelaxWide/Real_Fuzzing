@@ -1,5 +1,10 @@
 # v10 — BM9K1 (RISC-V) 커버리지 + 디렉토리 정리
 
+> 📌 **2026-09-08 이후 진행 상황은 `SESSION_HANDOFF_v10.0_overlay.md` 를 먼저 볼 것.**
+> 코드 오버레이 대응·LLM 프롬프트 변경·POR 재시도 금지 목록이 거기 있다.
+> 산출물 형식은 `BM9K1_ASSETS.md`.
+
+
 ## Context
 
 v9.8은 ARM 제품(PM9M1/BM9H1/P9)에서 **stripped 펌웨어를 Ghidra로 분석**한 BB/함수 목록에
