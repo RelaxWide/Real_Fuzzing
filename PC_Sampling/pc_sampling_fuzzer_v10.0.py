@@ -7526,22 +7526,14 @@ class NVMeFuzzer:
             _crash_dir.mkdir(parents=True, exist_ok=True)
         except OSError as _e:
             log.warning(f"[HANG] crash 폴더 생성 실패: {_e}")
-        # 마커 — timeout 크래시와 구분되게 원인 기록.
-        try:
-            (_crash_dir / "FW_HANG.marker").write_text(
-                f"captured_at : {_t.isoformat()}\n"
-                f"reason      : firmware hang (controller not-ready)\n"
-                f"id_ctrl_rc  : {_rc}\n"
-                f"id_ctrl_err : {_err[:200]}\n"
-                f"context     : {context}\n"
-                f"recovery    : none (ctrl-reset 무효, POR 은 pin→ROM 이라 불가). state preserved.\n")
-        except OSError:
-            pass
-        # 증거 선저장(로그/dmesg) — 덤프가 hang 해도 남게.
+        # 증거 선저장(로그 + at-crash dmesg) — dmesg 는 crash 직후 시점이 가장 값지므로
+        #  덤프 **전에** 이 선저장분만 남기고, 덤프 후 최종 수거는 하지 않는다(두 번째
+        #  dmesg 방지). 원인·id-ctrl rc 는 위 [HANG] 로그에 담겨 이 로그 복사본에 그대로
+        #  들어가므로 별도 마커 파일도 두지 않는다.
         try:
             self._snapshot_crash_context(_crash_dir, _t)
         except Exception as _e:
-            log.warning(f"[HANG] context 스냅샷 예외: {_e}")
+            log.warning(f"[HANG] context 선저장 예외: {_e}")
         # 재현 스크립트(직전 명령들)
         try:
             self._generate_replay_sh(_crash_dir, f"fwhang_{_t.strftime('%H%M%S')}")
@@ -7560,11 +7552,9 @@ class NVMeFuzzer:
                 log.warning(f"[HANG] UFAS 덤프 예외: {_e}")
         else:
             log.warning("[HANG] enable_ufas=False — 덤프 생략, 로그/dmesg 만 남김")
-        # 최종 artifact 수거(같은 crash_<ts>/ 로 모임)
-        try:
-            self._collect_crash_artifacts(_t)
-        except Exception as _e:
-            log.warning(f"[HANG] artifact 수거 예외: {_e}")
+        # (덤프 후 최종 수거 _collect_crash_artifacts 는 호출하지 않는다 — 두 번째(덤프 후)
+        #  dmesg 를 만들고, UFAS .bin·replay 는 이미 crash 폴더에 직접 생성되므로 재수거가
+        #  불필요하다. 필요한 증거는 위 선저장(로그+at-crash dmesg)+덤프 .bin 으로 충분.)
         log.error("[HANG] SSD 펌웨어 현상 유지(POR/reset/재인증 없음). "
                   f"crash 폴더의 덤프로 분석하세요 → {_logname(_crash_dir)}/  캠페인 종료.")
         return True
