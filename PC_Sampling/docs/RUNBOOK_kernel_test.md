@@ -1,5 +1,11 @@
 # RUNBOOK — 커널 6.8 테스트 (OS freeze 가 커널 문제인지 확정)
 
+> ⚠ **이 문서가 쓰는 진단 도구는 저장소에서 제거됐다** (`kernel_sweep.py` / `pcie_link_probe.py` / `halt_loop_stress.py`).
+> OS freeze 조사가 종료돼(커널 7 이후 재발 없음) 정리했다. 필요하면 git 히스토리에서 복구한다:
+> `git log --diff-filter=D --name-only -- 'PC_Sampling/tools/*'` 로 삭제 커밋을 찾고
+> `git checkout <커밋>^ -- PC_Sampling/tools/<파일>` 로 되살린다.
+
+
 문제 PC: Ubuntu 20.04.6 focal / **5.15.0-139-generic** — 프리즈 30만~48만 명령
 정상 PC: Ubuntu 22.04 jammy / **6.8** (jammy HWE) — 1000만 명령 무프리즈
 

@@ -3707,7 +3707,8 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                             f"bank 표 {len(cm.banks)}개)")
                 if not cm.banks:
                     log.warning(f"[Overlay] {cm.name}: bank 별 BB 표가 없다 — "
-                                f"fw_export.py 로 만들기 전까지는 bank 0 으로 접힌다")
+                                f"Ghidra 추출로 만들기 전까지는 bank 0 으로 접힌다 "
+                                f"(형식: docs/BM9K1_ASSETS.md)")
 
     def credit_cores(self):
         """interesting 판정에 표를 행사할 코어 집합. None 이면 전 코어(union)."""

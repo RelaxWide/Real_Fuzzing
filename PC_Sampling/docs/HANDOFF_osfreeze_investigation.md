@@ -1,5 +1,11 @@
 # HANDOFF — OS Freeze 조사 (J-Link halt 관련), 2026-07 진행 중
 
+> ⚠ **이 문서가 쓰는 진단 도구는 저장소에서 제거됐다** (`kernel_sweep.py` / `pcie_link_probe.py` / `halt_loop_stress.py`).
+> OS freeze 조사가 종료돼(커널 7 이후 재발 없음) 정리했다. 필요하면 git 히스토리에서 복구한다:
+> `git log --diff-filter=D --name-only -- 'PC_Sampling/tools/*'` 로 삭제 커밋을 찾고
+> `git checkout <커밋>^ -- PC_Sampling/tools/<파일>` 로 되살린다.
+
+
 퍼징 중 **호스트 OS 하드 프리즈** 조사.
 
 > ## ✅ 2026-07-28 결론 — 커널이 원인으로 확정

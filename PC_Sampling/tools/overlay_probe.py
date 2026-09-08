@@ -292,7 +292,8 @@ def main():
         else:
             print(f"      → 중복이 있다 = 여러 오버레이가 겹쳐 들어갔다. bisect 는 그중"
                   f" 하나만 고르므로 함수 귀속이 틀리고 분모도 부풀어 있다.")
-        print("      → fw_export.py 로 bank 별 표를 만들면 양쪽 다 해결된다.")
+        print("      → Ghidra 로 bank 별 표(basic_blocks/functions_core<X>_ovl<N>.txt)를")
+        print("         뽑으면 양쪽 다 해결된다. 형식은 docs/BM9K1_ASSETS.md 참조.")
 
     if a.coverage:
         tot, ins = stage0(a.coverage, base, end)
