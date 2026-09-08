@@ -1248,6 +1248,8 @@ class FuzzConfig:
     jlink_ap_index:  int   = 0                    # CoreSight APB-AP 인덱스 (P9: AP[0])
     pc_reg_index:    Optional[int] = None         # PC(R15) 레지스터 인덱스. None=connect 시 자동 탐지
     ufas_ini:        Optional[str] = 'PM9M1_A815.ini'  # UFAS --ini (enable_ufas 는 아래 정의)
+    ufas_binary:     Optional[str] = None   # UFAS 실행 파일 per-product override(None=paths.ufas_binary). BM9K1=dump/unified_pcie_dump_tool
+    ufas_mode:       str = '1'              # UFAS 위치인자 모드. PM9M1/BM9H1='1', BM9K1='2'
     allow_no_openocd: bool = False    # OpenOCD 실패 시 --pm 전용 테스트 경로 허용
     no_jlink:         bool = False    # J-Link 자체 없이 NVMe fuzz 만 수행 (coverage 0)
     unsupported_skip: bool = False    # v7.8: J-Link dump 의 EngineErrInt 검출 시 자동 skip + power cycle
@@ -3688,28 +3690,69 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         cm = self.cov.cores.get(core_id) if self.cov is not None else None
         return cm.resolve_bank(word) if cm is not None else None
 
+    def _probe_overlay_bank(self, cm, addr, attempts, delay):
+        """오버레이 프로브 **안정 읽기**. 오버레이는 상시 스왑되므로 connect 시점의
+        단발 읽기가 스왑/init 도중에 걸리면 'OVL' 매직은 맞지만 id 가 알려진 범위
+        밖인 워드가 나올 수 있고, 그 한 번으로 세션 전체의 bank 판별이 꺼진다.
+        유효 bank 로 풀리는 워드가 나올 때까지 재시도한다.
+
+        반환 (bank, word, kind):
+          kind 'read_fail' (bank·word None)  → 트랜스포트 읽기 실패(재시도 무의미)
+          kind 'unknown'   (bank None)       → 매직은 맞으나 id 가 범위 밖(torn/미상)
+          kind 'nomagic'   (bank None)       → 매직 자체가 불일치
+          kind 'ok'        (bank 값)         → 정상
+        (재시도는 connect 시점 단발 읽기라 §4 의 핫루프 폴링 제약과 무관하다.)
+        """
+        o = cm.overlay or {}
+        mm, mg = o.get("magic_mask"), o.get("magic")
+        last_w, kind = None, "nomagic"
+        for i in range(max(1, attempts)):
+            w = self.session.read_word(addr)
+            if w is None:
+                return None, None, "read_fail"
+            last_w = w
+            bank = cm.resolve_bank(w)
+            if bank is not None:
+                return bank, w, "ok"
+            # 매직은 맞는데 id 만 범위 밖이면 torn/미상, 매직조차 틀리면 맵 불일치.
+            kind = "unknown" if (mm and mg is not None and (w & mm) == mg) else "nomagic"
+            if i + 1 < attempts and delay:
+                time.sleep(delay)
+        return None, last_w, kind
+
     def _init_overlay_probe(self):
-        """오버레이가 있는 코어마다 프로브를 **실제로 한 번 읽어** 본다.
+        """오버레이가 있는 코어마다 프로브를 **실제로 읽어** 본다.
 
         SBA 로 PCSR 레지스터가 읽힌다고 코드 메모리도 읽힌다는 보장이 없다. 여기서
         확인하지 않으면 매 버스트마다 실패하면서 조용히 bank 없이 돌게 된다.
-        읽히더라도 매직이 안 맞으면 해석할 수 없으므로 역시 끈다.
+        ★ 오버레이는 상시 스왑되므로 단발 읽기는 스왑 도중(torn read)에 걸려 매직만
+          맞고 id 는 범위 밖인 워드를 낼 수 있다. 그 한 번으로 세션 전체 bank 판별이
+          꺼지지 않도록 유효 bank 가 나올 때까지 재시도한다(_probe_overlay_bank).
         """
         self._ovl_probe = {}
         if self.cov is None or self.session is None:
             return
+        rv = getattr(self.config, 'riscv', None) or {}
+        attempts = max(1, int(rv.get('overlay_probe_attempts', 12)))
+        delay = max(0.0, float(rv.get('overlay_probe_retry_sec', 0.005)))
         for cid, cm in (self.cov.cores or {}).items():
             addr = cm.overlay_probe_addr()
             if addr is None:
                 continue
-            w = self.session.read_word(addr)
-            bank = cm.resolve_bank(w)
-            if w is None:
+            bank, w, kind = self._probe_overlay_bank(cm, addr, attempts, delay)
+            if kind == "read_fail":
                 log.error(f"[Overlay] {cm.name}: 0x{addr:X} SBA 읽기 실패 — "
                           f"bank 판별 불가. 오버레이 창의 PC 는 bank 0 으로 합쳐진다")
+            elif kind == "unknown":
+                n_ovl = len(cm.overlay.get('bank_sizes') or {})
+                idm = int(cm.overlay.get('id_mask') or 0xFF)
+                log.error(f"[Overlay] {cm.name}: 0x{addr:X}=0x{w:08X} — 'OVL' 매직은 맞으나 "
+                          f"id 0x{w & idm:02X} 가 알려진 0~{max(0, n_ovl - 1)} 밖 "
+                          f"({attempts}회 재시도에도 안정 안 됨 — 스왑/init 중 torn read 가능). "
+                          f"bank 판별 끔")
             elif bank is None:
-                log.error(f"[Overlay] {cm.name}: 0x{addr:X}=0x{w:08X} 가 매직과 "
-                          f"불일치 — 맵이 이 펌웨어 것이 아닐 수 있다. bank 판별 끔")
+                log.error(f"[Overlay] {cm.name}: 0x{addr:X}=0x{w:08X} 가 매직과 불일치 — "
+                          f"맵이 이 펌웨어 것이 아닐 수 있다. bank 판별 끔")
             else:
                 self._ovl_probe[cid] = addr
                 log.warning(f"[Overlay] {cm.name}: 프로브 0x{addr:X} OK "
@@ -12565,17 +12608,37 @@ class NVMeFuzzer:
         log.warning("[UnsupChk] 복구 완료 — 메인 루프 재개")
         return True
 
-    def _run_ufas_dump(self) -> None:
+    def _run_ufas_dump(self, dest_dir: Optional[Path] = None) -> None:
         """crash 발생 시 UFAS 펌웨어 덤프를 실행한다.
 
-        실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./ufas
-        명령: sudo ./ufas <pcie_bus> 1 <YYYYMMDD>_UFAS_Dump.bin --ini=./SnapShot/PM9M1_A815.ini
-        Popen으로 PID 추적, timeout 후 D-state 대비 포기 처리.
+        실행 파일: paths.ufas_binary(기본 dump/ufas). 제품이 profile 의 ufas_binary 로
+        override 할 수 있다(BM9K1 = dump/unified_pcie_dump_tool).
+        명령: sudo <ufas> <pcie_bus> <mode> <출력.bin> [--ini=<ini>]
+          - PM9M1/BM9H1 : mode=1, --ini=dump/SnapShot/PM9M1_A815.ini
+          - BM9K1       : mode=2, --ini 없음 (ufas_mode='2', ufas_ini=None)
+        제품 간 차이는 profile 의 ufas_binary/ufas_mode/ufas_ini 로만 갈린다 —
+        Popen/PID 추적·timeout·폴링 흐름은 전 제품 공통.
+
+        dest_dir: 덤프 .bin 을 쓸 폴더. crash 핸들러가 crash_<ts>/ 를 넘기면 산출물이
+          **처음부터 crashes 폴더에** 떨어져 별도 복사가 필요 없다(--ini 는 여전히
+          cwd=script_dir 기준 상대경로라 도구 위치는 그대로). None 이면 종전대로
+          script_dir 에 쓰고 _collect_crash_artifacts 가 복사한다.
         """
         TIMEOUT = 600   # 10분 — 펌웨어 덤프는 수 분 소요됨
 
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-        ufas_path = os.path.join(script_dir, UFAS_BINARY)
+        # 제품 override(BM9K1) 우선, 없으면 전역 paths.ufas_binary(PM9M1/BM9H1).
+        ufas_rel = self.config.ufas_binary or UFAS_BINARY
+        ufas_path = os.path.join(script_dir, ufas_rel)
+        # 산출물 출력 폴더 — crash 핸들러가 준 crash_<ts>/ 우선(직접 생성), 없으면 script_dir.
+        if dest_dir is not None:
+            out_dir = str(dest_dir)
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except OSError:
+                out_dir = script_dir
+        else:
+            out_dir = script_dir
 
         log.warning(f"[UFAS] 실행 파일 경로: {ufas_path}")
         if not os.path.isfile(ufas_path):
@@ -12593,11 +12656,12 @@ class NVMeFuzzer:
         # 시분초까지 포함 — 동일 일자 다중 crash 시 파일 덮어쓰기 방지
         ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
         dump_filename = f"{ts_str}_UFAS_Dump.bin"
-        dump_path = os.path.join(script_dir, dump_filename)
+        dump_path = os.path.join(out_dir, dump_filename)
 
         # v8.0: ini 는 product profile 에서 (ufas_ini=None 이면 --ini 생략)
+        # v10: 위치인자 모드도 profile 에서 (PM9M1/BM9H1='1', BM9K1='2')
         _ini = self.config.ufas_ini
-        cmd = ['sudo', ufas_path, pcie_bus, '1', dump_path]
+        cmd = ['sudo', ufas_path, pcie_bus, str(self.config.ufas_mode), dump_path]
         if _ini:
             cmd.append(f'--ini={_ini}')
         log.warning(f"[UFAS] 실행 명령: {' '.join(cmd)}")
@@ -13756,7 +13820,8 @@ class NVMeFuzzer:
         if self.config.enable_ufas:
             log.warning("[TIMEOUT] UFAS 펌웨어 덤프를 실행합니다...")
             try:
-                self._run_ufas_dump()
+                # 산출물을 crash_<ts>/ 에 직접 생성 — 별도 복사 불필요.
+                self._run_ufas_dump(dest_dir=_crash_dir)
             except Exception as _ufas_exc:
                 log.warning(f"[UFAS] _run_ufas_dump 예기치 않은 예외: {_ufas_exc}")
             log.warning("[UFAS] _run_ufas_dump 반환")
@@ -17595,6 +17660,8 @@ if __name__ == "__main__":
         power_mask=_profile.get('power_mask'),
         invalid_pc_vals=tuple(_profile['invalid_pc_vals']) if _profile.get('invalid_pc_vals') else (),
         ufas_ini=_profile.get('ufas_ini'),
+        ufas_binary=_profile.get('ufas_binary'),   # per-product override(BM9K1). None → paths.ufas_binary
+        ufas_mode=str(_profile.get('ufas_mode', '1')),
         addr_range_start=_profile.get('fw_addr_start'),
         addr_range_end=_profile.get('fw_addr_end'),
         product=args.product or '',

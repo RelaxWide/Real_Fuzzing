@@ -1117,7 +1117,10 @@
       "invalid_pc_vals": [],
       "bb_file": "products/BM9K1/basic_blocks.txt",
       "func_file": "products/BM9K1/functions.txt",
-      "enable_ufas": false,
+      "_comment_ufas": "UFAS 덤프 = dump/unified_pcie_dump_tool. PM9M1 루틴과 동일하되 실행 인자만 다름: 바이너리명·모드 2(PM9M1=1)·--ini 없음. 명령: sudo dump/unified_pcie_dump_tool <bus> 2 <ts>_UFAS_Dump.bin",
+      "enable_ufas": true,
+      "ufas_binary": "dump/unified_pcie_dump_tool",
+      "ufas_mode": "2",
       "enable_jlink_dump": false,
       "enable_debug_tool_dump": false,
       "state_fields": "r8",
@@ -1165,7 +1168,7 @@
       "bb_file": "products/PM9M1/basic_blocks.txt",
       "func_file": "products/PM9M1/functions.txt",
       "enable_ufas": true,
-      "ufas_ini": "dump/PM9M1_A815.ini",
+      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
       "enable_jlink_dump": true,
       "state_fields": "r8"
     },
@@ -1204,7 +1207,7 @@
       "bb_file": "products/PM9M1/basic_blocks.txt",
       "func_file": "products/PM9M1/functions.txt",
       "enable_ufas": true,
-      "ufas_ini": "dump/PM9M1_A815.ini",
+      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
       "enable_jlink_dump": true,
       "state_fields": "r8",
       "_comment_variant": "PM9M1_LNB: 기존 PM9M1 동작(전 state 필드 관측, LID 0xDF snapshot 포함). PM9M1 과 동일."
@@ -1244,7 +1247,7 @@
       "bb_file": "products/PM9M1/basic_blocks.txt",
       "func_file": "products/PM9M1/functions.txt",
       "enable_ufas": true,
-      "ufas_ini": "dump/PM9M1_A815.ini",
+      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
       "enable_jlink_dump": true,
       "state_fields": "r8",
       "state_exclude_lids": [
@@ -1284,7 +1287,7 @@
       "bb_file": "products/BM9H1/basic_blocks.txt",
       "func_file": "products/BM9H1/functions.txt",
       "enable_ufas": true,
-      "ufas_ini": "dump/PM9M1_A815.ini",
+      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
       "enable_jlink_dump": true,
       "state_fields": "r8"
     },
