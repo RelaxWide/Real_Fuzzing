@@ -637,6 +637,46 @@ class CoverageModel:
                 "bb_starts": list(cm.bb_starts), "covered_bbs": cov,
                 "total_bbs": cm.total_bbs, "total_funcs": cm.total_funcs}
 
+    def reach_ranked_uncovered(self, core_id, max_hops=3):
+        """미도달 함수를 **도달한 코드로부터의 콜그래프 거리**로 순위 매긴다.
+
+        이름 패턴(부팅/ISR/...)으로 거르던 방식을 대체한다. 실제 심볼은
+        `ARES::IHAL_Fcore::Sync`, `ZEUS::IO::SVBlockConfig::GetIndex` 처럼 생겨서
+        문자열 규칙이 통하지 않고, 제품마다 다르다. 반면 "지금 밟은 코드에서
+        몇 번 호출을 건너야 닿나" 는 콜그래프로 계산되는 사실이다.
+
+        반환: [(name, size, entry, hops)] — hops 오름차순, 같으면 큰 것 먼저.
+              hops=1 이 frontier(직접 호출), None 이면 **도달 경로 없음**.
+        ⚠ 콜그래프는 직접 호출만 담는다(함수 포인터 미포함). 그래서 hops=None 은
+          '절대 못 감' 이 아니라 '알려진 경로가 없음' 이다 → 제외가 아니라 후순위.
+        """
+        cm = self.cores.get(core_id)
+        if cm is None:
+            return []
+        reached = {unpack(k)[2] for k in self.entered_funcs if unpack(k)[0] == core_id}
+        hops = {}
+        frontier = reached
+        for d in range(1, max_hops + 1):
+            nxt = set()
+            for caller in frontier:
+                for callee in cm.callees.get(caller, ()):
+                    if callee in reached or callee in hops:
+                        continue
+                    hops[callee] = d
+                    nxt.add(callee)
+            if not nxt:
+                break
+            frontier = nxt
+        out = []
+        for bank, fn_entries, fn_ends, fn_names, _bb in cm.iter_tables():
+            for i, e in enumerate(fn_entries):
+                if pack(core_id, bank, e) in self.entered_funcs:
+                    continue
+                out.append((fn_names[i], fn_ends[i] - e, e, hops.get(e)))
+        # hops=None 은 맨 뒤로(경로 미상), 나머지는 가까운 것 먼저·큰 것 먼저
+        out.sort(key=lambda t: (t[3] if t[3] is not None else 1 << 30, -t[1]))
+        return out
+
     def frontier_functions(self, core_id, limit=None):
         """★ 도달한 함수가 **직접 호출하는데** 아직 안 간 함수 — 호출자 수 많은 순.
         '가장 큰 미도달'보다 실행 가능하다: 퍼저가 이미 있는 지점에서 한 걸음 거리."""
