@@ -843,37 +843,106 @@ class TestLogCoverage(unittest.TestCase):
 
 
 class TestOverlayReachedLog(unittest.TestCase):
-    """오버레이는 35개가 한 주소를 공유한다 — '어느 것을 처음 밟았나' 가
-    터미널에 보여야 진행이 눈에 들어온다."""
+    """★ 실행 검증 — 소스 문자열 검사는 NameError 를 못 잡는다.
+    실기에서 _riscv_cov 미정의로 캠페인이 중단됐고, 문자열 테스트는 전부 통과했다.
+    """
 
-    def _src(self):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
         import pathlib
-        return pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py').read_text(
-            encoding='utf-8')
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).parent))
+        spec = importlib.util.spec_from_file_location(
+            "fz_ovl", str(pathlib.Path(__file__).with_name('pc_sampling_fuzzer_v10.0.py')))
+        cls.fz = importlib.util.module_from_spec(spec)
+        sys.modules['fz_ovl'] = cls.fz
+        spec.loader.exec_module(cls.fz)
+        import riscv_cov
+        cls.rc = riscv_cov
 
-    def test_logs_on_first_reach_only(self):
-        src = self._src()
-        self.assertIn('새 오버레이 도달', src)
-        i = src.index('새 오버레이 도달')
-        seg = src[max(0, i - 900):i]
-        self.assertIn('_fresh = sorted(_bks - _seen)', seg)
-        self.assertIn('if not _fresh:', seg)
+    def _inst(self, nbanks=35):
+        cm = self.rc.CoreMap(0, 'H')
+        cm.banks = {n + self.rc.OVL_BANK_OFFSET: {} for n in range(nbanks)}
+        m = self.rc.CoverageModel()
+        m.cores = {0: cm}
+        m.loaded = True
+        f = self.fz.NVMeFuzzer.__new__(self.fz.NVMeFuzzer)
+        f.cov, f._rcov, f._ovl_seen = m, self.rc, {}
+        return f
 
-    def test_tracks_per_core(self):
-        src = self._src()
-        self.assertIn('self._ovl_seen', src)
-        i = src.index('_seen = self._ovl_seen.setdefault(_cid, set())')
-        self.assertGreater(i, 0)
+    def _capture(self, fn):
+        import io
+        import logging
+        buf = io.StringIO()
+        h = logging.StreamHandler(buf)
+        h.setLevel(logging.WARNING)
+        self.fz.log.addHandler(h)
+        try:
+            fn()
+        finally:
+            self.fz.log.removeHandler(h)
+        return buf.getvalue()
 
-    def test_ignores_bank_zero(self):
-        """본체(bank 0)는 오버레이가 아니다 — 매 명령마다 찍히면 안 된다."""
-        src = self._src()
-        i = src.index('for _cid, _bk, _ in _nb:')
-        self.assertIn('if _bk:', src[i:i + 120])
+    def test_logs_first_reach(self):
+        f = self._inst()
+        B = 0x56000
+        out = self._capture(lambda: f._log_new_overlays(
+            {self.rc.pack(0, 3, B), self.rc.pack(0, 1, B + 16)}, 'nvme_read'))
+        self.assertIn('새 오버레이 도달', out)
+        self.assertIn('ovl[0, 2]', out)       # 내부 bank 1,3 → 표기는 0,2
+        self.assertIn('누적 2/35', out)
+        self.assertIn('nvme_read', out)
 
-    def test_shows_progress_and_command(self):
-        src = self._src()
-        i = src.index('새 오버레이 도달')
-        seg = src[i:i + 300]
-        self.assertIn('누적', seg)
-        self.assertIn('track_key', seg)
+    def test_silent_on_revisit(self):
+        f = self._inst()
+        B = 0x56000
+        self._capture(lambda: f._log_new_overlays({self.rc.pack(0, 3, B)}, 'a'))
+        out = self._capture(lambda: f._log_new_overlays({self.rc.pack(0, 3, B)}, 'b'))
+        self.assertEqual(out.strip(), "", "재도달은 찍히면 안 된다")
+
+    def test_bank_zero_ignored(self):
+        """본체는 오버레이가 아니다 — 매 명령마다 찍히면 로그가 못 쓰게 된다."""
+        f = self._inst()
+        out = self._capture(lambda: f._log_new_overlays(
+            {self.rc.pack(0, 0, 0x10000)}, 'nvme_write'))
+        self.assertEqual(out.strip(), "")
+
+    def test_no_crash_without_riscv(self):
+        """ARM 제품(_rcov=None)에서 예외가 나면 캠페인이 죽는다."""
+        f = self._inst()
+        f._rcov = None
+        self._capture(lambda: f._log_new_overlays({1, 2, 3}, 'x'))
+
+    def test_no_crash_without_cov(self):
+        f = self._inst()
+        f.cov = None
+        self._capture(lambda: f._log_new_overlays({1}, 'x'))
+
+    def test_empty_keys(self):
+        f = self._inst()
+        self._capture(lambda: f._log_new_overlays(set(), 'x'))
+
+    def test_unknown_core_does_not_crash(self):
+        f = self._inst()
+        out = self._capture(lambda: f._log_new_overlays(
+            {self.rc.pack(3, 2, 0x56000)}, 'x'))
+        self.assertIn('새 오버레이 도달', out)
+
+
+
+class TestFatalIsLogged(unittest.TestCase):
+    """run() 의 finally(차트·요약)가 먼저 돌아 화면상 정상 종료처럼 보이고
+    traceback 은 맨 끝에 stderr 로만 나갔다 — 로그만 보면 원인을 알 수 없었다."""
+
+    def test_run_wrapped(self):
+        import pathlib
+        src = pathlib.Path(__file__).with_name(
+            'pc_sampling_fuzzer_v10.0.py').read_text(encoding='utf-8')
+        i = src.index('fuzzer = NVMeFuzzer(config)')
+        seg = src[i:i + 700]
+        self.assertIn('try:', seg)
+        self.assertIn('fuzzer.run()', seg)
+        self.assertIn('[FATAL]', seg)
+        self.assertIn('format_exc()', seg)
+        self.assertIn('raise', seg, "삼키면 종료코드가 0 이 되어 자동화가 성공으로 본다")

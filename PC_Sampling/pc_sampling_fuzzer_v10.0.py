@@ -4538,6 +4538,7 @@ class NVMeFuzzer:
         self._autoname_kw_off = ((self.config.arch or 'arm') == 'riscv')
         # 코어별로 지금까지 도달한 오버레이 bank — '처음 밟은 순간' 만 알리기 위해
         self._ovl_seen: dict = {}
+        self._rcov = None            # riscv_cov 모듈 (arch=riscv 일 때만)
         self.cmd_core_yield: dict = defaultdict(lambda: defaultdict(int))
         self.cmd_core_samples: dict = defaultdict(lambda: defaultdict(int))
         self.cmd_traces: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
@@ -7557,27 +7558,7 @@ class NVMeFuzzer:
             for _o in _win_obs:
                 _s[_o.core_id] += 1
             self._adaptive_weights_step(_acct.new_by_core, _win_obs)
-            # ── 오버레이 신규 달성 알림 ──
-            #   35개가 한 주소를 공유하므로 "어느 오버레이를 처음 밟았나" 는
-            #   터미널에서 바로 보여야 값이 있다(리포트는 사후 확인용).
-            _nb = [_riscv_cov.unpack(_k) for _k in _acct.seed_keys]
-            _newbank = {}
-            for _cid, _bk, _ in _nb:
-                if _bk:
-                    _newbank.setdefault(_cid, set()).add(_bk)
-            for _cid, _bks in sorted(_newbank.items()):
-                _seen = self._ovl_seen.setdefault(_cid, set())
-                _fresh = sorted(_bks - _seen)
-                if not _fresh:
-                    continue
-                _seen |= _bks
-                _cm = self.cov.cores.get(_cid)
-                _nm = _cm.name if _cm else _cid
-                _tot = len(_cm.banks) if _cm and _cm.banks else 0
-                log.warning(
-                    f"[Overlay] {_nm}: 새 오버레이 도달 "
-                    f"ovl{[b - _riscv_cov.OVL_BANK_OFFSET for b in _fresh]} "
-                    f"(누적 {len(_seen)}/{_tot}) ← {track_key}")
+            self._log_new_overlays(_acct.seed_keys, track_key)
         elif self._sa_loaded and self._sa_bb_starts:
             _mask = self._sa_thumb_mask
             _cur_bbs: set = set()
@@ -9158,6 +9139,38 @@ class NVMeFuzzer:
                 ", ".join(f"{_names.get(c, c)}={_new[c]}" for c in sorted(_new)),
                 ", ".join(f"{_names.get(c, c)}={_r[c]:.3f}" for c in sorted(_r))))
 
+    def _log_new_overlays(self, seed_keys, cmd_label):
+        """오버레이를 **처음** 밟았을 때만 알린다.
+
+        35개가 한 주소를 공유하므로 "어느 오버레이를 처음 밟았나" 가 진행의
+        핵심인데, 리포트를 열어야만 보였다. 재도달은 찍지 않는다.
+
+        ★ 인라인으로 두면 이 경로가 테스트에서 실행되지 않아 NameError 같은 것이
+        실기에서야 터진다(실제로 겪음: _riscv_cov 미정의로 캠페인이 중단됐다).
+        메서드로 분리해 직접 실행 검증한다.
+        """
+        rc = self._rcov
+        if rc is None or self.cov is None or not seed_keys:
+            return
+        by_core = {}
+        for key in seed_keys:
+            cid, bank, _addr = rc.unpack(key)
+            if bank:                       # bank 0 = 비오버레이 본체 → 제외
+                by_core.setdefault(cid, set()).add(bank)
+        for cid, banks in sorted(by_core.items()):
+            seen = self._ovl_seen.setdefault(cid, set())
+            fresh = sorted(banks - seen)
+            if not fresh:
+                continue
+            seen |= banks
+            cm = self.cov.cores.get(cid)
+            name = cm.name if cm is not None else cid
+            total = len(cm.banks) if cm is not None and cm.banks else 0
+            log.warning(
+                f"[Overlay] {name}: 새 오버레이 도달 "
+                f"ovl{[b - rc.OVL_BANK_OFFSET for b in fresh]} "
+                f"(누적 {len(seen)}/{total}) ← {cmd_label}")
+
     def _cov_totals(self, by_core=False):
         """커버리지 집계를 한 곳에서 — RISC-V(CoverageModel)와 기존 제품(_sa_*) 양쪽.
         → (bb_covered, bb_total, fn_covered, fn_total, by_core|None)
@@ -9182,6 +9195,7 @@ class NVMeFuzzer:
             return
         try:
             import riscv_cov
+            self._rcov = riscv_cov      # 핫패스에서 매번 import 하지 않게 보관
         except Exception as e:
             log.error(f"[StaticAnalysis] riscv_cov import 실패: {e}")
             return
@@ -17608,4 +17622,12 @@ if __name__ == "__main__":
     )
 
     fuzzer = NVMeFuzzer(config)
-    fuzzer.run()
+    try:
+        fuzzer.run()
+    except Exception:
+        # ★ 여기서 안 잡으면 traceback 이 stderr 로만 나가 **텍스트 로그에 안 남는다**.
+        #   run() 의 finally(차트·요약)가 먼저 돌기 때문에 화면상으로는 정상 종료처럼
+        #   보이고 맨 끝에 traceback 만 찍힌다 — 로그만 보면 원인을 알 수 없다.
+        import traceback as _tb
+        log.error("[FATAL] 퍼저가 예외로 종료됐다:\n" + _tb.format_exc())
+        raise
