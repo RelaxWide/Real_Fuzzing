@@ -194,7 +194,8 @@ RAG_ENABLED          = bool(_RAG.get('enabled', False))
 RAG_MODULE_PATH      = str(_RAG.get('module_path', 'rag.rag_bridge_client'))
 RAG_FUNC_NAME        = str(_RAG.get('func_name', 'ask'))
 RAG_PASS_SYSTEM      = bool(_RAG.get('pass_system_prompt', True))  # False=단일인자 func(system+user)
-RAG_REQUEST_CADENCE  = int(_RAG.get('request_cadence', 5000))
+RAG_REQUEST_CADENCE  = int(_RAG.get('request_cadence', 5000))   # (v10 미사용) 실행수 기반 주기 — 아래 시간기반으로 대체
+RAG_REQUEST_INTERVAL = float(_RAG.get('request_interval_sec', 60.0))  # v10: LLM 요청 주기(벽시계 초). 성능과 무관하게 ≤이 간격마다 1회 시도(실행수 기반은 편차가 커서 대체)
 RAG_PLATEAU_EXECS    = int(_RAG.get('plateau_exec_threshold', 20000))
 RAG_MAX_SEEDS        = int(_RAG.get('max_seeds_per_round', 8))
 RAG_MAX_SEQS         = int(_RAG.get('max_seq_per_round', 4))
@@ -4206,7 +4207,7 @@ class LlmBridge:
         _call = (f"{config.rag_func_name}(system, user)" if self._pass_system
                  else f"{config.rag_func_name}(user)  [system 접합]")
         log.warning(f"[LLM] 활성 — {config.rag_module_path}.{_call} "
-                    f"(cadence={RAG_REQUEST_CADENCE}, tasks={RAG_TASKS})")
+                    f"(interval={RAG_REQUEST_INTERVAL:.0f}s, tasks={RAG_TASKS})")
 
     # ── 모듈/스키마 로드 (import-guarded) ─────────────────────────────
     @staticmethod
@@ -4336,6 +4337,8 @@ class NVMeFuzzer:
         self._llm_fail_streak = 0             # RAG service 호출 연속 실패 수(서킷브레이커)
         self._llm_last_task = None            # v9.5: 직전 선택 task(연속 상한 추적)
         self._llm_task_consec = 0             # v9.5: 같은 task 연속 선택 횟수(starvation-free cap)
+        # v10: LLM 요청 주기를 시간 기반으로. 마지막 '시도' 시각(monotonic). 시작 ~interval 뒤 첫 시도.
+        self._llm_last_attempt_ts = time.monotonic()
         self._llm_stats = {'seeds': 0, 'seqs': 0, 'dropped': 0, 'dupes': 0, 'rounds': 0,
                            'new_cov': 0,   # LLM 계보가 뚫은 새 커버리지(new_pcs) 누적 — "얼마나 잘 뚫나"
                            'depth_adv': 0}  # v9.2 Tier1: LLM 이 명령 SC-depth 를 전진시킨 횟수(PC 커버리지 보완)
@@ -8065,10 +8068,15 @@ class NVMeFuzzer:
                 and self.sampler.REPORTS_HALT_STATS):
             self._halt_health_check()
 
-        # v9.0: LLM-guided — request_cadence 마다 백그라운드 요청 제출, 매 명령 결과 drain.
-        # 비활성이면 두 메서드 모두 즉시 return(오버헤드 무시). corpus 변이는 여기(메인 스레드)서만.
+        # v10: LLM-guided — 요청 주기를 **시간 기반**(request_interval_sec)으로. 명령 실행수
+        #   기반(request_cadence)은 장치 성능에 따라 벽시계 편차가 커서 대체했다. ≤interval 마다
+        #   1회 '시도'(시도 시각을 advance 해 매 명령 프롬프트 재생성 방지). 실제 전송은
+        #   submit() 의 _inflight(중복 방지)가 govern. 매 명령 결과는 계속 drain.
+        #   비활성이면 두 메서드 모두 즉시 return(오버헤드 무시). corpus 변이는 여기(메인 스레드)서만.
         if self.llm.enabled:
-            if self.executions % RAG_REQUEST_CADENCE == 0 and self.executions > 0:
+            _now_mono = time.monotonic()
+            if _now_mono - self._llm_last_attempt_ts >= RAG_REQUEST_INTERVAL:
+                self._llm_last_attempt_ts = _now_mono
                 self._llm_maybe_submit()
                 self._llm_log_stats()          # B: 요청 낼 때마다 기여도 요약
             self._llm_drain_and_apply()
