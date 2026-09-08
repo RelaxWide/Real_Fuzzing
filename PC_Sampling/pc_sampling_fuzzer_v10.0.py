@@ -204,6 +204,11 @@ RAG_MAX_UNCOV_FUNCS  = int(_RAG.get('max_uncov_funcs', 40))
 # `ARES::IHAL_Fcore::Sync`, `ZEUS::IO::SVBlockConfig::GetIndex` 처럼 생겨 문자열
 # 규칙이 통하지 않고 제품마다 다르다. "지금 밟은 코드에서 몇 홉인가" 는 사실이다.
 RAG_MAX_HOPS         = int(_RAG.get('max_hops', 3))
+# _AUTONAME_KW((default|thunk|switch))는 자동생성명뿐 아니라 **진짜 심볼도 먹는다**
+# (set_default_mode, xxx_switch_handler …). 심볼이 살아있는 펌웨어에서만 끄면 되는데
+# 그 판단은 arch 가 아니라 **제품**의 성질이다 — ARM 제품도 심볼이 있을 수 있다.
+# 검증된 제품만 여기 넣는다(현재 BM9K1). FUN_/sub_ 정규식은 어디서나 유지.
+RAG_AUTONAME_KW_OFF  = set(_RAG.get('autoname_kw_off_products', ['BM9K1']))
 RAG_SEED_AT_STARTUP  = bool(_RAG.get('seed_at_startup', True))
 RAG_ENERGY_BOOST     = float(_RAG.get('llm_energy_boost', 1.5))
 # corpus_eval 자기점수(llm_score)가 이 값 **미만**일 때만 에너지 페널티(*0.5).
@@ -4540,8 +4545,8 @@ class NVMeFuzzer:
         # v10: 명령 × 코어 수확량 — primary_core / sample_plan.weights 를 추정이 아니라
         #   실측으로 정하기 위한 유일한 근거. yield=그 명령이 **최초 발견**한 BB 수,
         #   cost=그 명령 윈도우에서 그 코어에 쓴 샘플 수(무효 포함 — 읽기 비용은 동일).
-        # 심볼 있는 ELF(RISC-V)면 키워드 기반 자동생성명 필터를 끈다(플랜 §6-1).
-        self._autoname_kw_off = ((self.config.arch or 'arm') == 'riscv')
+        # 심볼이 살아있는 제품은 키워드 기반 자동생성명 필터를 끈다(제품 단위 관리).
+        self._autoname_kw_off = (self.config.product in RAG_AUTONAME_KW_OFF)
         # 코어별로 지금까지 도달한 오버레이 bank — '처음 밟은 순간' 만 알리기 위해
         self._ovl_seen: dict = {}
         self._rcov = None            # riscv_cov 모듈 (arch=riscv 일 때만)
