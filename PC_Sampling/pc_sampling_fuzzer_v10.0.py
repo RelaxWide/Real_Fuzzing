@@ -9387,6 +9387,8 @@ class NVMeFuzzer:
             return
         for w in self.cov.warnings:
             log.warning(f"[StaticAnalysis] {w}")
+        for n in getattr(self.cov, 'notes', []):   # 경고 아닌 정보성(오버레이 counts 규약 차이 등)
+            log.info(f"[StaticAnalysis] {n}")
         # ★ C3: 자산이 없거나 비면 빈 CoverageModel 로 **조용히** 진행하게 된다.
         #   per-core 분기가 선택되므로 신규 BB 가 영원히 0 — 정상처럼 보이는 무커버리지.
         #   여기서 끊는다.

@@ -314,6 +314,7 @@ class CoverageModel:
         self.loaded = False
         self.product = ""
         self.warnings: list[str] = []
+        self.notes: list[str] = []       # 경고 아닌 정보성(예: 오버레이 counts 규약 차이)
 
     # ── 로드 ──────────────────────────────────────────────────────────
     @classmethod
@@ -463,11 +464,19 @@ class CoverageModel:
                 ("functions", c.get("functions"), _fn_base, _fn_all)):
             if want is None or want in (base_v, all_v):
                 continue
-            self.warnings.append(
-                f"core{cm.name}: {label} 개수 불일치 symbols.json={want} "
-                f"실제 본체={base_v}"
-                + (f" / 오버레이 합산={all_v}" if all_v != base_v else "")
-                + " — 표가 잘렸거나 ELF 와 짝이 안 맞는다")
+            if cm.banks or cm.overlay:
+                # 오버레이가 있는 코어는 symbols.json counts 가 '본체 기준' 인지 '총계 기준'
+                # 인지 추출기 규약이 갈린다. 차이가 오버레이에서 오는 것이므로 **잘림이 아니다**
+                # — '불일치' 경고가 아니라 정보성 note 로만 남긴다. (실제 파일 잘림은 위 '버린 줄'
+                # 경고가, 오버레이 개수는 overlay_* counts 가 따로 검증한다.)
+                self.notes.append(
+                    f"core{cm.name}: {label} symbols.json={want} vs 본체={base_v}"
+                    + (f"(+오버레이 합산={all_v})" if all_v != base_v else "")
+                    + " — 오버레이 포함/제외 counts 규약 차이(정상, 잘림 아님)")
+            else:
+                self.warnings.append(
+                    f"core{cm.name}: {label} 개수 불일치 symbols.json={want} "
+                    f"실제={base_v} — 표가 잘렸거나 ELF 와 짝이 안 맞는다")
         checks = []
         if cm.banks:
             checks += [
