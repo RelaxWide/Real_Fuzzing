@@ -4225,6 +4225,7 @@ class LlmBridge:
         self._worker = None
         self._stop = threading.Event()
         self._inflight = False
+        self._req_seq = 0                     # 요청 일련번호(응답↔요청 대조용)
         self._last_submit_ts = 0.0            # 시간 기반 rate-limit 스로틀(마지막 제출 시각, monotonic)
         self._pass_system = getattr(config, 'rag_pass_system', True)
         if not config.rag_enabled:
@@ -4310,17 +4311,36 @@ class LlmBridge:
                                 f"retries={attempt} head={_head}")
                 self._out_q.put({'task': req['task'], 'raw': text, 'error': None,
                                  'submitted_at': req['submitted_at'],
-                                 'user': req.get('user'), 'retries': attempt})
+                                 'user': req.get('user'), 'retries': attempt,
+                                 'ctx': req.get('ctx'), 'req_id': req.get('req_id')})
             except Exception as e:
                 self._out_q.put({'task': req['task'], 'raw': None, 'error': str(e),
                                  'submitted_at': req['submitted_at'],
-                                 'user': req.get('user'), 'retries': 0})
+                                 'user': req.get('user'), 'retries': 0,
+                                 'ctx': req.get('ctx'), 'req_id': req.get('req_id')})
             finally:
                 self._inflight = False
 
     # ── 메인 스레드에서 호출 (non-blocking) ───────────────────────────
-    def submit(self, task: str, system: str, user: str, now_exec: int) -> bool:
-        """in-flight 없고 최소 시간간격 지났을 때만 요청 제출. 아니면 False(스킵)."""
+    def can_submit(self) -> bool:
+        """submit() 이 통과할 상태인지 **부작용 없이** 미리 본다.
+        호출부가 프롬프트를 만들기 **전에** 확인하는 용도 — 만들어놓고 버리는 낭비
+        (대조쌍 O(n²) 탐색·커버리지 컨텍스트 계산)를 없애고, corpus_eval 빌드가
+        요청도 못 하면서 상태를 건드리는 일도 막는다."""
+        if not self.enabled or self._inflight:
+            return False
+        if (RAG_MIN_REQ_INTERVAL > 0
+                and (time.monotonic() - self._last_submit_ts) < RAG_MIN_REQ_INTERVAL):
+            return False
+        return True
+
+    def submit(self, task: str, system: str, user: str, now_exec: int, ctx=None) -> bool:
+        """in-flight 없고 최소 시간간격 지났을 때만 요청 제출. 아니면 False(스킵).
+
+        ctx: 이 요청 **전용** 부속 데이터(예: corpus_eval 의 seed_id→시드 매핑).
+        전역에 두면 응답 대기 중 다음 요청이 덮어써 **엉뚱한 시드에 평가가 적용**된다
+        (실제 발생 가능 — 브리지 지연 > task 회전 주기). 요청에 실어 보내고 응답에서
+        그대로 돌려받아, 조회는 언제나 '그 요청이 보낸 표' 로만 한다."""
         if not self.enabled or self._inflight:
             return False
         now = time.monotonic()
@@ -4328,8 +4348,9 @@ class LlmBridge:
             return False   # rate-limit 스로틀: 아직 최소 간격 안 지남
         self._last_submit_ts = now
         self._inflight = True
+        self._req_seq += 1
         self._in_q.put({'task': task, 'system': system, 'user': user,
-                        'submitted_at': now_exec})
+                        'submitted_at': now_exec, 'ctx': ctx, 'req_id': self._req_seq})
         return True
 
     def drain(self):
@@ -4518,6 +4539,14 @@ class NVMeFuzzer:
         self._last_nvme_status: Optional[int] = None  # 직전 send 의 NVMe full status(0=성공, None=errno/내부)
         self._last_depth_adv: bool = False            # v9.2 Tier1: 직전 실행이 SC-depth 를 전진시켰나
         self._llm_depth_cmds: set = set()             # v9.2 Tier3: LLM 계보가 SC-depth 를 전진시킨 명령들(피드백)
+        # v10: 요청 전용 ctx 임시 슬롯(빌드→제출 사이에서만 산다. 전역 보관 금지).
+        self._llm_pending_ctx = None
+        # v10 되먹임: 제안이 어떻게 거절/보정됐는지를 다음 프롬프트에 짧게 돌려준다.
+        #   예전엔 조용히 버려서 LLM 이 같은 무효 제안을 반복했다.
+        self._llm_seq_rejects: deque = deque(maxlen=6)   # 시퀀스 폐기 사유
+        self._llm_repairs: deque = deque(maxlen=8)       # 스키마 보정 내역(제안→실제 발송)
+        # v10: coverage gap 후보 제안 횟수 — 같은 목록이 매 요청 반복되는 것을 막는 순환 키.
+        self._llm_gap_offered: dict = defaultdict(int)
         # v9.4: SC discovery-count (안 A) — 분모 없이 누적 발견. distinct (track_key, status) 집합.
         self._sc_seen: set = set()
         # v9.4 fix: state discovery-count — 진짜 누적. state_corpus 는 _cull_state_corpus 로
@@ -6001,13 +6030,17 @@ class NVMeFuzzer:
                     for cid in _core_ids:
                         rows = [r for r in _cov.frontier_functions(cid)
                                 if _is_rv_symbol(r[0])]
-                        _frontier[cid] = rows
+                        _frontier[cid] = self._llm_gap_sort(rows, lambda r: (cid, r[0]))
                         _frontier_keys.update((cid, r[2]) for r in rows)
                 except Exception as _fe:
                     if not getattr(self, '_llm_frontier_warned', False):
                         self._llm_frontier_warned = True
                         log.warning(f"[LLM/cov] frontier 계산 실패(무시): {_fe}")
-                chosen_frontier = _round_robin(_frontier, _budget)
+                # ★ frontier 가 예산을 전부 먹으면 미관측 함수는 영원히 목록에 못 오른다
+                #   (예전 동작). 일부를 미관측 몫으로 유보한다. frontier 가 그보다 적으면
+                #   남는 몫은 그대로 미관측이 가져가므로 총 예산은 줄지 않는다.
+                _reserve = max(1, _budget // 3)
+                chosen_frontier = _round_robin(_frontier, max(0, _budget - _reserve))
 
                 # 콜그래프 거리 순(가까운 것 먼저). frontier 로 이미 나간 것은 뺀다.
                 chosen_uncovered = []
@@ -6018,7 +6051,8 @@ class NVMeFuzzer:
                         _rows = [r for r in _cov.reach_ranked_uncovered(cid, RAG_MAX_HOPS)
                                  if _is_rv_symbol(r[0]) and (cid, r[2]) not in _frontier_keys]
                         _nopath += sum(1 for r in _rows if r[3] is None)
-                        _uncovered[cid] = [(r[0], r[1], r[2]) for r in _rows]
+                        _uncovered[cid] = self._llm_gap_sort(
+                            [(r[0], r[1], r[2]) for r in _rows], lambda r: (cid, r[0]))
                     if _nopath and not getattr(self, '_llm_nopath_logged', False):
                         self._llm_nopath_logged = True
                         _tot = sum(len(v) for v in _uncovered.values())
@@ -6039,7 +6073,13 @@ class NVMeFuzzer:
                                  f"(FRONTIER, reached_callers={callers})")
                 for cid, (name, size, _entry) in chosen_uncovered:
                     core = _cov.cores[cid].name
-                    lines.append(f"  - core={core} {name} (size={size}, NEVER entered)")
+                    # ★ 'NEVER entered' 는 과한 표현이다 — 우리 커버리지는 PC 를 주기적으로
+                    #   찍는 **샘플링**이라, 실행됐는데 샘플에 안 잡혔을 수 있다. 확정 표현을
+                    #   쓰면 LLM 이 '여긴 절대 안 도는 코드'로 잘못 배운다.
+                    lines.append(f"  - core={core} {name} "
+                                 f"(size={size}, not observed in PC samples)")
+                self._llm_gap_mark([(cid, r[0]) for cid, r in chosen_frontier]
+                                   + [(cid, r[0]) for cid, r in chosen_uncovered])
                 if lines:
                     return "\n".join(lines)
                 _remaining = sum(len(_cov.uncovered_functions(cid)) for cid in _core_ids)
@@ -6061,11 +6101,19 @@ class NVMeFuzzer:
                 return not (_AUTONAME_RE.match(nm) or _AUTONAME_KW.search(nm))
             named   = [f for f in (not_entered or []) if _is_symbol(f[0])]
             named_p = [f for f in (partial or [])     if _is_symbol(f[0])]
+            # riscv 경로와 같은 순환 — 제안 횟수 적은 후보 우선(안정 정렬).
+            named   = self._llm_gap_sort(named,   lambda f: ('sa', f[0]))
+            named_p = self._llm_gap_sort(named_p, lambda f: ('sa', f[0]))
             lines = []
-            for f in named[:RAG_MAX_UNCOV_FUNCS]:
-                lines.append(f"  - {f[0]} (size={f[1]}, NEVER entered)")
-            for f in named_p[:RAG_MAX_UNCOV_FUNCS // 2]:
+            _picked = named[:RAG_MAX_UNCOV_FUNCS]
+            _picked_p = named_p[:RAG_MAX_UNCOV_FUNCS // 2]
+            for f in _picked:
+                # 'NEVER entered' → 샘플링 한계를 반영한 표현(위 riscv 경로와 동일 근거)
+                lines.append(f"  - {f[0]} (size={f[1]}, not observed in PC samples)")
+            for f in _picked_p:
                 lines.append(f"  - {f[0]} (bb={f[3]:.0f}% partial)")
+            self._llm_gap_mark([('sa', f[0]) for f in _picked]
+                               + [('sa', f[0]) for f in _picked_p])
             if lines:
                 return "\n".join(lines)
             # 심볼명이 하나도 없으면(스트립 바이너리) 이름 대신 미접촉 개수 힌트만 — 명령 커버리지에 의존
@@ -6316,8 +6364,12 @@ class NVMeFuzzer:
                         # v9.2 Tier3: best_depth(0~3) 로 "성공까지 남은 거리" 를 명시 → LLM 이 어느 명령을
                         #   얼마나 밀면 되는지 판단(닫힌 피드백/repair). depth 3=성공, 낮을수록 얕게 막힘.
                         bd = st.get('best_depth', -1)
+                        # ★ 이 0~3 사다리는 NVMe 응답코드로 만든 **휴리스틱 추정**이지,
+                        #   펌웨어가 실제로 몇 단계를 거치는지 확인한 값이 아니다. 확정
+                        #   표현("2 steps from success")은 LLM 이 없는 사실을 믿게 만든다.
                         _dist = ("at SUCCESS(depth 3)" if bd >= 3
-                                 else f"reached depth {bd}/3 — {max(0, 3 - bd)} step(s) from success")
+                                 else f"response-depth heuristic {bd}/3 (estimated from the "
+                                      f"returned status code, NOT measured firmware progress)")
                         dig.append((rf, f"  {n} : dominant {self._sc_name(dom)}, {_dist} → "
                                         f"fix the exact field to advance depth"))
             dig.sort(reverse=True)
@@ -6423,14 +6475,16 @@ class NVMeFuzzer:
             seen.add(id(s)); out.append(s)
         return out[:n]
 
-    _CONTRAST_FIELDS = ('cdw2', 'cdw3', 'cdw10', 'cdw11', 'cdw12', 'cdw13', 'cdw14', 'cdw15',
-                        'data_len', 'opcode_override', 'nsid_override')
+    # LLM 이 직접 겨냥해 바꿀 수 있는 필드(대조의 '원인' 후보)
+    _CONTRAST_CDW_FIELDS = ('cdw2', 'cdw3', 'cdw10', 'cdw11', 'cdw12', 'cdw13', 'cdw14', 'cdw15')
+    # 실행 조건(guard/보정 이후 실제 발송값). 여기가 다르면 CDW 로 결과를 귀속할 수 없다.
+    _CONTRAST_CTX_FIELDS = ('queue', 'opcode', 'nsid', 'xfer_len', 'payload_h')
 
     def _llm_contrastive_block(self, max_examples: int = 2) -> str:
         """v9.5 Phase 0: 같은 명령의 두 변이가 '한 필드만 다른데 결과(SC/BB)가 갈린' 쌍을 찾아
         대조 예시 텍스트로. 같은 parent(prov_id) + 최소 필드 diff 우선 → LLM 이 '아무 성공/실패'가
         아니라 **어느 필드 관계가 결과를 갈랐는지**를 학습(잘못된 원인 학습 방지)."""
-        found = []   # (field_diff, not_same_prov, cmd, a, b, diff)
+        found = []   # (정렬키, cmd, a, b, diff, strong)
         for cmd_name, variants in self._contrast_pool.items():
             vs = list(variants)
             if len(vs) < 2:
@@ -6441,31 +6495,55 @@ class NVMeFuzzer:
                     a, b = vs[i], vs[j]
                     if a['sc'] == b['sc'] and a['new_pcs'] == b['new_pcs']:
                         continue   # 결과가 같으면 대조 가치 없음
-                    diff = [f for f in self._CONTRAST_FIELDS if a.get(f) != b.get(f)]
+                    _dcdw = [f for f in self._CONTRAST_CDW_FIELDS if a.get(f) != b.get(f)]
+                    _dctx = [f for f in self._CONTRAST_CTX_FIELDS if a.get(f) != b.get(f)]
+                    # ★ 조건이 섞인 쌍은 통제된 대조가 아니다 — CDW 도 다르고 실행 조건
+                    #   (큐/opcode/NSID/전송길이/페이로드)도 다르면 무엇이 결과를 갈랐는지
+                    #   귀속 불가. 한쪽만 다른 쌍은 그 자체가 단일 변수라 유효하다.
+                    if _dcdw and _dctx:
+                        continue
+                    diff = _dcdw + _dctx
                     if not diff or len(diff) > max(1, RAG_CONTRAST_MIN_DIFF) + 1:
                         continue   # 필드가 너무 많이 다르면 인과 귀속 흐려짐
+                    # 강한 증거 = 장치 응답(SC)이 갈린 쌍. 약한 증거 = 응답은 같고 신규 BB
+                    #   수만 다른 쌍(먼저 실행한 쪽이 신규 크레딧을 가져가는 순서 효과일 수
+                    #   있다) → 버리지 않고 뒤로 돌리며 프롬프트에 그 사실을 명시한다.
+                    strong = (a['sc'] != b['sc'])
                     same_prov = (a.get('prov_id') is not None
                                  and a.get('prov_id') == b.get('prov_id'))
-                    key = (len(diff), not same_prov)
+                    key = (not strong, len(diff), not same_prov)
                     if best is None or key < best[0]:
-                        best = (key, cmd_name, a, b, diff)
+                        best = (key, cmd_name, a, b, diff, strong)
             if best is not None:
                 found.append(best)
         if not found:
             return ""
-        found.sort(key=lambda e: e[0])   # 적은 diff + 같은 parent 우선
+        found.sort(key=lambda e: e[0])   # 강한 증거 → 적은 diff → 같은 parent 순
         lines = ["Contrastive examples (same command, MINIMAL change, DIFFERENT outcome — infer which "
-                 "field relation flipped the result and exploit it; do NOT just copy the success):"]
-        for _, cmd_name, a, b, diff in found[:max_examples]:
+                 "field relation flipped the result and exploit it; do NOT just copy the success). "
+                 "All listed values are what ACTUALLY reached the device (after guards/repair):"]
+        for _, cmd_name, a, b, diff, strong in found[:max_examples]:
             _fmt = lambda v: ", ".join(f"{f}={v.get(f)}" for f in diff)
             lines.append(f"  {cmd_name}:")
             lines.append(f"    A [{_fmt(a)}] -> status={self._sc_name(a['sc'])}, new_bb={a['new_pcs']}")
             lines.append(f"    B [{_fmt(b)}] -> status={self._sc_name(b['sc'])}, new_bb={b['new_pcs']}")
-            lines.append(f"    (only {', '.join(diff)} differ — that is the material change)")
+            if strong:
+                lines.append(f"    (these runs differ ONLY in {', '.join(diff)}, and the device "
+                             f"status differs — strong evidence)")
+            else:
+                lines.append(f"    (these runs differ ONLY in {', '.join(diff)}, but the device "
+                             f"status is the SAME — only new-BB count differs. WEAK evidence: the "
+                             f"input executed first takes credit for newly seen blocks, so this may "
+                             f"be an ordering artifact rather than causation. Treat as a hint.)")
         return "\n".join(lines)
 
     def _llm_build_request(self, task: str):
-        """task 별 (system, user) 프롬프트 구성. 불가하면 None. 전부 메인 스레드 스냅샷."""
+        """task 별 (system, user) 프롬프트 구성. 불가하면 None. 전부 메인 스레드 스냅샷.
+
+        요청 전용 부속 데이터가 필요한 task(corpus_eval)는 self._llm_pending_ctx 에 담는다.
+        호출부(_llm_maybe_submit)가 빌드 **직후** 즉시 꺼내 submit 에 실어 보내고 비운다 —
+        전역에 남겨두면 다음 빌드가 덮어써 응답이 엉뚱한 시드에 적용된다."""
+        self._llm_pending_ctx = None
         exercised = self._llm_exercised_names()
         cov = self._llm_coverage_context()
         ground = self._llm_grounding_block()   # 디바이스 grounding + 되먹임 + few-shot (연구 기반)
@@ -6497,7 +6575,8 @@ class NVMeFuzzer:
                     f"{n}(exec={_runs},new_cov={_gain},cov/exec={_yield:.4f})")
             _contrast = self._llm_contrastive_block()   # v9.5: field-relation 대조 예시
             _cb = (_contrast + "\n\n") if _contrast else ""
-            user = (_gp + _cb
+            _rb = self._llm_reject_block()             # v10: 거절·보정 되먹임
+            user = (_gp + _cb + _rb
                     + f"Coverage gaps (firmware functions NOT yet reached — PRIMARY target):\n"
                     f"{cov or '  (static map unavailable)'}\n\n"
                     f"Never-sent command groups: {sorted(never)[:30]}\n\n"
@@ -6513,7 +6592,7 @@ class NVMeFuzzer:
             names = [n for n in sorted(self.llm.schema_bridge.commands.keys())
                      if n not in self._unimpl_cmds]
             schema = self._llm_schema_summary(names[:RAG_SCHEMA_MAX])  # v9.1: 캡 제거(구현된 전부)
-            user = (_gp
+            user = (_gp + self._llm_reject_block()      # v10: 거절·보정 되먹임
                     + f"Coverage gaps (firmware functions NOT yet reached — target these):\n"
                     f"{cov or '  (static map unavailable)'}\n\n"
                     f"Available commands: {names}\n\nSchemas:\n{schema}\n\n"
@@ -6531,14 +6610,28 @@ class NVMeFuzzer:
                     f"{self._llm_data_directive()} JSON only.")
             return self._LLM_SYSTEM, user
         if task == 'corpus_eval':
-            # v9.5 Phase 0: 층화 표본 + 풍부한 context(cdw11/data_len/origin/last_status/favored).
+            # v9.5 Phase 0: 층화 표본 + 풍부한 context(cdw11/data_len/origin/command_dominant_error/favored).
             sample = self._corpus_eval_stratified_sample(40)
             # seed_id 에 id(s)(파이썬 객체 주소)를 쓰면 15자리라 프롬프트와 응답 양쪽을
             #   크게 부풀린다. 이 id 는 **이 요청 1건 안에서만** 유효하면 되므로 표본 내
             #   짧은 인덱스로 충분하다.
-            self._llm_eval_targets = {i: s for i, s in enumerate(sample)}
+            # ★ 이 표는 **요청에 실어** 보낸다(전역 금지). 함께 저장하는 (new_pcs,
+            #   last_gain_exec) 는 응답 도착 시 "그 사이 이 시드가 새 커버리지를 냈나" 를
+            #   판정해 낡은 keep=False 파기 지시를 보류하기 위한 스냅샷이다.
+            self._llm_pending_ctx = {
+                'kind': 'eval_targets',
+                'targets': {i: (s, getattr(s, 'new_pcs', 0), getattr(s, 'last_gain_exec', 0))
+                            for i, s in enumerate(sample)},
+            }
             rows = []
             for _i, s in enumerate(sample):
+                # ★ 이 값은 **이 시드의 응답이 아니다** — 같은 명령(track_key)을 쓴 모든
+                #   시드의 누적 오류 histogram 최빈값이다. 게다가 sc_hist 는 성공(_ns==0)을
+                #   기록하지 않으므로, 한 번도 실패한 적 없는 시드에도 남의 오류가 붙는다.
+                #   예전 이름 last_status + "이걸로 시드 가치를 판단하라"는 지시는 LLM 이
+                #   잘 도는 시드를 '거절당한다'고 낮게 평가하게 만들었다(→ 에너지 0.5배,
+                #   keep=False 면 삭제). 이름과 설명을 집계값으로 정직하게 바꾼다.
+                #   per-seed 실제 응답 추적은 별건(Seed 필드 추가 필요).
                 _tk = self._tracking_label(s.cmd, s)
                 _sc_hist = self.cmd_stats.get(_tk, {}).get('sc_hist', {})
                 _sc_top = max(_sc_hist, key=_sc_hist.get) if _sc_hist else None
@@ -6550,7 +6643,8 @@ class NVMeFuzzer:
                                ("new_pcs", s.new_pcs),
                                ("exec_count", s.exec_count),
                                ("favored", bool(getattr(s, 'is_favored', False))),
-                               ("last_status", self._sc_name(_sc_top) if _sc_top is not None else None)):
+                               ("command_dominant_error",
+                                self._sc_name(_sc_top) if _sc_top is not None else None)):
                     if _v:
                         _row[_k] = _v
                 if self._is_llm_seed(s):
@@ -6559,9 +6653,12 @@ class NVMeFuzzer:
             user = ("Current corpus sample (stratified: recent-LLM / recent-new-BB / favored / "
                     "stale / random). Each seed's summary:\n[" + ",\n".join(rows) + "]\n\n"
                     "Judge fuzzing value from: new_pcs (coverage produced), exec_count (effort spent), "
-                    "last_status (does it reach firmware or get rejected early), origin. A seed that "
-                    "reached the device but got a specific rejection (Invalid Field) is more valuable "
-                    "than one stuck at Invalid Opcode. High exec_count with new_pcs=0 = exhausted.\n"
+                    "origin. High exec_count with new_pcs=0 = exhausted.\n"
+                    "NOTE on \"command_dominant_error\": it is NOT this seed's own response. It is the "
+                    "most frequent error status across ALL seeds that issued the same command, and "
+                    "successful completions are excluded from that tally — so a seed that always "
+                    "succeeds still shows another seed's error here. Use it only as weak context "
+                    "about the command, never as evidence about this seed.\n"
                     "For each seed_id emit an \"evaluations\" entry with \"score\" (0..1 fuzzing value) "
                     "and \"keep\" (bool). JSON only.")
             return self._LLM_SYSTEM, user
@@ -6639,32 +6736,58 @@ class NVMeFuzzer:
         else:
             self._llm_last_task = task
             self._llm_task_consec = 1
+        # ★ 프롬프트를 만들기 **전에** 전송 가능 여부를 본다. 예전엔 만들고 나서 submit 이
+        #   거절(_inflight)했는데, corpus_eval 빌드는 그 과정에서 평가 대상 표를 갈아치웠다
+        #   → 대기 중이던 이전 응답이 **새 표** 기준으로 적용되는 대상 드리프트. 표를 요청에
+        #   싣는 것(ctx)이 근본 수정이고, 이 선게이트는 버려질 프롬프트 생성 비용까지 없앤다.
+        if not self.llm.can_submit():
+            return
         built = self._llm_build_request(task)
         if built is None:
             return
         sys_p, usr_p = built
-        if self.llm.submit(task, sys_p, usr_p, self.executions):
+        _ctx = getattr(self, '_llm_pending_ctx', None)
+        self._llm_pending_ctx = None      # 빌드↔제출 사이에서만 산다
+        if self.llm.submit(task, sys_p, usr_p, self.executions, ctx=_ctx):
             log.info(f"[LLM] 요청 제출: task={task} (plateau={plateau})")
             if task == 'io_patterns':   # io_patterns 는 터미널에서도 보이게(진단)
                 log.warning("[LLM] io_patterns 요청 제출 — I/O 워크로드 descriptor 요청")
 
-    def _llm_make_seed(self, item, seed_class):
-        """LLM seed 항목 dict → 검증된 Seed 또는 None(폐기). 메인 스레드."""
+    def _llm_make_seed(self, item, seed_class, why: 'Optional[list]' = None):
+        """LLM seed 항목 dict → 검증된 Seed 또는 None(폐기). 메인 스레드.
+
+        why: 리스트를 주면 폐기 사유 문자열을 append 한다(시퀀스 폐기 되먹임용).
+             보정(repair)이 일어난 경우에도 'repaired:...' 로 기록 — LLM 에게
+             '네 제안이 이렇게 고쳐져 나갔다'를 돌려주기 위함."""
+        def _why(msg):
+            if why is not None:
+                why.append(msg)
         try:
+            if not isinstance(item, dict):
+                _why(f"malformed item (expected object, got {type(item).__name__})")
+                return None
             name = item.get('command')
             cmd = _NAME_TO_CMD.get(name)
             if cmd is None:
+                _why(f"{name!r}: unknown command")
                 if RAG_DEBUG:
                     log.warning(f"[LLM/item] drop {name!r} (unknown command)")
                 return None
             cdw = {f'cdw{w}': _coerce_int(item.get(f'cdw{w}', 0)) for w in (2, 3, 10, 11, 12, 13, 14, 15)}
             repaired, _fixed, ok = self.llm.schema_bridge.validate_and_repair(name, cdw)
             if not ok:
+                _why(f"{name}: schema invalid or reserved value rejected")
                 if RAG_DEBUG:
                     log.warning(f"[LLM/item] drop {name} (schema invalid/reserved)")
                 return None
+            if _fixed:
+                # v10: 보정 내역을 되먹임 큐에 남긴다. 예전엔 _fixed 를 받아만 두고 버려서
+                #   LLM 이 '내 값이 고쳐져 나갔다'를 영영 몰랐고 같은 무효값을 반복했다.
+                self._llm_repair_note(name, _fixed)
+                _why(f"{name}: repaired {', '.join(_fixed[:3])}")
             danger, reason = self.llm.schema_bridge.is_dangerous(name, repaired)
             if danger:
+                _why(f"{name}: blocked as dangerous ({reason})")
                 log.info(f"[LLM] drop dangerous {name}: {reason}")
                 return None
             data = b''
@@ -6700,7 +6823,8 @@ class NVMeFuzzer:
                 cdw14=repaired.get('cdw14', 0), cdw15=repaired.get('cdw15', 0),
                 nsid_override=_nsid_override,
                 found_at=self.executions, seed_class=seed_class)
-        except Exception:
+        except Exception as _e:
+            _why(f"internal error: {_e}")
             return None
 
     def _llm_archive(self, res, data=None, added_s=None, added_q=None):
@@ -6815,16 +6939,38 @@ class NVMeFuzzer:
                 # (없으면 sq.get('commands') 에서 AttributeError 로 죽는다).
                 self._llm_stats['dropped'] += 1
                 continue
-            seeds = []
-            for citem in (sq.get('commands') or []):
-                s = self._llm_make_seed(citem, 'llm_seq')
+            # ★ 부분 채택 금지. 예전엔 탈락 멤버를 건너뛰고 나머지로 체인을 만들었다 —
+            #   A(setup)->B(setup)->C(trigger) 에서 B 가 떨어지면 A->C 가 corpus 에 들어가는데,
+            #   C 는 B 가 만든 상태에서만 의미가 있으므로 **LLM 이 제안한 적 없는, 의미가
+            #   파괴된 체인**이 캠페인 내내 실행됐다. 길이 초과를 truncate 대신 drop 하는
+            #   기존 원칙(아래)과 같은 논리를 멤버 탈락에도 적용한다.
+            _cmds = sq.get('commands')
+            if not isinstance(_cmds, list):
+                # commands 가 list 가 아니면 len()/순회가 엉뚱한 값을 낸다(문자열이면 글자 단위).
+                self._llm_stats['dropped'] += 1
+                self._llm_seq_reject(None, [f"'commands' must be a list "
+                                            f"(got {type(_cmds).__name__})"])
+                continue
+            seeds, _why = [], []
+            for citem in _cmds:
+                s = self._llm_make_seed(citem, 'llm_seq', why=_why)
                 if s is not None:
                     seeds.append(s)
+            if len(seeds) != len(_cmds):
+                # 부분 성공 = 전체 폐기. 어느 자리가 왜 떨어졌는지는 다음 요청에 알려준다.
+                self._llm_stats['dropped'] += 1
+                self._llm_seq_reject(_cmds, _why)
+                if RAG_DEBUG:
+                    log.warning(f"[LLM/item] drop seq — 멤버 {len(_cmds) - len(seeds)}/"
+                                f"{len(_cmds)} 탈락: {'; '.join(_why[:3])}")
+                continue
             if len(seeds) < 2 or len(seeds) > RAG_MAX_SEQ_LEN:
                 # 최소 2, 최대 RAG_MAX_SEQ_LEN(리플레이 비용 상한). 초과분은 truncate(=trigger
                 # 유실로 의미 파괴) 대신 drop. 유효명령 0~1개인 무효 체인도 폐기.
-                if sq.get('commands'):
+                if _cmds:
                     self._llm_stats['dropped'] += 1
+                    self._llm_seq_reject(_cmds, [f"chain length {len(seeds)} outside "
+                                                 f"allowed 2..{RAG_MAX_SEQ_LEN}"])
                     if RAG_DEBUG and len(seeds) > RAG_MAX_SEQ_LEN:
                         log.warning(f"[LLM/item] drop seq len={len(seeds)} (>{RAG_MAX_SEQ_LEN})")
                 continue
@@ -6858,20 +7004,48 @@ class NVMeFuzzer:
             })
             if RAG_DEBUG:
                 log.warning(f"[LLM/item] accept seq [{'->'.join(s.cmd.name for s in seeds)}]")
-        # evaluations (corpus_eval)
-        _targets = getattr(self, '_llm_eval_targets', {})
-        for ev in (data.get('evaluations') or []):
+        # evaluations (corpus_eval) — ★ 조회는 **이 응답의 요청이 보낸 표**로만 한다.
+        #   전역 표를 쓰던 예전 코드는, 응답 대기 중 다음 corpus_eval 빌드가 표를 덮어쓰면
+        #   LLM 이 본 적도 없는 시드를 지웠다(조용한 오삭제 — 로그도 안 남았다).
+        _ctxd = res.get('ctx') or {}
+        _targets = _ctxd.get('targets') if _ctxd.get('kind') == 'eval_targets' else None
+        _evs = data.get('evaluations') or []
+        if _evs and not _targets:
+            # 표 없는 평가 = 귀속 불가 → 적용하지 않는다(추정 금지).
+            self._llm_stats['eval_orphan'] = self._llm_stats.get('eval_orphan', 0) + len(_evs)
+            log.warning(f"[LLM/eval] 평가 {len(_evs)}건 폐기 — 요청의 대상 표 없음 "
+                        f"(req_id={res.get('req_id')}, task={res.get('task')})")
+            _evs = []
+        _corpus_ids = {id(s) for s in self.corpus} if _evs else set()
+        _ev_applied = _ev_gone = _ev_stale = 0
+        for ev in _evs:
             try:
-                s = _targets.get(int(ev.get('seed_id')))
-                if s is not None:
-                    if isinstance(ev.get('score'), (int, float)):
-                        s.llm_score = float(ev['score'])
-                    # keep=False = LLM 이 명시적으로 '버려라' → 컬링 우선(아래 _cull_corpus).
-                    #   score(에너지 *0.5)만으로는 프롬프트가 요구한 keep 판단이 배선 안 됐었다.
-                    if isinstance(ev.get('keep'), bool):
+                _t = _targets.get(int(ev.get('seed_id')))
+                if _t is None:
+                    continue
+                s, _np0, _gain0 = _t
+                if id(s) not in _corpus_ids:
+                    _ev_gone += 1        # 평가 대기 중 컬링됨 → 적용 대상 없음
+                    continue
+                if isinstance(ev.get('score'), (int, float)):
+                    s.llm_score = float(ev['score'])
+                # keep=False = LLM 이 명시적으로 '버려라' → 컬링 우선(아래 _cull_corpus).
+                #   score(에너지 *0.5)만으로는 프롬프트가 요구한 keep 판단이 배선 안 됐었다.
+                # ★ 단, 요청 이후 이 시드가 **새 커버리지를 냈다면** 그 판단은 낡았다
+                #   (평가 시점엔 무가치해 보였을 뿐) → 파기 지시만 보류한다. score 는 반영.
+                if isinstance(ev.get('keep'), bool):
+                    _advanced = (getattr(s, 'new_pcs', 0) > _np0
+                                 or getattr(s, 'last_gain_exec', 0) > _gain0)
+                    if ev['keep'] is False and _advanced:
+                        _ev_stale += 1
+                    else:
                         s.llm_keep = ev['keep']
+                _ev_applied += 1
             except Exception:
                 pass
+        if RAG_DEBUG and (_ev_applied or _ev_gone or _ev_stale):
+            log.warning(f"[LLM/eval] req_id={res.get('req_id')} 적용={_ev_applied} "
+                        f"컬링됨={_ev_gone} 낡은keep보류={_ev_stale}")
         # io_workload descriptor (io_patterns) — 검증 통과 시 pending 슬롯에 저장(1건).
         _wl = self._llm_make_workload_desc(data.get('io_workload'))
         if _wl is not None:
@@ -7062,6 +7236,58 @@ class NVMeFuzzer:
         """A: 중복 주입 판정용 시그니처 (명령+CDW+데이터)."""
         return (seed.cmd.name, seed.cdw2, seed.cdw3, seed.cdw10, seed.cdw11,
                 seed.cdw12, seed.cdw13, seed.cdw14, seed.cdw15, bytes(seed.data))
+
+    def _llm_gap_sort(self, rows, keyfn):
+        """coverage gap 후보를 '제안 횟수 적은 것 우선'으로 재배열(안정 정렬 →
+        동수면 기존 랭크 순서 유지). frontier/홉거리 랭킹은 잘 변하지 않아 매 요청
+        거의 같은 목록이 나갔고, LLM 은 60초마다 같은 숙제를 받았다. 성과 없이 반복
+        제안된 목표를 잠시 뒤로 돌려 예산이 다른 후보에게도 돌아가게 한다.
+        (커버된 함수는 애초에 후보 목록에서 빠지므로 별도 해제가 필요 없다.)"""
+        try:
+            return sorted(rows, key=lambda r: self._llm_gap_offered[keyfn(r)])
+        except Exception:
+            return rows
+
+    def _llm_gap_mark(self, keys):
+        """이번 프롬프트에 실제로 실린 후보의 제안 횟수를 올린다."""
+        try:
+            for k in keys:
+                self._llm_gap_offered[k] += 1
+        except Exception:
+            pass
+
+    def _llm_repair_note(self, name, fixed):
+        """스키마 보정 내역 기록(중복 억제). '제안 → 실제 발송' 차이를 LLM 에 되먹임."""
+        try:
+            _t = f"{name}: {', '.join(fixed[:3])}"
+            if _t not in self._llm_repairs:
+                self._llm_repairs.append(_t)
+        except Exception:
+            pass
+
+    def _llm_seq_reject(self, cmds, why):
+        """시퀀스 전체 폐기 사유 기록 — 다음 sequences 요청 프롬프트에 실린다."""
+        try:
+            _chain = "->".join(str(c.get('command')) if isinstance(c, dict) else '?'
+                               for c in (cmds or []))[:120] or '(malformed)'
+            _t = f"[{_chain}] rejected: {'; '.join(why[:2]) if why else 'unknown'}"
+            if _t not in self._llm_seq_rejects:
+                self._llm_seq_rejects.append(_t)
+        except Exception:
+            pass
+
+    def _llm_reject_block(self) -> str:
+        """직전 라운드들의 거절·보정 사유 블록. 없으면 빈 문자열."""
+        lines = []
+        if self._llm_seq_rejects:
+            lines.append("Your previous sequences that were REJECTED WHOLE (a chain is discarded "
+                         "if ANY member is invalid — the remaining members are NOT used):")
+            lines += [f"  {t}" for t in list(self._llm_seq_rejects)[-4:]]
+        if self._llm_repairs:
+            lines.append("Fields the fuzzer had to REPAIR before sending (your value was out of "
+                         "spec; the repaired value is what actually reached the device):")
+            lines += [f"  {t}" for t in list(self._llm_repairs)[-4:]]
+        return ("\n".join(lines) + "\n\n") if lines else ""
 
     @staticmethod
     def _llm_cull_protected(seed) -> bool:
@@ -7883,11 +8109,15 @@ class NVMeFuzzer:
         # v9.5 matched-contrastive: device 응답(sc)이 있는 실행만 명령별 변이 풀에 기록. 나중에
         #   같은 명령의 '한 필드만 다른데 결과가 갈린' 쌍을 뽑아 LLM 프롬프트의 대조 예시로 쓴다.
         if _led_sc is not None and rc not in (self.RC_TIMEOUT, self.RC_ERROR):
-            self._contrast_pool[cmd.name].append({
+            # v10: 버킷 키를 cmd.name → track_key(실제 wire 명령)로. opcode_override 로
+            #   다른 명령이 된 실행이 원래 명령 버킷에 섞이던 것을 없앤다.
+            #   레코드는 의도(*_override)가 아니라 **실제 발송값**(_last_wire)을 담는다.
+            _w = self._last_wire or {}
+            self._contrast_pool[track_key].append({
                 'cdw2': seed.cdw2, 'cdw3': seed.cdw3, 'cdw10': seed.cdw10, 'cdw11': seed.cdw11,
                 'cdw12': seed.cdw12, 'cdw13': seed.cdw13, 'cdw14': seed.cdw14, 'cdw15': seed.cdw15,
-                'data_len': (len(fuzz_data) if fuzz_data is not None else 0),
-                'opcode_override': seed.opcode_override, 'nsid_override': seed.nsid_override,
+                'queue': _w.get('queue'), 'opcode': _w.get('opcode'), 'nsid': _w.get('nsid'),
+                'xfer_len': _w.get('xfer_len'), 'payload_h': _w.get('payload_h'),
                 'sc': _led_sc, 'new_pcs': new_pcs, 'prov_id': _led_prov,
             })
 
@@ -8136,11 +8366,14 @@ class NVMeFuzzer:
         #   비활성이면 두 메서드 모두 즉시 return(오버헤드 무시). corpus 변이는 여기(메인 스레드)서만.
         if self.llm.enabled:
             _now_mono = time.monotonic()
+            # ★ drain 을 submit 보다 **먼저**. 완료된 응답이 큐에 앉아 있는 채로 다음 요청을
+            #   만들던 순서를 뒤집는다(경합 창 축소). 워커가 drain 직후 끝날 수도 있으므로
+            #   이것만으로 안전해지지는 않는다 — 정합성은 요청별 ctx 가 보장한다.
+            self._llm_drain_and_apply()
             if _now_mono - self._llm_last_attempt_ts >= RAG_REQUEST_INTERVAL:
                 self._llm_last_attempt_ts = _now_mono
                 self._llm_maybe_submit()
                 self._llm_log_stats()          # B: 요청 낼 때마다 기여도 요약
-            self._llm_drain_and_apply()
 
         # state monitoring
         if (self.config.state_enabled
@@ -11770,6 +12003,7 @@ class NVMeFuzzer:
         #   **전부**가 합법적으로 EINVAL 을 낼 수 있었다. 상한이 틀렸던 것이 문제였다.
         MAX_DATA_BUF = self._max_xfer_bytes()
         self._last_nvme_status = None   # v9.1: 이 send 의 NVMe status(성공=0, device status=full, errno/미전송=None)
+        self._last_wire = None          # v10: 이 send 의 **실제 발송값**(대조 예시 정확도용)
         self._last_cmd_submitted = True  # v9.7 ③: errno 거부 시에만 False (아래 rc 처리부)
 
         # --- override 필드 적용 ---
@@ -12018,6 +12252,25 @@ class NVMeFuzzer:
                 nvme_cmd.extend([f'--input-file={input_file}', '-w'])
             else:
                 nvme_cmd.append('-r')
+
+        # v10: **실제로 나간 값** 스냅샷. seed 의 *_override 는 '의도'일 뿐이고,
+        #   NSID guard 정규화·opcode/queue 재해석·MDTS 클램프를 거친 결과가 이것이다.
+        #   대조 예시가 "이 필드만 다르다"고 단정하려면 비교 대상이 의도가 아니라
+        #   실제 발송값이어야 한다(예전엔 force_admin 이 기록조차 안 돼, admin↔io 로
+        #   큐가 갈린 두 실행이 "cdw10 만 다르다"로 LLM 에 제시됐다).
+        #   ※ 해시 대상만 잘라서 넘긴다 — data[:data_len] 전량 복사는 MDTS 크기(수백 KB~
+        #     수 MB) write 마다 발생해 hot loop 에서 무시 못 할 비용이 된다.
+        _pl = data[:min(data_len, 4096)] if (write_data and data_len > 0 and data) else b''
+        self._last_wire = {
+            'queue': "admin" if passthru_type == "admin-passthru" else "io",
+            'opcode': actual_opcode,
+            'nsid': actual_nsid,
+            'xfer_len': data_len,
+            # 앞 4KB 프리픽스 해시 — '같은 길이 다른 내용'을 가르는 용도. 전량 해시는
+            # MDTS 크기(수백 KB)를 매 명령 돌려야 해서 비용이 크다. 4KB 뒤쪽만 다른
+            # 페이로드는 같은 것으로 보이지만, 이 용도(대조쌍 선별)에는 충분하다.
+            'payload_h': (hashlib.blake2b(_pl, digest_size=6).hexdigest() if _pl else None),
+        }
 
         # 재현 TC 히스토리 기록 (crash 시 replay .sh 생성에 사용)
         # replay 경로(record_history=False)에서는 _cmd_history를 오염시키지 않음.
