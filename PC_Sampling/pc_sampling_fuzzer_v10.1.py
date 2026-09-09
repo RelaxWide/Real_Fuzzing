@@ -5148,186 +5148,260 @@ class NVMeFuzzer:
                         f"{stderr_data.decode(errors='replace').strip()}")
 
     def _log_state_snapshot(self):
-        """state_fields.py에 정의된 모든 필드를 읽어 human-readable 형태로 로그에 기록.
-        퍼징 시작 시 1회 + 이후 10000회마다 호출."""
-        log.warning("[State-Snap] ══════════════ State Fields Snapshot ══════════════")
-        log.warning(f"[State-Snap] exec={self.executions:,}  "
-                    f"state-cov={len(self.state_cov_map)}  "
-                    f"state-corpus={len(self.state_corpus)}")
+        """상태 스냅샷 — 퍼징 시작 시 1회 + 이후 10000회마다.
 
-        # ── SMART (LID 02h) ───────────────────────────────────────────
-        smart_fields = [f for f in self.config.state_fields if f['source'] == 'smart']
-        if smart_fields:
+        2부 구성:
+          PART 1  가능한 정보를 **전부** 덤프. smart-log 는 파싱된 전 키, 전체
+                  레이아웃 표(log_layouts)가 있는 로그 페이지는 전 필드. 표가 없는
+                  LID/security_recv 는 레이아웃 미상이라 추측해서 찍지 않는다.
+          PART 2  그중 **state 모니터링 대상만** 한 표로 정리. 값 + 최초 관측값(init)
+                  대비 Δ + 현재 매핑되는 state 버킷까지 보여줘, state coverage 가
+                  실제로 무엇을 보고 있는지 한눈에 확인할 수 있게 한다.
+
+        소스는 한 번씩만 읽고 두 파트가 그 결과를 공유한다(장치 호출 중복 없음).
+        id-ctrl/id-ns 는 바로 앞 _log_device_info() 가, smart-log 원문은 _log_smart()
+        가 이미 출력하므로 여기서 원문을 다시 찍지는 않는다.
+        """
+        _SMART_TEXT_KEY_MAP = {
+            'percent_used': 'percentage_used',
+            'avail_spare': 'available_spare',
+            'spare_thresh': 'available_spare_threshold',
+            'warning_temp_time': 'warning_temperature_time',
+            'critical_comp_time': 'critical_composite_temperature_time',
+        }
+        _w = lambda m: log.warning(f"[State-Snap] {m}")
+
+        _w("═" * 78)
+        _w(f"State Fields Snapshot   exec={self.executions:,}  "
+           f"state-cov={len(self.state_cov_map)}  state-corpus={len(self.state_corpus)}")
+
+        fields = list(self.config.state_fields)
+
+        # ── 수집 (소스별 1회) ────────────────────────────────────────
+        smart_ordered = []          # [(key, raw_value_str)] — smart-log 출력 순서 보존
+        smart_text = {}             # {key: int}
+        vendor_raw = {}             # {lid: bytes}
+        vendor_len = {}             # {lid: 요청 log_len}
+        sec_raw = {}                # {(secp,spsp,nsid): bytes}
+        errors = []                 # 읽기 실패 기록 (PART 1 에 그대로 노출)
+
+        if any(f['source'] == 'smart' for f in fields):
             try:
-                proc = _run_nvme_state_cmd(
-                    ['nvme', 'smart-log', self.config.nvme_device])
+                proc = _run_nvme_state_cmd(['nvme', 'smart-log', self.config.nvme_device])
                 raw_out = proc.stdout or proc.stderr
-                smart_text: Dict[str, int] = {}
                 for line in raw_out.decode(errors='replace').splitlines():
                     if ':' not in line:
                         continue
                     k, _, v = line.partition(':')
                     k = k.strip().lower().replace(' ', '_')
-                    v = v.strip().split()[0].rstrip('%').replace(',', '') if v.strip() else ''
+                    vs = v.strip()
+                    if not k:
+                        continue
+                    smart_ordered.append((k, vs))
                     try:
-                        smart_text[k] = int(v, 0)
-                    except ValueError:
+                        smart_text[k] = int(vs.split()[0].rstrip('%').replace(',', ''), 0)
+                    except (ValueError, IndexError):
                         pass
-                _SMART_TEXT_KEY_MAP = {
-                    'percent_used': 'percentage_used',
-                    'avail_spare': 'available_spare',
-                    'spare_thresh': 'available_spare_threshold',
-                    'warning_temp_time': 'warning_temperature_time',
-                    'critical_comp_time': 'critical_composite_temperature_time',
-                }
-                log.warning("[State-Snap] ── LID 02h SMART / Health ──────────────────")
-                for f in smart_fields:
-                    text_key = _SMART_TEXT_KEY_MAP.get(f['key'], f['key'])
-                    val = smart_text.get(text_key)
-                    if val is not None:
-                        log.warning(f"[State-Snap]   {f['name']:<30s} = {val:>12,}   ({f['desc']})")
-                    else:
-                        log.warning(f"[State-Snap]   {f['name']:<30s} = {'N/A':>12}   ({f['desc']})")
-            except Exception as e:
-                log.warning(f"[State-Snap] SMART 읽기 실패: {e}")
+            except Exception as ex:
+                errors.append(f"smart-log 읽기 실패: {ex}")
 
-        # ── Vendor log (LID별 1회) ────────────────────────────────────
-        vendor_lids: Dict[int, int] = {}
-        for f in self.config.state_fields:
+        for f in fields:
             if f['source'] == 'vendor':
-                vendor_lids[f['lid']] = f['log_len']
-
-        for lid, log_len in sorted(vendor_lids.items()):
+                vendor_len.setdefault(f['lid'], f['log_len'])
+        for lid, log_len in sorted(vendor_len.items()):
             try:
                 proc = _run_nvme_state_cmd(
                     ['nvme', 'get-log', self.config.nvme_device,
                      f'--log-id={lid:#x}', f'--log-len={log_len}', '--raw-binary'])
                 if proc.returncode != 0:
-                    log.warning(f"[State-Snap] LID={lid:#x} 실패: "
-                                f"{proc.stderr.decode(errors='replace').strip()}")
+                    errors.append(f"LID {lid:#04x} 실패(rc={proc.returncode}): "
+                                  f"{proc.stderr.decode(errors='replace').strip()}")
                     continue
-                raw = proc.stdout
-                _layout = LOG_LAYOUTS.get(lid)
-                if _layout:
-                    # v10.1: 이 LID 의 **전체 레이아웃 표**가 있으면 모니터링 대상뿐 아니라
-                    #   전 필드를 찍는다. 모니터링 중인 offset 에는 '*' 와 내부 필드명을 붙여
-                    #   "무엇을 state 로 보고 있는지"가 표에서 바로 보이게 한다.
-                    #   표가 없는 LID(0x01/0xDF)는 아래 else 로 — 레이아웃 미상이라 추측하지 않는다.
-                    # ★ 키는 offset 만. 16B 누적 카운터는 값이 너무 커서 **하위 8B 만**
-                    #   모니터링하므로 (offset, length) 정확 일치로 찾으면 그 필드들이
-                    #   영영 '*' 표시를 못 받는다(실측 확인). 길이가 다르면 그 사실을 병기한다.
-                    _mon = {}
-                    for f in self.config.state_fields:
-                        if f['source'] == 'vendor' and f.get('lid') == lid:
-                            _mon[f['offset']] = (f['name'], f['length'])
-                    _flds = _layout['fields']
-                    log.warning(f"[State-Snap] ── LID {lid:#04x} ({log_len}B) "
-                                f"{_layout['name']} — 전체 {len(_flds)} 필드 "
-                                f"(* = state 모니터링 대상 {len(_mon)}개) ──")
-                    for lf in _flds:
-                        _o, _l = int(lf['offset']), int(lf['length'])
-                        _nm = str(lf.get('name', '?'))
-                        _mk, _ml = _mon.get(_o, (None, None))
-                        _tag = '*' if _mk else ' '
-                        if _o + _l > len(raw):
-                            _vs = 'SHORT'
-                        else:
-                            _v = int.from_bytes(raw[_o:_o + _l],
-                                                lf.get('endian', 'little'))
-                            # 8B 초과(16B 누적 카운터 등)는 십진이 너무 길어 hex 로.
-                            _vs = f'{_v:,}' if _l <= 8 else f'0x{_v:0{_l * 2}x}'
-                        _sfx = ''
-                        if _mk:
-                            _sfx = f"   → {_mk}" + (f" (하위 {_ml}B 만)" if _ml != _l else "")
-                        log.warning(f"[State-Snap]  {_tag} [{_o:3d}:{_l:2d}] {_nm:<42s} "
-                                    f"= {_vs}{_sfx}")
-                else:
-                    log.warning(f"[State-Snap] ── LID {lid:#04x} ({log_len}B) ──────────────────")
-                    for f in self.config.state_fields:
-                        if f['source'] != 'vendor' or f.get('lid') != lid:
-                            continue
-                        start, end = f['offset'], f['offset'] + f['length']
-                        if end > len(raw):
-                            log.warning(f"[State-Snap]   {f['name']:<30s} = {'SHORT':>12}   ({f['desc']})")
-                            continue
-                        val = int.from_bytes(raw[start:end], f.get('endian', 'little'))
-                        log.warning(f"[State-Snap]   {f['name']:<30s} = {val:>12,}   ({f['desc']})")
-            except Exception as e:
-                log.warning(f"[State-Snap] LID={lid:#x} 읽기 실패: {e}")
+                vendor_raw[lid] = proc.stdout
+            except Exception as ex:
+                errors.append(f"LID {lid:#04x} 예외: {ex}")
 
-        # ── Security Receive (secp/spsp 그룹별 Send→Recv) ────────────────
-        sec_groups: Dict[tuple, int] = {}
-        for f in self.config.state_fields:
+        sec_groups = {}
+        for f in fields:
             if f['source'] == 'security_recv':
                 key = (f['secp'], f['spsp'], f.get('nsid', 0))
                 sec_groups[key] = max(sec_groups.get(key, 0), f['size'])
-
         _DUMMY_PATH = '/tmp/nvme_sec_dummy.bin'
         if sec_groups and not os.path.exists(_DUMMY_PATH):
             try:
                 with open(_DUMMY_PATH, 'wb') as _df:
                     _df.write(b'\x00' * 4)
-            except Exception as e:
-                log.warning(f"[State-Snap] dummy 파일 생성 실패: {e}")
-
+            except Exception as ex:
+                errors.append(f"dummy 파일 생성 실패: {ex}")
         for (secp, spsp, nsid), size in sorted(sec_groups.items()):
             try:
-                send_cmd = [
-                    'nvme', 'security-send', self.config.nvme_device,
-                    '-p', f'{secp:#x}', '-s', f'{spsp:#x}', '-t', '4',
-                    '-f', _DUMMY_PATH,
-                ]
+                send_cmd = ['nvme', 'security-send', self.config.nvme_device,
+                            '-p', f'{secp:#x}', '-s', f'{spsp:#x}', '-t', '4',
+                            '-f', _DUMMY_PATH]
                 if nsid:
                     send_cmd += ['-n', str(nsid)]
                 proc_s = _run_nvme_state_cmd(send_cmd)
                 if proc_s.returncode not in (0, 1):
-                    log.warning(f"[State-Snap] security-send secp={secp:#x} spsp={spsp:#x} "
-                                f"실패 rc={proc_s.returncode}: "
-                                f"{proc_s.stderr.decode(errors='replace').strip()}")
+                    errors.append(f"security-send {secp:#x}/{spsp:#x} 실패 "
+                                  f"rc={proc_s.returncode}: "
+                                  f"{proc_s.stderr.decode(errors='replace').strip()}")
                     continue
-
-                recv_cmd = [
-                    'nvme', 'security-recv', self.config.nvme_device,
-                    '-p', f'{secp:#x}', '-s', f'{spsp:#x}',
-                    '-x', str(size), '-t', str(size),
-                ]
+                recv_cmd = ['nvme', 'security-recv', self.config.nvme_device,
+                            '-p', f'{secp:#x}', '-s', f'{spsp:#x}',
+                            '-x', str(size), '-t', str(size)]
                 if nsid:
                     recv_cmd += ['-n', str(nsid)]
                 proc_r = _run_nvme_state_cmd(recv_cmd, merge_stderr=True)
                 if proc_r.returncode != 0:
-                    log.warning(f"[State-Snap] security-recv secp={secp:#x} spsp={spsp:#x} "
-                                f"실패 rc={proc_r.returncode}: "
-                                f"{proc_r.stdout.decode(errors='replace').strip()}")
+                    errors.append(f"security-recv {secp:#x}/{spsp:#x} 실패 "
+                                  f"rc={proc_r.returncode}: "
+                                  f"{proc_r.stdout.decode(errors='replace').strip()[:120]}")
                     continue
-
-                raw = NVMeStateMonitor._parse_sec_hex(
-                    proc_r.stdout.decode(errors='replace'))
+                raw = NVMeStateMonitor._parse_sec_hex(proc_r.stdout.decode(errors='replace'))
                 if not raw:
-                    log.warning(f"[State-Snap] sec-recv hex 파싱 실패")
+                    errors.append(f"security-recv {secp:#x}/{spsp:#x} hex 파싱 실패")
                     continue
                 if raw[0] != (spsp & 0xFF):
-                    log.warning(f"[State-Snap] sec-recv magic 불일치: "
-                                f"raw[0]={raw[0]:#04x} expected={spsp & 0xFF:#04x}")
+                    errors.append(f"security-recv {secp:#x}/{spsp:#x} magic 불일치: "
+                                  f"raw[0]={raw[0]:#04x} 기대={spsp & 0xFF:#04x}")
                     continue
-                log.warning(f"[State-Snap] ── Security Recv secp={secp:#x} spsp={spsp:#x} "
-                            f"({size}B) ──────────")
-                for f in self.config.state_fields:
-                    if (f['source'] != 'security_recv'
-                            or f['secp'] != secp
-                            or f['spsp'] != spsp
-                            or f.get('nsid', 0) != nsid):
-                        continue
-                    start, end = f['offset'], f['offset'] + f['length']
-                    if end > len(raw):
-                        log.warning(f"[State-Snap]   {f['name']:<30s} = {'SHORT':>12}   ({f['desc']})")
-                        continue
-                    val = int.from_bytes(raw[start:end], f.get('endian', 'little'))
-                    log.warning(f"[State-Snap]   {f['name']:<30s} = {val:>12,}   ({f['desc']})")
-            except Exception as e:
-                log.warning(f"[State-Snap] security-recv secp={secp:#x} spsp={spsp:#x} "
-                            f"예외: {e}")
+                sec_raw[(secp, spsp, nsid)] = raw
+            except Exception as ex:
+                errors.append(f"security-recv {secp:#x}/{spsp:#x} 예외: {ex}")
 
-        log.warning("[State-Snap] ════════════════════════════════════════════════════")
+        # ── PART 1 — 가능한 정보 전체 ────────────────────────────────
+        _w("")
+        _w("┏━━ PART 1 ─ 장치가 주는 정보 전체 " + "━" * 42)
+
+        if smart_ordered:
+            _w(f"┃ ── SMART / Health (LID 02h) — smart-log 전 항목 {len(smart_ordered)}개 ──")
+            for k, vs in smart_ordered:
+                _w(f"┃    {k:<46s} = {vs}")
+        elif any(f['source'] == 'smart' for f in fields):
+            _w("┃ ── SMART / Health (LID 02h) — 읽기 실패 ──")
+
+        for lid in sorted(vendor_len):
+            log_len = vendor_len[lid]
+            raw = vendor_raw.get(lid)
+            layout = LOG_LAYOUTS.get(lid)
+            if raw is None:
+                _w(f"┃ ── LID {lid:#04x} ({log_len}B) — 읽기 실패 ──")
+                continue
+            if not layout:
+                # 전체 레이아웃 표가 없으면 추측해서 찍지 않는다. 감시 중인 offset 은 PART 2 에.
+                _n = sum(1 for f in fields if f['source'] == 'vendor' and f.get('lid') == lid)
+                _w(f"┃ ── LID {lid:#04x} ({log_len}B) — {len(raw)}B 수신. 전체 레이아웃 표 없음 "
+                   f"→ 감시 중인 {_n}개 offset 은 PART 2 참조 ──")
+                continue
+            _flds = layout['fields']
+            # 감시 중인 offset 에 '*' 와 내부 필드명을 병기 — 45개 표에서 무엇을 state 로
+            #   보고 있는지 바로 대조된다. 키는 offset 만(16B 필드를 하위 8B 만 감시하는 등
+            #   길이가 다를 수 있어 (offset,length) 정확일치로 찾으면 표시가 누락된다).
+            _mon = {}
+            for f in fields:
+                if f['source'] == 'vendor' and f.get('lid') == lid:
+                    _mon[f['offset']] = (f['name'], f['length'])
+            _w(f"┃ ── LID {lid:#04x} ({log_len}B) {layout['name']} — 전체 {len(_flds)} 필드 "
+               f"(* = state 모니터링 {len(_mon)}개) ──")
+            for lf in _flds:
+                _o, _l = int(lf['offset']), int(lf['length'])
+                _nm = str(lf.get('name', '?'))
+                if _o + _l > len(raw):
+                    _vs = 'SHORT'
+                else:
+                    _v = int.from_bytes(raw[_o:_o + _l], lf.get('endian', 'little'))
+                    if _l > 8:
+                        _vs = f'0x{_v:0{_l * 2}x}'          # 16B 누적 카운터: 십진이 너무 길다
+                    elif _v > 0xFFFFFFFF:
+                        # 상위 32비트가 살아있는 8B 값은 순수 카운터가 아닐 수 있다
+                        # (실측: System Area *Fail = [하위4B raw][상위4B normalized=100]).
+                        # 십진만 보면 구조가 안 보여 hex 를 함께 찍는다.
+                        _vs = f'{_v:,} (0x{_v:0{_l * 2}x})'
+                    else:
+                        _vs = f'{_v:,}'
+                _mk, _ml = _mon.get(_o, (None, None))
+                _tag = '*' if _mk else ' '
+                _sfx = ''
+                if _mk:
+                    _sfx = f"   → {_mk}" + (f" (하위 {_ml}B 만)" if _ml != _l else "")
+                # 표기는 스펙 원문과 같은 **끝:시작** (예: 31:16 = offset 16, 16 bytes)
+                _w(f"┃  {_tag} [{_o + _l - 1:3d}:{_o:3d}] {_nm:<44s} = {_vs}{_sfx}")
+
+        for (secp, spsp, nsid), size in sorted(sec_groups.items()):
+            raw = sec_raw.get((secp, spsp, nsid))
+            if raw is None:
+                _w(f"┃ ── Security Recv secp={secp:#x} spsp={spsp:#x} ({size}B) — 읽기 실패 ──")
+                continue
+            _n = sum(1 for f in fields if f['source'] == 'security_recv'
+                     and (f['secp'], f['spsp'], f.get('nsid', 0)) == (secp, spsp, nsid))
+            _w(f"┃ ── Security Recv secp={secp:#x} spsp={spsp:#x} ({size}B) — {len(raw)}B 수신. "
+               f"전체 레이아웃 표 없음 → 감시 중인 {_n}개 offset 은 PART 2 참조 ──")
+
+        if errors:
+            _w("┃ ── 읽기 실패 ──")
+            for msg in errors:
+                _w(f"┃    ! {msg}")
+        _w("┗" + "━" * 76)
+
+        # ── PART 2 — state 모니터링 대상만 ───────────────────────────
+        _inits = getattr(self.state_monitor, '_init_values', {}) or {}
+        vals = {}          # derived 계산 입력 겸 출력용
+
+        def _src_tag(f):
+            s = f['source']
+            if s == 'vendor':
+                return f"vendor:{f['lid']:#04x}"
+            if s == 'security_recv':
+                return f"sec:{f['secp']:#x}/{f['spsp']:#x}"
+            return s
+
+        rows = []
+        for f in fields:
+            name, src = f['name'], f['source']
+            val = None
+            if src == 'smart':
+                val = smart_text.get(_SMART_TEXT_KEY_MAP.get(f['key'], f['key']))
+            elif src == 'vendor':
+                raw = vendor_raw.get(f['lid'])
+                if raw is not None and f['offset'] + f['length'] <= len(raw):
+                    val = int.from_bytes(
+                        raw[f['offset']:f['offset'] + f['length']], f.get('endian', 'little'))
+            elif src == 'security_recv':
+                raw = sec_raw.get((f['secp'], f['spsp'], f.get('nsid', 0)))
+                if raw is not None and f['offset'] + f['length'] <= len(raw):
+                    val = int.from_bytes(
+                        raw[f['offset']:f['offset'] + f['length']], f.get('endian', 'little'))
+            elif src == 'derived':
+                # raw 필드를 다 채운 뒤 계산 — capture() 와 같은 순서/공식.
+                val = NVMeStateMonitor._compute_derived(f, vals)
+            if val is not None:
+                vals[name] = val
+            rows.append((f, val))
+
+        _got = sum(1 for _, v in rows if v is not None)
+        _w("")
+        _w(f"┏━━ PART 2 ─ state 모니터링 대상 {len(rows)}개 (수집 {_got} / 미수집 {len(rows) - _got}) "
+           + "━" * 14)
+        _w(f"┃ {'source':<14s} {'field':<26s} {'value':>18s} {'Δinit':>12s}  "
+           f"{'bucket':<12s} desc")
+        for f, val in rows:
+            name = f['name']
+            if val is None:
+                _w(f"┃ {_src_tag(f):<14s} {name:<26s} {'N/A':>18s} {'-':>12s}  "
+                   f"{'-':<12s} {f.get('desc', '')}")
+                continue
+            _vs = f'{val:,}' if val < 10 ** 15 else f'0x{val:x}'
+            _init = _inits.get(name)
+            if _init is None:
+                _ds, _bk = '(미등록)', '-'
+            else:
+                _d = val - _init
+                _ds = f'{_d:+,}'
+                _bk = NVMeStateMonitor._adaptive_bucket(name, _init, val).split(':', 1)[-1]
+            _w(f"┃ {_src_tag(f):<14s} {name:<26s} {_vs:>18s} {_ds:>12s}  "
+               f"{_bk:<12s} {f.get('desc', '')}")
+        _w("┗" + "━" * 76)
+        _w("═" * 78)
 
     def _prefill_drive(self) -> bool:
         """POR 전 드라이브 전체 영역에 랜덤 데이터 쓰기 (GC/Wear Leveling 트리거용).
