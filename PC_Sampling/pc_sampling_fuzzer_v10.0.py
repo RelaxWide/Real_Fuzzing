@@ -17,8 +17,9 @@ Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/�
 - Defect:   timeout 시 stuck PC 분석 → JLink dump → UFAS dump → PC 모니터링.
 
 버전 요약 (한 줄 요약; 상세는 git log / 각 버전 md)
-- v9.8: FW 개선 전 NSID override 불량 재발 방지. 기본 active_only 정책으로 활성
-        namespace를 탐지하고 mutation/LLM/corpus/replay를 그 allowlist 안으로 제한.
+- v9.8: NSID override 정책(active_only/configured_only/fuzz) 도입. active_only 는 활성
+        namespace 를 탐지해 mutation/LLM/corpus/replay 를 그 allowlist 로 제한(opt-in).
+        기본은 제약 없는 fuzz (v10).
 - v9.7: 전송상한 실측화(MDTS) + excluded_opcodes chokepoint 강제 + Write Protection 가드
         (WPS=1 시퀀스 hold 테스트) + telnet 재연결 desync/USB 레이스 수리 + LLM 파서·프롬프트·
         계보·favored/energy 수정 + PM9M1 LNB/HP 분리 + APST 파싱.
@@ -494,12 +495,12 @@ _WRITE_PROTECT_FID   = 0x84
 _WPS_WRITE_PROTECT   = 0x1     # 유일하게 in-band 가역 확인된 상태(발송 허용 + auto-clear)
 WRITE_PROTECT_TEST   = bool(_ST.get('write_protect_test', True))  # False = WPS!=0 전부 차단
 
-# v9.8: NSID override 정책.
-#   active_only(기본): 시작 시 활성 namespace를 탐지하고 그 집합 안에서만 NSID mutation.
+# NSID override 정책(값 3종).
+#   fuzz(기본): 0/broadcast/미존재/임의 NSID 변이를 제약 없이 그대로 FW에 전달한다.
+#   active_only: 시작 시 활성 namespace를 탐지하고 그 집합 안에서만 NSID mutation.
 #     LLM/기존 corpus/state replay override도 최종 send에서 같은 allowlist로 필터한다.
 #   configured_only: namespace 명령은 --namespace 하나, controller-scope 명령은 0으로 고정.
-#   fuzz: v9.7 동작. 0/broadcast/미존재/임의 NSID 변이를 그대로 FW에 전달한다.
-NSID_OVERRIDE_POLICY = str(_ST.get('nsid_override_policy', 'active_only')).strip().lower()
+NSID_OVERRIDE_POLICY = str(_ST.get('nsid_override_policy', 'fuzz')).strip().lower()
 if NSID_OVERRIDE_POLICY not in ('active_only', 'configured_only', 'fuzz'):
     sys.exit("[FATAL] strategy.nsid_override_policy 는 "
              "'active_only', 'configured_only', 'fuzz' 중 하나여야 합니다.")
