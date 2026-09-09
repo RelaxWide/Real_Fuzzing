@@ -1882,6 +1882,13 @@ class NVMeStateMonitor:
         #   result(raw 값)로부터 계산해 result 에 주입 → delta/bucket/state-cov 자동 흐름.
         self._derived_fields: List[dict] = [f for f in fields
                                             if f['source'] == 'derived']
+        # v10.1: 변화율(Δ) 기반 파생값을 위해 **직전 캡처**를 보관한다. capture() 마지막에 갱신되므로
+        #   Δ 의 창 = "직전 capture 이후"(주기 관측 100회 간격 또는 워크로드 버스트 스냅 간격).
+        self._prev_raw: Optional[Dict[str, int]] = None
+        # WAF 자가보정 기준: ΔNAND쓰기/Δ호스트쓰기 의 캠페인 최소비. NAND 기록량의 단위를 모르므로
+        #   스펙 대신 **관측 최소치**(가장 순차적이었던 구간 = WAF≈1 로 가정)로 나눠 배율을 얻는다.
+        #   ⚠ 캠페인 내내 순수 순차 구간이 없으면 기준이 부풀어 WAF 를 과소평가한다.
+        self._waf_rmin: Optional[float] = None
 
     def capture(self) -> Optional[Dict[str, int]]:
         """활성 필드 기준으로 필요한 nvme 명령만 실행.
@@ -2084,17 +2091,117 @@ class NVMeStateMonitor:
                 self._init_values[name] = val
                 log.info(f"[State] init_value 등록: {name}={val:,}")
         log.info(f"[State] capture 완료: 총 {len(result)}개 필드 수집")
+        self._prev_raw = dict(result)   # 다음 캡처의 Δ 기준 (파생값 포함, 무해)
         return result
 
-    @staticmethod
-    def _compute_derived(f: dict, raw: Dict[str, int]) -> Optional[int]:
-        """source='derived' 필드를 raw 필드 값에서 계산.
-        현재 fn: 'frag_pressure'(FFM). 계산 불가(입력 전무) 시 None."""
+    def _compute_derived(self, f: dict, raw: Dict[str, int],
+                         calibrate: bool = True) -> Optional[int]:
+        """source='derived' 필드를 raw 필드 값에서 계산. 계산 불가 시 None.
+        fn: frag_pressure(v1, 보존) / frag_pressure_v2 / waf_x100 / ratio_pct.
+
+        calibrate=False: WAF 자가보정 기준(_waf_rmin)을 **갱신하지 않는다**. 진단 출력
+        (_log_state_snapshot)처럼 정규 관측 창이 아닌 경로에서 호출될 때 쓴다 — 거기서
+        나온 엉뚱한 비율이 기준을 끌어내리면 이후 WAF 가 전부 부풀려진다."""
         fn = f.get('fn', 'frag_pressure')
+        ins = f.get('inputs', [])
         if fn == 'frag_pressure':
-            return NVMeStateMonitor._derive_frag_pressure(f.get('inputs', []), raw)
+            return NVMeStateMonitor._derive_frag_pressure(ins, raw)
+        if fn == 'waf_x100':
+            w = self._waf(ins[0] if ins else {}, raw, calibrate)
+            return None if w is None else int(round(w * 100))
+        if fn == 'ratio_pct':
+            return NVMeStateMonitor._derive_ratio_pct(ins[0] if ins else {}, raw)
+        if fn == 'frag_pressure_v2':
+            return self._derive_frag_pressure_v2(ins, raw, calibrate)
         log.warning(f"[State] 미지원 derived fn='{fn}' (field={f.get('name')})")
         return None
+
+    # ── v10.1 파생 헬퍼 ───────────────────────────────────────────────
+    def _delta(self, name: str, raw: Dict[str, int]) -> Optional[int]:
+        """직전 캡처 대비 증가분. 직전값 없음/감소(리셋·롤오버) 시 None."""
+        if self._prev_raw is None:
+            return None
+        a, b = raw.get(name), self._prev_raw.get(name)
+        if a is None or b is None or a < b:
+            return None
+        return a - b
+
+    def _waf(self, term: dict, raw: Dict[str, int],
+             calibrate: bool = True) -> Optional[float]:
+        """Write Amplification = ΔNAND기록 / Δ호스트기록, 캠페인 최소비로 자가보정.
+
+        매핑 조각화의 직접 대리지표. 순차 쓰기는 GC 가 옮길 게 없어 1.0 부근이고,
+        랜덤 덮어쓰기로 L2P 가 꼬이면 GC 가 valid page 를 대량 복사해 값이 오른다.
+        (충만도만 보던 v1 이 순차쓰기를 더 높게 보상하던 역방향 문제의 해소 지점.)
+        단위: 호스트는 1000×512B, NAND 는 미상 → 최소비를 WAF=1 로 보고 나눈다."""
+        dn = self._delta(term.get('field', ''), raw)
+        dh = self._delta(term.get('field2', ''), raw)
+        if dn is None or dh is None or dh <= 0:
+            return None            # 호스트 쓰기가 없던 구간은 WAF 정의 불가
+        r = dn / dh
+        if r <= 0:
+            return None
+        if calibrate and (self._waf_rmin is None or r < self._waf_rmin):
+            self._waf_rmin = r
+        if self._waf_rmin is None:
+            return None            # 기준 미확립 상태에서 진단 경로 호출 → 정규화 불가
+        return r / self._waf_rmin
+
+    @staticmethod
+    def _derive_ratio_pct(term: dict, raw: Dict[str, int]) -> Optional[int]:
+        """두 누적값의 비율(%) — 예: SLC 기록량 / 전체 NAND 기록량."""
+        a, b = raw.get(term.get('field', '')), raw.get(term.get('field2', ''))
+        if a is None or b is None or b <= 0:
+            return None
+        return int(round(100.0 * a / b))
+
+    def _derive_frag_pressure_v2(self, inputs: list, raw: Dict[str, int],
+                                 calibrate: bool = True) -> Optional[int]:
+        """FFM v2 — FTL dirty(매핑 꼬임) 지수 [0..100].
+
+        v1 은 free%/SLC%/sys%/PE skew/수명 **다섯 개 전부 '얼마나 찼나·닳았나'** 라
+        매핑이 얼마나 꼬였는지를 재는 항이 하나도 없었다. 그래서 순차 쓰기로 채우면
+        값이 올라가고(매핑은 깨끗한데) 좁은 영역 랜덤 덮어쓰기는 free block 이 평형이라
+        값이 안 움직여(매핑은 꼬이는데), **원하는 워크로드에 벌을 주고 있었다.**
+
+        v2 는 주축을 WAF 로 바꾼다:
+          dirty    (0.55) WAF 정규화 — 조각화 직접 대리
+          activity (0.30) GC/relocation 이벤트 Δ 합 — 내부 로직이 실제로 도는 중인가
+          fill     (0.15) 충만도 — 배경(GC 가 돌 여건인가)
+        가용한 항의 가중치로 재정규화(제품/구간 무관 degrade). 전부 불가면 None."""
+        num = den = 0.0
+        for t in inputs:
+            kind = t.get('kind', 'pct')
+            w = float(t.get('weight', 1.0))
+            val = None
+            if kind == 'waf_norm':
+                waf = self._waf(t, raw, calibrate)
+                if waf is not None:
+                    ref = float(t.get('ref', 4.0))
+                    val = (waf - 1.0) / max(ref - 1.0, 1e-9)
+            elif kind == 'rate_sum':
+                ds = [self._delta(n, raw) for n in t.get('fields', [])]
+                ds = [d for d in ds if d is not None]
+                if ds:
+                    ref = float(t.get('ref', 32))
+                    val = math.log2(1 + sum(ds)) / math.log2(1 + max(ref, 1))
+            elif kind == 'inv_pct':
+                v = raw.get(t.get('field', ''))
+                if v is not None:
+                    val = (100.0 - v) / 100.0
+            elif kind == 'pct':
+                v = raw.get(t.get('field', ''))
+                if v is not None:
+                    val = v / 100.0
+            else:
+                log.warning(f"[State] 미지원 FFM v2 term kind='{kind}'")
+            if val is None:
+                continue
+            num += min(1.0, max(0.0, val)) * w
+            den += w
+        if den <= 0:
+            return None
+        return int(round(100.0 * num / den))
 
     @staticmethod
     def _derive_frag_pressure(inputs: list, raw: Dict[str, int]) -> Optional[int]:
@@ -5391,7 +5498,12 @@ class NVMeFuzzer:
                         raw[f['offset']:f['offset'] + f['length']], f.get('endian', 'little'))
             elif src == 'derived':
                 # raw 필드를 다 채운 뒤 계산 — capture() 와 같은 순서/공식.
-                val = NVMeStateMonitor._compute_derived(f, vals)
+                #   Δ 기반 항(WAF/activity)은 monitor 의 직전 캡처를 기준으로 계산되므로
+                #   이 스냅샷 자체의 창이 아니라 "직전 주기 관측 이후" 값이다(진단용으로 충분).
+                _mon = getattr(self, 'state_monitor', None)
+                # calibrate=False: 진단 출력이 WAF 보정 기준을 건드리지 않게(위 주석 참조).
+                val = (_mon._compute_derived(f, vals, calibrate=False)
+                       if _mon is not None else None)
             if val is not None:
                 vals[name] = val
             rows.append((f, val))
@@ -6575,12 +6687,23 @@ class NVMeFuzzer:
         _dir = ("up (fragmentation/GC pressure rising)" if (_delta or 0) > 0
                 else "down (GC/relocation completing, blocks reclaimed)" if (_delta or 0) < 0
                 else "flat")
+        # v10.1: PARTIAL 기준을 ffm_range → ΔWAF 로. ffm_range 는 GC 가 이미 끝나 free block 이
+        #   회복된 경우에도 커서 "임계 근처에 머무는 것"과 "지나쳐버린 것"을 구분 못 했고,
+        #   순차 쓰기(매핑 깨끗)에도 반응해 원하는 워크로드와 반대로 보상했다. ΔWAF 는
+        #   GC 가 valid page 를 실제로 옮겼을 때만 오른다 = 매핑이 꼬였다는 직접 증거.
+        _wd = r.get('waf_delta')
         if _new_states > 0:
             verdict = (f"SUCCESS: it drove {_new_states} NEW internal state(s) — this pattern reaches "
                        f"un-exercised firmware logic. Push further / vary params around it.")
+        elif _wd and _wd > 0:
+            verdict = (f"PARTIAL: write amplification rose (WAF {r.get('waf_start')}→"
+                       f"{r.get('waf_peak')}, x100) — the FTL is copying valid pages, i.e. the "
+                       f"logical-to-physical mapping is getting fragmented. Keep this pattern and "
+                       f"push the working set / overwrite ratio further.")
         elif _ffm_range and _ffm_range > 0:
-            verdict = ("PARTIAL: it moved FTL state (FFM oscillated) but produced no NEW distinct state. "
-                       "Vary parameters (span/block_size/hot_fraction) to cross a new threshold.")
+            verdict = ("WEAK: FTL state oscillated but write amplification did not rise — the mapping "
+                       "is probably still clean (sequential-like). Use smaller random overwrites over "
+                       "a bounded span to tangle the mapping instead of just filling the drive.")
         else:
             verdict = ("NO EFFECT: internal state did not move. Try a different pattern or a larger "
                        "working-set / churn to force GC/wear/relocation.")
@@ -6588,7 +6711,9 @@ class NVMeFuzzer:
                 f"lba_span={d.get('lba_span')}, block_size={d.get('block_size')}, "
                 f"hot_fraction={d.get('hot_fraction')}, read_ratio={d.get('read_ratio')}}} — "
                 f"FFM {r.get('ffm_start')}→peak {r.get('ffm_peak')}/trough {r.get('ffm_trough')} "
-                f"(Δ{_delta}, moved {_dir}, range {_ffm_range}), new_states={_new_states} "
+                f"(Δ{_delta}, moved {_dir}, range {_ffm_range}), "
+                f"WAF(x100) {r.get('waf_start')}→{r.get('waf_peak')} (Δ{_wd}), "
+                f"new_states={_new_states} "
                 f"over {r.get('blocks')} blocks (stop={r.get('stop')}). {verdict}")
 
     def _corpus_eval_stratified_sample(self, n: int = 40):
@@ -6815,9 +6940,16 @@ class NVMeFuzzer:
             user = (_gp + _fb
                     + "SSD internal state (telemetry — name = value  [description]):\n"
                     + (tele or "  (telemetry unavailable)") + "\n\n"
-                    + "FFM (ffm_frag) is a 0-100 FTL fragmentation/GC-pressure index; higher = closer "
-                      "to GC / wear-leveling / relocation activity. Sustained Read/Write I/O — NOT admin "
-                      "commands — is what moves these fields.\n\n"
+                    + "Your goal is a DIRTY FTL: a logical-to-physical mapping that is heavily "
+                      "fragmented, so the firmware must run GC / valid-page copy / relocation paths.\n"
+                      "  - waf_x100 = write amplification x100 (100 = 1.0). THIS is the direct signal: "
+                      "it only rises when the FTL copies valid pages, i.e. the mapping is tangled. "
+                      "Filling the drive sequentially does NOT raise it — the mapping stays clean.\n"
+                      "  - ffm_frag (0-100) combines WAF (main), GC/relocation activity, and fullness.\n"
+                      "  - slc_fold_pct = share of NAND writes that went to static SLC.\n"
+                      "Small random OVERWRITES over a bounded span tangle the mapping; large sequential "
+                      "writes mostly just fill it. Sustained Read/Write I/O — NOT admin commands — is "
+                      "what moves these fields.\n\n"
                     + f"Available I/O patterns: {IO_WL_PATTERNS}\n\n"
                     + "Task: emit ONE \"io_workload\" descriptor — a compact recipe the fuzzer will "
                       "AMPLIFY into thousands of Read/Write commands to drive internal state toward "
@@ -12026,6 +12158,10 @@ class NVMeFuzzer:
         ffm_max = ffm0 if ffm0 is not None else 0
         ffm_min = ffm0 if ffm0 is not None else 0       # v9.5: FFM 하강(GC 완료 등)도 포착
         _state_seen0 = len(self._state_seen)            # v9.5: 이 버스트가 만든 신규 state 발견 수
+        # v10.1: WAF(매핑 조각화 대리지표)도 함께 추적. FFM 은 여러 항의 합이라 어느 축이
+        #   움직였는지 안 보이지만 WAF 는 "GC 가 valid page 를 얼마나 옮겼나" 하나만 잰다.
+        _waf0 = _snap_start.get('waf_x100') if _snap_start else None
+        _waf_max = _waf0 if _waf0 is not None else None
         stale = 0
         armed = False           # FFM 이 한 번이라도 오른 뒤에만 patience 발동(조기종료 오발 방지)
         blocks = 0
@@ -12066,6 +12202,9 @@ class NVMeFuzzer:
             _snap = self._state_capture_safe()
             if _snap:
                 _snap_last = _snap                      # 최신 스냅 갱신(후 telemetry 요약용)
+            _wnow = _snap.get('waf_x100') if _snap else None
+            if _wnow is not None:
+                _waf_max = _wnow if _waf_max is None else max(_waf_max, _wnow)
             ffm = _snap.get(IO_WL_FFM_FIELD) if _snap else None
             if ffm is not None:
                 if ffm < ffm_min:
@@ -12086,14 +12225,18 @@ class NVMeFuzzer:
         #   이 버스트 중 늘어난 distinct state 발견 수. 이 둘로 workload 되먹임을 판정.
         _new_states = len(self._state_seen) - _state_seen0
         _ffm_range = ((ffm_max - ffm_min) if ffm0 is not None else None)
+        _waf_delta = ((_waf_max - _waf0) if (_waf0 is not None and _waf_max is not None)
+                      else None)
         self._last_workload_result = {
             'pattern': pattern, 'desc': desc, 'blocks': blocks, 'rc0': n_ok,
             'ffm_start': ffm0, 'ffm_peak': ffm_max, 'ffm_trough': ffm_min,
+            'waf_start': _waf0, 'waf_peak': _waf_max, 'waf_delta': _waf_delta,
             'ffm_delta': ffm_delta, 'ffm_range': _ffm_range,
             'new_states': _new_states, 'stop': stop_reason,
         }
         log.warning(f"[IO-WL/burst] pattern={pattern} blocks={blocks} rc0={n_ok} "
-                    f"FFM {ffm0}→{ffm_max} (Δ{ffm_delta}) stop={stop_reason} "
+                    f"FFM {ffm0}→{ffm_max} (Δ{ffm_delta}) "
+                    f"WAF(x100) {_waf0}→{_waf_max} (Δ{_waf_delta}) stop={stop_reason} "
                     f"span={desc.get('lba_span')} bs={desc.get('block_size')} "
                     f"hot={desc.get('hot_fraction')} rd={desc.get('read_ratio')}")
         # 워크로드 전후 telemetry 변화 요약(터미널) — 어느 내부 상태를 얼마나 밀었나.

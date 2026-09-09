@@ -960,6 +960,20 @@
         "desc": "[02h 03h] 여유 스페어 블록 비율 (%) — 감소 방향 주목"
       },
       {
+        "name": "host_data_written",
+        "source": "smart",
+        "key": "data_units_written",
+        "weight": 1.0,
+        "desc": "[02h] Data Units Written — 호스트 기록량(1000×512B 단위). WAF 분모"
+      },
+      {
+        "name": "host_data_read",
+        "source": "smart",
+        "key": "data_units_read",
+        "weight": 1.0,
+        "desc": "[02h] Data Units Read — 호스트 읽기량. read 축 분모"
+      },
+      {
         "name": "err_status_field",
         "source": "vendor",
         "lid": 1,
@@ -1289,6 +1303,19 @@
         "desc": "[SecRecv 143:128] Total Data Written to NAND (하위 64-bit) — NAND 기록량 (C0h 15:0 중복 → SecRecv 우선)"
       },
       {
+        "name": "sec_total_data_written_slc",
+        "source": "security_recv",
+        "secp": "0xfe",
+        "spsp": "0x3d",
+        "nsid": 1,
+        "size": 4096,
+        "offset": 144,
+        "length": 8,
+        "endian": "little",
+        "weight": 1.5,
+        "desc": "[SecRecv 159:144] Total Data Written to Static SLC NAND (하위 64-bit) — SLC fold 분자"
+      },
+      {
         "name": "c0_phy_media_read",
         "source": "vendor",
         "lid": "0xc0",
@@ -1300,42 +1327,65 @@
         "desc": "[C0h 31:16] Physical Media Units Read (하위 64-bit) — NAND 읽기량 (SecRecv 에 대응 필드 없음 → C0h 유지)"
       },
       {
+        "name": "waf_x100",
+        "source": "derived",
+        "fn": "waf_x100",
+        "weight": 6.0,
+        "desc": "WAF×100 (100=WAF 1.0). ΔNAND쓰기/Δ호스트쓰기 를 캠페인 최소비(=가장 순차적인 구간, WAF≈1 가정)로 자가보정. 매핑 조각화의 직접 대리지표 — 순차쓰기와 랜덤덮어쓰기를 가른다.",
+        "inputs": [
+          {
+            "kind": "waf",
+            "field": "sec_total_data_written_nand",
+            "field2": "host_data_written"
+          }
+        ]
+      },
+      {
+        "name": "slc_fold_pct",
+        "source": "derived",
+        "fn": "ratio_pct",
+        "weight": 2.0,
+        "desc": "SLC 기록량 / 전체 NAND 기록량 × 100 — SLC fold 비율(누적)",
+        "inputs": [
+          {
+            "kind": "ratio",
+            "field": "sec_total_data_written_slc",
+            "field2": "sec_total_data_written_nand"
+          }
+        ]
+      },
+      {
         "name": "ffm_frag",
         "source": "derived",
-        "fn": "frag_pressure",
+        "fn": "frag_pressure_v2",
         "weight": 3.0,
-        "desc": "FFM: FTL 조각화/GC 압력 지수(0-100). free_block 고갈+PE skew+usage 정규화 가중합 — I/O 워크로드가 내부 상태를 미는 정도. 파생값(디바이스 로그 아님).",
+        "desc": "FFM v2: FTL dirty(매핑 꼬임) 지수 0-100. 주축=WAF(조각화 직접 대리), 보조=GC/relocation 활동량(Δ), 배경=충만도. 구 v1 은 충만도만 재서 순차쓰기를 더 높게 보상하는 역방향 문제가 있었다.",
         "inputs": [
+          {
+            "term": "dirty",
+            "kind": "waf_norm",
+            "field": "sec_total_data_written_nand",
+            "field2": "host_data_written",
+            "ref": 4.0,
+            "weight": 0.55
+          },
+          {
+            "term": "activity",
+            "kind": "rate_sum",
+            "ref": 32,
+            "weight": 0.3,
+            "fields": [
+              "sec_wear_level_count",
+              "sec_refresh_counts",
+              "sec_read_reclaim",
+              "sec_patrol_relocated"
+            ]
+          },
           {
             "term": "fill",
             "kind": "inv_pct",
             "field": "sec_free_blocks_pct",
-            "weight": 0.4
-          },
-          {
-            "term": "skew",
-            "kind": "skew",
-            "field": "df_max_pe_cycles",
-            "field2": "df_avg_pe_cycles",
-            "weight": 0.25
-          },
-          {
-            "term": "slc",
-            "kind": "pct",
-            "field": "sec_slc_pct_used",
             "weight": 0.15
-          },
-          {
-            "term": "sys",
-            "kind": "pct",
-            "field": "sec_sys_data_pct_used",
-            "weight": 0.1
-          },
-          {
-            "term": "end",
-            "kind": "pct",
-            "field": "percent_used",
-            "weight": 0.1
           }
         ]
       }
