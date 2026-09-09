@@ -5304,13 +5304,11 @@ class NVMeFuzzer:
                         _vs = f'{_v:,} (0x{_v:0{_l * 2}x})'
                     else:
                         _vs = f'{_v:,}'
-                _mk, _ml = mon.get(_o, (None, None))
-                _tag = '*' if _mk else ' '
-                _sfx = ''
-                if _mk:
-                    _sfx = f"   → {_mk}" + (f" (하위 {_ml}B 만)" if _ml != _l else "")
+                # 감시 여부는 '*' 하나로 충분 — 내부 필드명/감시폭 병기는 줄만 길어져 뺐다
+                # (무엇을 어떤 폭으로 보는지는 PART 2 표에 다 있다).
+                _tag = '*' if _o in mon else ' '
                 # 표기는 스펙 원문과 같은 **끝:시작** (예: 31:16 = offset 16, 16 bytes)
-                _w(f"┃  {_tag} [{_o + _l - 1:3d}:{_o:3d}] {_nm:<44s} = {_vs}{_sfx}")
+                _w(f"┃  {_tag} [{_o + _l - 1:3d}:{_o:3d}] {_nm:<44s} = {_vs}")
 
         # ── PART 1 — 가능한 정보 전체 ────────────────────────────────
         _w("")
@@ -5402,13 +5400,13 @@ class NVMeFuzzer:
         _w("")
         _w(f"┏━━ PART 2 ─ state 모니터링 대상 {len(rows)}개 (수집 {_got} / 미수집 {len(rows) - _got}) "
            + "━" * 14)
-        _w(f"┃ {'source':<14s} {'field':<26s} {'value':>18s} {'Δinit':>12s}  "
-           f"{'bucket':<12s} desc")
+        # desc 는 뺀다 — 한 줄을 넘겨 표가 깨진다. 필드 설명은 config 와 PART 1 의
+        # 사람이 읽는 필드명에 있다.
+        _w(f"┃ {'source':<13s} {'field':<27s} {'value':>16s} {'Δinit':>13s} bucket")
         for f, val in rows:
             name = f['name']
             if val is None:
-                _w(f"┃ {_src_tag(f):<14s} {name:<26s} {'N/A':>18s} {'-':>12s}  "
-                   f"{'-':<12s} {f.get('desc', '')}")
+                _w(f"┃ {_src_tag(f):<13s} {name:<27s} {'N/A':>16s} {'-':>13s} -")
                 continue
             _vs = f'{val:,}' if val < 10 ** 15 else f'0x{val:x}'
             _init = _inits.get(name)
@@ -5418,8 +5416,7 @@ class NVMeFuzzer:
                 _d = val - _init
                 _ds = f'{_d:+,}'
                 _bk = NVMeStateMonitor._adaptive_bucket(name, _init, val).split(':', 1)[-1]
-            _w(f"┃ {_src_tag(f):<14s} {name:<26s} {_vs:>18s} {_ds:>12s}  "
-               f"{_bk:<12s} {f.get('desc', '')}")
+            _w(f"┃ {_src_tag(f):<13s} {name:<27s} {_vs:>16s} {_ds:>13s} {_bk}")
         _w("┗" + "━" * 76)
         _w("═" * 78)
 
