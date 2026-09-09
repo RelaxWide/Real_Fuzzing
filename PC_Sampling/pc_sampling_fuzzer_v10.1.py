@@ -204,6 +204,17 @@ for _ly in (_CFG.get('log_layouts', {}) or {}).get('vendor_logs', []) or []:
         }
     except Exception as _e:
         print(f"[WARN] log_layouts 항목 무시({_ly!r}): {_e}", file=sys.stderr)
+# security_recv 버퍼 레이아웃 {(secp, spsp) → {'name', 'fields'}}. vendor 로그와 동일 규약.
+SEC_LAYOUTS = {}
+for _ly in (_CFG.get('log_layouts', {}) or {}).get('security_logs', []) or []:
+    try:
+        SEC_LAYOUTS[(int(_ly['secp']), int(_ly['spsp']))] = {
+            'name':   str(_ly.get('name', '')),
+            'fields': [f for f in _ly.get('fields', [])
+                       if isinstance(f, dict) and 'offset' in f and 'length' in f],
+        }
+    except Exception as _e:
+        print(f"[WARN] security_logs 항목 무시({_ly!r}): {_e}", file=sys.stderr)
 _DEFAULT_STATE_FIELDS = STATE_FIELD_SETS.get('r8', [])
 
 # v9.0: LLM-guided fuzzing 설정 (rag 섹션). 섹션 없어도 fatal 아님(.get) — 없으면 비활성=v8.8 동등.
@@ -5269,6 +5280,38 @@ class NVMeFuzzer:
             except Exception as ex:
                 errors.append(f"security-recv {secp:#x}/{spsp:#x} 예외: {ex}")
 
+        def _dump_layout(title, layout, raw, mon):
+            """레이아웃 표가 있는 버퍼의 **전 필드**를 찍는다(reserved 는 표에 없어 자동 생략).
+            감시 중인 offset 에는 '*' 와 내부 필드명을 병기 — 표에서 무엇을 state 로 보고
+            있는지 바로 대조된다. 키는 offset 만: 16B 필드를 하위 8B 만 감시하는 경우가 있어
+            (offset,length) 정확일치로 찾으면 표시가 누락된다(실측 확인)."""
+            _flds = layout['fields']
+            _w(f"┃ ── {title} — 명명된 필드 {len(_flds)}개 "
+               f"(* = state 모니터링 {len(mon)}개, reserved 생략) ──")
+            for lf in _flds:
+                _o, _l = int(lf['offset']), int(lf['length'])
+                _nm = str(lf.get('name', '?'))
+                if _o + _l > len(raw):
+                    _vs = 'SHORT'
+                else:
+                    _v = int.from_bytes(raw[_o:_o + _l], lf.get('endian', 'little'))
+                    if _l > 8:
+                        _vs = f'0x{_v:0{_l * 2}x}'          # 16B 누적 카운터: 십진이 너무 길다
+                    elif _v > 0xFFFFFFFF:
+                        # 상위 32비트가 살아있는 8B 값은 순수 카운터가 아닐 수 있다
+                        # (실측: System Area *Fail = [하위4B raw][상위4B normalized=100]).
+                        # 십진만 보면 구조가 안 보여 hex 를 함께 찍는다.
+                        _vs = f'{_v:,} (0x{_v:0{_l * 2}x})'
+                    else:
+                        _vs = f'{_v:,}'
+                _mk, _ml = mon.get(_o, (None, None))
+                _tag = '*' if _mk else ' '
+                _sfx = ''
+                if _mk:
+                    _sfx = f"   → {_mk}" + (f" (하위 {_ml}B 만)" if _ml != _l else "")
+                # 표기는 스펙 원문과 같은 **끝:시작** (예: 31:16 = offset 16, 16 bytes)
+                _w(f"┃  {_tag} [{_o + _l - 1:3d}:{_o:3d}] {_nm:<44s} = {_vs}{_sfx}")
+
         # ── PART 1 — 가능한 정보 전체 ────────────────────────────────
         _w("")
         _w("┏━━ PART 1 ─ 장치가 주는 정보 전체 " + "━" * 42)
@@ -5293,49 +5336,25 @@ class NVMeFuzzer:
                 _w(f"┃ ── LID {lid:#04x} ({log_len}B) — {len(raw)}B 수신. 전체 레이아웃 표 없음 "
                    f"→ 감시 중인 {_n}개 offset 은 PART 2 참조 ──")
                 continue
-            _flds = layout['fields']
-            # 감시 중인 offset 에 '*' 와 내부 필드명을 병기 — 45개 표에서 무엇을 state 로
-            #   보고 있는지 바로 대조된다. 키는 offset 만(16B 필드를 하위 8B 만 감시하는 등
-            #   길이가 다를 수 있어 (offset,length) 정확일치로 찾으면 표시가 누락된다).
-            _mon = {}
-            for f in fields:
-                if f['source'] == 'vendor' and f.get('lid') == lid:
-                    _mon[f['offset']] = (f['name'], f['length'])
-            _w(f"┃ ── LID {lid:#04x} ({log_len}B) {layout['name']} — 전체 {len(_flds)} 필드 "
-               f"(* = state 모니터링 {len(_mon)}개) ──")
-            for lf in _flds:
-                _o, _l = int(lf['offset']), int(lf['length'])
-                _nm = str(lf.get('name', '?'))
-                if _o + _l > len(raw):
-                    _vs = 'SHORT'
-                else:
-                    _v = int.from_bytes(raw[_o:_o + _l], lf.get('endian', 'little'))
-                    if _l > 8:
-                        _vs = f'0x{_v:0{_l * 2}x}'          # 16B 누적 카운터: 십진이 너무 길다
-                    elif _v > 0xFFFFFFFF:
-                        # 상위 32비트가 살아있는 8B 값은 순수 카운터가 아닐 수 있다
-                        # (실측: System Area *Fail = [하위4B raw][상위4B normalized=100]).
-                        # 십진만 보면 구조가 안 보여 hex 를 함께 찍는다.
-                        _vs = f'{_v:,} (0x{_v:0{_l * 2}x})'
-                    else:
-                        _vs = f'{_v:,}'
-                _mk, _ml = _mon.get(_o, (None, None))
-                _tag = '*' if _mk else ' '
-                _sfx = ''
-                if _mk:
-                    _sfx = f"   → {_mk}" + (f" (하위 {_ml}B 만)" if _ml != _l else "")
-                # 표기는 스펙 원문과 같은 **끝:시작** (예: 31:16 = offset 16, 16 bytes)
-                _w(f"┃  {_tag} [{_o + _l - 1:3d}:{_o:3d}] {_nm:<44s} = {_vs}{_sfx}")
+            _dump_layout(f"LID {lid:#04x} ({log_len}B) {layout['name']}", layout, raw,
+                         {f['offset']: (f['name'], f['length']) for f in fields
+                          if f['source'] == 'vendor' and f.get('lid') == lid})
 
         for (secp, spsp, nsid), size in sorted(sec_groups.items()):
             raw = sec_raw.get((secp, spsp, nsid))
             if raw is None:
                 _w(f"┃ ── Security Recv secp={secp:#x} spsp={spsp:#x} ({size}B) — 읽기 실패 ──")
                 continue
-            _n = sum(1 for f in fields if f['source'] == 'security_recv'
-                     and (f['secp'], f['spsp'], f.get('nsid', 0)) == (secp, spsp, nsid))
-            _w(f"┃ ── Security Recv secp={secp:#x} spsp={spsp:#x} ({size}B) — {len(raw)}B 수신. "
-               f"전체 레이아웃 표 없음 → 감시 중인 {_n}개 offset 은 PART 2 참조 ──")
+            _mon = {f['offset']: (f['name'], f['length']) for f in fields
+                    if f['source'] == 'security_recv'
+                    and (f['secp'], f['spsp'], f.get('nsid', 0)) == (secp, spsp, nsid)}
+            _slay = SEC_LAYOUTS.get((secp, spsp))
+            if _slay:
+                _dump_layout(f"Security Recv secp={secp:#x} spsp={spsp:#x} ({size}B) "
+                             f"{_slay['name']}", _slay, raw, _mon)
+            else:
+                _w(f"┃ ── Security Recv secp={secp:#x} spsp={spsp:#x} ({size}B) — {len(raw)}B 수신. "
+                   f"전체 레이아웃 표 없음 → 감시 중인 {len(_mon)}개 offset 은 PART 2 참조 ──")
 
         if errors:
             _w("┃ ── 읽기 실패 ──")
@@ -5344,7 +5363,8 @@ class NVMeFuzzer:
         _w("┗" + "━" * 76)
 
         # ── PART 2 — state 모니터링 대상만 ───────────────────────────
-        _inits = getattr(self.state_monitor, '_init_values', {}) or {}
+        # 진단용 출력이라 어떤 이유로든 죽지 않게 — state_monitor 가 없으면 Δ/bucket 만 생략.
+        _inits = getattr(getattr(self, 'state_monitor', None), '_init_values', {}) or {}
         vals = {}          # derived 계산 입력 겸 출력용
 
         def _src_tag(f):

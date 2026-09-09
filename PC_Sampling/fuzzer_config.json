@@ -457,51 +457,480 @@
         "log_len": 512,
         "_comment": "BM9K1 전용. Get Log Page LID C0h. 표는 0..269 연속(Incomplete Shutdowns = 115:112). 16B 필드는 출력 시 hex, 모니터링은 하위 8B 만 읽는다.",
         "fields": [
-          {"offset": 0, "length": 16, "name": "Physical Media Units Written"},
-          {"offset": 16, "length": 16, "name": "Physical Media Units Read"},
-          {"offset": 32, "length": 8, "name": "Bad User NAND Blocks"},
-          {"offset": 40, "length": 8, "name": "Bad System NAND Blocks"},
-          {"offset": 48, "length": 8, "name": "XOR Recovery Count"},
-          {"offset": 56, "length": 8, "name": "Uncorrectable Read Error Count"},
-          {"offset": 64, "length": 8, "name": "Soft ECC Error Count"},
-          {"offset": 72, "length": 8, "name": "End to End Correction Counts"},
-          {"offset": 80, "length": 1, "name": "System Data % Used"},
-          {"offset": 81, "length": 7, "name": "Refresh Counts"},
-          {"offset": 88, "length": 8, "name": "User Data Erase Counts"},
-          {"offset": 96, "length": 2, "name": "Thermal Throttling Status and Count"},
-          {"offset": 98, "length": 6, "name": "DSSD Specification Version"},
-          {"offset": 104, "length": 8, "name": "PCIe Correctable Error Count"},
-          {"offset": 112, "length": 4, "name": "Incomplete Shutdowns"},
-          {"offset": 116, "length": 4, "name": "Reserved"},
-          {"offset": 120, "length": 1, "name": "% Free Blocks"},
-          {"offset": 121, "length": 7, "name": "Reserved"},
-          {"offset": 128, "length": 2, "name": "Capacitor Health"},
-          {"offset": 130, "length": 1, "name": "NVM Express Base Errata Version"},
-          {"offset": 131, "length": 1, "name": "NVM Command Set Errata Version"},
-          {"offset": 132, "length": 1, "name": "NVM Express NVMe Over PCIe Errata Version"},
-          {"offset": 133, "length": 1, "name": "NVM Express Management Interface Errata Version"},
-          {"offset": 134, "length": 2, "name": "Reserved"},
-          {"offset": 136, "length": 8, "name": "Unaligned I/O"},
-          {"offset": 144, "length": 8, "name": "Security Version Number"},
-          {"offset": 152, "length": 8, "name": "Total NUSE"},
-          {"offset": 160, "length": 16, "name": "PLP Start Count"},
-          {"offset": 176, "length": 16, "name": "Endurance Estimate"},
-          {"offset": 192, "length": 8, "name": "PCIe Link Retraining Count"},
-          {"offset": 200, "length": 8, "name": "Power State Change Count"},
-          {"offset": 208, "length": 8, "name": "Lowest Permitted Firmware Revision"},
-          {"offset": 216, "length": 2, "name": "Total Media Dies"},
-          {"offset": 218, "length": 2, "name": "Media Die Failure Tolerance"},
-          {"offset": 220, "length": 2, "name": "Media Dies Offline"},
-          {"offset": 222, "length": 1, "name": "Max Temperature Recorded"},
-          {"offset": 223, "length": 1, "name": "Reserved"},
-          {"offset": 224, "length": 8, "name": "NAND Avg. Erase Count"},
-          {"offset": 232, "length": 4, "name": "Command Timeouts"},
-          {"offset": 236, "length": 8, "name": "System Area Program Fail Count"},
-          {"offset": 244, "length": 8, "name": "System Area Uncorrectable Read Count"},
-          {"offset": 252, "length": 8, "name": "System Area Erase Fail Count"},
-          {"offset": 260, "length": 2, "name": "Max Peak Power Capability"},
-          {"offset": 262, "length": 2, "name": "Current Max Average Power"},
-          {"offset": 264, "length": 6, "name": "Lifetime Power Consumed"}
+          {
+            "offset": 0,
+            "length": 16,
+            "name": "Physical Media Units Written"
+          },
+          {
+            "offset": 16,
+            "length": 16,
+            "name": "Physical Media Units Read"
+          },
+          {
+            "offset": 32,
+            "length": 8,
+            "name": "Bad User NAND Blocks"
+          },
+          {
+            "offset": 40,
+            "length": 8,
+            "name": "Bad System NAND Blocks"
+          },
+          {
+            "offset": 48,
+            "length": 8,
+            "name": "XOR Recovery Count"
+          },
+          {
+            "offset": 56,
+            "length": 8,
+            "name": "Uncorrectable Read Error Count"
+          },
+          {
+            "offset": 64,
+            "length": 8,
+            "name": "Soft ECC Error Count"
+          },
+          {
+            "offset": 72,
+            "length": 8,
+            "name": "End to End Correction Counts"
+          },
+          {
+            "offset": 80,
+            "length": 1,
+            "name": "System Data % Used"
+          },
+          {
+            "offset": 81,
+            "length": 7,
+            "name": "Refresh Counts"
+          },
+          {
+            "offset": 88,
+            "length": 8,
+            "name": "User Data Erase Counts"
+          },
+          {
+            "offset": 96,
+            "length": 2,
+            "name": "Thermal Throttling Status and Count"
+          },
+          {
+            "offset": 98,
+            "length": 6,
+            "name": "DSSD Specification Version"
+          },
+          {
+            "offset": 104,
+            "length": 8,
+            "name": "PCIe Correctable Error Count"
+          },
+          {
+            "offset": 112,
+            "length": 4,
+            "name": "Incomplete Shutdowns"
+          },
+          {
+            "offset": 120,
+            "length": 1,
+            "name": "% Free Blocks"
+          },
+          {
+            "offset": 128,
+            "length": 2,
+            "name": "Capacitor Health"
+          },
+          {
+            "offset": 130,
+            "length": 1,
+            "name": "NVM Express Base Errata Version"
+          },
+          {
+            "offset": 131,
+            "length": 1,
+            "name": "NVM Command Set Errata Version"
+          },
+          {
+            "offset": 132,
+            "length": 1,
+            "name": "NVM Express NVMe Over PCIe Errata Version"
+          },
+          {
+            "offset": 133,
+            "length": 1,
+            "name": "NVM Express Management Interface Errata Version"
+          },
+          {
+            "offset": 136,
+            "length": 8,
+            "name": "Unaligned I/O"
+          },
+          {
+            "offset": 144,
+            "length": 8,
+            "name": "Security Version Number"
+          },
+          {
+            "offset": 152,
+            "length": 8,
+            "name": "Total NUSE"
+          },
+          {
+            "offset": 160,
+            "length": 16,
+            "name": "PLP Start Count"
+          },
+          {
+            "offset": 176,
+            "length": 16,
+            "name": "Endurance Estimate"
+          },
+          {
+            "offset": 192,
+            "length": 8,
+            "name": "PCIe Link Retraining Count"
+          },
+          {
+            "offset": 200,
+            "length": 8,
+            "name": "Power State Change Count"
+          },
+          {
+            "offset": 208,
+            "length": 8,
+            "name": "Lowest Permitted Firmware Revision"
+          },
+          {
+            "offset": 216,
+            "length": 2,
+            "name": "Total Media Dies"
+          },
+          {
+            "offset": 218,
+            "length": 2,
+            "name": "Media Die Failure Tolerance"
+          },
+          {
+            "offset": 220,
+            "length": 2,
+            "name": "Media Dies Offline"
+          },
+          {
+            "offset": 222,
+            "length": 1,
+            "name": "Max Temperature Recorded"
+          },
+          {
+            "offset": 224,
+            "length": 8,
+            "name": "NAND Avg. Erase Count"
+          },
+          {
+            "offset": 232,
+            "length": 4,
+            "name": "Command Timeouts"
+          },
+          {
+            "offset": 236,
+            "length": 8,
+            "name": "System Area Program Fail Count"
+          },
+          {
+            "offset": 244,
+            "length": 8,
+            "name": "System Area Uncorrectable Read Count"
+          },
+          {
+            "offset": 252,
+            "length": 8,
+            "name": "System Area Erase Fail Count"
+          },
+          {
+            "offset": 260,
+            "length": 2,
+            "name": "Max Peak Power Capability"
+          },
+          {
+            "offset": 262,
+            "length": 2,
+            "name": "Current Max Average Power"
+          },
+          {
+            "offset": 264,
+            "length": 6,
+            "name": "Lifetime Power Consumed"
+          }
+        ]
+      },
+      {
+        "lid": "0xdf",
+        "name": "Vendor Log DFh",
+        "log_len": 512,
+        "_comment": "명명된 필드만. 사이 빈 구간은 reserved 로 보고 출력 생략.",
+        "fields": [
+          {
+            "offset": 224,
+            "length": 16,
+            "name": "NAND Written Count"
+          },
+          {
+            "offset": 240,
+            "length": 4,
+            "name": "CRC Error Count"
+          },
+          {
+            "offset": 244,
+            "length": 16,
+            "name": "Static SLC NAND Written Count"
+          },
+          {
+            "offset": 260,
+            "length": 1,
+            "name": "Percentage Used"
+          },
+          {
+            "offset": 271,
+            "length": 8,
+            "name": "Read Patrol"
+          },
+          {
+            "offset": 279,
+            "length": 2,
+            "name": "Average Number of PE Cycles"
+          },
+          {
+            "offset": 281,
+            "length": 2,
+            "name": "Max Number of PE Cycles"
+          },
+          {
+            "offset": 283,
+            "length": 2,
+            "name": "Number of Bad Blocks"
+          },
+          {
+            "offset": 285,
+            "length": 2,
+            "name": "Number of DRAM Parity Errors"
+          },
+          {
+            "offset": 287,
+            "length": 2,
+            "name": "Number of SRAM Parity Errors"
+          }
+        ]
+      }
+    ],
+    "security_logs": [
+      {
+        "secp": "0xfe",
+        "spsp": "0x3d",
+        "name": "Vendor Security Log (SECP FEh / SPSP 3Dh)",
+        "size": 4096,
+        "_comment": "명명된 필드만. 빈 구간은 reserved 로 보고 출력 생략. Bad User NAND Block Count 는 원자료 384:398 이 392:397(Bad System)과 겹쳐 Bad System 과 같은 6B(384..389)로 가정 — 확인 필요.",
+        "fields": [
+          {
+            "offset": 64,
+            "length": 1,
+            "name": "Errata Version"
+          },
+          {
+            "offset": 66,
+            "length": 6,
+            "name": "OCP Spec Version"
+          },
+          {
+            "offset": 72,
+            "length": 8,
+            "name": "Security Version Number (FW)"
+          },
+          {
+            "offset": 80,
+            "length": 8,
+            "name": "NUSE"
+          },
+          {
+            "offset": 128,
+            "length": 16,
+            "name": "Total Data Written to NAND"
+          },
+          {
+            "offset": 144,
+            "length": 16,
+            "name": "Total Data Written to Static SLC NAND"
+          },
+          {
+            "offset": 160,
+            "length": 4,
+            "name": "Accumulated Host Active/Idle Count"
+          },
+          {
+            "offset": 164,
+            "length": 8,
+            "name": "Unaligned I/O"
+          },
+          {
+            "offset": 192,
+            "length": 4,
+            "name": "Incomplete Shutdowns"
+          },
+          {
+            "offset": 196,
+            "length": 2,
+            "name": "Highest Temperature"
+          },
+          {
+            "offset": 198,
+            "length": 2,
+            "name": "Lowest Temperature"
+          },
+          {
+            "offset": 200,
+            "length": 1,
+            "name": "Thermal Throttling Count"
+          },
+          {
+            "offset": 201,
+            "length": 1,
+            "name": "Thermal Throttling Status"
+          },
+          {
+            "offset": 202,
+            "length": 4,
+            "name": "Accumulated PS3 Count"
+          },
+          {
+            "offset": 206,
+            "length": 4,
+            "name": "Accumulated PS4 Count"
+          },
+          {
+            "offset": 210,
+            "length": 1,
+            "name": "Count of Short Power On"
+          },
+          {
+            "offset": 212,
+            "length": 8,
+            "name": "PCIe Correctable Error Count"
+          },
+          {
+            "offset": 220,
+            "length": 8,
+            "name": "PCIe Link Retraining Count"
+          },
+          {
+            "offset": 228,
+            "length": 1,
+            "name": "Used Reserved Block Count (Worst)"
+          },
+          {
+            "offset": 229,
+            "length": 1,
+            "name": "Used Reserved Block Count (Total)"
+          },
+          {
+            "offset": 230,
+            "length": 4,
+            "name": "Reserved Block Count (Total)"
+          },
+          {
+            "offset": 234,
+            "length": 4,
+            "name": "Wear Level Count"
+          },
+          {
+            "offset": 239,
+            "length": 1,
+            "name": "System Area Wear Level"
+          },
+          {
+            "offset": 240,
+            "length": 1,
+            "name": "System Data % Used"
+          },
+          {
+            "offset": 241,
+            "length": 1,
+            "name": "Percentage Used in Static SLC"
+          },
+          {
+            "offset": 242,
+            "length": 1,
+            "name": "% Free Blocks"
+          },
+          {
+            "offset": 252,
+            "length": 8,
+            "name": "Endurance Estimate"
+          },
+          {
+            "offset": 320,
+            "length": 4,
+            "name": "Read Recovery Attempt"
+          },
+          {
+            "offset": 324,
+            "length": 8,
+            "name": "Lifetime Read Reclaim"
+          },
+          {
+            "offset": 332,
+            "length": 8,
+            "name": "Read Patrol Relocated Block"
+          },
+          {
+            "offset": 340,
+            "length": 7,
+            "name": "Refresh Counts"
+          },
+          {
+            "offset": 384,
+            "length": 6,
+            "name": "Bad User NAND Block Count (Raw)"
+          },
+          {
+            "offset": 392,
+            "length": 6,
+            "name": "Bad System NAND Block Count (Raw)"
+          },
+          {
+            "offset": 400,
+            "length": 8,
+            "name": "Uncorrectable Read Error Count"
+          },
+          {
+            "offset": 408,
+            "length": 8,
+            "name": "End-to-End Correction Counts"
+          },
+          {
+            "offset": 416,
+            "length": 2,
+            "name": "DRAM Parity Error Count"
+          },
+          {
+            "offset": 418,
+            "length": 2,
+            "name": "SRAM Parity Error Count"
+          },
+          {
+            "offset": 420,
+            "length": 8,
+            "name": "Soft ECC Error Count"
+          },
+          {
+            "offset": 671,
+            "length": 4,
+            "name": "System Max EC"
+          },
+          {
+            "offset": 675,
+            "length": 4,
+            "name": "FTL Internal SPOR Count"
+          }
         ]
       }
     ]
@@ -509,403 +938,407 @@
   "state_fields": {
     "_comment_bm9k1": "BM9K1 전용(v10.1). r8 기준에서 4개 제외 — media_errors·sec_uncorr_read_errors 는 WriteUncorrectable 로 우리가 심고 우리가 읽어 올리는 자기유발 카운터, num_err_log_entries 는 실행수와 상관되는 단조 카운터라 novelty 0, sec_endurance_estimate 는 정적값. critical_warning 은 유지(안 변하는 동안 :=init 로 커버리지 영향 0, 비용 0, 뒤집히면 최상위 신호). + C0h Extended SMART 10개 추가. C0h 중 %% Free Blocks·System Data %% Used·Refresh Counts·User Erase·Soft ECC·E2E Correction·PCIe Corr·NAND Avg Erase 는 기존 sec_*/df_* 와 같은 물리량이라 모니터링에서 제외(중복 버킷 → 동시변경 필드 수가 늘어 전역이벤트 오탐). 출력에는 45 필드 전부 나온다.",
     "bm9k1": [
+      {
+        "name": "critical_warning",
+        "source": "smart",
+        "key": "critical_warning",
+        "weight": 2.0,
+        "desc": "[02h 00h] 헬스 비트마스크 (spare/temp/reliability/ro/volatile)"
+      },
+      {
+        "name": "percent_used",
+        "source": "smart",
+        "key": "percent_used",
+        "weight": 3.0,
+        "desc": "[02h 05h] 수명 소모율 (%) — 100 초과 가능"
+      },
+      {
+        "name": "avail_spare",
+        "source": "smart",
+        "key": "avail_spare",
+        "weight": 2.0,
+        "desc": "[02h 03h] 여유 스페어 블록 비율 (%) — 감소 방향 주목"
+      },
+      {
+        "name": "err_status_field",
+        "source": "vendor",
+        "lid": 1,
+        "log_len": 64,
+        "offset": 12,
+        "length": 2,
+        "endian": "little",
+        "weight": 1.0,
+        "desc": "[01h 0Ch] 최신 에러 SCT/SC — fuzz 에러마다 변화 (noisy)"
+      },
+      {
+        "name": "df_crc_errors",
+        "source": "vendor",
+        "lid": 223,
+        "log_len": 512,
+        "offset": 240,
+        "length": 4,
+        "endian": "little",
+        "weight": 4.0,
+        "desc": "[DFh 0xF0] LCRC/ECRC 에러 누적 — 인터페이스 무결성"
+      },
+      {
+        "name": "df_max_pe_cycles",
+        "source": "vendor",
+        "lid": 223,
+        "log_len": 512,
+        "offset": 281,
+        "length": 2,
+        "endian": "little",
+        "weight": 3.0,
+        "desc": "[DFh 0x119] Max PE Cycles — 최대 소거 횟수 (느린 변화)"
+      },
+      {
+        "name": "df_avg_pe_cycles",
+        "source": "vendor",
+        "lid": 223,
+        "log_len": 512,
+        "offset": 279,
+        "length": 2,
+        "endian": "little",
+        "weight": 2.0,
+        "desc": "[DFh 0x117] Average PE Cycles — 평균 소거 횟수"
+      },
+      {
+        "name": "sec_dram_parity_errors",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 416,
+        "length": 2,
+        "endian": "little",
+        "weight": 10.0,
+        "desc": "[SecRecv 416] DRAM Parity error — 메모리 corruption"
+      },
+      {
+        "name": "sec_sram_parity_errors",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 418,
+        "length": 2,
+        "endian": "little",
+        "weight": 10.0,
+        "desc": "[SecRecv 418] SRAM Parity error — 캐시/버퍼 무결성"
+      },
+      {
+        "name": "sec_e2e_corrections",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 408,
+        "length": 8,
+        "endian": "little",
+        "weight": 2.0,
+        "desc": "[SecRecv 408] End-to-End Correction Counts"
+      },
+      {
+        "name": "sec_pcie_corr_errors",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 212,
+        "length": 8,
+        "endian": "little",
+        "weight": 2.0,
+        "desc": "[SecRecv 212] PCIe Correctable Error — PM 전환 시 정상 발생"
+      },
+      {
+        "name": "sec_soft_ecc_errors",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 420,
+        "length": 8,
+        "endian": "little",
+        "weight": 2.0,
+        "desc": "[SecRecv 420] Soft ECC error — read 부하 시 흔함"
+      },
+      {
+        "name": "sec_patrol_relocated",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 332,
+        "length": 8,
+        "endian": "little",
+        "weight": 10.0,
+        "desc": "[SecRecv 332] Read Patrol relocated block — NAND 열화 직접 지표"
+      },
+      {
+        "name": "sec_sys_wear_level",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 239,
+        "length": 1,
+        "endian": "little",
+        "weight": 7.0,
+        "desc": "[SecRecv 239] System Area Wear Level"
+      },
+      {
+        "name": "sec_system_max_ec",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 671,
+        "length": 4,
+        "endian": "little",
+        "weight": 7.0,
+        "desc": "[SecRecv 671] System Max EC — 시스템 영역 최대 소거"
+      },
+      {
+        "name": "sec_read_reclaim",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 324,
+        "length": 8,
+        "endian": "little",
+        "weight": 6.0,
+        "desc": "[SecRecv 324] Lifetime Read Reclaim — read 부하 자동"
+      },
+      {
+        "name": "sec_free_blocks_pct",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 242,
+        "length": 1,
+        "endian": "little",
+        "weight": 5.0,
+        "desc": "[SecRecv 242] % Free Blocks"
+      },
+      {
+        "name": "sec_wear_level_count",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 234,
+        "length": 4,
+        "endian": "little",
+        "weight": 4.0,
+        "desc": "[SecRecv 234] Wear Level Count — write 부하 자동"
+      },
+      {
+        "name": "sec_refresh_counts",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 340,
+        "length": 7,
+        "endian": "little",
+        "weight": 4.0,
+        "desc": "[SecRecv 340] Refresh Counts (7B) — 백그라운드 자동"
+      },
+      {
+        "name": "sec_slc_pct_used",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 241,
+        "length": 1,
+        "endian": "little",
+        "weight": 1.0,
+        "desc": "[SecRecv 241] Percentage Used in Static SLC"
+      },
+      {
+        "name": "sec_sys_data_pct_used",
+        "source": "security_recv",
+        "secp": 254,
+        "spsp": 61,
+        "nsid": 1,
+        "size": 4096,
+        "offset": 240,
+        "length": 1,
+        "endian": "little",
+        "weight": 1.5,
+        "desc": "[SecRecv 240] System data % used"
+      },
+      {
+        "name": "c0_xor_recovery",
+        "source": "vendor",
+        "lid": "0xc0",
+        "log_len": 512,
+        "offset": 48,
+        "length": 8,
+        "endian": "little",
+        "weight": 4.0,
+        "desc": "[C0h 55:48] XOR Recovery Count — XOR/RAID 복구 경로 발동"
+      },
+      {
+        "name": "c0_capacitor_health",
+        "source": "vendor",
+        "lid": "0xc0",
+        "log_len": 512,
+        "offset": 128,
+        "length": 2,
+        "endian": "little",
+        "weight": 4.0,
+        "desc": "[C0h 129:128] Capacitor Health — PLP 하드웨어 상태"
+      },
+      {
+        "name": "sec_unaligned_io",
+        "source": "security_recv",
+        "secp": "0xfe",
+        "spsp": "0x3d",
+        "nsid": 1,
+        "size": 4096,
+        "offset": 164,
+        "length": 8,
+        "endian": "little",
+        "weight": 3.0,
+        "desc": "[SecRecv 171:164] Unaligned I/O — I/O 워크로드가 직접 만드는 패턴 (C0h 143:136 중복 → SecRecv 우선)"
+      },
+      {
+        "name": "c0_media_dies_offline",
+        "source": "vendor",
+        "lid": "0xc0",
+        "log_len": 512,
+        "offset": 220,
+        "length": 2,
+        "endian": "little",
+        "weight": 9.0,
+        "desc": "[C0h 221:220] Media Dies Offline — 다이 이탈(회복 불가 열화)"
+      },
+      {
+        "name": "c0_command_timeouts",
+        "source": "vendor",
+        "lid": "0xc0",
+        "log_len": 512,
+        "offset": 232,
+        "length": 4,
+        "endian": "little",
+        "weight": 8.0,
+        "desc": "[C0h 235:232] Command Timeouts — 타임아웃 자체가 탐지 목표"
+      },
+      {
+        "name": "c0_sys_program_fail",
+        "source": "vendor",
+        "lid": "0xc0",
+        "log_len": 512,
+        "offset": 236,
+        "length": 4,
+        "endian": "little",
+        "weight": 8.0,
+        "desc": "[C0h 239:236] System Area Program Fail Count (raw count 하위 4B — 상위 4B 는 normalized 값 100)"
+      },
+      {
+        "name": "c0_sys_uncorr_read",
+        "source": "vendor",
+        "lid": "0xc0",
+        "log_len": 512,
+        "offset": 244,
+        "length": 4,
+        "endian": "little",
+        "weight": 8.0,
+        "desc": "[C0h 247:244] System Area Uncorrectable Read Count (raw count 하위 4B — 상위 4B 는 normalized)"
+      },
+      {
+        "name": "c0_sys_erase_fail",
+        "source": "vendor",
+        "lid": "0xc0",
+        "log_len": 512,
+        "offset": 252,
+        "length": 4,
+        "endian": "little",
+        "weight": 8.0,
+        "desc": "[C0h 255:252] System Area Erase Fail Count (raw count 하위 4B — 상위 4B 는 normalized)"
+      },
+      {
+        "name": "sec_total_data_written_nand",
+        "source": "security_recv",
+        "secp": "0xfe",
+        "spsp": "0x3d",
+        "nsid": 1,
+        "size": 4096,
+        "offset": 128,
+        "length": 8,
+        "endian": "little",
+        "weight": 1.5,
+        "desc": "[SecRecv 143:128] Total Data Written to NAND (하위 64-bit) — NAND 기록량 (C0h 15:0 중복 → SecRecv 우선)"
+      },
+      {
+        "name": "c0_phy_media_read",
+        "source": "vendor",
+        "lid": "0xc0",
+        "log_len": 512,
+        "offset": 16,
+        "length": 8,
+        "endian": "little",
+        "weight": 1.5,
+        "desc": "[C0h 31:16] Physical Media Units Read (하위 64-bit) — NAND 읽기량 (SecRecv 에 대응 필드 없음 → C0h 유지)"
+      },
+      {
+        "name": "ffm_frag",
+        "source": "derived",
+        "fn": "frag_pressure",
+        "weight": 3.0,
+        "desc": "FFM: FTL 조각화/GC 압력 지수(0-100). free_block 고갈+PE skew+usage 정규화 가중합 — I/O 워크로드가 내부 상태를 미는 정도. 파생값(디바이스 로그 아님).",
+        "inputs": [
           {
-                "name": "critical_warning",
-                "source": "smart",
-                "key": "critical_warning",
-                "weight": 2.0,
-                "desc": "[02h 00h] 헬스 비트마스크 (spare/temp/reliability/ro/volatile)"
+            "term": "fill",
+            "kind": "inv_pct",
+            "field": "sec_free_blocks_pct",
+            "weight": 0.4
           },
           {
-                "name": "percent_used",
-                "source": "smart",
-                "key": "percent_used",
-                "weight": 3.0,
-                "desc": "[02h 05h] 수명 소모율 (%) — 100 초과 가능"
+            "term": "skew",
+            "kind": "skew",
+            "field": "df_max_pe_cycles",
+            "field2": "df_avg_pe_cycles",
+            "weight": 0.25
           },
           {
-                "name": "avail_spare",
-                "source": "smart",
-                "key": "avail_spare",
-                "weight": 2.0,
-                "desc": "[02h 03h] 여유 스페어 블록 비율 (%) — 감소 방향 주목"
+            "term": "slc",
+            "kind": "pct",
+            "field": "sec_slc_pct_used",
+            "weight": 0.15
           },
           {
-                "name": "err_status_field",
-                "source": "vendor",
-                "lid": 1,
-                "log_len": 64,
-                "offset": 12,
-                "length": 2,
-                "endian": "little",
-                "weight": 1.0,
-                "desc": "[01h 0Ch] 최신 에러 SCT/SC — fuzz 에러마다 변화 (noisy)"
+            "term": "sys",
+            "kind": "pct",
+            "field": "sec_sys_data_pct_used",
+            "weight": 0.1
           },
           {
-                "name": "df_crc_errors",
-                "source": "vendor",
-                "lid": 223,
-                "log_len": 512,
-                "offset": 240,
-                "length": 4,
-                "endian": "little",
-                "weight": 4.0,
-                "desc": "[DFh 0xF0] LCRC/ECRC 에러 누적 — 인터페이스 무결성"
-          },
-          {
-                "name": "df_max_pe_cycles",
-                "source": "vendor",
-                "lid": 223,
-                "log_len": 512,
-                "offset": 281,
-                "length": 2,
-                "endian": "little",
-                "weight": 3.0,
-                "desc": "[DFh 0x119] Max PE Cycles — 최대 소거 횟수 (느린 변화)"
-          },
-          {
-                "name": "df_avg_pe_cycles",
-                "source": "vendor",
-                "lid": 223,
-                "log_len": 512,
-                "offset": 279,
-                "length": 2,
-                "endian": "little",
-                "weight": 2.0,
-                "desc": "[DFh 0x117] Average PE Cycles — 평균 소거 횟수"
-          },
-          {
-                "name": "sec_dram_parity_errors",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 416,
-                "length": 2,
-                "endian": "little",
-                "weight": 10.0,
-                "desc": "[SecRecv 416h] DRAM Parity error — 메모리 corruption"
-          },
-          {
-                "name": "sec_sram_parity_errors",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 418,
-                "length": 2,
-                "endian": "little",
-                "weight": 10.0,
-                "desc": "[SecRecv 418h] SRAM Parity error — 캐시/버퍼 무결성"
-          },
-          {
-                "name": "sec_e2e_corrections",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 408,
-                "length": 8,
-                "endian": "little",
-                "weight": 2.0,
-                "desc": "[SecRecv 408h] End-to-End Correction Counts"
-          },
-          {
-                "name": "sec_pcie_corr_errors",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 212,
-                "length": 8,
-                "endian": "little",
-                "weight": 2.0,
-                "desc": "[SecRecv 212h] PCIe Correctable Error — PM 전환 시 정상 발생"
-          },
-          {
-                "name": "sec_soft_ecc_errors",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 420,
-                "length": 8,
-                "endian": "little",
-                "weight": 2.0,
-                "desc": "[SecRecv 420h] Soft ECC error — read 부하 시 흔함"
-          },
-          {
-                "name": "sec_patrol_relocated",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 332,
-                "length": 8,
-                "endian": "little",
-                "weight": 10.0,
-                "desc": "[SecRecv 332h] Read Patrol relocated block — NAND 열화 직접 지표"
-          },
-          {
-                "name": "sec_sys_wear_level",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 239,
-                "length": 1,
-                "endian": "little",
-                "weight": 7.0,
-                "desc": "[SecRecv 239h] System Area Wear Level"
-          },
-          {
-                "name": "sec_system_max_ec",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 671,
-                "length": 4,
-                "endian": "little",
-                "weight": 7.0,
-                "desc": "[SecRecv 671h] System Max EC — 시스템 영역 최대 소거"
-          },
-          {
-                "name": "sec_read_reclaim",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 324,
-                "length": 8,
-                "endian": "little",
-                "weight": 6.0,
-                "desc": "[SecRecv 324h] Lifetime Read Reclaim — read 부하 자동"
-          },
-          {
-                "name": "sec_free_blocks_pct",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 242,
-                "length": 1,
-                "endian": "little",
-                "weight": 5.0,
-                "desc": "[SecRecv 242h] % Free Blocks"
-          },
-          {
-                "name": "sec_wear_level_count",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 234,
-                "length": 4,
-                "endian": "little",
-                "weight": 4.0,
-                "desc": "[SecRecv 234h] Wear Level Count — write 부하 자동"
-          },
-          {
-                "name": "sec_refresh_counts",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 340,
-                "length": 4,
-                "endian": "little",
-                "weight": 4.0,
-                "desc": "[SecRecv 340h] Refresh Counts (하위 4 바이트) — 백그라운드 자동"
-          },
-          {
-                "name": "sec_slc_pct_used",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 241,
-                "length": 1,
-                "endian": "little",
-                "weight": 1.0,
-                "desc": "[SecRecv 241h] Percentage Used in Static SLC"
-          },
-          {
-                "name": "sec_sys_data_pct_used",
-                "source": "security_recv",
-                "secp": 254,
-                "spsp": 61,
-                "nsid": 1,
-                "size": 4096,
-                "offset": 240,
-                "length": 1,
-                "endian": "little",
-                "weight": 1.5,
-                "desc": "[SecRecv 240h] System data % used"
-          },
-          {
-                "name": "c0_xor_recovery",
-                "source": "vendor",
-                "lid": "0xc0",
-                "log_len": 512,
-                "offset": 48,
-                "length": 8,
-                "endian": "little",
-                "weight": 4.0,
-                "desc": "[C0h 55:48] XOR Recovery Count — XOR/RAID 복구 경로 발동"
-          },
-          {
-                "name": "c0_capacitor_health",
-                "source": "vendor",
-                "lid": "0xc0",
-                "log_len": 512,
-                "offset": 128,
-                "length": 2,
-                "endian": "little",
-                "weight": 4.0,
-                "desc": "[C0h 129:128] Capacitor Health — PLP 하드웨어 상태"
-          },
-          {
-                "name": "c0_unaligned_io",
-                "source": "vendor",
-                "lid": "0xc0",
-                "log_len": 512,
-                "offset": 136,
-                "length": 8,
-                "endian": "little",
-                "weight": 3.0,
-                "desc": "[C0h 143:136] Unaligned I/O — I/O 워크로드가 직접 만드는 패턴"
-          },
-          {
-                "name": "c0_media_dies_offline",
-                "source": "vendor",
-                "lid": "0xc0",
-                "log_len": 512,
-                "offset": 220,
-                "length": 2,
-                "endian": "little",
-                "weight": 9.0,
-                "desc": "[C0h 221:220] Media Dies Offline — 다이 이탈(회복 불가 열화)"
-          },
-          {
-                "name": "c0_command_timeouts",
-                "source": "vendor",
-                "lid": "0xc0",
-                "log_len": 512,
-                "offset": 232,
-                "length": 4,
-                "endian": "little",
-                "weight": 8.0,
-                "desc": "[C0h 235:232] Command Timeouts — 타임아웃 자체가 탐지 목표"
-          },
-          {
-                "name": "c0_sys_program_fail",
-                "source": "vendor",
-                "lid": "0xc0",
-                "log_len": 512,
-                "offset": 236,
-                "length": 4,
-                "endian": "little",
-                "weight": 8.0,
-                "desc": "[C0h 239:236] System Area Program Fail Count (raw count 하위 4B — 상위 4B 는 normalized 값 100)"
-          },
-          {
-                "name": "c0_sys_uncorr_read",
-                "source": "vendor",
-                "lid": "0xc0",
-                "log_len": 512,
-                "offset": 244,
-                "length": 4,
-                "endian": "little",
-                "weight": 8.0,
-                "desc": "[C0h 247:244] System Area Uncorrectable Read Count (raw count 하위 4B — 상위 4B 는 normalized)"
-          },
-          {
-                "name": "c0_sys_erase_fail",
-                "source": "vendor",
-                "lid": "0xc0",
-                "log_len": 512,
-                "offset": 252,
-                "length": 4,
-                "endian": "little",
-                "weight": 8.0,
-                "desc": "[C0h 255:252] System Area Erase Fail Count (raw count 하위 4B — 상위 4B 는 normalized)"
-          },
-          {
-                "name": "c0_phy_media_written",
-                "source": "vendor",
-                "lid": "0xc0",
-                "log_len": 512,
-                "offset": 0,
-                "length": 8,
-                "endian": "little",
-                "weight": 1.5,
-                "desc": "[C0h 15:0] Physical Media Units Written (하위 64-bit) — 호스트 write 볼륨"
-          },
-          {
-                "name": "c0_phy_media_read",
-                "source": "vendor",
-                "lid": "0xc0",
-                "log_len": 512,
-                "offset": 16,
-                "length": 8,
-                "endian": "little",
-                "weight": 1.5,
-                "desc": "[C0h 31:16] Physical Media Units Read (하위 64-bit) — 호스트 read 볼륨"
-          },
-          {
-                "name": "ffm_frag",
-                "source": "derived",
-                "fn": "frag_pressure",
-                "weight": 3.0,
-                "desc": "FFM: FTL 조각화/GC 압력 지수(0-100). free_block 고갈+PE skew+usage 정규화 가중합 — I/O 워크로드가 내부 상태를 미는 정도. 파생값(디바이스 로그 아님).",
-                "inputs": [
-                      {
-                            "term": "fill",
-                            "kind": "inv_pct",
-                            "field": "sec_free_blocks_pct",
-                            "weight": 0.4
-                      },
-                      {
-                            "term": "skew",
-                            "kind": "skew",
-                            "field": "df_max_pe_cycles",
-                            "field2": "df_avg_pe_cycles",
-                            "weight": 0.25
-                      },
-                      {
-                            "term": "slc",
-                            "kind": "pct",
-                            "field": "sec_slc_pct_used",
-                            "weight": 0.15
-                      },
-                      {
-                            "term": "sys",
-                            "kind": "pct",
-                            "field": "sec_sys_data_pct_used",
-                            "weight": 0.1
-                      },
-                      {
-                            "term": "end",
-                            "kind": "pct",
-                            "field": "percent_used",
-                            "weight": 0.1
-                      }
-                ]
+            "term": "end",
+            "kind": "pct",
+            "field": "percent_used",
+            "weight": 0.1
           }
+        ]
+      }
     ],
     "_comment": "제품별 state 관측 필드 세트. 제품의 state_fields 키가 세트명을 가리킴. r8=PM9M1/BM9H1, p9=P9(LID 0xDF df_* 제외).",
     "r8": [
@@ -999,7 +1432,7 @@
         "length": 2,
         "endian": "little",
         "weight": 10.0,
-        "desc": "[SecRecv 416h] DRAM Parity error — 메모리 corruption"
+        "desc": "[SecRecv 416] DRAM Parity error — 메모리 corruption"
       },
       {
         "name": "sec_sram_parity_errors",
@@ -1012,7 +1445,7 @@
         "length": 2,
         "endian": "little",
         "weight": 10.0,
-        "desc": "[SecRecv 418h] SRAM Parity error — 캐시/버퍼 무결성"
+        "desc": "[SecRecv 418] SRAM Parity error — 캐시/버퍼 무결성"
       },
       {
         "name": "sec_uncorr_read_errors",
@@ -1025,7 +1458,7 @@
         "length": 8,
         "endian": "little",
         "weight": 2.0,
-        "desc": "[SecRecv 400h] Uncorrectable read — WriteUncorrectable로도 증가"
+        "desc": "[SecRecv 400] Uncorrectable read — WriteUncorrectable로도 증가"
       },
       {
         "name": "sec_e2e_corrections",
@@ -1038,7 +1471,7 @@
         "length": 8,
         "endian": "little",
         "weight": 2.0,
-        "desc": "[SecRecv 408h] End-to-End Correction Counts"
+        "desc": "[SecRecv 408] End-to-End Correction Counts"
       },
       {
         "name": "sec_pcie_corr_errors",
@@ -1051,7 +1484,7 @@
         "length": 8,
         "endian": "little",
         "weight": 2.0,
-        "desc": "[SecRecv 212h] PCIe Correctable Error — PM 전환 시 정상 발생"
+        "desc": "[SecRecv 212] PCIe Correctable Error — PM 전환 시 정상 발생"
       },
       {
         "name": "sec_soft_ecc_errors",
@@ -1064,7 +1497,7 @@
         "length": 8,
         "endian": "little",
         "weight": 2.0,
-        "desc": "[SecRecv 420h] Soft ECC error — read 부하 시 흔함"
+        "desc": "[SecRecv 420] Soft ECC error — read 부하 시 흔함"
       },
       {
         "name": "sec_patrol_relocated",
@@ -1077,7 +1510,7 @@
         "length": 8,
         "endian": "little",
         "weight": 10.0,
-        "desc": "[SecRecv 332h] Read Patrol relocated block — NAND 열화 직접 지표"
+        "desc": "[SecRecv 332] Read Patrol relocated block — NAND 열화 직접 지표"
       },
       {
         "name": "sec_sys_wear_level",
@@ -1090,7 +1523,7 @@
         "length": 1,
         "endian": "little",
         "weight": 7.0,
-        "desc": "[SecRecv 239h] System Area Wear Level"
+        "desc": "[SecRecv 239] System Area Wear Level"
       },
       {
         "name": "sec_system_max_ec",
@@ -1103,7 +1536,7 @@
         "length": 4,
         "endian": "little",
         "weight": 7.0,
-        "desc": "[SecRecv 671h] System Max EC — 시스템 영역 최대 소거"
+        "desc": "[SecRecv 671] System Max EC — 시스템 영역 최대 소거"
       },
       {
         "name": "sec_endurance_estimate",
@@ -1116,7 +1549,7 @@
         "length": 8,
         "endian": "little",
         "weight": 6.0,
-        "desc": "[SecRecv 252h] Endurance Estimate (하위 64-bit)"
+        "desc": "[SecRecv 252] Endurance Estimate (하위 64-bit)"
       },
       {
         "name": "sec_read_reclaim",
@@ -1129,7 +1562,7 @@
         "length": 8,
         "endian": "little",
         "weight": 6.0,
-        "desc": "[SecRecv 324h] Lifetime Read Reclaim — read 부하 자동"
+        "desc": "[SecRecv 324] Lifetime Read Reclaim — read 부하 자동"
       },
       {
         "name": "sec_free_blocks_pct",
@@ -1142,7 +1575,7 @@
         "length": 1,
         "endian": "little",
         "weight": 5.0,
-        "desc": "[SecRecv 242h] % Free Blocks"
+        "desc": "[SecRecv 242] % Free Blocks"
       },
       {
         "name": "sec_wear_level_count",
@@ -1155,7 +1588,7 @@
         "length": 4,
         "endian": "little",
         "weight": 4.0,
-        "desc": "[SecRecv 234h] Wear Level Count — write 부하 자동"
+        "desc": "[SecRecv 234] Wear Level Count — write 부하 자동"
       },
       {
         "name": "sec_refresh_counts",
@@ -1165,10 +1598,10 @@
         "nsid": 1,
         "size": 4096,
         "offset": 340,
-        "length": 4,
+        "length": 7,
         "endian": "little",
         "weight": 4.0,
-        "desc": "[SecRecv 340h] Refresh Counts (하위 4 바이트) — 백그라운드 자동"
+        "desc": "[SecRecv 340] Refresh Counts (7B) — 백그라운드 자동"
       },
       {
         "name": "sec_slc_pct_used",
@@ -1181,7 +1614,7 @@
         "length": 1,
         "endian": "little",
         "weight": 1.0,
-        "desc": "[SecRecv 241h] Percentage Used in Static SLC"
+        "desc": "[SecRecv 241] Percentage Used in Static SLC"
       },
       {
         "name": "sec_sys_data_pct_used",
@@ -1194,7 +1627,7 @@
         "length": 1,
         "endian": "little",
         "weight": 1.5,
-        "desc": "[SecRecv 240h] System data % used"
+        "desc": "[SecRecv 240] System data % used"
       },
       {
         "name": "ffm_frag",
@@ -1295,7 +1728,7 @@
         "length": 2,
         "endian": "little",
         "weight": 10.0,
-        "desc": "[SecRecv 416h] DRAM Parity error — 메모리 corruption"
+        "desc": "[SecRecv 416] DRAM Parity error — 메모리 corruption"
       },
       {
         "name": "sec_sram_parity_errors",
@@ -1308,7 +1741,7 @@
         "length": 2,
         "endian": "little",
         "weight": 10.0,
-        "desc": "[SecRecv 418h] SRAM Parity error — 캐시/버퍼 무결성"
+        "desc": "[SecRecv 418] SRAM Parity error — 캐시/버퍼 무결성"
       },
       {
         "name": "sec_uncorr_read_errors",
@@ -1321,7 +1754,7 @@
         "length": 8,
         "endian": "little",
         "weight": 2.0,
-        "desc": "[SecRecv 400h] Uncorrectable read — WriteUncorrectable로도 증가"
+        "desc": "[SecRecv 400] Uncorrectable read — WriteUncorrectable로도 증가"
       },
       {
         "name": "sec_e2e_corrections",
@@ -1334,7 +1767,7 @@
         "length": 8,
         "endian": "little",
         "weight": 2.0,
-        "desc": "[SecRecv 408h] End-to-End Correction Counts"
+        "desc": "[SecRecv 408] End-to-End Correction Counts"
       },
       {
         "name": "sec_pcie_corr_errors",
@@ -1347,7 +1780,7 @@
         "length": 8,
         "endian": "little",
         "weight": 2.0,
-        "desc": "[SecRecv 212h] PCIe Correctable Error — PM 전환 시 정상 발생"
+        "desc": "[SecRecv 212] PCIe Correctable Error — PM 전환 시 정상 발생"
       },
       {
         "name": "sec_soft_ecc_errors",
@@ -1360,7 +1793,7 @@
         "length": 8,
         "endian": "little",
         "weight": 2.0,
-        "desc": "[SecRecv 420h] Soft ECC error — read 부하 시 흔함"
+        "desc": "[SecRecv 420] Soft ECC error — read 부하 시 흔함"
       },
       {
         "name": "sec_patrol_relocated",
@@ -1373,7 +1806,7 @@
         "length": 8,
         "endian": "little",
         "weight": 10.0,
-        "desc": "[SecRecv 332h] Read Patrol relocated block — NAND 열화 직접 지표"
+        "desc": "[SecRecv 332] Read Patrol relocated block — NAND 열화 직접 지표"
       },
       {
         "name": "sec_sys_wear_level",
@@ -1386,7 +1819,7 @@
         "length": 1,
         "endian": "little",
         "weight": 7.0,
-        "desc": "[SecRecv 239h] System Area Wear Level"
+        "desc": "[SecRecv 239] System Area Wear Level"
       },
       {
         "name": "sec_system_max_ec",
@@ -1399,7 +1832,7 @@
         "length": 4,
         "endian": "little",
         "weight": 7.0,
-        "desc": "[SecRecv 671h] System Max EC — 시스템 영역 최대 소거"
+        "desc": "[SecRecv 671] System Max EC — 시스템 영역 최대 소거"
       },
       {
         "name": "sec_endurance_estimate",
@@ -1412,7 +1845,7 @@
         "length": 8,
         "endian": "little",
         "weight": 6.0,
-        "desc": "[SecRecv 252h] Endurance Estimate (하위 64-bit)"
+        "desc": "[SecRecv 252] Endurance Estimate (하위 64-bit)"
       },
       {
         "name": "sec_read_reclaim",
@@ -1425,7 +1858,7 @@
         "length": 8,
         "endian": "little",
         "weight": 6.0,
-        "desc": "[SecRecv 324h] Lifetime Read Reclaim — read 부하 자동"
+        "desc": "[SecRecv 324] Lifetime Read Reclaim — read 부하 자동"
       },
       {
         "name": "sec_free_blocks_pct",
@@ -1438,7 +1871,7 @@
         "length": 1,
         "endian": "little",
         "weight": 5.0,
-        "desc": "[SecRecv 242h] % Free Blocks"
+        "desc": "[SecRecv 242] % Free Blocks"
       },
       {
         "name": "sec_wear_level_count",
@@ -1451,7 +1884,7 @@
         "length": 4,
         "endian": "little",
         "weight": 4.0,
-        "desc": "[SecRecv 234h] Wear Level Count — write 부하 자동"
+        "desc": "[SecRecv 234] Wear Level Count — write 부하 자동"
       },
       {
         "name": "sec_refresh_counts",
@@ -1461,10 +1894,10 @@
         "nsid": 1,
         "size": 4096,
         "offset": 340,
-        "length": 4,
+        "length": 7,
         "endian": "little",
         "weight": 4.0,
-        "desc": "[SecRecv 340h] Refresh Counts (하위 4 바이트) — 백그라운드 자동"
+        "desc": "[SecRecv 340] Refresh Counts (7B) — 백그라운드 자동"
       },
       {
         "name": "sec_slc_pct_used",
@@ -1477,7 +1910,7 @@
         "length": 1,
         "endian": "little",
         "weight": 1.0,
-        "desc": "[SecRecv 241h] Percentage Used in Static SLC"
+        "desc": "[SecRecv 241] Percentage Used in Static SLC"
       },
       {
         "name": "sec_sys_data_pct_used",
@@ -1490,7 +1923,7 @@
         "length": 1,
         "endian": "little",
         "weight": 1.5,
-        "desc": "[SecRecv 240h] System data % used"
+        "desc": "[SecRecv 240] System data % used"
       },
       {
         "name": "ffm_frag",
