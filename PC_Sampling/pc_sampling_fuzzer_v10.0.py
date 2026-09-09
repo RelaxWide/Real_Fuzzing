@@ -3526,6 +3526,14 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         self._rng = random.Random(self._seed)        # ★ 재현용 — 세션 로그에 남긴다
         self._valid_bit = int(plan.get('valid_bit', 1))
         self._jitter_pct = float(plan.get('jitter_pct', 20.0))
+        # 끈질긴 재수립: 빠른 1회(_reinit_target) 실패 후 _reconnect 가 settle+backoff 로 N회 재시도.
+        #   컨트롤러는 살아있는데 직전 세션의 J-Link USB 가 아직 안 풀려 즉시 재오픈이 실패하는
+        #   transient 를 넘기기 위함(퍼저 종료 후 재connect 는 되던 현상). bounded(무한 hang 방지).
+        self._reconnect_attempts = max(1, int(rv.get('reconnect_attempts', 6)))
+        self._reconnect_settle = max(0.0, float(rv.get('reconnect_settle_sec', 0.5)))
+        self._reconnect_backoff = max(0.0, float(rv.get('reconnect_backoff_sec', 1.0)))
+        self._reconnect_backoff_cap = max(self._reconnect_backoff,
+                                          float(rv.get('reconnect_backoff_cap_sec', 3.0)))
         # 플랜 §4 재현성: 셔플·지터 seed 를 남기지 않으면 특정 커버리지나 세션 붕괴가
         #   나온 샘플링 조건을 재현할 수 없다. seed 는 config 에 고정값을 넣어 재현한다.
         log.warning(f"[cJTAG/SBA] 샘플링 seed={self._seed} "
@@ -3999,12 +4007,36 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         s = self.session
         return bool(s is not None and s.lk is not None and s.dap is not None)
 
-    def _reconnect(self) -> bool:
+    def _reinit_target(self) -> bool:
+        """빠른 1회 재수립(OpenOCD 의 telnet 재연결에 대응하는 경량 경로).
+        orchestrator 가 이걸 먼저 부르고, 실패하면 _reconnect(끈질긴 재시도)로 넘어간다."""
         self.close()
         return self.connect()
 
-    def _reinit_target(self) -> bool:
-        return self._reconnect()
+    def _reconnect(self) -> bool:
+        """끈질긴 재수립 — close→settle→connect 를 최대 N회, 점증 backoff.
+
+        컨트롤러는 살아있는데 직전 세션의 J-Link USB/cJTAG 가 아직 안 풀려 즉시 재오픈이
+        실패하는 transient 를 넘긴다(퍼저 종료 뒤 수동 재connect 는 되던 현상). settle 로
+        USB 해제 시간을 주고, 안 되면 backoff 두고 다시. 전 구간 bounded(무한 hang 방지).
+        """
+        n = self._reconnect_attempts
+        for k in range(1, n + 1):
+            self.close()
+            if self._reconnect_settle:
+                time.sleep(self._reconnect_settle)   # J-Link/libjaylink USB 해제 대기
+            if self.connect():
+                if k > 1:
+                    log.warning(f"[cJTAG/SBA] 재연결 성공 (시도 {k}/{n})")
+                return True
+            if k < n:
+                _bo = min(self._reconnect_backoff * k, self._reconnect_backoff_cap)
+                log.warning(f"[cJTAG/SBA] 재연결 {k}/{n} 실패 — {_bo:.1f}s 후 재시도 "
+                            f"(settle={self._reconnect_settle:.1f}s)")
+                if _bo:
+                    time.sleep(_bo)
+        log.error(f"[cJTAG/SBA] 재연결 {n}회 모두 실패 — 링크 재수립 불가")
+        return False
 
     # OpenOCD 전용 경로 무력화 (JLinkHaltSampler 와 동일 전략)
     def _send_startup_tcl(self, *a, **k):   return True
