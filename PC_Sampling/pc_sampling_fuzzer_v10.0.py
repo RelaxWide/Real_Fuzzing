@@ -1202,6 +1202,7 @@ class Seed:
     # v9.0 LLM-guided: 출처 태그(예: 'llm_new_group')와 LLM 유용성 점수(0~1). None=기존 경로.
     seed_class: Optional[str] = None
     llm_score: Optional[float] = None
+    llm_keep: Optional[bool] = None  # corpus_eval 의 keep. False=LLM 이 버리라고 판단 → 컬링 우선
     last_gain_exec: int = 0      # v9.2 staleness: 마지막으로 새 코드 커버리지를 낸 exec_count
     prov_id: Optional[int] = None  # v9.4 ledger: LLM 제안 계보 id(관측 전용, 결정 로직 미참조)
 
@@ -1217,6 +1218,8 @@ class SequenceSeed:
     is_favored: bool = False
     covered_pcs: Optional[set] = None
     seed_class: Optional[str] = None   # v9.0: 'llm_seq' 등 출처 태그
+    llm_score: Optional[float] = None
+    llm_keep: Optional[bool] = None  # corpus_eval 의 keep. False=LLM 이 버리라고 판단 → 컬링 우선
     last_gain_exec: int = 0      # v9.2 staleness: 마지막으로 새 코드 커버리지를 낸 exec_count
     prov_id: Optional[int] = None  # v9.4 ledger: LLM 제안 계보 id(관측 전용, 결정 로직 미참조)
 
@@ -5987,31 +5990,46 @@ class NVMeFuzzer:
                             break
                     return out
 
+                # ★ frontier 와 uncovered 는 **독립 가드**로 만든다. 예전엔 함수 전체가
+                #   하나의 try 라, 뒤쪽(미도달 랭킹)이 실데이터에서 터지면 앞에서 성공한
+                #   frontier 결과까지 통째로 버려지고 "" 가 나갔다(빈 프롬프트). 이제 한쪽이
+                #   실패해도 다른 쪽은 살린다.
                 _frontier = {}
                 _frontier_keys = set()
-                for cid in _core_ids:
-                    rows = [r for r in _cov.frontier_functions(cid)
-                            if _is_rv_symbol(r[0])]
-                    _frontier[cid] = rows
-                    _frontier_keys.update((cid, r[2]) for r in rows)
+                try:
+                    for cid in _core_ids:
+                        rows = [r for r in _cov.frontier_functions(cid)
+                                if _is_rv_symbol(r[0])]
+                        _frontier[cid] = rows
+                        _frontier_keys.update((cid, r[2]) for r in rows)
+                except Exception as _fe:
+                    if not getattr(self, '_llm_frontier_warned', False):
+                        self._llm_frontier_warned = True
+                        log.warning(f"[LLM/cov] frontier 계산 실패(무시): {_fe}")
                 chosen_frontier = _round_robin(_frontier, _budget)
 
                 # 콜그래프 거리 순(가까운 것 먼저). frontier 로 이미 나간 것은 뺀다.
-                _uncovered = {}
-                _nopath = 0
-                for cid in _core_ids:
-                    _rows = [r for r in _cov.reach_ranked_uncovered(cid, RAG_MAX_HOPS)
-                             if _is_rv_symbol(r[0]) and (cid, r[2]) not in _frontier_keys]
-                    _nopath += sum(1 for r in _rows if r[3] is None)
-                    _uncovered[cid] = [(r[0], r[1], r[2]) for r in _rows]
-                if _nopath and not getattr(self, '_llm_nopath_logged', False):
-                    self._llm_nopath_logged = True
-                    _tot = sum(len(v) for v in _uncovered.values())
-                    log.info(f"[LLM/cov] 미도달 {_tot}개 중 {_nopath}개는 도달 경로 미상"
-                             f"(콜그래프상 {RAG_MAX_HOPS}홉 내 호출자 없음) — 후순위. "
-                             f"직접 호출만 담긴 콜그래프라 '절대 불가'는 아니다")
-                chosen_uncovered = _round_robin(
-                    _uncovered, max(0, _budget - len(chosen_frontier)))
+                chosen_uncovered = []
+                try:
+                    _uncovered = {}
+                    _nopath = 0
+                    for cid in _core_ids:
+                        _rows = [r for r in _cov.reach_ranked_uncovered(cid, RAG_MAX_HOPS)
+                                 if _is_rv_symbol(r[0]) and (cid, r[2]) not in _frontier_keys]
+                        _nopath += sum(1 for r in _rows if r[3] is None)
+                        _uncovered[cid] = [(r[0], r[1], r[2]) for r in _rows]
+                    if _nopath and not getattr(self, '_llm_nopath_logged', False):
+                        self._llm_nopath_logged = True
+                        _tot = sum(len(v) for v in _uncovered.values())
+                        log.info(f"[LLM/cov] 미도달 {_tot}개 중 {_nopath}개는 도달 경로 미상"
+                                 f"(콜그래프상 {RAG_MAX_HOPS}홉 내 호출자 없음) — 후순위. "
+                                 f"직접 호출만 담긴 콜그래프라 '절대 불가'는 아니다")
+                    chosen_uncovered = _round_robin(
+                        _uncovered, max(0, _budget - len(chosen_frontier)))
+                except Exception as _ue:
+                    if not getattr(self, '_llm_uncov_warned', False):
+                        self._llm_uncov_warned = True
+                        log.warning(f"[LLM/cov] 미도달 랭킹 실패(무시, frontier 는 유지): {_ue}")
 
                 lines = []
                 for cid, (name, callers, _entry) in chosen_frontier:
@@ -6844,8 +6862,13 @@ class NVMeFuzzer:
         for ev in (data.get('evaluations') or []):
             try:
                 s = _targets.get(int(ev.get('seed_id')))
-                if s is not None and isinstance(ev.get('score'), (int, float)):
-                    s.llm_score = float(ev['score'])
+                if s is not None:
+                    if isinstance(ev.get('score'), (int, float)):
+                        s.llm_score = float(ev['score'])
+                    # keep=False = LLM 이 명시적으로 '버려라' → 컬링 우선(아래 _cull_corpus).
+                    #   score(에너지 *0.5)만으로는 프롬프트가 요구한 keep 판단이 배선 안 됐었다.
+                    if isinstance(ev.get('keep'), bool):
+                        s.llm_keep = ev['keep']
             except Exception:
                 pass
         # io_workload descriptor (io_patterns) — 검증 통과 시 pending 슬롯에 저장(1건).
@@ -7042,7 +7065,11 @@ class NVMeFuzzer:
     @staticmethod
     def _llm_cull_protected(seed) -> bool:
         """②: LLM 출처 시드는 exec_count < RAG_CULL_GRACE 동안 컬링 보호.
-        부스트로 exec_count 가 빨리 2에 닿아도 변이가 커버리지 찾을 기회를 더 준다."""
+        부스트로 exec_count 가 빨리 2에 닿아도 변이가 커버리지 찾을 기회를 더 준다.
+        ★ 단 corpus_eval 에서 LLM 이 keep=False(버려라)로 판단한 시드는 보호하지 않는다
+          — LLM 자신이 무가치로 판정한 것을 LLM 계보라는 이유로 지켜줄 이유가 없다."""
+        if getattr(seed, 'llm_keep', None) is False:
+            return False
         sc = str(getattr(seed, 'seed_class', '') or '')
         return sc.startswith('llm') and getattr(seed, 'exec_count', 0) < RAG_CULL_GRACE
 
@@ -7106,9 +7133,10 @@ class NVMeFuzzer:
         elif sc.startswith('llm'):
             e *= self._llm_boost
         ls = getattr(seed, 'llm_score', None)
-        if ls is not None and ls < RAG_LLM_SCORE_FLOOR:
-            e *= 0.5   # LLM 이 **극단적으로** 낮게 평가한 시드만 비우선화(삭제 안 함).
-            #          구 0.3 은 0.25~0.65 클러스터를 벌줘 자기평가로 자기 페널티였음.
+        if getattr(seed, 'llm_keep', None) is False or (ls is not None and ls < RAG_LLM_SCORE_FLOOR):
+            e *= 0.5   # LLM 이 keep=False(버려라) 또는 **극단적으로** 낮게 평가한 시드 비우선화.
+            #          (컬링으로 제거되기 전까지 선택도 덜 되게. 구 0.3 은 0.25~0.65 클러스터를
+            #           벌줘 자기평가로 자기 페널티였음 → 0.5.)
         return e
 
     def _calculate_energy(self, seed: 'Union[Seed, SequenceSeed]') -> float:
@@ -8254,20 +8282,28 @@ class NVMeFuzzer:
         before = len(self.corpus)
         # v9.0 ②: LLM 시드는 exec_count < RAG_CULL_GRACE 동안 컬링 보호(변이 탐색 기회 부여) —
         #   부스트로 자주 뽑혀 exec_count 가 빨리 2에 닿아도 바로 안 잘리게.
-        _to_remove = [s for s in self.corpus
-                      if not (s.is_favored or s.exec_count < 2 or s.found_at == 0
-                              or self._llm_cull_protected(s))]
+        def _survives_cull(s):
+            # favored(어떤 PC 의 유일/최선 대표)·기본 시드(found_at==0)는 커버리지 보존이
+            #   LLM 의견보다 우선이라 항상 보존.
+            if s.is_favored or s.found_at == 0:
+                return True
+            # corpus_eval 에서 LLM 이 keep=False 로 판단 → young/LLM grace 없이 즉시 제거 대상.
+            if getattr(s, 'llm_keep', None) is False:
+                return False
+            return s.exec_count < 2 or self._llm_cull_protected(s)
+
+        _to_remove = [s for s in self.corpus if not _survives_cull(s)]
         _removed_seq_set = {id(s) for s in _to_remove if isinstance(s, SequenceSeed)}
         if RAG_DEBUG:   # ① 가시성: 어느 LLM 시드가 왜 잘리는지
             for s in _to_remove:
                 if self._is_llm_seed(s):
                     _nm = s.cmd.name if isinstance(s, Seed) else 'seq'
+                    _kept = getattr(s, 'llm_keep', None)
                     log.warning(f"[LLM/cull] {_nm} exec_count={s.exec_count} "
                                 f"covered_pcs={len(s.covered_pcs) if s.covered_pcs else 0} "
-                                f"favored={s.is_favored}")
-        self.corpus = [s for s in self.corpus
-                       if s.is_favored or s.exec_count < 2 or s.found_at == 0
-                       or self._llm_cull_protected(s)]
+                                f"favored={s.is_favored}"
+                                + ("  keep=False(LLM 버림 판정)" if _kept is False else ""))
+        self.corpus = [s for s in self.corpus if _survives_cull(s)]
         removed = before - len(self.corpus)
         if removed > 0:
             log.info(f"[Cull] corpus {before} → {len(self.corpus)} "

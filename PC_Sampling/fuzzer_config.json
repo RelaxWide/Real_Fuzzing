@@ -403,7 +403,7 @@
     "schema_max": 48,
     "boost_lr": 0.3,
     "boost_min": 0.5,
-    "boost_max": 3.0,
+    "boost_max": 5.0,
     "boost_min_samples": 50,
     "debug_exec": false,
     "boost_min_gain": 5,
