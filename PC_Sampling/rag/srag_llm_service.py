@@ -37,6 +37,7 @@ LLM_FUNC   = "generate_rag_response"   # 그 안의 함수명. generate_rag_resp
 # 문자만 바뀌므로, 이 파일을 매번 고치는 대신 찾아서 쓴다.
 BRIDGE_SUBPATH   = Path("pc_sample") / "rag" / "bridge"   # 드라이브 루트 아래 상대경로
 BRIDGE_PREFERRED = "ZYX"               # 먼저 볼 드라이브 문자(보통 이 선에서 끝난다)
+_BRIDGE_SRC = "?"                      # 어느 규칙으로 골랐는지(시작 배너에 표시)
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -54,26 +55,30 @@ def _win_live_drives():
 
 
 def _probe_bridge_dir():
-    """**실재하는** bridge 폴더를 찾아 (경로, 찾아본 경로들) 로 돌려준다. 없으면 (None, ...).
+    """**실재하는** bridge 폴더를 (경로, 출처, 찾아본 경로들) 로 돌려준다. 없으면 (None, "", ...).
 
     시작 시점과 실행 중 재탐색이 같은 규칙을 쓰도록 분리했다 — 이쪽은 비치명이라
     실패해도 종료하지 않는다.
+
+    ⚠ Windows 에서는 **드라이브 탐색을 먼저** 한다. 스크립트 옆 bridge/ 를 먼저 보면,
+    예전 버전이 만들어 둔 빈 bridge/ 가 남아 있을 때 네트워크 드라이브를 아예 찾지
+    않고 그 빈 폴더를 폴링한다 — 요청을 영영 못 받고 로그도 조용하다(실측).
     """
     local = _HERE / "bridge"
-    tried = [str(local)]
+    tried = []
+    if os.name == "nt":
+        for d in _win_live_drives():
+            cand = Path(f"{d}:\\") / BRIDGE_SUBPATH
+            tried.append(str(cand))
+            try:
+                if cand.is_dir():
+                    return cand, "드라이브 탐색", tried
+            except OSError:
+                continue                # 권한/끊김 — 다음 문자로
+    tried.append(str(local))
     if local.is_dir():
-        return local, tried
-    if os.name != "nt":
-        return None, tried
-    for d in _win_live_drives():
-        cand = Path(f"{d}:\\") / BRIDGE_SUBPATH
-        tried.append(str(cand))
-        try:
-            if cand.is_dir():
-                return cand, tried
-        except OSError:
-            continue                    # 권한/끊김 — 다음 문자로
-    return None, tried
+        return local, "스크립트 옆", tried
+    return None, "", tried
 
 
 def _find_bridge_dir():
@@ -82,19 +87,23 @@ def _find_bridge_dir():
     (조용히 기본값으로 떨어지면 서비스가 뜬 채로 영영 요청을 못 받는다 — 그 실패는
      _IDLE_WARN_SEC 가 지나야 드러나므로, 시작 시점에 끊는 편이 낫다.)
     """
-    found, tried = _probe_bridge_dir()
+    global _BRIDGE_SRC
+    found, src, tried = _probe_bridge_dir()
     if found is not None:
+        _BRIDGE_SRC = src
         return found
     if os.name != "nt":
+        _BRIDGE_SRC = "스크립트 옆(신규 생성)"
         return _HERE / "bridge"         # 리눅스/오프라인 쪽 기존 동작(없으면 아래에서 생성)
     sys.exit("[RAG service] bridge 폴더를 찾지 못했습니다. 네트워크 드라이브 연결을 "
              "확인하거나 RAG_BRIDGE_DIR 로 직접 지정하세요.\n  찾아본 경로:\n    "
              + "\n    ".join(tried))
 
 
-def _rebind_bridge(newdir: Path):
+def _rebind_bridge(newdir: Path, src: str = "재탐색"):
     """실행 중 bridge 위치 변경을 반영한다(네트워크 드라이브 문자 변경 등)."""
-    global BRIDGE_DIR, _REQ, _RESP
+    global BRIDGE_DIR, _REQ, _RESP, _BRIDGE_SRC
+    _BRIDGE_SRC = src
     BRIDGE_DIR = newdir
     _REQ = newdir / "requests"
     _RESP = newdir / "responses"
@@ -110,7 +119,10 @@ LLM_MODULE = os.environ.get("RAG_LLM_MODULE", LLM_MODULE)
 LLM_FUNC = os.environ.get("RAG_LLM_FUNC", LLM_FUNC)
 _env_bridge = os.environ.get("RAG_BRIDGE_DIR")
 _BRIDGE_PINNED = _env_bridge is not None   # 사용자가 못박음 → 실행 중 재탐색하지 않는다
-BRIDGE_DIR = Path(_env_bridge) if _env_bridge else _find_bridge_dir()
+if _env_bridge:
+    BRIDGE_DIR, _BRIDGE_SRC = Path(_env_bridge), "RAG_BRIDGE_DIR"
+else:
+    BRIDGE_DIR = _find_bridge_dir()
 
 _REQ = BRIDGE_DIR / "requests"
 _RESP = BRIDGE_DIR / "responses"
@@ -212,7 +224,7 @@ def _log(msg: str):
 
 
 def main():
-    _log(f"watching {_REQ}  (LLM={LLM_MODULE}.{LLM_FUNC})")
+    _log(f"watching {_REQ}  [{_BRIDGE_SRC}]  (LLM={LLM_MODULE}.{LLM_FUNC})")
     _log(f"유휴 경고 간격 {_IDLE_WARN_SEC:.0f}초 (RAG_IDLE_WARN_SEC 로 조정)")
     last_ok = time.monotonic()     # 마지막으로 요청을 처리한(또는 폴더가 멀쩡했던) 시각
     _unreadable = {}               # 파일명 -> 연속 읽기 실패 횟수(권한 문제 조기 발견)
@@ -246,10 +258,10 @@ def main():
             # 찾으면 경로만 갈아끼우고, 정상 판정/복구 로그는 다음 라운드에 맡긴다.
             if not _BRIDGE_PINNED and (now - last_redetect) >= _REDETECT_SEC:
                 last_redetect = now
-                _found, _ = _probe_bridge_dir()
+                _found, _src, _ = _probe_bridge_dir()
                 if _found is not None and _found != BRIDGE_DIR:
-                    _log(f"✓ bridge 위치 변경 감지: {BRIDGE_DIR} → {_found}")
-                    _rebind_bridge(_found)
+                    _log(f"✓ bridge 위치 변경 감지: {BRIDGE_DIR} → {_found} ({_src})")
+                    _rebind_bridge(_found, _src)
                     continue
             time.sleep(_POLL)
             continue
