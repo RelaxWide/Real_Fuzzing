@@ -274,7 +274,7 @@ RAG_MAX_CONSEC_TASK  = int(_RAG.get('max_consec_task', 3))     # 같은 LLM task
 RAG_CONTRAST_MIN_DIFF = int(_RAG.get('contrast_min_field_diff', 1))  # matched-contrastive: sibling 최대 다른 필드 수(1=한 요인만)
 RAG_MIN_REQ_INTERVAL = float(_RAG.get('min_request_interval_sec', 0.0))  # 요청 최소 시간간격(초). rate-limit 회피. 0=끔
 RAG_CULL_GRACE       = int(_RAG.get('cull_grace', 8))     # LLM 시드 컬링 유예: exec_count < 이 값이면 보호(변이 탐색 기회)
-RAG_FAIL_LIMIT       = int(_RAG.get('fail_limit', 3))     # RAG service 호출 연속 실패 이 횟수 도달 시 이후 RAG 비활성(0=끔)
+RAG_FAIL_LIMIT       = int(_RAG.get('fail_limit', 10))    # RAG service 호출 연속 실패 이 횟수 도달 시 이후 RAG 비활성(0=끔)
 # 디바이스 grounding용: Identify Controller OACS/ONCS 비트 → 지원 명령 매핑 (프롬프트에 실제 능력 주입)
 _OACS_CMDS = {0: 'SecuritySend/Receive', 1: 'FormatNVM', 2: 'FWDownload/FWCommit',
               3: 'NamespaceManagement', 4: 'DeviceSelfTest', 5: 'DirectiveSend/Receive',
@@ -3748,7 +3748,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             if not self._weights:
                 self._weights = {cid: 1 for cid in self._cores}
             self._pcsr_addrs = [0] * len(self._cores)
-        log.warning(f"[cJTAG/SBA] 세션 OK (SJTAG 인증 {self.session.auth_count}회, "
+        log.warning(f"[cJTAG/SBA] 링크 준비 완료, PC 검증 전 (SJTAG 인증 {self.session.auth_count}회, "
                     f"{self.session.auth_ms:.0f}ms). 버스트 seed={self._seed} "
                     f"(재현하려면 sample_plan.seed 에 지정)")
         ok_cores = []
@@ -3758,21 +3758,28 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             else:
                 log.error(f"[cJTAG/SBA] core{cid} pin 실패 — 이 코어는 샘플링 제외")
         if not ok_cores:
+            self.close()
             return False
-        self._weights = {c: w for c, w in self._weights.items() if c in ok_cores}
+        # 재시도는 이전 샘플링 계획에서 다시 시작한다. 실패한 connect가
+        # self._weights를 비우면 이후 PC가 회복해도 모든 재시도가 실패한다.
+        candidate_weights = {c: w for c, w in self._weights.items() if c in ok_cores}
         bad = self._verify_ranges(ok_cores)
         if bad:
-            self._weights = {c: w for c, w in self._weights.items() if c not in bad}
+            candidate_weights = {c: w for c, w in candidate_weights.items() if c not in bad}
             log.error(f"[cJTAG/SBA] 정합성 미확인 코어 제외: {sorted(bad)} — "
-                      f"남은 코어: {sorted(self._weights)}")
-        if not self._weights:
+                      f"남은 코어: {sorted(candidate_weights)}")
+        if not candidate_weights:
             log.error("[cJTAG/SBA] 샘플링 가능한 코어가 없다 — 연결 실패로 처리")
+            self.close()
             return False
+        self._weights = candidate_weights
         if self._primary not in self._weights:
             self._primary = max(self._weights, key=self._weights.get)
             log.warning(f"[cJTAG/SBA] primary 코어를 {self._primary} 로 재선정")
         # 오버레이 프로브는 세션이 살아 있는 지금 확인한다(재연결마다 다시).
         self._init_overlay_probe()
+        log.warning(f"[cJTAG/SBA] 세션 OK — PC 정합성 검증 통과 "
+                    f"cores={sorted(self._weights)}")
         return True
 
     def _verify_ranges(self, cores):
@@ -3795,6 +3802,13 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                 continue
             obs = self.session.burst(cid, 200, self._valid_bit)
             pcs = [o.pc for o in obs if o.valid and o.pc is not None]
+            if not pcs:
+                bad.append(cid)
+                reason = ('전송 실패' if self.session.last_fail_kind == 'transport'
+                          else '읽기는 완료했으나 유효 PC 없음')
+                log.error(f"[cJTAG/SBA] core{cid} PC 검증 실패: {reason} "
+                          f"(samples={len(obs)}, valid=0) — ELF 정합성 판정 불가")
+                continue
             off = int(str((self._cores.get(cid) or {}).get('load_offset', 0)), 0)
             ok, info = elf_map.check_gate(pcs, elf, off, thr,
                                           label=f"core{cid}", verbose=True)
@@ -3952,6 +3966,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             self._stopped_reason = ""
             self._reset_window_extra()          # _observations 비움
             self._invalid_streak = {}
+            self._all_invalid_since = None    # 이전 window의 무효 시간을 이어 세지 않는다
             cfg, total, empty, bail = self.config, 0, 0, False
             limit = max(1, int(cfg.max_samples_per_run))
             try:
@@ -3984,6 +3999,16 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                         if _pa is not None:
                             _bank = self._resolve_bank(core, self.session.read_word(_pa))
                         obs = self.session.burst(core, n, self._valid_bit)
+                        # transport 실패는 valid=0(WFI)와 별개다. 오버레이 폐기보다
+                        # 먼저 확인해야 bank 미검출 continue에 장애가 가려지지 않는다.
+                        # 빈 버스트(pin 실패)는 아래 기존 연속 실패 한도를 적용한다.
+                        if obs and self.session.last_fail_kind == 'transport':
+                            self._stopped_reason = 'transport'
+                            log.error(f"[cJTAG/SBA] core{core} 버스트 전송 실패 — "
+                                      "샘플링 중단, 메인 루프에서 링크 복구")
+                            self.openocd_error.set()
+                            bail = True
+                            break
                         if _pa is not None and obs:
                             # 버스트 도중 스왑이 일어났으면 이 샘플들이 어느 오버레이의
                             # 것인지 알 수 없다 → 틀린 귀속보다 버리는 게 낫다.
@@ -4089,6 +4114,10 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             self._all_invalid_since = None
 
     def _maybe_recover(self):
+        # stop_sampling()이 join 중일 때 새 인증/USB 재연결을 시작하지 않는다.
+        # 인증은 수십 초 걸릴 수 있어 공용 join timeout 뒤 메인 복구와 겹친다.
+        if self.stop_event.is_set() or self.openocd_error.is_set():
+            return
         sj = self._sj_mod()
         if self._all_invalid_since is None:
             return

@@ -361,7 +361,7 @@
     "_comment_call": "pass_system_prompt=true → func(system, user) 2-인자(개발 mock ask). false → func(system+user 결합) 1-인자. 실배포(2-PC Samba): 오프라인은 module_path='rag.rag_bridge_client'(drop-box 클라이언트), func_name='generate_rag_response', pass_system_prompt=false. 온라인은 srag_llm_service.py 가 실제 LLM 처리(rag/README 없음 — v9.0.md 참조).",
     "_comment_debug": "debug=true → [LLM/raw](원본응답) [LLM/parse](파싱결과) [LLM/item](항목 accept/dup/drop) [LLM/stats](기여도 요약) 단계별 로그. log_responses=true → output/llm_io.jsonl 에 원본 전량 기록. 둘 다 분석/디버깅용 — 실운영은 false. json_retries=응답이 JSON 아니면 교정 리프롬프트 재시도 상한.",
     "enabled": true,
-    "fail_limit": 3,
+    "fail_limit": 10,
     "debug": true,
     "json_retries": 2,
     "log_responses": false,
