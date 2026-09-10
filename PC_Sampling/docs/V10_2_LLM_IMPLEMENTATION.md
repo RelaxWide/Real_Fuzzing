@@ -1,5 +1,7 @@
 # v10.2 실행 근거 기반 LLM 탐색
 
+실행·설정 안내: [pc_sampling_fuzzer v10.2](pc_sampling_fuzzer_v10.2.md).
+
 기준: `pc_sampling_fuzzer_v10.1.py`를 복사한 `pc_sampling_fuzzer_v10.2.py` (10.2.0).
 설계 근거: [LLM_IMPROVEMENT_PROJECT.md](LLM_IMPROVEMENT_PROJECT.md).
 상태: 코드 구현 및 하드웨어 없는 단위·통합 검증 완료. 실제 SSD/JLink에서의 장시간 성능과
