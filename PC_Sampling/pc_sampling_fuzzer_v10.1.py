@@ -599,6 +599,9 @@ ADMIN_SWAP_PROB        = _MU['admin_swap']
 DATALEN_MUT_PROB       = _MU['datalen']
 SCHEMA_MUT_PROB        = _MU['schema']
 _PAGE_SIZE             = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+# 주기 통계의 오버레이 경고 임계. 누적 절대값은 크고 작음을 판단할 수 없어 비율로 본다.
+OVL_DROP_WARN_PCT      = 1.0      # 스왑 폐기 비율이 이 %를 넘으면 경고(+burst_len 조정 안내)
+OVL_ZERO_WARN_EXEC     = 20_000   # 이 실행 수를 넘도록 bank 관측이 0 이면 경고(초기 노이즈 회피)
 LBA_PAIR_MUT_PROB      = _MU['lba_pair']
 STRUCT_PAYLOAD_MUT_PROB= _MU['struct_payload']
 SEQ_PROB               = _MU['seq_prob']
@@ -3694,6 +3697,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         # 코어만 채운다(SBA 가 코드 메모리에 못 닿을 수 있다).
         self._ovl_probe = {}
         self._ovl_dropped = 0
+        self._ovl_kept = 0        # 태깅에 성공한 샘플 — ovl-drop 비율의 분모
         self.collapse_count = 0
         self.recover_ok = 0
         self.recover_fail = 0
@@ -4017,6 +4021,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                                 self._ovl_dropped += len(obs)
                                 total += len(obs)      # 진행은 시켜야 무한루프가 안 난다
                                 continue
+                            self._ovl_kept += len(obs)
                             obs = [o._replace(bank=_bank) for o in obs]
                         if not obs:
                             # ★ 빈 버스트(=pin 실패)에 continue 만 하면 total 이 안 늘어
@@ -16051,19 +16056,14 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         # 보이지 않았다. 붕괴가 **감지되지 않은 채** 진행되면 커버리지가 조용히
         # 멈추므로, 카운터를 주기 통계에 노출해 눈에 띄게 한다.
         # 오버레이 진행 — 35개가 한 주소를 공유해 전체 BB% 만 보면 본체에 묻힌다.
-        _ovl_tag = ""
+        # 커버리지 정보이므로 [Stats](실행 통계) 가 아니라 아래 [StatCov] 코어별 줄에 붙인다.
+        _ovl = {}
         _covm = getattr(self, 'cov', None)
         if _covm is not None and getattr(_covm, 'loaded', False):
             try:
-                _os = _covm.overlay_stats()
+                _ovl = _covm.overlay_stats()
             except Exception:
-                _os = {}
-            _parts = [f"{v['name']} {v['banks_seen']}/{v['banks_total']}bank "
-                      f"{v['bbs']:,}/{v['bbs_total']:,}BB" for v in _os.values()]
-            if _parts:
-                _ovl_tag = " | ovl: " + ", ".join(_parts)
-        _ovd = getattr(self.sampler, '_ovl_dropped', 0)
-        _ovd_tag = f" | ovl-drop: {_ovd:,}" if _ovd else ""
+                _ovl = {}
         _col = getattr(self.sampler, 'collapse_count', 0)
         _col_tag = ""
         if _col:
@@ -16074,7 +16074,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                  f"pcs: {stats['coverage_unique_pcs']:,} | "
                  f"exec/s: {window_eps:.1f} | "
                  f"seq_run: {_seq_run}"
-                 f"{_col_tag}{_ovl_tag}{_ovd_tag}{ps_tag}{state_tag}")
+                 f"{_col_tag}{ps_tag}{state_tag}")
         # 시작 배너를 놓쳐도 알 수 있게 주기 통계마다 재알림(정상 버전이면 아무것도 안 찍힘).
         _nvme_cli_warn(log, brief=True)
         _bbc, _bbt, _fnc, _fnt, _by_core = self._cov_totals(by_core=True)
@@ -16095,9 +16095,38 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             if sa_parts:
                 log.warning(f"[StatCov] {' | '.join(sa_parts)}")
             if _by_core:      # v10 RISC-V: 코어별 내역 (어느 코어가 도는지 한눈에)
-                log.warning("[StatCov] " + " | ".join(
-                    f"{v['name']} BB {v['bb']:,}/{v['bb_total']:,}({v['bb_pct']:.1f}%)"
-                    for _, v in sorted(_by_core.items())))
+                # overlay_stats() 는 코어 id 로 키가 잡히고 name 도 코어 이름이라 같은 줄에
+                # 붙는다 — BB 진행과 오버레이 진행을 나란히 봐야 대조가 된다.
+                _cparts = []
+                for _cid, v in sorted(_by_core.items()):
+                    _t = (f"{v['name']} BB {v['bb']:,}/{v['bb_total']:,}"
+                          f"({v['bb_pct']:.1f}%)")
+                    _o = _ovl.get(_cid)
+                    if _o:
+                        _t += f" ovl {_o['banks_seen']}/{_o['banks_total']}b"
+                    _cparts.append(_t)
+                log.warning("[StatCov] " + " | ".join(_cparts))
+
+            # 스왑으로 버린 샘플 — 버려진 것과 '커버리지 없음' 은 로그상 구분이 안 되므로
+            # 노출은 해야 하지만, 누적 절대값으로는 크고 작음을 판단할 수 없다. 비율로 낸다.
+            _ovd = getattr(self.sampler, '_ovl_dropped', 0)
+            _ovk = getattr(self.sampler, '_ovl_kept', 0)
+            _tot = _ovd + _ovk
+            if _tot > 0:
+                _pct = 100.0 * _ovd / _tot
+                if _pct >= OVL_DROP_WARN_PCT:
+                    log.warning(f"[StatCov] ⚠ ovl-drop {_pct:.1f}% ({_ovd:,}/{_tot:,}) — "
+                                f"버스트 중 스왑으로 폐기. 해당 코어 burst_len↓ 검토")
+
+            # bank 를 하나도 못 본 오버레이 — 프로브가 굳었거나 그 오버레이를 안 타는 중.
+            # 초반엔 정상이라 실행 수가 쌓인 뒤에만 알린다.
+            if _ovl and stats['executions'] >= OVL_ZERO_WARN_EXEC:
+                _zero = [v['name'] for v in _ovl.values()
+                         if v['banks_total'] and not v['banks_seen']]
+                if _zero:
+                    log.warning(f"[StatCov] ⚠ 오버레이 bank 관측 0: {', '.join(_zero)} — "
+                                f"프로브 고착 또는 해당 오버레이 미진입. "
+                                f"시작 로그의 [Overlay] 줄 확인")
 
     def _run_pm_openocdless_test(self):
         """OpenOCD 없이 PCIe/NVMe PM 조합만 독립 검증한다."""
