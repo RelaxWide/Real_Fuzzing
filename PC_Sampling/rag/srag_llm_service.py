@@ -22,6 +22,7 @@ import string
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -185,24 +186,38 @@ def _call_once(prompt: str, timeout: float) -> str:
     return box.get('ok', '')
 
 
+def _log_call_error(label, exc):
+    """Keep the exception type and guide frame; str(KeyError) alone is just 'hits'."""
+    summary = f"{type(exc).__name__}: {exc}"
+    frames = traceback.extract_tb(exc.__traceback__)
+    if frames:
+        leaf = frames[-1]
+        summary += f" ({leaf.filename}:{leaf.lineno} in {leaf.name})"
+    _log(f"⚠ {label}: {summary}")
+    # Standard traceback excludes locals and request/response payload dumps.
+    for line in traceback.format_exception(type(exc), exc, exc.__traceback__):
+        _log(line.rstrip())
+    return summary
+
+
 def _call_llm_resilient(prompt: str):
     """호출 → 실패 시 모듈 reload(재연결) → 1회 재시도. (text, error) 반환."""
     try:
         return _call_once(prompt, _CALL_TIMEOUT), None
     except Exception as e1:
-        _log(f"⚠ LLM 호출 실패: {e1}")
-        _log("⚠   연결이 끊긴 것으로 보고 모듈을 다시 로드해 재연결 후 1회 재시도합니다.")
+        _log_call_error("LLM 호출 실패", e1)
+        _log("⚠   모듈을 다시 로드해 1회 재시도합니다. 연결 문제 여부는 위 traceback으로 확인하세요.")
         try:
             _reload_llm()
         except Exception as e_rl:
-            _log(f"⚠   모듈 reload 실패(무시하고 재시도): {e_rl}")
+            _log_call_error("모듈 reload 실패(기존 함수로 재시도)", e_rl)
         try:
             _text = _call_once(prompt, _CALL_TIMEOUT)
-            _log("✓ 재연결 후 성공")
+            _log("✓ 모듈 reload 후 재시도 성공")
             return _text, None
         except Exception as e2:
-            _log(f"⚠ 재시도도 실패: {e2}")
-            return "", f"{e2} (재연결 재시도 후에도 실패)"
+            detail = _log_call_error("재시도도 실패", e2)
+            return "", f"{detail} (모듈 reload 후 재시도도 실패)"
 
 
 def _atomic_write(path: Path, text: str):
