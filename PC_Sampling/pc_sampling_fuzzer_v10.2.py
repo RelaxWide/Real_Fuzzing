@@ -1680,6 +1680,33 @@ def _logname(p) -> str:
 log = logging.getLogger('pcfuzz')
 
 
+def _bounded_output_lines(fd, limit=8192):
+    """Stream CR/LF lines, splitting oversized lines without losing their bytes."""
+    buf = b''
+    while True:
+        try:
+            data = os.read(fd, 4096)
+        except OSError as exc:
+            if exc.errno == 5:  # PTY EOF on Linux
+                break
+            raise
+        if not data:
+            break
+        buf += data.replace(b'\r', b'\n')
+        while buf:
+            newline = buf.find(b'\n', 0, limit)
+            if newline >= 0:
+                yield buf[:newline]
+                buf = buf[newline + 1:]
+            elif len(buf) >= limit:
+                yield buf[:limit]
+                buf = buf[limit:]
+            else:
+                break
+    if buf:
+        yield buf
+
+
 class _EarlyBuffer(logging.Handler):
     """setup_logging 전에 나온 레코드를 담아뒀다가 파일 핸들러에 다시 흘린다.
 
@@ -12981,6 +13008,65 @@ class _V101Fuzzer:
         sampler._terminate_proc()
         log.warning("[JLINK] OpenOCD 종료 완료")
 
+    def _monitor_timeout_pc(self, read_pc, stop, idle_pcs,
+                            max_attempts=20, interval=30.0):
+        """Bounded diagnostic reads; the final attempt has no trailing wait."""
+        log.warning(f"[MONITOR] JLink PC 모니터링 시작 ({interval:g}초 간격, 최대 {max_attempts}회)")
+        log.warning("[MONITOR] Ctrl+C → 모니터링 종료")
+        for attempt in range(1, max_attempts + 1):
+            if stop.is_set():
+                break
+            self._log_process_memory(f"monitor-before-{attempt}")
+            pcs = read_pc()
+            if pcs:
+                pc = pcs[0]
+                tag = "[IDLE]" if pc in idle_pcs else "[NON-IDLE]"
+                log.warning(f"[MONITOR] {attempt}/{max_attempts} Core0={hex(pc)} {tag}")
+            else:
+                log.warning(f"[MONITOR] {attempt}/{max_attempts} JLink PC 읽기 실패")
+            self._log_process_memory(f"monitor-after-{attempt}")
+            if attempt < max_attempts and stop.wait(interval):
+                break
+        log.warning("[MONITOR] 모니터링 종료 (횟수 상한 또는 사용자 중단)")
+
+    def _log_process_memory(self, stage):
+        """Small /proc snapshots, streamed to disk; no retained diagnostic history."""
+        try:
+            processes = {"fuzzer": os.getpid()}
+            child = getattr(self, '_graph_child_proc', None)
+            if child is not None and child.poll() is None:
+                processes['chart'] = child.pid
+            row = {'time': datetime.now().isoformat(), 'stage': stage,
+                   'exec': getattr(self, 'executions', 0), 'processes': {}}
+            for role, pid in processes.items():
+                fields = {'pid': pid}
+                try:
+                    for line in Path(f'/proc/{pid}/status').read_text().splitlines():
+                        key, _, value = line.partition(':')
+                        if key in ('VmSize', 'VmRSS', 'RssAnon', 'VmHWM', 'Threads'):
+                            fields[key] = int(value.split()[0])
+                except (OSError, ValueError, IndexError):
+                    fields['unavailable'] = True
+                row['processes'][role] = fields
+            row['containers'] = {
+                name: len(getattr(self, name, ())) for name in
+                ('corpus', 'state_corpus', '_sa_cov_history', '_cov_growth_hist',
+                 '_csfuzz_history', '_llm_boost_hist')}
+            with open(self.output_dir / 'process_memory.jsonl', 'a') as stream:
+                stream.write(json.dumps(row) + '\n')
+            log.info("[Memory] " + json.dumps(row))
+        except Exception as exc:
+            log.info(f"[Memory] snapshot 실패: {exc}")
+
+    def _spawn_dump_logged(self, cmd, tag, **kwargs):
+        """Keep full dump output on disk, never in communicate()'s RAM buffers."""
+        path = self.output_dir / (tag + '_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.log')
+        with open(path, 'wb') as stream:
+            proc = subprocess.Popen(cmd, stdout=stream, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, **kwargs)
+        log.warning(f"[{tag}] stdout/stderr → {path} (PID={proc.pid})")
+        return proc
+
     def _run_jlink_dump(self) -> None:
         """crash 발생 시 JLink 메모리 덤프를 실행한다.
 
@@ -13013,11 +13099,7 @@ class _V101Fuzzer:
         log.warning(f"[JLINK DUMP] 실행: {sh_path} (DUMP_TIMESTAMP={ts_str})")
 
         try:
-            proc = subprocess.Popen(
-                cmd, cwd=script_dir, env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-            )
+            proc = self._spawn_dump_logged(cmd, 'JLINK_DUMP', cwd=script_dir, env=env)
         except Exception as e:
             log.warning(f"[JLINK DUMP] Popen 실패: {e}")
             return
@@ -13027,16 +13109,13 @@ class _V101Fuzzer:
         import threading
         _result: dict = {}
 
-        def _communicate():
+        def _wait_process():
             try:
-                out, err = proc.communicate()
-                _result['stdout'] = out
-                _result['stderr'] = err
-                _result['rc'] = proc.returncode
+                _result['rc'] = proc.wait()
             except Exception as ex:
                 _result['error'] = ex
 
-        t = threading.Thread(target=_communicate, daemon=True)
+        t = threading.Thread(target=_wait_process, daemon=True)
         t.start()
 
         POLL_INTERVAL = 30
@@ -13046,6 +13125,7 @@ class _V101Fuzzer:
             if not t.is_alive():
                 break
             waited += POLL_INTERVAL
+            self._log_process_memory("jlink-dump-wait")
             log.warning(f"[JLINK DUMP] 진행 중... {waited}s 경과")
 
         if t.is_alive():
@@ -13069,13 +13149,6 @@ class _V101Fuzzer:
             return
 
         rc = _result.get('rc', -1)
-        out = _result.get('stdout', b'').decode(errors='replace').strip()
-        err = _result.get('stderr', b'').decode(errors='replace').strip()
-        # 길고 verbose 한 JLinkExe 출력은 파일 로그에만 (INFO) — 터미널은 summary 만.
-        if out:
-            log.info(f"[JLINK DUMP] stdout:\n{out}")
-        if err:
-            log.info(f"[JLINK DUMP] stderr:\n{err}")
         log.warning(f"[JLINK DUMP] 완료 (rc={rc})")
 
     # ──────────────────────────────────────────────────────────────────
@@ -13443,33 +13516,26 @@ class _V101Fuzzer:
         log.warning(f"[UFAS] 덤프 출력 파일: {dump_path}")
 
         try:
-            proc = subprocess.Popen(
-                cmd, cwd=script_dir,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,  # sudo 패스워드 프롬프트 방지
-            )
+            proc = self._spawn_dump_logged(cmd, 'UFAS', cwd=script_dir)
         except Exception as e:
             log.warning(f"[UFAS] Popen 실패: {e}")
             return
 
         log.warning(f"[UFAS] 프로세스 시작 PID={proc.pid} — 최대 {TIMEOUT}초 대기")
 
-        # communicate()는 블로킹이라 진행 상황을 알 수 없으므로
+        # 출력은 파일로 직접 쓰고, 프로세스 대기는 별도 스레드에서 수행한다.
         # 30초마다 파일 크기를 확인해 진행 중임을 표시
         import threading
 
         _result: dict = {}
 
-        def _communicate():
+        def _wait_process():
             try:
-                out, err = proc.communicate()
-                _result['stdout'] = out
-                _result['stderr'] = err
-                _result['rc'] = proc.returncode
+                _result['rc'] = proc.wait()
             except Exception as ex:
                 _result['error'] = ex
 
-        t = threading.Thread(target=_communicate, daemon=True)
+        t = threading.Thread(target=_wait_process, daemon=True)
         t.start()
 
         POLL_INTERVAL = 30
@@ -13479,6 +13545,7 @@ class _V101Fuzzer:
             if not t.is_alive():
                 break
             waited += POLL_INTERVAL
+            self._log_process_memory("ufas-dump-wait")
             # 덤프 파일이 생성 중이면 크기 확인
             if os.path.exists(dump_path):
                 fsize = os.path.getsize(dump_path)
@@ -13503,17 +13570,10 @@ class _V101Fuzzer:
 
         # 정상 완료
         if 'error' in _result:
-            log.warning(f"[UFAS] communicate 오류: {_result['error']}")
+            log.warning(f"[UFAS] wait 오류: {_result['error']}")
             return
 
         rc = _result.get('rc', -1)
-        out = _result.get('stdout', b'').decode(errors='replace').strip()
-        err = _result.get('stderr', b'').decode(errors='replace').strip()
-        # UFAS 실행 출력도 verbose 하므로 파일 로그에만 (INFO).
-        if out:
-            log.info(f"[UFAS] stdout:\n{out}")
-        if err:
-            log.info(f"[UFAS] stderr:\n{err}")
         if rc == 0:
             log.warning(f"[UFAS] 덤프 완료 (rc=0) → {dump_path}")
         else:
@@ -13594,24 +13654,10 @@ class _V101Fuzzer:
                     s = ln.decode(errors='replace').strip()
                     if s:
                         log.warning(f"[DebugTool] {s}")
-            buf = b''
             try:
-                if master_fd is not None:
-                    while True:
-                        try:
-                            data = os.read(master_fd, 4096)
-                        except OSError:
-                            break   # slave 닫힘(child 종료) → EIO = EOF
-                        if not data:
-                            break
-                        buf = (buf + data).replace(b'\r', b'\n')
-                        *full, buf = buf.split(b'\n')
-                        _emit(full)
-                    if buf.strip():
-                        _emit([buf])
-                else:
-                    for raw in iter(proc.stdout.readline, b''):
-                        _emit([raw])
+                fd = master_fd if master_fd is not None else proc.stdout.fileno()
+                for raw in _bounded_output_lines(fd):
+                    _emit([raw])
             except Exception as ex:
                 _reader_err['error'] = ex
             finally:
@@ -13634,6 +13680,7 @@ class _V101Fuzzer:
             if not t.is_alive():
                 break
             waited += POLL_INTERVAL
+            self._log_process_memory("debug-tool-wait")
             log.warning(f"[DebugTool] 진행 중... {waited}s 경과")
 
         if t.is_alive():
@@ -14370,6 +14417,7 @@ class _V101Fuzzer:
             log.warning(f"[REPRO] 타겟 opcode 0x{actual_opcode:02x} ({cmd.name}) timeout "
                         f"— 크래시 캡처 진입")
 
+        self._log_process_memory("timeout-entry")
         _crash_time = datetime.now()   # artifact 폴더 타임스탬프 기준
         # crash 산출물 통합 폴더 — replay.sh, replay_data/, dump, log, dmesg 모두 여기로.
         _crash_dir = self.crashes_dir / f"crash_{_crash_time.strftime('%Y%m%d_%H%M%S')}"
@@ -14623,6 +14671,8 @@ class _V101Fuzzer:
             except Exception as _dt_exc:
                 log.warning(f"[DebugTool] _run_debug_tool_dump 예기치 않은 예외: {_dt_exc}")
             log.warning("[DebugTool] _run_debug_tool_dump 반환")
+
+        self._log_process_memory("after-dumps")
 
         # 3.8) 모든 dump 완료 후 artifact 수집 (crash 폴더에 날짜 폴더 생성)
         log.warning("[TIMEOUT] Crash artifact 수집을 시작합니다...")
@@ -15347,6 +15397,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                     pass
         self._graph_child_proc = proc
         self._graph_snapshot_path = snap_path
+        self._log_process_memory("chart-spawn")
 
     def _generate_graphs(self):
         """그래프 생성 진입점.
@@ -16550,6 +16601,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         VmallocUsed 계단식 상승=고갈, 평탄→급사=손상. taint 변화 시 손상 의심 모듈 특정.
         순수 /proc 읽기(vmallocinfo 미접근) → fuzz 무영향. [VMon] 은 파일에만 남고 터미널 미노출.
         (스레드 아님 → 별도 동시성/소켓 경합 0. taint 변화만 [Taint] 로 터미널 노출.)"""
+        self._log_process_memory("periodic")
         m = self._vmon_read_meminfo()
         used  = m.get('VmallocUsed')
         chunk = m.get('VmallocChunk')
@@ -16575,6 +16627,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
 
     def _start_vmalloc_watchdog(self) -> None:
         """taint 스냅샷 1회 + vmon exec-기반 샘플 상태 초기화(스레드 없음 — 메인 루프가 주기 호출)."""
+        self._log_process_memory("startup")
         self._log_taint_snapshot(tag="startup")
         self._vmon_prev_used = None
         self._vmon_last_taint = _read_kernel_taint()[0]
@@ -17954,6 +18007,8 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             except Exception as e:
                 log.error(f"Coverage save failed: {e}")
 
+            self._log_process_memory("before-final-charts")
+
             # 진행 중이던 주기 차트 fork 자식 회수(좀비 방지 + 비정상 종료 로그)
             self._reap_graph_child(block=True)
 
@@ -17992,7 +18047,9 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             except Exception:
                 pass
 
-            # timeout crash: JLink 기반 PC 모니터링 루프 (30초 간격, Ctrl+C로 종료)
+            self._log_process_memory("after-final-charts")
+
+            # timeout crash: JLink PC 관측 최대 20회 (30초 간격, Ctrl+C로 조기 종료)
             # OpenOCD는 JLink dump 전에 이미 종료됨 → JLink 직접 연결로 PC 읽기
             if self._timeout_crash:
                 import threading as _threading
@@ -18053,9 +18110,6 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                         log.warning(f"[MONITOR] JLink 예외: {e}")
                         return None
 
-                log.warning("[MONITOR] JLink PC 모니터링 시작 (30초 간격)")
-                log.warning("[MONITOR] Ctrl+C → 모니터링 종료")
-
                 _monitor_stop = _threading.Event()
 
                 def _sigint_monitor(sig, frame):
@@ -18066,17 +18120,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                 except Exception:
                     pass
 
-                while not _monitor_stop.is_set():
-                    pcs = _read_pc_via_jlink()
-                    if pcs:
-                        pc = pcs[0]
-                        tag = "[IDLE]" if pc in idle_pcs else "[NON-IDLE]"
-                        log.warning(f"[MONITOR] Core0={hex(pc)} {tag}")
-                    else:
-                        log.warning("[MONITOR] JLink PC 읽기 실패")
-                    _monitor_stop.wait(30.0)
-
-                log.warning("[MONITOR] 모니터링 종료")
+                self._monitor_timeout_pc(_read_pc_via_jlink, _monitor_stop, idle_pcs)
 
                 # v8.8: timeout-crash 종료 경로에서도 샘플러(pylink JLink)를 명시적으로
                 # 닫는다. 이 분기는 그동안 close() 를 호출하지 않아, 열린 JLink 세션

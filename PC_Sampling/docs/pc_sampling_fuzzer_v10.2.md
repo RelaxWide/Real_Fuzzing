@@ -194,3 +194,12 @@ python3 -m py_compile PC_Sampling/pc_sampling_fuzzer_v10.2.py PC_Sampling/llm_le
 - [v10.2 상세 구현·리뷰 기록](V10_2_LLM_IMPLEMENTATION.md)
 - [v10.1 JLink 상태 및 복구 조사](STATUS_v10_1_JLINK.md)
 - [Spec outcome 별도 계획](V10_1_SPEC_OUTCOME_DENOMINATOR.md)
+
+## Timeout 이후 진단 종료와 메모리 기록
+
+PC 모니터링은 30초 간격으로 **총 20회** 관측 후 종료한다(Ctrl+C 조기 종료 가능).
+JLink/UFAS 출력은 출력 폴더의 별도 로그 파일로 직접 기록하고,
+RDDump의 줄바꿈 없는 출력도 8 KiB 단위로 분할해 무제한 RAM 누적을 방지한다.
+`process_memory.jsonl`에는 timeout/덤프/차트/모니터링 단계별 PID와 RSS를 기록한다.
+검증 및 보고된 OOM/Identify timeout의 판정 한계는
+[V10_2_TIMEOUT_MEMORY_REVIEW.md](V10_2_TIMEOUT_MEMORY_REVIEW.md)를 참고한다.
