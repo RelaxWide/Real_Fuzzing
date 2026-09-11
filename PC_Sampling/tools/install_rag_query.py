@@ -11,20 +11,22 @@ import shutil
 
 
 # Self-contained payload: this installer is the only migration file to copy.
-INLINE_SOURCE = r'''# BEGIN INLINED RAG QUERY V1
+INLINE_SOURCE = r'''# BEGIN INLINED RAG QUERY V2
 import logging
-import os
 
 _rag_query_log = logging.getLogger(__name__)
 _RAG_QUERY_START, _RAG_QUERY_END = '[RAG-QUERY]', '[/RAG-QUERY]'
-_RAG_QUERY_TOKENIZER = None
+_RAG_QUERY_MAX_CHARS = 1024
+_RAG_QUERY_MAX_BYTES = 2048
+_RAG_QUERY_FALLBACK = 'NVMe command requirements, field relationships, state transitions and error completion status.'
 
 
 class _rag_RagSearchError(RuntimeError):
     """Search failure which must not be represented as an empty successful search."""
-    def __init__(self, message, retryable=False):
+    def __init__(self, message, retryable=False, error_code=None):
         super().__init__(message)
         self.retryable = retryable
+        self.error_code = error_code
 
 
 
@@ -37,49 +39,17 @@ def _rag_extract_query(prompt):
         end = prompt.index(_RAG_QUERY_END)
         if end > start and prompt[start:end].strip():
             return prompt[start:end].strip(), 'marker'
-    _rag_query_log.warning('[RAG query] missing/invalid marker; using token-bounded legacy query')
-    return prompt, 'legacy'
+    _rag_query_log.warning('[RAG query] missing/invalid marker; using short generic NVMe query')
+    return _RAG_QUERY_FALLBACK, 'generic'
 
 
-def _rag_get_tokenizer():
-    global _RAG_QUERY_TOKENIZER
-    if _RAG_QUERY_TOKENIZER is None:
-        try:
-            from transformers import AutoTokenizer
-        except ImportError as exc:
-            raise _rag_RagSearchError('Install transformers and sentencepiece on the online LLM PC') from exc
-        # Set a local path to avoid downloads on the online rig if desired.
-        _RAG_QUERY_TOKENIZER = AutoTokenizer.from_pretrained(
-            os.environ.get('RAG_TOKENIZER_PATH', 'BAAI/bge-m3'), trust_remote_code=False)
-    return _RAG_QUERY_TOKENIZER
-
-
-def _rag_prepare_query(prompt, tokenizer=None, budget=None):
-    tokenizer = tokenizer if tokenizer is not None else _rag_get_tokenizer()
-    budget = int(os.environ.get('RAG_QUERY_TOKEN_BUDGET', '1024')) if budget is None else budget
-    if not isinstance(budget, int) or isinstance(budget, bool) or not 16 <= budget <= 8000:
-        raise ValueError('RAG_QUERY_TOKEN_BUDGET must be 16..8000 (default 1024)')
+def _rag_prepare_query(prompt):
     query, mode = _rag_extract_query(prompt)
-    def count(text):
-        return len(tokenizer.encode(text, add_special_tokens=True))
-    before = count(query)
-    if before > budget:
-        ids = tokenizer.encode(query, add_special_tokens=False)
-        take = max(0, budget - tokenizer.num_special_tokens_to_add(pair=False))
-        # Decode/re-encode can differ. Verify the actual outgoing string too.
-        while take > 0:
-            clipped = tokenizer.decode(ids[:take], skip_special_tokens=True)
-            if count(clipped) <= budget:
-                query = clipped
-                break
-            take -= max(1, count(clipped) - budget)
-        else:
-            raise _rag_RagSearchError('RAG query cannot fit tokenizer budget')
-    after = count(query)
-    if not query.strip():
-        raise _rag_RagSearchError('RAG query is empty')
-    _rag_query_log.warning('[RAG query] mode=%s tokens=%d->%d budget=%d truncated=%s',
-                mode, before, after, budget, before > after)
+    before = len(query)
+    # These are character/UTF-8 byte limits, not estimated token counts.
+    query = query[:_RAG_QUERY_MAX_CHARS].encode('utf-8')[:_RAG_QUERY_MAX_BYTES].decode('utf-8', errors='ignore').strip()
+    _rag_query_log.warning('[RAG query] mode=%s chars=%d->%d bytes=%d tokenizer=none',
+                           mode, before, len(query), len(query.encode('utf-8')))
     return query
 
 
@@ -101,7 +71,7 @@ def _rag_extract_search_context(response):
             details['message'] = result['message'][:500]
         raise _rag_RagSearchError(f'RAG search HTTP {status}: {details or "server error"}',
                              retryable=code != 'QUERY_TOKEN_LIMIT_EXCEEDED' and
-                             (status == 429 or status >= 500))
+                             (status == 429 or status >= 500), error_code=code)
     envelope = result.get('hits')
     if not isinstance(envelope, dict) or not isinstance(envelope.get('hits'), list):
         raise _rag_RagSearchError('RAG search malformed response: expected hits.hits array')
@@ -117,18 +87,42 @@ def _rag_extract_search_context(response):
     return text
 
 
-def _rag_generate_with_rag(prompt, retrieve, generate, tokenizer=None):
-    query = _rag_prepare_query(prompt, tokenizer=tokenizer)
-    context = retrieve(query)
+def _rag_generate_with_rag(prompt, retrieve, generate):
+    query = _rag_prepare_query(prompt)
+    # At most 4 searches: initial query + 3 shorter retries, only for this error.
+    for attempt in range(4):
+        try:
+            context = retrieve(query)
+            break
+        except _rag_RagSearchError as exc:
+            if exc.error_code != 'QUERY_TOKEN_LIMIT_EXCEEDED' or attempt == 3 or len(query) <= 1:
+                raise
+            shorter = query[:max(1, len(query) // 2)].strip()
+            if not shorter:
+                raise
+            _rag_query_log.warning('[RAG query] server token limit; retry=%d/3 chars=%d->%d',
+                                   attempt + 1, len(query), len(shorter))
+            query = shorter
     suffix = '\n[참고 문서]\n' + context if context else '\n[RAG 문서 없음]'
     return generate(prompt + suffix)
-# END INLINED RAG QUERY V1
+# END INLINED RAG QUERY V2
 '''
 
 def patch_source(source):
-    if '# BEGIN INLINED RAG QUERY V1' in source:
-        compile(source, '<guide>', 'exec')
-        return source
+    for version in (2, 1):
+        begin = f'# BEGIN INLINED RAG QUERY V{version}'
+        end = f'# END INLINED RAG QUERY V{version}'
+        if begin not in source:
+            continue
+        if source.count(begin) != 1 or source.count(end) != 1:
+            raise ValueError('Ambiguous inline support markers; no changes made')
+        first, last = source.index(begin), source.index(end)
+        if last < first:
+            raise ValueError('Invalid inline support markers; no changes made')
+        # Upgrade V1 (tokenizer dependency) and refresh V2 in place, without duplicate helpers.
+        patched = source[:first] + INLINE_SOURCE.rstrip('\n') + source[last + len(end):]
+        compile(patched, '<guide>', 'exec')
+        return patched
     legacy_import = 'from rag_query import generate_with_rag, extract_search_context'
     if legacy_import in source:
         # Migrate the previous split-file installation; keep original guide settings.

@@ -12,17 +12,6 @@ from rag_inline_support import (query_module, extract_query, prepare_query,
                            extract_search_context, generate_with_rag, RagSearchError)
 
 
-class Tokenizer:
-    # Deterministic char tokenizer for boundary/contract tests, not a BGE substitute.
-    def encode(self, text, add_special_tokens=True):
-        ids = list(map(ord, text))
-        return [1] + ids + [2] if add_special_tokens else ids
-    def decode(self, ids, skip_special_tokens=True):
-        return ''.join(map(chr, ids))
-    def num_special_tokens_to_add(self, pair=False):
-        return 2
-
-
 class QueryTests(unittest.TestCase):
     def test_real_fuzzer_adds_query_when_learning_disabled(self):
         inst = harness({'enabled': False})
@@ -38,25 +27,80 @@ class QueryTests(unittest.TestCase):
         prompt = query_block('new_group_seeds', ['FWCommit']) + 'evidence ' * 10000
         retrieve = Mock(return_value='reference')
         generate = Mock(return_value='answer')
-        self.assertEqual(generate_with_rag(prompt, retrieve, generate, Tokenizer()), 'answer')
+        self.assertEqual(generate_with_rag(prompt, retrieve, generate), 'answer')
         query = retrieve.call_args.args[0]
         self.assertIn('FWCommit', query)
         self.assertNotIn('evidence', query)
         self.assertEqual(generate.call_args.args[0], prompt + '\n[참고 문서]\nreference')
 
-    def test_budget_on_both_marker_and_legacy_queries(self):
-        for query in ('x' * 8498, '[RAG-QUERY]' + 'x' * 8498 + '[/RAG-QUERY]'):
-            out = prepare_query(query, Tokenizer(), budget=8000)
-            self.assertEqual(len(Tokenizer().encode(out)), 8000)
-        for size in (7998, 7999):
-            out = prepare_query('x' * size, Tokenizer(), budget=8000)
-            self.assertLessEqual(len(Tokenizer().encode(out)), 8000)
+    def test_character_and_utf8_limits(self):
+        for content in ('x' * 8498, '한글' * 5000, '😀' * 5000):
+            out = prepare_query('[RAG-QUERY]' + content + '[/RAG-QUERY]')
+            self.assertLessEqual(len(out), 1024)
+            self.assertLessEqual(len(out.encode('utf-8')), 2048)
+            self.assertTrue(content.startswith(out))
 
-    def test_invalid_marker_uses_bounded_fallback(self):
-        for text in ('abc', '[RAG-QUERY]x', '[RAG-QUERY][/RAG-QUERY]',
+    def test_invalid_marker_never_searches_full_prompt(self):
+        for text in ('private evidence ' * 10000, '[RAG-QUERY]x', '[RAG-QUERY][/RAG-QUERY]',
                      '[/RAG-QUERY][RAG-QUERY]', query_block('sequences') * 2):
-            self.assertEqual(extract_query(text), (text, 'legacy'))
-            self.assertLessEqual(len(Tokenizer().encode(prepare_query(text, Tokenizer(), 32))), 32)
+            query, mode = extract_query(text)
+            self.assertEqual(mode, 'generic')
+            self.assertEqual(prepare_query(text), query_module._RAG_QUERY_FALLBACK)
+            self.assertNotIn('private evidence', query)
+
+    def test_server_limit_retries_shrink_query_and_preserve_prompt(self):
+        error = RagSearchError('too long', error_code='QUERY_TOKEN_LIMIT_EXCEEDED')
+        prompt = '[RAG-QUERY]' + 'x' * 2000 + '[/RAG-QUERY]full evidence'
+        retrieve = Mock(side_effect=[error, error, 'reference'])
+        generate = Mock(return_value='ok')
+        self.assertEqual(generate_with_rag(prompt, retrieve, generate), 'ok')
+        self.assertEqual([len(c.args[0]) for c in retrieve.call_args_list], [1024, 512, 256])
+        self.assertEqual(generate.call_args.args[0], prompt + '\n[참고 문서]\nreference')
+        retrieve = Mock(side_effect=error)
+        generate.reset_mock()
+        with self.assertRaises(RagSearchError):
+            generate_with_rag(prompt, retrieve, generate)
+        self.assertEqual(retrieve.call_count, 4)
+        generate.assert_not_called()
+        retrieve = Mock(side_effect=RagSearchError('HTTP 401'))
+        with self.assertRaises(RagSearchError):
+            generate_with_rag(prompt, retrieve, generate)
+        retrieve.assert_called_once()
+
+    def test_support_runs_without_site_packages(self):
+        from rag_inline_support import installer
+        path = Path(installer.__file__).resolve()
+        code = ("import runpy,sys; m=runpy.run_path(sys.argv[1]); ns={}; "
+                "exec(m['INLINE_SOURCE'],ns); "
+                "p='[RAG-QUERY]NVMe Firmware Commit[/RAG-QUERY]full evidence'; "
+                "out=ns['_rag_generate_with_rag'](p,lambda q:'ref',lambda p:p); "
+                "assert out==p+'\\n[참고 문서]\\nref'; print('OK')")
+        run = subprocess.run([sys.executable, '-I', '-S', '-c', code, str(path)],
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn('OK', run.stdout)
+
+    def test_upgrade_v1_removes_tokenizer_dependency(self):
+        from rag_inline_support import installer
+        source = """# BEGIN INLINED RAG QUERY V1
+import transformers
+import sentencepiece
+def _rag_get_tokenizer():
+    raise RuntimeError('old dependency')
+# END INLINED RAG QUERY V1
+setting = 'preserve'
+def generate_response(prompt):
+    return prompt
+"""
+        updated = installer.patch_source(source)
+        self.assertNotIn('transformers', updated)
+        self.assertNotIn('sentencepiece', updated)
+        self.assertNotIn('_rag_get_tokenizer', updated)
+        self.assertIn("setting = 'preserve'", updated)
+        self.assertEqual(installer.patch_source(updated), updated)
+        env = {}
+        exec(compile(updated, '<updated guide>', 'exec'), env)
+        self.assertTrue(env['_rag_prepare_query'](query_block('sequences')))
 
     def test_response_errors_and_empty_result(self):
         def response(body, status=200):
@@ -73,7 +117,7 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(extract_search_context(response({'hits': {'hits': []}})), '')
         prompt = query_block('sequences') + 'original'
         generate = Mock(return_value='ok')
-        generate_with_rag(prompt, lambda q: '', generate, Tokenizer())
+        generate_with_rag(prompt, lambda q: '', generate)
         self.assertEqual(generate.call_args.args[0], prompt + '\n[RAG 문서 없음]')
 
     def test_installer_cli_preview_backup_and_apply(self):
@@ -97,7 +141,7 @@ class QueryTests(unittest.TestCase):
             self.assertEqual(backups[0].read_bytes(), original)
             self.assertFalse((guide.parent / 'rag_query.py').exists())
             self.assertNotIn('from rag_query import', guide.read_text())
-            self.assertIn('# BEGIN INLINED RAG QUERY V1', guide.read_text())
+            self.assertIn('# BEGIN INLINED RAG QUERY V2', guide.read_text())
             compile(guide.read_text(), str(guide), 'exec')
 
     def test_migrate_existing_split_guide_without_helper_file(self):
@@ -115,7 +159,7 @@ def generate_rag_response(prompt):
         self.assertNotIn('from rag_query import', patched)
         env = {'response': NS(status_code=200, json=lambda: {'hits': {'hits': []}})}
         exec(compile(patched, '<migrated guide>', 'exec'), env)
-        env['_rag_get_tokenizer'] = lambda: Tokenizer()
+        # No tokenizer needed
         prompt = query_block('sequences') + 'original prompt'
         self.assertEqual(env['generate_rag_response'](prompt), prompt + '\n[RAG 문서 없음]')
         self.assertEqual(env['setting'], 'preserved')
@@ -146,7 +190,7 @@ def generate_rag_response(prompt):
                         {'_source': {'merge_title_content': 'reference'}}]}})
                     env = {'request': Mock(return_value=response), 'record': record}
                     exec(compile(patched, '<guide variant>', 'exec'), env)
-                    env['_rag_get_tokenizer'] = lambda: Tokenizer()
+                    # No tokenizer needed
                     prompt = query_block('sequences') + 'full original'
                     self.assertEqual(env['generate_rag_responses'](prompt),
                                      prompt + '\n[참고 문서]\nreference')
@@ -188,7 +232,7 @@ def generate_rag_response(user_prompt):
             'hits': {'hits': [{'_source': {'merge_title_content': 'reference'}}]}}))
         env = {'request': request}
         exec(compile(patched, '<online guide>', 'exec'), env)
-        env['_rag_get_tokenizer'] = lambda: Tokenizer()
+        # No tokenizer needed
         prompt = query_block('sequences') + 'full evidence ' * 2000
         output = env['generate_rag_response'](prompt)
         self.assertEqual(output, prompt + '\n[참고 문서]\nreference')

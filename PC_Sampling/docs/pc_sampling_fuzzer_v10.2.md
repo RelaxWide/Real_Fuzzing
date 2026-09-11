@@ -231,7 +231,8 @@ python3 PC_Sampling/tools/coverage_growth_plot.py /path/to/output_dir
 ## RAG 검색 입력 분리
 
 v10.2 요청에 짧은 `[RAG-QUERY]` 블록을 추가했다. 기존 evidence/setup은 유지하며,
-온라인 guide에서 검색 입력에만 BGE-M3 토큰 예산(기본 1,024)을 적용한다.
+온라인 guide에서 검색 입력만 최대 1,024자·UTF-8 2,048바이트로 제한한다.
+로컬 토크나이저 없이 서버의 토큰 초과 응답에만 축소 재검색(최대 3회 추가)을 적용한다.
 **온라인 guide도 먼저 업데이트해야 한다.** 퍼저만 업데이트하면 기존 guide는 여전히
 전체 프롬프트를 검색에 보낸다. 기존 온라인 설정을 보존하는 설치 도구와 순서는
 [RAG_QUERY_DEPLOYMENT.md](RAG_QUERY_DEPLOYMENT.md)에 있다.
@@ -242,3 +243,9 @@ v10.2 요청에 짧은 `[RAG-QUERY]` 블록을 추가했다. 기존 evidence/set
 합친다. **별도 `rag_query.py` 배포는 필요 없다.** 온라인 적용 도구
 `install_rag_query.py`도 단독 파일로 실행되며 이전 분리형 guide를 통합형으로 전환한다.
 구체적인 명령과 최종 배치는 [RAG_QUERY_DEPLOYMENT.md](RAG_QUERY_DEPLOYMENT.md)를 따른다.
+
+### 토크나이저 의존성 제거
+
+transformers/sentencepiece 및 토크나이저 다운로드가 필요 없는 V2 통합형으로 변경했다.
+이미 패치한 온라인 guide에도 최신 `install_rag_query.py --apply`를 다시 실행해야 한다.
+기존 토크나이저 코드 블록을 교체하며 추가 파일이나 pip 설치는 필요 없다.
