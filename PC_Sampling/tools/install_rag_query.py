@@ -155,31 +155,93 @@ def patch_source(source):
         raise ValueError('Missing generate_response; inspect guide manually')
     if len(generate.args.args) != 1:
         raise ValueError('Expected single-argument RAG guide')
-    # Only replace the known terminal response.json()/hits parsing pair.
-    body = retrieve.body
-    if len(body) < 2 or not isinstance(body[-1], ast.Return) or not isinstance(body[-2], ast.Assign):
-        raise ValueError('Unexpected retrieval layout; no changes made')
-    assignment, returned = body[-2], body[-1]
-    call = assignment.value
-    if (not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute)
-            or call.func.attr != 'json' or not isinstance(call.func.value, ast.Name)
-            or len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name)):
-        raise ValueError('Expected terminal result = response.json(); no changes made')
-    result = assignment.targets[0].id
-    expected = ast.parse(f"{result}['hits']['hits'][0]['_source']['merge_title_content']", mode='eval').body
-    if ast.dump(returned.value) != ast.dump(expected):
-        raise ValueError('Unexpected hit selection; inspect guide manually')
     lines = source.splitlines(keepends=True)
     arg = generate.args.args[0].arg
-    edits = [
-        (assignment.lineno - 1, returned.end_lineno,
-         f'    return _rag_extract_search_context({call.func.value.id})\n'),
-        (generate.body[0].lineno - 1, generate.end_lineno,
-         f'    return _rag_generate_with_rag({arg}, {retrieve.name}, generate_response)\n'),
-    ]
+    edits = retrieval_edits(source, retrieve)
+    edits.append((generate.body[0].lineno - 1, generate.end_lineno,
+                  f'    return _rag_generate_with_rag({arg}, {retrieve.name}, generate_response)\n'))
     for start, end, replacement in sorted(edits, reverse=True):
         lines[start:end] = [replacement]
     return insert_support(''.join(lines))
+
+
+def retrieval_edits(source, retrieve):
+    """Find JSON parsing and first-hit return by data flow, not terminal positions.
+
+    Preserve logging, aliases, try/except/finally and original request setup.
+    Ambiguous control flow is rejected rather than discarding unknown statements.
+    """
+    import copy
+    def owned_nodes(node):
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            yield from owned_nodes(child)
+    nodes = list(owned_nodes(retrieve))
+    parses = []
+    for node in nodes:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        value = node.value
+        if (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                and value.func.attr == 'json' and isinstance(value.func.value, ast.Name)
+                and not value.args and not value.keywords):
+            parses.append(node)
+    if len(parses) != 1:
+        raise ValueError(f'{retrieve.name}: expected one response.json() assignment, found {len(parses)}; '
+                         'no changes made. Share this function from the response assignment through return.')
+    assignment = parses[0]
+    result = assignment.targets[0].id
+    context_name = '_rag_checked_context'
+    if any(isinstance(n, ast.Name) and n.id == context_name for n in nodes):
+        raise ValueError('Existing local _rag_checked_context; inspect guide before merging')
+    expected = ast.parse(f"{result}['hits']['hits'][0]['_source']['merge_title_content']", mode='eval').body
+    # Resolve only unconditional assignments in the same statement list as return.
+    # Never infer aliases from another branch, exception handler, or nested function.
+    matches = []
+    def visit(block, inherited):
+        aliases = dict(inherited)
+        class Resolve(ast.NodeTransformer):
+            def visit_Name(self, node):
+                return copy.deepcopy(aliases.get(node.id, node))
+        for node in block:
+            if isinstance(node, ast.Assign):
+                resolved = Resolve().visit(copy.deepcopy(node.value))
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        aliases[target.id] = (ast.Name(id=result, ctx=ast.Load())
+                                              if node is assignment else resolved)
+            elif isinstance(node, ast.Return) and node.lineno > assignment.lineno:
+                resolved = Resolve().visit(copy.deepcopy(node.value))
+                if ast.dump(resolved) == ast.dump(expected):
+                    matches.append(node)
+            elif isinstance(node, ast.Try):
+                visit(node.body, aliases)
+                for handler in node.handlers:
+                    visit(handler.body, aliases)
+                # Bindings across compound statements are ambiguous; do not infer them.
+                aliases.clear()
+            elif isinstance(node, (ast.If, ast.For, ast.While, ast.With)):
+                visit(node.body, aliases)
+                if hasattr(node, 'orelse'):
+                    visit(node.orelse, aliases)
+                aliases.clear()
+    visit(retrieve.body, {})
+    if len(matches) != 1:
+        raise ValueError(f'{retrieve.name}: cannot identify a unique first-document return '
+                         f'(found {len(matches)}); no changes made. '
+                         'Share this function from the response assignment through return.')
+    lines = source.splitlines(keepends=True)
+    def indent(node):
+        line = lines[node.lineno - 1]
+        return line[:len(line) - len(line.lstrip())]
+    # Parse/validate before legacy hits indexing. Empty results return without IndexError.
+    # response.json() is decoded again by the original statement, not another HTTP call.
+    pad = indent(assignment)
+    prefix = (f'{pad}{context_name} = _rag_extract_search_context({assignment.value.func.value.id})\n'
+              f'{pad}if not {context_name}:\n{pad}    return ""\n')
+    return [(assignment.lineno - 1, assignment.lineno - 1, prefix)]
 
 
 def insert_support(source):
@@ -210,7 +272,17 @@ def main():
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     source = args.guide.read_text(encoding='utf-8-sig')
-    patched = patch_source(source)
+    print(f'[RAG install] Guide: {args.guide.resolve()}')
+    try:
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.FunctionDef) and node.name in (
+                    'retrieve_from_rag', 'retreive_from_rag',
+                    'generate_rag_response', 'generate_rag_responses'):
+                structure = ', '.join(type(stmt).__name__ for stmt in node.body)
+                print(f'[RAG install] {node.name}: line {node.lineno}, body=[{structure}]')
+        patched = patch_source(source)
+    except (ValueError, SyntaxError) as exc:
+        parser.exit(2, f'[RAG install] {exc}\n')
     if not args.apply:
         print(''.join(difflib.unified_diff(source.splitlines(True), patched.splitlines(True),
                                          fromfile=str(args.guide), tofile=str(args.guide) + ' (patched)')))

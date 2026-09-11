@@ -121,6 +121,44 @@ def generate_rag_response(prompt):
         self.assertEqual(env['setting'], 'preserved')
         self.assertEqual(installer.patch_source(patched), patched)
 
+    def test_retrieval_logging_aliases_try_and_spelling_variants(self):
+        from rag_inline_support import installer
+        for wrapped in (False, True):
+            for name in ('retrieve_from_rag', 'retreive_from_rag'):
+                with self.subTest(wrapped=wrapped, name=name):
+                    body = """    response = request({'query_text': prompt})
+    result = response.json()
+    record('parsed')
+    hits = result['hits']['hits']
+    first = hits[0]
+    text = first['_source']['merge_title_content']
+    return text
+"""
+                    if wrapped:
+                        body = ('    try:\n' + ''.join('    ' + line for line in body.splitlines(True))
+                                + "    finally:\n        record('cleanup')\n")
+                    source = (f'def {name}(prompt):\n' + body +
+                              'def generate_response(prompt):\n    return prompt\n' +
+                              'def generate_rag_responses(prompt):\n    return prompt\n')
+                    patched = installer.patch_source(source)
+                    record = Mock()
+                    response = NS(status_code=200, json=lambda: {'hits': {'hits': [
+                        {'_source': {'merge_title_content': 'reference'}}]}})
+                    env = {'request': Mock(return_value=response), 'record': record}
+                    exec(compile(patched, '<guide variant>', 'exec'), env)
+                    env['_rag_get_tokenizer'] = lambda: Tokenizer()
+                    prompt = query_block('sequences') + 'full original'
+                    self.assertEqual(env['generate_rag_responses'](prompt),
+                                     prompt + '\n[참고 문서]\nreference')
+                    record.assert_any_call('parsed')
+                    if wrapped:
+                        record.assert_any_call('cleanup')
+                    response.json = lambda: {'hits': {'hits': []}}
+                    self.assertEqual(env['generate_rag_responses'](prompt), prompt + '\n[RAG 문서 없음]')
+                    response.json = lambda: {'error_code': 'QUERY_TOKEN_LIMIT_EXCEEDED', 'query_tokens': 8498}
+                    with self.assertRaisesRegex(RuntimeError, 'QUERY_TOKEN_LIMIT_EXCEEDED'):
+                        env['generate_rag_responses'](prompt)
+
     def test_installer_preserves_query_http_settings_and_original_prompt(self):
         path = Path(__file__).resolve().parents[1] / 'tools' / 'install_rag_query.py'
         spec = importlib.util.spec_from_file_location('install_query_test', path)
@@ -143,7 +181,7 @@ def generate_rag_response(user_prompt):
         patched = installer.patch_source(source)
         self.assertIn("setting = 'preserve me'", patched)
         self.assertIn("fields = {'query_text': user_prompt}", patched)
-        self.assertIn('return _rag_extract_search_context(response)', patched)
+        self.assertIn('_rag_checked_context = _rag_extract_search_context(response)', patched)
         self.assertIn('return _rag_generate_with_rag(user_prompt, retrieve_from_rag, generate_response)', patched)
         self.assertEqual(installer.patch_source(patched), patched)
         request = Mock(return_value=NS(status_code=200, json=lambda: {
