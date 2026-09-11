@@ -20,6 +20,36 @@ import random
 import time
 
 log = logging.getLogger(__name__)
+START, END = '[RAG-QUERY]', '[/RAG-QUERY]'
+TASKS = {
+    'new_group_seeds': 'NVMe command field requirements, boundary conditions and error completion status.',
+    'sequences': 'NVMe command prerequisites, setup and trigger sequences, state transitions and completion status.',
+    'corpus_eval': 'NVMe command validity, field relationships and completion status interpretation.',
+    'io_patterns': 'NVMe I/O workload patterns, write read deallocate interactions and controller state transitions.',
+}
+
+def build_query(task, commands=(), targets=()):
+    # These are identifiers from structured state, never payloads or raw evidence.
+    def names(values):
+        out = []
+        for value in values:
+            value = str(value).replace(START, '').replace(END, '')
+            value = ' '.join(value.split())[:96]
+            if value and value not in out:
+                out.append(value)
+            if len(out) == 3:
+                break
+        return ', '.join(out)
+    lines = [TASKS.get(task, 'NVMe command requirements and firmware error handling.')]
+    for label, values in [('Commands', commands), ('Target firmware functions', targets)]:
+        value = names(values)
+        if value:
+            lines.append(f'{label}: {value}.')
+    return '\n'.join(lines)
+
+def query_block(task, commands=(), targets=()):
+    return START + '\n' + build_query(task, commands, targets) + '\n' + END + '\n\n'
+
 CDWS = tuple(f'cdw{x}' for x in (2, 3, 10, 11, 12, 13, 14, 15))
 DEFAULTS = dict(enabled=True, evidence=True, preserve_setup=True, generators=True,
                 adaptive_tasks=True, setup_preserve_ratio=0.8, evaluation_commands=8,
@@ -399,7 +429,6 @@ class LearningMixin:
         built = self._llm_build_learning_request(task)
         if built is None:
             return None
-        from rag.rag_query import query_block
         ctx = getattr(self, '_llm_pending_ctx', None) or {}
         learning = getattr(self, 'learning', None)
         targets = []

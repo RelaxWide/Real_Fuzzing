@@ -6,20 +6,23 @@
 온라인 guide는 이 블록으로 검색하고, 원본 전체 프롬프트와 검색 문서를 LLM에 보낸다.
 기존 evidence/setup 정보는 자르지 않는다. 별도 요약 LLM 호출은 추가하지 않는다.
 
-- `llm_learning.py`: learning 활성 여부와 무관하게 요청에 검색 블록 추가.
+- `llm_learning.py`: 검색 블록 생성 코드 포함. learning 활성 여부와 무관하게 요청에 추가.
 - `pc_sampling_fuzzer_v10.2.py`: 요청의 후보 명령을 최대 3개 전달.
-- `rag/rag_query.py`: 검색 블록 구성/추출, BGE-M3 토큰 예산, 응답 파싱, LLM 전달.
+- 기존 온라인 `srag_llm_guide.py`: 마커 추출, BGE-M3 토큰 예산, 응답 파싱, LLM 전달을 내부에 포함.
 - `rag/srag_llm_service.py`: 토큰 초과/응답 형식 오류 같은 명시적 비재시도 오류는
   같은 요청으로 reload 재시도하지 않고 원래 원인을 반환. 일반 연결 오류 재시도는 유지.
-- `tools/install_rag_query.py`: 기존 온라인 guide의 설정을 유지하는 설치 도구.
+- `tools/install_rag_query.py`: 온라인 코드를 내장한 단일 파일 설치 도구.
+
+**별도 `rag_query.py`는 더 이상 필요하지 않다.** 퍼징 PC는 기존 `llm_learning.py`,
+온라인 PC는 기존 guide 안에 각각 필요한 코드가 들어간다.
 
 이 저장소에는 실제 온라인 guide가 없고 구조만 기록한 `srag_llm_guide.reference.py`가 있다.
 **참고 사본을 실제 guide 대신 배포하지 않는다.** 실제 온라인 PC에 자동 배포한 것은 아니다.
 
 ## 온라인 PC부터 적용
 
-온라인 PC로 업데이트된 `PC_Sampling/rag/`와 `PC_Sampling/tools/`를 동일한 상대 구조로
-가져온다. 아래 명령은 `PC_Sampling` 폴더에서 실행한다. `실제_guide_경로`는 서비스가
+온라인 PC에 `tools/install_rag_query.py` **한 파일만** 가져온다. 아래 명령은
+그 파일이 있는 폴더에서 실행한다. `실제_guide_경로`는 서비스가
 실제로 import하는 기존 `srag_llm_guide.py`의 경로로 바꾼다.
 
 1. 서비스의 요청 처리가 끝난 뒤 서비스를 중지한다.
@@ -32,21 +35,26 @@ python -m pip install transformers sentencepiece
 3. 변경 미리보기:
 
 ```bash
-python tools/install_rag_query.py "실제_guide_경로"
+python install_rag_query.py "실제_guide_경로"
 ```
 
 4. 적용:
 
 ```bash
-python tools/install_rag_query.py "실제_guide_경로" --apply
+python install_rag_query.py "실제_guide_경로" --apply
 ```
 
-도구는 guide를 시각이 포함된 `.bak`으로 백업하고 `rag_query.py`를 guide 옆에 설치한다.
-기존 helper가 있으면 그것도 백업한다. guide의 서버/인증/모델 설정, HTTP 호출은 유지한다.
+도구는 guide를 시각이 포함된 `.bak`으로 백업하고 검색 처리 코드를 **guide 내부에 삽입**한다.
+별도 helper 파일을 읽거나 생성하지 않는다. guide의 서버/인증/모델 설정, HTTP 호출은 유지한다.
 함수명 오타 호환: `retrieve_from_rag`/`retreive_from_rag`,
 `generate_rag_response`/`generate_rag_responses`를 지원한다.
 
-도구는 알려진 `result = response.json()` 및 첫 검색 결과 선택 구조만 수정한다.
+이전 분리형 패치를 이미 적용했다면 `from rag_query import ...`를 제거하고 내부 코드로
+전환한다. 적용 완료 후 그 guide에는 기존 `rag_query.py`가 필요 없으므로, 다른 프로그램에서
+사용하지 않는 파일이라면 삭제해도 된다. 설치 도구는 기존 helper 파일을 자동 삭제하지 않는다.
+합친 파일에 재실행하면 중복으로 코드를 추가하지 않는다.
+
+원본 guide에는 알려진 `result = response.json()` 및 첫 검색 결과 선택 구조만 수정한다.
 실제 파일 구조가 다르면 변경하지 않고 오류를 낸다. 그 경우 파일의 해당 함수에 맞춰
 별도 검토해야 하며, 참고 사본으로 덮어쓰지 않는다.
 
@@ -64,7 +72,8 @@ Hugging Face 접근이 안 되는 환경이면 서버와 같은 토크나이저 
 
 ## 퍼징 PC 적용
 
-v10.2 실행 파일, `llm_learning.py`, `rag/rag_query.py`를 포함해 업데이트한다.
+v10.2 실행 파일과 `llm_learning.py`를 업데이트한다. 기존 `rag_bridge_client.py`,
+`rag_schema.py`와 공유 bridge 구성은 그대로 유지한다. `rag/rag_query.py`는 필요 없다.
 퍼징 PC에는 transformers 설치가 필요 없다. 토크나이저는 온라인 guide에서만 로드한다.
 bridge 요청 JSON 및 함수 인자 수는 그대로다. 새 검색 마커는 온라인 guide가 먼저
 지원해야 하므로 **guide 먼저, 퍼저 나중** 순서로 배포한다.
@@ -105,9 +114,11 @@ HTTP 429/5xx는 토큰 초과가 아닌 경우 기존 재시도를 허용한다.
 
 ## 검증
 
-69개 회귀 테스트 통과. 실제 퍼저 요청 래퍼, 마커 오류와 구버전 입력, HTTP 200 토큰 오류,
+70개 회귀 테스트 통과. 실제 퍼저 요청 래퍼, 마커 오류와 구버전 입력, HTTP 200 토큰 오류,
 빈 결과, 원본 프롬프트 보존, 온라인 guide 패치 후 검색/생성 흐름을 검증했다.
 기존 sampler 및 기본 NVMe 전송 함수의 고정 AST 검사도 통과했다.
+별도 helper가 없는 폴더에서 설치 도구 단독 실행, 원본 guide 적용, 이전 분리형 guide 전환,
+백업 생성 및 재실행 시 중복 삽입 방지도 검증했다.
 
 별도의 임시 환경(transformers 4.46.3)에서 실제 BAAI/bge-m3 토크나이저로 추가 확인:
 
@@ -117,3 +128,23 @@ HTTP 429/5xx는 토큰 초과가 아닌 경우 기존 재시도를 허용한다.
 
 이 수치는 합성 입력 검증이다. 사용자가 실패한 실제 8,498토큰 문자열 자체는 없어서
 그 동일 문자열을 재현하지는 못했다. 사내 검색 서버/LLM/SSD 실기와 검색 관련성은 미검증이다.
+
+## 최종 배치
+
+```text
+퍼징 PC: PC_Sampling/
+  pc_sampling_fuzzer_v10.2.py
+  llm_learning.py
+  fuzzer_config.json
+  rag/rag_bridge_client.py
+  rag/rag_schema.py
+  rag/bridge/ ...
+
+온라인 PC: 기존 실행 폴더/
+  srag_llm_guide.py      # 검색 처리 코드 포함
+  srag_llm_service.py
+  기존 설정 파일 ...
+```
+
+`install_rag_query.py`는 적용할 때만 필요한 도구다. 서비스 실행 중에는 필요 없다.
+Python 패키지 transformers/sentencepiece 및 토크나이저 캐시는 여전히 온라인 PC에 필요하다.

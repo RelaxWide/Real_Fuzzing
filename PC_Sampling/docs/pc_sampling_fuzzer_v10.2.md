@@ -235,3 +235,10 @@ v10.2 요청에 짧은 `[RAG-QUERY]` 블록을 추가했다. 기존 evidence/set
 **온라인 guide도 먼저 업데이트해야 한다.** 퍼저만 업데이트하면 기존 guide는 여전히
 전체 프롬프트를 검색에 보낸다. 기존 온라인 설정을 보존하는 설치 도구와 순서는
 [RAG_QUERY_DEPLOYMENT.md](RAG_QUERY_DEPLOYMENT.md)에 있다.
+
+### RAG 배포 파일 통합
+
+검색 블록 생성은 `llm_learning.py`에, 온라인 검색 처리는 기존 `srag_llm_guide.py`에
+합친다. **별도 `rag_query.py` 배포는 필요 없다.** 온라인 적용 도구
+`install_rag_query.py`도 단독 파일로 실행되며 이전 분리형 guide를 통합형으로 전환한다.
+구체적인 명령과 최종 배치는 [RAG_QUERY_DEPLOYMENT.md](RAG_QUERY_DEPLOYMENT.md)를 따른다.

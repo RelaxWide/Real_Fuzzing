@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Patch the existing online guide without replacing its connection settings.
-Default: print a reviewable diff. --apply: back up guide and install helper.
+Default: print a reviewable diff. --apply: back up guide and inline search support (no extra runtime file).
 """
 import argparse
 import ast
@@ -10,9 +10,138 @@ from pathlib import Path
 import shutil
 
 
+# Self-contained payload: this installer is the only migration file to copy.
+INLINE_SOURCE = r'''# BEGIN INLINED RAG QUERY V1
+import logging
+import os
+
+_rag_query_log = logging.getLogger(__name__)
+_RAG_QUERY_START, _RAG_QUERY_END = '[RAG-QUERY]', '[/RAG-QUERY]'
+_RAG_QUERY_TOKENIZER = None
+
+
+class _rag_RagSearchError(RuntimeError):
+    """Search failure which must not be represented as an empty successful search."""
+    def __init__(self, message, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+
+
+
+
+def _rag_extract_query(prompt):
+    if prompt.count(_RAG_QUERY_START) == 1 and prompt.count(_RAG_QUERY_END) == 1:
+        start = prompt.index(_RAG_QUERY_START) + len(_RAG_QUERY_START)
+        end = prompt.index(_RAG_QUERY_END)
+        if end > start and prompt[start:end].strip():
+            return prompt[start:end].strip(), 'marker'
+    _rag_query_log.warning('[RAG query] missing/invalid marker; using token-bounded legacy query')
+    return prompt, 'legacy'
+
+
+def _rag_get_tokenizer():
+    global _RAG_QUERY_TOKENIZER
+    if _RAG_QUERY_TOKENIZER is None:
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as exc:
+            raise _rag_RagSearchError('Install transformers and sentencepiece on the online LLM PC') from exc
+        # Set a local path to avoid downloads on the online rig if desired.
+        _RAG_QUERY_TOKENIZER = AutoTokenizer.from_pretrained(
+            os.environ.get('RAG_TOKENIZER_PATH', 'BAAI/bge-m3'), trust_remote_code=False)
+    return _RAG_QUERY_TOKENIZER
+
+
+def _rag_prepare_query(prompt, tokenizer=None, budget=None):
+    tokenizer = tokenizer if tokenizer is not None else _rag_get_tokenizer()
+    budget = int(os.environ.get('RAG_QUERY_TOKEN_BUDGET', '1024')) if budget is None else budget
+    if not isinstance(budget, int) or isinstance(budget, bool) or not 16 <= budget <= 8000:
+        raise ValueError('RAG_QUERY_TOKEN_BUDGET must be 16..8000 (default 1024)')
+    query, mode = _rag_extract_query(prompt)
+    def count(text):
+        return len(tokenizer.encode(text, add_special_tokens=True))
+    before = count(query)
+    if before > budget:
+        ids = tokenizer.encode(query, add_special_tokens=False)
+        take = max(0, budget - tokenizer.num_special_tokens_to_add(pair=False))
+        # Decode/re-encode can differ. Verify the actual outgoing string too.
+        while take > 0:
+            clipped = tokenizer.decode(ids[:take], skip_special_tokens=True)
+            if count(clipped) <= budget:
+                query = clipped
+                break
+            take -= max(1, count(clipped) - budget)
+        else:
+            raise _rag_RagSearchError('RAG query cannot fit tokenizer budget')
+    after = count(query)
+    if not query.strip():
+        raise _rag_RagSearchError('RAG query is empty')
+    _rag_query_log.warning('[RAG query] mode=%s tokens=%d->%d budget=%d truncated=%s',
+                mode, before, after, budget, before > after)
+    return query
+
+
+def _rag_extract_search_context(response):
+    status = response.status_code
+    try:
+        result = response.json()
+    except (ValueError, TypeError) as exc:
+        raise _rag_RagSearchError(f'RAG search HTTP {status}: invalid JSON',
+                             retryable=status == 429 or status >= 500) from exc
+    if not isinstance(result, dict):
+        raise _rag_RagSearchError(f'RAG search HTTP {status}: expected JSON object')
+    code = result.get('error_code')
+    if not 200 <= status < 300 or code or result.get('error'):
+        # Preserve the reported cause without dumping document bodies or credentials.
+        details = {key: result[key] for key in
+                   ('error_code', 'query_tokens', 'max_tokens', 'embedding_model') if key in result}
+        if isinstance(result.get('message'), str):
+            details['message'] = result['message'][:500]
+        raise _rag_RagSearchError(f'RAG search HTTP {status}: {details or "server error"}',
+                             retryable=code != 'QUERY_TOKEN_LIMIT_EXCEEDED' and
+                             (status == 429 or status >= 500))
+    envelope = result.get('hits')
+    if not isinstance(envelope, dict) or not isinstance(envelope.get('hits'), list):
+        raise _rag_RagSearchError('RAG search malformed response: expected hits.hits array')
+    hits = envelope['hits']
+    if not hits:
+        _rag_query_log.warning('[RAG query] no documents; generating with original prompt only')
+        return ''
+    first = hits[0]
+    source = first.get('_source') if isinstance(first, dict) else None
+    text = source.get('merge_title_content') if isinstance(source, dict) else None
+    if not isinstance(text, str):
+        raise _rag_RagSearchError('RAG search malformed hit: missing merge_title_content string')
+    return text
+
+
+def _rag_generate_with_rag(prompt, retrieve, generate, tokenizer=None):
+    query = _rag_prepare_query(prompt, tokenizer=tokenizer)
+    context = retrieve(query)
+    suffix = '\n[참고 문서]\n' + context if context else '\n[RAG 문서 없음]'
+    return generate(prompt + suffix)
+# END INLINED RAG QUERY V1
+'''
+
 def patch_source(source):
-    if 'from rag_query import generate_with_rag, extract_search_context' in source:
+    if '# BEGIN INLINED RAG QUERY V1' in source:
+        compile(source, '<guide>', 'exec')
         return source
+    legacy_import = 'from rag_query import generate_with_rag, extract_search_context'
+    if legacy_import in source:
+        # Migrate the previous split-file installation; keep original guide settings.
+        import io
+        import tokenize
+        tokens = []
+        for token in tokenize.generate_tokens(io.StringIO(source.replace(legacy_import, '')).readline):
+            if token.type == tokenize.NAME and token.string in ('generate_with_rag', 'extract_search_context'):
+                token = token._replace(string='_rag_' + token.string)
+            tokens.append(token)
+        source = tokenize.untokenize(tokens)
+        return insert_support(source)
+
     tree = ast.parse(source)
     functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
     def choose(names):
@@ -44,13 +173,21 @@ def patch_source(source):
     arg = generate.args.args[0].arg
     edits = [
         (assignment.lineno - 1, returned.end_lineno,
-         f'    return extract_search_context({call.func.value.id})\n'),
+         f'    return _rag_extract_search_context({call.func.value.id})\n'),
         (generate.body[0].lineno - 1, generate.end_lineno,
-         f'    return generate_with_rag({arg}, {retrieve.name}, generate_response)\n'),
+         f'    return _rag_generate_with_rag({arg}, {retrieve.name}, generate_response)\n'),
     ]
     for start, end, replacement in sorted(edits, reverse=True):
         lines[start:end] = [replacement]
-    # Insert after docstring/future imports to preserve Python import rules.
+    return insert_support(''.join(lines))
+
+
+def insert_support(source):
+    tree = ast.parse(source)
+    # Refuse to shadow an existing integration or user-defined helper.
+    if any(isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name.startswith('_rag_')
+           for n in tree.body):
+        raise ValueError('Existing _rag_ helpers found; inspect guide before merging')
     anchor = 0
     for node in tree.body:
         if (isinstance(node, ast.Expr) and isinstance(node.value, (ast.Str, ast.Constant))
@@ -60,7 +197,8 @@ def patch_source(source):
             anchor = node.end_lineno
         else:
             break
-    lines.insert(anchor, '\nfrom rag_query import generate_with_rag, extract_search_context\n')
+    lines = source.splitlines(keepends=True)
+    lines.insert(anchor, '\n' + INLINE_SOURCE + '\n')
     patched = ''.join(lines)
     compile(patched, '<patched guide>', 'exec')
     return patched
@@ -77,17 +215,8 @@ def main():
         print(''.join(difflib.unified_diff(source.splitlines(True), patched.splitlines(True),
                                          fromfile=str(args.guide), tofile=str(args.guide) + ' (patched)')))
         return
-    helper = Path(__file__).resolve().parents[1] / 'rag' / 'rag_query.py'
-    target = args.guide.parent / 'rag_query.py'
-    # Validate/read all inputs before modifying the live guide.
-    helper_source = helper.read_bytes()
     backup = args.guide.with_name(args.guide.name + datetime.now().strftime('.%Y%m%d_%H%M%S_%f.bak'))
     shutil.copy2(args.guide, backup)
-    if target.exists():
-        shutil.copy2(target, backup.with_name(backup.name + '.rag_query'))
-    temporary = target.with_suffix('.py.tmp')
-    temporary.write_bytes(helper_source)
-    temporary.replace(target)
     temporary = args.guide.with_suffix('.py.tmp')
     temporary.write_text(patched, encoding='utf-8')
     shutil.copymode(args.guide, temporary)

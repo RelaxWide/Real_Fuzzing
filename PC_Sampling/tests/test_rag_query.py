@@ -7,8 +7,8 @@ import tempfile
 import subprocess
 from unittest.mock import Mock, patch
 from test_v10_2_learning import fuzzer, harness
-import rag.rag_query as query_module
-from rag.rag_query import (query_block, extract_query, prepare_query,
+from llm_learning import query_block
+from rag_inline_support import (query_module, extract_query, prepare_query,
                            extract_search_context, generate_with_rag, RagSearchError)
 
 
@@ -82,7 +82,9 @@ class QueryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             guide = Path(folder) / 'srag_llm_guide.py'
             guide.write_bytes(original)
-            command = [sys.executable, str(root / 'tools' / 'install_rag_query.py'), str(guide)]
+            standalone = Path(folder) / 'install_rag_query.py'
+            standalone.write_bytes((root / 'tools' / 'install_rag_query.py').read_bytes())
+            command = [sys.executable, str(standalone), str(guide)]
             preview = subprocess.run(command, capture_output=True, text=True, timeout=10)
             self.assertEqual(preview.returncode, 0, preview.stderr)
             self.assertIn('generate_with_rag', preview.stdout)
@@ -93,9 +95,31 @@ class QueryTests(unittest.TestCase):
             backups = list(guide.parent.glob('*.bak'))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_bytes(), original)
-            self.assertEqual((guide.parent / 'rag_query.py').read_bytes(),
-                             (root / 'rag' / 'rag_query.py').read_bytes())
+            self.assertFalse((guide.parent / 'rag_query.py').exists())
+            self.assertNotIn('from rag_query import', guide.read_text())
+            self.assertIn('# BEGIN INLINED RAG QUERY V1', guide.read_text())
             compile(guide.read_text(), str(guide), 'exec')
+
+    def test_migrate_existing_split_guide_without_helper_file(self):
+        from rag_inline_support import installer
+        source = """from rag_query import generate_with_rag, extract_search_context
+setting = 'preserved'
+def retrieve_from_rag(query):
+    return extract_search_context(response)
+def generate_response(prompt):
+    return prompt
+def generate_rag_response(prompt):
+    return generate_with_rag(prompt, retrieve_from_rag, generate_response)
+"""
+        patched = installer.patch_source(source)
+        self.assertNotIn('from rag_query import', patched)
+        env = {'response': NS(status_code=200, json=lambda: {'hits': {'hits': []}})}
+        exec(compile(patched, '<migrated guide>', 'exec'), env)
+        env['_rag_get_tokenizer'] = lambda: Tokenizer()
+        prompt = query_block('sequences') + 'original prompt'
+        self.assertEqual(env['generate_rag_response'](prompt), prompt + '\n[RAG 문서 없음]')
+        self.assertEqual(env['setting'], 'preserved')
+        self.assertEqual(installer.patch_source(patched), patched)
 
     def test_installer_preserves_query_http_settings_and_original_prompt(self):
         path = Path(__file__).resolve().parents[1] / 'tools' / 'install_rag_query.py'
@@ -119,17 +143,16 @@ def generate_rag_response(user_prompt):
         patched = installer.patch_source(source)
         self.assertIn("setting = 'preserve me'", patched)
         self.assertIn("fields = {'query_text': user_prompt}", patched)
-        self.assertIn('return extract_search_context(response)', patched)
-        self.assertIn('return generate_with_rag(user_prompt, retrieve_from_rag, generate_response)', patched)
+        self.assertIn('return _rag_extract_search_context(response)', patched)
+        self.assertIn('return _rag_generate_with_rag(user_prompt, retrieve_from_rag, generate_response)', patched)
         self.assertEqual(installer.patch_source(patched), patched)
         request = Mock(return_value=NS(status_code=200, json=lambda: {
             'hits': {'hits': [{'_source': {'merge_title_content': 'reference'}}]}}))
         env = {'request': request}
-        with patch.dict(sys.modules, {'rag_query': query_module}), \
-                patch.object(query_module, 'get_tokenizer', return_value=Tokenizer()):
-            exec(compile(patched, '<online guide>', 'exec'), env)
-            prompt = query_block('sequences') + 'full evidence ' * 2000
-            output = env['generate_rag_response'](prompt)
+        exec(compile(patched, '<online guide>', 'exec'), env)
+        env['_rag_get_tokenizer'] = lambda: Tokenizer()
+        prompt = query_block('sequences') + 'full evidence ' * 2000
+        output = env['generate_rag_response'](prompt)
         self.assertEqual(output, prompt + '\n[참고 문서]\nreference')
         self.assertNotIn('full evidence', request.call_args.args[0]['query_text'])
 

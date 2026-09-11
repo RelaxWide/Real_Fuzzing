@@ -44,7 +44,7 @@ class ServiceErrorTests(unittest.TestCase):
         ns['_reload_llm'].assert_called_once()
 
     def test_token_limit_does_not_repeat_identical_request(self):
-        from rag.rag_query import RagSearchError
+        from rag_inline_support import RagSearchError
         call = Mock(side_effect=RagSearchError('QUERY_TOKEN_LIMIT_EXCEEDED: 8498 > 8192'))
         ns = self.service(call)
         text, error = ns['_call_llm_resilient']('prompt')
