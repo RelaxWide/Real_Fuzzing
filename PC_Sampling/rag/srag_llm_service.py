@@ -18,11 +18,9 @@
 import importlib
 import json
 import os
-import string
 import sys
 import threading
 import time
-import traceback
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -31,106 +29,19 @@ sys.path.insert(0, str(_HERE))   # 같은 폴더의 srag_llm_guide.py 를 import
 # ═══════════════ 설정 — 필요시 이 값만 수정 (실행 인자 불필요) ═══════════════
 LLM_MODULE = "srag_llm_guide"          # 같은 폴더의 srag_llm_guide.py (실제 LLM 함수 보유)
 LLM_FUNC   = "generate_rag_response"   # 그 안의 함수명. generate_rag_response(user)->str
-# Samba 공유 drop-box — 오프라인 PC 의 PC_Sampling/rag/bridge 와 **같은 물리 폴더**여야 한다.
-# 찾는 순서: ① 환경변수 RAG_BRIDGE_DIR → ② 이 스크립트 옆의 bridge/ (공유 안에서 돌 때)
-#            → ③ (Windows) 드라이브 문자를 훑어 BRIDGE_SUBPATH 가 있는 드라이브
-# ③ 은 네트워크 드라이브 문자가 연결할 때마다 바뀌는 경우용이다. 경로 구조는 그대로고
-# 문자만 바뀌므로, 이 파일을 매번 고치는 대신 찾아서 쓴다.
-BRIDGE_SUBPATH   = Path("pc_sample") / "rag" / "bridge"   # 드라이브 루트 아래 상대경로
-BRIDGE_PREFERRED = "ZYX"               # 먼저 볼 드라이브 문자(보통 이 선에서 끝난다)
-_BRIDGE_SRC = "?"                      # 어느 규칙으로 골랐는지(시작 배너에 표시)
+BRIDGE_DIR = _HERE / "bridge"          # Samba 공유 drop-box. 오프라인 PC 와 같은 물리 폴더여야 함.
+#            ↑ 이 서비스가 공유 폴더에서 돌면 그대로 OK. 마운트 위치가 다르면 실제 경로로:
+#              예) BRIDGE_DIR = Path("/mnt/samba_share/bridge")
 # ══════════════════════════════════════════════════════════════════════════
 
-
-def _win_live_drives():
-    """존재하는 드라이브 문자만 **선호순**으로 돌려준다.
-
-    GetLogicalDrives 는 비트마스크라 I/O 가 없다 — 끊긴 네트워크 드라이브를 stat 하다
-    수 초씩 멈추는 것을 피하려고 후보를 먼저 이걸로 좁힌다.
-    """
-    import ctypes
-    mask = ctypes.windll.kernel32.GetLogicalDrives()
-    live = [c for i, c in enumerate(string.ascii_uppercase) if mask >> i & 1]
-    pref = [c for c in BRIDGE_PREFERRED if c in live]
-    return pref + [c for c in live if c not in pref]
-
-
-def _probe_bridge_dir():
-    """**실재하는** bridge 폴더를 (경로, 출처, 찾아본 경로들) 로 돌려준다. 없으면 (None, "", ...).
-
-    시작 시점과 실행 중 재탐색이 같은 규칙을 쓰도록 분리했다 — 이쪽은 비치명이라
-    실패해도 종료하지 않는다.
-
-    ⚠ Windows 에서는 **드라이브 탐색을 먼저** 한다. 스크립트 옆 bridge/ 를 먼저 보면,
-    예전 버전이 만들어 둔 빈 bridge/ 가 남아 있을 때 네트워크 드라이브를 아예 찾지
-    않고 그 빈 폴더를 폴링한다 — 요청을 영영 못 받고 로그도 조용하다(실측).
-    """
-    local = _HERE / "bridge"
-    tried = []
-    if os.name == "nt":
-        for d in _win_live_drives():
-            cand = Path(f"{d}:\\") / BRIDGE_SUBPATH
-            tried.append(str(cand))
-            try:
-                if cand.is_dir():
-                    return cand, "드라이브 탐색", tried
-            except OSError:
-                continue                # 권한/끊김 — 다음 문자로
-    tried.append(str(local))
-    if local.is_dir():
-        return local, "스크립트 옆", tried
-    return None, "", tried
-
-
-def _find_bridge_dir():
-    """시작 시 BRIDGE_DIR 확정. 못 찾으면 찾아본 경로를 보여주고 종료한다.
-
-    (조용히 기본값으로 떨어지면 서비스가 뜬 채로 영영 요청을 못 받는다 — 그 실패는
-     _IDLE_WARN_SEC 가 지나야 드러나므로, 시작 시점에 끊는 편이 낫다.)
-    """
-    global _BRIDGE_SRC
-    found, src, tried = _probe_bridge_dir()
-    if found is not None:
-        _BRIDGE_SRC = src
-        return found
-    if os.name != "nt":
-        _BRIDGE_SRC = "스크립트 옆(신규 생성)"
-        return _HERE / "bridge"         # 리눅스/오프라인 쪽 기존 동작(없으면 아래에서 생성)
-    sys.exit("[RAG service] bridge 폴더를 찾지 못했습니다. 네트워크 드라이브 연결을 "
-             "확인하거나 RAG_BRIDGE_DIR 로 직접 지정하세요.\n  찾아본 경로:\n    "
-             + "\n    ".join(tried))
-
-
-def _rebind_bridge(newdir: Path, src: str = "재탐색"):
-    """실행 중 bridge 위치 변경을 반영한다(네트워크 드라이브 문자 변경 등)."""
-    global BRIDGE_DIR, _REQ, _RESP, _BRIDGE_SRC
-    _BRIDGE_SRC = src
-    BRIDGE_DIR = newdir
-    _REQ = newdir / "requests"
-    _RESP = newdir / "responses"
-    for _d in (_REQ, _RESP):
-        try:
-            _d.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-
-
-# (선택) 환경변수 override — 없으면 위 기본값/자동탐색 사용
+# (선택) 환경변수 override — 없으면 위 기본값 사용
 LLM_MODULE = os.environ.get("RAG_LLM_MODULE", LLM_MODULE)
 LLM_FUNC = os.environ.get("RAG_LLM_FUNC", LLM_FUNC)
-_env_bridge = os.environ.get("RAG_BRIDGE_DIR")
-_BRIDGE_PINNED = _env_bridge is not None   # 사용자가 못박음 → 실행 중 재탐색하지 않는다
-if _env_bridge:
-    BRIDGE_DIR, _BRIDGE_SRC = Path(_env_bridge), "RAG_BRIDGE_DIR"
-else:
-    BRIDGE_DIR = _find_bridge_dir()
+BRIDGE_DIR = Path(os.environ.get("RAG_BRIDGE_DIR", BRIDGE_DIR))
 
 _REQ = BRIDGE_DIR / "requests"
 _RESP = BRIDGE_DIR / "responses"
 _POLL = 0.5
-# 접근 불가가 이어질 때 bridge 위치를 다시 찾아보는 간격(초). 드라이브 문자가 바뀌는
-# 경우를 잡는 용도라 폴링(_POLL)보다 성기게 둔다.
-_REDETECT_SEC = 5.0
 # 유휴 경고 간격(초). 퍼저는 request_cadence(기본 5000 exec) 마다만 요청하므로 수 분 공백은
 # 정상이다 → 기본 15분. 공유가 조용히 끊긴 경우를 잡는 게 목적.
 _IDLE_WARN_SEC = float(os.environ.get("RAG_IDLE_WARN_SEC", "900"))
@@ -186,38 +97,24 @@ def _call_once(prompt: str, timeout: float) -> str:
     return box.get('ok', '')
 
 
-def _log_call_error(label, exc):
-    """Keep the exception type and guide frame; str(KeyError) alone is just 'hits'."""
-    summary = f"{type(exc).__name__}: {exc}"
-    frames = traceback.extract_tb(exc.__traceback__)
-    if frames:
-        leaf = frames[-1]
-        summary += f" ({leaf.filename}:{leaf.lineno} in {leaf.name})"
-    _log(f"⚠ {label}: {summary}")
-    # Standard traceback excludes locals and request/response payload dumps.
-    for line in traceback.format_exception(type(exc), exc, exc.__traceback__):
-        _log(line.rstrip())
-    return summary
-
-
 def _call_llm_resilient(prompt: str):
     """호출 → 실패 시 모듈 reload(재연결) → 1회 재시도. (text, error) 반환."""
     try:
         return _call_once(prompt, _CALL_TIMEOUT), None
     except Exception as e1:
-        _log_call_error("LLM 호출 실패", e1)
-        _log("⚠   모듈을 다시 로드해 1회 재시도합니다. 연결 문제 여부는 위 traceback으로 확인하세요.")
+        _log(f"⚠ LLM 호출 실패: {e1}")
+        _log("⚠   연결이 끊긴 것으로 보고 모듈을 다시 로드해 재연결 후 1회 재시도합니다.")
         try:
             _reload_llm()
         except Exception as e_rl:
-            _log_call_error("모듈 reload 실패(기존 함수로 재시도)", e_rl)
+            _log(f"⚠   모듈 reload 실패(무시하고 재시도): {e_rl}")
         try:
             _text = _call_once(prompt, _CALL_TIMEOUT)
-            _log("✓ 모듈 reload 후 재시도 성공")
+            _log("✓ 재연결 후 성공")
             return _text, None
         except Exception as e2:
-            detail = _log_call_error("재시도도 실패", e2)
-            return "", f"{detail} (모듈 reload 후 재시도도 실패)"
+            _log(f"⚠ 재시도도 실패: {e2}")
+            return "", f"{e2} (재연결 재시도 후에도 실패)"
 
 
 def _atomic_write(path: Path, text: str):
@@ -238,46 +135,13 @@ def _log(msg: str):
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [RAG service] {msg}", flush=True)
 
 
-# 대조용 환경변수 후보. 값은 찍지 않는다 — 자격증명이 섞일 수 있어 **키 이름만** 본다.
-_ENV_HINTS = ("PROXY", "ELASTIC", "ES_", "_ES", "OPENSEARCH", "RAG",
-              "SSL", "CERT", "TOKEN", "API_KEY", "AUTH", "CONDA", "VIRTUAL_ENV")
-
-
-def _log_environment():
-    """서비스와 (노트북 등) 직접 실행의 환경 차이를 한 줄씩 대조하기 위한 시작 진단.
-
-    같은 함수·같은 입력이 한쪽에서만 실패하면 원인은 입력이 아니라 이 값들 중 하나다.
-    특히 `guide` — 서비스는 sys.path 에 스크립트 폴더를 넣으므로, 사본이 둘이면
-    노트북과 **다른 파일**을 import 하고 있을 수 있다.
-    """
-    import getpass, platform
-    def _safe(fn, default="?"):
-        try:
-            return fn()
-        except Exception:
-            return default
-    for k, v in (("python", sys.executable),
-                 ("version", sys.version.split()[0]),
-                 ("cwd", os.getcwd()),
-                 ("script", str(_HERE)),
-                 ("guide", getattr(_llm_mod, "__file__", "?")),
-                 ("user", _safe(getpass.getuser)),
-                 ("host", _safe(platform.node))):
-        _log(f"[env] {k:<8}= {v}")
-    keys = sorted(k for k in os.environ
-                  if any(t in k.upper() for t in _ENV_HINTS))
-    _log(f"[env] related env keys ({len(keys)}): {', '.join(keys) or '(없음)'}")
-
-
 def main():
-    _log(f"watching {_REQ}  [{_BRIDGE_SRC}]  (LLM={LLM_MODULE}.{LLM_FUNC})")
-    _log_environment()
+    _log(f"watching {_REQ}  (LLM={LLM_MODULE}.{LLM_FUNC})")
     _log(f"유휴 경고 간격 {_IDLE_WARN_SEC:.0f}초 (RAG_IDLE_WARN_SEC 로 조정)")
     last_ok = time.monotonic()     # 마지막으로 요청을 처리한(또는 폴더가 멀쩡했던) 시각
     _unreadable = {}               # 파일명 -> 연속 읽기 실패 횟수(권한 문제 조기 발견)
     last_warn = 0.0
     broken = False                 # 감시 폴더 접근 불가 상태인지
-    last_redetect = 0.0            # 마지막으로 bridge 위치를 다시 찾아본 시각
     while True:
         now = time.monotonic()
 
@@ -301,15 +165,6 @@ def main():
                      "드라이브 매핑/네트워크를 확인하세요.")
                 last_warn = now
             broken = True
-            # 드라이브 문자가 바뀌었을 수 있다 — 접근 불가가 이어지는 동안 다시 찾는다.
-            # 찾으면 경로만 갈아끼우고, 정상 판정/복구 로그는 다음 라운드에 맡긴다.
-            if not _BRIDGE_PINNED and (now - last_redetect) >= _REDETECT_SEC:
-                last_redetect = now
-                _found, _src, _ = _probe_bridge_dir()
-                if _found is not None and _found != BRIDGE_DIR:
-                    _log(f"✓ bridge 위치 변경 감지: {BRIDGE_DIR} → {_found} ({_src})")
-                    _rebind_bridge(_found, _src)
-                    continue
             time.sleep(_POLL)
             continue
         if broken:
