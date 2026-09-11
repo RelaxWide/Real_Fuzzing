@@ -15547,7 +15547,11 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         2. firmware_map.png     — 펌웨어 주소 공간 커버리지 맵
         3. uncovered_funcs.png  — 미커버 함수 Top-30 (크기 순)
         """
-        if not self._sa_loaded:
+        # RISC-V keeps coverage in cov, while _sa_loaded remains False.
+        # Use the same all-core denominators as the stored growth percentages.
+        _, total_bbs, _, total_funcs, _ = self._cov_totals()
+        if total_bbs <= 0 and total_funcs <= 0:
+            log.info("[StatGraph] 성장 곡선 생략 — 정적 커버리지 분모 없음")
             return
 
         try:
@@ -15576,12 +15580,12 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                 gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.35},
                 sharex=True,
             )
-            if self._sa_total_bbs > 0:
+            if total_bbs > 0:
                 ax_top.plot(execs, c_pcts, color='steelblue', linewidth=1.7,
-                            label=f'Basic Blocks ({self._sa_total_bbs:,})')
-            if self._sa_total_funcs > 0:
+                            label=f'Basic Blocks ({total_bbs:,})')
+            if total_funcs > 0:
                 ax_top.plot(execs, f_pcts, color='coral', linewidth=1.7,
-                            label=f'Functions ({self._sa_total_funcs:,})')
+                            label=f'Functions ({total_funcs:,})')
 
             ax_top.set_ylabel('Coverage (%)')
             ax_top.set_title('Coverage Growth')
@@ -15591,7 +15595,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             ax_top.grid(True, alpha=0.3)
 
             # --- 마일스톤 annotation (25/50/75% BB 도달 시점) ---
-            if self._sa_total_bbs > 0 and c_pcts:
+            if total_bbs > 0 and c_pcts:
                 milestones = [25.0, 50.0, 75.0, 90.0]
                 _ms_label_y = _ymax * 0.95
                 for ms in milestones:
@@ -15618,7 +15622,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             # --- Plateau 하이라이트 ---
             # window별로 BB% 증가량이 임계 미만이면 plateau로 표시.
             # window = 전체 길이의 5% (최소 3개 샘플)
-            if self._sa_total_bbs > 0 and len(execs) >= 6:
+            if total_bbs > 0 and len(execs) >= 6:
                 _win = max(3, len(execs) // 20)
                 _plateau_thresh_pct = 0.5   # 0.5% 미만 증가 = plateau
                 _in_plateau = False
@@ -15654,7 +15658,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             # 의미: 직전 snapshot 이후 추가된 BB 커버율 (BB% increment per window).
             # 막대 높이가 클수록 그 시간 동안 진행이 빨랐다는 뜻.
             # 0에 가까우면 포화 — 위 plateau 음영과 같은 정보를 다른 형태로 보여줌.
-            if self._sa_total_bbs > 0 and len(execs) >= 2:
+            if total_bbs > 0 and len(execs) >= 2:
                 _bar_x = execs[1:]
                 _bar_w_arr = [execs[i] - execs[i-1] for i in range(1, len(execs))]
                 _vel = [(c_pcts[i] - c_pcts[i-1]) for i in range(1, len(execs))]
@@ -15707,14 +15711,14 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
 
             # plateau / 마일스톤 범례 — 처음부터 다시 빌드 (matplotlib 버전 호환성)
             _legend_handles = []
-            if self._sa_total_bbs > 0:
+            if total_bbs > 0:
                 _legend_handles.append(plt.Line2D(
                     [], [], color='steelblue', linewidth=1.7,
-                    label=f'Basic Blocks ({self._sa_total_bbs:,})'))
-            if self._sa_total_funcs > 0:
+                    label=f'Basic Blocks ({total_bbs:,})'))
+            if total_funcs > 0:
                 _legend_handles.append(plt.Line2D(
                     [], [], color='coral', linewidth=1.7,
-                    label=f'Functions ({self._sa_total_funcs:,})'))
+                    label=f'Functions ({total_funcs:,})'))
             _legend_handles.append(mpatches.Patch(
                 color='#ffd966', alpha=0.4, label='Plateau (Δ<0.5%/window)'))
             ax_top.legend(handles=_legend_handles, loc='lower right', fontsize=8)
@@ -15723,6 +15727,9 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             plt.savefig(growth_file, dpi=150, bbox_inches='tight')
             plt.close()
             log.info(f"[StatGraph] 성장 곡선 → {_logname(growth_file)}")
+
+        else:
+            log.info(f"[StatGraph] 성장 곡선 생략 — 이력 {len(self._sa_cov_history)}개 (최소 2개 필요)")
 
         # ------------------------------------------------------------------ #
         # 2. Firmware address-space map  (v7.6: BB gradient + 전체 함수 + Top-N)
@@ -15744,11 +15751,11 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                 _drawn += 1
             if not _drawn:
                 log.info("[StatGraph] 펌웨어 맵 생략 — 본체 함수가 있는 코어가 없다")
-        elif self._sa_func_entries and self._sa_total_funcs > 0:
+        elif self._sa_func_entries and total_funcs > 0:
             self._render_firmware_map(
                 self._sa_func_entries, self._sa_func_ends, self._sa_func_names,
                 self._sa_entered_funcs, self._sa_bb_starts, self._sa_covered_bbs,
-                self._sa_total_bbs, graph_dir / 'firmware_map.png')
+                total_bbs, graph_dir / 'firmware_map.png')
 
         # v7.6: uncovered_funcs.png 제거. firmware_map의 Top-N 라벨 + 그라데이션이
         # 같은 정보를 더 효율적으로 보여주고, 우선순위 분석은 텍스트 로그가 더 효과적.

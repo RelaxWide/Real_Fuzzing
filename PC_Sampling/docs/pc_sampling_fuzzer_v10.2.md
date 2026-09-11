@@ -203,3 +203,27 @@ RDDump의 줄바꿈 없는 출력도 8 KiB 단위로 분할해 무제한 RAM 누
 `process_memory.jsonl`에는 timeout/덤프/차트/모니터링 단계별 PID와 RSS를 기록한다.
 검증 및 보고된 OOM/Identify timeout의 판정 한계는
 [V10_2_TIMEOUT_MEMORY_REVIEW.md](V10_2_TIMEOUT_MEMORY_REVIEW.md)를 참고한다.
+
+## Coverage growth 차트 누락 수정
+
+RISC-V(BM9K1)는 `CoverageModel`에 정적 커버리지를 보관하고 기존 ARM용
+`_sa_loaded`는 False로 둔다. 그런데 정적 차트 함수가 이 플래그만 확인하고
+즉시 반환해서 `graphs/coverage_growth.png`와 코어별 firmware map을 건너뛰었다.
+이제 통계와 동일한 `_cov_totals()`로 판단한다. 성장률과 범례의 BB/함수 분모도
+전체 코어 기준으로 맞췄다. 기존 ARM 경로 역시 같은 집계 함수를 사용한다.
+
+성장 곡선에는 통계 이력이 최소 2개 필요하며, 부족하거나 정적 분모가 없으면
+주 로그의 `[StatGraph]`에 생략 사유를 기록한다. 생성 시점은 기존과 동일하게
+차트 갱신 주기(기본 5,000 실행) 및 정상적인 종료 정리 단계다.
+OOM/SIGKILL로 강제 종료되면 종료 정리가 실행되지 않을 수 있다.
+
+`coverage_growth_axes.png`, `coverage_growth_normalized.png`,
+`coverage_growth_by_source.png`는 별도 오프라인 도구의 산출물이다.
+이미 저장된 데이터는 다음 명령으로 그릴 수 있다(SSD 접근 없음).
+
+```bash
+python3 PC_Sampling/tools/coverage_growth_plot.py /path/to/output_dir
+```
+
+검증: 총 58개 회귀 테스트 통과. RISC-V/ARM 양쪽에서 실제 PNG 생성,
+전체 코어 분모의 범례, figure 해제, 이력 부족 안내를 확인했다. 실기는 미검증이다.
