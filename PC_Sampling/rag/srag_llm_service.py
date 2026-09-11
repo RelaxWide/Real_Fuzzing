@@ -238,8 +238,40 @@ def _log(msg: str):
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [RAG service] {msg}", flush=True)
 
 
+# 대조용 환경변수 후보. 값은 찍지 않는다 — 자격증명이 섞일 수 있어 **키 이름만** 본다.
+_ENV_HINTS = ("PROXY", "ELASTIC", "ES_", "_ES", "OPENSEARCH", "RAG",
+              "SSL", "CERT", "TOKEN", "API_KEY", "AUTH", "CONDA", "VIRTUAL_ENV")
+
+
+def _log_environment():
+    """서비스와 (노트북 등) 직접 실행의 환경 차이를 한 줄씩 대조하기 위한 시작 진단.
+
+    같은 함수·같은 입력이 한쪽에서만 실패하면 원인은 입력이 아니라 이 값들 중 하나다.
+    특히 `guide` — 서비스는 sys.path 에 스크립트 폴더를 넣으므로, 사본이 둘이면
+    노트북과 **다른 파일**을 import 하고 있을 수 있다.
+    """
+    import getpass, platform
+    def _safe(fn, default="?"):
+        try:
+            return fn()
+        except Exception:
+            return default
+    for k, v in (("python", sys.executable),
+                 ("version", sys.version.split()[0]),
+                 ("cwd", os.getcwd()),
+                 ("script", str(_HERE)),
+                 ("guide", getattr(_llm_mod, "__file__", "?")),
+                 ("user", _safe(getpass.getuser)),
+                 ("host", _safe(platform.node))):
+        _log(f"[env] {k:<8}= {v}")
+    keys = sorted(k for k in os.environ
+                  if any(t in k.upper() for t in _ENV_HINTS))
+    _log(f"[env] related env keys ({len(keys)}): {', '.join(keys) or '(없음)'}")
+
+
 def main():
     _log(f"watching {_REQ}  [{_BRIDGE_SRC}]  (LLM={LLM_MODULE}.{LLM_FUNC})")
+    _log_environment()
     _log(f"유휴 경고 간격 {_IDLE_WARN_SEC:.0f}초 (RAG_IDLE_WARN_SEC 로 조정)")
     last_ok = time.monotonic()     # 마지막으로 요청을 처리한(또는 폴더가 멀쩡했던) 시각
     _unreadable = {}               # 파일명 -> 연속 읽기 실패 횟수(권한 문제 조기 발견)
