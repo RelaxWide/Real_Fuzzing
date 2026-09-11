@@ -205,7 +205,9 @@ def _call_llm_resilient(prompt: str):
     try:
         return _call_once(prompt, _CALL_TIMEOUT), None
     except Exception as e1:
-        _log_call_error("LLM 호출 실패", e1)
+        detail = _log_call_error("LLM 호출 실패", e1)
+        if getattr(e1, "retryable", None) is False:
+            return "", detail
         _log("⚠   모듈을 다시 로드해 1회 재시도합니다. 연결 문제 여부는 위 traceback으로 확인하세요.")
         try:
             _reload_llm()

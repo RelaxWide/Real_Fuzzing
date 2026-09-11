@@ -1,10 +1,13 @@
 """Exercise real service functions without importing the external online guide."""
 import ast
+import sys
 from pathlib import Path
 import threading
 import traceback
 import unittest
 from unittest.mock import Mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 class ServiceErrorTests(unittest.TestCase):
@@ -39,6 +42,16 @@ class ServiceErrorTests(unittest.TestCase):
         self.assertEqual(ns['_call_llm_resilient']('prompt'), ('{"seeds": []}', None))
         self.assertEqual(call.call_count, 2)
         ns['_reload_llm'].assert_called_once()
+
+    def test_token_limit_does_not_repeat_identical_request(self):
+        from rag.rag_query import RagSearchError
+        call = Mock(side_effect=RagSearchError('QUERY_TOKEN_LIMIT_EXCEEDED: 8498 > 8192'))
+        ns = self.service(call)
+        text, error = ns['_call_llm_resilient']('prompt')
+        self.assertEqual(text, '')
+        self.assertIn('QUERY_TOKEN_LIMIT_EXCEEDED', error)
+        call.assert_called_once()
+        ns['_reload_llm'].assert_not_called()
 
     def test_success_does_not_reload(self):
         ns = self.service(Mock(return_value='ok'))

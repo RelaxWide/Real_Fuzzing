@@ -227,3 +227,11 @@ python3 PC_Sampling/tools/coverage_growth_plot.py /path/to/output_dir
 
 검증: 총 58개 회귀 테스트 통과. RISC-V/ARM 양쪽에서 실제 PNG 생성,
 전체 코어 분모의 범례, figure 해제, 이력 부족 안내를 확인했다. 실기는 미검증이다.
+
+## RAG 검색 입력 분리
+
+v10.2 요청에 짧은 `[RAG-QUERY]` 블록을 추가했다. 기존 evidence/setup은 유지하며,
+온라인 guide에서 검색 입력에만 BGE-M3 토큰 예산(기본 1,024)을 적용한다.
+**온라인 guide도 먼저 업데이트해야 한다.** 퍼저만 업데이트하면 기존 guide는 여전히
+전체 프롬프트를 검색에 보낸다. 기존 온라인 설정을 보존하는 설치 도구와 순서는
+[RAG_QUERY_DEPLOYMENT.md](RAG_QUERY_DEPLOYMENT.md)에 있다.

@@ -6923,6 +6923,7 @@ class _V101Fuzzer:
 
             explored = sorted([n for n in known if n in exercised], key=_cmd_yield)
             candidates = never + explored            # never-entered 우선, 그다음 low-yield
+            self._llm_pending_ctx = {"rag_query_commands": candidates[:3]}
             schema = self._llm_schema_summary(candidates[:RAG_SCHEMA_MAX])
             _low_lbl = []
             for n in explored[:15]:
@@ -6947,6 +6948,7 @@ class _V101Fuzzer:
             # v9.1 #5: 확정 미구현 opcode 는 시퀀스 재료에서 제외(죽은 opcode 로 체인 조립 방지).
             names = [n for n in sorted(self.llm.schema_bridge.commands.keys())
                      if n not in self._unimpl_cmds]
+            self._llm_pending_ctx = {"rag_query_commands": names[:3]}
             schema = self._llm_schema_summary(names[:RAG_SCHEMA_MAX])  # v9.1: 캡 제거(구현된 전부)
             user = (_gp + self._llm_reject_block()      # v10: 거절·보정 되먹임
                     + f"Coverage gaps (firmware functions NOT yet reached — target these):\n"
@@ -6975,6 +6977,7 @@ class _V101Fuzzer:
             #   last_gain_exec) 는 응답 도착 시 "그 사이 이 시드가 새 커버리지를 냈나" 를
             #   판정해 낡은 keep=False 파기 지시를 보류하기 위한 스냅샷이다.
             self._llm_pending_ctx = {
+                'rag_query_commands': list(dict.fromkeys(s.cmd.name for s in sample))[:3],
                 'kind': 'eval_targets',
                 'targets': {i: (s, getattr(s, 'new_pcs', 0), getattr(s, 'last_gain_exec', 0))
                             for i, s in enumerate(sample)},

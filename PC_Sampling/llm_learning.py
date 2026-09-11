@@ -396,6 +396,23 @@ class LearningMixin:
         return [self.learning.target(r) for r in selected]
 
     def _llm_build_request(self, task):
+        built = self._llm_build_learning_request(task)
+        if built is None:
+            return None
+        from rag.rag_query import query_block
+        ctx = getattr(self, '_llm_pending_ctx', None) or {}
+        learning = getattr(self, 'learning', None)
+        targets = []
+        commands = []
+        for tid in ctx.get('learning_targets', [])[:3]:
+            target = learning.targets.get(tid, {}) if learning is not None else {}
+            targets.append(target.get('name', ''))
+            commands.extend(target.get('caller_commands', [])[:3])
+        # Command groups already prioritized by the base request builder.
+        commands = commands or ctx.get('rag_query_commands', [])
+        return built[0], query_block(task, commands, targets) + built[1]
+
+    def _llm_build_learning_request(self, task):
         built = super()._llm_build_request(task)
         if built is None or not self.learning.enabled:
             return built
