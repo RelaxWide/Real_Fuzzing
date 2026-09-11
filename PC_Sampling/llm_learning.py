@@ -9,6 +9,7 @@ import bisect
 from collections import Counter, OrderedDict, deque
 from copy import deepcopy
 from dataclasses import replace
+from functools import wraps
 import hashlib
 import json
 import logging
@@ -24,7 +25,7 @@ DEFAULTS = dict(enabled=True, evidence=True, preserve_setup=True, generators=Tru
                 adaptive_tasks=True, setup_preserve_ratio=0.8, evaluation_commands=8,
                 exploration_every=4, max_targets=512, max_proposals=2048,
                 max_generators=128, max_generator_keys=4096, recent_commands=256,
-                max_variants=16, random_seed=102)
+                max_variants=16, random_seed=102, snapshot_min_interval_sec=60.0)
 
 
 def digest(obj):
@@ -139,22 +140,30 @@ def compile_recipe(recipe, max_bytes, max_variants=16):
 class LearningState:
     def __init__(self, config=None):
         self.options = dict(DEFAULTS)
-        supplied = config or {}
-        if not isinstance(supplied, dict) or set(supplied) - set(DEFAULTS):
-            raise ValueError('rag.learning contains unknown options')
-        self.options.update(supplied)
+        supplied = {} if config is None else config
+        if not isinstance(supplied, dict):
+            raise ValueError(f'rag.learning must be an object, got {type(supplied).__name__}')
+        unknown = sorted(set(supplied) - set(DEFAULTS))
+        if unknown:
+            log.warning('[LLM/v10.2] 알 수 없는 설정 키 무시: %s',
+                        ', '.join(f'rag.learning.{key}' for key in unknown))
+        self.options.update({k: v for k, v in supplied.items() if k in DEFAULTS})
         for k in ('enabled', 'evidence', 'preserve_setup', 'generators', 'adaptive_tasks'):
             if type(self.options[k]) is not bool:
-                raise ValueError(f'rag.learning.{k} must be boolean')
+                raise ValueError(f'rag.learning.{k}={self.options[k]!r} must be boolean')
         for k in ('evaluation_commands', 'exploration_every', 'max_targets', 'max_proposals',
                   'max_generators', 'max_generator_keys', 'recent_commands', 'max_variants'):
-            checked_int(self.options[k], 1, 100000, k)
+            checked_int(self.options[k], 1, 100000, f'rag.learning.{k}={self.options[k]!r}')
         if self.options['max_variants'] > 64:
-            raise ValueError('max_variants must be <=64')
+            raise ValueError(f'rag.learning.max_variants={self.options["max_variants"]!r} must be <=64')
         ratio = self.options['setup_preserve_ratio']
         if type(ratio) not in (int, float) or not math.isfinite(ratio) or not 0 <= ratio <= 1:
-            raise ValueError('setup_preserve_ratio must be 0..1')
-        checked_int(self.options['random_seed'], 0, 0xffffffff, 'random_seed')
+            raise ValueError(f'rag.learning.setup_preserve_ratio={ratio!r} must be 0..1')
+        checked_int(self.options['random_seed'], 0, 0xffffffff,
+                    f'rag.learning.random_seed={self.options["random_seed"]!r}')
+        interval = self.options['snapshot_min_interval_sec']
+        if (type(interval) not in (int, float) or not math.isfinite(interval) or interval < 0):
+            raise ValueError(f'rag.learning.snapshot_min_interval_sec={interval!r} must be finite and >=0')
         self.rng = random.Random(self.options['random_seed'])
         self.targets = OrderedDict()
         self.proposals = OrderedDict()
@@ -310,13 +319,35 @@ class LearningState:
 class LearningMixin:
     """Small adapter around v10.1. The NVMe transport and its guards stay upstream."""
     def __init__(self, config):
+        # Validate before the base constructor allocates resources or loads assets.
+        try:
+            learning = LearningState(self._learning_config)
+        except ValueError as exc:
+            raise SystemExit(f'[FATAL] v10.2 설정 오류: {exc}') from None
         super().__init__(config)
-        self.learning = LearningState(self._learning_config)
+        self.learning = learning
         self._learning_apply_ctx = {}
         self._learning_sequence = None
         self._learning_last_send = None
+        self._learning_account_send = None
         self._learning_window_valid = False
         self._learning_save_warned = False
+        self._learning_last_save_attempt = None
+        self._learning_attach_sampler()
+
+    def _learning_attach_sampler(self):
+        # Cover every window, including PM/idle windows with no NVMe send, without
+        # changing the frozen sampler implementations. Called once at construction.
+        start = self.sampler.start_sampling
+
+        @wraps(start)
+        def begin(*args, **kwargs):
+            self._learning_last_send = None
+            self._learning_account_send = None
+            self._learning_window_valid = False
+            return start(*args, **kwargs)
+
+        self.sampler.start_sampling = begin
 
     def _learning_candidates(self, limit=12):
         rows = []
@@ -599,13 +630,20 @@ class LearningMixin:
         return super()._proposal_write(rec)
 
     def _send_nvme_command(self, data, seed, *args, **kwargs):
+        self._learning_last_send = None
+        self._learning_account_send = None
         started = time.monotonic()
-        try:
-            return super()._send_nvme_command(data, seed, *args, **kwargs)
-        finally:
+        result = super()._send_nvme_command(data, seed, *args, **kwargs)
+        if result != self.RC_SKIP:
             self._learning_last_send = (seed, time.monotonic() - started)
+        return result
 
     def _stop_sampling_checked(self, context='command'):
+        # Consume once: a second stop or a window without a send has no proposal.
+        pending = self._learning_last_send
+        self._learning_last_send = None
+        self._learning_account_send = None
+        status = getattr(self, '_last_nvme_status', None)
         err = getattr(self.sampler, 'openocd_error', None)
         had_error = bool(err and err.is_set())
         result = super()._stop_sampling_checked(context)
@@ -613,14 +651,17 @@ class LearningMixin:
         self._learning_window_valid = bool(result[1] and not had_error
                                            and not getattr(self, '_learning_window_failed', False)
                                            and reason not in ('transport', 'pin_fail', 'openocd_error'))
-        if (not result[1] and self._learning_last_send is not None
+        self._learning_account_send = pending
+        if (not result[1] and pending is not None
                 and context.startswith(('command:', 'calibration:', 'workload:', 'replay:'))):
-            seed, _ = self._learning_last_send
-            self._learning_observe(seed, getattr(self, '_last_nvme_status', None),
-                                   None, set(), 0, 'sampling_failure', False)
+            seed, _ = pending
+            self._learning_observe(seed, status, None, set(), 0, 'sampling_failure', False)
         return result
 
     def _learning_observe(self, seed, status, rc, keys, new_count, source, seq_member):
+        send = getattr(self, '_learning_account_send', None) or self._learning_last_send
+        self._learning_last_send = None
+        self._learning_account_send = None
         if not self.learning.enabled:
             return
         parent = getattr(self, '_credit_seed', None)
@@ -628,7 +669,7 @@ class LearningMixin:
         if pid is None:
             pid = getattr(parent, 'prov_id', None)
         wire = dict(getattr(self, '_last_wire', None) or {})
-        seconds = self._learning_last_send[1] if self._learning_last_send else 0.0
+        seconds = send[1] if send is not None and send[0] is seed else 0.0
         observable = bool(keys) and self._learning_window_valid
         scopes = {('sa', 0)} if keys else set()
         submitted = 'completion' if status is not None else 'unknown'
@@ -744,9 +785,16 @@ class LearningMixin:
                     result.data_len_override = setup.data_len_override
         return result
 
-    def _learning_save(self):
+    def _learning_save(self, force=False):
         if not self.learning.enabled:
-            return
+            return False
+        now = time.monotonic()
+        previous = getattr(self, '_learning_last_save_attempt', None)
+        if (not force and previous is not None
+                and now - previous < self.learning.options['snapshot_min_interval_sec']):
+            return False
+        # Throttle failures too, so a full disk does not cause per-command retries.
+        self._learning_last_save_attempt = now
         try:
             directory = Path(self.output_dir) / 'llm'
             directory.mkdir(parents=True, exist_ok=True)
@@ -754,16 +802,19 @@ class LearningMixin:
             temporary.write_text(json.dumps(self.learning.snapshot(), ensure_ascii=False, indent=2),
                                  encoding='utf-8')
             temporary.replace(directory / 'learning_v10.2.json')
+            self._learning_save_warned = False
+            return True
         except (OSError, TypeError, ValueError) as exc:
             if not self._learning_save_warned:
                 log.warning('[LLM/v10.2] learning snapshot save failed: %s', exc)
                 self._learning_save_warned = True
+            return False
 
     def run(self):
         try:
             return super().run()
         finally:
-            self._learning_save()
+            self._learning_save(force=True)
 
     def _collect_stats(self):
         stats = super()._collect_stats()

@@ -31,7 +31,7 @@ v10.1 실행 파일, 드라이버, IOMMU/커널 설정은 이 작업에서 변�
 | setup 보존 | corpus 시퀀스의 마지막 명령을 trigger로 정의. 보호 실행에서는 setup을 복사하고 trigger만 변이 |
 | 입력 생성 규칙 | 유한 JSON 규칙을 little-endian payload 및 CDW 변형으로 전개. 기존 스키마 및 발송 guard를 거침 |
 | 작업 배분 | 유효 관측 실행 예산을 소비한 proposal의 신규 관측 성과와 장치/LLM 시간을 반영. 최소 탐색 유지 |
-| 결과 보존 | 주기 통계·LLM 요청/응답 처리·종료 시 `llm/learning_v10.2.json`을 임시 파일 후 교체 방식으로 저장 |
+| 결과 보존 | 기본 60초 간격으로 `llm/learning_v10.2.json` 전체 저장. 종료 시 강제 저장. 임시 파일 후 교체 방식 |
 
 목표 후보는 코어별로 번갈아 선택한다. 본체 callgraph에 근거가 있는 경우 직접 호출자가
 관측된 명령도 연결한다. 오버레이 bank의 호출 관계를 본체 주소로 추정하지 않는다.
@@ -141,8 +141,8 @@ generator 128개, generator별 코드 키 4096개, 최근 명령 256개다. prop
 
 ## 검증과 리뷰
 
-로컬 결과: 전체 37개 시험 통과(기존 sampler 회귀 6개 + v10.2 시험 31개).
-Python 문법 검사, CLI `--help`, 기존 sampler/발송 함수의 AST 동일성 검사도 통과했다.
+2026-09-11 보완 기준 로컬 결과: 전체 50개 시험 통과(기존 sampler 회귀 6개 + v10.2 시험 44개).
+Python 문법 검사, CLI `--help`, 고정 기준 sampler/발송 함수 AST 검사도 통과했다.
 
 ```bash
 python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py' -v
@@ -162,3 +162,30 @@ python3 -m py_compile PC_Sampling/pc_sampling_fuzzer_v10.2.py PC_Sampling/llm_le
    반복 캠페인의 성과·오버헤드를 확인해야 한다. 실기 테스트를 수행했다고 주장하지 않는다.
 
 별도 문서의 Spec outcome 분모/compiler/observe/guide 전체 구현은 이번 버전에 포함하지 않았다.
+
+
+## 2026-09-11 리뷰 반영
+
+1. Critical issues: 이번 리뷰 범위에서 별도 치명 결함은 보고되지 않았다.
+2. Potential bugs: 학습 모듈 누락은 배포 경로를 포함한 `[FATAL]`로 안내한다. 설정의 타입·범위
+   오류는 키와 값을 명시하고 리소스 초기화 전에 종료한다. 미지 키는 경고 후 무시해 공유 config의
+   후속 버전 키를 허용한다. sampler 시작 호출을 감싸 window마다 발송 기록을 초기화하고,
+   stop/회계에서 한 번 소비해 이전 proposal에 sampling_failure·비용이 중복 귀속되지 않게 했다.
+   이 변경은 sampler 구현 자체를 수정하지 않는다. 기존에도 sampling_failure를 0점 보상으로
+   쓰지는 않았으며, 이번 수정은 실패 기록과 비용의 귀속 문제를 해결한다.
+3. Reliability improvements: `rag.learning.snapshot_min_interval_sec` 기본값은 60초다. 간격
+   안에서는 `snapshot()`의 coverage 정렬과 JSON 직렬화도 실행하지 않는다. 저장 실패에도 간격을
+   적용하며 종료 시에는 강제 저장한다. AST 기준은 `tests/fixtures/v10_2_device_ast.json`에 동결했다.
+   기준 커밋은 `13204e6`이며 해당 커밋의 원본 AST와도 대조했다. v10.2 장치 경로를 의도적으로
+   수정하는 경우에만 리뷰 후 fixture의 hash와 source_commit을 함께 갱신한다. 테스트 실패 시
+   자동 갱신하지 않는다. 정규화는 위치 정보를 제외하고 빈 type_params를 무시하여 Python
+   3.8/3.12의 AST 형식 차이를 흡수한다.
+4. Suggested tests: `test_v10_2_hardening.py`에 배포 누락/설정 오류 subprocess 시험,
+   미지 키 경고, 발송 없는 window, 반복 stop, 정상 발송 시간의 회계 전달, 발송 중 예외,
+   저장 간격/실패 재시도/종료 강제 저장, coverage 상한 round-trip 시험을 추가했다.
+
+저장 부하 측정: generator 128개 × 각 4096개의 정수 키(`(i << 48) + j`)를 채운 합성
+snapshot은 **13,965,383 bytes(약 13.3 MiB), 저장 0.287초**였다. 로컬 파일시스템에서의 단일
+측정이며 SSD 테스트 리그의 디스크 처리량을 보장하는 수치는 아니다. generator coverage 상한만
+채웠으므로 모든 메타데이터까지 포함한 최대 파일 크기라는 뜻도 아니다. 회귀 시험은 실행 시간의
+절대 임계값 대신 전체 키 복원 및 간격 안에서의 직렬화 생략을 검사한다.

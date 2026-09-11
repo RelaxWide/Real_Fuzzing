@@ -1,0 +1,11 @@
+{
+  "source_commit": "13204e6",
+  "algorithm": "sha256-canonical-ast-json-v1 (ignore empty type_params)",
+  "hashes": {
+    "RiscvPcsrSampler": "a2101a787fffa79ed4734666fb53bd342f8677ed682acb8f7898f437bee33d33",
+    "JLinkHaltSampler": "a9184fb8e6c02f9eace38bd8af583a982dfc402637655c6c588366feded3ee6b",
+    "OpenOCDHaltSampler": "0887feec2a284a78bd11862f267ee3a0838d7844dd6791ce5aac04b07425e80d",
+    "OpenOCDPCSampler": "0740aaade6fde390017c4bc0d547c94e76a19026eb0c57fb49488991618bf740",
+    "_V101Fuzzer._send_nvme_command": "2dec67666b6e66200243e3b6b4b0d8bfa65645db5a50cd995efeb25f579b03f0"
+  }
+}

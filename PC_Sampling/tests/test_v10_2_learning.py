@@ -426,18 +426,37 @@ class IntegrationTests(unittest.TestCase):
         state.observe(1, dict(row(), evaluation_boundary=True), set(), {1})
         self.assertTrue(state.proposals[1]['rewarded'])
 
-    def test_sampler_implementations_and_nvme_transport_match_v101(self):
+    def test_device_paths_match_frozen_v102_baseline(self):
+        """Frozen at 13204e6; v10.1 hotfixes must not redefine this baseline.
+
+        If a v10.2 device path intentionally changes, review it and update the
+        fixture hashes/source_commit explicitly. Never auto-refresh on test failure.
+        Empty type_params are ignored for Python 3.8/3.12 AST compatibility.
+        """
         import ast
-        old = ast.parse((ROOT / 'pc_sampling_fuzzer_v10.1.py').read_text())
-        new = ast.parse((ROOT / 'pc_sampling_fuzzer_v10.2.py').read_text())
-        def cls(tree, name):
-            return next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
-        for name in ('RiscvPcsrSampler', 'JLinkHaltSampler', 'OpenOCDHaltSampler', 'OpenOCDPCSampler'):
-            self.assertEqual(ast.dump(cls(old, name)), ast.dump(cls(new, name)))
-        def send(node):
-            return next(n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == '_send_nvme_command')
-        self.assertEqual(ast.dump(send(cls(old, 'NVMeFuzzer'))),
-                         ast.dump(send(cls(new, '_V101Fuzzer'))))
+        import hashlib
+        def normalize(node):
+            if isinstance(node, ast.AST):
+                return {'type': type(node).__name__,
+                        'fields': {k: normalize(v) for k, v in ast.iter_fields(node)
+                                   if not (k == 'type_params' and not v)}}
+            if isinstance(node, list):
+                return [normalize(x) for x in node]
+            if node is Ellipsis:
+                return {'literal': 'Ellipsis'}
+            if isinstance(node, bytes):
+                return {'bytes': node.hex()}
+            return node
+        frozen = json.loads((ROOT / 'tests/fixtures/v10_2_device_ast.json').read_text())
+        tree = ast.parse((ROOT / 'pc_sampling_fuzzer_v10.2.py').read_text())
+        classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+        for path, expected in frozen['hashes'].items():
+            cls, _, method = path.partition('.')
+            node = classes[cls]
+            if method:
+                node = next(n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == method)
+            value = json.dumps(normalize(node), sort_keys=True, separators=(',', ':'))
+            self.assertEqual(hashlib.sha256(value.encode()).hexdigest(), expected, path)
 
     def test_comparison_tool_reports_complement_without_claiming_significance(self):
         from importlib.util import spec_from_file_location, module_from_spec

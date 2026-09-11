@@ -368,7 +368,8 @@
       "evaluation_commands": 8,
       "exploration_every": 4,
       "max_variants": 16,
-      "random_seed": 102
+      "random_seed": 102,
+      "snapshot_min_interval_sec": 60
     },
     "_comment": "v9.0 LLM-guided fuzzing. enabled=false 또는 --no-rag 면 이 섹션 전체 무시(v8.8 byte-동등). module_path/func_name = LLM callable. request_interval_sec(초)마다 백그라운드로 1 라운드 시도(in-flight 1건, 성능 무관 시간 기반 — request_cadence 실행수 기반은 v10에서 미사용). min_request_interval_sec = 전송 하한 안전 플로어(주기보다 작게). plateau_exec_threshold exec coverage 정체 시 우선 요청. LLM 산출물은 스키마 검증+위험필터 통과분만 corpus 주입.",
     "_comment_call": "pass_system_prompt=true → func(system, user) 2-인자(개발 mock ask). false → func(system+user 결합) 1-인자. 실배포(2-PC Samba): 오프라인은 module_path='rag.rag_bridge_client'(drop-box 클라이언트), func_name='generate_rag_response', pass_system_prompt=false. 온라인은 srag_llm_service.py 가 실제 LLM 처리(rag/README 없음 — v9.0.md 참조).",

@@ -17662,7 +17662,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             log.warning("Interrupted by user — 정리 작업 완료 후 종료합니다 (잠시 대기)...")
 
         finally:
-            self._learning_save()
+            self._learning_save(force=True)
             # 시퀀스 도중 종료돼 write-protect 를 보유한 채라면 여기서 해제 시도
             # (best-effort; 실패해도 다음 실행 startup clear 가 최후 net).
             if self._wp_held_nsid is not None:
@@ -18162,7 +18162,11 @@ def _render_charts_from_snapshot(snapshot_path: str) -> int:
     return 0
 
 
-from llm_learning import LearningMixin
+try:
+    from llm_learning import LearningMixin
+except ImportError as _learning_import_error:
+    sys.exit(f"[FATAL] v10.2 학습 모듈을 불러올 수 없습니다: {_learning_import_error}. "
+             f"llm_learning.py를 {Path(__file__).resolve().parent}에 함께 배포하세요.")
 
 
 class NVMeFuzzer(LearningMixin, _V101Fuzzer):

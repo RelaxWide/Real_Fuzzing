@@ -45,7 +45,7 @@ python3 PC_Sampling/pc_sampling_fuzzer_v10.2.py --help
 ```
 
 배포할 때는 실행 파일 외에 같은 디렉터리의 `llm_learning.py`와 갱신된 `fuzzer_config.json`도
-함께 반영한다. 기존 `rag/`, 제품 자산, NVMe 명령 스키마 등은 기존 프로젝트 구성을 사용한다.
+함께 반영한다. 모듈 누락 시 배포 위치를 포함한 `[FATAL]` 안내로 종료한다. 기존 `rag/`, 제품 자산, NVMe 명령 스키마 등은 기존 프로젝트 구성을 사용한다.
 Windows RAG bridge의 호출 API는 동일하며, 생성 규칙은 퍼징 PC에서 처리한다.
 
 ## 기본 설정
@@ -65,7 +65,8 @@ Windows RAG bridge의 호출 API는 동일하며, 생성 규칙은 퍼징 PC에�
     "evaluation_commands": 8,
     "exploration_every": 4,
     "max_variants": 16,
-    "random_seed": 102
+    "random_seed": 102,
+    "snapshot_min_interval_sec": 60
   }
 }
 ```
@@ -82,6 +83,11 @@ Windows RAG bridge의 호출 API는 동일하며, 생성 규칙은 퍼징 PC에�
 | `exploration_every` | 최소 탐색 슬롯의 요청 주기. 기본값은 4회마다 한 슬롯 |
 | `max_variants` | 생성 규칙 하나의 최대 파라미터 값 개수 |
 | `random_seed` | 학습 모듈 전용 RNG seed. 전체 SSD 실험의 결정론을 보장하지는 않음 |
+| `snapshot_min_interval_sec` | 전체 snapshot 저장 시도 간 최소 간격(초). 기본 60, 0이면 제한 없음 |
+
+미지의 `rag.learning` 키는 이름을 경고하고 무시한다. 공유 config에 후속 버전의 키가 추가돼도
+v10.2의 알려진 옵션은 계속 사용할 수 있다. 알려진 옵션의 잘못된 타입·범위는 해당 키와 값을
+포함한 `[FATAL]` 안내로 종료하며, 기본 퍼저의 리소스 초기화 전에 검사한다.
 
 생성 규칙은 응답당 최대 2개를 처리하며, 전개된 시드는 일반 시드와
 `rag.max_seeds_per_round` 예산을 공유한다. 현재 기본값은 라운드당 8개다.
@@ -121,7 +127,9 @@ IOMMU 설정이나 커널 변경은 이 버전의 설치 조건이 아니다.
 ## 결과 확인
 
 실행 output 디렉터리 아래 `llm/learning_v10.2.json`을 확인한다.
-주기 통계, LLM 요청·응답 처리, 종료 시 기록되며 매 명령마다 파일을 쓰지는 않는다.
+주기 통계와 LLM 요청·응답 처리 시 저장을 요청하되 기본 60초 간격으로 제한한다.
+간격 안에서는 전체 coverage 정렬·직렬화도 생략한다. 종료·예외 정리 시에는 간격과 무관하게
+전체 결과를 저장한다. 저장 실패도 같은 간격으로 재시도하여 반복 I/O를 방지한다.
 
 | 필드 | 확인할 내용 |
 |---|---|
@@ -163,15 +171,19 @@ python3 PC_Sampling/tools/compare_llm_learning.py \
 
 구현 시 로컬에서 다음 검증을 완료했다.
 
-- 전체 37개 테스트 통과: 기존 sampler 회귀 6개, v10.2 시험 31개.
+- 2026-09-11 보완 기준 전체 50개 테스트 통과: 기존 sampler 회귀 6개, v10.2 시험 44개.
 - Python 문법 검사와 CLI `--help` 확인.
-- 기존 sampler 구현 및 NVMe 발송 함수의 AST 동일성 검사.
+- sampler 구현 및 NVMe 발송 함수의 AST를 초기 구현 커밋 `13204e6`의 고정 해시와 비교.
+  v10.1 파일을 비교 기준으로 읽지 않으므로 v10.1 후속 수정과 독립적이다.
 - 실제 v10.2 응답 적용, 명령 회계, calibration 경로를 모의 입력으로 검증.
 
 ```bash
 python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py' -v
 python3 -m py_compile PC_Sampling/pc_sampling_fuzzer_v10.2.py PC_Sampling/llm_learning.py
 ```
+
+추가 회귀 시험은 모듈 누락 안내, 미지 설정 키 호환, 발송 없는 window의 실패 귀속,
+반복 stop의 중복 기록 방지, 정상 발송 시간 보존, 저장 주기 및 종료 시 강제 저장을 포함한다.
 
 실제 SSD/JLink의 장시간 동작, 탐색 효율 및 불량 재현율 향상은 아직 실측하지 않았다.
 별도 계획인 Spec outcome 분모/compiler/observe/guide 구현도 이번 버전에 포함하지 않는다.
