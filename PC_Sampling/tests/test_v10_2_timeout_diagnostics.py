@@ -109,3 +109,46 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Bm9k1MonitorTests(unittest.TestCase):
+    def make_fuzzer(self):
+        inst = fuzzer.NVMeFuzzer.__new__(fuzzer.NVMeFuzzer)
+        inst._log_process_memory = Mock()
+        inst.sampler = Mock(spec=['session', '_cores', '_valid_bit', '_reconnect'])
+        inst.sampler._cores = {0: {}}
+        inst.sampler._valid_bit = 1
+        inst.sampler.session = Mock()
+        return inst
+
+    def test_twenty_reads_never_reconnect_or_authenticate(self):
+        inst = self.make_fuzzer()
+        session = inst.sampler.session
+        session.burst.return_value = [Mock(valid=True, pc=0)]
+        stop = Mock()
+        stop.is_set.return_value = False
+        stop.wait.return_value = False
+        inst._monitor_timeout_pc(inst._read_bm9k1_monitor_pc, stop, set())
+        self.assertEqual(session.burst.call_count, 20)
+        session.burst.assert_called_with(0, 1, 1)
+        inst.sampler._reconnect.assert_not_called()
+        session.ensure_auth.assert_not_called()
+        session.recover.assert_not_called()
+        self.assertEqual(inst._read_bm9k1_monitor_pc(), [0])
+
+    def test_unavailable_invalid_and_exception_do_not_reconnect(self):
+        inst = self.make_fuzzer()
+        session = inst.sampler.session
+        for attr in ('lk', 'dap'):
+            original = getattr(session, attr)
+            setattr(session, attr, None)
+            self.assertIsNone(inst._read_bm9k1_monitor_pc())
+            session.burst.assert_not_called()
+            setattr(session, attr, original)
+        session.burst.return_value = [Mock(valid=False, pc=None)]
+        self.assertIsNone(inst._read_bm9k1_monitor_pc())
+        session.burst.side_effect = RuntimeError('transport failure')
+        self.assertIsNone(inst._read_bm9k1_monitor_pc())
+        inst.sampler._reconnect.assert_not_called()
+        session.ensure_auth.assert_not_called()
+        session.recover.assert_not_called()

@@ -13082,6 +13082,20 @@ class _V101Fuzzer:
         sampler._terminate_proc()
         log.warning("[JLINK] OpenOCD 종료 완료")
 
+    def _read_bm9k1_monitor_pc(self):
+        """종료 후 기존 PCSR 세션으로 Core0만 관측. 인증/재연결/복구하지 않는다."""
+        session = getattr(self.sampler, 'session', None)
+        if (session is None or session.lk is None or session.dap is None):
+            return None
+        if 0 not in self.sampler._cores:
+            return None
+        try:
+            observations = session.burst(0, 1, self.sampler._valid_bit)
+            return [o.pc for o in observations if o.valid and o.pc is not None] or None
+        except Exception:
+            log.info("[MONITOR] BM9K1 PC 읽기 실패 (재인증/복구 생략)", exc_info=True)
+            return None
+
     def _monitor_timeout_pc(self, read_pc, stop, idle_pcs,
                             max_attempts=20, interval=30.0):
         """Bounded diagnostic reads; the final attempt has no trailing wait."""
@@ -18142,6 +18156,10 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                 idle_pcs = self.sampler.idle_pcs
 
                 def _read_pc_via_jlink() -> Optional[List[int]]:
+                    # BM9K1은 sampler.jlink가 아니라 session.lk/dap을 사용한다.
+                    # P9의 jlink=None 검사에 넣으면 정상 세션도 매 관측마다 재인증한다.
+                    if self.config.sampler_type == 'riscv_pcsr':
+                        return self._read_bm9k1_monitor_pc()
                     # v8.1: J-Link halt 샘플러(P9)는 pylink 가 USB 를 점유 중 → JLinkExe spawn 시
                     # USB 충돌. sampler 핸들을 직접 경유해 stuck PC 를 읽는다.
                     if self.sampler.USES_JLINK_USB:
