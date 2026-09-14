@@ -2894,21 +2894,21 @@ class OpenOCDPCSampler:
         _ret_vars = ' '.join(f'$pc{i}' for i in range(len(self._pcsr_addrs)))
         if self.config.interface == 'jtag':
             proc_body = (
-                'proc read_all_pcs {} {'
+                'proc read_all_pcs {token} {'
                 ' if {[catch {'
                 + _read_stmts +
-                ' } _err]} { return "ERR:$_err" };'
-                f' return "{_ret_vars}"'
+                ' } _err]} { return "PCFUZZ_PCSR:${token}:ERR:$_err:END" };'
+                f' return "PCFUZZ_PCSR:${{token}}:{_ret_vars}:END"'
                 ' }'
             )
         else:
             proc_body = (
-                'proc read_all_pcs {} {'
+                'proc read_all_pcs {token} {'
                 f' catch {{{_px}.dap dpreg 0 0x1e}};'
                 ' if {[catch {'
                 + _read_stmts +
-                ' } _err]} { return "ERR:$_err" };'
-                f' return "{_ret_vars}"'
+                ' } _err]} { return "PCFUZZ_PCSR:${token}:ERR:$_err:END" };'
+                f' return "PCFUZZ_PCSR:${{token}}:{_ret_vars}:END"'
                 ' }'
             )
         self._telnet_cmd(proc_body)
@@ -2929,20 +2929,34 @@ class OpenOCDPCSampler:
         """PCSR 배치 읽기: 1 RTT = N코어 PC 튜플. Thumb bit 마스킹 포함."""
         n = len(self._pcsr_addrs)
         try:
-            resp = self._telnet_cmd('read_all_pcs')
-            _resp_lower = resp.lower()
-            if resp.startswith('ERR:') or 'error' in _resp_lower or 'failed' in _resp_lower:
-                log.warning(f"[OpenOCD] 에러 응답 감지: {repr(resp)}")
-                self._drain_socket()   # desync 가능성 — 다음 읽기 재정렬
-                return None
-            parts = re.findall(r'0x[0-9a-fA-F]+', resp)
-            if len(parts) != n:
-                log.warning(f"[OpenOCD] 파싱 실패 (토큰 {len(parts)}개, 기대 {n}개): {repr(resp)}")
-                # 응답 자리에서 직전 명령 echo 를 읽은 정렬 밀림(off-by-one) — 버퍼를
-                # 비워 다음 read_all_pcs 가 깨끗한 정렬로 읽게 한다(persistent desync 차단).
+            # OpenOCD 비동기 진단/명령 echo의 주소를 PC로 해석하지 않는다.
+            # 요청 번호도 확인해 이전 응답을 현재 관측으로 인정하지 않는다.
+            self._pcsr_request_id = getattr(self, '_pcsr_request_id', 0) + 1
+            token = f'r{self._pcsr_request_id}'
+            resp = self._telnet_cmd(f'read_all_pcs {token}')
+            prefix = f'PCFUZZ_PCSR:{token}:'
+            frames = [line.strip() for line in resp.splitlines()
+                      if line.strip().startswith(prefix) and line.strip().endswith(':END')]
+            if len(frames) != 1:
+                log.warning(f"[OpenOCD] PCSR 응답 프레임 불일치 ({token}, {len(frames)}개): {resp!r}")
                 self._drain_socket()
                 return None
-            pcs = tuple(int(p, 16) & ~1 for p in parts[:n])
+            payload = frames[0][len(prefix):-len(':END')]
+            if payload.startswith('ERR:'):
+                log.warning(f"[OpenOCD] PCSR 에러 응답: {payload!r}")
+                self._drain_socket()
+                return None
+            parts = payload.split()
+            if len(parts) != n or any(re.fullmatch(r'0x[0-9a-fA-F]{1,8}', p) is None
+                                     for p in parts):
+                log.warning(f"[OpenOCD] PCSR 파싱 실패 (토큰 {len(parts)}개, 기대 {n}개): {resp!r}")
+                self._drain_socket()
+                return None
+            # PC 외 출력은 진단 증거로 파일에 보존한다.
+            if any(line.strip() and line.strip() not in
+                   (f'read_all_pcs {token}', frames[0]) for line in resp.splitlines()):
+                log.info(f"[OpenOCD] PCSR 부가 출력 포함 응답: {resp!r}")
+            pcs = tuple(int(p, 16) & ~1 for p in parts)
             # 무효 PC 필터 1: sentinel(0xFFFFFFFE) 또는 0 — 모두 해당할 때만
             _sentinel = {0, 0xFFFFFFFE}
             if all(pc in _sentinel for pc in pcs):
