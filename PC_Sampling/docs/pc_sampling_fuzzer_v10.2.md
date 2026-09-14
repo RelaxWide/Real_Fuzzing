@@ -249,3 +249,15 @@ v10.2 요청에 짧은 `[RAG-QUERY]` 블록을 추가했다. 기존 evidence/set
 transformers/sentencepiece 및 토크나이저 다운로드가 필요 없는 V2 통합형으로 변경했다.
 이미 패치한 온라인 guide에도 최신 `install_rag_query.py --apply`를 다시 실행해야 한다.
 기존 토크나이저 코드 블록을 교체하며 추가 파일이나 pip 설치는 필요 없다.
+
+### FW Commit 후 재연결 로그 (2026-09-14)
+
+FW Commit 성공 후 예약된 디버그 재연결은 터미널에 성공/실패와 소요 시간을
+한 줄로 출력한다. 인증·DM 활성화·PC 검증·재시도 상세와 예외 traceback은
+기존 `fuzzer_*.log`에 남긴다. 하위 Python 코드의 stdout/stderr도 이 구간에서
+`[FWCommit/detail]`로 기록하며, 출력 전체를 메모리에 모으지 않는다.
+다른 스레드의 출력과 FW Commit 이외의 장애 복구 출력은 기존대로 유지한다.
+장치 명령, 인증 판단, 재연결 횟수는 바꾸지 않는다.
+배포 시 `pc_sampling_fuzzer_v10.2.py`만 교체하면 되며, 실행 중인 프로세스에는
+적용되지 않는다. 모의 성공/실패/예외 및 다른 스레드 출력으로 검증했으며
+BM9K1 실기 검증은 별도로 필요하다.

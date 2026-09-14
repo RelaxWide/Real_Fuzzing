@@ -1490,6 +1490,68 @@ class _FuzzingTerminalFilter(logging.Filter):
         return bool(self._ALLOW.search(record.getMessage()))
 
 
+class _ReconnectDetailStream:
+    """재연결 스레드의 print만 파일 로그로 전달. 긴 줄도 제한된 크기로 배출."""
+    def __init__(self, original, owner):
+        self.original = original
+        self.owner = owner
+        self.pending = ''
+
+    def write(self, text):
+        if threading.get_ident() != self.owner:
+            return self.original.write(text)
+        size = len(text)
+        while text:
+            room = 8192 - len(self.pending)
+            chunk, text = text[:room], text[room:]
+            self.pending += chunk
+            while '\n' in self.pending:
+                line, self.pending = self.pending.split('\n', 1)
+                log.info("[FWCommit/detail] %s", line.rstrip('\r'))
+            if len(self.pending) >= 8192:
+                self.flush()
+        return size
+
+    def flush(self):
+        if threading.get_ident() != self.owner:
+            return self.original.flush()
+        if self.pending:
+            line, self.pending = self.pending, ''
+            log.info("[FWCommit/detail] %s", line)
+
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
+
+@contextlib.contextmanager
+def _fw_commit_detail_logging():
+    """FWCommit 재연결 상세는 파일로만. 다른 스레드의 터미널 로그는 유지."""
+    owner = threading.get_ident()
+
+    class _OtherThreads(logging.Filter):
+        def filter(self, record):
+            return record.thread != owner
+
+    gate = _OtherThreads()
+    handlers = [h for h in log.handlers
+                if isinstance(h, logging.StreamHandler)
+                and not isinstance(h, logging.FileHandler)]
+    out = _ReconnectDetailStream(sys.stdout, owner)
+    err = _ReconnectDetailStream(sys.stderr, owner)
+    for handler in handlers:
+        handler.addFilter(gate)
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                yield
+            finally:
+                out.flush()
+                err.flush()
+    finally:
+        for handler in handlers:
+            handler.removeFilter(gate)
+
+
 class _LlmOnlyFilter(logging.Filter):
     """RAG 관련([LLM 으로 시작) 레코드만 통과 — llm/ 전용 로그 파일용.
     검증 로그([LLM/raw|parse|item|stats], 주입/drop/활성/오류 등)를 한 곳에 모은다."""
@@ -8103,6 +8165,25 @@ class _V101Fuzzer:
         self._csfuzz_c1_rewards.clear()
         self._csfuzz_c2_rewards.clear()
 
+    def _reconnect_after_fw_commit(self):
+        """장치 동작은 그대로 두고 재연결 상세/터미널 요약의 출력만 분리."""
+        started = time.monotonic()
+        with _fw_commit_detail_logging():
+            log.info("[Sampler] FWCommit 후 디버그 세션 재확립 시작")
+            try:
+                ok = self.sampler._reconnect()
+            except Exception:
+                ok = False
+                log.exception("[Sampler] FWCommit 후 재연결 예외")
+            log.info("[Sampler] FWCommit 후 디버그 세션 재확립 결과: %s", ok)
+        elapsed = time.monotonic() - started
+        if ok:
+            log.warning("[Sampler] FWCommit 후 디버그 재확립 성공 (%.1fs)", elapsed)
+        else:
+            log.error("[Sampler] FWCommit 후 디버그 재확립 실패 (%.1fs) — 상세는 텍스트 로그 확인",
+                      elapsed)
+        return ok
+
     def _stop_sampling_checked(self, context: str = "command") -> tuple[int, bool]:
         """sampling worker를 정지하고 transport 오류가 있으면 즉시 복구한다.
 
@@ -8275,17 +8356,7 @@ class _V101Fuzzer:
             self._fw_commit_reset_pending = False
             # (캐시 무효화는 _send_nvme_command 의 FWCommit 성공 지점에서 이미 수행 —
             #  샘플러 무관이라 이 halt 전용 블록에 두면 PCSR 제품에서 누락된다.)
-            # 성공 복구는 정상 동작 → 파일 info(터미널 스팸 방지). 실패만 터미널 경고.
-            log.info("[Sampler] FWCommit 후 J-Link 재연결로 디버그 halt 재확립...")
-            try:
-                _fw_rc_ok = self.sampler._reconnect()
-            except Exception as _fw_re_exc:
-                _fw_rc_ok = False
-                log.warning(f"[Sampler] 재연결 예외: {_fw_re_exc}")
-            if _fw_rc_ok:
-                log.info("[Sampler] J-Link 재연결 성공 — halt 복구")
-            else:
-                log.warning("[Sampler] J-Link 재연결 실패 — POR/재시작 필요할 수 있음")
+            self._reconnect_after_fw_commit()
 
         # P3: passthru_stats (replay 포함 모든 경로 추적)
         if seed.force_admin is True:
