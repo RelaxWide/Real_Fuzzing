@@ -5,7 +5,7 @@
     "RiscvPcsrSampler": "a2101a787fffa79ed4734666fb53bd342f8677ed682acb8f7898f437bee33d33",
     "JLinkHaltSampler": "a9184fb8e6c02f9eace38bd8af583a982dfc402637655c6c588366feded3ee6b",
     "OpenOCDHaltSampler": "0887feec2a284a78bd11862f267ee3a0838d7844dd6791ce5aac04b07425e80d",
-    "OpenOCDPCSampler": "3a904a09ab0e115b8bdbf5af300396abc4d55e8c83db6c9f31865c41f509d148",
+    "OpenOCDPCSampler": "ef8a08815b4013d77d2c5d82207a001475e267441816896e285192939db0a91e",
     "_V101Fuzzer._send_nvme_command": "f00c1b1a895739bb6773e24d79551c6a7cc40913c9d08e84ac49bbaf82cd74d6"
   },
   "amendments": [
@@ -20,6 +20,12 @@
       "date": "2026-09-15",
       "base_commit": "6fa05fb",
       "reason": "Four optional best-effort progress events only; no change to command construction, submission, waiting, or timeout handling. Verified by AST comparison removing _freeze_emit calls."
+    },
+    {
+      "path": "OpenOCDPCSampler",
+      "date": "2026-09-15",
+      "base_commit": "1652cc8",
+      "reason": "Normalize only line-boundary NUL in raw Telnet PCSR replies. Reproduced exact user response and fragmented CR/NUL input; internal corruption remains rejected."
     }
   ]
 }

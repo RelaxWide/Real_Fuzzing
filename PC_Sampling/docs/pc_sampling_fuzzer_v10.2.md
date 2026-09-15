@@ -300,3 +300,13 @@ OpenOCD의 read_all_pcs Tcl 응답을 `PCFUZZ_PCSR:r번호:값들:END` 형태로
 기본 비활성, 추가 배포 파일/패키지 없음. 마지막 명령과 sampler/통계 fsync/
 learning/차트 단계 및 독립 프로세스 상태를 Windows PuTTY 로그에 남긴다.
 사용법·기존 버전 비교·증거의 한계는 [PM9M1_HP_FREEZE_V102.md](PM9M1_HP_FREEZE_V102.md) 참조.
+
+### PCSR 프레임 앞 NUL 처리 (2026-09-15)
+
+사용자 원문 `read_all_pcs r1\r\n\x00PCFUZZ_PCSR:r1:0x1adb9 0x17a5 0x89cd:END`
+으로 프레임 0개 실패를 재현했다. `strip()`이 NUL을 제거하지 않는 것이 원인이다.
+응답 줄 경계의 공백/CR/LF/NUL만 제거하도록 수정했다. PC 값 내부의 NUL,
+텍스트 접두사, 이전 요청 번호, 4개 PC 값은 계속 거부한다. 기존 Thumb 마스킹
+결과는 `(0x1adb8, 0x17a4, 0x89cc)`다. 원문 및 분할 CR/NUL 수신 테스트는
+수정 전 실패·수정 후 통과했다. 원래의 추가 `0x6xxxxxxx` 값 출처는 이 로그로
+확정하지 않는다. 실기 미검증. v10.2 본체 파일만 교체하면 된다.

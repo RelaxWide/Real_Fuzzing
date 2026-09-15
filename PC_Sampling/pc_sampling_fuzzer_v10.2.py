@@ -3145,8 +3145,12 @@ class OpenOCDPCSampler:
             token = f'r{self._pcsr_request_id}'
             resp = self._telnet_cmd(f'read_all_pcs {token}')
             prefix = f'PCFUZZ_PCSR:{token}:'
-            frames = [line.strip() for line in resp.splitlines()
-                      if line.strip().startswith(prefix) and line.strip().endswith(':END')]
+            # Raw Telnet 응답의 줄 경계에는 NUL이 남을 수 있다. str.strip()은
+            # NUL을 제거하지 않아 정상 프레임을 놓친다. 경계에서만 정규화하고
+            # PC 숫자/프레임 내부의 NUL은 손상으로 계속 거부한다.
+            lines = [line.strip(' \t\r\n\x00') for line in resp.splitlines()]
+            frames = [line for line in lines
+                      if line.startswith(prefix) and line.endswith(':END')]
             if len(frames) != 1:
                 log.warning(f"[OpenOCD] PCSR 응답 프레임 불일치 ({token}, {len(frames)}개): {resp!r}")
                 self._drain_socket()
@@ -3163,8 +3167,8 @@ class OpenOCDPCSampler:
                 self._drain_socket()
                 return None
             # PC 외 출력은 진단 증거로 파일에 보존한다.
-            if any(line.strip() and line.strip() not in
-                   (f'read_all_pcs {token}', frames[0]) for line in resp.splitlines()):
+            if any(line and line not in
+                   (f'read_all_pcs {token}', frames[0]) for line in lines):
                 log.info(f"[OpenOCD] PCSR 부가 출력 포함 응답: {resp!r}")
             pcs = tuple(int(p, 16) & ~1 for p in parts)
             # 무효 PC 필터 1: sentinel(0xFFFFFFFE) 또는 0 — 모두 해당할 때만

@@ -61,6 +61,39 @@ class PcsrResponseTests(unittest.TestCase):
         self.assertEqual([c.args[0] for c in obj._sock.sendall.call_args_list],
                          [b'read_all_pcs r1\n', b'read_all_pcs r2\n'])
 
+    def test_reported_nul_prefixed_reply(self):
+        obj = self.sampler()
+        obj._telnet_cmd = Mock(return_value=(
+            'read_all_pcs r1\r\n\x00PCFUZZ_PCSR:r1:0x1adb9 0x17a5 0x89cd:END'))
+        self.assertEqual(obj._read_all_pcs(), (0x1adb8, 0x17a4, 0x89cc))
+        obj._drain_socket.assert_not_called()
+
+    def test_nul_at_line_boundaries_across_socket_chunks(self):
+        obj = self.sampler()
+        obj._sock_buf = b''
+        obj._sock = Mock()
+        obj._sock.recv.side_effect = [
+            b'read_all_pcs r1\r', b'\n', b'\x00PCFUZZ_PCSR:r1:0x1adb9 ',
+            b'0x17a5 0x89cd:END\r', b'\x00> ',
+            b'read_all_pcs r2\r\n\x00PCFUZZ_PCSR:r2:0x1000 0x2000 0x3000:END\r\x00> ',
+        ]
+        self.assertEqual(obj._read_all_pcs(), (0x1adb8, 0x17a4, 0x89cc))
+        self.assertEqual(obj._read_all_pcs(), (0x1000, 0x2000, 0x3000))
+        obj._drain_socket.assert_not_called()
+
+    def test_interior_nul_and_text_prefix_are_not_repaired(self):
+        for reply in [
+            'PCFUZZ_PCSR:r1:0x1ad\x00b9 0x17a5 0x89cd:END',
+            'PCFUZZ_PCSR:r1:0x1adb9\x00 0x17a5 0x89cd:END',
+            'echo \x00PCFUZZ_PCSR:r1:0x1adb9 0x17a5 0x89cd:END',
+            '\x00PCFUZZ_PCSR:r0:0x1adb9 0x17a5 0x89cd:END',
+            '\x00PCFUZZ_PCSR:r1:0x1adb9 0x17a5 0x89cd 0x6ba02477:END',
+        ]:
+            with self.subTest(reply=reply):
+                obj = self.sampler()
+                obj._telnet_cmd = Mock(return_value=reply)
+                self.assertIsNone(obj._read_all_pcs())
+
     def test_core_count_comes_from_product(self):
         obj = self.sampler(n=1)
         obj._telnet_cmd = Mock(return_value='PCFUZZ_PCSR:r1:0x1001:END')
