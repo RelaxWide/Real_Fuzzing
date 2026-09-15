@@ -4720,6 +4720,7 @@ class LlmBridge:
         self._req_seq = 0                     # 요청 일련번호(응답↔요청 대조용)
         self._last_submit_ts = 0.0            # 시간 기반 rate-limit 스로틀(마지막 제출 시각, monotonic)
         self._pass_system = getattr(config, 'rag_pass_system', True)
+        self._accepts_meta = False
         if not config.rag_enabled:
             return
         try:
@@ -4727,13 +4728,25 @@ class LlmBridge:
             self._callable = getattr(mod, config.rag_func_name)
             if not callable(self._callable):
                 raise TypeError(f"{config.rag_func_name} not callable")
+            # v10.3: 3인자(system, user, meta)를 받는 백엔드에만 meta 를 넘긴다.
+            #   기존 1·2인자 백엔드(사내 브리지, mock)는 그대로 동작한다.
+            try:
+                import inspect as _inspect
+                _params = _inspect.signature(self._callable).parameters
+                self._accepts_meta = (
+                    len(_params) >= 3
+                    or any(p.kind == _inspect.Parameter.VAR_KEYWORD for p in _params.values())
+                    or 'meta' in _params)
+            except (TypeError, ValueError):
+                self._accepts_meta = False
             self.schema_bridge = self._load_schema_bridge()
         except Exception as e:
             log.warning(f"[LLM] 비활성화 — 모듈/스키마 로드 실패 ({e}). v8.8 동등 동작.")
             self._callable = None
             return
         self.enabled = True
-        _call = (f"{config.rag_func_name}(system, user)" if self._pass_system
+        _call = (f"{config.rag_func_name}(system, user, meta)" if self._accepts_meta
+                 else f"{config.rag_func_name}(system, user)" if self._pass_system
                  else f"{config.rag_func_name}(user)  [system 접합]")
         log.warning(f"[LLM] 활성 — {config.rag_module_path}.{_call} "
                     f"(interval={RAG_REQUEST_INTERVAL:.0f}s, tasks={RAG_TASKS})")
@@ -4771,12 +4784,31 @@ class LlmBridge:
     def stop(self):
         self._stop.set()
 
-    def _call_llm(self, system: str, user: str) -> str:
-        # 사내 래퍼가 단일인자(generate_rag_response(user))면 system 을 user 에 접어 호출
-        # (그쪽 system_prompt 는 고정 내장). 2-인자 mock 은 (system, user).
-        if self._pass_system:
-            return self._callable(system, user)
-        return self._callable(system + "\n\n" + user)
+    def _call_llm(self, system: str, user: str, meta=None):
+        """백엔드 호출 → (raw 문자열, diagnostics dict).
+
+        v10.3: 백엔드가 meta(task/req_id/rag_query/실제 설정)를 받고
+        {"raw":…, "diagnostics":…} 를 돌려줄 수 있다. 기존 백엔드는 문자열을
+        그대로 반환하므로 **여기서 두 형태를 정규화**한다 — 파서는 raw 만 보고,
+        진단은 그 요청의 아카이브로 간다.
+
+        meta 는 입력이다. 백엔드가 여기에 결과를 되써넣거나 모듈 전역의 '마지막
+        응답'으로 돌려주면 요청이 겹칠 때 엉뚱한 요청에 귀속된다 — 그래서 반환값
+        외의 통로는 읽지 않는다.
+        """
+        if self._accepts_meta:
+            out = self._callable(system, user, meta or {})
+        elif self._pass_system:
+            out = self._callable(system, user)
+        else:
+            # 단일인자 래퍼(사내 브리지). system 을 user 에 접어 보낸다.
+            out = self._callable(system + "\n\n" + user)
+        if isinstance(out, dict):
+            diag = out.get('diagnostics') if isinstance(out.get('diagnostics'), dict) else {}
+            if out.get('error'):
+                raise RuntimeError(str(out['error']))
+            return (out.get('raw') or ''), dict(diag)
+        return (out or ''), {}
 
     def _run(self):
         while not self._stop.is_set():
@@ -4787,7 +4819,10 @@ class LlmBridge:
             try:
                 _llm_started = time.monotonic()
                 system, user = req['system'], req['user']
-                text = self._call_llm(system, user)   # 수 초 — 여기서만 블록
+                _meta = dict(req.get('meta') or {})
+                _meta.update({'task': req['task'], 'req_id': req.get('req_id'),
+                              'user_prompt': user})
+                text, _diag = self._call_llm(system, user, _meta)   # 수 초 — 여기서만 블록
                 # ② JSON 유효성 체크 → 무효면 교정 리프롬프트로 상한 재시도(회수율↑).
                 attempt = 0
                 while _llm_extract_json(text) is None and attempt < RAG_JSON_RETRIES:
@@ -4797,7 +4832,10 @@ class LlmBridge:
                                     f"{attempt}/{RAG_JSON_RETRIES}")
                     corr = user + ("\n\nYour previous reply was NOT valid JSON. Return ONLY the "
                                    "single JSON object described above — no prose, no code fence.")
-                    text = self._call_llm(system, corr)
+                    _meta['correction_attempt'] = attempt   # 교정 호출도 같은 계약으로
+                    text, _d2 = self._call_llm(system, corr, _meta)
+                    if _d2:
+                        _diag = dict(_diag, correction=_d2)
                 if RAG_DEBUG:
                     _head = (text or '')[:200].replace('\n', ' ')
                     log.warning(f"[LLM/raw] task={req['task']} len={len(text or '')} "
@@ -4806,12 +4844,14 @@ class LlmBridge:
                                  'submitted_at': req['submitted_at'],
                                  'user': req.get('user'), 'retries': attempt,
                                  'ctx': req.get('ctx'), 'req_id': req.get('req_id'),
+                                 'diagnostics': _diag,
                                  'llm_seconds': time.monotonic() - _llm_started})
             except Exception as e:
                 self._out_q.put({'task': req['task'], 'raw': None, 'error': str(e),
                                  'submitted_at': req['submitted_at'],
                                  'user': req.get('user'), 'retries': 0,
                                  'ctx': req.get('ctx'), 'req_id': req.get('req_id'),
+                                 'diagnostics': locals().get('_diag') or {},
                                  'llm_seconds': time.monotonic() - _llm_started})
             finally:
                 self._inflight = False
@@ -4829,7 +4869,8 @@ class LlmBridge:
             return False
         return True
 
-    def submit(self, task: str, system: str, user: str, now_exec: int, ctx=None) -> bool:
+    def submit(self, task: str, system: str, user: str, now_exec: int, ctx=None,
+               meta=None) -> bool:
         """in-flight 없고 최소 시간간격 지났을 때만 요청 제출. 아니면 False(스킵).
 
         ctx: 이 요청 **전용** 부속 데이터(예: corpus_eval 의 seed_id→시드 매핑).
@@ -4845,7 +4886,8 @@ class LlmBridge:
         self._inflight = True
         self._req_seq += 1
         self._in_q.put({'task': task, 'system': system, 'user': user,
-                        'submitted_at': now_exec, 'ctx': ctx, 'req_id': self._req_seq})
+                        'submitted_at': now_exec, 'ctx': ctx, 'req_id': self._req_seq,
+                        'meta': meta})
         return True
 
     def drain(self):
@@ -4886,7 +4928,11 @@ class _V101Fuzzer:
         self._llm_last_cov = 0                # plateau 감지용 직전 coverage 크기
         self._llm_plateau_since = 0           # coverage 정체 시작 exec
         self._llm_task_rr = 0                 # task 라운드로빈 인덱스
-        self._llm_fail_streak = 0             # RAG service 호출 연속 실패 수(서킷브레이커)
+        self._llm_fail_streak = 0             # 백엔드 연속 실패 수(서킷브레이커)
+        # v10.3 깔때기 — 기여가 낮을 때 **어느 단계에서** 줄었는지 보기 위한 계측.
+        #   학습 전략 개선이 아니라 이관 검증용이다.
+        self._llm_funnel = {'requests': 0, 'transport_ok': 0, 'json_ok': 0,
+                            'items': 0, 'adopted': 0, 'empty_ok': 0}
         self._llm_last_task = None            # v9.5: 직전 선택 task(연속 상한 추적)
         self._llm_task_consec = 0             # v9.5: 같은 task 연속 선택 횟수(starvation-free cap)
         # v10: LLM 요청 주기를 시간 기반으로. 마지막 '시도' 시각(monotonic). 시작 ~interval 뒤 첫 시도.
@@ -7347,6 +7393,45 @@ class _V101Fuzzer:
             return self._LLM_SYSTEM, user
         return None
 
+    def _llm_backend_meta(self, task, ctx):
+        """v10.3: 백엔드에 넘길 요청 문맥.
+
+        **실제로 로딩된 설정**을 넘긴다 — 백엔드가 기본 fuzzer_config.json 을 따로
+        읽으면 --config 로 고른 설정과 어긋난다.
+
+        rag_query 는 검색용 **짧은 질의**다. 프롬프트 전문을 질의로 쓰면 임베딩 입력
+        상한(bge-m3 8,192)을 넘고, 신호도 희석된다. 퍼저는 목표 함수명과 명령 이름을
+        알고 있으므로 여기서 만드는 것이 가장 정확하다.
+        """
+        return {'task': task, 'config': _CFG, 'product': self.config.product,
+                'rag_query': self._llm_rag_query(task, ctx)}
+
+    def _llm_rag_query(self, task, ctx):
+        """검색 질의. 없으면 None → 검색 생략(전문을 질의로 쓰지 않는다)."""
+        try:
+            parts = ['NVMe']
+            for row in (ctx or {}).get('learning_targets', [])[:4]:
+                t = self.learning.targets.get(row) if isinstance(row, str) else None
+                if t and t.get('name'):
+                    parts.append(str(t['name']))
+            for name in (self._llm_gap_cmds() or [])[:6]:
+                parts.append(str(name))
+            if len(parts) == 1:
+                return None
+            return ' '.join(dict.fromkeys(parts))[:2000]
+        except Exception:
+            return None
+
+    def _llm_gap_cmds(self):
+        """검색 질의에 쓸 명령 이름 — 아직 안 쐈거나 수확이 낮은 것 우선."""
+        try:
+            exercised = self._llm_exercised_names()
+            names = [c.name for c in NVME_COMMANDS
+                     if c.name not in self._unimpl_cmds and c.name not in exercised]
+            return names or [c.name for c in NVME_COMMANDS[:6]]
+        except Exception:
+            return []
+
     def _llm_maybe_submit(self):
         """활성 task 중 하나를 가중 라운드로빈(또는 plateau 시 seeds/seq 우선) 선택해 제출."""
         if not self.llm.enabled:
@@ -7411,7 +7496,8 @@ class _V101Fuzzer:
         sys_p, usr_p = built
         _ctx = getattr(self, '_llm_pending_ctx', None)
         self._llm_pending_ctx = None      # 빌드↔제출 사이에서만 산다
-        if self.llm.submit(task, sys_p, usr_p, self.executions, ctx=_ctx):
+        if self.llm.submit(task, sys_p, usr_p, self.executions, ctx=_ctx,
+                           meta=self._llm_backend_meta(task, _ctx)):
             self._learning_submitted(task, sys_p, usr_p, _ctx)
             log.info(f"[LLM] 요청 제출: task={task} (plateau={plateau})")
             if task == 'io_patterns':   # io_patterns 는 터미널에서도 보이게(진단)
@@ -7514,44 +7600,66 @@ class _V101Fuzzer:
                 'injected': None if added_s is None else {'seeds': added_s, 'seqs': added_q},
                 'prompt': res.get('user'),
                 'response': res.get('raw'),
+                # v10.3: 백엔드 진단(finish_reason/usage/검색 문서)은 **이 요청**에만 붙는다.
+                'diagnostics': res.get('diagnostics') or {},
+                'req_id': res.get('req_id'),
             }
             self._llm_io_fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
             self._llm_io_fh.flush()
         except Exception:
             pass
 
+    def _llm_fail(self, why, res, data=None):
+        """실패 1건 처리 — 연속 실패를 세고 상한에서 RAG 를 끈다.
+
+        **여기로 오는 것만 실패다.** 통신 실패·잘린 응답·파싱 실패·잘못된 형식.
+        정상 응답인데 중복이라 채택이 0개인 경우는 실패가 아니다(정상 동작 중
+        LLM 이 꺼진다). v10.2 는 백엔드가 반환만 하면 파싱 성패와 무관하게 연속
+        실패를 0 으로 되돌려, 무효 응답이 반복돼도 상한에 영영 도달하지 않았다.
+        """
+        self._llm_fail_streak += 1
+        self._llm_archive(res, data)
+        log.error("=" * 78)
+        log.error(f"[LLM] 백엔드 {why} ({self._llm_fail_streak}/{RAG_FAIL_LIMIT})")
+        _diag = res.get('diagnostics') or {}
+        if _diag.get('base_url'):
+            log.error(f"[LLM]   backend={_diag.get('backend')} "
+                      f"url={_diag['base_url']} model={_diag.get('model')}")
+        elif str(getattr(self.config, 'rag_module_path', '')).endswith('rag_bridge_client'):
+            log.error(f"[LLM]   드롭박스 경로: {_rag_bridge_dir()} "
+                      "— 온라인 PC 의 서비스와 같은 물리 폴더여야 합니다.")
+        else:
+            log.error(f"[LLM]   백엔드: {getattr(self.config, 'rag_module_path', '?')}")
+        log.error("=" * 78)
+        if RAG_FAIL_LIMIT > 0 and self._llm_fail_streak >= RAG_FAIL_LIMIT:
+            self.llm.enabled = False
+            log.error(f"[LLM] {self._llm_fail_streak}회 연속 실패 → 이후 RAG 비활성화"
+                      f"(blind/mutation fuzzing 은 계속)")
+
     def _llm_apply_result(self, res):
         """워커 결과 1건을 파싱·검증·주입(메인 스레드). 절대 raise 안 함."""
-        # stale 결과(너무 오래된 요청)는 무시.
+        self._llm_funnel['requests'] += 1
         if res.get('error'):
-            # RAG service 호출 자체 실패(엔드포인트 down/예외). 서킷브레이커: 연속 RAG_FAIL_LIMIT
-            #   회 실패하면 이후 RAG 를 끄고 blind/mutation fuzzing 으로 계속(무한 재시도 방지).
-            self._llm_fail_streak += 1
-            self._llm_archive(res)
-            # 실패할 때마다 매번 안내한다(요청은 request_cadence 마다라 자주 안 뜬다).
-            #   log.error 라 굵은 빨강 + 퍼징 루프 중 터미널 필터를 무조건 통과.
-            log.error("=" * 78)
-            log.error(f"[LLM] RAG service 호출 실패 "
-                      f"({self._llm_fail_streak}/{RAG_FAIL_LIMIT}): {res['error']}")
-            log.error("[LLM] 윈도우 PC 의 rag/srag_llm_service.py 에서 BRIDGE_DIR 경로를 확인하세요.")
-            log.error(f"[LLM]   퍼징 PC(이 머신)가 보는 경로: {_rag_bridge_dir()}")
-            log.error("[LLM]   → 이 폴더와 같은 물리 폴더를 가리켜야 합니다.")
-            log.error("=" * 78)
-            if RAG_FAIL_LIMIT > 0 and self._llm_fail_streak >= RAG_FAIL_LIMIT:
-                self.llm.enabled = False
-                log.error(f"[LLM] {self._llm_fail_streak}회 연속 실패 → 이후 RAG 비활성화"
-                          f"(blind/mutation fuzzing 은 계속)")
+            # 백엔드 호출 자체 실패. 서킷브레이커: 연속 RAG_FAIL_LIMIT 회 실패하면 이후
+            #   RAG 를 끄고 blind/mutation fuzzing 으로 계속한다(무한 재시도 방지).
+            self._llm_fail(f"호출 실패: {res['error']}", res)
             return
-        self._llm_fail_streak = 0   # 서비스가 응답함(파싱 성패 무관) → 연속 실패 리셋
+        self._llm_funnel['transport_ok'] += 1
         if self.executions - res.get('submitted_at', 0) > RAG_RESULT_STALE:
             log.info("[LLM] stale 결과 무시")
             return
         data = _llm_extract_json(res.get('raw'))
         if not isinstance(data, dict):
-            self._llm_archive(res, data)          # 파싱 실패한 원본도 기록
+            # 잘림(finish_reason=length)도 여기로 온다 — 진단에 이유가 남는다.
+            _fr = (res.get('diagnostics') or {}).get('finish_reason')
+            self._llm_fail("JSON 파싱 실패" + (f" (finish_reason={_fr})" if _fr else ""),
+                           res, data=data)
             self._llm_stats['dropped'] += 1
-            log.info("[LLM] JSON 파싱 실패 — 결과 폐기")   # ③(2) 파싱 실패
             return
+        self._llm_funnel['json_ok'] += 1
+        # 여기부터는 **정상 응답**이다. 중복이나 빈 결과로 채택이 0개여도 실패가 아니다
+        #   — 실패로 세면 정상 동작 중에 LLM 이 꺼진다.
+        self._llm_fail_streak = 0
         if RAG_DEBUG:   # ③(2) 파싱 성공 — 항목 수
             log.warning(f"[LLM/parse] ok task={res.get('task')} "
                         f"seeds={len(data.get('seeds') or [])} "
@@ -7738,6 +7846,16 @@ class _V101Fuzzer:
         self._llm_stats['seeds'] += added_s
         self._llm_stats['seqs'] += added_q
         self._llm_stats['rounds'] += 1
+        # v10.3 깔때기 — 응답이 실어 온 항목 수와 실제 채택 수를 나눠 센다.
+        self._llm_funnel['items'] += (len(data.get('seeds') or [])
+                                      + len(data.get('sequences') or [])
+                                      + len(data.get('evaluations') or [])
+                                      + (1 if data.get('io_workload') else 0))
+        self._llm_funnel['adopted'] += added_s + added_q
+        if not (added_s or added_q):
+            # 정상 응답인데 채택 0 — 중복이거나 task 가 새 시드를 안 만드는 경우.
+            #   실패가 아니다. 기여 0 으로만 기록한다.
+            self._llm_funnel['empty_ok'] += 1
         self._llm_archive(res, data, added_s, added_q)   # 성공 라운드 원본+주입결과 기록
         if added_s or added_q:
             log.warning(f"[LLM] 주입: seeds+{added_s} seqs+{added_q} "
@@ -7984,6 +8102,14 @@ class _V101Fuzzer:
                         f"seq {_llm_seq}[fav {_fav_seq}]) | "
                         f"누적 주입 seeds={st['seeds']} seqs={st['seqs']} "
                         f"dropped={st['dropped']} dupes={st['dupes']} rounds={st['rounds']}")
+            # v10.3 깔때기 — 기여가 낮을 때 어느 단계에서 줄었는지. 'ok0' 은 정상
+            #   응답인데 중복 등으로 채택이 0이던 횟수이고 **실패가 아니다**.
+            _fn = self._llm_funnel
+            if _fn['requests']:
+                log.warning(f"[LLM/funnel] 요청={_fn['requests']} → 통신ok={_fn['transport_ok']} "
+                            f"→ JSONok={_fn['json_ok']} → 항목={_fn['items']} "
+                            f"→ 채택={_fn['adopted']} (정상0건={_fn['empty_ok']}, "
+                            f"연속실패={self._llm_fail_streak}/{RAG_FAIL_LIMIT})")
             # v9.1: 되먹임 신호 성숙도 — 확정 미구현 / accept 예시 보유 / 구현됐으나 얕게 반송
             _acc_n = sum(1 for _n, _s in self.cmd_stats.items() if _s.get('accepted'))
             _impl_low = [ _n for _n, _s in self.cmd_stats.items()

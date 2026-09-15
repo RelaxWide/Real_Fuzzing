@@ -379,9 +379,9 @@
     "debug": true,
     "json_retries": 2,
     "log_responses": false,
-    "module_path": "rag.rag_bridge_client",
+    "module_path": "rag.vllm_client",
     "func_name": "generate_rag_response",
-    "pass_system_prompt": false,
+    "pass_system_prompt": true,
     "request_cadence": 5000,
     "request_interval_sec": 60,
     "min_request_interval_sec": 5,
@@ -426,7 +426,32 @@
     "autoname_kw_off_products": [
       "BM9K1"
     ],
-    "_comment_autoname_kw": "(default|thunk|switch) 키워드 필터를 끌 제품 목록. 이 필터는 진짜 심볼(set_default_mode 등)도 지운다. 심볼 살아있는 펌웨어에서만 끄되, 제품별로 검증하고 추가한다. FUN_/sub_ 정규식은 어디서나 유지."
+    "_comment_autoname_kw": "(default|thunk|switch) 키워드 필터를 끌 제품 목록. 이 필터는 진짜 심볼(set_default_mode 등)도 지운다. 심볼 살아있는 펌웨어에서만 끄되, 제품별로 검증하고 추가한다. FUN_/sub_ 정규식은 어디서나 유지.",
+    "_comment_vllm": "v10.3: 로컬 vLLM(OpenAI 호환) 백엔드. base_url 은 IP 가 바뀔 수 있어 값으로 받는다. retrieval 은 P2 — tools/rag_ingest.py 로 인덱스를 만든 뒤 enabled=true. 사내 브리지로 되돌리려면 module_path=rag.rag_bridge_client, pass_system_prompt=false.",
+    "vllm": {
+      "base_url": "http://192.168.137.238:8000/v1",
+      "api_key": "not-used",
+      "model": "nemotron-3-super",
+      "timeout_sec": 300.0,
+      "connect_timeout_sec": 10.0,
+      "max_tokens": 16384,
+      "temperature": 0.7,
+      "max_response_bytes": 8388608,
+      "structured_output": true,
+      "include_generators_in_schema": true,
+      "freeform_retry": false,
+      "retries": 1,
+      "retrieval": {
+        "enabled": false,
+        "index_dir": "rag/index",
+        "top_k": 5,
+        "embed_base_url": "http://192.168.137.238:8001/v1",
+        "embed_model": "bge-m3",
+        "query_max_chars": 8000,
+        "context_max_chars": 60000,
+        "permission_groups": null
+      }
+    }
   },
   "io_workload": {
     "_comment": "v8.4 IO 워크로드 엔진. fuzz_gap 명령마다 rc=0 보장 Write/Read block_size 블록 주입(SSD 내부 동작 자극). rc=0 경계(nsze/mdts/lba)는 Identify 런타임 자동. enabled=false 또는 --no-io-workload 로 비활성.",

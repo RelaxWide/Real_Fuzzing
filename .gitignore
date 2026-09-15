@@ -389,3 +389,6 @@ PC_Sampling/risc-v/sf_e76.JLinkScript
 # N-Trace Phase 0 런타임 산출물 — arm↔delta 베이스라인, raw 트레이스 덤프
 PC_Sampling/risc-v/.trace_state.json
 PC_Sampling/risc-v/*.bin
+
+# v10.3 로컬 RAG 인덱스 — 내부 스펙 원문이 들어갈 수 있다. 저장소에 넣지 않는다.
+PC_Sampling/rag/index/
