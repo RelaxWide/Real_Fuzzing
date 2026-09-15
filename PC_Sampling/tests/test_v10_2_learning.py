@@ -3,6 +3,7 @@ import importlib.util
 import json
 import logging
 from pathlib import Path
+import re
 import random
 import sys
 import tempfile
@@ -16,11 +17,16 @@ from llm_learning import LearningState, compile_recipe, seed_item
 from rag.rag_schema import SchemaBridge
 from riscv_cov import CoreMap, CoverageModel, pack
 
+# 활성 실행 파일의 단일 출처. 버전업 시 이 한 줄만 바꾼다.
+FUZZER_FILE = ROOT / 'pc_sampling_fuzzer_v10.3.py'
+# 장치 경로 AST 는 과거 버전까지 같은 기준선으로 계속 검사한다(아래 고정 기준선 시험).
+DEVICE_AST_FILES = (ROOT / 'pc_sampling_fuzzer_v10.2.py', FUZZER_FILE)
+
 # Import the real entrypoint with CLI argv isolated; __main__ never executes.
-spec = importlib.util.spec_from_file_location('fuzzer_v102_test', ROOT / 'pc_sampling_fuzzer_v10.2.py')
+spec = importlib.util.spec_from_file_location('fuzzer_active_test', FUZZER_FILE)
 fuzzer = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = fuzzer
-with patch.object(sys, 'argv', [str(ROOT / 'pc_sampling_fuzzer_v10.2.py')]):
+with patch.object(sys, 'argv', [str(FUZZER_FILE)]):
     spec.loader.exec_module(fuzzer)
 
 
@@ -359,7 +365,11 @@ class IntegrationTests(unittest.TestCase):
                  patch.object(fuzzer.NVMeFuzzer, '_load_riscv_coverage'), \
                  patch('subprocess.run', side_effect=AssertionError('device access')):
                 obj = fuzzer.NVMeFuzzer(config)
-            self.assertEqual(obj.VERSION, '10.2.0')
+            # 리터럴 대신 파일명에서 유도한다 — 버전업 때 안 고쳐도 되고, 파일명과
+            # FUZZER_VERSION 이 어긋나는 실제 버그(복사 후 상수 미수정)를 잡는다.
+            expected = re.search(r'_v(\d+\.\d+)\.py$', FUZZER_FILE.name).group(1)
+            self.assertTrue(obj.VERSION.startswith(expected + '.'),
+                            f'{FUZZER_FILE.name} vs FUZZER_VERSION={obj.VERSION}')
             self.assertTrue(obj.learning.enabled)
 
     def test_inflight_request_does_not_consume_a_scheduler_slot(self):
@@ -427,10 +437,13 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(state.proposals[1]['rewarded'])
 
     def test_device_paths_match_frozen_v102_baseline(self):
-        """Frozen at 13204e6; v10.1 hotfixes must not redefine this baseline.
+        """Frozen at 13204e6; later versions must not redefine this baseline.
 
-        If a v10.2 device path intentionally changes, review it and update the
-        fixture hashes/source_commit explicitly. Never auto-refresh on test failure.
+        The *target* follows the active version (DEVICE_AST_FILES), but the
+        *baseline* stays the verified v10.2 fixture. Regenerating hashes from
+        candidate code would rubber-stamp unintended device-path changes, so a
+        version bump never refreshes this fixture. If a device path changes on
+        purpose, review it and update hashes/source_commit explicitly.
         Empty type_params are ignored for Python 3.8/3.12 AST compatibility.
         """
         import ast
@@ -448,15 +461,18 @@ class IntegrationTests(unittest.TestCase):
                 return {'bytes': node.hex()}
             return node
         frozen = json.loads((ROOT / 'tests/fixtures/v10_2_device_ast.json').read_text())
-        tree = ast.parse((ROOT / 'pc_sampling_fuzzer_v10.2.py').read_text())
-        classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
-        for path, expected in frozen['hashes'].items():
-            cls, _, method = path.partition('.')
-            node = classes[cls]
-            if method:
-                node = next(n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == method)
-            value = json.dumps(normalize(node), sort_keys=True, separators=(',', ':'))
-            self.assertEqual(hashlib.sha256(value.encode()).hexdigest(), expected, path)
+        for source in DEVICE_AST_FILES:
+            tree = ast.parse(source.read_text())
+            classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+            for path, expected in frozen['hashes'].items():
+                cls, _, method = path.partition('.')
+                node = classes[cls]
+                if method:
+                    node = next(n for n in node.body
+                                if isinstance(n, ast.FunctionDef) and n.name == method)
+                value = json.dumps(normalize(node), sort_keys=True, separators=(',', ':'))
+                self.assertEqual(hashlib.sha256(value.encode()).hexdigest(), expected,
+                                 f'{source.name}:{path}')
 
     def test_comparison_tool_reports_complement_without_claiming_significance(self):
         from importlib.util import spec_from_file_location, module_from_spec

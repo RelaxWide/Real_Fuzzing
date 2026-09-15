@@ -10,16 +10,16 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from test_v10_2_learning import ROOT, fuzzer, harness
+from test_v10_2_learning import ROOT, FUZZER_FILE, fuzzer, harness
 from llm_learning import LearningState
 
 
 class DeploymentTests(unittest.TestCase):
     def test_missing_learning_module_exits_with_deployment_hint(self):
         with tempfile.TemporaryDirectory() as d:
-            for name in ('pc_sampling_fuzzer_v10.2.py', 'nvme_seeds.py', 'fuzzer_config.json'):
+            for name in (FUZZER_FILE.name, 'nvme_seeds.py', 'fuzzer_config.json'):
                 shutil.copy2(ROOT / name, Path(d) / name)
-            result = subprocess.run([sys.executable, str(Path(d) / 'pc_sampling_fuzzer_v10.2.py'), '--help'],
+            result = subprocess.run([sys.executable, str(Path(d) / FUZZER_FILE.name), '--help'],
                                     cwd=d, env=dict(os.environ, PYTHONPATH=''),
                                     capture_output=True, text=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)
@@ -56,7 +56,7 @@ class DeploymentTests(unittest.TestCase):
         code = ("import runpy,sys; sys.argv=[sys.argv[1]]; "
                 "m=runpy.run_path(sys.argv[0]); c=m['NVMeFuzzer']; "
                 "c._learning_config={'setup_preserve_ratio':2}; c(None)")
-        result = subprocess.run([sys.executable, '-c', code, str(ROOT / 'pc_sampling_fuzzer_v10.2.py')],
+        result = subprocess.run([sys.executable, '-c', code, str(FUZZER_FILE)],
                                 capture_output=True, text=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('[FATAL]', result.stderr)
