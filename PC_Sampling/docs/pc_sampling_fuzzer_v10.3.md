@@ -10,12 +10,19 @@ v10.3 은 v10.2 의 SSD FW 퍼징 기능을 그대로 두고, **LLM 백엔드를
 | 단계 | 내용 | 상태 |
 |---|---|---|
 | **P0** | 버전 생성 | **완료** |
-| P1 | vLLM 생성 교체(검색 없음) | 미착수 |
-| P2 | 로컬 RAG | 미착수 |
-| P3 | 전환·측정 | 미착수 |
+| **P1** | vLLM 생성 교체 | **완료** (실기 미검증) |
+| **P2** | 로컬 RAG | **구현 완료** — 인덱스 생성 필요 |
+| P3 | 전환·측정 | 계측만 완료 |
 
-**P0 시점의 v10.3 은 v10.2 와 동작이 같다.** 버전 문자열·docstring·출력 디렉터리만
-다르다. LLM 백엔드는 아직 기존 `rag.rag_bridge_client` 를 가리킨다.
+실기(실제 SSD·JTAG), DGX vLLM 서버, 추출된 JSONL 품질은 아직 검증하지 않았다.
+
+## 지금 상태로 무엇이 되나
+
+`fuzzer_config.json` 의 `rag.module_path` 가 **`rag.vllm_client`** 를 가리킨다.
+`rag.vllm.base_url` 의 서버만 뜨면 LLM 경로가 동작한다. 검색은 기본 꺼짐
+(`rag.vllm.retrieval.enabled=false`) — P2 인덱스를 만든 뒤 켠다.
+
+되돌리기: `module_path` → `rag.rag_bridge_client`, `pass_system_prompt` → `false`.
 
 ## v10.2 대비 변경 (P0)
 
@@ -64,6 +71,67 @@ AST 보호가 실제로 v10.3 을 검사하는지는 **주입 시험으로 확�
 통과한다.
 
 실기 동작(실제 SSD·JTAG), DGX vLLM 서버, 추출된 JSONL 품질은 아직 검증하지 않았다.
+
+## P1 — LLM 백엔드
+
+```
+generate_rag_response(system, user, meta) -> {"raw": ..., "diagnostics": {...}}
+  meta = {task, req_id, rag_query, config(실제 로딩된 것), product}
+```
+
+| 파일 | 역할 |
+|---|---|
+| `rag/vllm_client.py` | urllib 만 쓰는 OpenAI 호환 호출. 시간 예산·응답 크기 상한·HTTP 오류 본문 보존 |
+| `rag/llm_schema.py` | task별 `json_schema`. 최상위 키를 task 마다 `required` 로 둬 `{}` 를 막는다 |
+
+**하위호환** — `meta` 없이 부른 v10.2 에는 기존대로 문자열을 주고 실패는 raise 한다.
+`fuzzer_config.json` 이 공유되므로 두 버전이 같은 설정으로 이 백엔드를 쓸 수 있다.
+
+**실패 분류** — 통신 실패·잘림(`finish_reason=length`)·파싱 실패만 실패로 센다.
+정상 응답인데 중복으로 채택이 0개인 경우는 **실패가 아니다**. v10.2 는 백엔드가 반환만
+하면 파싱 성패와 무관하게 연속 실패를 0 으로 되돌려, 무효 응답이 반복돼도 서킷브레이커가
+안 걸렸다.
+
+**계측** — 주기 통계에 깔때기가 찍힌다.
+
+```
+[LLM/funnel] 요청=12 → 통신ok=12 → JSONok=11 → 항목=64 → 채택=31 (정상0건=2, 연속실패=0/10)
+```
+
+## P2 — 로컬 RAG
+
+```bash
+# DGX 에 bge-m3 를 두 번째 vLLM 인스턴스로 띄운 뒤
+python3 PC_Sampling/tools/rag_ingest.py <JSONL...> \
+  --embed-base-url http://192.168.137.238:8001/v1
+```
+
+인덱스는 `rag/index/<version>/` 에 만들고 `current` 포인터만 원자적으로 교체한다.
+이전 버전은 지우지 않는다 — 실행 중 캠페인이 쓰고 있을 수 있다. `rag/index/` 는
+`.gitignore` 다(내부 스펙 원문이 들어갈 수 있다).
+
+만든 뒤 `rag.vllm.retrieval.enabled=true` 로 켠다.
+
+**검색 질의**는 프롬프트 전문이 아니다 — 임베딩 상한(bge-m3 8,192)은 생성 컨텍스트(1M)와
+별개 단계의 제약이다. 순서: `meta.rag_query` → 프롬프트의 `[RAG-QUERY]` 블록 → 생략.
+토크나이저는 쓰지 않는다(문자 수 기준이며 토큰 수 보장이 아니다).
+
+## 검증 (P1·P2)
+
+```bash
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 115 tests, OK
+```
+
+`tests/test_v10_3_backend.py` 23개가 가짜 HTTP 서버로 DGX 없이 돈다. 주요 항목:
+
+- **스키마↔파서 대조**를 AST 로 강제 — 파서가 읽는 키가 스키마에 없으면 실패한다.
+  계획 초안이 `data_len` 을 빠뜨렸던 것이 이 시험의 계기이고, 실제로 스키마에서 그
+  필드를 빼면 시험이 깨지는 것을 확인했다.
+- 기존 문자열 반환과 새 `{raw, diagnostics}` 가 모두 처리되고 진단이 해당 요청에만 붙는지
+- HTTP 오류 본문 보존, 스키마 거부 시 자동 폴백 금지, 잘림 보고
+- 정상 응답의 채택 0건이 실패로 안 세지는지 / 무효 응답 반복은 서킷브레이커가 걸리는지
+- ingest: 임베딩 실패 시 미게시, 포인터 교체, 이전 버전 미삭제, 변경 없는 소스 재사용
+- 토크나이저 패키지를 import 하지 않는지(AST)
 
 ## 알려진 정리 대상
 
