@@ -6,7 +6,7 @@
     "JLinkHaltSampler": "a9184fb8e6c02f9eace38bd8af583a982dfc402637655c6c588366feded3ee6b",
     "OpenOCDHaltSampler": "0887feec2a284a78bd11862f267ee3a0838d7844dd6791ce5aac04b07425e80d",
     "OpenOCDPCSampler": "3a904a09ab0e115b8bdbf5af300396abc4d55e8c83db6c9f31865c41f509d148",
-    "_V101Fuzzer._send_nvme_command": "2dec67666b6e66200243e3b6b4b0d8bfa65645db5a50cd995efeb25f579b03f0"
+    "_V101Fuzzer._send_nvme_command": "f00c1b1a895739bb6773e24d79551c6a7cc40913c9d08e84ac49bbaf82cd74d6"
   },
   "amendments": [
     {
@@ -14,6 +14,12 @@
       "date": "2026-09-15",
       "base_commit": "24a4aef",
       "reason": "Explicit legacy PCSR response framing and request identity; register reads unchanged. Regression tests: test_v10_2_pcsr_response.py."
+    },
+    {
+      "path": "_V101Fuzzer._send_nvme_command",
+      "date": "2026-09-15",
+      "base_commit": "6fa05fb",
+      "reason": "Four optional best-effort progress events only; no change to command construction, submission, waiting, or timeout handling. Verified by AST comparison removing _freeze_emit calls."
     }
   ]
 }

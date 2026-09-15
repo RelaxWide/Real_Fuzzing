@@ -1,5 +1,11 @@
 # HANDOFF — OS Freeze 조사 (J-Link halt 관련), 2026-07 진행 중
 
+> **2026-09-15 재조사 주의:** 아래는 P7/Cortex-R5 halt 당시의 기록이다.
+> 현재 PM9M1_HP/OpenOCD PCSR, v10.2/6.8.12에서 별도 OS freeze가 보고됐다.
+> 과거의 “커널 확정/다른 원인 배제” 표현을 현재 사건의 확정 결론으로 사용하지 않는다.
+> 현재 증거·버전 비교·PuTTY 독립 감시는 [PM9M1_HP_FREEZE_V102.md](PM9M1_HP_FREEZE_V102.md) 참조.
+
+
 > ⚠ **이 문서가 쓰는 진단 도구는 저장소에서 제거됐다** (`kernel_sweep.py` / `pcie_link_probe.py` / `halt_loop_stress.py`).
 > OS freeze 조사가 종료돼(커널 7 이후 재발 없음) 정리했다. 필요하면 git 히스토리에서 복구한다:
 > `git log --diff-filter=D --name-only -- 'PC_Sampling/tools/*'` 로 삭제 커밋을 찾고

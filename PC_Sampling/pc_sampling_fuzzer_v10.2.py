@@ -85,6 +85,216 @@ from enum import Enum, IntEnum
 import contextlib
 import bisect
 
+# Optional freeze evidence: local nonblocking UDP -> independent PuTTY watcher.
+# This code precedes config/device imports so --freeze-watch needs only stdlib.
+_freeze_trace = None
+
+
+def _freeze_emit(phase, **data):
+    if _freeze_trace is not None:
+        _freeze_trace.emit(phase, **data)
+
+
+class _FreezeTrace:
+    def __init__(self, port):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+        self.dest = ('127.0.0.1', port)
+        self.session = f'{os.getpid()}-{time.monotonic_ns()}'
+        self.seq = self.dropped = 0
+        self.lock = threading.Lock()
+        self.local = threading.local()
+        self.fuzzer = None
+
+    def emit(self, phase, **data):
+        # Never fail the test because evidence delivery failed. No acknowledgments,
+        # file I/O, unbounded queues, device probes, or diagnostic worker in fuzzer.
+        try:
+            with self.lock:
+                self.seq += 1
+                row = dict(session=self.session, pid=os.getpid(), seq=self.seq,
+                           mono=time.monotonic(), tid=threading.get_native_id(),
+                           phase=phase, stack=list(getattr(self.local, 'stack', ()))[-8:],
+                           dropped=self.dropped, exec=getattr(self.fuzzer, 'executions', 0),
+                           **data)
+                payload = json.dumps(row, ensure_ascii=True).encode()
+                if len(payload) > 8192:
+                    self.dropped += 1
+                    return
+                self.sock.sendto(payload, self.dest)
+        except Exception:
+            self.dropped += 1
+
+    def wrap(self, obj, name, label):
+        from functools import wraps
+        original = getattr(obj, name, None)
+        if original is None:
+            return
+
+        @wraps(original)
+        def observed(*args, **kwargs):
+            stack = getattr(self.local, 'stack', None)
+            if stack is None:
+                stack = self.local.stack = []
+            stack.append(label)
+            self.emit(label + '.enter')
+            try:
+                result = original(*args, **kwargs)
+            except BaseException as exc:
+                stack.pop()
+                self.emit(label + '.raise', error=type(exc).__name__)
+                raise
+            stack.pop()
+            self.emit(label + '.exit', result=result if type(result) in (int, bool) else None)
+            return result
+        setattr(obj, name, observed)
+
+    def install(self, instance):
+        self.fuzzer = instance
+        for name in ('_send_nvme_command', '_stop_sampling_checked', '_calibrate_seed',
+                     '_print_status', '_collect_stats', '_learning_save',
+                     '_learning_observe', '_llm_drain_and_apply', '_llm_maybe_submit',
+                     '_snapshot_chart_data', '_generate_graphs_isolated',
+                     '_generate_all_charts', '_log_device_info', '_log_smart',
+                     '_log_state_snapshot', '_handle_timeout_crash', '_run_ufas_dump'):
+            self.wrap(instance, name, name.lstrip('_'))
+        for name in ('start_sampling', 'stop_sampling', '_sampling_worker',
+                     '_reinit_target', '_reconnect', 'diagnose'):
+            self.wrap(instance.sampler, name, 'sampler.' + name.lstrip('_'))
+        self.emit('trace.start', product=getattr(instance.config, 'product', None))
+
+    def close(self):
+        self.sock.close()
+
+
+def _freeze_proc_snapshot(pid):
+    """Bounded /proc reads only. No NVMe/PCIe/J-Link access or subprocesses."""
+    def read(path, limit=16384):
+        try:
+            with open(path) as stream:
+                return stream.read(limit)
+        except OSError:
+            return ''
+
+    def process(p):
+        root = f'/proc/{p}'
+        status = {}
+        for line in read(root + '/status').splitlines():
+            key, _, value = line.partition(':')
+            if key in ('Name', 'State', 'VmRSS', 'VmSize', 'Threads'):
+                status[key] = value.strip()
+        status['pid'] = p
+        status['alive'] = bool(status.get('Name'))
+        status['wchan'] = read(root + '/wchan', 128).strip()
+        return status
+
+    result = {'main': process(pid)}
+    tids = []
+    try:
+        with os.scandir(f'/proc/{pid}/task') as entries:
+            for entry in entries:
+                if len(tids) >= 32:
+                    break
+                if entry.name.isdigit():
+                    tids.append(entry.name)
+    except OSError:
+        pass
+    result['threads'] = [{'tid': int(t), 'wchan': read(f'/proc/{pid}/task/{t}/wchan', 128).strip()}
+                         for t in tids]
+    children = set()
+    for t in tids:
+        for p in read(f'/proc/{pid}/task/{t}/children', 4096).split():
+            if p.isdigit() and len(children) < 16:
+                children.add(int(p))
+    result['children'] = [process(p) for p in sorted(children)]
+    result['memory'] = {k: v.strip() for line in read('/proc/meminfo').splitlines()
+                        for k, _, v in [line.partition(':')]
+                        if k in ('MemAvailable', 'SwapFree', 'Slab', 'SUnreclaim', 'PageTables')}
+    return result
+
+
+def _freeze_watch(port):
+    """One JSON heartbeat/second; save this PuTTY window on the client PC."""
+    import select
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('127.0.0.1', port))
+    sock.setblocking(False)
+    history = deque(maxlen=12)
+    states = {}
+    active = latest = wire = None
+    last_seq = missing = received = 0
+    next_tick = time.monotonic() + 1
+    print(f'[FreezeWatch] ready port={port}; enable PuTTY All session output logging on your PC', flush=True)
+    try:
+        while True:
+            select.select([sock], [], [], max(0, min(0.1, next_tick - time.monotonic())))
+            for _ in range(256):
+                try:
+                    raw = sock.recv(8193)
+                except BlockingIOError:
+                    break
+                try:
+                    row = json.loads(raw)
+                    if (not isinstance(row, dict) or type(row.get('pid')) is not int
+                            or row['pid'] <= 0 or type(row.get('seq')) is not int
+                            or row['seq'] < 1 or type(row.get('tid')) is not int
+                            or type(row.get('mono')) not in (int, float)
+                            or not math.isfinite(row['mono'])
+                            or not isinstance(row.get('stack'), list)
+                            or len(row['stack']) > 8
+                            or not all(isinstance(v, str) for v in row['stack'])
+                            or not isinstance(row.get('phase'), str)
+                            or not isinstance(row.get('session'), str)):
+                        continue
+                    if active is None:
+                        active = row['session']
+                    if row['session'] != active:
+                        continue  # one watcher per campaign; restart for another run
+                    if row['seq'] <= last_seq:
+                        continue
+                    missing += max(0, row['seq'] - last_seq - 1)
+                    last_seq = row['seq']
+                    latest = row
+                    received += 1
+                    history.append(row)
+                    tid = row.get('tid')
+                    if row.get('stack'):
+                        states[tid] = row['stack']
+                        if len(states) > 32:
+                            del states[next(iter(states))]
+                    else:
+                        states.pop(tid, None)
+                    if row.get('phase') == 'nvme.before_popen':
+                        wire = row
+                except (ValueError, TypeError, KeyError):
+                    continue
+            now = time.monotonic()
+            if now >= next_tick:
+                report = dict(watch_time=datetime.now().isoformat(timespec='seconds'),
+                              received=received, missing=missing, active=states,
+                              last_events=list(history), last_nvme=wire)
+                if latest:
+                    report['age_s'] = round(now - latest['mono'], 3)
+                    report['host'] = _freeze_proc_snapshot(latest['pid'])
+                print(json.dumps(report, ensure_ascii=True), flush=True)
+                next_tick = time.monotonic() + 1
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        sock.close()
+
+
+if __name__ == '__main__' and '--freeze-watch' in sys.argv:
+    import argparse as _freeze_argparse
+    _fp = _freeze_argparse.ArgumentParser(description='Independent freeze progress watcher')
+    _fp.add_argument('--freeze-watch', action='store_true')
+    _fp.add_argument('--port', type=int, default=47471)
+    _fa = _fp.parse_args()
+    if not 1024 <= _fa.port <= 65535:
+        _fp.error('port must be 1024..65535')
+    raise SystemExit(_freeze_watch(_fa.port))
+
+
 # 시드 파일 import (같은 디렉토리의 nvme_seeds.py)
 sys.path.insert(0, str(Path(__file__).parent))
 from nvme_seeds import SEED_TEMPLATES as _DEFAULT_SEED_TEMPLATES
@@ -8798,10 +9008,14 @@ class _V101Fuzzer:
 
             stats = self._collect_stats()
             self._print_status(stats, last_samples, window_eps=_window_eps)
+            _freeze_emit('stats.sync.enter')
             for h in log.handlers:
                 h.flush()
                 if isinstance(h, logging.FileHandler) and h.stream:
+                    _freeze_emit('stats.fsync.enter', file=h.baseFilename)
                     os.fsync(h.stream.fileno())
+                    _freeze_emit('stats.fsync.exit', file=h.baseFilename)
+            _freeze_emit('stats.sync.exit')
 
         if self.executions % 10000 == 0 and self.executions > 0:
             self._log_device_info()   # 주기적 Device Information(id-ctrl/id-ns) 재출력
@@ -12804,6 +13018,7 @@ class _V101Fuzzer:
         self.sampler.start_sampling()
 
         process = None
+        _freeze_emit('nvme.before_popen', argv=list(nvme_cmd))
         try:
             process = subprocess.Popen(
                 nvme_cmd,
@@ -12812,11 +13027,13 @@ class _V101Fuzzer:
                 start_new_session=True,  # v4.6: setsid() — 부모 종료/SIGHUP 후에도 생존
             )
 
+            _freeze_emit('nvme.spawned', child_pid=process.pid)
             # 타임아웃 시 공통 처리: kill → fd 닫힘 → 커널 abort → controller reset →
             # SSD 상태 소멸. nvme-cli를 살려두면 fd가 유지되어 커널은 --timeout(30일)까지
             # 대기 → SSD 펌웨어 상태가 장기간 보존됨. D-state(ioctl 대기)라 stdout/stderr
             # 에 쓰지 않으므로 파이프 부모 쪽만 닫아 나중에 SIGPIPE로 조용히 처리.
             def _on_timeout(desc: str):
+                _freeze_emit('nvme.timeout', child_pid=process.pid)
                 try:
                     if process.stdout:
                         process.stdout.close()
@@ -12874,6 +13091,7 @@ class _V101Fuzzer:
                          + ("  (halt 오버헤드 지배 — 초고속 명령)" if _freeze > _wall else ""))
 
             rc = process.returncode
+            _freeze_emit('nvme.returned', child_pid=process.pid, rc=rc)
 
             # FWCommit(0x10) 성공 = 펌웨어 활성화로 R5 코어가 리셋될 수 있고, 그러면 프로브(USB)는
             # 살아있어도 타겟 디버그가 끊겨 halt 가 죽는다. 즉시 재연결하면 아직 샘플링 스레드가
@@ -18707,6 +18925,16 @@ if __name__ == "__main__":
     )
 
     fuzzer = NVMeFuzzer(config)
+    _trace_port = os.environ.get('PCFUZZ_FREEZE_TRACE')
+    if _trace_port:
+        try:
+            _port = int(_trace_port)
+            if not 1024 <= _port <= 65535:
+                raise ValueError('port must be 1024..65535')
+            _freeze_trace = _FreezeTrace(_port)
+            _freeze_trace.install(fuzzer)
+        except (ValueError, OSError) as _trace_error:
+            raise SystemExit(f'[FATAL] PCFUZZ_FREEZE_TRACE: {_trace_error}')
     try:
         fuzzer.run()
     except Exception:
@@ -18716,3 +18944,7 @@ if __name__ == "__main__":
         import traceback as _tb
         log.error("[FATAL] 퍼저가 예외로 종료됐다:\n" + _tb.format_exc())
         raise
+    finally:
+        if _freeze_trace is not None:
+            _freeze_trace.emit('trace.end')
+            _freeze_trace.close()
