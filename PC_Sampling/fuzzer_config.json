@@ -429,7 +429,7 @@
     "_comment_autoname_kw": "(default|thunk|switch) 키워드 필터를 끌 제품 목록. 이 필터는 진짜 심볼(set_default_mode 등)도 지운다. 심볼 살아있는 펌웨어에서만 끄되, 제품별로 검증하고 추가한다. FUN_/sub_ 정규식은 어디서나 유지.",
     "_comment_vllm": "v10.3: 로컬 vLLM(OpenAI 호환) 백엔드. base_url 은 IP 가 바뀔 수 있어 값으로 받는다. retrieval 은 P2 — tools/rag_ingest.py 로 인덱스를 만든 뒤 enabled=true. 사내 브리지로 되돌리려면 module_path=rag.rag_bridge_client, pass_system_prompt=false.",
     "vllm": {
-      "base_url": "http://192.168.137.238:8000/v1",
+      "base_url": "http://192.168.10.1:8000/v1",
       "api_key": "not-used",
       "model": "nemotron-3-super",
       "timeout_sec": 300.0,
@@ -444,7 +444,7 @@
         "enabled": false,
         "index_dir": "rag/index",
         "top_k": 5,
-        "embed_base_url": "http://192.168.137.238:8001/v1",
+        "embed_base_url": "http://192.168.10.1:8001/v1",
         "embed_model": "bge-m3",
         "embed_model_revision": null,
         "query_max_chars": 8000,
