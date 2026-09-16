@@ -1432,5 +1432,66 @@ class SourceIdentityDistinguishesSplitFiles(unittest.TestCase):
         self.assertIn('소스 식별자', buf.getvalue())
 
 
+class ByteOrderMarkDoesNotBreakAnything(unittest.TestCase):
+    """Windows 편집기가 붙이는 UTF-8 BOM. 설정은 파싱이 통째로 깨지고,
+    JSONL 은 **첫 레코드만** 조용히 버려진다(파일당 한 건씩)."""
+
+    BOM = b'\xef\xbb\xbf'
+
+    def setUp(self):
+        spec = __import__('importlib.util', fromlist=['util']).spec_from_file_location(
+            'rag_ingest_bom', ROOT / 'tools/rag_ingest.py')
+        self.mod = __import__('importlib.util', fromlist=['util']).module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def write_bom(self, path, text):
+        Path(path).write_bytes(self.BOM + text.encode('utf-8'))
+        return str(path)
+
+    def test_plain_utf8_still_breaks_without_the_fix(self):
+        """대조군 — BOM 이 실제로 json.loads 를 깨뜨리는지."""
+        with tempfile.TemporaryDirectory() as d:
+            p = self.write_bom(Path(d) / 'c.json', json.dumps({'a': 1}))
+            with self.assertRaises(ValueError):
+                json.loads(Path(p).read_text(encoding='utf-8'))
+
+    def test_ingest_reads_a_config_with_a_bom(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = {'rag': {'vllm': {'retrieval': {
+                'embed_base_url': 'http://dgx:8001/v1', 'embed_model': 'bge-m3'}}}}
+            p = self.write_bom(Path(d) / 'fuzzer_config.json', json.dumps(cfg))
+            got = self.mod.config_defaults(p)
+        self.assertEqual(got['embed_base_url'], 'http://dgx:8001/v1',
+                         'BOM 때문에 내장 기본값(127.0.0.1)으로 떨어졌다')
+
+    def test_jsonl_with_a_bom_keeps_its_first_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = json.dumps({'doc_id': 'first', 'title': 't',
+                              'content': 'body ' * 50, 'permission_groups': ['g']})
+            p = self.write_bom(Path(d) / 'a.jsonl', rec + '\n')
+            chunks, skipped = self.mod.load_jsonl([p], 6000)
+        self.assertEqual(skipped, 0, 'BOM 때문에 첫 레코드가 버려졌다')
+        self.assertEqual([c['doc_id'] for c in chunks], ['first'])
+
+    def test_fuzzer_does_not_fatal_on_a_config_with_a_bom(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = {'rag': {'enabled': True}, 'io_workload': {'patterns': ['seq_write']}}
+            p = self.write_bom(Path(d) / 'fuzzer_config.json', json.dumps(cfg))
+            loaded = fuzzer.load_user_config(p)      # sys.exit 하면 SystemExit
+        self.assertEqual(loaded['rag']['enabled'], True)
+
+    def test_vllm_client_config_fallback_reads_a_bom_file(self):
+        from rag import vllm_client
+        with tempfile.TemporaryDirectory() as d:
+            cfg = {'rag': {'vllm': {'model': 'from-bom-file'}}}
+            target = Path(d) / 'fuzzer_config.json'
+            self.write_bom(target, json.dumps(cfg))
+            with patch.object(vllm_client, 'Path') as P:
+                P.return_value.resolve.return_value.parent.parent.__truediv__ = (
+                    lambda self, name: target)
+                got = vllm_client._config({})
+        self.assertEqual(got['model'], 'from-bom-file')
+
+
 if __name__ == '__main__':
     unittest.main()

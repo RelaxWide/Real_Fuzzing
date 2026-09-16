@@ -68,7 +68,8 @@ def _config(meta):
         vllm = {}
         try:
             path = Path(__file__).resolve().parent.parent / "fuzzer_config.json"
-            vllm = json.loads(path.read_text(encoding="utf-8")).get("rag", {}).get("vllm", {})
+            # utf-8-sig — Windows 편집기의 BOM 을 흡수한다(없어도 그대로 읽힌다).
+            vllm = json.loads(path.read_text(encoding="utf-8-sig")).get("rag", {}).get("vllm", {})
         except Exception as exc:
             _log.warning("[LLM/vllm] fuzzer_config.json 을 읽지 못했습니다(기본값 사용): %s", exc)
     out = dict(DEFAULTS)

@@ -127,7 +127,10 @@ def load_jsonl(paths, max_chars):
     chunks, skipped = [], 0
     for path in paths:
         source = source_id(path)
-        for lineno, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        # utf-8-sig: 사내 산출물에 BOM 이 붙어 오면 **첫 레코드만** 파싱이 깨져
+        #   조용히 버려진다(건너뜀 카운터에만 잡힌다). 파일당 한 건씩 잃는 셈이다.
+        for lineno, line in enumerate(
+                Path(path).read_text(encoding="utf-8-sig").splitlines(), 1):
             if not line.strip():
                 continue
             try:
@@ -242,7 +245,8 @@ def config_defaults(path):
     """
     out = dict.fromkeys(FALLBACK)
     try:
-        cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+        # utf-8-sig — Windows 편집기의 BOM 을 흡수한다(없어도 그대로 읽힌다).
+        cfg = json.loads(Path(path).read_text(encoding="utf-8-sig"))
         table = ((cfg.get("rag") or {}).get("vllm") or {}).get("retrieval") or {}
         for key in out:
             if table.get(key):
@@ -301,7 +305,7 @@ def inspect_only(inputs, max_chars):
     rows, missing = [], Counter()
     for path in inputs:
         try:
-            text = Path(path).read_text(encoding="utf-8")
+            text = Path(path).read_text(encoding="utf-8-sig")
         except OSError as exc:
             print(f"  ! 읽기 실패: {path}: {exc}")
             continue

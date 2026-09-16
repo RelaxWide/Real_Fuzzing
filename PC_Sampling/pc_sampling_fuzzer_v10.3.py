@@ -371,7 +371,10 @@ def load_user_config(path=None):
                  f"        fuzzer_config.json 을 fuzzer 와 같은 디렉토리에 두거나 "
                  f"--config PATH 로 지정하세요.")
     try:
-        with open(p, encoding='utf-8') as _f:
+        # utf-8-sig: Windows 편집기가 붙이는 BOM 을 흡수한다. BOM 이 있으면
+        #   'Unexpected UTF-8 BOM' 으로 파싱이 통째로 깨지는데, 설정을 저쪽에서
+        #   고쳐 오는 일이 흔하다. BOM 없는 파일도 그대로 읽힌다.
+        with open(p, encoding='utf-8-sig') as _f:
             _raw = json.load(_f)
     except Exception as e:
         sys.exit(f"[FATAL] 설정 파일 파싱 실패({p}): {e}")

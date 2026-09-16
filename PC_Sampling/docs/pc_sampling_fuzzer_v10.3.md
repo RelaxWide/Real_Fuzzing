@@ -234,10 +234,10 @@ task 무관한 목록으로 채운다. `query_block()` 이 쓰는 키와 같다.
 ## 검증 (P1·P2)
 
 ```bash
-python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 177 tests, OK
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 182 tests, OK
 ```
 
-`tests/test_v10_3_backend.py` 85개가 가짜 HTTP 서버로 DGX 없이 돈다. 주요 항목:
+`tests/test_v10_3_backend.py` 90개가 가짜 HTTP 서버로 DGX 없이 돈다. 주요 항목:
 
 - **스키마↔파서 대조**를 AST 로 강제 — 파서가 읽는 키가 스키마에 없으면 실패한다.
   계획 초안이 `data_len` 을 빠뜨렸던 것이 이 시험의 계기이고, 실제로 스키마에서 그
@@ -265,11 +265,28 @@ python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 177 tests, 
   잘못된 경로가 errno 22 대신 메시지로 멈추는지
 - **소스 식별**: 폴더가 다르고 파일명이 같은 분할 파일이 합쳐지지 않는지, manifest 가
   입력 전부를 기록하는지, 트리를 옮겨도 식별자가 그대로인지, 남은 충돌은 거부되는지
+- **UTF-8 BOM**: BOM 붙은 설정을 세 읽기 지점이 모두 읽는지, BOM 붙은 JSONL 의 첫
+  레코드가 안 버려지는지(대조군으로 BOM 이 실제 `json.loads` 를 깨는지도 함께)
 - **깔때기**: 적용된 워크로드가 채택으로 세어지는지(정상0건이 아닌지)
 - **인덱스 정합성**: 상한 초과 청크 분할 후 본문 전량 보존·본문↔벡터 일치, 청크 크기·
   revision 변경 시 재임베딩, doc_id 중복·영벡터 거부, 락, 모델 불일치 인덱스 거부
 
-각 시험은 **고친 코드를 되돌리면 실패하는 것**까지 확인했다(19건 주입 시험).
+각 시험은 **고친 코드를 되돌리면 실패하는 것**까지 확인했다(20건 주입 시험).
+
+## 설정·JSONL 인코딩
+
+`fuzzer_config.json` 과 JSONL 은 **UTF-8 BOM 이 있어도 읽는다**(`utf-8-sig`). Windows
+편집기가 BOM 을 붙이는데, 그러면 `json.loads` 가 `Unexpected UTF-8 BOM` 으로 깨진다.
+증상이 지점마다 다르고 전부 원인이 잘 안 보인다.
+
+| 지점 | BOM 일 때(수정 전) |
+|---|---|
+| `load_user_config` | 퍼저가 `[FATAL] 설정 파일 파싱 실패` 로 **시작도 못 함** |
+| `rag_ingest.config_defaults` | 조용히 내장 기본값(`127.0.0.1:8001`)으로 떨어져 연결 실패 |
+| `vllm_client._config` | 같은 방식으로 기본 base_url 로 떨어짐 |
+| `load_jsonl` | **각 파일의 첫 레코드만** 파싱 실패로 버려짐(건너뜀 카운터에만 잡힌다) |
+
+BOM 없는 파일도 그대로 읽히므로 `utf-8-sig` 가 항상 맞다.
 
 ## 알려진 정리 대상
 
