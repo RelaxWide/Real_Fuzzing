@@ -1199,5 +1199,85 @@ class MissingEmbedEndpointIsNotSilent(unittest.TestCase):
         warn.assert_not_called()
 
 
+class DryRunInspectsWithoutAServer(unittest.TestCase):
+    """--dry-run 은 임베딩 서버·numpy·설정 없이 돌아야 한다 — 사내 PC 에서 쓰는 점검이다."""
+
+    def setUp(self):
+        spec = __import__('importlib.util', fromlist=['util']).spec_from_file_location(
+            'rag_ingest_dry', ROOT / 'tools/rag_ingest.py')
+        self.mod = __import__('importlib.util', fromlist=['util']).module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def jsonl(self, d, name, doc_id, content='hello world ' * 100):
+        p = Path(d) / name
+        p.write_text(json.dumps({'doc_id': doc_id, 'title': 'T', 'content': content,
+                                 'permission_groups': ['g']}) + '\n', encoding='utf-8')
+        return str(p)
+
+    def run_dry(self, *paths, max_chars=6000):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = self.mod.main(list(paths) + ['--dry-run', '--max-chars', str(max_chars)])
+        return code, buf.getvalue()
+
+    def test_duplicate_doc_ids_across_split_files_are_reported_and_nonzero(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.jsonl(d, 'p001-100.jsonl', 'NVMe_Base', 'x' * 20000)
+            b = self.jsonl(d, 'p101-200.jsonl', 'NVMe_Base', 'y' * 20000)
+            code, out = self.run_dry(a, b)
+        self.assertEqual(code, 1, '중복이 있는데 진행 가능으로 보고했다')
+        self.assertIn('doc_id 중복', out)
+        self.assertIn('서로 다른 파일', out, '분할 때문인지 구분해 주지 않았다')
+
+    def test_clean_input_reports_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.jsonl(d, 'p001-100.jsonl', 'NVMe_Base_p1')
+            b = self.jsonl(d, 'p101-200.jsonl', 'NVMe_Base_p2')
+            code, out = self.run_dry(a, b)
+        self.assertEqual(code, 0, out)
+        self.assertIn('그대로 색인 가능', out)
+
+    def test_dry_run_creates_no_index_and_contacts_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.jsonl(d, 'doc.jsonl', 'only')
+            code, _ = self.run_dry(a)
+        self.assertEqual(code, 0)
+        self.assertFalse((ROOT / 'rag' / 'index').exists(),
+                         '--dry-run 이 인덱스 디렉터리를 만들었다')
+
+    def test_missing_fields_are_counted_not_fatal(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'partial.jsonl'
+            p.write_text(json.dumps({'content': 'body text ' * 50}) + '\n'
+                         + 'not json at all\n', encoding='utf-8')
+            code, out = self.run_dry(str(p))
+        self.assertIn('doc_id 없음/빈값', out)
+        self.assertIn('JSON 파싱 실패', out)
+        self.assertEqual(code, 0, '필드 누락만으로 거부하면 안 된다')
+
+    def test_dry_run_needs_neither_numpy_nor_a_config_file(self):
+        """사내 PC 에는 설정도 numpy 도 없을 수 있다 — 점검은 그래도 돌아야 한다."""
+        import io, contextlib
+        with tempfile.TemporaryDirectory() as d:
+            a = self.jsonl(d, 'doc.jsonl', 'only')
+            buf = io.StringIO()
+            with patch.dict(sys.modules, {'numpy': None}):      # import 시 ImportError
+                with contextlib.redirect_stdout(buf):
+                    code = self.mod.main([a, '--dry-run',
+                                          '--config', str(Path(d) / 'no-such.json')])
+        self.assertEqual(code, 0, buf.getvalue())
+        self.assertIn('그대로 색인 가능', buf.getvalue())
+
+    def test_a_real_ingest_still_needs_numpy(self):
+        """위 시험이 numpy 차단을 실제로 하고 있는지 — 대조군."""
+        with tempfile.TemporaryDirectory() as d:
+            a = self.jsonl(d, 'doc.jsonl', 'only')
+            with patch.dict(sys.modules, {'numpy': None}):
+                with self.assertRaises((ImportError, SystemExit)):
+                    self.mod.main([a, '--index-dir', str(Path(d) / 'index'),
+                                   '--embed-base-url', 'http://127.0.0.1:1/v1'])
+
+
 if __name__ == '__main__':
     unittest.main()

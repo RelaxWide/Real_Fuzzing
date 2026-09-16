@@ -231,6 +231,82 @@ def config_defaults(path):
     return out
 
 
+def inspect_only(inputs, max_chars):
+    """`--dry-run` — 게시를 막을 것들을 **임베딩 전에** 찾는다. 0=진행 가능, 1=거부됨.
+
+    본 ingest 와 **같은** load_jsonl/split_record 를 쓴다. 점검을 따로 구현하면
+    언젠가 갈라져서, 통과했는데 실제로는 거부되는 일이 생긴다.
+    """
+    rows, missing = [], Counter()
+    for path in inputs:
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"  ! 읽기 실패: {path}: {exc}")
+            continue
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                missing["JSON 파싱 실패(레코드 버려짐)"] += 1
+                continue
+            if not isinstance(row, dict):
+                missing["dict 아님(레코드 버려짐)"] += 1
+                continue
+            for key in ("doc_id", "title", "content", "permission_groups"):
+                if not row.get(key):
+                    missing[f"{key} 없음/빈값"] += 1
+            rows.append((Path(path).name, row))
+
+    print(f"[점검] 파일 {len(inputs)}개 · 레코드 {len(rows)}개")
+    if not rows:
+        print("[점검] ✗ 읽어들인 레코드가 없습니다")
+        return 1
+    lengths = sorted(len(r.get("content") or "") for _, r in rows)
+    print(f"[점검] content 길이  최소 {lengths[0]:,}  중앙 {lengths[len(lengths) // 2]:,}  "
+          f"최대 {lengths[-1]:,}")
+    print(f"[점검] 레코드/파일   {len(rows) / max(1, len(inputs)):.1f}")
+    for key, count in missing.items():
+        print(f"  ! {key}: {count}건")
+
+    chunks, skipped = load_jsonl(list(inputs), max_chars)
+    print(f"\n[점검] --max-chars {max_chars} 기준 → 청크 {len(chunks):,}개"
+          + (f" (건너뛴 레코드 {skipped})" if skipped else ""))
+    if chunks:
+        widest = max(len(c["content"]) for c in chunks)
+        print(f"[점검] 가장 긴 청크 {widest:,}자 — 임베딩 상한을 넘으면 자동 분할된다")
+
+    verdict = 0
+    seen_ids = Counter(c["doc_id"] for c in chunks)
+    dupes = [d for d, n in seen_ids.items() if n > 1]
+    print(f"[점검] doc_id 원본 고유값 {len({r.get('doc_id') for _, r in rows})}개")
+    if dupes:
+        by_source = {}
+        for chunk in chunks:
+            by_source.setdefault(chunk["doc_id"], set()).add(chunk["source_file"])
+        cross = [d for d in dupes if len(by_source[d]) > 1]
+        print(f"  ✗ doc_id 중복 {len(dupes)}건 — 이대로는 **게시가 거부된다**")
+        print(f"    예: {dupes[:3]}")
+        if cross:
+            print(f"    그중 {len(cross)}건은 서로 다른 파일에 같은 doc_id "
+                  f"(한 PDF 를 쪽수로 쪼갠 경우 흔하다)")
+        verdict = 1
+    else:
+        print("  ✓ doc_id 중복 없음")
+
+    if not chunks:
+        print("  ✗ 청크가 0개입니다")
+        verdict = 1
+    tiny = sum(1 for c in chunks if len(c["content"]) < MIN_CHUNK_CHARS)
+    if tiny:
+        print(f"  · {MIN_CHUNK_CHARS}자 미만 청크 {tiny}개 — 임베딩 상한에 걸리면 더 못 쪼갠다")
+    print("\n[점검] " + ("그대로 색인 가능합니다." if verdict == 0
+                         else "위 ✗ 를 먼저 해결해야 합니다. 인덱스는 만들지 않았습니다."))
+    return verdict
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="JSONL → 로컬 RAG 인덱스 (P2)")
     ap.add_argument("inputs", nargs="+", help="사내 PDF→JSONL 산출물")
@@ -249,7 +325,14 @@ def main(argv=None):
                     help="청크 문자 상한(토큰 수 보장 아님)")
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--timeout", type=float, default=600.0)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="임베딩 서버 없이 JSONL 만 점검한다. 인덱스를 만들지 않고, "
+                         "설정·numpy·네트워크가 없어도 돈다")
     args = ap.parse_args(argv)
+
+    if args.dry_run:
+        # 설정 해석보다 **먼저** 갈라진다 — 점검은 엔드포인트도 numpy 도 필요 없다.
+        return inspect_only(args.inputs, args.max_chars)
 
     # 우선순위: CLI > 설정 > 내장 기본값.
     defaults = config_defaults(args.config)

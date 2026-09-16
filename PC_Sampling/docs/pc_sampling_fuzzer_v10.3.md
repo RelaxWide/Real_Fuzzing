@@ -155,9 +155,22 @@ DGX 에 **두 인스턴스**가 뜬다. 생성과 임베딩은 모델도 상한�
 | 8001 | `bge-m3` | 임베딩 (입력 상한 8,192) | `rag.vllm.retrieval.embed_base_url` · `embed_model` |
 
 ```bash
-# 8001 에 bge-m3 를 띄운 뒤 — 엔드포인트는 설정에서 읽는다
+# 0) 먼저 점검 — 임베딩 서버·numpy·설정 없이 돈다. 인덱스를 만들지 않는다
+python3 PC_Sampling/tools/rag_ingest.py <JSONL...> --dry-run
+
+# 1) 8001 에 bge-m3 를 띄운 뒤 — 엔드포인트는 설정에서 읽는다
 python3 PC_Sampling/tools/rag_ingest.py <JSONL...>
 ```
+
+`--dry-run` 은 **게시를 막을 것을 임베딩 전에** 찾는다(종료코드 0=진행 가능, 1=거부됨).
+레코드 수·content 길이 분포·청크 수·`doc_id` 중복을 보고한다. 본 ingest 와 **같은**
+`load_jsonl`/`split_record` 를 쓴다 — 점검을 따로 구현하면 갈라져서, 통과했는데 실제로는
+거부되는 일이 생긴다. JSONL 이 다른 망에만 있어 그쪽에서 확인해야 할 때 쓰라고 만든 것이라
+설정 파일도 numpy 도 없는 환경에서 돌아간다.
+
+**한 PDF 를 쪽수로 쪼개 만든 JSONL 은 `doc_id` 가 겹치기 쉽다.** 분할 파일마다 같은
+`doc_id` 가 붙으면 청크 id 가 파일 간에 충돌해 게시가 거부된다 — `--dry-run` 이 "서로
+다른 파일에 같은 doc_id" 로 구분해 알려 준다.
 
 임베딩 서버·모델·revision 은 `fuzzer_config.json` 의 `rag.vllm.retrieval` 에서 읽고,
 CLI 인자(`--embed-base-url` 등)가 그것을 덮어쓴다. **인덱스를 만들 때와 검색할 때의
@@ -208,10 +221,10 @@ task 무관한 목록으로 채운다. `query_block()` 이 쓰는 키와 같다.
 ## 검증 (P1·P2)
 
 ```bash
-python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 159 tests, OK
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 165 tests, OK
 ```
 
-`tests/test_v10_3_backend.py` 67개가 가짜 HTTP 서버로 DGX 없이 돈다. 주요 항목:
+`tests/test_v10_3_backend.py` 73개가 가짜 HTTP 서버로 DGX 없이 돈다. 주요 항목:
 
 - **스키마↔파서 대조**를 AST 로 강제 — 파서가 읽는 키가 스키마에 없으면 실패한다.
   계획 초안이 `data_len` 을 빠뜨렸던 것이 이 시험의 계기이고, 실제로 스키마에서 그
@@ -233,11 +246,13 @@ python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 159 tests, 
 - **엔드포인트 출처**: ingest 가 설정에서 서버·모델·revision 을 읽는지, CLI 가 그것을
   덮어쓰는지, 설정에 8000(생성)·8001(임베딩)이 서로 다르게 살아 있는지
 - **임베딩 폴백**: `embed_base_url` 이 없어 생성 서버로 갈 때 경고가 뜨는지
+- **`--dry-run`**: 분할 파일 간 `doc_id` 중복을 종료코드 1 로 알리는지, 인덱스를 안 만드는지,
+  numpy·설정 없이 도는지(대조군으로 실제 색인은 numpy 를 요구하는지)
 - **깔때기**: 적용된 워크로드가 채택으로 세어지는지(정상0건이 아닌지)
 - **인덱스 정합성**: 상한 초과 청크 분할 후 본문 전량 보존·본문↔벡터 일치, 청크 크기·
   revision 변경 시 재임베딩, doc_id 중복·영벡터 거부, 락, 모델 불일치 인덱스 거부
 
-각 시험은 **고친 코드를 되돌리면 실패하는 것**까지 확인했다(16건 주입 시험).
+각 시험은 **고친 코드를 되돌리면 실패하는 것**까지 확인했다(17건 주입 시험).
 
 ## 알려진 정리 대상
 
