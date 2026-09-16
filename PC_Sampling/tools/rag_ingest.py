@@ -25,22 +25,27 @@
 ------------------------
 chunks/vectors/manifest 중 일부만 갱신된 채 중단되면 행 번호가 어긋난다. `.npy` 는
 헤더에 배열 크기가 있어 파일 끝에 바이트를 붙이는 것으로 확장되지도 않는다. 그래서
-**증분은 임베딩 재사용으로만** 하고(직전 버전에서 sha256 이 같은 소스의 벡터를 그대로
-가져온다), 파일은 언제나 새 버전으로 통째로 쓴다.
+**증분은 임베딩 재사용으로만** 하고, 파일은 언제나 새 버전으로 통째로 쓴다.
+재사용 키는 (소스 파일, doc_id, **본문 sha256**) 이다 — 본문을 키에 넣어야
+`--max-chars` 를 바꿔 같은 doc_id 에 다른 본문이 들어올 때 예전 벡터가 따라붙지
+않는다. 임베딩 모델 이름과 revision 이 모두 같을 때만 재사용한다.
 
 길이 제한
 ---------
 임베딩 상한은 질의뿐 아니라 **문서 청크에도** 걸린다. 레코드를 문자 수 기준으로 자르고,
-서버가 길이 초과를 반환하면 더 잘라 제한된 횟수만 재시도한다. 처리하지 못한 청크가
-있으면 **인덱스를 게시하지 않는다** — 조용히 누락된 인덱스가 가장 나쁘다.
+서버가 길이 초과를 반환하면 그 청크를 **둘로 쪼개 양쪽 다** 임베딩한다. 앞부분만 남기고
+버리면 저장 본문과 벡터가 어긋나 뒷부분이 검색에 영영 안 걸린다. 더 쪼갤 수 없으면
+예외로 올려 **인덱스를 게시하지 않는다** — 조용히 누락된 인덱스가 가장 나쁘다.
 (문자 수는 토큰 수 보장이 아니다. 토크나이저 의존성을 들이지 않기 위한 선택이다.)
 """
 import argparse
+import contextlib
 import hashlib
 import json
+import os
 import shutil
 import sys
-import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -54,6 +59,18 @@ def sha256_file(path):
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def chunk_key(chunk):
+    """벡터 재사용 키 — **본문 해시를 포함한다**.
+
+    소스 파일 해시와 doc_id 만으로 키를 잡으면, 분할 설정(--max-chars)을 바꿨을 때
+    같은 doc_id 에 **다른 본문**이 들어오는데도 예전 벡터를 그대로 붙인다. 소스
+    파일은 안 바뀌었으니 재사용 조건도 통과한다. 본문이 키에 들어가면 그 자체로
+    막힌다(같은 본문이면 재사용해도 항상 옳다).
+    """
+    return (chunk["source_file"], chunk["doc_id"],
+            hashlib.sha256(chunk["content"].encode("utf-8")).hexdigest())
 
 
 def split_record(row, max_chars):
@@ -109,36 +126,77 @@ def load_jsonl(paths, max_chars):
     return chunks, skipped
 
 
-def embed_all(texts, base_url, model, batch, timeout):
-    """임베딩. 길이 초과는 더 잘라 재시도하고, 끝내 실패하면 예외로 올린다."""
+def _is_length_error(exc):
+    return any(t in str(exc).lower() for t in
+               ("token", "too long", "maximum context", "length"))
+
+
+MIN_CHUNK_CHARS = 200
+
+
+def split_chunk(chunk):
+    """상한을 넘은 청크를 **둘로 쪼갠다**. 더 못 쪼개면 예외 — 게시를 막는다.
+
+    앞부분만 남기고 잘라 버리면 안 된다. 저장하는 본문은 원문 그대로인데 벡터는
+    앞부분만 표현하게 돼, **뒷부분의 스펙 내용이 검색에 영영 안 걸리는** 인덱스가
+    정상인 얼굴로 게시된다. 조용히 누락된 인덱스가 가장 나쁘다.
+    """
+    text = chunk["content"]
+    if len(text) < MIN_CHUNK_CHARS * 2:
+        raise ValueError(
+            f"청크를 더 쪼갤 수 없습니다 (doc_id={chunk['doc_id']}, {len(text)}자). "
+            f"--max-chars 를 줄여 다시 실행하세요.")
+    lo, hi = MIN_CHUNK_CHARS, len(text) - MIN_CHUNK_CHARS
+    cut = text.rfind("\n\n", lo, hi)
+    if cut < 0:
+        cut = text.rfind(" ", lo, hi)
+    if cut < 0:
+        cut = len(text) // 2
+    halves = [text[:cut].strip(), text[cut:].strip()]
+    if not all(halves):
+        raise ValueError(f"청크 분할 결과가 비었습니다 (doc_id={chunk['doc_id']})")
+    return [dict(chunk, doc_id=f"{chunk['doc_id']}.{k}", content=part)
+            for k, part in enumerate(halves)]
+
+
+def embed_all(chunks, base_url, model, batch, timeout):
+    """청크 목록을 임베딩한다. `chunks` 는 분할로 **늘어날 수 있다**(in-place).
+
+    반환 벡터는 반환 시점의 `chunks` 와 1:1 로 대응한다 — 본문과 벡터가 어긋나면
+    검색이 조용히 틀리므로, 둘은 언제나 같이 움직인다.
+    """
     from rag.vllm_client import _post, BackendError
     cfg = {"api_key": "not-used", "timeout_sec": timeout, "max_response_bytes": 256 << 20}
     url = base_url.rstrip("/") + "/embeddings"
     out = []
     i = 0
-    while i < len(texts):
-        group = texts[i:i + batch]
+    while i < len(chunks):
+        group = chunks[i:i + batch]
         try:
-            data = _post(url, {"model": model, "input": group}, cfg)
+            data = _post(url, {"model": model,
+                               "input": [c["content"] for c in group]}, cfg)
         except BackendError as exc:
-            over = any(t in str(exc).lower() for t in
-                       ("token", "too long", "maximum context", "length"))
-            if over and batch > 1:
-                batch = max(1, batch // 2)
+            if not _is_length_error(exc):
+                raise
+            if len(group) > 1:
+                batch = max(1, len(group) // 2)
                 print(f"  길이 초과 — 배치를 {batch} 로 줄여 재시도", flush=True)
                 continue
-            if over and len(group[0]) > 400:
-                texts[i] = group[0][: len(group[0]) // 2]
-                print(f"  청크 하나가 상한 초과 — {len(texts[i])}자로 줄여 재시도", flush=True)
-                continue
-            raise
+            # 단일 청크가 상한 초과 → 쪼개서 **양쪽 다** 임베딩한다.
+            halves = split_chunk(chunks[i])
+            chunks[i:i + 1] = halves
+            print(f"  청크 상한 초과 — {halves[0]['doc_id']}/{halves[1]['doc_id']} 로 분할 "
+                  f"({len(halves[0]['content'])}+{len(halves[1]['content'])}자)", flush=True)
+            continue
         rows = sorted(data.get("data") or [], key=lambda r: r.get("index", 0))
         if len(rows) != len(group):
             raise BackendError(f"임베딩 개수 불일치: 요청 {len(group)} / 응답 {len(rows)}")
         out.extend(r["embedding"] for r in rows)
         i += len(group)
-        print(f"  {i}/{len(texts)}", end="\r", flush=True)
+        print(f"  {i}/{len(chunks)}", end="\r", flush=True)
     print()
+    if len(out) != len(chunks):
+        raise BackendError(f"벡터 수 불일치: 청크 {len(chunks)} / 벡터 {len(out)}")
     return out
 
 
@@ -148,6 +206,9 @@ def main(argv=None):
     ap.add_argument("--index-dir", default=str(ROOT / "rag" / "index"))
     ap.add_argument("--embed-base-url", default="http://127.0.0.1:8001/v1")
     ap.add_argument("--embed-model", default="bge-m3")
+    ap.add_argument("--embed-model-revision", default=None,
+                    help="manifest 에 기록하고 재사용·검색 시 대조한다. 이름이 같은 채로 "
+                         "모델이 교체되는 경우를 구분하는 유일한 수단이다")
     ap.add_argument("--max-chars", type=int, default=6000,
                     help="청크 문자 상한(토큰 수 보장 아님)")
     ap.add_argument("--batch", type=int, default=16)
@@ -157,7 +218,32 @@ def main(argv=None):
     import numpy as np
     index_dir = Path(args.index_dir)
     index_dir.mkdir(parents=True, exist_ok=True)
+    with _ingest_lock(index_dir):
+        return _build(args, index_dir, np)
 
+
+@contextlib.contextmanager
+def _ingest_lock(index_dir):
+    """단일 writer 보장. 동시 실행은 staging 과 포인터 임시파일에서 서로를 밟는다."""
+    lock = index_dir / ".ingest.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        sys.exit(f"[ingest] 다른 색인 작업이 진행 중입니다: {lock}\n"
+                 f"         중단된 작업이 남긴 것이라면 이 파일을 지우고 다시 실행하세요.")
+    try:
+        os.write(fd, f"{os.getpid()} {datetime.now().isoformat(timespec='seconds')}\n"
+                 .encode("utf-8"))
+        os.close(fd)
+        yield
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
+def _build(args, index_dir, np):
     sources = {Path(p).name: sha256_file(p) for p in args.inputs}
     chunks, skipped = load_jsonl(args.inputs, args.max_chars)
     if not chunks:
@@ -165,7 +251,7 @@ def main(argv=None):
     print(f"[ingest] 소스 {len(sources)}개 → 청크 {len(chunks):,}개"
           + (f" (건너뜀 {skipped})" if skipped else ""))
 
-    # ── 증분: 직전 버전에서 sha256 이 같은 소스의 벡터를 재사용 ──
+    # ── 증분: 직전 버전에서 **본문이 같은** 청크의 벡터를 재사용 ──
     reuse = {}
     pointer = index_dir / "current"
     if pointer.is_file():
@@ -173,35 +259,49 @@ def main(argv=None):
             prev = index_dir / pointer.read_text(encoding="utf-8").strip()
             old_manifest = json.loads((prev / "manifest.json").read_text(encoding="utf-8"))
             same = {n for n, h in old_manifest.get("sources", {}).items() if sources.get(n) == h}
-            if same and old_manifest.get("embed_model") == args.embed_model:
+            same_model = (old_manifest.get("embed_model") == args.embed_model
+                          and old_manifest.get("embed_model_revision")
+                          == args.embed_model_revision)
+            if same and same_model:
                 old_vecs = np.load(prev / "vectors.f16.npy")
                 for n, row in enumerate(
                         json.loads(l) for l in (prev / "chunks.jsonl").read_text(
                             encoding="utf-8").splitlines() if l.strip()):
-                    if row.get("source_file") in same:
-                        reuse[(row.get("source_file"), row.get("doc_id"))] = old_vecs[n]
+                    if row.get("source_file") in same and n < old_vecs.shape[0]:
+                        reuse[chunk_key(row)] = old_vecs[n]
                 print(f"[ingest] 직전 버전에서 벡터 {len(reuse):,}개 재사용 "
                       f"(변경 없는 소스 {len(same)}개)")
+            elif same and not same_model:
+                print("[ingest] 임베딩 모델/revision 이 달라 전량 재임베딩합니다")
         except Exception as exc:
             print(f"[ingest] 직전 버전 재사용 불가(전량 재임베딩): {exc}")
 
-    todo = [c for c in chunks if (c["source_file"], c["doc_id"]) not in reuse]
+    kept = [c for c in chunks if chunk_key(c) in reuse]
+    todo = [c for c in chunks if chunk_key(c) not in reuse]
     print(f"[ingest] 새로 임베딩할 청크 {len(todo):,}개")
-    fresh = {}
+    vecs = []
     if todo:
-        vecs = embed_all([c["content"] for c in todo], args.embed_base_url,
-                         args.embed_model, args.batch, args.timeout)
-        fresh = {(c["source_file"], c["doc_id"]): v for c, v in zip(todo, vecs)}
-
-    matrix = np.asarray([reuse.get((c["source_file"], c["doc_id"]))
-                         if (c["source_file"], c["doc_id"]) in reuse
-                         else fresh[(c["source_file"], c["doc_id"])]
-                         for c in chunks], dtype=np.float32)
+        # todo 는 분할로 늘어날 수 있다. 반환 벡터는 **반환 시점의 todo** 와 1:1.
+        vecs = embed_all(todo, args.embed_base_url, args.embed_model,
+                         args.batch, args.timeout)
+    # 재사용분 → 새로 임베딩한 분 순서. 순서 자체에는 의미가 없고, chunks.jsonl 과
+    #   vectors 가 같은 순서로 함께 쓰이는 것만이 중요하다.
+    chunks = kept + todo
+    matrix = np.asarray([reuse[chunk_key(c)] for c in kept] + list(vecs), dtype=np.float32)
     if matrix.shape[0] != len(chunks):
         sys.exit(f"[ingest] 벡터 수 불일치 — 게시하지 않습니다 "
                  f"({matrix.shape[0]} != {len(chunks)})")
+    if matrix.ndim != 2 or matrix.shape[1] == 0:
+        sys.exit(f"[ingest] 벡터 차원이 이상합니다 — 게시하지 않습니다 ({matrix.shape})")
+    if not np.isfinite(matrix).all():
+        sys.exit("[ingest] 벡터에 NaN/Inf 가 있습니다 — 게시하지 않습니다")
+    dupes = [d for d, n in Counter(c["doc_id"] for c in chunks).items() if n > 1]
+    if dupes:
+        sys.exit(f"[ingest] doc_id 중복 {len(dupes)}건 — 게시하지 않습니다: {dupes[:5]}")
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
+    zero = int((norms == 0).sum())
+    if zero:
+        sys.exit(f"[ingest] 영벡터 {zero}개 — 게시하지 않습니다(임베딩 실패로 봅니다)")
     matrix = (matrix / norms).astype(np.float16)     # 검색은 정규화 후 내적
 
     version = "v" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -210,7 +310,9 @@ def main(argv=None):
         while (index_dir / f"{version}_{suffix}").exists():
             suffix += 1
         version = f"{version}_{suffix}"
-    staging = index_dir / (version + ".staging")
+    # staging·포인터 임시파일에 pid 를 붙인다. 락이 단일 writer 를 보장하지만,
+    #   락이 지워진 채 남은 잔해가 남의 것을 밟는 경우까지는 막아 둔다.
+    staging = index_dir / f"{version}.{os.getpid()}.staging"
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
@@ -220,7 +322,9 @@ def main(argv=None):
     (staging / "manifest.json").write_text(json.dumps({
         "version": version, "created": datetime.now().isoformat(timespec="seconds"),
         "sources": sources, "chunks": len(chunks), "dim": int(matrix.shape[1]),
-        "embed_model": args.embed_model, "embed_base_url": args.embed_base_url,
+        "embed_model": args.embed_model,
+        "embed_model_revision": args.embed_model_revision,
+        "embed_base_url": args.embed_base_url,
         "normalization": "l2", "dtype": "float16",
         "chunk_max_chars": args.max_chars, "skipped_records": skipped,
         "note": "chunk_max_chars 는 문자 수다. 토큰 수 보장이 아니다.",
@@ -235,7 +339,7 @@ def main(argv=None):
         sys.exit("[ingest] 검증 실패 — 게시하지 않았습니다")
     final = index_dir / version
     staging.rename(final)
-    tmp = index_dir / "current.tmp"
+    tmp = index_dir / f"current.{os.getpid()}.tmp"
     tmp.write_text(version, encoding="utf-8")
     tmp.replace(pointer)                      # 포인터만 원자적으로 교체
     print(f"[ingest] 게시 완료: {final}  (청크 {len(chunks):,}, {matrix.shape[1]}차원)")

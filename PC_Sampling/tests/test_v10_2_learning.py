@@ -63,8 +63,9 @@ def harness(options=None):
     obj._pending_seq_seeds = None
     obj._seq_sink = None
     obj._llm_stats = dict(seeds=0, seqs=0, dropped=0, dupes=0, rounds=0)
-    obj._llm_funnel = dict(requests=0, transport_ok=0, json_ok=0,
-                           items=0, adopted=0, empty_ok=0)   # v10.3 깔때기 계측
+    obj._llm_funnel = dict(requests=0, transport_ok=0, json_ok=0,      # v10.3 깔때기 계측
+                           items=0, adopted=0, empty_ok=0,
+                           seeds=0, seqs=0, evals=0, workloads=0)
     obj._llm_fail_streak = 0
     obj._llm_fail = Mock()
     obj._llm_seen = set()

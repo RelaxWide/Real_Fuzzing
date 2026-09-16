@@ -9,7 +9,8 @@
 질의 만들기 (계획 D7 — 사다리)
 ------------------------------
 1. `meta['rag_query']`      — 퍼저가 목표 함수명·명령 이름을 알고 있어 가장 정확
-2. 프롬프트의 `[RAG-QUERY] … [/RAG-QUERY]` 블록 — 기존 호환 경로
+2. 프롬프트의 `[RAG-QUERY] … [/RAG-QUERY]` 블록 — `llm_learning.query_block()` 이
+   학습이 켜져 있을 때 붙인다. meta 를 안 넘기는 구버전 호출을 받아 주는 경로다
 3. 둘 다 없으면 검색을 **생략**한다(전문을 질의로 쓰지 않는다)
 4. 서버가 토큰 초과를 반환하면 제한된 축소 재시도 후 **명시적 실패**
 
@@ -32,6 +33,7 @@ _PINNED = {}
 def _defaults():
     return {"enabled": True, "index_dir": "rag/index", "top_k": 5,
             "embed_base_url": None, "embed_model": "bge-m3",
+            "embed_model_revision": None,   # 설정하면 인덱스 manifest 와 대조한다
             "query_max_chars": 8000,      # 토큰 수 보장이 아니다. 보수적 문자 상한
             "context_max_chars": 60000,
             "permission_groups": None}
@@ -93,10 +95,10 @@ def embed(text, opts, cfg, deadline, shrink=2):
         left = deadline - time.monotonic()
         if left <= 0:
             raise BackendError("시간 예산 소진 — 임베딩 요청 중단")
-        call = dict(cfg, timeout_sec=min(cfg["timeout_sec"], left))
         try:
             data = _post(opts["embed_base_url"] + "/embeddings",
-                         {"model": opts["embed_model"], "input": body}, call)
+                         {"model": opts["embed_model"], "input": body}, cfg,
+                         deadline=deadline)
             return data["data"][0]["embedding"]
         except BackendError as exc:
             over = any(t in str(exc).lower() for t in
@@ -121,7 +123,24 @@ def retrieve(meta, cfg, deadline):
 
     import numpy as np
     manifest, chunks, vectors, version = _load(opts["index_dir"])
+    # 인덱스를 만든 모델과 지금 질의를 임베딩할 모델이 다르면 **벡터 공간이 다르다**.
+    #   점수는 여전히 계산되므로 조용히 엉뚱한 문서가 뽑힌다 — 실행 시점에 막는다.
+    _built = manifest.get("embed_model")
+    if _built and _built != opts["embed_model"]:
+        raise ValueError(
+            f"인덱스 임베딩 모델 불일치: 인덱스={_built} 설정={opts['embed_model']} "
+            f"({version.name}) — tools/rag_ingest.py 로 다시 색인하세요")
+    # revision 을 명시했으면 **누락도 불일치**다. 빠진 것을 통과시키면 revision 을
+    #   기록하지 않던 구형 인덱스를 새 모델 공간과 섞어 쓰는 것을 막지 못한다.
+    _rev, _want_rev = manifest.get("embed_model_revision"), opts.get("embed_model_revision")
+    if _want_rev and _rev != _want_rev:
+        raise ValueError(
+            f"인덱스 임베딩 모델 revision 불일치: 인덱스={_rev or '(기록 없음)'} "
+            f"설정={_want_rev} ({version.name}) — 다시 색인하세요")
     vec = np.asarray(embed(q, opts, cfg, deadline), dtype=np.float32)
+    if vec.shape[0] != vectors.shape[1]:
+        raise ValueError(f"질의 벡터 차원 불일치: 질의={vec.shape[0]} "
+                         f"인덱스={vectors.shape[1]} ({version.name})")
     norm = float(np.linalg.norm(vec)) or 1.0
     scores = (vectors.astype(np.float32) @ (vec / norm))
 

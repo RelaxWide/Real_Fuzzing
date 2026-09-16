@@ -578,6 +578,16 @@ class LearningMixin:
         data = self._learning_parse(res.get('raw'))
         if not isinstance(data, dict):
             return super()._llm_apply_result(res)
+        # Reject before touching learning state: a discarded response must not
+        # register generators or bump target counters, or later valid rules hit
+        # "generator capacity reached" because of a failure that was thrown away.
+        reject = getattr(self, '_llm_response_rejection', None)
+        why = reject(res, data) if reject is not None else None
+        if why:
+            # The reason is diagnostic only (bounded deque); it changes nothing
+            # that a later request depends on, unlike generators/target counters.
+            self.learning.errors.append(f'rejected: {why}')
+            return super()._llm_apply_result(res)
         ctx = dict(res.get('ctx') or {})
         ctx['request_id'] = res.get('req_id')
         self._learning_apply_ctx = ctx
@@ -640,7 +650,10 @@ class LearningMixin:
                     tid = item.get('target_id')
                     if isinstance(tid, str) and tid in ctx.get('learning_targets', []) and tid in self.learning.targets:
                         self.learning.targets[tid]['selected'] += 1
-            prepared = dict(res, raw=json.dumps(data))
+            # raw_original: 정규화 **전** 원본. 위에서 잘못된 컨테이너를 빈 배열로
+            #   고치고 seeds 키까지 만들어 넣으므로, 이 사본만 보면 '{"seeds":"bad"}'
+            #   나 엉뚱한 task 의 응답이 정상으로 보인다. 형식 검사는 원본으로 한다.
+            prepared = dict(res, raw=json.dumps(data), raw_original=res.get('raw'))
             super()._llm_apply_result(prepared)
             accepted = []
             for seed in self.corpus:

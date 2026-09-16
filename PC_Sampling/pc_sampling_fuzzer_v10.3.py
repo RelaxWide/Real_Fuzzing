@@ -4699,6 +4699,50 @@ def _llm_extract_json(text: str):
     return None
 
 
+# task 가 실제로 요구하는 최상위 컨테이너와 그 타입.
+#   _llm_schema_ok 는 **task 를 보지 않는다** — top-key 가 하나라도 있으면 통과라
+#   new_group_seeds 요청에 {"evaluations": []} 가 와도 '정상 응답'이 됐다. 구조화
+#   출력이 켜져 있으면 서버가 막아 주지만, structured_output=false 나 사내 브리지로
+#   되돌린 상태 — 즉 **뭔가 잘못돼서 폴백한 상황** — 이 정확히 서킷브레이커가
+#   필요한 때다. 그래서 호스트에서도 task 별로 한 번 더 본다.
+#   값은 **허용되는** (키, 타입) 목록이다. 하나도 없으면 그 task 의 응답이 아니고,
+#   있는데 타입이 틀리면 무효다. new_group_seeds 는 generators 만 온 응답도 정상이다
+#   — 학습 모듈이 그것을 seeds 로 컴파일한다.
+_LLM_TASK_CONTAINERS = {
+    'new_group_seeds': (('seeds', list), ('generators', list)),
+    'sequences':       (('sequences', list),),
+    'corpus_eval':     (('evaluations', list),),
+    'io_patterns':     (('io_workload', dict),),
+}
+
+
+def _llm_final_finish_reason(diag):
+    """교정 호출이 있었으면 **마지막** 호출의 finish_reason 이 최종값이다.
+
+    성공 경로는 교정 진단을 diagnostics['correction'] 에 겹쳐 싣는다. 맨 바깥
+    finish_reason 은 첫 호출의 것이라 잘림 판정에 쓰면 안 된다.
+    """
+    d = diag if isinstance(diag, dict) else {}
+    seen = 0
+    while isinstance(d.get('correction'), dict) and seen < 8:
+        d = d['correction']
+        seen += 1
+    return d.get('finish_reason')
+
+
+class _LlmBackendFailure(RuntimeError):
+    """백엔드가 **진단과 함께** 보고한 실패.
+
+    진단을 예외에 실어야 그 요청에 귀속된다. 문자열만 올리면 워커의 except 절이
+    직전 요청의 진단을 집어 들어(_diag 는 루프를 가로질러 산다) 실패한 요청에
+    엉뚱한 req_id·finish_reason 이 붙는다.
+    """
+
+    def __init__(self, message, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = dict(diagnostics or {})
+
+
 class LlmBridge:
     """사내 LLM(또는 mock) callable 을 in-process 로 호출하는 브리지.
 
@@ -4806,7 +4850,9 @@ class LlmBridge:
         if isinstance(out, dict):
             diag = out.get('diagnostics') if isinstance(out.get('diagnostics'), dict) else {}
             if out.get('error'):
-                raise RuntimeError(str(out['error']))
+                # 진단을 예외에 싣는다. 버리면 실패 당시의 서버·검색·응답 상태를
+                #   잃고, 워커가 직전 요청의 진단으로 그 자리를 메운다.
+                raise _LlmBackendFailure(str(out['error']), diag)
             return (out.get('raw') or ''), dict(diag)
         return (out or ''), {}
 
@@ -4816,12 +4862,18 @@ class LlmBridge:
                 req = self._in_q.get(timeout=0.5)
             except queue.Empty:
                 continue
+            # ★ 요청마다 초기화한다. _diag 는 이 while 루프를 가로질러 사는 지역
+            #   변수라, 초기화하지 않으면 **직전 요청의 진단**이 이번 실패에 붙는다.
+            _diag = {}
+            _llm_started = time.monotonic()
             try:
-                _llm_started = time.monotonic()
                 system, user = req['system'], req['user']
                 _meta = dict(req.get('meta') or {})
                 _meta.update({'task': req['task'], 'req_id': req.get('req_id'),
-                              'user_prompt': user})
+                              'user_prompt': user,
+                              # 최초 호출과 교정 호출이 **하나의 시간 예산**을 나눠 쓴다.
+                              #   호출마다 새 예산을 주면 json_retries 배만큼 늘어난다.
+                              'budget_started': _llm_started})
                 text, _diag = self._call_llm(system, user, _meta)   # 수 초 — 여기서만 블록
                 # ② JSON 유효성 체크 → 무효면 교정 리프롬프트로 상한 재시도(회수율↑).
                 attempt = 0
@@ -4847,11 +4899,16 @@ class LlmBridge:
                                  'diagnostics': _diag,
                                  'llm_seconds': time.monotonic() - _llm_started})
             except Exception as e:
+                # 백엔드가 진단과 함께 실패를 보고했으면 **그것**을 쓴다. 교정 호출에서
+                #   터졌으면 앞선 성공 진단 위에 correction 으로 겹친다(성공 경로와 동일).
+                _edia = getattr(e, 'diagnostics', None)
+                if isinstance(_edia, dict) and _edia:
+                    _diag = dict(_diag, correction=_edia) if _diag else dict(_edia)
                 self._out_q.put({'task': req['task'], 'raw': None, 'error': str(e),
                                  'submitted_at': req['submitted_at'],
                                  'user': req.get('user'), 'retries': 0,
                                  'ctx': req.get('ctx'), 'req_id': req.get('req_id'),
-                                 'diagnostics': locals().get('_diag') or {},
+                                 'diagnostics': _diag,
                                  'llm_seconds': time.monotonic() - _llm_started})
             finally:
                 self._inflight = False
@@ -4932,7 +4989,9 @@ class _V101Fuzzer:
         # v10.3 깔때기 — 기여가 낮을 때 **어느 단계에서** 줄었는지 보기 위한 계측.
         #   학습 전략 개선이 아니라 이관 검증용이다.
         self._llm_funnel = {'requests': 0, 'transport_ok': 0, 'json_ok': 0,
-                            'items': 0, 'adopted': 0, 'empty_ok': 0}
+                            'items': 0, 'adopted': 0, 'empty_ok': 0,
+                            # 채택의 내역(task 마다 채택의 형태가 다르다)
+                            'seeds': 0, 'seqs': 0, 'evals': 0, 'workloads': 0}
         self._llm_last_task = None            # v9.5: 직전 선택 task(연속 상한 추적)
         self._llm_task_consec = 0             # v9.5: 같은 task 연속 선택 횟수(starvation-free cap)
         # v10: LLM 요청 주기를 시간 기반으로. 마지막 '시도' 시각(monotonic). 시작 ~interval 뒤 첫 시도.
@@ -7414,8 +7473,13 @@ class _V101Fuzzer:
                 t = self.learning.targets.get(row) if isinstance(row, str) else None
                 if t and t.get('name'):
                     parts.append(str(t['name']))
-            for name in (self._llm_gap_cmds() or [])[:6]:
-                parts.append(str(name))
+            # 이 요청이 실제로 겨냥한 명령을 먼저 쓴다 — 프롬프트 빌더가 ctx 에
+            #   담아 둔다(never-sent/low-yield 후보, corpus_eval 이면 표본 명령).
+            #   llm_learning 의 질의 블록도 같은 키를 같은 순서로 쓴다.
+            cmds = [str(n) for n in ((ctx or {}).get('rag_query_commands') or [])[:6]]
+            if not cmds:
+                cmds = [str(n) for n in (self._llm_gap_cmds() or [])[:6]]
+            parts.extend(cmds)
             if len(parts) == 1:
                 return None
             return ' '.join(dict.fromkeys(parts))[:2000]
@@ -7609,6 +7673,34 @@ class _V101Fuzzer:
         except Exception:
             pass
 
+    def _llm_response_rejection(self, res, data):
+        """폐기해야 할 응답이면 사유 문자열, 아니면 None. **어떤 상태도 바꾸지 않는다.**
+
+        학습 모듈이 generator 를 등록하고 목표 통계를 올리기 **전에** 불려야 한다.
+        폐기할 응답이 learning.generators 를 채우면, 이후 정상 규칙이 capacity
+        reached 로 거절된다 — 실패한 요청이 뒤따르는 정상 요청을 망가뜨린다.
+        """
+        _fr = _llm_final_finish_reason(res.get('diagnostics'))
+        if _fr == 'length':
+            # 잘린 응답은 **파싱이 우연히 성공해도** 신뢰할 수 없다. 모델이 유효한
+            #   JSON 을 낸 뒤 상한에 걸려도 그 안의 목록은 잘린 중간 결과다.
+            return "응답 잘림 (finish_reason=length) — max_tokens 를 확인하세요"
+        if not isinstance(data, dict):
+            return None                      # 파싱 실패는 호출부가 따로 처리한다
+        _want = _LLM_TASK_CONTAINERS.get(res.get('task'))
+        if not _want:
+            return None
+        _present = [(k, t) for k, t in _want if k in data]
+        if not _present:
+            return (f"task={res.get('task')} 응답에 {[k for k, _ in _want]} 중 "
+                    f"아무것도 없음 (받은 키={sorted(data.keys())})")
+        _bad = [(k, t) for k, t in _present if not isinstance(data.get(k), t)]
+        if _bad:
+            _k, _t = _bad[0]
+            return (f"task={res.get('task')} '{_k}' 타입 오류 — {_t.__name__} 를 "
+                    f"기대했으나 {type(data.get(_k)).__name__}")
+        return None
+
     def _llm_fail(self, why, res, data=None):
         """실패 1건 처리 — 연속 실패를 세고 상한에서 RAG 를 끈다.
 
@@ -7648,12 +7740,25 @@ class _V101Fuzzer:
         if self.executions - res.get('submitted_at', 0) > RAG_RESULT_STALE:
             log.info("[LLM] stale 결과 무시")
             return
+        _fr = _llm_final_finish_reason(res.get('diagnostics'))
         data = _llm_extract_json(res.get('raw'))
         if not isinstance(data, dict):
-            # 잘림(finish_reason=length)도 여기로 온다 — 진단에 이유가 남는다.
-            _fr = (res.get('diagnostics') or {}).get('finish_reason')
             self._llm_fail("JSON 파싱 실패" + (f" (finish_reason={_fr})" if _fr else ""),
                            res, data=data)
+            self._llm_stats['dropped'] += 1
+            return
+        # 검사 대상은 **모델이 실제로 낸 응답**이다. 학습 모듈은 잘못된 컨테이너를
+        #   빈 배열로 고치고 없던 seeds 키까지 만들어 넘기므로, 정규화된 사본을 보면
+        #   모든 응답이 형식상 정상으로 보인다(raw_original 이 원본을 들고 온다).
+        _shape = data
+        _orig_raw = res.get('raw_original')
+        if _orig_raw is not None and _orig_raw != res.get('raw'):
+            _parsed = _llm_extract_json(_orig_raw)
+            if isinstance(_parsed, dict):
+                _shape = _parsed
+        _why = self._llm_response_rejection(res, _shape)
+        if _why:
+            self._llm_fail(_why, res, data=data)
             self._llm_stats['dropped'] += 1
             return
         self._llm_funnel['json_ok'] += 1
@@ -7847,13 +7952,22 @@ class _V101Fuzzer:
         self._llm_stats['seqs'] += added_q
         self._llm_stats['rounds'] += 1
         # v10.3 깔때기 — 응답이 실어 온 항목 수와 실제 채택 수를 나눠 센다.
+        #   채택은 **task 마다 형태가 다르다**. seed/sequence 만 세면 정상 적용된
+        #   corpus_eval·io_patterns 라운드가 전부 '정상0건' 으로 집계돼 P1↔P2 비교
+        #   지표가 처음부터 오염된다. 종류별로 나눠 센다.
+        _added_w = 1 if _wl is not None else 0
         self._llm_funnel['items'] += (len(data.get('seeds') or [])
                                       + len(data.get('sequences') or [])
                                       + len(data.get('evaluations') or [])
                                       + (1 if data.get('io_workload') else 0))
-        self._llm_funnel['adopted'] += added_s + added_q
-        if not (added_s or added_q):
-            # 정상 응답인데 채택 0 — 중복이거나 task 가 새 시드를 안 만드는 경우.
+        self._llm_funnel['seeds'] += added_s
+        self._llm_funnel['seqs'] += added_q
+        self._llm_funnel['evals'] += _ev_applied
+        self._llm_funnel['workloads'] += _added_w
+        _adopted = added_s + added_q + _ev_applied + _added_w
+        self._llm_funnel['adopted'] += _adopted
+        if not _adopted:
+            # 정상 응답인데 채택 0 — 중복이거나 대상이 이미 컬링된 경우.
             #   실패가 아니다. 기여 0 으로만 기록한다.
             self._llm_funnel['empty_ok'] += 1
         self._llm_archive(res, data, added_s, added_q)   # 성공 라운드 원본+주입결과 기록
@@ -8108,7 +8222,10 @@ class _V101Fuzzer:
             if _fn['requests']:
                 log.warning(f"[LLM/funnel] 요청={_fn['requests']} → 통신ok={_fn['transport_ok']} "
                             f"→ JSONok={_fn['json_ok']} → 항목={_fn['items']} "
-                            f"→ 채택={_fn['adopted']} (정상0건={_fn['empty_ok']}, "
+                            f"→ 채택={_fn['adopted']}"
+                            f"(시드 {_fn['seeds']}/시퀀스 {_fn['seqs']}/"
+                            f"평가 {_fn['evals']}/워크로드 {_fn['workloads']}) "
+                            f"(정상0건={_fn['empty_ok']}, "
                             f"연속실패={self._llm_fail_streak}/{RAG_FAIL_LIMIT})")
             # v9.1: 되먹임 신호 성숙도 — 확정 미구현 / accept 예시 보유 / 구현됐으나 얕게 반송
             _acc_n = sum(1 for _n, _s in self.cmd_stats.items() if _s.get('accepted'))

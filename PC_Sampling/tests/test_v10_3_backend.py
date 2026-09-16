@@ -4,17 +4,19 @@
 """
 import ast
 import json
+import queue
 import re
 import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from test_v10_2_learning import ROOT, FUZZER_FILE, fuzzer, harness
+from test_v10_2_learning import ROOT, FUZZER_FILE, add_target, fuzzer, harness, recipe
 
 sys.path.insert(0, str(ROOT))
 from rag import llm_schema                                  # noqa: E402
@@ -421,6 +423,682 @@ class IngestIndex(unittest.TestCase):
             self.assertNotEqual(first, second, '새 버전이 만들어지지 않았다')
             self.assertTrue((index / first).is_dir(), '이전 버전을 지웠다 — 캠페인이 쓰고 있을 수 있다')
             self.assertEqual(len(calls), 1, '변경 없는 소스를 다시 임베딩했다')
+
+
+# ── 리뷰 반영 회귀 시험 ────────────────────────────────────────────────────
+class DiagnosticsBelongToTheirRequest(unittest.TestCase):
+    """_diag 는 워커 루프를 가로질러 사는 지역변수였다. 초기화하지 않으면
+    실패한 요청에 **직전 요청의** req_id·finish_reason 이 붙는다."""
+
+    def bridge(self, callable_):
+        klass = FuzzerSideNormalization._find_bridge_class()
+        obj = klass.__new__(klass)
+        obj._accepts_meta, obj._pass_system = True, True
+        obj._callable = callable_
+        obj._in_q, obj._out_q = queue.Queue(), queue.Queue()
+        obj._stop = threading.Event()
+        obj._inflight = False
+        return obj
+
+    def drive(self, obj, requests):
+        for r in requests:
+            obj._in_q.put(r)
+        worker = threading.Thread(target=obj._run, daemon=True)
+        worker.start()
+        try:
+            return [obj._out_q.get(timeout=10) for _ in requests]
+        finally:
+            obj._stop.set()
+            worker.join(timeout=5)
+
+    @staticmethod
+    def req(n):
+        return {'task': 'new_group_seeds', 'system': 's', 'user': 'u',
+                'submitted_at': 0, 'ctx': None, 'req_id': n, 'meta': {}}
+
+    def test_failure_after_a_success_does_not_inherit_the_previous_diagnostics(self):
+        def backend(system, user, meta):
+            if meta['req_id'] == 1:
+                return {'raw': '{"seeds": []}',
+                        'diagnostics': {'req_id': 1, 'finish_reason': 'stop'}}
+            raise fuzzer._LlmBackendFailure('연결 실패', {'req_id': 2, 'base_url': 'http://x/v1'})
+
+        out = self.drive(self.bridge(backend), [self.req(1), self.req(2)])
+        self.assertIsNone(out[0]['error'])
+        self.assertEqual(out[0]['diagnostics']['req_id'], 1)
+        self.assertEqual(out[1]['diagnostics'].get('req_id'), 2,
+                         '실패한 요청에 직전 요청의 진단이 붙었다')
+        self.assertNotEqual(out[1]['diagnostics'].get('finish_reason'), 'stop')
+
+    def test_first_request_failing_carries_the_backend_diagnostics(self):
+        def backend(system, user, meta):
+            raise fuzzer._LlmBackendFailure('HTTP 500 boom',
+                                            {'backend': 'vllm', 'base_url': 'http://y/v1'})
+
+        out = self.drive(self.bridge(backend), [self.req(1)])
+        self.assertEqual(out[0]['diagnostics'].get('base_url'), 'http://y/v1',
+                         '백엔드가 준 진단을 버렸다')
+
+    def test_backend_error_dict_keeps_its_diagnostics_through_call_llm(self):
+        klass = FuzzerSideNormalization._find_bridge_class()
+        obj = klass.__new__(klass)
+        obj._accepts_meta, obj._pass_system = True, True
+        obj._callable = lambda s, u, m: {'raw': '', 'error': 'HTTP 500',
+                                         'diagnostics': {'base_url': 'http://z/v1'}}
+        with self.assertRaises(RuntimeError) as ctx:
+            obj._call_llm('s', 'u', {})
+        self.assertEqual(getattr(ctx.exception, 'diagnostics', {}).get('base_url'),
+                         'http://z/v1')
+
+    def test_correction_call_failure_is_attributed_as_a_correction(self):
+        calls = []
+
+        def backend(system, user, meta):
+            calls.append(user)
+            if len(calls) == 1:
+                return {'raw': 'not json', 'diagnostics': {'req_id': 1,
+                                                           'finish_reason': 'stop'}}
+            raise fuzzer._LlmBackendFailure('교정 중 연결 끊김', {'stage': 'correction'})
+
+        out = self.drive(self.bridge(backend), [self.req(1)])
+        self.assertGreaterEqual(len(calls), 2, '교정 호출이 일어나지 않았다')
+        diag = out[0]['diagnostics']
+        self.assertEqual(diag.get('req_id'), 1)
+        self.assertEqual(diag.get('correction', {}).get('stage'), 'correction')
+
+    def test_final_finish_reason_prefers_the_correction_call(self):
+        self.assertEqual(fuzzer._llm_final_finish_reason(
+            {'finish_reason': 'stop', 'correction': {'finish_reason': 'length'}}), 'length')
+        self.assertEqual(fuzzer._llm_final_finish_reason({'finish_reason': 'stop'}), 'stop')
+        self.assertIsNone(fuzzer._llm_final_finish_reason(None))
+
+
+class TimeBudget(unittest.TestCase):
+    """urlopen(timeout=) 은 소켓 연산별 상한이라 총 경과 시간을 막지 못한다."""
+
+    class _Trickle(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            raw = json.dumps(ok_completion('{"seeds": []}')[1]).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            for i in range(0, len(raw), 16):      # 조금씩 흘려보낸다
+                try:
+                    self.wfile.write(raw[i:i + 16])
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                time.sleep(0.05)
+
+    def test_slow_dribbling_response_is_discarded_not_returned(self):
+        httpd = HTTPServer(('127.0.0.1', 0), self._Trickle)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f'http://127.0.0.1:{httpd.server_port}/v1'
+        try:
+            from rag import vllm_client
+            started = time.monotonic()
+            out = vllm_client.generate_rag_response(
+                's', 'u', {'task': 'new_group_seeds',
+                           'config': client_cfg(base, timeout_sec=0.2)})
+            elapsed = time.monotonic() - started
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertTrue(out.get('error'), '예산을 넘긴 응답이 성공으로 돌아왔다')
+        self.assertIn('예산', out['error'])
+        self.assertLess(elapsed, 2.0, f'예산을 한참 넘겨서야 끝났다 ({elapsed:.2f}s)')
+
+    def test_correction_calls_share_one_budget_with_the_first_call(self):
+        """budget_started 를 주면 최초 호출과 교정 호출이 예산을 나눠 쓴다."""
+        with FakeServer(lambda p, b: ok_completion('{"seeds": []}')) as srv:
+            from rag import vllm_client
+            cfg = client_cfg(srv.base, timeout_sec=30.0)
+            spent = time.monotonic() - 29.5        # 예산이 0.5초만 남은 상태
+            out = vllm_client.generate_rag_response(
+                's', 'u', {'task': 'new_group_seeds', 'config': cfg,
+                           'budget_started': spent})
+            self.assertIn('raw', out)
+            drained = time.monotonic() - 100.0     # 예산이 이미 소진된 상태
+            out2 = vllm_client.generate_rag_response(
+                's', 'u', {'task': 'new_group_seeds', 'config': cfg,
+                           'budget_started': drained})
+        self.assertTrue(out2.get('error'), '소진된 예산으로도 요청을 보냈다')
+        self.assertIn('예산', out2['error'])
+
+    def test_worker_stamps_one_budget_start_shared_by_the_correction_call(self):
+        """최초 호출과 교정 호출이 **같은** budget_started 를 받아야 한다."""
+        seen = []
+
+        def backend(system, user, meta):
+            seen.append(meta.get('budget_started'))
+            return {'raw': 'still not json' if len(seen) <= fuzzer.RAG_JSON_RETRIES
+                    else '{"seeds": []}', 'diagnostics': {}}
+
+        driver = DiagnosticsBelongToTheirRequest()
+        obj = driver.bridge(backend)
+        driver.drive(obj, [driver.req(1)])
+        self.assertGreaterEqual(len(seen), 2, '교정 호출이 일어나지 않았다')
+        self.assertTrue(all(isinstance(v, float) for v in seen), 'budget_started 가 없다')
+        self.assertEqual(len(set(seen)), 1,
+                         '교정 호출이 새 예산을 받았다 — 요청 하나가 timeout_sec 의 '
+                         '몇 배를 붙들 수 있다')
+
+
+class TaskAwareFailureAccounting(unittest.TestCase):
+    """잘림·잘못된 task·잘못된 타입은 실패다. 정상 빈 결과·중복은 아니다."""
+
+    def obj(self):
+        o = harness()
+        o._llm_fail = fuzzer.NVMeFuzzer._llm_fail.__get__(o)
+        o._llm_archive = Mock()
+        o.llm = Mock(enabled=True)
+        o.config = Mock(rag_module_path='rag.vllm_client')
+        o._llm_fail_streak = 0
+        return o
+
+    def apply(self, o, raw, task='new_group_seeds', diagnostics=None):
+        fuzzer.NVMeFuzzer._llm_apply_result(o, {
+            'task': task, 'raw': raw, 'submitted_at': 1, 'error': None,
+            'req_id': 1, 'diagnostics': diagnostics or {}})
+
+    def test_truncated_but_parsable_response_is_a_failure(self):
+        o = self.obj()
+        self.apply(o, '{"seeds": []}', diagnostics={'finish_reason': 'length'})
+        self.assertEqual(o._llm_fail_streak, 1, '잘린 응답이 정상으로 집계됐다')
+        self.assertEqual(o._llm_funnel['json_ok'], 0)
+
+    def test_truncation_in_the_correction_call_is_also_caught(self):
+        o = self.obj()
+        self.apply(o, '{"seeds": []}',
+                   diagnostics={'finish_reason': 'stop',
+                                'correction': {'finish_reason': 'length'}})
+        self.assertEqual(o._llm_fail_streak, 1, '교정 호출의 잘림을 놓쳤다')
+
+    def test_response_for_a_different_task_is_a_failure(self):
+        o = self.obj()
+        self.apply(o, '{"evaluations": []}', task='new_group_seeds')
+        self.assertEqual(o._llm_fail_streak, 1, '엉뚱한 task 컨테이너가 통과했다')
+
+    def test_wrong_container_type_is_a_failure(self):
+        o = self.obj()
+        self.apply(o, '{"seeds": "bad"}')
+        self.assertEqual(o._llm_fail_streak, 1,
+                         '학습 모듈이 빈 배열로 정규화해 조용히 0개 주입이 됐다')
+
+    def test_io_patterns_expects_an_object_not_a_list(self):
+        o = self.obj()
+        self.apply(o, '{"io_workload": []}', task='io_patterns')
+        self.assertEqual(o._llm_fail_streak, 1)
+
+    def test_a_genuinely_empty_but_correct_response_still_resets_the_streak(self):
+        o = self.obj()
+        o._llm_fail_streak = 3
+        self.apply(o, '{"seeds": []}', diagnostics={'finish_reason': 'stop'})
+        self.assertEqual(o._llm_fail_streak, 0, '정상 빈 응답을 실패로 셌다')
+        self.assertTrue(o.llm.enabled)
+
+    def test_repeated_wrong_task_responses_trip_the_breaker(self):
+        o = self.obj()
+        for _ in range(fuzzer.RAG_FAIL_LIMIT):
+            self.apply(o, '{"evaluations": []}', task='new_group_seeds')
+        self.assertFalse(o.llm.enabled, '무효 응답이 반복돼도 서킷브레이커가 안 걸렸다')
+
+
+class FunnelCountsEveryKindOfAdoption(unittest.TestCase):
+    """seed·sequence 만 세면 정상 적용된 corpus_eval·io_patterns 가 '정상0건' 이 된다."""
+
+    def test_applied_workload_counts_as_an_adoption(self):
+        o = harness()
+        o._llm_fail = Mock()
+        o._llm_archive = Mock()
+        o.llm = Mock(enabled=True)
+        o.config = Mock(rag_module_path='rag.vllm_client')
+        pattern = sorted(fuzzer.IO_WL_PATTERNS)[0]
+        fuzzer.NVMeFuzzer._llm_apply_result(o, {
+            'task': 'io_patterns', 'submitted_at': 1, 'error': None, 'req_id': 1,
+            'raw': json.dumps({'io_workload': {'pattern': pattern}}),
+            'diagnostics': {'finish_reason': 'stop'}})
+        self.assertEqual(o._llm_funnel['workloads'], 1)
+        self.assertEqual(o._llm_funnel['adopted'], 1, '적용된 워크로드를 채택으로 안 셌다')
+        self.assertEqual(o._llm_funnel['empty_ok'], 0, '정상 적용을 정상0건으로 셌다')
+
+
+class RagQueryUsesTheRequestsOwnCommands(unittest.TestCase):
+    def test_ctx_commands_are_preferred_over_the_generic_gap_list(self):
+        o = fuzzer.NVMeFuzzer.__new__(fuzzer.NVMeFuzzer)
+        o.learning = Mock(targets={})
+        o._llm_gap_cmds = lambda: ['GenericA', 'GenericB']
+        q = fuzzer.NVMeFuzzer._llm_rag_query(
+            o, 'new_group_seeds', {'rag_query_commands': ['FWCommit', 'Sanitize']})
+        self.assertIn('FWCommit', q)
+        self.assertNotIn('GenericA', q, '요청이 겨냥한 명령 대신 일반 목록을 썼다')
+
+    def test_falls_back_to_the_gap_list_when_ctx_has_none(self):
+        o = fuzzer.NVMeFuzzer.__new__(fuzzer.NVMeFuzzer)
+        o.learning = Mock(targets={})
+        o._llm_gap_cmds = lambda: ['GenericA']
+        self.assertIn('GenericA', fuzzer.NVMeFuzzer._llm_rag_query(o, 'sequences', {}))
+
+
+class IndexIntegrity(unittest.TestCase):
+    def setUp(self):
+        spec = __import__('importlib.util', fromlist=['util']).spec_from_file_location(
+            'rag_ingest_integrity', ROOT / 'tools/rag_ingest.py')
+        self.mod = __import__('importlib.util', fromlist=['util']).module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def jsonl(self, d, rows, name='docs.jsonl'):
+        p = Path(d) / name
+        p.write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows),
+                     encoding='utf-8')
+        return str(p)
+
+    @staticmethod
+    def _load(index):
+        version = (index / 'current').read_text().strip()
+        chunks = [json.loads(l) for l in
+                  (index / version / 'chunks.jsonl').read_text().splitlines() if l.strip()]
+        import numpy as np
+        return chunks, np.load(index / version / 'vectors.f16.npy'), \
+            json.loads((index / version / 'manifest.json').read_text())
+
+    def test_oversize_chunk_is_split_so_no_text_loses_its_vector(self):
+        """앞부분만 임베딩하고 원문을 그대로 저장하면 뒷부분이 검색에 영영 안 걸린다."""
+        with tempfile.TemporaryDirectory() as d:
+            body = ('alpha ' * 100) + ('omega ' * 100)
+            src = self.jsonl(d, [{'doc_id': 'a', 'title': 'A', 'content': body,
+                                  'permission_groups': []}])
+            index = Path(d) / 'index'
+            state = {'rejected': False}
+
+            def reply(path, body_json):
+                texts = body_json['input']
+                if not state['rejected'] and any(len(t) > 600 for t in texts):
+                    state['rejected'] = True
+                    return 400, {'error': {'code': 'QUERY_TOKEN_LIMIT_EXCEEDED'}}
+                return 200, {'data': [{'index': i, 'embedding': [1.0, 0.0]}
+                                      for i in range(len(texts))]}
+
+            with FakeServer(reply) as srv:
+                self.mod.main([src, '--index-dir', str(index),
+                               '--embed-base-url', srv.base, '--max-chars', '100000'])
+            chunks, vectors, _ = self._load(index)
+            self.assertTrue(state['rejected'], '상한 초과 경로를 타지 않았다')
+            self.assertEqual(len(chunks), vectors.shape[0], '본문과 벡터 수가 어긋났다')
+            self.assertEqual(''.join(c['content'] for c in chunks).replace(' ', ''),
+                             body.replace(' ', ''), '분할에서 본문 일부가 사라졌다')
+            self.assertEqual(len({c['doc_id'] for c in chunks}), len(chunks))
+
+    def test_unsplittable_chunk_publishes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self.jsonl(d, [{'doc_id': 'a', 'title': 'A', 'content': 'tiny',
+                                  'permission_groups': []}])
+            index = Path(d) / 'index'
+            with FakeServer(lambda p, b: (400, {'error': 'maximum context length'})) as srv:
+                with self.assertRaises((SystemExit, ValueError, Exception)):
+                    self.mod.main([src, '--index-dir', str(index),
+                                   '--embed-base-url', srv.base])
+            self.assertFalse((index / 'current').exists(), '불완전한 인덱스를 게시했다')
+
+    def test_changing_chunk_size_reembeds_instead_of_reusing_other_text(self):
+        """재사용 키에 본문이 없으면 같은 doc_id 에 예전 본문의 벡터가 붙는다."""
+        with tempfile.TemporaryDirectory() as d:
+            src = self.jsonl(d, [{'doc_id': 'a', 'title': 'A',
+                                  'content': 'abcdefghijkl', 'permission_groups': []}])
+            index = Path(d) / 'index'
+            seen = []
+
+            def reply(path, body):
+                seen.append(list(body['input']))
+                return 200, {'data': [{'index': i, 'embedding': [float(len(t)), 1.0]}
+                                      for i, t in enumerate(body['input'])]}
+
+            with FakeServer(reply) as srv:
+                self.mod.main([src, '--index-dir', str(index),
+                               '--embed-base-url', srv.base, '--max-chars', '6'])
+                seen.clear()
+                self.mod.main([src, '--index-dir', str(index),
+                               '--embed-base-url', srv.base, '--max-chars', '4'])
+            embedded = [t for call in seen for t in call]
+            chunks, _, manifest = self._load(index)
+            self.assertEqual(manifest['chunk_max_chars'], 4)
+            self.assertEqual(sorted(c['content'] for c in chunks), ['abcd', 'efgh', 'ijkl'])
+            self.assertEqual(sorted(embedded), ['abcd', 'efgh', 'ijkl'],
+                             '분할이 바뀌었는데 예전 본문의 벡터를 재사용했다')
+
+    def test_changing_model_revision_forces_reembedding(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self.jsonl(d, [{'doc_id': 'a', 'title': 'A', 'content': 'hello',
+                                  'permission_groups': []}])
+            index = Path(d) / 'index'
+            calls = []
+
+            def reply(path, body):
+                calls.append(len(body['input']))
+                return 200, {'data': [{'index': i, 'embedding': [1.0, 0.0]}
+                                      for i in range(len(body['input']))]}
+
+            with FakeServer(reply) as srv:
+                self.mod.main([src, '--index-dir', str(index), '--embed-base-url', srv.base,
+                               '--embed-model-revision', 'r1'])
+                calls.clear()
+                self.mod.main([src, '--index-dir', str(index), '--embed-base-url', srv.base,
+                               '--embed-model-revision', 'r2'])
+            _, _, manifest = self._load(index)
+            self.assertEqual(manifest['embed_model_revision'], 'r2')
+            self.assertEqual(len(calls), 1, 'revision 이 바뀌었는데 벡터를 재사용했다')
+
+    def test_duplicate_doc_ids_across_sources_are_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.jsonl(d, [{'doc_id': 'dup', 'title': 'A', 'content': 'one',
+                                'permission_groups': []}], name='a.jsonl')
+            b = self.jsonl(d, [{'doc_id': 'dup', 'title': 'B', 'content': 'two',
+                                'permission_groups': []}], name='b.jsonl')
+            index = Path(d) / 'index'
+            with FakeServer(lambda p, body: (200, {'data': [
+                    {'index': i, 'embedding': [1.0, 0.0]}
+                    for i in range(len(body['input']))]})) as srv:
+                with self.assertRaises(SystemExit):
+                    self.mod.main([a, b, '--index-dir', str(index),
+                                   '--embed-base-url', srv.base])
+            self.assertFalse((index / 'current').exists())
+
+    def test_zero_vectors_are_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self.jsonl(d, [{'doc_id': 'a', 'title': 'A', 'content': 'hello',
+                                  'permission_groups': []}])
+            index = Path(d) / 'index'
+            with FakeServer(lambda p, body: (200, {'data': [
+                    {'index': i, 'embedding': [0.0, 0.0]}
+                    for i in range(len(body['input']))]})) as srv:
+                with self.assertRaises(SystemExit):
+                    self.mod.main([src, '--index-dir', str(index),
+                                   '--embed-base-url', srv.base])
+            self.assertFalse((index / 'current').exists())
+
+    def test_a_second_concurrent_ingest_is_refused_by_the_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self.jsonl(d, [{'doc_id': 'a', 'title': 'A', 'content': 'hello',
+                                  'permission_groups': []}])
+            index = Path(d) / 'index'
+            index.mkdir(parents=True)
+            (index / '.ingest.lock').write_text('999999\n', encoding='utf-8')
+            with self.assertRaises(SystemExit):
+                self.mod.main([src, '--index-dir', str(index),
+                               '--embed-base-url', 'http://127.0.0.1:1/v1'])
+
+    def test_retrieval_refuses_an_index_built_with_another_model(self):
+        from rag import rag_retrieval as rr
+        with tempfile.TemporaryDirectory() as d:
+            index = Path(d) / 'index'
+            (index / 'v1').mkdir(parents=True)
+            (index / 'current').write_text('v1', encoding='utf-8')
+            (index / 'v1' / 'chunks.jsonl').write_text(
+                json.dumps({'doc_id': 'a', 'title': 'A', 'content': 'x',
+                            'permission_groups': []}) + '\n', encoding='utf-8')
+            (index / 'v1' / 'manifest.json').write_text(
+                json.dumps({'embed_model': 'other-model'}), encoding='utf-8')
+            import numpy as np
+            np.save(index / 'v1' / 'vectors.f16.npy',
+                    np.ones((1, 2), dtype=np.float16))
+            rr._PINNED.clear()
+            cfg = {'base_url': 'http://127.0.0.1:1/v1', 'timeout_sec': 1.0,
+                   'max_response_bytes': 1 << 20, 'api_key': 'x',
+                   'retrieval': {'enabled': True, 'index_dir': str(index),
+                                 'embed_model': 'bge-m3'}}
+            with self.assertRaises(ValueError) as ctx:
+                rr.retrieve({'rag_query': 'q'}, cfg, time.monotonic() + 5)
+            self.assertIn('모델 불일치', str(ctx.exception))
+            rr._PINNED.clear()
+
+
+class SlowHttpErrorBodyRespectsTheBudget(unittest.TestCase):
+    """오류 본문만 예산 밖에서 읽으면 느린 4xx/5xx 가 예산을 통째로 우회한다."""
+
+    class _SlowError(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            raw = json.dumps({'error': {'code': 'BOOM', 'detail': 'x' * 400}}).encode()
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            for i in range(0, len(raw), 8):
+                try:
+                    self.wfile.write(raw[i:i + 8])
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                time.sleep(0.05)
+
+    def test_error_body_read_stops_inside_the_budget(self):
+        httpd = HTTPServer(('127.0.0.1', 0), self._SlowError)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f'http://127.0.0.1:{httpd.server_port}/v1'
+        try:
+            from rag import vllm_client
+            started = time.monotonic()
+            out = vllm_client.generate_rag_response(
+                's', 'u', {'task': 'new_group_seeds',
+                           'config': client_cfg(base, timeout_sec=0.2)})
+            elapsed = time.monotonic() - started
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertTrue(out.get('error'))
+        self.assertLess(elapsed, 2.0,
+                        f'오류 본문을 끝까지 기다렸다 ({elapsed:.2f}s) — 예산을 우회했다')
+        self.assertIn('HTTP 500', out['error'], 'HTTP 상태를 잃었다')
+
+
+class RejectedResponsesLeaveNoLearningState(unittest.TestCase):
+    """폐기한 응답이 generator 저장소를 채우면 이후 정상 규칙이 capacity 로 거절된다."""
+
+    def obj(self):
+        o = harness({'generators': True, 'evidence': True})
+        o._llm_fail = Mock()
+        o._llm_archive = Mock()
+        o.llm = Mock(enabled=True, schema_bridge=harness().llm.schema_bridge)
+        o.config = Mock(rag_module_path='rag.vllm_client')
+        return o
+
+    def apply(self, o, payload, task='new_group_seeds', diagnostics=None):
+        ctx = {'learning_targets': list(o.learning.targets)[:3]}
+        o._llm_apply_result({'task': task, 'raw': json.dumps(payload), 'ctx': ctx,
+                             'submitted_at': 1, 'error': None, 'req_id': 1,
+                             'llm_seconds': 0.1, 'diagnostics': diagnostics or {}})
+
+    def test_truncated_response_registers_no_generator(self):
+        o = self.obj()
+        self.apply(o, {'generators': [recipe()]},
+                   diagnostics={'finish_reason': 'length'})
+        self.assertEqual(len(o.corpus), 0)
+        self.assertEqual(len(o.learning.generators), 0,
+                         '폐기한 응답이 generator 저장소를 바꿨다')
+
+    def test_wrong_task_response_does_not_bump_target_counters(self):
+        o = self.obj()
+        for i in range(3):
+            add_target(o, entry=100 + i * 10, end=105 + i * 10)
+        selected_before = sum(t.get('selected', 0) for t in o.learning.targets.values())
+        self.apply(o, {'evaluations': []}, task='new_group_seeds')
+        selected_after = sum(t.get('selected', 0) for t in o.learning.targets.values())
+        self.assertEqual(selected_after, selected_before,
+                         '폐기한 응답이 목표 통계를 올렸다')
+        self.assertEqual(len(o.learning.generators), 0)
+
+    def test_a_valid_generator_response_still_registers(self):
+        """거부 검사가 정상 경로까지 막지는 않는지."""
+        o = self.obj()
+        self.apply(o, {'generators': [recipe()]}, diagnostics={'finish_reason': 'stop'})
+        self.assertGreater(len(o.corpus), 0, '정상 generator 응답이 막혔다')
+
+
+class RevisionMismatchIsRefused(unittest.TestCase):
+    def index(self, d, manifest):
+        index = Path(d) / 'index'
+        (index / 'v1').mkdir(parents=True)
+        (index / 'current').write_text('v1', encoding='utf-8')
+        (index / 'v1' / 'chunks.jsonl').write_text(
+            json.dumps({'doc_id': 'a', 'title': 'A', 'content': 'x',
+                        'permission_groups': []}) + '\n', encoding='utf-8')
+        (index / 'v1' / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+        import numpy as np
+        np.save(index / 'v1' / 'vectors.f16.npy', np.ones((1, 2), dtype=np.float16))
+        return index
+
+    def retrieve(self, index, want_rev):
+        from rag import rag_retrieval as rr
+        rr._PINNED.clear()
+        cfg = {'base_url': 'http://127.0.0.1:1/v1', 'timeout_sec': 1.0,
+               'max_response_bytes': 1 << 20, 'api_key': 'x',
+               'retrieval': {'enabled': True, 'index_dir': str(index),
+                             'embed_model': 'bge-m3', 'embed_model_revision': want_rev}}
+        try:
+            return rr.retrieve({'rag_query': 'q'}, cfg, time.monotonic() + 5)
+        finally:
+            rr._PINNED.clear()
+
+    def test_missing_revision_in_manifest_is_a_mismatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            index = self.index(d, {'embed_model': 'bge-m3'})
+            with self.assertRaises(ValueError) as ctx:
+                self.retrieve(index, 'r2')
+            self.assertIn('revision', str(ctx.exception))
+
+    def test_null_revision_in_manifest_is_a_mismatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            index = self.index(d, {'embed_model': 'bge-m3', 'embed_model_revision': None})
+            with self.assertRaises(ValueError):
+                self.retrieve(index, 'r2')
+
+    def test_differing_revision_is_a_mismatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            index = self.index(d, {'embed_model': 'bge-m3', 'embed_model_revision': 'r1'})
+            with self.assertRaises(ValueError):
+                self.retrieve(index, 'r2')
+
+    def test_no_declared_revision_keeps_older_indexes_usable(self):
+        """설정이 revision 을 요구하지 않으면 예전 인덱스는 그대로 쓴다."""
+        with tempfile.TemporaryDirectory() as d:
+            index = self.index(d, {'embed_model': 'bge-m3'})
+            with self.assertRaises(Exception) as ctx:
+                self.retrieve(index, None)
+            self.assertNotIn('revision', str(ctx.exception))   # 임베딩 연결 실패여야 한다
+
+
+class ErrorBodySurvivesAStalledServer(unittest.TestCase):
+    """read1 안에서 소켓 타임아웃이 터져도 받은 본문과 중단 사유를 잃으면 안 된다."""
+
+    PARTIAL = b'{"error":"IMPORTANT_REASON"'
+
+    class _Stall(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', '4000')     # 약속만 하고 안 보낸다
+            self.end_headers()
+            try:
+                self.wfile.write(ErrorBodySurvivesAStalledServer.PARTIAL)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            for _ in range(40):                            # 그대로 멈춘다
+                if getattr(self.server, 'done', False):
+                    return
+                time.sleep(0.1)
+
+    def test_partial_body_and_the_stop_reason_are_both_reported(self):
+        httpd = HTTPServer(('127.0.0.1', 0), self._Stall)
+        httpd.done = False
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f'http://127.0.0.1:{httpd.server_port}/v1'
+        try:
+            from rag import vllm_client
+            started = time.monotonic()
+            out = vllm_client.generate_rag_response(
+                's', 'u', {'task': 'new_group_seeds',
+                           'config': client_cfg(base, timeout_sec=0.3)})
+            elapsed = time.monotonic() - started
+        finally:
+            httpd.done = True
+            httpd.shutdown()
+            httpd.server_close()
+        err = out.get('error') or ''
+        self.assertIn('HTTP 500', err, 'HTTP 상태를 잃었다')
+        self.assertIn('IMPORTANT_REASON', err, '받은 오류 본문을 잃었다')
+        self.assertIn('예산', err, '왜 잘렸는지가 사라졌다')
+        self.assertLess(elapsed, 3.0, f'멈춘 서버를 계속 기다렸다 ({elapsed:.2f}s)')
+
+    def test_socket_is_found_through_the_httperror_wrapper(self):
+        """HTTPError 는 실제 HTTPResponse 를 한 겹 감싼다 — 한 단계만 보면 놓친다."""
+        from rag import vllm_client
+        with FakeServer(lambda p, b: (500, {'error': 'x'})) as srv:
+            import urllib.error, urllib.request
+            req = urllib.request.Request(srv.base + '/chat/completions', data=b'{}',
+                                         method='POST',
+                                         headers={'Content-Type': 'application/json'})
+            try:
+                urllib.request.urlopen(req, timeout=5)
+                self.fail('500 이 안 났다')
+            except urllib.error.HTTPError as exc:
+                self.assertIsNotNone(vllm_client._sock_of(exc),
+                                     'HTTPError 에서 소켓을 못 찾아 읽기별 갱신을 건너뛴다')
+
+    def test_read_bounded_returns_partial_and_reason_on_read_failure(self):
+        from rag import vllm_client
+
+        class Boom:
+            def read1(self, n):
+                if not getattr(self, 'hit', False):
+                    self.hit = True
+                    return b'HEAD'
+                raise TimeoutError('timed out')
+
+        body, stopped = vllm_client._read_bounded(
+            Boom(), 4096, time.monotonic() + 30, 'u', '오류 본문', partial_ok=True)
+        self.assertEqual(body, b'HEAD', '읽기 예외에 이미 모은 조각을 잃었다')
+        self.assertIn('수신 실패', stopped)
+        with self.assertRaises(Exception):
+            vllm_client._read_bounded(Boom(), 4096, time.monotonic() + 30, 'u')
+
+
+class LegacyCallerCanStillUseTheQueryBlock(unittest.TestCase):
+    """meta 없는 호출도 프롬프트의 [RAG-QUERY] 로 질의를 만들 수 있어야 한다."""
+
+    def test_user_prompt_defaults_to_the_user_message(self):
+        from rag import vllm_client, rag_retrieval
+        seen = {}
+
+        def spy(meta, cfg, deadline):
+            seen['meta'] = dict(meta)
+            return '', {'enabled': False}
+
+        user = 'body [RAG-QUERY] FWCommit Sanitize [/RAG-QUERY] tail'
+        with FakeServer(lambda p, b: ok_completion('{"seeds": []}')) as srv:
+            with patch.object(rag_retrieval, 'retrieve', spy):
+                with patch.object(vllm_client, '_config',
+                                  lambda m: dict(vllm_client.DEFAULTS,
+                                                 base_url=srv.base, retries=0,
+                                                 timeout_sec=10.0)):
+                    vllm_client.generate_rag_response('sys', user)      # meta 없음
+        self.assertIn('meta', seen, '검색 함수가 호출되지 않았다')
+        self.assertEqual(seen['meta'].get('user_prompt'), user)
+        self.assertEqual(
+            rag_retrieval.query_from(seen['meta'], seen['meta'].get('user_prompt', ''), 100),
+            ('FWCommit Sanitize', 'prompt_block'))
 
 
 if __name__ == '__main__':

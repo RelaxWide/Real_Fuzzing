@@ -433,7 +433,6 @@
       "api_key": "not-used",
       "model": "nemotron-3-super",
       "timeout_sec": 300.0,
-      "connect_timeout_sec": 10.0,
       "max_tokens": 16384,
       "temperature": 0.7,
       "max_response_bytes": 8388608,
@@ -447,6 +446,7 @@
         "top_k": 5,
         "embed_base_url": "http://192.168.137.238:8001/v1",
         "embed_model": "bge-m3",
+        "embed_model_revision": null,
         "query_max_chars": 8000,
         "context_max_chars": 60000,
         "permission_groups": null
