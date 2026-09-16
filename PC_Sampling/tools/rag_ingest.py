@@ -70,6 +70,22 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def source_id(path):
+    """소스 파일의 식별자 — `상위폴더/파일명`.
+
+    basename 만 쓰면 PDF 별 폴더에 같은 이름의 분할 파일(part1.jsonl …)이 있을 때
+    서로 다른 파일이 하나로 합쳐진다. 그러면 manifest 가 무엇이 들어갔는지 못
+    말하고, "이 소스는 안 바뀌었다" 판정도 엉뚱한 해시로 하게 된다.
+
+    절대 경로를 쓰지 않는 이유는 **재사용 안정성**이다. 같은 트리를 다른 위치에
+    두거나 다른 디렉터리에서 실행하면 식별자가 통째로 바뀌어 전량 재임베딩이 된다.
+    두 단계로도 겹치는 경우는 게시 전에 오류로 잡는다(조용히 합치지 않는다).
+    """
+    path = Path(path)
+    parent = path.parent.name
+    return f"{parent}/{path.name}" if parent else path.name
+
+
 def chunk_key(chunk):
     """벡터 재사용 키 — **본문 해시를 포함한다**.
 
@@ -110,7 +126,7 @@ def load_jsonl(paths, max_chars):
     """JSONL → 청크 목록. 스키마 위반은 건너뛰되 개수를 보고한다."""
     chunks, skipped = [], 0
     for path in paths:
-        source = Path(path).name
+        source = source_id(path)
         for lineno, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue
@@ -303,7 +319,7 @@ def inspect_only(inputs, max_chars):
             for key in ("doc_id", "title", "content", "permission_groups"):
                 if not row.get(key):
                     missing[f"{key} 없음/빈값"] += 1
-            rows.append((Path(path).name, row))
+            rows.append((source_id(path), row))
 
     print(f"[점검] 파일 {len(inputs)}개 · 레코드 {len(rows)}개")
     if not rows:
@@ -324,6 +340,11 @@ def inspect_only(inputs, max_chars):
         print(f"[점검] 가장 긴 청크 {widest:,}자 — 임베딩 상한을 넘으면 자동 분할된다")
 
     verdict = 0
+    clash = [s for s, n in Counter(source_id(p) for p in inputs).items() if n > 1]
+    if clash:
+        print(f"  ✗ 소스 식별자(상위폴더/파일명) 중복 {len(clash)}건 — **게시가 거부된다**")
+        print(f"    예: {clash[:3]}  · 폴더 이름을 구분하거나 파일명을 바꾸세요")
+        verdict = 1
     seen_ids = Counter(c["doc_id"] for c in chunks)
     dupes = [d for d, n in seen_ids.items() if n > 1]
     print(f"[점검] doc_id 원본 고유값 {len({r.get('doc_id') for _, r in rows})}개")
@@ -421,7 +442,12 @@ def _ingest_lock(index_dir):
 
 
 def _build(args, index_dir, np):
-    sources = {Path(p).name: sha256_file(p) for p in args.inputs}
+    sources = {source_id(p): sha256_file(p) for p in args.inputs}
+    if len(sources) != len(args.inputs):
+        clash = [s for s, n in Counter(source_id(p) for p in args.inputs).items() if n > 1]
+        sys.exit(f"[ingest] 소스 식별자가 겹칩니다 {clash[:5]} — 게시하지 않습니다.\n"
+                 f"         상위폴더/파일명 이 같은 파일이 둘 이상입니다. "
+                 f"폴더 이름을 구분하거나 파일명을 바꾸세요.")
     chunks, skipped = load_jsonl(args.inputs, args.max_chars)
     if not chunks:
         sys.exit("[ingest] 청크가 0개입니다 — 입력을 확인하세요")

@@ -1347,5 +1347,90 @@ class InputsAreResolvedWithoutAShell(unittest.TestCase):
         self.assertIn('입력 2개', buf.getvalue())
 
 
+class SourceIdentityDistinguishesSplitFiles(unittest.TestCase):
+    """PDF 별 폴더에 같은 이름의 분할 파일이 있는 구조 — basename 만 쓰면 합쳐진다."""
+
+    def setUp(self):
+        spec = __import__('importlib.util', fromlist=['util']).spec_from_file_location(
+            'rag_ingest_src', ROOT / 'tools/rag_ingest.py')
+        self.mod = __import__('importlib.util', fromlist=['util']).module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def per_pdf_tree(self, d, folders=('NVMe_Base', 'PCIe')):
+        for folder in folders:
+            (Path(d) / folder).mkdir(parents=True, exist_ok=True)
+            for i in (1, 2):
+                (Path(d) / folder / f'part{i}.jsonl').write_text(
+                    json.dumps({'doc_id': f'{folder}_{i}', 'title': folder,
+                                'content': f'{folder} body {i} ' * 50,
+                                'permission_groups': ['g']}) + '\n', encoding='utf-8')
+        return d
+
+    def test_same_filename_in_different_folders_stays_distinct(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.per_pdf_tree(d)
+            inputs = self.mod.resolve_inputs([d])
+            ids = {self.mod.source_id(p) for p in inputs}
+        self.assertEqual(len(inputs), 4)
+        self.assertEqual(len(ids), 4, 'basename 이 같아 소스가 합쳐졌다')
+        self.assertIn('NVMe_Base/part1.jsonl', ids)
+        self.assertIn('PCIe/part1.jsonl', ids)
+
+    def test_manifest_records_every_input_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.per_pdf_tree(d)
+            index = Path(d) / 'index'
+            with FakeServer(lambda p, body: (200, {'data': [
+                    {'index': i, 'embedding': [float(i + 1), 1.0]}
+                    for i in range(len(body['input']))]})) as srv:
+                self.mod.main([d, '--index-dir', str(index), '--embed-base-url', srv.base])
+            version = (index / 'current').read_text().strip()
+            manifest = json.loads((index / version / 'manifest.json').read_text())
+        self.assertEqual(len(manifest['sources']), 4,
+                         f"manifest 가 입력 4개를 {len(manifest['sources'])}개로 기록했다")
+
+    def test_identity_is_stable_when_the_tree_moves(self):
+        """절대 경로를 쓰면 트리를 옮기거나 다른 cwd 에서 돌릴 때 전량 재임베딩이 된다."""
+        with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as two:
+            self.per_pdf_tree(one)
+            self.per_pdf_tree(two)
+            a = {self.mod.source_id(p) for p in self.mod.resolve_inputs([one])}
+            b = {self.mod.source_id(p) for p in self.mod.resolve_inputs([two])}
+        self.assertEqual(a, b, '위치가 바뀌면 식별자도 바뀐다 — 재사용이 깨진다')
+
+    def test_a_remaining_collision_is_refused_not_merged(self):
+        with tempfile.TemporaryDirectory() as d:
+            for side in ('a', 'b'):
+                (Path(d) / side / 'split').mkdir(parents=True)
+                (Path(d) / side / 'split' / 'p1.jsonl').write_text(
+                    json.dumps({'doc_id': f'{side}1', 'title': side,
+                                'content': 'body ' * 50,
+                                'permission_groups': ['g']}) + '\n', encoding='utf-8')
+            index = Path(d) / 'index'
+            with FakeServer(lambda p, body: (200, {'data': [
+                    {'index': i, 'embedding': [1.0, 0.0]}
+                    for i in range(len(body['input']))]})) as srv:
+                with self.assertRaises(SystemExit) as ctx:
+                    self.mod.main([d, '--index-dir', str(index),
+                                   '--embed-base-url', srv.base])
+            self.assertIn('소스 식별자', str(ctx.exception))
+            self.assertFalse((index / 'current').exists(), '충돌인데 게시했다')
+
+    def test_dry_run_reports_the_collision_before_embedding(self):
+        import io, contextlib
+        with tempfile.TemporaryDirectory() as d:
+            for side in ('a', 'b'):
+                (Path(d) / side / 'split').mkdir(parents=True)
+                (Path(d) / side / 'split' / 'p1.jsonl').write_text(
+                    json.dumps({'doc_id': f'{side}1', 'title': side,
+                                'content': 'body ' * 50,
+                                'permission_groups': ['g']}) + '\n', encoding='utf-8')
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = self.mod.main([d, '--dry-run'])
+        self.assertEqual(code, 1)
+        self.assertIn('소스 식별자', buf.getvalue())
+
+
 if __name__ == '__main__':
     unittest.main()
