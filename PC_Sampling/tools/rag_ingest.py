@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """사내 PDF→JSONL 산출물을 로컬 RAG 인덱스로 만든다 (계획 P2).
 
-    python3 tools/rag_ingest.py <JSONL...> [--index-dir rag/index]
+    python3 tools/rag_ingest.py <JSONL|디렉터리|글롭...> [--dry-run]
+                                [--index-dir rag/index]
                                 [--embed-base-url http://HOST:8001/v1]
                                 [--embed-model bge-m3] [--max-chars 6000]
+
+입력은 파일·디렉터리·`*.jsonl` 같은 글롭을 모두 받는다. Windows 셸은 글롭을 펴 주지
+않으므로(리터럴 `*` 를 열면 errno 22) 이 도구가 직접 편다.
 
 임베딩 서버·모델·revision 은 기본적으로 `fuzzer_config.json` 의
 `rag.vllm.retrieval` 에서 읽는다 — 퍼저가 **검색할 때** 쓰는 값과 인덱스를 **만들 때**
@@ -44,6 +48,7 @@ chunks/vectors/manifest 중 일부만 갱신된 채 중단되면 행 번호가 �
 """
 import argparse
 import contextlib
+import glob as globlib
 import hashlib
 import json
 import os
@@ -231,6 +236,46 @@ def config_defaults(path):
     return out
 
 
+def resolve_inputs(inputs):
+    """glob 패턴·디렉터리를 실제 파일 목록으로 편다.
+
+    Windows 셸(cmd/PowerShell)은 `*.jsonl` 을 펴 주지 않아 리터럴 `*` 가 그대로
+    넘어오고, 그걸 열면 EINVAL(errno 22) 이 난다. 사내 JSONL 이 그쪽에 있으니
+    도구가 직접 편다 — 셸이 이미 펴 준 경우(Linux)에는 파일이 실재하므로 그대로 쓴다.
+
+    디렉터리를 주면 그 아래 `*.jsonl` 을 재귀로 찾는다. 한 폴더를 통째로 넘기는 게
+    분할된 PDF 를 다루는 가장 편한 방법이다.
+    """
+    found = []
+    for item in inputs:
+        path = Path(item)
+        if path.is_dir():
+            under = sorted(path.rglob("*.jsonl"))
+            if not under:
+                sys.exit(f"[ingest] 디렉터리에 .jsonl 이 없습니다: {item}")
+            found.extend(under)
+        elif path.exists():
+            found.append(path)
+        else:
+            matched = sorted(Path(p) for p in globlib.glob(item, recursive=True))
+            matched = [p for p in matched if p.is_file()]
+            if not matched:
+                sys.exit(f"[ingest] 입력을 찾지 못했습니다: {item}\n"
+                         f"         (셸이 와일드카드를 펴 주지 않으면 이 도구가 펴지만, "
+                         f"경로 자체가 틀리면 여기서 멈춘다)")
+            found.extend(matched)
+    seen, unique = set(), []
+    for path in found:                      # 같은 파일이 여러 인자로 들어와도 한 번만
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(str(path))
+    return unique
+
+
 def inspect_only(inputs, max_chars):
     """`--dry-run` — 게시를 막을 것들을 **임베딩 전에** 찾는다. 0=진행 가능, 1=거부됨.
 
@@ -329,6 +374,8 @@ def main(argv=None):
                     help="임베딩 서버 없이 JSONL 만 점검한다. 인덱스를 만들지 않고, "
                          "설정·numpy·네트워크가 없어도 돈다")
     args = ap.parse_args(argv)
+    args.inputs = resolve_inputs(args.inputs)
+    print(f"[ingest] 입력 {len(args.inputs)}개")
 
     if args.dry_run:
         # 설정 해석보다 **먼저** 갈라진다 — 점검은 엔드포인트도 numpy 도 필요 없다.

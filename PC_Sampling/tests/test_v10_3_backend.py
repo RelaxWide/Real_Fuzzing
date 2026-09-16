@@ -1279,5 +1279,73 @@ class DryRunInspectsWithoutAServer(unittest.TestCase):
                                    '--embed-base-url', 'http://127.0.0.1:1/v1'])
 
 
+class InputsAreResolvedWithoutAShell(unittest.TestCase):
+    """Windows 셸은 *.jsonl 을 펴 주지 않는다 — 리터럴 '*' 를 열면 errno 22 다."""
+
+    def setUp(self):
+        spec = __import__('importlib.util', fromlist=['util']).spec_from_file_location(
+            'rag_ingest_glob', ROOT / 'tools/rag_ingest.py')
+        self.mod = __import__('importlib.util', fromlist=['util']).module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def tree(self, d):
+        (Path(d) / 'sub').mkdir()
+        for name, doc in (('a.jsonl', 'A'), ('b.jsonl', 'B'), ('sub/c.jsonl', 'C')):
+            (Path(d) / name).write_text(
+                json.dumps({'doc_id': doc, 'title': doc, 'content': 'text ' * 100,
+                            'permission_groups': []}) + '\n', encoding='utf-8')
+        (Path(d) / 'notes.txt').write_text('ignore me', encoding='utf-8')
+
+    def test_literal_glob_is_expanded_by_the_tool(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            got = self.mod.resolve_inputs([str(Path(d) / '*.jsonl')])
+        self.assertEqual([Path(p).name for p in got], ['a.jsonl', 'b.jsonl'])
+
+    def test_directory_is_walked_recursively_for_jsonl_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            got = self.mod.resolve_inputs([d])
+        self.assertEqual(sorted(Path(p).name for p in got),
+                         ['a.jsonl', 'b.jsonl', 'c.jsonl'])
+        self.assertFalse(any(p.endswith('.txt') for p in got))
+
+    def test_already_expanded_paths_still_work(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            paths = [str(Path(d) / 'a.jsonl'), str(Path(d) / 'b.jsonl')]
+            self.assertEqual(self.mod.resolve_inputs(paths), paths)
+
+    def test_the_same_file_named_twice_is_used_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            one = str(Path(d) / 'a.jsonl')
+            got = self.mod.resolve_inputs([one, one, str(Path(d) / '*.jsonl')])
+        self.assertEqual([Path(p).name for p in got], ['a.jsonl', 'b.jsonl'])
+
+    def test_a_wrong_path_stops_with_a_message_not_errno22(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(SystemExit) as ctx:
+                self.mod.resolve_inputs([str(Path(d) / 'nope' / '*.jsonl')])
+        self.assertIn('찾지 못했습니다', str(ctx.exception))
+
+    def test_empty_directory_is_named_in_the_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(SystemExit) as ctx:
+                self.mod.resolve_inputs([d])
+        self.assertIn('.jsonl 이 없습니다', str(ctx.exception))
+
+    def test_dry_run_accepts_a_literal_glob_end_to_end(self):
+        """셸이 안 펴 준 인자를 그대로 넘겨도 점검이 돈다(사내 Windows PC 경로)."""
+        import io, contextlib
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = self.mod.main([str(Path(d) / '*.jsonl'), '--dry-run'])
+        self.assertEqual(code, 0, buf.getvalue())
+        self.assertIn('입력 2개', buf.getvalue())
+
+
 if __name__ == '__main__':
     unittest.main()

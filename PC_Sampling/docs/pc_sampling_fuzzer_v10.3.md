@@ -156,11 +156,17 @@ DGX 에 **두 인스턴스**가 뜬다. 생성과 임베딩은 모델도 상한�
 
 ```bash
 # 0) 먼저 점검 — 임베딩 서버·numpy·설정 없이 돈다. 인덱스를 만들지 않는다
-python3 PC_Sampling/tools/rag_ingest.py <JSONL...> --dry-run
+python3 PC_Sampling/tools/rag_ingest.py ~/rag_src --dry-run
 
 # 1) 8001 에 bge-m3 를 띄운 뒤 — 엔드포인트는 설정에서 읽는다
-python3 PC_Sampling/tools/rag_ingest.py <JSONL...>
+python3 PC_Sampling/tools/rag_ingest.py ~/rag_src
 ```
+
+입력은 **파일·디렉터리·글롭**을 모두 받는다. 디렉터리를 주면 그 아래 `*.jsonl` 을 재귀로
+찾는다 — 한 폴더를 통째로 넘기는 게 쪽수로 쪼갠 PDF 를 다루는 가장 편한 방법이다.
+글롭도 도구가 직접 편다. **Windows 셸(cmd/PowerShell)은 `*.jsonl` 을 펴 주지 않아**
+리터럴 `*` 가 그대로 넘어오고, 그걸 열면 errno 22(EINVAL) 이 난다(Linux 는 errno 2).
+사내 JSONL 이 그쪽에 있을 수 있으므로 셸에 기대지 않는다.
 
 `--dry-run` 은 **게시를 막을 것을 임베딩 전에** 찾는다(종료코드 0=진행 가능, 1=거부됨).
 레코드 수·content 길이 분포·청크 수·`doc_id` 중복을 보고한다. 본 ingest 와 **같은**
@@ -221,10 +227,10 @@ task 무관한 목록으로 채운다. `query_block()` 이 쓰는 키와 같다.
 ## 검증 (P1·P2)
 
 ```bash
-python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 165 tests, OK
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 172 tests, OK
 ```
 
-`tests/test_v10_3_backend.py` 73개가 가짜 HTTP 서버로 DGX 없이 돈다. 주요 항목:
+`tests/test_v10_3_backend.py` 80개가 가짜 HTTP 서버로 DGX 없이 돈다. 주요 항목:
 
 - **스키마↔파서 대조**를 AST 로 강제 — 파서가 읽는 키가 스키마에 없으면 실패한다.
   계획 초안이 `data_len` 을 빠뜨렸던 것이 이 시험의 계기이고, 실제로 스키마에서 그
@@ -248,11 +254,13 @@ python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 165 tests, 
 - **임베딩 폴백**: `embed_base_url` 이 없어 생성 서버로 갈 때 경고가 뜨는지
 - **`--dry-run`**: 분할 파일 간 `doc_id` 중복을 종료코드 1 로 알리는지, 인덱스를 안 만드는지,
   numpy·설정 없이 도는지(대조군으로 실제 색인은 numpy 를 요구하는지)
+- **입력 해석**: 리터럴 글롭·디렉터리(재귀, `.jsonl` 만)·이미 펴진 경로·중복 인자,
+  잘못된 경로가 errno 22 대신 메시지로 멈추는지
 - **깔때기**: 적용된 워크로드가 채택으로 세어지는지(정상0건이 아닌지)
 - **인덱스 정합성**: 상한 초과 청크 분할 후 본문 전량 보존·본문↔벡터 일치, 청크 크기·
   revision 변경 시 재임베딩, doc_id 중복·영벡터 거부, 락, 모델 불일치 인덱스 거부
 
-각 시험은 **고친 코드를 되돌리면 실패하는 것**까지 확인했다(17건 주입 시험).
+각 시험은 **고친 코드를 되돌리면 실패하는 것**까지 확인했다(18건 주입 시험).
 
 ## 알려진 정리 대상
 
