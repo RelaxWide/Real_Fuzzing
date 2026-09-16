@@ -147,11 +147,26 @@ sequence 만 세면 정상 적용된 corpus_eval·io_patterns 라운드가 전�
 
 ## P2 — 로컬 RAG
 
+DGX 에 **두 인스턴스**가 뜬다. 생성과 임베딩은 모델도 상한도 다른 별개 단계다.
+
+| 포트 | 모델 | 쓰임 | 설정 키 |
+|---|---|---|---|
+| 8000 | `nemotron-3-super` | 생성 (컨텍스트 1M) | `rag.vllm.base_url` · `model` |
+| 8001 | `bge-m3` | 임베딩 (입력 상한 8,192) | `rag.vllm.retrieval.embed_base_url` · `embed_model` |
+
 ```bash
-# DGX 에 bge-m3 를 두 번째 vLLM 인스턴스로 띄운 뒤
-python3 PC_Sampling/tools/rag_ingest.py <JSONL...> \
-  --embed-base-url http://192.168.137.238:8001/v1
+# 8001 에 bge-m3 를 띄운 뒤 — 엔드포인트는 설정에서 읽는다
+python3 PC_Sampling/tools/rag_ingest.py <JSONL...>
 ```
+
+임베딩 서버·모델·revision 은 `fuzzer_config.json` 의 `rag.vllm.retrieval` 에서 읽고,
+CLI 인자(`--embed-base-url` 등)가 그것을 덮어쓴다. **인덱스를 만들 때와 검색할 때의
+값이 같아야** 하므로 설정을 단일 출처로 둔다 — 두 곳에 두면 IP 가 바뀔 때 어긋나고,
+어긋나면 벡터 공간이 달라져 조용히 엉뚱한 문서가 뽑힌다. 실행하면 어느 서버에
+무엇으로 색인하는지 한 줄 찍는다(검색이 이상할 때 첫 단서다).
+
+`retrieval.embed_base_url` 이 비면 **생성 서버로** 임베딩하게 된다. 한 서버에 둘 다
+올린 구성도 있을 수 있어 막지는 않되, 경고를 띄운다.
 
 인덱스는 `rag/index/<version>/` 에 만들고 `current` 포인터만 원자적으로 교체한다.
 이전 버전은 지우지 않는다 — 실행 중 캠페인이 쓰고 있을 수 있다. `rag/index/` 는
@@ -193,10 +208,10 @@ task 무관한 목록으로 채운다. `query_block()` 이 쓰는 키와 같다.
 ## 검증 (P1·P2)
 
 ```bash
-python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 153 tests, OK
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 159 tests, OK
 ```
 
-`tests/test_v10_3_backend.py` 61개가 가짜 HTTP 서버로 DGX 없이 돈다. 주요 항목:
+`tests/test_v10_3_backend.py` 67개가 가짜 HTTP 서버로 DGX 없이 돈다. 주요 항목:
 
 - **스키마↔파서 대조**를 AST 로 강제 — 파서가 읽는 키가 스키마에 없으면 실패한다.
   계획 초안이 `data_len` 을 빠뜨렸던 것이 이 시험의 계기이고, 실제로 스키마에서 그
@@ -215,11 +230,14 @@ python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 153 tests, 
 - **멈춘 서버**: 오류 본문 일부만 받고 정지해도 상태·부분 본문·중단 사유가 남는지,
   HTTPError 래퍼 너머에서 소켓을 찾는지
 - **구버전 호출**: `meta` 없이 불러도 프롬프트의 `[RAG-QUERY]` 로 질의가 만들어지는지
+- **엔드포인트 출처**: ingest 가 설정에서 서버·모델·revision 을 읽는지, CLI 가 그것을
+  덮어쓰는지, 설정에 8000(생성)·8001(임베딩)이 서로 다르게 살아 있는지
+- **임베딩 폴백**: `embed_base_url` 이 없어 생성 서버로 갈 때 경고가 뜨는지
 - **깔때기**: 적용된 워크로드가 채택으로 세어지는지(정상0건이 아닌지)
 - **인덱스 정합성**: 상한 초과 청크 분할 후 본문 전량 보존·본문↔벡터 일치, 청크 크기·
   revision 변경 시 재임베딩, doc_id 중복·영벡터 거부, 락, 모델 불일치 인덱스 거부
 
-각 시험은 **고친 코드를 되돌리면 실패하는 것**까지 확인했다(14건 주입 시험).
+각 시험은 **고친 코드를 되돌리면 실패하는 것**까지 확인했다(16건 주입 시험).
 
 ## 알려진 정리 대상
 

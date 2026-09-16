@@ -43,7 +43,13 @@ def _settings(cfg):
     out = _defaults()
     out.update({k: v for k, v in (cfg.get("retrieval") or {}).items() if k in out})
     if not out["embed_base_url"]:
+        # 한 서버에 생성·임베딩을 함께 올린 구성이면 맞는 폴백이라 막지는 않는다.
+        #   다만 nemotron(8000)·bge-m3(8001) 를 나눠 띄운 구성에서는 임베딩이 생성
+        #   서버로 가고, 그래도 점수는 계산되므로 조용히 엉뚱한 문서가 뽑힌다.
         out["embed_base_url"] = cfg["base_url"]
+        _log.warning("[LLM/rag] retrieval.embed_base_url 이 없어 **생성 서버**(%s)로 "
+                     "임베딩합니다 — 임베딩 서버를 따로 띄웠다면 설정을 확인하세요",
+                     out["embed_base_url"])
     out["embed_base_url"] = str(out["embed_base_url"]).rstrip("/")
     return out
 

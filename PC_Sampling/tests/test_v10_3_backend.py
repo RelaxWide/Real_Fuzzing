@@ -4,6 +4,7 @@
 """
 import ast
 import json
+import logging
 import queue
 import re
 import shutil
@@ -1099,6 +1100,103 @@ class LegacyCallerCanStillUseTheQueryBlock(unittest.TestCase):
         self.assertEqual(
             rag_retrieval.query_from(seen['meta'], seen['meta'].get('user_prompt', ''), 100),
             ('FWCommit Sanitize', 'prompt_block'))
+
+
+class IngestTakesEndpointsFromTheConfig(unittest.TestCase):
+    """색인할 때와 검색할 때의 임베딩 서버·모델이 같아야 한다 — 설정이 단일 출처다."""
+
+    def setUp(self):
+        spec = __import__('importlib.util', fromlist=['util']).spec_from_file_location(
+            'rag_ingest_cfg', ROOT / 'tools/rag_ingest.py')
+        self.mod = __import__('importlib.util', fromlist=['util']).module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def jsonl(self, d):
+        p = Path(d) / 'docs.jsonl'
+        p.write_text(json.dumps({'doc_id': 'a', 'title': 'A', 'content': 'hello',
+                                 'permission_groups': []}) + '\n', encoding='utf-8')
+        return str(p)
+
+    def config(self, d, **retrieval):
+        p = Path(d) / 'cfg.json'
+        p.write_text(json.dumps({'rag': {'vllm': {'retrieval': retrieval}}}),
+                     encoding='utf-8')
+        return str(p)
+
+    @staticmethod
+    def embed_reply(seen):
+        def reply(path, body):
+            seen.append((path, body.get('model')))
+            return 200, {'data': [{'index': i, 'embedding': [1.0, 0.0]}
+                                  for i in range(len(body['input']))]}
+        return reply
+
+    def test_endpoint_and_model_come_from_the_config_when_not_given(self):
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            with FakeServer(self.embed_reply(seen)) as srv:
+                cfg = self.config(d, embed_base_url=srv.base, embed_model='bge-m3-cfg',
+                                  embed_model_revision='rev-cfg')
+                self.mod.main([self.jsonl(d), '--index-dir', str(Path(d) / 'index'),
+                               '--config', cfg])
+            self.assertTrue(seen, '설정의 임베딩 서버로 요청이 가지 않았다')
+            self.assertEqual(seen[0][1], 'bge-m3-cfg')
+            manifest = json.loads((Path(d) / 'index' / (
+                Path(d) / 'index' / 'current').read_text().strip()
+                / 'manifest.json').read_text())
+            self.assertEqual(manifest['embed_model_revision'], 'rev-cfg',
+                             'revision 이 설정에서 안 왔다')
+
+    def test_cli_overrides_the_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            with FakeServer(self.embed_reply(seen)) as srv:
+                cfg = self.config(d, embed_base_url='http://127.0.0.1:1/v1',
+                                  embed_model='from-config')
+                self.mod.main([self.jsonl(d), '--index-dir', str(Path(d) / 'index'),
+                               '--config', cfg, '--embed-base-url', srv.base,
+                               '--embed-model', 'from-cli'])
+            self.assertEqual(seen[0][1], 'from-cli', 'CLI 인자가 설정에 밀렸다')
+
+    def test_unreadable_config_falls_back_without_crashing(self):
+        with tempfile.TemporaryDirectory() as d:
+            got = self.mod.config_defaults(str(Path(d) / 'missing.json'))
+            self.assertEqual(got, dict.fromkeys(self.mod.FALLBACK))
+
+    def test_repo_config_actually_carries_the_two_endpoints(self):
+        """8000=생성, 8001=임베딩 이 설정에 살아 있는지."""
+        cfg = json.loads((ROOT / 'fuzzer_config.json').read_text(encoding='utf-8'))
+        vllm = cfg['rag']['vllm']
+        self.assertIn(':8000', vllm['base_url'])
+        self.assertEqual(vllm['model'], 'nemotron-3-super')
+        self.assertIn(':8001', vllm['retrieval']['embed_base_url'])
+        self.assertEqual(vllm['retrieval']['embed_model'], 'bge-m3')
+        self.assertNotEqual(vllm['base_url'], vllm['retrieval']['embed_base_url'],
+                            '생성·임베딩이 같은 엔드포인트를 가리킨다')
+        self.assertEqual(self.mod.config_defaults(str(ROOT / 'fuzzer_config.json'))[
+            'embed_base_url'], vllm['retrieval']['embed_base_url'])
+
+
+class MissingEmbedEndpointIsNotSilent(unittest.TestCase):
+    def test_falling_back_to_the_generation_server_warns(self):
+        from rag import rag_retrieval as rr
+        cfg = {'base_url': 'http://gen-server:8000/v1', 'retrieval': {'enabled': True}}
+        with self.assertLogs(level='WARNING') as caught:
+            opts = rr._settings(cfg)
+        self.assertEqual(opts['embed_base_url'], 'http://gen-server:8000/v1')
+        self.assertTrue(any('embed_base_url' in line for line in caught.output),
+                        '임베딩이 생성 서버로 가는데 조용했다')
+
+    def test_configured_endpoint_does_not_warn(self):
+        from rag import rag_retrieval as rr
+        cfg = {'base_url': 'http://gen-server:8000/v1',
+               'retrieval': {'enabled': True,
+                             'embed_base_url': 'http://embed-server:8001/v1'}}
+        logging.disable(logging.NOTSET)
+        with patch.object(rr._log, 'warning') as warn:
+            opts = rr._settings(cfg)
+        self.assertEqual(opts['embed_base_url'], 'http://embed-server:8001/v1')
+        warn.assert_not_called()
 
 
 if __name__ == '__main__':

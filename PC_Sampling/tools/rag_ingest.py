@@ -5,6 +5,10 @@
                                 [--embed-base-url http://HOST:8001/v1]
                                 [--embed-model bge-m3] [--max-chars 6000]
 
+임베딩 서버·모델·revision 은 기본적으로 `fuzzer_config.json` 의
+`rag.vllm.retrieval` 에서 읽는다 — 퍼저가 **검색할 때** 쓰는 값과 인덱스를 **만들 때**
+쓰는 값이 같아야 하기 때문이다. CLI 인자는 그것을 덮어쓰는 일회성 예외다.
+
 입력 JSONL 한 줄 = {"doc_id", "title", "content", "permission_groups"}.
 내부 스펙도 같은 형식이므로 **추가는 명령 한 줄**이다.
 
@@ -200,20 +204,63 @@ def embed_all(chunks, base_url, model, batch, timeout):
     return out
 
 
+# CLI·설정 어디에도 없을 때의 최후 기본값. 퍼징 PC 에서 바로 쓰기 위한 값이지
+#   운영 값이 아니다 — 운영 값은 fuzzer_config.json 에 있다.
+FALLBACK = {"embed_base_url": "http://127.0.0.1:8001/v1",
+            "embed_model": "bge-m3",
+            "embed_model_revision": None}
+
+
+def config_defaults(path):
+    """`rag.vllm.retrieval` 을 기본값으로 읽는다.
+
+    IP·모델이 설정과 CLI 두 곳에 살면 언젠가 어긋난다. 설정이 단일 출처이고
+    CLI 인자는 그것을 덮어쓰는 일회성 예외다(계획: "IP 가 바뀔 수 있어 설정값으로
+    받는다"). 퍼저가 검색할 때 쓰는 값과 인덱스를 만들 때 쓰는 값이 같아야 한다 —
+    다르면 벡터 공간이 달라져 조용히 엉뚱한 문서가 뽑힌다.
+    """
+    out = dict.fromkeys(FALLBACK)
+    try:
+        cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+        table = ((cfg.get("rag") or {}).get("vllm") or {}).get("retrieval") or {}
+        for key in out:
+            if table.get(key):
+                out[key] = table[key]
+    except Exception as exc:
+        print(f"[ingest] 설정을 읽지 못했습니다(내장 기본값 사용): {path}: {exc}")
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="JSONL → 로컬 RAG 인덱스 (P2)")
     ap.add_argument("inputs", nargs="+", help="사내 PDF→JSONL 산출물")
     ap.add_argument("--index-dir", default=str(ROOT / "rag" / "index"))
-    ap.add_argument("--embed-base-url", default="http://127.0.0.1:8001/v1")
-    ap.add_argument("--embed-model", default="bge-m3")
+    ap.add_argument("--config", default=str(ROOT / "fuzzer_config.json"),
+                    help="embed_base_url·embed_model 기본값을 읽을 설정 파일")
+    ap.add_argument("--embed-base-url", default=None,
+                    help="기본값: 설정의 rag.vllm.retrieval.embed_base_url")
+    ap.add_argument("--embed-model", default=None,
+                    help="기본값: 설정의 rag.vllm.retrieval.embed_model")
     ap.add_argument("--embed-model-revision", default=None,
                     help="manifest 에 기록하고 재사용·검색 시 대조한다. 이름이 같은 채로 "
-                         "모델이 교체되는 경우를 구분하는 유일한 수단이다")
+                         "모델이 교체되는 경우를 구분하는 유일한 수단이다. "
+                         "기본값: 설정의 rag.vllm.retrieval.embed_model_revision")
     ap.add_argument("--max-chars", type=int, default=6000,
                     help="청크 문자 상한(토큰 수 보장 아님)")
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--timeout", type=float, default=600.0)
     args = ap.parse_args(argv)
+
+    # 우선순위: CLI > 설정 > 내장 기본값.
+    defaults = config_defaults(args.config)
+    for key, fallback in FALLBACK.items():
+        if getattr(args, key) is None:
+            chosen = defaults[key] if defaults[key] is not None else fallback
+            setattr(args, key, chosen)
+    # 어느 서버에 무엇으로 색인하는지 남긴다 — 나중에 검색이 이상할 때 첫 단서다.
+    print(f"[ingest] 임베딩 서버: {args.embed_base_url}  model={args.embed_model}"
+          + (f"  revision={args.embed_model_revision}"
+             if args.embed_model_revision else "  revision=(미지정)"))
 
     import numpy as np
     index_dir = Path(args.index_dir)
