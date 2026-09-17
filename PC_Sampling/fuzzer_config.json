@@ -10,6 +10,16 @@
     "openocd_config_jtag": "products/BM9H1/openocd.cfg",
     "openocd_telnet_host": "127.0.0.1",
     "openocd_telnet_port": 4444,
+    "_comment_probe_usb_reset": "v10.3: OpenOCD 재시작이 모두 실패한 뒤의 **최후 수단**. J-Link 는 자체 MCU 라 호스트 재부팅으로 리셋되지 않아, 고착되면 사람이 케이블을 뽑아야 했다. vendor_ids 에 일치하는 USB 장치만 만진다(DUT 는 NVMe/PCIe 라 무관). uhubctl 은 VBUS 를 실제로 끊어 재삽입과 동등하지만, 엉뚱한 포트를 끄면 위험하므로 location/port 를 명시했을 때만 쓴다. 전기적으로 죽은 링크는 이걸로도 안 살아난다.",
+    "probe_usb_reset": {
+      "enabled": true,
+      "vendor_ids": ["1366"],
+      "settle_sec": 3.0,
+      "uhubctl_binary": "uhubctl",
+      "uhubctl_location": null,
+      "uhubctl_port": null,
+      "uhubctl_delay_sec": 2
+    },
     "openocd_startup_timeout": 10.0,
     "pcsr_core0": "0x80030084",
     "pcsr_core1": "0x80032084",

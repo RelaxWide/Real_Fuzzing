@@ -466,7 +466,11 @@ class IntegrationTests(unittest.TestCase):
                 return {'bytes': node.hex()}
             return node
         frozen = json.loads((ROOT / 'tests/fixtures/v10_2_device_ast.json').read_text())
+        overrides = frozen.get('overrides', {})
         for source in DEVICE_AST_FILES:
+            # 파일별 override 는 **검토를 거쳐 의도적으로 달라진** 경로만 담는다
+            # (fixture 의 amendments 에 이유가 남는다). 없는 경로는 기준선에 묶인다.
+            per_file = overrides.get(source.name, {})
             tree = ast.parse(source.read_text())
             classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
             for path, expected in frozen['hashes'].items():
@@ -476,7 +480,8 @@ class IntegrationTests(unittest.TestCase):
                     node = next(n for n in node.body
                                 if isinstance(n, ast.FunctionDef) and n.name == method)
                 value = json.dumps(normalize(node), sort_keys=True, separators=(',', ':'))
-                self.assertEqual(hashlib.sha256(value.encode()).hexdigest(), expected,
+                self.assertEqual(hashlib.sha256(value.encode()).hexdigest(),
+                                 per_file.get(path, expected),
                                  f'{source.name}:{path}')
 
     def test_comparison_tool_reports_complement_without_claiming_significance(self):

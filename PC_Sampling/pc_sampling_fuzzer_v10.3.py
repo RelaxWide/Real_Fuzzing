@@ -574,6 +574,8 @@ OPENOCD_CONFIG_JTAG     = _G['openocd_config_jtag']
 OPENOCD_TELNET_HOST     = _G['openocd_telnet_host']
 OPENOCD_TELNET_PORT     = _G['openocd_telnet_port']
 OPENOCD_STARTUP_TIMEOUT = _G['openocd_startup_timeout']
+# 디버그 프로브 USB 강제 복구(최후 수단). 사다리의 마지막 칸 — §_probe_usb_recover 참조.
+PROBE_USB_RESET   = _G.get('probe_usb_reset', {}) or {}
 
 # PCSR 주소 (CoreBase + 0x084, APB-AP ap-num 0)
 PCSR_CORE0      = _G['pcsr_core0']
@@ -2926,6 +2928,114 @@ class OpenOCDPCSampler:
             log.warning(f"[OpenOCD] 타겟 재초기화 예외: {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # 최후 수단: 디버그 프로브 USB 강제 복구
+    # ------------------------------------------------------------------
+    # OpenOCD 재시작으로도 안 붙을 때, 프로브 **자체**가 고착된 경우가 있다. J-Link 는
+    # 자체 MCU/펌웨어를 갖고 있어 호스트 재부팅으로도 리셋되지 않는다(대부분의 보드가
+    # S5 에서도 USB 에 +5V 를 유지한다). 사람이 케이블을 뽑는 것이 유일한 해제 수단이던
+    # 자리를, 여기서 소프트웨어로 대신한다.
+    #
+    # 두 단계다. uhubctl 은 **VBUS 를 실제로 끊어** 물리적 재삽입과 동등하고,
+    # USBDEVFS_RESET 은 재열거만 시킨다(더 약하지만 의존성이 없다).
+    #
+    # ⚠ 범위를 좁히는 것이 중요하다. 설정된 **vendor id 에 일치하는 장치만** 만진다.
+    #   uhubctl 은 허브 포트 전원을 끊으므로 위치를 추측하지 않는다 — 설정에 명시했을
+    #   때만 쓴다(엉뚱한 포트를 끄면 DUT 전원이나 키보드가 날아간다).
+    #   DUT 는 NVMe(PCIe)라 USB 리셋의 영향을 받지 않는다.
+
+    _USBDEVFS_RESET = 0x5514          # _IO('U', 20)
+
+    def _probe_usb_devices(self):
+        """설정된 vendor id 에 일치하는 USB 장치 → [(devnode, sysfs이름, 'vid:pid')]."""
+        def _vid(raw):
+            # lstrip('0x') 는 **문자 집합**을 지운다 — '0d28' → 'd28' 이 되어 0 으로
+            #   시작하는 vendor id 가 전부 어긋난다. 접두사만 떼고 4자리로 맞춘다.
+            text = str(raw).strip().lower()
+            if text.startswith('0x'):
+                text = text[2:]
+            return text.zfill(4)
+
+        vids = {_vid(v) for v in (PROBE_USB_RESET.get('vendor_ids') or ['1366'])}
+        root = Path(PROBE_USB_RESET.get('sysfs_root') or '/sys/bus/usb/devices')
+        found = []
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            return found
+        for dev in entries:
+            try:
+                vid = _vid((dev / 'idVendor').read_text())
+                if vid not in vids:
+                    continue
+                pid = (dev / 'idProduct').read_text().strip().lower()
+                bus = int((dev / 'busnum').read_text().strip())
+                num = int((dev / 'devnum').read_text().strip())
+            except (OSError, ValueError):
+                continue        # 디렉터리마다 있는 속성이 아니다(인터페이스 등)
+            found.append((f"/dev/bus/usb/{bus:03d}/{num:03d}", dev.name, f"{vid}:{pid}"))
+        return found
+
+    def _probe_usb_recover(self) -> bool:
+        """프로브 USB 를 강제로 되살린다. 실제로 무언가 했으면 True.
+
+        True 가 곧 성공은 아니다 — 호출자가 재기동을 한 번 더 시도해 확인한다.
+        """
+        if not PROBE_USB_RESET.get('enabled', True):
+            return False
+        acted = False
+
+        # ① uhubctl — VBUS 를 끊는 진짜 전원 사이클. 위치가 설정돼 있을 때만.
+        loc, port = PROBE_USB_RESET.get('uhubctl_location'), PROBE_USB_RESET.get('uhubctl_port')
+        if loc and port:
+            cmd = [PROBE_USB_RESET.get('uhubctl_binary', 'uhubctl'),
+                   '-l', str(loc), '-p', str(port), '-a', 'cycle',
+                   '-d', str(PROBE_USB_RESET.get('uhubctl_delay_sec', 2))]
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=30)
+                if r.returncode == 0:
+                    log.warning(f"[Probe] uhubctl 전원 사이클 완료 ({loc} port {port})")
+                    acted = True
+                else:
+                    log.warning(f"[Probe] uhubctl 실패(rc={r.returncode}): "
+                                f"{r.stderr.decode(errors='replace')[:200]}")
+            except FileNotFoundError:
+                log.warning("[Probe] uhubctl 없음 — USBDEVFS_RESET 으로 진행")
+            except Exception as e:
+                log.warning(f"[Probe] uhubctl 예외: {e}")
+
+        # ② USBDEVFS_RESET — 재열거. 의존성 없음. root 필요.
+        devices = self._probe_usb_devices()
+        if not devices:
+            if not acted:
+                log.warning("[Probe] USB 프로브를 찾지 못했습니다 "
+                            "(vendor_ids 설정과 실제 장치를 확인하세요)")
+            return acted
+        import fcntl
+        for devnode, name, ident in devices:
+            try:
+                fd = os.open(devnode, os.O_WRONLY)
+            except PermissionError:
+                log.error(f"[Probe] {devnode} 열기 권한 없음 — root 로 실행해야 합니다")
+                continue
+            except OSError as e:
+                log.warning(f"[Probe] {devnode} 열기 실패: {e}")
+                continue
+            try:
+                fcntl.ioctl(fd, self._USBDEVFS_RESET, 0)
+                log.warning(f"[Probe] USB 리셋 완료: {name} ({ident})")
+                acted = True
+            except OSError as e:
+                log.warning(f"[Probe] {name} USB 리셋 실패: {e}")
+            finally:
+                os.close(fd)
+
+        if acted:
+            settle = float(PROBE_USB_RESET.get('settle_sec', 3.0))
+            log.warning(f"[Probe] USB 재열거 대기 {settle:.0f}s...")
+            time.sleep(settle)
+        return acted
+
     def _reconnect(self, attempts: int = 3) -> bool:
         log.warning("[OpenOCD] 재시작 시도...")
         self._stop_worker()   # 소켓/프로세스 만지기 전 샘플링 스레드 정지(경합 방지)
@@ -2959,8 +3069,19 @@ class OpenOCDPCSampler:
                     log.warning(f"[OpenOCD] 재시작 성공 ({_i}/{attempts}회차)")
                 return True
             log.warning(f"[OpenOCD] 재시작 {_i}/{attempts} 실패"
-                        + (" — USB 해제 대기 후 재시도..." if _i < attempts else " — 포기"))
+                        + (" — USB 해제 대기 후 재시도..." if _i < attempts else
+                           " — 프로브 USB 강제 복구로 escalate"))
             self._terminate_proc()   # 부분 기동된 프로세스 정리 후 다음 시도
+        # ── 최후 수단 — 여기까지 왔으면 프로브 자체가 고착됐을 수 있다 ──
+        #   전기적으로 죽은 링크는 이걸로도 안 살아난다. 고착만 푼다.
+        if self._probe_usb_recover():
+            self._kill_stale_openocd()
+            if self._launch_openocd() and self._reopen_telnet():
+                log.warning("[OpenOCD] 프로브 USB 복구 후 재시작 성공")
+                return True
+            log.error("[OpenOCD] 프로브 USB 복구 후에도 재시작 실패 — 전기적 문제일 수 있습니다"
+                      " (VTarget·배선·프로브 교차 확인: docs/RUNBOOK_v10.3.md)")
+            self._terminate_proc()
         return False
 
     def _reopen_telnet(self) -> bool:

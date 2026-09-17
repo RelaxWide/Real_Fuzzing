@@ -4,7 +4,7 @@
 구현 현황 정본은 [pc_sampling_fuzzer_v10.3.md](pc_sampling_fuzzer_v10.3.md) 를 본다.
 이 문서는 **실제로 돌리는 방법**과 **걸렸던 함정**을 모은 것이다.
 
-작성 기준 2026-09-16. 시험 182개 통과, 인덱스 968청크 구축 완료.
+작성 기준 2026-09-17. 시험 194개 통과, 인덱스 968청크 구축 완료.
 
 ---
 
@@ -277,6 +277,43 @@ LLM 이 꺼진다.
 
 ---
 
+## 6-1. 디버그 프로브가 안 붙을 때
+
+퍼저의 복구 사다리는 이렇다. 위에서 실패하면 아래로 내려간다.
+
+| 칸 | 하는 일 | 비용 |
+|---|---|---|
+| `_reinit_target()` | OpenOCD 유지 + 디버그 전원 재활성화 + proc 재정의 + telnet 재연결 | ~1초 |
+| `_reconnect(3회)` | telnet `shutdown` 으로 J-Link USB 를 정상 해제한 뒤 OpenOCD 재시작 | 수초 |
+| **`_probe_usb_recover()`** | **프로브 USB 강제 복구 — 최후 수단** | ~3초 |
+| 종료 | | |
+
+**최후 수단이 필요한 이유**: J-Link 는 자체 MCU·펌웨어를 갖고 있어 **호스트를 재부팅해도
+리셋되지 않는다**(대부분의 보드가 S5 에서도 USB 에 +5V 를 유지한다). 프로브가 고착되면
+사람이 케이블을 뽑는 것이 유일한 해제 수단이었고, 그 자리를 소프트웨어로 대신한다.
+
+```jsonc
+"probe_usb_reset": {
+  "enabled": true,
+  "vendor_ids": ["1366"],        // SEGGER. CMSIS-DAP 이면 "0d28" 등 추가
+  "settle_sec": 3.0,
+  "uhubctl_location": null,      // 설정해야만 uhubctl 을 쓴다
+  "uhubctl_port": null
+}
+```
+
+두 단계다.
+
+1. **uhubctl** — VBUS 를 실제로 끊어 물리적 재삽입과 동등하다. 다만 **위치를 추측하지
+   않는다.** 엉뚱한 포트를 끄면 DUT 전원이나 키보드가 날아가므로, `uhubctl_location`·
+   `uhubctl_port` 를 명시했을 때만 쓴다.
+2. **`USBDEVFS_RESET`** — 재열거만 시킨다. 더 약하지만 의존성이 없다. root 필요.
+
+`vendor_ids` 에 일치하는 USB 장치만 만진다. **DUT 는 NVMe(PCIe)라 영향받지 않는다.**
+
+> ⚠ **전기적으로 죽은 링크는 이걸로도 안 살아난다.** 고착만 푼다. 재부팅·재삽입에도
+> 안 붙고 같은 DUT 가 다른 PC 에서 되면 프로브·USB·접지 쪽 고장이다 — §7 을 볼 것.
+
 ## 7. 트러블슈팅 — 실제로 걸렸던 것들
 
 증상이 원인을 안 가리키는 것들만 모았다. **위에서부터** 의심한다.
@@ -293,6 +330,9 @@ LLM 이 꺼진다.
 | `Errno 110 timed out` | 패킷이 조용히 버려짐(DROP) | 방화벽 |
 | ping 은 되는데 TCP 만 113 | 방화벽이 ICMP 는 허용, TCP 는 REJECT | 8000/8001 열기 |
 | `다른 색인 작업이 진행 중입니다` | 중단된 실행이 남긴 `.ingest.lock` | 파일 지우고 재실행 |
+| `swd: read data parity mismatch` + DPIDR 값이 매번 다름 | SWD 신호 무결성 | `adapter speed` 를 4000 → 1000 → 500 으로. 배선·GND 리턴 |
+| 재부팅·재삽입에도 **영영** 안 붙고 같은 DUT 는 다른 PC 에서 됨 | 마진이 아니라 **고장**. 프로브·USB 포트·접지 | 프로브 USB 30초 분리 → `VTarget` 확인 → USB 포트 변경 → 프로브를 정상 PC 로 교차 확인 → 호스트·DUT 접지 통일. **속도 조절은 이 단계에서 무의미** |
+| `JLinkExe` 의 `VTarget = 0.000V` | VTref 배선 또는 프로브 입력 손상 | 커넥터 1번 핀 방향·핀 휨 확인. 프로브 교체 |
 
 오류 번호가 층을 정확히 가리킨다 — **113=거부(REJECT), 111=포트 없음, 110=버려짐(DROP).**
 
@@ -398,5 +438,5 @@ sudo no_proxy=192.168.10.1 http_proxy= https_proxy= \
   --product BM9K1 --nvme /dev/nvme0 --namespace 1 --rag
 
 # 시험
-python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 182 tests
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 194 tests
 ```

@@ -26,6 +26,19 @@
       "date": "2026-09-15",
       "base_commit": "1652cc8",
       "reason": "Normalize only line-boundary NUL in raw Telnet PCSR replies. Reproduced exact user response and fragmented CR/NUL input; internal corruption remains rejected."
+    },
+    {
+      "path": "OpenOCDPCSampler",
+      "file": "pc_sampling_fuzzer_v10.3.py",
+      "date": "2026-09-17",
+      "base_commit": "5dbb593",
+      "reason": "Last-resort probe USB recovery appended to the restart ladder (_probe_usb_devices/_probe_usb_recover + tail of _reconnect). Purely additive: PC read path (_read_all_pcs, _telnet_cmd, PCSR framing) is byte-identical; the only deletion is one log string. Scope is limited to USB devices matching configured vendor ids; the DUT is NVMe/PCIe and is not touched. v10.2 stays on the frozen baseline. Regression tests: test_v10_3_probe_recovery.py."
     }
-  ]
+  ],
+  "overrides_note": "hashes 는 모든 DEVICE_AST_FILES 에 적용되는 기준선이다. overrides 는 검토를 거쳐 **특정 파일에서만** 의도적으로 달라진 경로를 기록한다. v10.2 는 검증된 fallback 이라 계속 기준선 그대로여야 하고, 여기 올라오지 않은 파일·경로는 전부 기준선에 묶인다.",
+  "overrides": {
+    "pc_sampling_fuzzer_v10.3.py": {
+      "OpenOCDPCSampler": "29d98e16cfb522c3a4d16d100ff8ba1b7f64ccf2c0aa8dd004c2f4b1851c137f"
+    }
+  }
 }
