@@ -1,5 +1,9 @@
 # PM9M1_HP v10.2 OS freeze — 2026-09-15
 
+> 2026-09-17 재현에서는 SSH·키보드·감시 창이 살아 있는 상태에서 퍼저 PID의
+> 커널 `kmem_cache_alloc` fault가 확인됐다. 이전 전체 프리즈와 구분하며,
+> 최신 관측값과 미확정 가설은 [커널 fault 조사 인계](HANDOFF_PM9M1_HP_KERNEL_FAULT_20260917.md)를 먼저 볼 것.
+
 ## 1. Critical issues
 
 현재 확인된 OS 전체 프리즈의 직접 원인은 없다. 현상은 6.8.12, PM9M1_HP,
