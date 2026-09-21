@@ -370,6 +370,10 @@ LLM 이 꺼진다.
 
 ## 9. 앞으로 할 일
 
+장치 없이 먼저 확인하려면 [RAG 단독 테스트](RAG_SMOKE_TEST.md)를 따른다.
+`python3 PC_Sampling/tools/rag_smoke_test.py`로 기존 인덱스 검색, 생성 OFF/ON을
+검사하고 단계별 보고서를 저장한다.
+
 ### 0) 1분짜리 — revision 채우기
 
 현재 인덱스의 `embed_model_revision` 이 비어 있다. 이름이 같은 채로 모델이 교체되면
