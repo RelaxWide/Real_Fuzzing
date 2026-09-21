@@ -46,7 +46,10 @@ DEFAULTS = {
     "timeout_sec": 300.0,
     "max_tokens": 16384,
     "temperature": 0.7,
-    "chat_template_kwargs": None,          # None: 서버 기본값. Nemotron low_effort 등
+    # Nemotron chat template 제어. 서버에 chat_template_kwargs 로 그대로 전달된다.
+    #   enable_thinking: 추론 블록 생성 여부 / low_effort: 추론을 짧게.
+    #   None 이면 서버 기본값. 값은 불리언만 받는다(_chat 에서 검증).
+    "chat_template_kwargs": {"enable_thinking": True, "low_effort": True},
     "max_response_bytes": 8 * 1024 * 1024,  # 응답 크기 상한(계획 D2)
     "structured_output": True,
     "include_generators_in_schema": True,   # 중첩 anyOf 를 못 다루는 백엔드용 탈출구

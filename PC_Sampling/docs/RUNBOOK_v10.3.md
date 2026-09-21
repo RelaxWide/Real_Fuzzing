@@ -4,7 +4,7 @@
 구현 현황 정본은 [pc_sampling_fuzzer_v10.3.md](pc_sampling_fuzzer_v10.3.md) 를 본다.
 이 문서는 **실제로 돌리는 방법**과 **걸렸던 함정**을 모은 것이다.
 
-작성 기준 2026-09-21. 시험 240개 통과, 인덱스 968청크 구축 완료.
+작성 기준 2026-09-21. 시험 246개 통과, 인덱스 968청크 구축 완료.
 
 ---
 
@@ -103,6 +103,10 @@ JSONL 한 줄 = `{"doc_id", "title", "content", "permission_groups"}`.
     "timeout_sec": 300.0,                    // 임베딩+생성+JSON교정 **전체** 예산
     "max_tokens": 16384,
     "temperature": 0.7,
+    "chat_template_kwargs": {                // Nemotron 추론 제어 (null=서버 기본값)
+      "enable_thinking": true,               //   추론 블록 생성 여부
+      "low_effort": true                     //   추론을 짧게 → 생성 토큰↓ 응답↑
+    },
     "structured_output": true,               // json_schema 강제
     "include_generators_in_schema": true,    // 중첩 anyOf 못 다루는 백엔드용 탈출구
     "freeform_retry": false,
@@ -384,6 +388,23 @@ Nemotron 응답이 3분 넘게 걸릴 때 어디를 줄일지.
 15K~19K 토큰. prompt throughput 이 generation 의 약 20배라 **prefill 은 병목이 아니다**
 — 프롬프트 축소의 값어치는 prefill 시간이 아니라 **reasoning 길이를 줄이는 간접 효과**다.
 그래서 확실한 이득이라고 단정하지 않는다.
+
+### 추론 제어 — `chat_template_kwargs`
+
+서버에 그대로 전달된다. 불리언만 받으며 클라이언트가 **보내기 전에** 타입을 검증한다.
+`null` 이면 서버 기본값을 따라가므로, 무엇으로 돌고 있는지 알 수 없다 — 명시해 두는 편이
+낫다. 어떤 값으로 부른 응답인지는 `diagnostics.requested_chat_template_kwargs` 에 남는다.
+
+| 키 | 효과 |
+|---|---|
+| `enable_thinking` | 추론 블록 생성 여부. 끄면 짧고 빠르지만 형식 오류가 는다 |
+| `low_effort` | 추론을 짧게. **생성이 병목이므로 여기가 가장 큰 지렛대다** |
+
+> ⚠ `low_effort` 를 켜면 JSON 품질이 떨어져 교정 호출이 늘 수 있다. 최초 호출과 교정
+> 호출이 **`timeout_sec` 하나를 나눠 쓰므로**(§P1) 예산 초과가 늘 수 있다. 실제로
+> 추론을 낮췄을 때 예산 초과 20% 가 관측됐는데, **느려서가 아니라 재시도 때문일 수
+> 있다.** `diagnostics.correction` 이 붙어 있는지 먼저 보고, 그렇다면 `json_retries`
+> 를 줄이거나 `timeout_sec` 를 올리는 쪽이 답이다.
 
 ### 효과가 약한 것들 (실측으로 배제됨)
 

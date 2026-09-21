@@ -450,7 +450,11 @@
       "base_url": "http://192.168.10.1:8000/v1",
       "api_key": "not-used",
       "model": "nemotron-3-super",
-      "chat_template_kwargs": null,
+      "_comment_chat_template_kwargs": "Nemotron chat template 제어. 서버로 chat_template_kwargs 로 그대로 전달된다. enable_thinking=추론 블록 생성 여부(끄면 응답이 짧고 빠르지만 형식 오류가 는다). low_effort=추론을 짧게(생성 토큰이 줄어 응답이 빨라진다). 둘 다 불리언만 허용하며, 클라이언트가 타입을 검증한다. null 로 두면 서버 기본값을 쓴다. ※ low_effort 를 켜면 JSON 품질이 떨어져 교정 호출이 늘 수 있고, 최초 호출과 교정 호출이 timeout_sec 하나를 나눠 쓰므로 예산 초과가 늘 수 있다 — diagnostics.correction 과 finish_reason 을 보며 json_retries/timeout_sec 를 함께 조정할 것.",
+      "chat_template_kwargs": {
+        "enable_thinking": true,
+        "low_effort": true
+      },
       "timeout_sec": 300.0,
       "max_tokens": 16384,
       "temperature": 0.7,

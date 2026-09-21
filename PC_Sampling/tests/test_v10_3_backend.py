@@ -1493,5 +1493,62 @@ class ByteOrderMarkDoesNotBreakAnything(unittest.TestCase):
         self.assertEqual(got['model'], 'from-bom-file')
 
 
+class ChatTemplateControlsAreExplicit(unittest.TestCase):
+    """추론 제어는 설정에 **드러나 있어야** 한다 — null 이면 서버 기본값에 끌려간다."""
+
+    def test_config_spells_out_both_switches(self):
+        g = json.loads((ROOT / 'fuzzer_config.json').read_text(encoding='utf-8'))
+        kw = g['rag']['vllm']['chat_template_kwargs']
+        self.assertIsInstance(kw, dict, 'null 이면 서버 기본값에 의존한다')
+        self.assertIs(kw['enable_thinking'], True)
+        self.assertIs(kw['low_effort'], True)
+
+    def test_client_default_matches_the_config(self):
+        from rag import vllm_client
+        self.assertEqual(vllm_client.DEFAULTS['chat_template_kwargs'],
+                         {'enable_thinking': True, 'low_effort': True})
+
+    def test_kwargs_reach_the_request_payload(self):
+        from rag import vllm_client
+        with FakeServer(lambda p, b: ok_completion('{"seeds": []}')) as srv:
+            cfg = client_cfg(srv.base,
+                             chat_template_kwargs={'enable_thinking': True,
+                                                   'low_effort': False})
+            vllm_client.generate_rag_response(
+                's', 'u', {'task': 'new_group_seeds', 'config': cfg})
+            body = srv.seen[0][1]
+        self.assertEqual(body['chat_template_kwargs'],
+                         {'enable_thinking': True, 'low_effort': False})
+
+    def test_null_means_server_default_and_sends_nothing(self):
+        from rag import vllm_client
+        with FakeServer(lambda p, b: ok_completion('{"seeds": []}')) as srv:
+            cfg = client_cfg(srv.base, chat_template_kwargs=None)
+            vllm_client.generate_rag_response(
+                's', 'u', {'task': 'new_group_seeds', 'config': cfg})
+            body = srv.seen[0][1]
+        self.assertNotIn('chat_template_kwargs', body,
+                         'null 인데 키를 보내면 서버 기본값을 덮어쓴다')
+
+    def test_non_boolean_is_refused_before_sending(self):
+        from rag import vllm_client
+        with FakeServer(lambda p, b: ok_completion('{"seeds": []}')) as srv:
+            cfg = client_cfg(srv.base, chat_template_kwargs={'low_effort': 'yes'})
+            out = vllm_client.generate_rag_response(
+                's', 'u', {'task': 'new_group_seeds', 'config': cfg})
+        self.assertIn('true/false', out.get('error') or '')
+
+    def test_requested_kwargs_are_recorded_in_diagnostics(self):
+        from rag import vllm_client
+        with FakeServer(lambda p, b: ok_completion('{"seeds": []}')) as srv:
+            cfg = client_cfg(srv.base,
+                             chat_template_kwargs={'enable_thinking': False})
+            out = vllm_client.generate_rag_response(
+                's', 'u', {'task': 'new_group_seeds', 'config': cfg})
+        self.assertEqual(out['diagnostics']['requested_chat_template_kwargs'],
+                         {'enable_thinking': False},
+                         '어떤 설정으로 부른 응답인지 사후에 알 수 없다')
+
+
 if __name__ == '__main__':
     unittest.main()
