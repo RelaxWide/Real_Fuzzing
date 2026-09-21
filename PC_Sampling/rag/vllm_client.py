@@ -33,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-_log = logging.getLogger()          # 태그를 '[LLM' 로 시작시켜야 llm 전용 로그에 실린다
+_log = logging.getLogger("pcfuzz.rag.vllm_client")          # 태그를 '[LLM' 로 시작시켜야 llm 전용 로그에 실린다
 
 # ── 설정 ──────────────────────────────────────────────────────────────────
 DEFAULTS = {

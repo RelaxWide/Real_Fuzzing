@@ -1852,7 +1852,6 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     for _r in _early_buffer.records:
         if _r.levelno >= fh.level:
             fh.emit(_r)
-    _early_buffer.records.clear()
 
     # LLM 전용 로그: 모든 [LLM* 레코드를 output/llm/ 하위폴더에 별도로 모은다(검증 편의).
     # 요청/응답 원본 아카이브(llm_io.jsonl)도 이 폴더에 쌓임 → RAG 관련은 전부 llm/ 에서 확인.
@@ -1863,6 +1862,10 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     lfh.setFormatter(fmt)
     lfh.addFilter(_LlmOnlyFilter())
     logger.addHandler(lfh)
+    for _r in _early_buffer.records:
+        if _r.levelno >= lfh.level:
+            lfh.handle(_r)
+    _early_buffer.records.clear()
 
     # 콘솔: 초기화 단계에서는 WARNING 이상 전부 출력
     # 메인 퍼징 루프 진입 시 _FuzzingTerminalFilter 추가로 제한됨
@@ -5089,6 +5092,7 @@ class LlmBridge:
         self._pass_system = getattr(config, 'rag_pass_system', True)
         self._accepts_meta = False
         if not config.rag_enabled:
+            log.warning("[LLM] 비활성 — 최종 rag_enabled=false (--rag/--no-rag 및 설정 확인)")
             return
         try:
             mod = self._load_module(config.rag_module_path)
@@ -5147,6 +5151,8 @@ class LlmBridge:
             return
         self._worker = threading.Thread(target=self._run, daemon=True, name="LlmWorker")
         self._worker.start()
+        log.warning("[LLM] 워커 시작 — 초기시딩=%s, 요청주기=%ss (주기 요청은 명령 완료 후 확인)",
+                    RAG_SEED_AT_STARTUP, RAG_REQUEST_INTERVAL)
 
     def stop(self):
         self._stop.set()
@@ -5191,6 +5197,7 @@ class LlmBridge:
             _llm_started = time.monotonic()
             try:
                 system, user = req['system'], req['user']
+                log.warning("[LLM] 호출 시작: req_id=%s task=%s", req.get('req_id'), req['task'])
                 _meta = dict(req.get('meta') or {})
                 _meta.update({'task': req['task'], 'req_id': req.get('req_id'),
                               'user_prompt': user,
@@ -17702,7 +17709,9 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                 _built = self._llm_build_request('new_group_seeds')
                 _ctx = getattr(self, '_llm_pending_ctx', None)
                 self._llm_pending_ctx = None
-                if _built and self.llm.submit('new_group_seeds', _built[0], _built[1], 0, ctx=_ctx):
+                if _built and self.llm.submit(
+                        'new_group_seeds', _built[0], _built[1], 0, ctx=_ctx,
+                        meta=self._llm_backend_meta('new_group_seeds', _ctx)):
                     self._learning_submitted('new_group_seeds', _built[0], _built[1], _ctx)
                     log.warning("[LLM] 초기 시딩 요청 제출 (첫 결과는 다음 drain 에 적용)")
 

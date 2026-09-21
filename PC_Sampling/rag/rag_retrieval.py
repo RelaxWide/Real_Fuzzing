@@ -23,7 +23,7 @@ import re
 import time
 from pathlib import Path
 
-_log = logging.getLogger()
+_log = logging.getLogger("pcfuzz.rag.rag_retrieval")
 _QUERY_BLOCK = re.compile(r"\[RAG-QUERY\](.*?)\[/RAG-QUERY\]", re.S)
 
 # 캠페인은 시작할 때 해석한 인덱스 버전을 끝까지 쓴다.
