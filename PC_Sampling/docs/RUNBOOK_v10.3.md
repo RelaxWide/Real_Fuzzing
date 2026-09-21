@@ -4,7 +4,7 @@
 구현 현황 정본은 [pc_sampling_fuzzer_v10.3.md](pc_sampling_fuzzer_v10.3.md) 를 본다.
 이 문서는 **실제로 돌리는 방법**과 **걸렸던 함정**을 모은 것이다.
 
-작성 기준 2026-09-21. 시험 232개 통과, 인덱스 968청크 구축 완료.
+작성 기준 2026-09-21. 시험 240개 통과, 인덱스 968청크 구축 완료.
 
 ---
 
@@ -424,6 +424,51 @@ low-yield) 앞쪽을 취한다. 정렬을 다시 하지 않는다.
 "schema_max": 16        // 0 이면 전부
 ```
 
+## 6-4. BLAS 스레드 — 퍼저 hang 의 원인
+
+**검색(P2)을 켜면 퍼저가 hang 처럼 보이는 현상이 있었다.** `sched_yield` busy-wait 로
+관측됐고, 원인은 OpenBLAS 스레드풀이다.
+
+`rag_retrieval.retrieve()` 의 top-k 행렬곱(`vectors @ vec`)이 OpenBLAS 를 부른다.
+OpenBLAS 워커는 **연산이 끝난 뒤에도** 다음 작업을 기다리며 `sched_yield()` 로
+busy-wait 한다(기본 spin 시간이 길다). 퍼저는 샘플러·LLM 워커·메인 루프가 함께 도는
+멀티스레드 프로세스라, 코어 수만큼의 스핀 스레드가 CPU 를 태우고 다른 스레드를 굶긴다.
+
+### 실측
+
+| | OS 스레드 | 행렬곱 200회 | `sched_yield` |
+|---|---|---|---|
+| 제한 없음 | 4개 | 14.7 ms | **2,793회** |
+| `*_NUM_THREADS=1` | 1개 | 23.8 ms | **0회** |
+
+회당 0.073 → 0.119 ms. **60초에 한 번 도는 연산이라 무의미한 차이**이고, 스핀은 사라진다.
+
+### 조치
+
+`pc_sampling_fuzzer_v10.3.py` · `rag/rag_retrieval.py` · `tools/rag_ingest.py` 최상단에서
+**numpy import 보다 먼저** 아래를 `setdefault` 한다(사용자 지정값은 존중).
+
+```
+OPENBLAS_NUM_THREADS · OMP_NUM_THREADS · MKL_NUM_THREADS
+NUMEXPR_NUM_THREADS · VECLIB_MAXIMUM_THREADS = 1
+```
+
+> **순서가 전부다.** numpy 가 먼저 로드되면 환경변수는 무시된다. 이 코드베이스는 numpy
+> 를 전부 함수 안에서 지연 import 하므로 최상단 설정이 확실히 먼저 잡힌다. 시험이
+> 별도 프로세스를 띄워 "import 직후 값이 1이고 numpy 는 아직 미로드" 를 확인한다.
+
+함께 고친 것 — `retrieve()` 가 질의마다 `vectors.astype(np.float32)` 로 **인덱스 전체를
+복사**하고 있었다(10만 청크면 매 질의 400 MB). `_load()` 에서 한 번만 변환해 캐시한다.
+
+### hang 이 다시 나면
+
+```bash
+PID=$(pgrep -f pc_sampling_fuzzer)
+py-spy dump --pid $PID              # 모든 스레드의 파이썬 스택 — 이게 제일 빠르다
+ps -o nlwp= -p $PID                 # 스레드 수가 코어 수만큼이면 네이티브 풀 의심
+sudo strace -c -f -p $PID           # sched_yield 가 압도적이면 스핀
+```
+
 ## 7. 트러블슈팅 — 실제로 걸렸던 것들
 
 증상이 원인을 안 가리키는 것들만 모았다. **위에서부터** 의심한다.
@@ -440,6 +485,7 @@ low-yield) 앞쪽을 취한다. 정렬을 다시 하지 않는다.
 | `Errno 110 timed out` | 패킷이 조용히 버려짐(DROP) | 방화벽 |
 | ping 은 되는데 TCP 만 113 | 방화벽이 ICMP 는 허용, TCP 는 REJECT | 8000/8001 열기 |
 | `다른 색인 작업이 진행 중입니다` | 중단된 실행이 남긴 `.ingest.lock` | 파일 지우고 재실행 |
+| 검색 켠 뒤 퍼저가 **hang**, `sched_yield` busy-wait | OpenBLAS 스레드풀 스핀 | `*_NUM_THREADS=1` (§6-4). numpy import 보다 먼저 |
 | `swd: read data parity mismatch` + DPIDR 값이 매번 다름 | SWD 신호 무결성 | `adapter speed` 를 4000 → 1000 → 500 으로. 배선·GND 리턴 |
 | 재부팅·재삽입에도 **영영** 안 붙고 같은 DUT 는 다른 PC 에서 됨 | 마진이 아니라 **고장**. 프로브·USB 포트·접지 | 프로브 USB 30초 분리 → `VTarget` 확인 → USB 포트 변경 → 프로브를 정상 PC 로 교차 확인 → 호스트·DUT 접지 통일. **속도 조절은 이 단계에서 무의미** |
 | `JLinkExe` 의 `VTarget = 0.000V` | VTref 배선 또는 프로브 입력 손상 | 커넥터 1번 핀 방향·핀 휨 확인. 프로브 교체 |

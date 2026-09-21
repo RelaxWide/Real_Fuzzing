@@ -17,6 +17,20 @@
 토크나이저는 쓰지 않는다. 길이 제한은 문자 수 기준이며 **정확한 토큰 수를 보장한다고
 표현하지 않는다** — 퍼징 PC 에 transformers/sentencepiece 를 다시 들이지 않기 위해서다.
 """
+# ── BLAS 스레드 제한 — **numpy import 보다 반드시 먼저** ──────────────────
+#   OpenBLAS 워커는 연산이 끝난 뒤에도 다음 작업을 기다리며 sched_yield() 로
+#   busy-wait 한다(기본 spin 시간이 길다). 퍼저는 샘플러·LLM 워커·메인 루프가
+#   같이 도는 멀티스레드 프로세스라, 코어 수만큼의 스핀 스레드가 CPU 를 태우고
+#   다른 스레드를 굶겨 hang 처럼 보인다. 실제로 rag_retrieval 의 top-k 행렬곱에서
+#   관측됐다.
+#   여기 쓰이는 행렬곱은 (청크수 × 1024) @ (1024,) 하나뿐이고 단일 스레드로 1ms 도
+#   안 걸린다 — 스레드를 늘려 얻는 게 없다.
+#   setdefault 라 사용자가 명시적으로 지정한 값은 존중한다.
+import os as _os_blas
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    _os_blas.environ.setdefault(_v, "1")
+
 import json
 import logging
 import re
@@ -89,7 +103,10 @@ def _load(index_dir):
     _log.warning("[LLM/rag] 인덱스 %s — 청크 %d개, %d차원, 모델 %s",
                  version.name, len(chunks), vectors.shape[1],
                  manifest.get("embed_model"))
-    _PINNED[key] = (manifest, chunks, vectors, version)
+    # float16 저장분을 질의마다 float32 로 복사하면 인덱스 크기에 비례해 낭비가 커진다
+    #   (10만 청크면 매 질의 400 MB). 한 번만 변환해 캐시한다.
+    matrix32 = vectors.astype(np.float32)
+    _PINNED[key] = (manifest, chunks, matrix32, version)
     return _PINNED[key]
 
 
@@ -148,7 +165,8 @@ def retrieve(meta, cfg, deadline):
         raise ValueError(f"질의 벡터 차원 불일치: 질의={vec.shape[0]} "
                          f"인덱스={vectors.shape[1]} ({version.name})")
     norm = float(np.linalg.norm(vec)) or 1.0
-    scores = (vectors.astype(np.float32) @ (vec / norm))
+    # vectors 는 _load 에서 이미 float32 로 변환·캐시된 것이다(질의마다 복사하지 않는다).
+    scores = vectors @ (vec / norm)
 
     groups = opts["permission_groups"]
     order = np.argsort(-scores)

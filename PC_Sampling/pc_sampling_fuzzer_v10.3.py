@@ -58,6 +58,17 @@ Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/�
 
 from __future__ import annotations
 
+# ── BLAS 스레드 제한 — **numpy 를 쓰는 어떤 import 보다 먼저** ────────────
+#   OpenBLAS 워커는 연산 후에도 sched_yield() 로 busy-wait 한다. 퍼저는 샘플러·
+#   LLM 워커·메인 루프가 같이 도는 멀티스레드 프로세스라, 코어 수만큼의 스핀
+#   스레드가 다른 스레드를 굶겨 hang 처럼 보인다. RAG 검색의 top-k 행렬곱
+#   (rag_retrieval)에서 실제로 관측됐다. 이 프로세스의 BLAS 연산은 그 하나뿐이고
+#   단일 스레드로 1ms 도 안 걸린다. setdefault 라 사용자 지정값은 존중한다.
+import os as _os_blas
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    _os_blas.environ.setdefault(_v, "1")
+
 import socket
 import struct
 import time

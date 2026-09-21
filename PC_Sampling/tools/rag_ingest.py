@@ -46,6 +46,20 @@ chunks/vectors/manifest 중 일부만 갱신된 채 중단되면 행 번호가 �
 예외로 올려 **인덱스를 게시하지 않는다** — 조용히 누락된 인덱스가 가장 나쁘다.
 (문자 수는 토큰 수 보장이 아니다. 토크나이저 의존성을 들이지 않기 위한 선택이다.)
 """
+# ── BLAS 스레드 제한 — **numpy import 보다 반드시 먼저** ──────────────────
+#   OpenBLAS 워커는 연산이 끝난 뒤에도 다음 작업을 기다리며 sched_yield() 로
+#   busy-wait 한다(기본 spin 시간이 길다). 퍼저는 샘플러·LLM 워커·메인 루프가
+#   같이 도는 멀티스레드 프로세스라, 코어 수만큼의 스핀 스레드가 CPU 를 태우고
+#   다른 스레드를 굶겨 hang 처럼 보인다. 실제로 rag_retrieval 의 top-k 행렬곱에서
+#   관측됐다.
+#   여기 쓰이는 행렬곱은 (청크수 × 1024) @ (1024,) 하나뿐이고 단일 스레드로 1ms 도
+#   안 걸린다 — 스레드를 늘려 얻는 게 없다.
+#   setdefault 라 사용자가 명시적으로 지정한 값은 존중한다.
+import os as _os_blas
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    _os_blas.environ.setdefault(_v, "1")
+
 import argparse
 import contextlib
 import glob as globlib
