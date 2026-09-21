@@ -31,3 +31,30 @@ class ThinkingTests(unittest.TestCase):
                         srv.base, chat_template_kwargs=template, retrieval={'enabled': False})})
                 self.assertIn('chat_template_kwargs', result['error'])
                 self.assertEqual(srv.seen, [])
+
+    def test_reasoning_aliases_are_measured_without_changing_final_content(self):
+        cases = [
+            ({'reasoning': 'abcde'}, 'reasoning', 5),
+            ({'reasoning_content': 'abc'}, 'reasoning_content', 3),
+            ({'reasoning_content': None, 'reasoning': 'abcde'}, 'reasoning', 5),
+            ({'reasoning_content': '', 'reasoning': 'abcde'}, 'reasoning', 5),
+            ({'reasoning_content': 'abc', 'reasoning': 'abcde'}, 'reasoning_content', 3),
+            ({}, None, 0),
+        ]
+        for fields, field, count in cases:
+            with self.subTest(fields=fields):
+                def reply(path, body):
+                    status, payload = ok_completion('{"seeds": []}')
+                    payload['choices'][0]['message'].update(fields)
+                    payload['usage'] = {'completion_tokens': 53}
+                    return status, payload
+                with FakeServer(reply) as srv:
+                    result = vllm_client.generate_rag_response('s', 'u', {
+                        'task': 'new_group_seeds', 'config': client_cfg(
+                            srv.base, retrieval={'enabled': False})})
+                self.assertEqual(result['raw'], '{"seeds": []}')
+                diag = result['diagnostics']
+                self.assertEqual(diag['reasoning_chars'], count)
+                self.assertEqual(diag['reasoning_field'], field)
+                self.assertEqual(diag['content_chars'], len(result['raw']))
+                self.assertEqual(diag['usage']['completion_tokens'], 53)

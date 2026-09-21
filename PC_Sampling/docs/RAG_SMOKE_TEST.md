@@ -116,3 +116,11 @@ low_effort는 엄격한 추론 토큰 상한이 아니다. max_tokens·검색량
 
 출처: [NVIDIA 모델 카드의 Low-effort reasoning](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8#api-client).
 NVIDIA RAG Blueprint 전용 LLM_LOW_EFFORT 환경변수는 이 퍼저가 읽지 않는다.
+
+추론 진단은 서버별 `message.reasoning_content`와 `message.reasoning`을 모두 지원한다.
+둘 다 비어 있지 않은 문자열이면 reasoning_content를 우선하며 합산하지 않는다.
+`reasoning_field`에 선택한 키, `reasoning_chars`에 길이, `content_chars`에 최종 응답
+길이를 남긴다. 추론 본문은 저장하지 않고 서버의 usage는 원형 그대로 보존한다.
+문자 수만으로 정확한 추론 토큰 수나 추론/최종 출력 소요 시간을 계산할 수는 없다.
+필드 계측 수정 자체는 생성 시간을 줄이지 않는다. 추론 OFF 비교에는
+`{"enable_thinking": false}`를 사용한다. null은 OFF가 아니라 서버 기본값이다.

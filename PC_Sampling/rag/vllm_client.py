@@ -247,12 +247,22 @@ def _chat(system, user, cfg, schema, deadline):
     text = message.get("content")
     if not isinstance(text, str):
         raise BackendError(f"content 가 문자열이 아님: {str(choices[0])[:500]}")
+    # 서버/파서 버전에 따라 reasoning_content 또는 reasoning 으로 분리된다.
+    # 두 키가 함께 있으면 한 필드만 선택해 중복 집계하지 않는다.
+    reasoning, reasoning_field = "", None
+    for key in ("reasoning_content", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str) and value:
+            reasoning, reasoning_field = value, key
+            break
     return text, {
         "finish_reason": choices[0].get("finish_reason"),
         "usage": data.get("usage"),
         "model": data.get("model"),
         # 일부 모델은 사고 과정을 따로 준다. 길이만 남기고 본문은 싣지 않는다.
-        "reasoning_chars": len(message.get("reasoning_content") or ""),
+        "reasoning_chars": len(reasoning),
+        "reasoning_field": reasoning_field,
+        "content_chars": len(text),
         "schema_enforced": schema is not None,
     }
 
