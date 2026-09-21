@@ -92,6 +92,81 @@ class SchemaBridge:
             lines.append(s)
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------
+    # 다중 명령 스키마 — 필드 정의를 한 번만 쓴다
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _field_sig(f):
+        return (f['word'], f['hi'], f['lo'], f['ftype'],
+                tuple(f['valid'] or ()), tuple(f['vendor'] or ()),
+                tuple(f['reserved'] or ()), f.get('max_val'))
+
+    def _field_text(self, f):
+        """한 필드의 정의 문자열(이름 제외)."""
+        s = f"CDW{f['word']}[{f['hi']}:{f['lo']}] ({f['ftype']})"
+        if f["valid"]:
+            vs = list(f["valid"])
+            s += " valid=" + ",".join(hex(v) for v in vs[:8])
+            if len(vs) > 8:
+                s += f",...(+{len(vs) - 8})"
+        if f["vendor"]:
+            s += f" vendor=0x{f['vendor'][0]:x}-0x{f['vendor'][1]:x}"
+        if f["reserved"]:
+            s += f" reserved=0x{f['reserved'][0]:x}-0x{f['reserved'][1]:x}"
+        if f["ftype"] == "SLOT":
+            s += f" max={f['max_val']}"
+        return s
+
+    def schemas_to_prompt(self, names):
+        """여러 명령의 필드 정의를 **중복 없이** 렌더한다.
+
+        같은 필드(SLBA_LO/NLB/PRINFO 등)가 명령마다 그대로 반복되면서 스키마 섹션이
+        불필요하게 커졌다. 공통 정의를 용어집으로 한 번만 쓰고, 명령은 이름만 나열한다.
+
+        **주의**: 같은 이름이 명령마다 다른 비트 위치를 갖는 경우가 있다(SEL/STC/CA/NUMD
+        등 15개). 그런 이름은 용어집에 올리지 않고 해당 명령에 **인라인**한다 — 축약이
+        의미를 바꾸면 안 된다.
+        """
+        names = [n for n in names if n in self.commands]
+        if not names:
+            return ""
+        sigs, uses = {}, {}
+        for n in names:
+            for f in self.schemas.get(n, []):
+                sigs.setdefault(f['name'], set()).add(self._field_sig(f))
+                uses[f['name']] = uses.get(f['name'], 0) + 1
+        # 용어집에 올릴 조건: 정의가 하나뿐이고(모호하지 않고) **2개 이상 명령에서 쓰임**.
+        #   한 번만 쓰이는 필드를 올리면 줄만 늘고 절감이 없다.
+        shared = {k for k, v in sigs.items() if len(v) == 1 and uses.get(k, 0) >= 2}
+
+        gloss = []
+        seen = set()
+        for n in names:
+            for f in self.schemas.get(n, []):
+                if f['name'] in shared and f['name'] not in seen:
+                    seen.add(f['name'])
+                    gloss.append(f"  {f['name']} = {self._field_text(f)}")
+
+        out = []
+        if gloss:
+            out.append("Field definitions (a command listing a name below uses exactly "
+                       "this definition):")
+            out.extend(sorted(gloss))
+            out.append("")
+        out.append("Commands (fields in CDW order; inline definitions override the list "
+                   "above for that command):")
+        for n in names:
+            c = self.commands.get(n, {})
+            head = f"  {n} (opcode=0x{c.get('opcode', 0):02x}, {c.get('cmd_type', '?')})"
+            fields = self.schemas.get(n, [])
+            if not fields:
+                out.append(f"{head}: (no CDW parameters)")
+                continue
+            parts = [f['name'] if f['name'] in shared
+                     else f"{f['name']}={self._field_text(f)}" for f in fields]
+            out.append(f"{head}: " + ", ".join(parts))
+        return "\n".join(out)
+
     def is_dangerous(self, cmd, cdw=None):
         """device 를 파괴/잠금하거나 하네스를 깨는 명령이면 (True, 사유). 생성 금지 대상."""
         g, cdw = self.guards, (cdw or {})

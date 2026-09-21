@@ -11,6 +11,7 @@
     "openocd_telnet_host": "127.0.0.1",
     "openocd_telnet_port": 4444,
     "_comment_probe_usb_reset": "v10.3: OpenOCD 재시작이 모두 실패한 뒤의 **최후 수단**. J-Link 는 자체 MCU 라 호스트 재부팅으로 리셋되지 않아, 고착되면 사람이 케이블을 뽑아야 했다. vendor_ids 에 일치하는 USB 장치만 만진다(DUT 는 NVMe/PCIe 라 무관). uhubctl 은 VBUS 를 실제로 끊어 재삽입과 동등하지만, 엉뚱한 포트를 끄면 위험하므로 location/port 를 명시했을 때만 쓴다. 전기적으로 죽은 링크는 이걸로도 안 살아난다.",
+    "_comment_schema_max": "프롬프트에 실을 명령 스키마 개수 상한. 예전 48 은 구현 명령 수(41)보다 커서 캡이 없는 것과 같았고, 관련도와 무관하게 매번 전 명령이 실렸다. 호출부가 never-sent → low-yield 순으로 준 앞쪽만 취한다. 0 이면 전부. 낮추면 프롬프트가 줄지만 LLM 이 보는 명령 종류도 줄어든다 — 커버리지 영향이 있으니 funnel 채택률을 보며 조정할 것.",
     "_comment_sampler_diag": "v10.3 샘플러 진단 계측. 전부 읽기·기록만이라 퍼징 동작을 바꾸지 않는다. OpenOCD 출력은 파일로 받는다 — PIPE 는 아무도 안 읽으면 64KiB 에서 OpenOCD 를 write 에 블록시킨다. 읽기 실패 시 DP DPIDR/CTRL-STAT 을 sticky 클리어 **전에** 남긴다(STICKYORUN=속도과다, PWRUPACK 꺼짐=디버그전원, 못읽음=링크사망). resource_monitor 는 OpenOCD·퍼저의 RSS/fd 추세로 누수를 가린다.",
     "sampler_diag": {
       "resource_monitor": true,
@@ -431,7 +432,7 @@
     "unimpl_ratio": 0.9,
     "unimpl_energy_floor": 0.05,
     "unimpl_energy_floor_on": true,
-    "schema_max": 48,
+    "schema_max": 16,
     "boost_lr": 0.3,
     "boost_min": 0.5,
     "boost_max": 5.0,

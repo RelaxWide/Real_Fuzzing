@@ -7049,14 +7049,34 @@ class _V101Fuzzer:
         "\"evaluations\":[{\"seed_id\":int,\"score\":float,\"keep\":bool}]}"
     )
 
-    def _llm_schema_summary(self, names) -> str:
-        """주어진 명령들의 CDW 필드 정의를 프롬프트용 텍스트로."""
-        sb = self.llm.schema_bridge
-        out = []
+    def _llm_schema_pick(self, names):
+        """스키마에 실을 명령을 고른다 — 상한 RAG_SCHEMA_MAX, **관련도 순 유지**.
+
+        예전 기본값 48 은 구현 명령 수(41)보다 커서 사실상 캡이 없었고, 관련도와
+        무관하게 매번 전 명령이 실렸다. 호출부가 이미 우선순위대로 준 목록의 앞쪽을
+        취한다(never-sent → low-yield). 정렬을 다시 하지 않는다.
+        """
+        cap = RAG_SCHEMA_MAX if RAG_SCHEMA_MAX > 0 else len(names)
+        seen, out = set(), []
         for n in names:
-            if n in sb.commands:
-                out.append(sb.schema_to_prompt(n))
-        return "\n\n".join(out)
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+            if len(out) >= cap:
+                break
+        return out
+
+    def _llm_schema_summary(self, names) -> str:
+        """주어진 명령들의 CDW 필드 정의를 프롬프트용 텍스트로.
+
+        명령마다 같은 필드(SLBA_LO/NLB/PRINFO …)를 통째로 반복하던 것을 공통 용어집 +
+        이름 나열로 바꾼다. 정의가 명령마다 다른 이름은 용어집에 올리지 않고 인라인한다.
+        """
+        sb = self.llm.schema_bridge
+        fn = getattr(sb, 'schemas_to_prompt', None)
+        if fn is not None:
+            return fn(list(names))
+        return "\n\n".join(sb.schema_to_prompt(n) for n in names if n in sb.commands)
 
     def _llm_coverage_context(self) -> str:
         """미접촉 함수 상위 N개 텍스트. 없거나 실패 시 빈 문자열.
@@ -7401,9 +7421,20 @@ class _V101Fuzzer:
             if prod:
                 lines.append("\nYour past seeds that found NEW firmware coverage on this device — "
                              "generate NOVEL variations that push FURTHER (not copies):")
-                for s in prod[:6]:
+                # 프롬프트에는 (command, cdw10, cdw11) 만 찍는다. 다른 필드만 다른 시드는
+                #   같은 줄로 나와 예시 6칸이 중복으로 낭비됐다 — 찍히는 키로 중복을 없애
+                #   6칸을 **서로 다른** 예시로 채운다.
+                _seen_ex, _shown = set(), 0
+                for s in prod:
+                    _key = (s.cmd.name, s.cdw10, s.cdw11)
+                    if _key in _seen_ex:
+                        continue
+                    _seen_ex.add(_key)
                     lines.append(f'  {{"command":"{s.cmd.name}","cdw10":{s.cdw10},'
                                  f'"cdw11":{s.cdw11}}}  (favored={bool(getattr(s,"is_favored",False))})')
+                    _shown += 1
+                    if _shown >= 6:
+                        break
             # v9.1 #2: 이 디바이스가 실제 accept(성공)한 필드값 — 유효 envelope few-shot.
             known = self.llm.schema_bridge.commands
             acc = []
@@ -7652,7 +7683,7 @@ class _V101Fuzzer:
             explored = sorted([n for n in known if n in exercised], key=_cmd_yield)
             candidates = never + explored            # never-entered 우선, 그다음 low-yield
             self._llm_pending_ctx = {"rag_query_commands": candidates[:3]}
-            schema = self._llm_schema_summary(candidates[:RAG_SCHEMA_MAX])
+            schema = self._llm_schema_summary(self._llm_schema_pick(candidates))
             _low_lbl = []
             for n in explored[:15]:
                 _yield, _gain, _runs = _cmd_yield(n)
@@ -7677,7 +7708,9 @@ class _V101Fuzzer:
             names = [n for n in sorted(self.llm.schema_bridge.commands.keys())
                      if n not in self._unimpl_cmds]
             self._llm_pending_ctx = {"rag_query_commands": names[:3]}
-            schema = self._llm_schema_summary(names[:RAG_SCHEMA_MAX])  # v9.1: 캡 제거(구현된 전부)
+            # 스키마에 실을 명령은 **관련도 순**으로 고른다. names 는 알파벳 순이라
+            #   그대로 자르면 A~M 만 남는 임의 절단이 된다(캡이 명령 수보다 작을 때).
+            schema = self._llm_schema_summary(self._llm_schema_pick(names))
             user = (_gp + self._llm_reject_block()      # v10: 거절·보정 되먹임
                     + f"Coverage gaps (firmware functions NOT yet reached — target these):\n"
                     f"{cov or '  (static map unavailable)'}\n\n"
