@@ -93,3 +93,26 @@ v10.3의 초기 활성/비활성 메시지는 main 로그뿐 아니라 `llm/llm_
 장치 초기화/명령에서 멈추면 워커 시작이나 주기 통계에 도달하지 못할 수 있다.
 초기 활성 메시지가 main 파일에도 전혀 없다면 실행 파일·실제 인자·현재 실행의
 로그 파일을 확인해야 한다. 로깅 수정만으로 실제 요청이 없던 원인까지 확정하지 않는다.
+
+## Nemotron 3 Super 추론 강도 비교
+
+`fuzzer_config.json`의 `rag.vllm.chat_template_kwargs`는 기본 null(서버 기본값)이다.
+저강도 추론은 이 값만 아래 객체로 바꾼다. 임베딩/인덱스 변경은 필요 없다.
+
+```json
+"chat_template_kwargs": {"enable_thinking": true, "low_effort": true}
+```
+
+추론 OFF 비교는 `{"enable_thinking": false}`, 원복은 `null`이다.
+변경 후 단독 테스트를 다시 실행하거나 퍼저를 재시작한다. 지원하는 서버·모델 템플릿이면
+요청별로 적용되므로 서버 재시작은 필요 없다. 클라이언트는 urllib HTTP 본문 최상위에
+chat_template_kwargs를 전달한다(OpenAI SDK 전용 extra_body로 감싸지 않는다).
+
+진단의 `requested_chat_template_kwargs`는 **요청한 값**이지 서버가 실제 적용했다는
+확인이 아니다. elapsed_sec, usage, reasoning_chars와 응답 품질을 함께 비교한다.
+서버가 옵션을 무시하는 구형 템플릿이면 모델/서버 설정을 확인해야 한다.
+low_effort는 엄격한 추론 토큰 상한이 아니다. max_tokens·검색량은 우선 유지해
+추론 모드 하나의 효과부터 비교한다. 현재 도구는 reasoning_budget을 구현하지 않는다.
+
+출처: [NVIDIA 모델 카드의 Low-effort reasoning](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8#api-client).
+NVIDIA RAG Blueprint 전용 LLM_LOW_EFFORT 환경변수는 이 퍼저가 읽지 않는다.

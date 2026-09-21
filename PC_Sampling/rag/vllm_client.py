@@ -46,6 +46,7 @@ DEFAULTS = {
     "timeout_sec": 300.0,
     "max_tokens": 16384,
     "temperature": 0.7,
+    "chat_template_kwargs": None,          # None: 서버 기본값. Nemotron low_effort 등
     "max_response_bytes": 8 * 1024 * 1024,  # 응답 크기 상한(계획 D2)
     "structured_output": True,
     "include_generators_in_schema": True,   # 중첩 anyOf 를 못 다루는 백엔드용 탈출구
@@ -225,6 +226,14 @@ def _chat(system, user, cfg, schema, deadline):
         "max_tokens": int(cfg["max_tokens"]),
         "temperature": float(cfg["temperature"]),
     }
+    template = cfg.get("chat_template_kwargs")
+    if template is not None:
+        if not isinstance(template, dict):
+            raise BackendError("chat_template_kwargs 는 JSON 객체 또는 null 이어야 합니다")
+        for key in ("enable_thinking", "low_effort"):
+            if key in template and not isinstance(template[key], bool):
+                raise BackendError(f"chat_template_kwargs.{key} 는 true/false 이어야 합니다")
+        payload["chat_template_kwargs"] = dict(template)
     if schema is not None:
         payload["response_format"] = {"type": "json_schema", "json_schema": schema}
     left = deadline - time.monotonic()
@@ -269,7 +278,8 @@ def generate_rag_response(system, user, meta=None):
     deadline = float(_budget_from) + float(cfg["timeout_sec"])
     task = meta.get("task")
     diag = {"task": task, "req_id": meta.get("req_id"), "backend": "vllm",
-            "base_url": cfg["base_url"], "model": cfg["model"]}
+            "base_url": cfg["base_url"], "model": cfg["model"],
+            "requested_chat_template_kwargs": cfg.get("chat_template_kwargs")}
 
     # 검색 사다리 2단(`[RAG-QUERY]` 블록)은 프롬프트 본문에서 찾는다. meta 를 안
     #   넘기는 구버전 호출은 user_prompt 가 비어 블록이 있어도 못 찾았다. setdefault

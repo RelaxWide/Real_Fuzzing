@@ -449,6 +449,7 @@
       "base_url": "http://192.168.10.1:8000/v1",
       "api_key": "not-used",
       "model": "nemotron-3-super",
+      "chat_template_kwargs": null,
       "timeout_sec": 300.0,
       "max_tokens": 16384,
       "temperature": 0.7,
