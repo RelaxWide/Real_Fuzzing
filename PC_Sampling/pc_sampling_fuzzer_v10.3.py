@@ -576,6 +576,10 @@ OPENOCD_TELNET_PORT     = _G['openocd_telnet_port']
 OPENOCD_STARTUP_TIMEOUT = _G['openocd_startup_timeout']
 # 디버그 프로브 USB 강제 복구(최후 수단). 사다리의 마지막 칸 — §_probe_usb_recover 참조.
 PROBE_USB_RESET   = _G.get('probe_usb_reset', {}) or {}
+# 재시작 사다리의 회차별 adapter speed(kHz). None=cfg 기본값 유지.
+#   같은 설정으로 반복해 봐야 링크가 열화됐으면 매번 실패한다 — 회차마다 낮춘다.
+RECONNECT_SPEEDS_KHZ = _G.get('reconnect_speeds_khz', [None, 1000, 500])
+SAMPLER_DIAG      = _G.get('sampler_diag', {}) or {}
 
 # PCSR 주소 (CoreBase + 0x084, APB-AP ap-num 0)
 PCSR_CORE0      = _G['pcsr_core0']
@@ -2784,6 +2788,19 @@ class OpenOCDPCSampler:
         self.idle_pcs: Set[int]      = set()
         self._sock_buf: bytes        = b''   # 소켓 읽기 잔여 버퍼
 
+        # ── v10.3 진단 계측 (읽기·기록만. 퍼징 동작을 바꾸지 않는다) ──
+        #   3일씩 돌다 죽는 원인을 사후에 가리려면 '실패했다' 만으론 부족하다.
+        #   실패 시점의 DAP 상태와 거기까지의 누적 이력을 남긴다.
+        self._ocd_log_path: Optional[Path] = None   # OpenOCD stdout/stderr 파일
+        self._ocd_log_fh = None
+        self._session_started = 0.0            # 현 OpenOCD 세션 시작(monotonic)
+        self._total_reads = 0                  # 누적 PCSR 읽기 시도
+        self._reinit_count = 0                 # _reinit_target 호출 누계
+        self._reconnect_count = 0              # _reconnect 호출 누계
+        self._diag_dumps = 0                   # DAP 덤프 횟수(스로틀)
+        self._res_thread: Optional[threading.Thread] = None
+        self._res_stop = threading.Event()
+
         # v8.0: product profile 의 PCSR 주소 사용 (product 주도).
         #   profile 미지정(구식 --interface 경로)이면 interface 기본값으로 폴백.
         if config.pcsr_addrs:
@@ -2838,6 +2855,151 @@ class OpenOCDPCSampler:
                 self._proc.kill()
         self._proc = None
 
+    # ------------------------------------------------------------------
+    # v10.3 진단 계측 — 전부 읽기·기록. 퍼징 경로를 건드리지 않는다.
+    # ------------------------------------------------------------------
+    def _diag_dir(self) -> Optional[Path]:
+        try:
+            d = Path(getattr(self.config, 'output_dir', None) or OUTPUT_DIR) / 'sampler_diag'
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        except Exception:
+            return None
+
+    def _ocd_log_open(self):
+        """OpenOCD 출력을 받을 파일. 실패하면 None → 호출부가 DEVNULL 로 간다."""
+        self._ocd_log_close()
+        d = self._diag_dir()
+        if d is None:
+            return None
+        try:
+            self._ocd_log_path = d / f"openocd_{datetime.now():%Y%m%d_%H%M%S}.log"
+            self._ocd_log_fh = open(self._ocd_log_path, 'ab', buffering=0)
+            return self._ocd_log_fh
+        except Exception as e:
+            log.warning(f"[Diag] OpenOCD 로그 파일 열기 실패(DEVNULL 로 진행): {e}")
+            self._ocd_log_path = None
+            return None
+
+    def _ocd_log_close(self):
+        if getattr(self, '_ocd_log_fh', None) is not None:
+            try:
+                self._ocd_log_fh.close()
+            except Exception:
+                pass
+        self._ocd_log_fh = None
+
+    def _ocd_log_tail(self, lines: int = 20):
+        if not getattr(self, '_ocd_log_path', None):
+            return []
+        try:
+            return self._ocd_log_path.read_text(errors='replace').splitlines()[-lines:]
+        except Exception:
+            return []
+
+    def _diag_write(self, text: str):
+        """진단 한 줄을 즉시 디스크로. 버퍼에 들고 있다 급사하면 아무것도 안 남는다."""
+        d = self._diag_dir()
+        if d is None:
+            return
+        try:
+            with open(d / 'sampler_events.log', 'a', encoding='utf-8') as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {text}\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            pass
+
+    def _diag_context(self) -> str:
+        """누적 이력 — 점진 열화였는지 급사였는지를 가른다."""
+        started = getattr(self, '_session_started', 0.0)
+        up = time.monotonic() - started if started else 0.0
+        return (f"uptime={up / 3600:.2f}h reads={getattr(self, '_total_reads', 0)} "
+                f"reinit={getattr(self, '_reinit_count', 0)} "
+                f"reconnect={getattr(self, '_reconnect_count', 0)} "
+                f"ok={getattr(self, 'halt_ok_total', 0)} "
+                f"fail={getattr(self, 'halt_fail_total', 0)}")
+
+    def _dap_state(self) -> str:
+        """읽기 실패 원인을 DAP 에게 직접 묻는다. **읽기만** 한다.
+
+        STICKYERR=AP fault / STICKYORUN=속도 과다 / PWRUPACK 꺼짐=디버그 전원 내려감 /
+        아예 못 읽음=SWD 링크 사망. 지금까지 이 값을 보지 않고 곧바로 지워 왔다.
+        """
+        if getattr(self, '_sock', None) is None:
+            return 'DAP=<소켓 없음>'
+        px = self._tcl_prefix
+        out = []
+        for name, reg in (('DPIDR', 0), ('CTRL/STAT', 4)):
+            try:
+                resp = self._telnet_cmd(f'{px}.dap dpreg {reg}')
+                out.append(f"{name}={(resp or '').strip()[:40]!r}")
+            except Exception as e:
+                out.append(f"{name}=<실패:{type(e).__name__}>")
+        return ' '.join(out)
+
+    def _diag_on_read_failure(self, why: str):
+        """읽기 실패 시 진단 1회. **절대 예외를 올리지 않는다.**
+
+        계측이 관측 대상을 망가뜨리면 안 된다 — 이 프로젝트가 이미 두 번 겪은 실패
+        방식이다(faulthandler, 커널 debug 옵션). 속성이 없거나 소켓이 죽었거나
+        무엇이 잘못돼도 읽기 경로는 그대로 진행되어야 한다.
+
+        스로틀: PCSR 은 초당 수십 번이라 매 실패마다 찍으면 그 자체가 부하다.
+        """
+        try:
+            n = getattr(self, '_diag_dumps', 0) + 1
+            self._diag_dumps = n
+            if n > 1 and n % 200 != 0:
+                return
+            # sticky 를 지우기 **전에** 읽어야 한다(다음 읽기의 pre-clear 가 증거를 지운다).
+            info = (f"[read-fail #{n}] {why} | {self._diag_context()} "
+                    f"| {self._dap_state()}")
+            log.warning(f"[Diag] {info}")
+            self._diag_write(info)
+        except Exception:
+            pass
+
+    def _res_sample(self) -> str:
+        """OpenOCD·퍼저의 RSS/fd. 누수면 단조 증가한다."""
+        def one(tag, pid):
+            if not pid:
+                return f"{tag}=-"
+            try:
+                rss = 0
+                for ln in Path(f'/proc/{pid}/status').read_text().splitlines():
+                    if ln.startswith('VmRSS:'):
+                        rss = int(ln.split()[1])
+                        break
+                nfd = len(os.listdir(f'/proc/{pid}/fd'))
+                nth = len(os.listdir(f'/proc/{pid}/task'))
+                return f"{tag}=rss{rss}k/fd{nfd}/th{nth}"
+            except Exception:
+                return f"{tag}=?"
+        ocd = self._proc.pid if (self._proc and self._proc.poll() is None) else None
+        return f"{one('ocd', ocd)} {one('fuzzer', os.getpid())}"
+
+    def _res_monitor_start(self, interval: float = 300.0):
+        if getattr(self, '_res_thread', None) is not None:
+            return
+
+        def _loop():
+            while not self._res_stop.wait(interval):
+                try:
+                    self._diag_write(f"[res] {self._res_sample()} | {self._diag_context()}")
+                except Exception:
+                    pass
+
+        self._res_stop.clear()
+        self._res_thread = threading.Thread(target=_loop, daemon=True)
+        self._res_thread.start()
+
+    def _res_monitor_stop(self):
+        ev = getattr(self, '_res_stop', None)
+        if ev is not None:
+            ev.set()
+        self._res_thread = None
+
     def _kill_stale_openocd(self):
         """포트 충돌 방지: 기존 OpenOCD 프로세스 종료 (포트+이름 양쪽)."""
         try:
@@ -2852,20 +3014,33 @@ class OpenOCDPCSampler:
             pass
         time.sleep(1.0)   # USB 장치 해제 대기
 
-    def _launch_openocd(self) -> bool:
-        """OpenOCD 서브프로세스 시작 후 포트 대기."""
+    def _launch_openocd(self, speed_khz: Optional[int] = None) -> bool:
+        """OpenOCD 서브프로세스 시작 후 포트 대기.
+
+        speed_khz 를 주면 cfg 의 adapter speed 를 덮어쓴다(재시작 사다리의 속도 변주).
+        """
         cfg_path = resolve_asset(self.config.openocd_config)
         if not os.path.exists(cfg_path):
             log.error(f"[OpenOCD] 설정 파일 없음: {cfg_path}")
             return False
         cmd = [self.config.openocd_binary, '-f', cfg_path]
+        if speed_khz:
+            cmd += ['-c', f'adapter speed {int(speed_khz)}']
+        # ★ PIPE 를 쓰지 않는다. OpenOCD 는 모든 로그를 stderr 로 쓰는데, 아무도 읽지 않는
+        #   파이프는 리눅스 기본 64 KiB 가 차는 순간 **OpenOCD 를 write 에서 무기한 블록**
+        #   시킨다. 실패 1줄이 ~50B 라 며칠이면 조용히 임계에 닿고, telnet 응답이 끊겨
+        #   전면 PCSR 실패로 보인다. 파일은 블록되지 않고 전체 로그도 남는다.
+        _fh = self._ocd_log_open()
         try:
             self._proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=_fh or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if _fh else subprocess.DEVNULL,
                 start_new_session=True,
             )
+            self._session_started = time.monotonic()
+            if SAMPLER_DIAG.get('resource_monitor', True):
+                self._res_monitor_start(float(SAMPLER_DIAG.get('resource_interval_sec', 300)))
         except FileNotFoundError:
             log.error(f"[OpenOCD] 바이너리를 찾을 수 없음: {self.config.openocd_binary}")
             return False
@@ -2874,12 +3049,11 @@ class OpenOCDPCSampler:
                       f"({self.config.openocd_timeout}s). OpenOCD 시작 실패.")
             self._proc.terminate()
             try:
-                _, stderr_data = self._proc.communicate(timeout=2.0)
-                if stderr_data:
-                    for line in stderr_data.decode(errors='replace').splitlines():
-                        log.error(f"[OpenOCD stderr] {line}")
+                self._proc.wait(timeout=2.0)
             except Exception:
                 pass
+            for line in self._ocd_log_tail(20):
+                log.error(f"[OpenOCD log] {line}")
             return False
         return True
 
@@ -2900,7 +3074,7 @@ class OpenOCDPCSampler:
         return self._proc is not None and self._proc.poll() is None
 
     def _reinit_target(self) -> bool:
-        """OpenOCD 프로세스 유지 + 타겟 디버그 전원 재활성화 + proc 재정의.
+        """OpenOCD 프로세스 유지 + 타겟 디버그 전원 재활성화 + proc 재정의.  [계측: _reinit_count]
 
         SSD 펌웨어 reset 등으로 APB-AP 접근이 끊어졌을 때 사용.
         OpenOCD를 재시작하지 않으므로 빠름 (~1초).
@@ -2908,6 +3082,8 @@ class OpenOCDPCSampler:
         실패 시 False 반환 → 호출자가 _reconnect()로 escalate.
         """
         self._stop_worker()   # 소켓 만지기 전 샘플링 스레드 정지(경합 방지)
+        self._reinit_count = getattr(self, '_reinit_count', 0) + 1
+        self._diag_write(f"[reinit #{self._reinit_count}] {self._diag_context()}")
         if not self._openocd_alive():
             return False
         try:
@@ -3038,6 +3214,9 @@ class OpenOCDPCSampler:
 
     def _reconnect(self, attempts: int = 3) -> bool:
         log.warning("[OpenOCD] 재시작 시도...")
+        self._reconnect_count = getattr(self, '_reconnect_count', 0) + 1
+        self._diag_write(f"[reconnect #{self._reconnect_count}] {self._diag_context()} "
+                         f"| {self._res_sample()} | {self._dap_state()}")
         self._stop_worker()   # 소켓/프로세스 만지기 전 샘플링 스레드 정지(경합 방지)
         # ★ USB 정상 해제: SIGTERM 만으로는 libjaylink 가 J-Link USB 를 잠근 채 종료해
         #   새 OpenOCD 가 'no j-link device found' 로 죽는다(close() 와 동일 이유).
@@ -3062,11 +3241,18 @@ class OpenOCDPCSampler:
         #   일시적 USB 해제 레이스를 bounded retry 로 견딘다 — 한 번 실패가 곧바로
         #   fatal(퍼저 종료)이 되지 않게 한다.
         attempts = max(1, attempts)
+        # 속도 변주: 같은 설정으로 3번 반복해 봐야 링크가 열화됐으면 3번 다 실패한다.
+        #   회차마다 adapter speed 를 낮춰 마진을 넓힌다(None=cfg 기본값 유지).
+        _speeds = list(RECONNECT_SPEEDS_KHZ) or [None]
         for _i in range(1, attempts + 1):
+            _spd = _speeds[min(_i - 1, len(_speeds) - 1)]
             self._kill_stale_openocd()
-            if self._launch_openocd() and self._reopen_telnet():
+            if self._launch_openocd(speed_khz=_spd) and self._reopen_telnet():
                 if _i > 1:
-                    log.warning(f"[OpenOCD] 재시작 성공 ({_i}/{attempts}회차)")
+                    log.warning(f"[OpenOCD] 재시작 성공 ({_i}/{attempts}회차"
+                                + (f", speed={_spd}kHz)" if _spd else ")"))
+                self._diag_write(f"[reconnect-ok] attempt={_i} speed={_spd} "
+                                 f"| {self._diag_context()}")
                 return True
             log.warning(f"[OpenOCD] 재시작 {_i}/{attempts} 실패"
                         + (" — USB 해제 대기 후 재시도..." if _i < attempts else
@@ -3132,6 +3318,14 @@ class OpenOCDPCSampler:
         finally:
             self._sock.settimeout(self._SOCK_TIMEOUT)
         self._sock_buf = b''   # 프롬프트까지 소비 — clean slate (정렬 보장)
+
+    def _diag_shutdown(self):
+        """진단 리소스 정리 — 리소스 모니터 스레드와 OpenOCD 로그 핸들."""
+        try:
+            self._res_monitor_stop()
+            self._ocd_log_close()
+        except Exception:
+            pass
 
     def _close_telnet(self):
         if self._sock:
@@ -3265,6 +3459,7 @@ class OpenOCDPCSampler:
     def _read_all_pcs(self) -> Optional[Tuple[int, ...]]:
         """PCSR 배치 읽기: 1 RTT = N코어 PC 튜플. Thumb bit 마스킹 포함."""
         n = len(self._pcsr_addrs)
+        self._total_reads = getattr(self, '_total_reads', 0) + 1
         try:
             # OpenOCD 비동기 진단/명령 echo의 주소를 PC로 해석하지 않는다.
             # 요청 번호도 확인해 이전 응답을 현재 관측으로 인정하지 않는다.
@@ -3280,17 +3475,20 @@ class OpenOCDPCSampler:
                       if line.startswith(prefix) and line.endswith(':END')]
             if len(frames) != 1:
                 log.warning(f"[OpenOCD] PCSR 응답 프레임 불일치 ({token}, {len(frames)}개): {resp!r}")
+                self._diag_on_read_failure('frame-mismatch')
                 self._drain_socket()
                 return None
             payload = frames[0][len(prefix):-len(':END')]
             if payload.startswith('ERR:'):
                 log.warning(f"[OpenOCD] PCSR 에러 응답: {payload!r}")
+                self._diag_on_read_failure(f'err-payload {payload[:60]!r}')
                 self._drain_socket()
                 return None
             parts = payload.split()
             if len(parts) != n or any(re.fullmatch(r'0x[0-9a-fA-F]{1,8}', p) is None
                                      for p in parts):
                 log.warning(f"[OpenOCD] PCSR 파싱 실패 (토큰 {len(parts)}개, 기대 {n}개): {resp!r}")
+                self._diag_on_read_failure(f'parse {len(parts)}!={n}')
                 self._drain_socket()
                 return None
             # PC 외 출력은 진단 증거로 파일에 보존한다.
@@ -3735,6 +3933,7 @@ class OpenOCDPCSampler:
                 pass
         self._close_telnet()
         self._terminate_proc()
+        self._diag_shutdown()
 
 
 class OpenOCDHaltSampler(OpenOCDPCSampler):
