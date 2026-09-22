@@ -163,3 +163,111 @@ class ActiveListIsShared(unittest.TestCase):
         self.assertIn('io_patterns', obj._llm_active_tasks())
         obj._pending_workload = {'anything': 1}
         self.assertNotIn('io_patterns', obj._llm_active_tasks())
+
+
+class StartupTaskPinIsOptional(unittest.TestCase):
+    """rag.startup_task — 1건째만 고정. 기본은 off(회전판이 정함)."""
+
+    def test_default_is_off(self):
+        from test_v10_2_learning import fuzzer
+        self.assertEqual(fuzzer.RAG_STARTUP_TASK.lower(), 'off')
+
+    def test_shipped_config_ships_it_off(self):
+        import json
+        from test_v10_2_learning import ROOT
+        cfg = json.loads((ROOT / 'fuzzer_config.json').read_text(encoding='utf-8'))
+        self.assertEqual(cfg['rag']['startup_task'], 'off')
+
+    def test_missing_key_falls_back_to_off(self):
+        # 설정에 없거나 null 이어도 켜지면 안 된다.
+        for supplied in ({}, {'startup_task': None}, {'startup_task': ''}):
+            self.assertEqual(
+                str(supplied.get('startup_task', 'off') or 'off').strip().lower(), 'off',
+                f'{supplied} 에서 고정이 켜진다')
+
+    def test_pin_is_applied_after_the_slot_is_consumed(self):
+        # 고정이 순번 소비를 건너뛰면 2건째가 1건째와 겹친다 — 바로 그 버그로 돌아간다.
+        src = StartupSeedingSharesTheRotation._startup_source()
+        self.assertIn('RAG_STARTUP_TASK', src, '기동 블록이 startup_task 를 안 본다')
+        self.assertLess(src.index('_llm_rr_next'), src.index('RAG_STARTUP_TASK'),
+                        '고정이 회전 순번 소비보다 먼저다 — 순번이 안 소비된다')
+
+    def test_unknown_or_inactive_name_is_ignored_not_fatal(self):
+        src = StartupSeedingSharesTheRotation._startup_source()
+        self.assertIn('in _startup_active', src, '활성 여부를 확인하지 않는다')
+        self.assertIn('log.warning', src, '무시할 때 경고가 없다')
+
+
+class StartupBlockRunsAsShipped(unittest.TestCase):
+    """기동 블록 소스를 그대로 실행해 동작을 본다(문자열 대조가 아니라)."""
+
+    @staticmethod
+    def _block():
+        import ast, textwrap
+        from test_v10_2_learning import FUZZER_FILE
+        text = FUZZER_FILE.read_text(encoding='utf-8')
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.If) and isinstance(node.test, ast.Name) \
+                    and node.test.id == '_startup_active':
+                src = ' ' * node.col_offset + ast.get_source_segment(text, node)
+                return compile(textwrap.dedent(src), '<startup>', 'exec')
+        raise AssertionError('기동 시딩 블록을 못 찾았다')
+
+    def _run(self, startup_task, active, rr=0):
+        sent = {}
+
+        class Stub:
+            _llm_pending_ctx = None
+            _llm_task_rr = rr
+
+            def _llm_rr_next(self, act):
+                from test_v10_2_learning import fuzzer
+                return fuzzer.NVMeFuzzer._llm_rr_next(self, act)
+
+            def _llm_build_request(self, task):
+                return ('sys', 'usr')
+
+            def _llm_backend_meta(self, task, ctx):
+                return {}
+
+            def _learning_submitted(self, task, s, u, ctx):
+                sent['task'] = task
+
+            class llm:
+                @staticmethod
+                def submit(task, s, u, n, ctx=None, meta=None):
+                    return True
+
+        ns = {'_startup_active': active, 'self': Stub(),
+              'RAG_STARTUP_TASK': startup_task,
+              '_LLM_TASK_CONTAINERS': {'new_group_seeds': (), 'sequences': (),
+                                       'corpus_eval': (), 'io_patterns': ()},
+              'log': unittest.mock.Mock()}
+        exec(self._block(), ns)
+        return sent.get('task'), ns['self']._llm_task_rr, ns['log']
+
+    ACTIVE = ['new_group_seeds', 'sequences', 'corpus_eval', 'io_patterns']
+
+    def test_off_follows_the_rotation(self):
+        task, rr, _ = self._run('off', self.ACTIVE)
+        self.assertEqual(task, 'new_group_seeds')   # 회전판 0번
+        self.assertEqual(rr, 1, '순번이 소비되지 않았다')
+
+    def test_pin_overrides_the_task_but_still_consumes_the_slot(self):
+        task, rr, _ = self._run('corpus_eval', self.ACTIVE)
+        self.assertEqual(task, 'corpus_eval')
+        self.assertEqual(rr, 1, '고정했다고 순번을 안 쓰면 2건째가 겹친다')
+
+    def test_pin_to_a_disabled_task_is_ignored_with_a_warning(self):
+        task, rr, log = self._run('io_patterns', ['new_group_seeds', 'sequences'])
+        self.assertEqual(task, 'new_group_seeds', '비활성 task 로 고정돼 버렸다')
+        self.assertEqual(rr, 1)
+        self.assertTrue(log.warning.called, '무시했는데 경고가 없다')
+
+    def test_pin_to_an_unknown_name_is_ignored(self):
+        task, _, log = self._run('nonsense', self.ACTIVE)
+        self.assertEqual(task, 'new_group_seeds')
+        self.assertTrue(log.warning.called)
+
+    def test_case_insensitive_off(self):
+        self.assertEqual(self._run('OFF', self.ACTIVE)[0], 'new_group_seeds')

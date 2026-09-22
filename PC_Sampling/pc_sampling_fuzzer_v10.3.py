@@ -495,6 +495,11 @@ RAG_MAX_HOPS         = int(_RAG.get('max_hops', 3))
 # 검증된 제품만 여기 넣는다(현재 BM9K1). FUN_/sub_ 정규식은 어디서나 유지.
 RAG_AUTONAME_KW_OFF  = set(_RAG.get('autoname_kw_off_products', ['BM9K1']))
 RAG_SEED_AT_STARTUP  = bool(_RAG.get('seed_at_startup', True))
+# 기동 1건째 task 고정. 'off'(기본)=가중 회전판이 정한다(= 순번 0번).
+#   task 이름을 주면 그 task 로 고정하되 **회전 순번은 그대로 소비**한다 — 고정 때문에
+#   2건째가 1건째와 겹치는 일이 없도록. 활성이 아닌 이름이면 무시하고 회전판을 따른다.
+#   (검증·경고는 기동 블록에서 한다. 이 시점엔 아직 log 가 없다.)
+RAG_STARTUP_TASK     = str(_RAG.get('startup_task', 'off') or 'off').strip()
 RAG_ENERGY_BOOST     = float(_RAG.get('llm_energy_boost', 1.5))
 # corpus_eval 자기점수(llm_score)가 이 값 **미만**일 때만 에너지 페널티(*0.5).
 # 실측상 corpus_eval 점수가 0.25~0.65 에 몰려 변별력이 낮아, 구 임계 0.3 은 정상
@@ -17850,6 +17855,16 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             if _startup_active:
                 # 첫 건부터 회전판을 돈다. 순번도 여기서 소비하므로 다음 요청은 그 다음 칸이다.
                 _task0 = self._llm_rr_next(_startup_active)
+                # rag.startup_task 로 1건째만 고정할 수 있다. 순번은 위에서 이미 소비했으므로
+                #   고정하더라도 2건째는 회전판의 다음 칸이다.
+                if RAG_STARTUP_TASK.lower() != 'off':
+                    if RAG_STARTUP_TASK in _startup_active:
+                        _task0 = RAG_STARTUP_TASK
+                    else:
+                        _why = ('알 수 없는 task' if RAG_STARTUP_TASK not in _LLM_TASK_CONTAINERS
+                                else '지금 비활성')
+                        log.warning(f"[LLM] rag.startup_task={RAG_STARTUP_TASK!r} 무시 ({_why}) "
+                                    f"— 회전판 순번 {_task0} 으로 간다")
                 _built = self._llm_build_request(_task0)
                 _ctx = getattr(self, '_llm_pending_ctx', None)
                 self._llm_pending_ctx = None
@@ -17857,7 +17872,9 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                         _task0, _built[0], _built[1], 0, ctx=_ctx,
                         meta=self._llm_backend_meta(_task0, _ctx)):
                     self._learning_submitted(_task0, _built[0], _built[1], _ctx)
-                    log.warning(f"[LLM] 기동 요청 제출: task={_task0} (첫 결과는 다음 drain 에 적용)")
+                    _pin = ' [startup_task 고정]' if RAG_STARTUP_TASK.lower() != 'off' else ''
+                    log.warning(f"[LLM] 기동 요청 제출: task={_task0}{_pin}"
+                                f" (첫 결과는 다음 drain 에 적용)")
 
         nvme_dev = self.config.nvme_device
         # 사용자가 --nvme /dev/nvmeXnY 처럼 namespace 경로를 직접 명시했을 때,

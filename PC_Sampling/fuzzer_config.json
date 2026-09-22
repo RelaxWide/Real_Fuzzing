@@ -423,6 +423,8 @@
     "max_seq_len": 16,
     "max_uncov_funcs": 40,
     "seed_at_startup": true,
+    "_comment_startup_task": "기동 직후 1건째 LLM 요청의 task 를 고정한다. \"off\"(기본) = 가중 회전판이 정함(task_weights 순번 0번). task 이름(new_group_seeds/sequences/corpus_eval/io_patterns)을 주면 그것으로 고정하되 회전 순번은 그대로 소비하므로 2건째는 다음 칸이다. 비활성이거나 모르는 이름이면 경고 후 무시. seed_at_startup=false 면 기동 요청 자체가 없어 이 값도 무의미하다.",
+    "startup_task": "off",
     "llm_energy_boost": 1.5,
     "reserved_policy": "reject",
     "result_stale_execs": 50000,
