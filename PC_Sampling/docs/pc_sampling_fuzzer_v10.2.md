@@ -1,5 +1,10 @@
 # pc_sampling_fuzzer v10.2
 
+> **이 문서는 이력이다.** 운용은 v10.3(`RUNBOOK_v10.3.md`)만 쓴다. 여기 적힌 2-PC Samba
+> drop-box RAG 경로(`tools/install_rag_query.py`, `RAG_QUERY_DEPLOYMENT.md`, 온라인
+> `srag_llm_guide.py` 패치)는 v10.3 의 로컬 vLLM 전환으로 **저장소에서 제거됐다**.
+> 필요하면 히스토리에서 복구한다: `git log --diff-filter=D -- PC_Sampling/tools/install_rag_query.py`
+
 v10.2.0은 v10.1의 SSD FW 퍼징 기능을 기반으로, **LLM 제안을 실제 실행 결과와 연결해
 다음 탐색에 반영하는 버전**이다. 목표별 근거 추적, setup 보존형 시퀀스, JSON 입력 생성 규칙,
 실측 성과 기반 LLM 작업 배분을 추가했다.
@@ -192,7 +197,7 @@ python3 -m py_compile PC_Sampling/pc_sampling_fuzzer_v10.2.py PC_Sampling/llm_le
 
 - [LLM 개선 프로젝트 설계](LLM_IMPROVEMENT_PROJECT.md)
 - [v10.2 상세 구현·리뷰 기록](V10_2_LLM_IMPLEMENTATION.md)
-- [v10.1 JLink 상태 및 복구 조사](STATUS_v10_1_JLINK.md)
+- v10.1 JLink 상태 및 복구 조사 — 문서 제거됨(`git log -- PC_Sampling/docs/STATUS_v10_1_JLINK.md`)
 - [Spec outcome 별도 계획](V10_1_SPEC_OUTCOME_DENOMINATOR.md)
 
 ## Timeout 이후 진단 종료와 메모리 기록
@@ -201,8 +206,8 @@ PC 모니터링은 30초 간격으로 **총 20회** 관측 후 종료한다(Ctrl
 JLink/UFAS 출력은 출력 폴더의 별도 로그 파일로 직접 기록하고,
 RDDump의 줄바꿈 없는 출력도 8 KiB 단위로 분할해 무제한 RAM 누적을 방지한다.
 `process_memory.jsonl`에는 timeout/덤프/차트/모니터링 단계별 PID와 RSS를 기록한다.
-검증 및 보고된 OOM/Identify timeout의 판정 한계는
-[V10_2_TIMEOUT_MEMORY_REVIEW.md](V10_2_TIMEOUT_MEMORY_REVIEW.md)를 참고한다.
+검증 및 보고된 OOM/Identify timeout의 판정 한계를 적은 `V10_2_TIMEOUT_MEMORY_REVIEW.md`는
+조사 종료로 제거됐다(`git log -- PC_Sampling/docs/V10_2_TIMEOUT_MEMORY_REVIEW.md`).
 
 ## Coverage growth 차트 누락 수정
 
@@ -234,15 +239,15 @@ v10.2 요청에 짧은 `[RAG-QUERY]` 블록을 추가했다. 기존 evidence/set
 온라인 guide에서 검색 입력만 최대 1,024자·UTF-8 2,048바이트로 제한한다.
 로컬 토크나이저 없이 서버의 토큰 초과 응답에만 축소 재검색(최대 3회 추가)을 적용한다.
 **온라인 guide도 먼저 업데이트해야 한다.** 퍼저만 업데이트하면 기존 guide는 여전히
-전체 프롬프트를 검색에 보낸다. 기존 온라인 설정을 보존하는 설치 도구와 순서는
-[RAG_QUERY_DEPLOYMENT.md](RAG_QUERY_DEPLOYMENT.md)에 있다.
+전체 프롬프트를 검색에 보낸다. 기존 온라인 설정을 보존하는 설치 도구와 순서는 `RAG_QUERY_DEPLOYMENT.md`에 있었으나,
+v10.3 로컬 vLLM 전환으로 이 경로 전체가 제거됐다(§ 문서 머리말 참조).
 
 ### RAG 배포 파일 통합
 
 검색 블록 생성은 `llm_learning.py`에, 온라인 검색 처리는 기존 `srag_llm_guide.py`에
 합친다. **별도 `rag_query.py` 배포는 필요 없다.** 온라인 적용 도구
 `install_rag_query.py`도 단독 파일로 실행되며 이전 분리형 guide를 통합형으로 전환한다.
-구체적인 명령과 최종 배치는 [RAG_QUERY_DEPLOYMENT.md](RAG_QUERY_DEPLOYMENT.md)를 따른다.
+구체적인 명령과 최종 배치는 `RAG_QUERY_DEPLOYMENT.md`를 따랐다 — 둘 다 제거됨.
 
 ### 토크나이저 의존성 제거
 

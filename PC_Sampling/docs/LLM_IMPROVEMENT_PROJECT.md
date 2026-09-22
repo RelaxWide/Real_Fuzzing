@@ -45,7 +45,7 @@ v10.1에는 BM9K1 Extended SMART 관측이 추가됐다.
 | `_update_llm_boost()` | 기존 LLM/mutation 성과 비교와 새 정책의 관계 정리 |
 | `_llm_telemetry_block()` | 상태 문맥과 이상 징후의 역할 구분 |
 
-기존 [방법론 로드맵](ROADMAP_v9.6plus_methodology.md)에도 generator, scheduler, state graph 등의
+기존 방법론 로드맵(`ROADMAP_v9.6plus_methodology.md`, 미구현 제안서라 제거됨)에도 generator, scheduler, state graph 등의
 유사 아이디어가 있다. 이 문서는 최신 연구 근거와 단계별 도입 범위를 보완한다.
 기존 [논문 포지셔닝](paper.md)과 [LLM 전략 정리](LLM_strategies_and_paper_positioning.md)는
 과거 버전 기준이므로 현재 구현 상태의 증거로 그대로 사용하지 않는다.
