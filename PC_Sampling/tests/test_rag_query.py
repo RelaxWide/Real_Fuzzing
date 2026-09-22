@@ -21,7 +21,7 @@ class QueryTests(unittest.TestCase):
             system, user = inst._llm_build_request('new_group_seeds')
         self.assertEqual(system, 'system unchanged')
         self.assertTrue(user.endswith('evidence unchanged'))
-        self.assertIn('FWCommit', extract_query(user)[0])
+        self.assertIn('Firmware Commit', extract_query(user)[0])
 
     def test_large_prompt_preserved_for_generation(self):
         prompt = query_block('new_group_seeds', ['FWCommit']) + 'evidence ' * 10000

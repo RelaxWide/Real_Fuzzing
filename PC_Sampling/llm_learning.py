@@ -430,6 +430,13 @@ class LearningMixin:
         if built is None:
             return None
         ctx = getattr(self, '_llm_pending_ctx', None) or {}
+        # v10.3: meta 우선 경로와 프롬프트 블록을 같은 빌더로 생성한다.
+        # 구버전에는 메서드가 없으므로 기존 블록 생성 경로를 유지한다.
+        builder = getattr(self, '_llm_rag_query', None)
+        if builder is not None:
+            query = builder(task, ctx)
+            block = START + '\n' + query + '\n' + END + '\n\n' if query else ''
+            return built[0], block + built[1]
         learning = getattr(self, 'learning', None)
         targets = []
         commands = []

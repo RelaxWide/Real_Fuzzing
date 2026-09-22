@@ -676,14 +676,14 @@ class RagQueryUsesTheRequestsOwnCommands(unittest.TestCase):
         o._llm_gap_cmds = lambda: ['GenericA', 'GenericB']
         q = fuzzer.NVMeFuzzer._llm_rag_query(
             o, 'new_group_seeds', {'rag_query_commands': ['FWCommit', 'Sanitize']})
-        self.assertIn('FWCommit', q)
-        self.assertNotIn('GenericA', q, '요청이 겨냥한 명령 대신 일반 목록을 썼다')
+        self.assertIn('Firmware Commit', q)
+        self.assertNotIn('Generic A', q, '요청이 겨냥한 명령 대신 일반 목록을 썼다')
 
     def test_falls_back_to_the_gap_list_when_ctx_has_none(self):
         o = fuzzer.NVMeFuzzer.__new__(fuzzer.NVMeFuzzer)
         o.learning = Mock(targets={})
         o._llm_gap_cmds = lambda: ['GenericA']
-        self.assertIn('GenericA', fuzzer.NVMeFuzzer._llm_rag_query(o, 'sequences', {}))
+        self.assertIn('Generic A', fuzzer.NVMeFuzzer._llm_rag_query(o, 'sequences', {}))
 
 
 class IndexIntegrity(unittest.TestCase):

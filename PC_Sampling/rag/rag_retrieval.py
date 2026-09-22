@@ -33,6 +33,8 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
 
 import json
 import logging
+import math
+from rag.retrieval_policy import canonical, tags, spec_name
 import re
 import time
 from pathlib import Path
@@ -50,7 +52,7 @@ def _defaults():
             "embed_model_revision": None,   # 설정하면 인덱스 manifest 와 대조한다
             "query_max_chars": 8000,      # 토큰 수 보장이 아니다. 보수적 문자 상한
             "context_max_chars": 60000,
-            "permission_groups": None}
+            "permission_groups": None, "command_tag_bonus": 0.1}
 
 
 def _settings(cfg):
@@ -169,7 +171,18 @@ def retrieve(meta, cfg, deadline):
     scores = vectors @ (vec / norm)
 
     groups = opts["permission_groups"]
-    order = np.argsort(-scores)
+    # 대상 명령은 구조화된 요청 문맥만 사용한다. 질의 문자열에서 임의 추측하지 않는다.
+    commands = (meta or {}).get("rag_query_commands") or []
+    if not isinstance(commands, list) or any(not isinstance(c, str) for c in commands):
+        raise ValueError("rag_query_commands must be a list of command names")
+    bonus = float(opts["command_tag_bonus"])
+    if not math.isfinite(bonus) or bonus < 0:
+        raise ValueError("command_tag_bonus must be finite and nonnegative")
+    wanted = {canonical(spec_name(c)) for c in commands}
+    covers = [tags(row.get("content", "")) for row in chunks]
+    matched = np.asarray([bool(wanted & {canonical(t) for t in ts}) for ts in covers])
+    final_scores = scores + bonus * matched
+    order = np.argsort(-final_scores, kind="stable")
     picked, parts = [], []
     for i in order:
         if len(picked) >= int(opts["top_k"]):
@@ -178,10 +191,23 @@ def retrieve(meta, cfg, deadline):
         if groups and not set(row.get("permission_groups") or []) & set(groups):
             continue
         picked.append({"doc_id": row.get("doc_id"), "title": row.get("title"),
-                       "score": round(float(scores[int(i)]), 4)})
+                       "score": round(float(final_scores[int(i)]), 4),
+                       "dense_score": float(scores[int(i)]),
+                       "tag_bonus": bonus if matched[int(i)] else 0.0,
+                       "covers_commands": covers[int(i)], "rank": len(picked) + 1})
         parts.append(f"## {row.get('title') or row.get('doc_id')}\n{row.get('content', '')}")
 
-    text = "\n\n".join(parts)[: int(opts["context_max_chars"])]
-    return text, {"enabled": True, "query_source": source, "query_chars": len(q),
+    limit = max(0, int(opts["context_max_chars"]))
+    full_context = "\n\n".join(parts)
+    text = full_context[:limit]
+    offset = 0
+    for hit, part in zip(picked, parts):
+        hit["injected_chars"] = max(0, min(len(part), len(text) - offset))
+        hit["truncated"] = hit["injected_chars"] < len(part)
+        offset += len(part) + 2
+    return text, {"enabled": True, "query_source": source, "query": q, "query_chars": len(q),
+                  "commands": commands, "command_tag_bonus": bonus,
+                  "query_version": (meta or {}).get("rag_query_version"),
+                  "context": text, "context_truncated": len(text) < len(full_context),
                   "index_version": version.name, "embed_model": manifest.get("embed_model"),
                   "hits": picked, "context_chars": len(text)}

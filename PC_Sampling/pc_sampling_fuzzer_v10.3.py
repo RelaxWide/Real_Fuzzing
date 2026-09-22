@@ -7843,28 +7843,26 @@ class _V101Fuzzer:
         알고 있으므로 여기서 만드는 것이 가장 정확하다.
         """
         return {'task': task, 'config': _CFG, 'product': self.config.product,
-                'rag_query': self._llm_rag_query(task, ctx)}
+                'rag_query': self._llm_rag_query(task, ctx),
+                'rag_query_commands': self._llm_rag_commands(ctx),
+                'rag_query_version': 'command-dword-fields-v1'}
+
+    def _llm_rag_commands(self, ctx):
+        """질의와 태그 보너스가 동일한 명령 집합을 사용하도록 한 곳에서 결정."""
+        cmds = list((ctx or {}).get('rag_query_commands') or [])
+        if not cmds:
+            learning = getattr(self, 'learning', None)
+            for tid in (ctx or {}).get('learning_targets', [])[:4]:
+                target = learning.targets.get(tid, {}) if learning else {}
+                cmds.extend(target.get('caller_commands', []))
+        if not cmds:
+            cmds = list(self._llm_gap_cmds() or [])
+        return list(dict.fromkeys(str(c) for c in cmds))[:6]
 
     def _llm_rag_query(self, task, ctx):
-        """검색 질의. 없으면 None → 검색 생략(전문을 질의로 쓰지 않는다)."""
-        try:
-            parts = ['NVMe']
-            for row in (ctx or {}).get('learning_targets', [])[:4]:
-                t = self.learning.targets.get(row) if isinstance(row, str) else None
-                if t and t.get('name'):
-                    parts.append(str(t['name']))
-            # 이 요청이 실제로 겨냥한 명령을 먼저 쓴다 — 프롬프트 빌더가 ctx 에
-            #   담아 둔다(never-sent/low-yield 후보, corpus_eval 이면 표본 명령).
-            #   llm_learning 의 질의 블록도 같은 키를 같은 순서로 쓴다.
-            cmds = [str(n) for n in ((ctx or {}).get('rag_query_commands') or [])[:6]]
-            if not cmds:
-                cmds = [str(n) for n in (self._llm_gap_cmds() or [])[:6]]
-            parts.extend(cmds)
-            if len(parts) == 1:
-                return None
-            return ' '.join(dict.fromkeys(parts))[:2000]
-        except Exception:
-            return None
+        from rag.retrieval_policy import enhanced_query
+        schemas = getattr(getattr(getattr(self, 'llm', None), 'schema_bridge', None), 'schemas', {})
+        return enhanced_query(self._llm_rag_commands(ctx), schemas)
 
     def _llm_gap_cmds(self):
         """검색 질의에 쓸 명령 이름 — 아직 안 쐈거나 수확이 낮은 것 우선."""

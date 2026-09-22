@@ -10,8 +10,8 @@
   reviewed=true를 일괄 지정하지 말 것. 정규식 후보는 정답이 아니다.
 - evaluate만 임베딩 API를 호출한다. 생성 모델/NVMe/퍼저 인스턴스는 호출하지
   않으며, 원본/인덱스/운영 설정을 수정하거나 전체 재임베딩하지 않는다.
-- A/B/C/D는 이 파일에서만 시험한다. 운영 rag_retrieval.py 반영과 llm_io
-  로그 확장은 별도 작업이다. 실측 개선 없이 운영에 가산점을 넣지 말 것.
+- A/B/C/D를 비교한다. 운영 검색은 검증된 D 방식(스키마 질의+태그 0.1)을
+  사용한다. 질의/태그 공통 규칙은 rag/retrieval_policy.py를 참고한다.
 - 실행 예시/정답표 형식/한계: ../docs/RAG_RETRIEVAL_EVAL.md.
 """
 import argparse
@@ -33,19 +33,8 @@ COMMANDS = ['Identify', 'Get Features', 'Set Features', 'Get Log Page',
             'Delete I/O Submission Queue', 'Delete I/O Completion Queue',
             'Namespace Management', 'Namespace Attachment', 'Firmware Commit',
             'Firmware Image Download', 'Read', 'Write', 'Dataset Management']
-CAPTION = re.compile(r'Figure\s+\d+\s*:\s*([^:\n]{1,140}?)\s*[-–—]\s*Command\s+Dword', re.I)
-
-
-def canonical(s):
-    """GetFeatures / Get Features 등 표기 차이만 제거한다(의미적 별칭 아님)."""
-    return re.sub(r'[^a-z0-9]', '', s.lower())
-
-
-def tags(content):
-    # PDF 추출 줄바꿈과 대시 변형을 허용한다. 제목 없는 후속 청크로 태그를
-    # 추정 전파하지 않는다. 이 규칙의 누락/오탐은 후보 본문으로 확인해야 한다.
-    return sorted(set(m.group(1).strip() for m in CAPTION.finditer(
-        re.sub(r'\s+', ' ', content))))
+# 운영과 동일한 태깅 규칙을 사용하여 평가/배포 간 차이를 막는다.
+from rag.retrieval_policy import canonical, tags, spec_name
 
 
 def read_jsonl(path):
@@ -114,7 +103,7 @@ def rank_case(scores, chunks, case, bonus, top_k):
     역순위이며, 여러 정답 전체를 찾았는지 측정하는 recall과 다르다.
     """
     import numpy as np
-    wanted = {canonical(x) for x in case.get('commands', [case['command']])}
+    wanted = {canonical(spec_name(x)) for x in case.get('commands', [case['command']])}
     tag_scores = np.asarray([float(bool(wanted & {canonical(t) for t in tags(r['content'])})) for r in chunks])
     final = scores + bonus * tag_scores
     order = np.argsort(-final, kind='stable')

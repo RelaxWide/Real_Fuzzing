@@ -304,14 +304,19 @@ def generate_rag_response(system, user, meta=None):
     try:
         from rag import rag_retrieval
         context, retrieval = rag_retrieval.retrieve(meta, cfg, deadline)
-    except ImportError:
-        pass
+    except ImportError as exc:
+        retrieval = {"enabled": True, "error": f"ImportError: {exc}"}
     except Exception as exc:                # 검색 실패가 생성을 막지 않는다
         retrieval = {"enabled": True, "error": f"{type(exc).__name__}: {exc}"}
         _log.warning("[LLM/vllm] 검색 실패 — 문서 없이 생성합니다: %s", exc)
     diag["retrieval"] = retrieval
     if context:
         user = f"{user}\n\n[참고 문서]\n{context}"
+
+    # 아카이브의 prompt는 RAG 전 원본이다. 실제 전송 문맥은 diagnostics에 보존한다.
+    diag["effective_user_prompt"] = user
+    diag["effective_system_prompt"] = system
+    diag["correction_attempt"] = meta.get("correction_attempt", 0)
 
     schema = None
     if cfg["structured_output"]:

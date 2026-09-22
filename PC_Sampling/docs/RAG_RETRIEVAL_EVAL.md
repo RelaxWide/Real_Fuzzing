@@ -56,7 +56,33 @@ Hit는 정답 중 하나 이상이 들어가는 비율이며, 모든 관련 청�
 순위 개선만으로 생성 결과의 정확성 개선까지 입증한 것은 아니다.
 
 파일은 덮어쓰지 않으므로 반복 시험에는 다른 output 이름을 쓴다.
-태그·질의 변경은 **평가 도구 안에서만** 적용된다. 운영 검색, 원본 JSONL,
-인덱스 벡터, llm_io 로그는 이 도구가 변경하지 않는다. 쿼리 스키마 자동 추출 및
-운영 llm_io 로그 확장은 별도 변경이다. 실제 인덱스·API에서 결과를 확인한 뒤
-운영 반영 여부를 결정한다.
+운영 검색에도 D 방식이 연결됐다. `rag.vllm.retrieval.command_tag_bonus` 기본값은
+검증에 사용한 0.1이며 0으로 설정하면 태그 가산점만 끌 수 있다. 원본 JSONL과
+벡터는 변경하지 않는다. `retrieval.enabled`는 기존 설정을 따르며 인덱스가 없는
+환경에서 자동 활성화하지 않는다.
+
+## 운영 질의와 로그 (2026-09-22)
+
+`rag/retrieval_policy.py`가 태그 규칙과 개선 질의 생성 함수를 제공한다.
+`_llm_rag_commands()`에서 선택한 동일 명령 집합을 질의와 태그 매칭에 사용한다.
+meta.rag_query와 프롬프트 RAG-QUERY 블록도 같은 빌더를 사용한다.
+스키마의 word/name을 읽어 `명령 command Command Dword 번호 약칭 전체명 ... field encoding`
+형식으로 만든다. 현재 스키마에는 전체명이 없으므로 사용자 평가에서 확인한
+OFI/IFC/PRHBT/SCP/SANACT/FID/SEL만 검색용 사전에 확장했고 나머지는 약칭을 유지한다.
+실행 스키마와 valid 값은 변경하지 않는다. 선택적인 enum 이름은 붙이지 않는다.
+스키마의 모든 정의된 필드를 쓰므로 손으로 작성한 평가 예시와 필드 수/순서는
+다를 수 있다. 이 자동 생성 질의의 실서버 성능은 별도로 확인해야 한다.
+
+`rag.log_responses=true`일 때 `llm/llm_io_<timestamp>.jsonl`의 diagnostics에서 확인:
+
+- retrieval.query / commands / query_version / command_tag_bonus
+- retrieval.hits: dense_score, tag_bonus, score(최종 점수), rank, covers_commands
+- retrieval.hits[].injected_chars / truncated: 선택됐어도 실제로 잘린 청크 구별
+- retrieval.context: 길이 제한 후 주입한 본문
+- effective_user_prompt / effective_system_prompt: 실제 생성 입력
+- correction_attempt 및 correction 하위 진단: 교정 요청 구분
+
+기존 prompt는 RAG 전 원본이다. 기본 설정의 log_responses는 true로 변경했으며
+다른 config를 사용하는 환경은 해당 값을 확인한다. 실패/비활성 시에도 진단이
+기록된다. 서버 토큰 상한으로 질의 임베딩이 축소되는 기존 재시도는 유지되며,
+retrieval.query는 축소 전 질의이므로 축소 경고가 있는 요청은 별도로 확인한다.
