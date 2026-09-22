@@ -66,6 +66,7 @@ def harness(options=None):
     obj._llm_funnel = dict(requests=0, transport_ok=0, json_ok=0,      # v10.3 깔때기 계측
                            items=0, adopted=0, empty_ok=0,
                            seeds=0, seqs=0, evals=0, workloads=0)
+    obj._llm_by_task = {}          # v10.3 task 별 깔때기
     obj._llm_fail_streak = 0
     obj._llm_fail = Mock()
     obj._llm_seen = set()

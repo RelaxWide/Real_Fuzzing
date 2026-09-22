@@ -1550,5 +1550,90 @@ class ChatTemplateControlsAreExplicit(unittest.TestCase):
                          '어떤 설정으로 부른 응답인지 사후에 알 수 없다')
 
 
+class FunnelIsPerTaskNotSummed(unittest.TestCase):
+    """채택 수를 합산하면 단위가 다른 것이 섞인다 — 평가 1건 ≠ 신규 시드 1건.
+
+    응답 1건당 상한이 task 마다 5배 넘게 다르므로(seeds 8 / seq 6 / eval 40),
+    합계는 평가가 지배한다. task 별 '요청 대비' 로 봐야 한다.
+    """
+
+    def obj(self):
+        o = harness()
+        o._llm_fail = Mock()
+        o._llm_archive = Mock()
+        o.llm = Mock(enabled=True, schema_bridge=harness().llm.schema_bridge)
+        o.config = Mock(rag_module_path='rag.vllm_client')
+        o._llm_by_task = {}
+        # 하네스 기본값(16)은 운영과 다르다 — 운영은 _learning_max_seeds = RAG_MAX_SEEDS.
+        #   맞춰 두지 않으면 믹스인이 절단하지 않아 '원본 vs 사본' 구분이 사라진다.
+        o._learning_max_seeds = fuzzer.RAG_MAX_SEEDS
+        o._learning_max_seqs = fuzzer.RAG_MAX_SEQS
+        return o
+
+    def apply(self, o, payload, task='new_group_seeds'):
+        # **바운드 메서드**로 부른다 — 학습 믹스인을 거쳐야 실제 운영과 같이
+        #   data 가 먼저 절단되고 raw_original 로 원본이 전달된다.
+        o._llm_apply_result({
+            'task': task, 'raw': json.dumps(payload), 'submitted_at': 1,
+            'error': None, 'req_id': 1, 'ctx': {}, 'llm_seconds': 0.1,
+            'diagnostics': {'finish_reason': 'stop'}})
+
+    def test_requests_are_counted_per_task(self):
+        o = self.obj()
+        self.apply(o, {'seeds': []}, 'new_group_seeds')
+        self.apply(o, {'seeds': []}, 'new_group_seeds')
+        self.apply(o, {'evaluations': []}, 'corpus_eval')
+        self.assertEqual(o._llm_by_task['new_group_seeds']['req'], 2)
+        self.assertEqual(o._llm_by_task['corpus_eval']['req'], 1)
+
+    def test_cap_hit_is_detected(self):
+        o = self.obj()
+        full = [{'command': 'Read'} for _ in range(fuzzer.RAG_MAX_SEEDS)]
+        self.apply(o, {'seeds': full}, 'new_group_seeds')
+        bt = o._llm_by_task['new_group_seeds']
+        self.assertEqual(bt['capped'], 1, '상한 도달을 못 셌다')
+        self.assertEqual(bt['cap'], fuzzer.RAG_MAX_SEEDS)
+
+    def test_discarded_count_needs_the_untruncated_response(self):
+        """학습 모듈이 먼저 8개로 자른다. 정규화된 사본만 보면 '몇 개를 버렸는지'는
+        영원히 0 으로 보인다 — 상한이 기여를 자르는지 판단할 근거가 사라진다."""
+        o = self.obj()
+        over = fuzzer.RAG_MAX_SEEDS + 5
+        self.apply(o, {'seeds': [{'command': 'Read'} for _ in range(over)]},
+                   'new_group_seeds')
+        self.assertEqual(o._llm_by_task['new_group_seeds']['cut'], 5,
+                         '상한이 버린 개수를 원본 기준으로 세지 않았다')
+
+    def test_below_cap_is_not_counted_as_capped(self):
+        o = self.obj()
+        self.apply(o, {'seeds': [{'command': 'Read'}]}, 'new_group_seeds')
+        self.assertEqual(o._llm_by_task['new_group_seeds']['capped'], 0)
+
+    def test_corpus_eval_sample_is_configurable(self):
+        g = json.loads((ROOT / 'fuzzer_config.json').read_text(encoding='utf-8'))
+        self.assertEqual(g['rag']['corpus_eval_sample'], fuzzer.CORPUS_EVAL_SAMPLE)
+
+    def test_sample_size_is_not_hardcoded_at_the_call_site(self):
+        import ast
+        src = (ROOT / 'pc_sampling_fuzzer_v10.3.py').read_text(encoding='utf-8')
+        self.assertNotIn('_corpus_eval_stratified_sample(40)', src,
+                         '표본 수가 여전히 하드코딩이다')
+        self.assertIn('_corpus_eval_stratified_sample(CORPUS_EVAL_SAMPLE)', src)
+
+    def test_generator_budget_squeeze_is_visible(self):
+        """generators 는 seeds 와 같은 예산을 나눠 쓴다 — 버려진 수가 보여야 한다."""
+        src = (ROOT / 'pc_sampling_fuzzer_v10.3.py').read_text(encoding='utf-8')
+        self.assertIn('generator_variants_budgeted_out', src,
+                      '버려진 generator 변형이 어디에도 보고되지 않는다')
+        self.assertIn('gen버려짐', src)
+
+    def test_summary_is_two_lines_not_one_per_task(self):
+        import ast
+        src = (ROOT / 'pc_sampling_fuzzer_v10.3.py').read_text(encoding='utf-8')
+        self.assertIn('[LLM/task] ', src)
+        # task 별로 log 를 따로 찍으면 줄이 길어진다 — 한 줄에 join 해야 한다
+        self.assertIn('" ".join(_parts)', src)
+
+
 if __name__ == '__main__':
     unittest.main()

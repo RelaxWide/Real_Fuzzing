@@ -415,6 +415,8 @@
     },
     "max_seeds_per_round": 8,
     "max_seq_per_round": 6,
+    "_comment_corpus_eval_sample": "corpus_eval 이 한 번에 평가시키는 시드 수(층화 표본). 하드코딩 40 이었다. task 마다 응답 1건당 항목 수가 크게 달라(seeds 8 / seq 6 / eval 40) 채택 수를 합산하면 평가가 총합을 지배한다 — [LLM/task] 는 task 별로 요청 대비로 본다.",
+    "corpus_eval_sample": 40,
     "max_seq_len": 16,
     "max_uncov_funcs": 40,
     "seed_at_startup": true,

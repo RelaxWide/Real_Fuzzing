@@ -456,6 +456,8 @@ RAG_REQUEST_INTERVAL = float(_RAG.get('request_interval_sec', 60.0))  # v10: LLM
 RAG_PLATEAU_EXECS    = int(_RAG.get('plateau_exec_threshold', 20000))
 RAG_MAX_SEEDS        = int(_RAG.get('max_seeds_per_round', 8))
 RAG_MAX_SEQS         = int(_RAG.get('max_seq_per_round', 4))
+# corpus_eval 이 한 번에 평가시키는 시드 수(층화 표본). 하드코딩 40 이었다.
+CORPUS_EVAL_SAMPLE   = int(_RAG.get('corpus_eval_sample', 40))
 RAG_MAX_UNCOV_FUNCS  = int(_RAG.get('max_uncov_funcs', 40))
 # 미도달 함수 순위는 **콜그래프 거리**로 정한다(riscv_cov.reach_ranked_uncovered).
 # 이름 패턴(부팅/ISR/...)을 쓰다 걷어냈다 — 실제 심볼이
@@ -5333,6 +5335,10 @@ class _V101Fuzzer:
                             'items': 0, 'adopted': 0, 'empty_ok': 0,
                             # 채택의 내역(task 마다 채택의 형태가 다르다)
                             'seeds': 0, 'seqs': 0, 'evals': 0, 'workloads': 0}
+        # task 별 요청 수·상한 도달 횟수. 합산 채택 수는 단위가 달라 비교가 안 된다
+        #   (평가 1건 ≠ 신규 시드 1건). task 마다 '요청 대비 얼마'로 봐야 한다.
+        #   capped = 모델이 상한만큼 채워 보낸 횟수 → 상한이 실제로 무는지 판단.
+        self._llm_by_task = {}
         self._llm_last_task = None            # v9.5: 직전 선택 task(연속 상한 추적)
         self._llm_task_consec = 0             # v9.5: 같은 task 연속 선택 횟수(starvation-free cap)
         # v10: LLM 요청 주기를 시간 기반으로. 마지막 '시도' 시각(monotonic). 시작 ~interval 뒤 첫 시도.
@@ -7741,7 +7747,7 @@ class _V101Fuzzer:
             return self._LLM_SYSTEM, user
         if task == 'corpus_eval':
             # v9.5 Phase 0: 층화 표본 + 풍부한 context(cdw11/data_len/origin/command_dominant_error/favored).
-            sample = self._corpus_eval_stratified_sample(40)
+            sample = self._corpus_eval_stratified_sample(CORPUS_EVAL_SAMPLE)
             # seed_id 에 id(s)(파이썬 객체 주소)를 쓰면 15자리라 프롬프트와 응답 양쪽을
             #   크게 부풀린다. 이 id 는 **이 요청 1건 안에서만** 유효하면 되므로 표본 내
             #   짧은 인덱스로 충분하다.
@@ -8136,6 +8142,25 @@ class _V101Fuzzer:
             self._llm_stats['dropped'] += 1
             return
         self._llm_funnel['json_ok'] += 1
+        # task 별 집계. 상한 도달은 **절단 전 원본**(_shape)으로 센다 — 학습 모듈이
+        #   먼저 잘라 넘기므로 정규화된 사본으로는 모델이 몇 개 보냈는지 알 수 없다.
+        _tk = str(res.get('task') or 'unknown')
+        if getattr(self, '_llm_by_task', None) is None:
+            self._llm_by_task = {}       # __init__ 을 우회해 만든 객체도 안전하게
+        _bt = self._llm_by_task.setdefault(
+            _tk, {'req': 0, 'adopted': 0, 'capped': 0, 'cap': 0, 'cut': 0})
+        _bt['req'] += 1
+        for _key, _cap in (('seeds', RAG_MAX_SEEDS), ('sequences', RAG_MAX_SEQS),
+                           ('evaluations', CORPUS_EVAL_SAMPLE)):
+            _got = _shape.get(_key)
+            if isinstance(_got, list) and _cap:
+                _bt['cap'] = _cap
+                if len(_got) >= _cap:
+                    _bt['capped'] += 1
+                # 상한이 **실제로 버린 개수**. 정규화된 사본은 이미 잘려 있어
+                #   원본(_shape)으로만 셀 수 있다 — 상한이 기여를 자르는지의 근거다.
+                _bt['cut'] = _bt.get('cut', 0) + max(0, len(_got) - _cap)
+                break
         # 여기부터는 **정상 응답**이다. 중복이나 빈 결과로 채택이 0개여도 실패가 아니다
         #   — 실패로 세면 정상 동작 중에 LLM 이 꺼진다.
         self._llm_fail_streak = 0
@@ -8340,6 +8365,10 @@ class _V101Fuzzer:
         self._llm_funnel['workloads'] += _added_w
         _adopted = added_s + added_q + _ev_applied + _added_w
         self._llm_funnel['adopted'] += _adopted
+        if getattr(self, '_llm_by_task', None) is None:
+            self._llm_by_task = {}
+        self._llm_by_task.setdefault(
+            _tk, {'req': 0, 'adopted': 0, 'capped': 0, 'cap': 0})['adopted'] += _adopted
         if not _adopted:
             # 정상 응답인데 채택 0 — 중복이거나 대상이 이미 컬링된 경우.
             #   실패가 아니다. 기여 0 으로만 기록한다.
@@ -8595,12 +8624,30 @@ class _V101Fuzzer:
             _fn = self._llm_funnel
             if _fn['requests']:
                 log.warning(f"[LLM/funnel] 요청={_fn['requests']} → 통신ok={_fn['transport_ok']} "
-                            f"→ JSONok={_fn['json_ok']} → 항목={_fn['items']} "
-                            f"→ 채택={_fn['adopted']}"
-                            f"(시드 {_fn['seeds']}/시퀀스 {_fn['seqs']}/"
-                            f"평가 {_fn['evals']}/워크로드 {_fn['workloads']}) "
-                            f"(정상0건={_fn['empty_ok']}, "
-                            f"연속실패={self._llm_fail_streak}/{RAG_FAIL_LIMIT})")
+                            f"→ JSONok={_fn['json_ok']} | 정상0건={_fn['empty_ok']} "
+                            f"연속실패={self._llm_fail_streak}/{RAG_FAIL_LIMIT}")
+                # task 별로 '요청 대비 채택'을 본다. 합산은 단위가 달라 의미가 없다
+                #   — 평가 1건과 신규 시드 1건을 같은 1로 세면 평가가 총합을 지배한다.
+                #   캡% = 모델이 상한만큼 채워 보낸 비율. 높으면 상한이 기여를 자르고 있다.
+                _short = {'new_group_seeds': 'seed', 'sequences': 'seq',
+                          'corpus_eval': 'eval', 'io_patterns': 'wl'}
+                _parts = []
+                for _t, _d in sorted((getattr(self, '_llm_by_task', None) or {}).items()):
+                    _r = _d['req'] or 1
+                    _seg = (f"{_short.get(_t, _t)} {_d['req']}→{_d['adopted']}"
+                            f"({_d['adopted'] / _r:.1f}")
+                    if _d['cap']:
+                        _seg += f"/{_d['cap']},캡{_d['capped'] * 100 // _r}%"
+                        if _d.get('cut'):
+                            _seg += f",잘림{_d['cut']}"
+                    _parts.append(_seg + ")")
+                _gdrop = 0
+                try:
+                    _gdrop = self.learning.counts.get('generator_variants_budgeted_out', 0)
+                except Exception:
+                    pass
+                log.warning("[LLM/task] " + " ".join(_parts)
+                            + (f" | gen버려짐={_gdrop}" if _gdrop else ""))
             # v9.1: 되먹임 신호 성숙도 — 확정 미구현 / accept 예시 보유 / 구현됐으나 얕게 반송
             _acc_n = sum(1 for _n, _s in self.cmd_stats.items() if _s.get('accepted'))
             _impl_low = [ _n for _n, _s in self.cmd_stats.items()
