@@ -458,6 +458,31 @@ RAG_MAX_SEEDS        = int(_RAG.get('max_seeds_per_round', 8))
 RAG_MAX_SEQS         = int(_RAG.get('max_seq_per_round', 4))
 # corpus_eval 이 한 번에 평가시키는 시드 수(층화 표본). 하드코딩 40 이었다.
 CORPUS_EVAL_SAMPLE   = int(_RAG.get('corpus_eval_sample', 40))
+# 종료 요약의 NSID 분포에 나열할 상위 개수. nsid 는 퍼징 대상이라 값 종류가
+#   계속 늘어, 긴 캠페인에서 전량 나열하면 요약이 수백 줄이 된다. 0 이면 전부.
+SUMMARY_NSID_TOP     = int(_G.get('summary_nsid_top', 8))
+
+
+def _fmt_nsid_dist(dist, top=None):
+    """종료 요약의 NSID 분포 한 줄. **횟수 상위만** 나열하고 꼬리는 접는다.
+
+    nsid 는 퍼징 대상이라 값 종류가 계속 늘어난다. 전량 나열하면 긴 캠페인에서 이
+    한 줄이 요약을 통째로 덮는다(1,300종 → 2.5만 자). 꼬리는 개별 값보다 '얼마나
+    퍼졌나' 가 정보라, 종수와 합계로 접는다. top<=0 이면 전부 나열.
+
+    값 순이 아니라 **횟수 순**으로 자른다 — 값 순으로 자르면 가장 많이 쓴 nsid 가
+    잘려 나갈 수 있다.
+    """
+    top = SUMMARY_NSID_TOP if top is None else top
+    rows = sorted(dict(dist or {}).items(), key=lambda kv: (-kv[1], kv[0]))
+    if not rows:
+        return ""
+    head = rows if top <= 0 else rows[:top]
+    text = ', '.join(f"nsid={n}:{c}회" for n, c in head)
+    rest = rows[len(head):]
+    if rest:
+        text += f", …그 외 {len(rest):,}종 {sum(c for _, c in rest):,}회"
+    return f"Actual NSID distribution ({len(rows):,}종): {text}"
 RAG_MAX_UNCOV_FUNCS  = int(_RAG.get('max_uncov_funcs', 40))
 # 미도달 함수 순위는 **콜그래프 거리**로 정한다(riscv_cov.reach_ranked_uncovered).
 # 이름 패턴(부팅/ISR/...)을 쓰다 걷어냈다 — 실제 심볼이
@@ -18952,11 +18977,9 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                     f"NSID override policy: {NSID_OVERRIDE_POLICY} "
                     f"(active={list(self._active_nsids)}, send normalized={_nsid_norm}회, "
                     f"LLM stripped={_nsid_llm}회, device skip={_nsid_dev_skip}회)")
-                if stats.get('actual_nsid_dist'):
-                    _nsid_dist = ', '.join(
-                        f"nsid={n}:{count}회"
-                        for n, count in sorted(stats['actual_nsid_dist'].items()))
-                    summary_lines.append(f"Actual NSID distribution: {_nsid_dist}")
+                _nsid_line = _fmt_nsid_dist(stats.get('actual_nsid_dist'))
+                if _nsid_line:
+                    summary_lines.append(_nsid_line)
                 # SetFeatures Write Protect(FID 0x84) 차단 누적 — WPS=2(POR복구불가)/3(영구).
                 _blk_wp = self.stats.get('blocked_write_protect', 0)
                 if _blk_wp > 0:

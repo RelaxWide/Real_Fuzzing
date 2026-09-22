@@ -28,6 +28,8 @@
       "uhubctl_port": null,
       "uhubctl_delay_sec": 2
     },
+    "_comment_summary_nsid_top": "종료 요약의 'Actual NSID distribution' 에 나열할 상위 개수(횟수 내림차순). nsid 는 퍼징 대상이라 값 종류가 계속 늘어, 긴 캠페인에서 전량 나열하면 이 한 줄이 요약을 덮는다. 나머지는 종수·합계로 접는다. 0 이면 전부 나열.",
+    "summary_nsid_top": 8,
     "openocd_startup_timeout": 10.0,
     "pcsr_core0": "0x80030084",
     "pcsr_core1": "0x80032084",
