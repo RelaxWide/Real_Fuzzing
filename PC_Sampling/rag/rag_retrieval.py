@@ -34,7 +34,7 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
 import json
 import logging
 import math
-from rag.retrieval_policy import canonical, tags, spec_name
+from rag.retrieval_policy import canonical, tags, spec_name, cache_chunk_tags, definition_lookup, enhanced_query
 import re
 import time
 from pathlib import Path
@@ -107,6 +107,8 @@ def _load(index_dir):
                  manifest.get("embed_model"))
     # float16 저장분을 질의마다 float32 로 복사하면 인덱스 크기에 비례해 낭비가 커진다
     #   (10만 청크면 매 질의 400 MB). 한 번만 변환해 캐시한다.
+    cache_chunk_tags(chunks)
+    manifest["_field_lookups"] = {}
     matrix32 = vectors.astype(np.float32)
     _PINNED[key] = (manifest, chunks, matrix32, version)
     return _PINNED[key]
@@ -162,6 +164,18 @@ def retrieve(meta, cfg, deadline):
         raise ValueError(
             f"인덱스 임베딩 모델 revision 불일치: 인덱스={_rev or '(기록 없음)'} "
             f"설정={_want_rev} ({version.name}) — 다시 색인하세요")
+    # 디스크 접근/메타데이터 확장은 LLM 워커에서 수행한다. 메인 퍼저 스레드는
+    # 스키마만 전달하며 기존 인덱스(field_definitions 없음)는 원래 질의를 유지한다.
+    schemas = (meta or {}).get('rag_query_schemas')
+    if schemas is not None and 'field_definitions' in manifest:
+        group_key = tuple(sorted(opts['permission_groups'] or []))
+        lookups = manifest.setdefault('_field_lookups', {})
+        if group_key not in lookups:
+            lookups[group_key] = definition_lookup(manifest['field_definitions'], group_key)[0]
+        expanded = enhanced_query((meta or {}).get('rag_query_commands') or [], schemas, lookups[group_key])
+        if expanded:
+            q = expanded[:int(opts['query_max_chars'])]
+            source = 'index_field_definitions'
     vec = np.asarray(embed(q, opts, cfg, deadline), dtype=np.float32)
     if vec.shape[0] != vectors.shape[1]:
         raise ValueError(f"질의 벡터 차원 불일치: 질의={vec.shape[0]} "
@@ -179,8 +193,9 @@ def retrieve(meta, cfg, deadline):
     if not math.isfinite(bonus) or bonus < 0:
         raise ValueError("command_tag_bonus must be finite and nonnegative")
     wanted = {canonical(spec_name(c)) for c in commands}
-    covers = [tags(row.get("content", "")) for row in chunks]
-    matched = np.asarray([bool(wanted & {canonical(t) for t in ts}) for ts in covers])
+    cache_chunk_tags(chunks)  # _load에서 완료; 외부/시험 로더도 최초 1회만 계산
+    covers = [row["covers_commands"] for row in chunks]
+    matched = np.asarray([bool(wanted & row["_command_keys"]) for row in chunks])
     final_scores = scores + bonus * matched
     order = np.argsort(-final_scores, kind="stable")
     picked, parts = [], []
@@ -208,6 +223,7 @@ def retrieve(meta, cfg, deadline):
     return text, {"enabled": True, "query_source": source, "query": q, "query_chars": len(q),
                   "commands": commands, "command_tag_bonus": bonus,
                   "query_version": (meta or {}).get("rag_query_version"),
+                  "metadata_extraction": manifest.get("metadata_extraction"),
                   "context": text, "context_truncated": len(text) < len(full_context),
                   "index_version": version.name, "embed_model": manifest.get("embed_model"),
                   "hits": picked, "context_chars": len(text)}

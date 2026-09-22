@@ -209,7 +209,7 @@ def main(argv=None):
             report = evaluate(draft['cases'], chunks, vectors, embed, a.bonus, a.top_k)
             report['bonus'] = a.bonus
             print(json.dumps(report['summary'], ensure_ascii=False, indent=2))
-        report.update(index_version=version.name, chunks_sha256=fingerprint, manifest=manifest,
+        report.update(index_version=version.name, chunks_sha256=fingerprint, manifest={k: v for k, v in manifest.items() if not k.startswith("_")},
                       eligible_chunks=len(chunks), permission_groups=opts.get('permission_groups'))
         a.output.parent.mkdir(parents=True, exist_ok=True)
         with a.output.open('x', encoding='utf-8') as f:

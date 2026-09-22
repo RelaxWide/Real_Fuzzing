@@ -76,6 +76,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+from rag.retrieval_policy import tags, extract_definitions, definition_lookup, EXTRACTION_VERSION
+
+
 def sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -155,6 +158,8 @@ def load_jsonl(paths, max_chars):
             if not isinstance(row, dict) or not (row.get("content") or "").strip():
                 skipped += 1
                 continue
+            definitions = extract_definitions(row['content'], source,
+                row.get('doc_id') or f'{source}:{lineno}', row.get('permission_groups') or [])
             pieces = split_record(row, max_chars)
             for part, text in enumerate(pieces):
                 chunks.append({
@@ -164,6 +169,7 @@ def load_jsonl(paths, max_chars):
                     "content": text,
                     "permission_groups": row.get("permission_groups") or [],
                     "source_file": source,
+                    "_field_definitions": definitions,
                 })
     return chunks, skipped
 
@@ -537,10 +543,24 @@ def _build(args, index_dir, np):
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
+    # 새 파일 없이 최종 청크에는 태그, manifest에는 분할 전 원문의 정의를 저장.
+    # 임베딩 입력과 재사용 키(content sha256)는 변경하지 않는다.
+    definitions_by_key = {}
+    for chunk in chunks:
+        chunk['covers_commands'] = tags(chunk['content'])
+        for definition in chunk.pop('_field_definitions', []):
+            definitions_by_key[json.dumps(definition, sort_keys=True)] = definition
+    definitions = list(definitions_by_key.values())
+    _, conflicts = definition_lookup(definitions)
+    print(f"[ingest] 필드 정의 {len(definitions)}건, 충돌 키 {conflicts}건 (충돌은 검색 확장 제외)")
     (staging / "chunks.jsonl").write_text(
         "".join(json.dumps(c, ensure_ascii=False) + "\n" for c in chunks), encoding="utf-8")
     np.save(staging / "vectors.f16.npy", matrix)
     (staging / "manifest.json").write_text(json.dumps({
+        "field_definitions": definitions,
+        "metadata_extraction": {"version": EXTRACTION_VERSION, "conflicting_keys": conflicts,
+                                "definitions": len(definitions),
+                                "untagged_chunks": sum(not c["covers_commands"] for c in chunks)},
         "version": version, "created": datetime.now().isoformat(timespec="seconds"),
         "sources": sources, "chunks": len(chunks), "dim": int(matrix.shape[1]),
         "embed_model": args.embed_model,

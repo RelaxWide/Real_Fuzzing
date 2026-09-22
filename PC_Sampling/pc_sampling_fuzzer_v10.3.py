@@ -7870,6 +7870,8 @@ class _V101Fuzzer:
         return {'task': task, 'config': _CFG, 'product': self.config.product,
                 'rag_query': self._llm_rag_query(task, ctx),
                 'rag_query_commands': self._llm_rag_commands(ctx),
+                'rag_query_schemas': {c: self.llm.schema_bridge.schemas.get(c, [])
+                                      for c in self._llm_rag_commands(ctx)},
                 'rag_query_version': 'command-dword-fields-v1'}
 
     def _llm_rag_commands(self, ctx):

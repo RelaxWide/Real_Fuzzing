@@ -31,7 +31,7 @@ def spec_name(name):
     return COMMAND_NAMES.get(name, re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', name))
 
 
-def enhanced_query(commands, schemas):
+def enhanced_query(commands, schemas, definitions=None):
     """구조화 스키마에서 검색문을 생성한다. 미등록 필드 전체명은 추측하지 않는다.
 
     Dword 번호는 현행 스키마에서 읽는다. 선택 사항인 enum 이름은 추가하지
@@ -47,7 +47,64 @@ def enhanced_query(commands, schemas):
             text += ' Command Dword ' + ' '.join(map(str, words))
         for term in terms:
             text += ' ' + term
-            if term in FIELD_NAMES:
-                text += ' ' + FIELD_NAMES[term]
+            if definitions is None:
+                full = FIELD_NAMES.get(term)  # 기존 인덱스 호환
+            else:
+                candidates = {definitions[(canonical(spec_name(command)), f['word'], term)]
+                              for f in fields if f['name'] == term
+                              and (canonical(spec_name(command)), f['word'], term) in definitions}
+                full = next(iter(candidates)) if len(candidates) == 1 else None
+            if full:
+                text += ' ' + full
         parts.append(text + ' field encoding')
     return '\n'.join(parts) or None
+
+EXTRACTION_VERSION = 'figure-field-definitions-v1'
+# 필드 표의 줄 시작/비트 범위 다음에 오는 "전체명 (약칭):"만 채택한다.
+# 일반 설명의 괄호나 임의 약칭을 전체명으로 추측하지 않는다.
+_SECTION = re.compile(r'Figure\s+\d+\s*:\s*([^:\n]{1,140}?)\s*[-–—]\s*Command\s+Dword\s+(\d+)', re.I)
+_FIELD = re.compile(r'(?m)^\s*(?:\|\s*)?(?:\d+(?::\d+)?\s*(?:\|\s*)?)?'
+                    r'([A-Za-z][A-Za-z0-9 /-]{2,100})\s*\(([A-Z][A-Z0-9_]{1,15})\)\s*(?::|\||$)')
+
+
+def extract_definitions(content, source_file, source_doc_id, permission_groups=()):
+    """분할 전 원문에서 Figure 범위 내 명시적 정의만 읽고 원문 근거를 남긴다."""
+    definitions = []
+    # 다른 Figure가 나오면 문맥을 종료하여 다음 표에 잘못 귀속하지 않는다.
+    starts = list(re.finditer(r'(?i)Figure\s+\d+\s*:', content))
+    for i, start in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(content)
+        section = content[start.start():end]
+        heading = _SECTION.match(section)
+        if not heading:
+            continue
+        for match in _FIELD.finditer(section[heading.end():]):
+            name = ' '.join(match.group(1).split())
+            definitions.append(dict(command=heading.group(1).strip(), dword=int(heading.group(2)),
+                                    abbreviation=match.group(2), full_name=name,
+                                    source_file=source_file, source_doc_id=source_doc_id,
+                                    permission_groups=list(permission_groups),
+                                    evidence=match.group(0).strip()[:240]))
+    return definitions
+
+
+def definition_lookup(definitions, groups=None):
+    """동일 명령/Dword/약칭의 전체명이 충돌하면 채택하지 않는다."""
+    names = {}
+    for row in definitions:
+        if groups and not set(groups) & set(row.get('permission_groups') or []):
+            continue
+        key = (canonical(row['command']), row['dword'], row['abbreviation'])
+        names.setdefault(key, set()).add(row['full_name'])
+    return {k: next(iter(v)) for k, v in names.items() if len(v) == 1}, sum(len(v) > 1 for v in names.values())
+
+
+def cache_chunk_tags(chunks):
+    """구형 인덱스는 최초 로드 때만 본문에서 추출. _ 키는 메모리 전용."""
+    for row in chunks:
+        if '_command_keys' not in row:
+            covers = row.get('covers_commands')
+            if not isinstance(covers, list) or any(not isinstance(c, str) for c in covers):
+                covers = tags(row.get('content', ''))
+            row['covers_commands'] = covers
+            row['_command_keys'] = frozenset(canonical(c) for c in covers)
