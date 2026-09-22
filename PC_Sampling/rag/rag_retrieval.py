@@ -200,6 +200,7 @@ def retrieve(meta, cfg, deadline):
             _log.warning('[LLM/rag] 스펙 필드 확장 %d건 / 미확인 %d건 (metadata=%s)',
                          field_expansion['matched_count'], field_expansion['missing_count'],
                          field_expansion['metadata_present'])
+            _log.warning('[LLM/rag] 미확인 사유: %s', field_expansion['missing_reasons'])
     vec = np.asarray(embed(q, opts, cfg, deadline), dtype=np.float32)
     if vec.shape[0] != vectors.shape[1]:
         raise ValueError(f"질의 벡터 차원 불일치: 질의={vec.shape[0]} "

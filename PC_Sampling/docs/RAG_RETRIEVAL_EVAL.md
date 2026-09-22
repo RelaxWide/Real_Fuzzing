@@ -158,3 +158,52 @@ manifest와 설정을 비교한다. 실제 모델 변경이 없으면 날짜에 
 자동 추출은 명시적인 이름-약칭 정의에 한정된다. 전체 원문의 정의가 항상 이 형태라는
 보장은 없으므로 누락 목록으로 추가 형식을 확인한다. 다중 명령의 top-k 배분 정책은
 이번 수정에서 변경하지 않았다.
+
+## 필드 정규화·미확인 원인·전체 스키마 감사
+
+진단은 모든 명령에 공통 적용한다. `field_expansion.missing_fields[]`에
+`reason`, `normalized_field`, `alias_applied`, 원문 후보(최대 8개)와 전체 후보 수를
+기록한다. permission_groups로 제외된 근거는 후보에도 노출하지 않는다.
+
+- definition_missing: 허용된 정의에서 해당 이름을 찾지 못함
+- definition_conflict: 같은 문맥 또는 공통 사전에 서로 다른 전체명 후보 존재
+- context_mismatch: 동일 명령의 정의가 다른 Dword에 귀속되어 있음
+- schema_location_mismatch: 확인된 표준 필드 위치와 실행 스키마 위치가 다름
+- 성공은 matched_scoped / matched_global로 구분
+
+추출 v3은 괄호 약칭 없는 `CNS Specific Identifier:`와 `UUID Index:`도 수집한다.
+검색 별칭은 명령/Dword별로 한정한다. Identify CNSSI, Identify/GetFeatures/SetFeatures
+UIDX와 7개 명령의 SLBA_LO/SLBA_HI를 처리한다. 임의 `_LO/_HI` 제거는 하지 않는다.
+원문 정의가 있어야 확장하며, 별칭 자체로 전체명을 꾸며 넣지 않는다.
+구형 인덱스는 로드 시 v3 규칙으로 1회 보충하므로 퍼저 재시작으로 적용된다.
+
+명령별 요청에 등장하지 않은 필드까지 점검하려면:
+
+```bash
+python3 tools/rag_field_audit.py --config fuzzer_config.json \
+  --index-dir rag/index --output output/rag_field_audit.json
+```
+
+현행 41개 명령/171개 필드 선언을 AST로 읽는다. 퍼저 인스턴스/장치/API 호출 없이
+현재 인덱스와 전체 필드를 대조한다. 이 개수는 스키마가 바뀌면 달라진다.
+전체명 매칭 검사이며 모든 NVMe 비트 배치의 적합성을 인증하는 도구는 아니다.
+
+### 검토 중 발견한 별도 스키마 문제
+
+NVMe Base 2.0d Figure 292/293과 현재 Lockdown 실행 스키마의 위치가 다르다:
+
+| 필드 | 현재 | 표준 2.0d |
+|---|---|---|
+| OFI | CDW10[7:0] | CDW10[15:8] |
+| IFC | CDW10[25:24] | CDW10[6:5] |
+| PRHBT | CDW10[15] | CDW10[4] |
+| SCP | CDW10[19:16] | CDW10[3:0] |
+| UUID | CDW10[14:9] | UUID Index, CDW14[6:0] |
+
+출처: https://nvmexpress.org/wp-content/uploads/NVM-Express-Base-Specification-2.0d-2024.01.11-Ratified.pdf
+
+CNSSI는 같은 문서 Identify CDW11의 `CNS Specific Identifier`(괄호 약칭 없음)와
+대응한다. UUID와 UUID Index는 일반적인 전역 동의어가 아니므로 일괄 치환하지 않는다.
+이번 변경은 검색용 별칭·진단만 적용한다. Lockdown 실행 스키마와 가드는 바꾸지
+않았고, UUID 위치 불일치를 진단으로 명시한다. 나머지 비트 불일치는 이 표에
+기록했으며 별도 실행 스키마 수정/회귀검증이 필요하다.

@@ -7872,7 +7872,7 @@ class _V101Fuzzer:
                 'rag_query_commands': self._llm_rag_commands(ctx),
                 'rag_query_schemas': {c: self.llm.schema_bridge.schemas.get(c, [])
                                       for c in self._llm_rag_commands(ctx)},
-                'rag_query_version': 'command-dword-fields-v1'}
+                'rag_query_version': 'command-dword-fields-v2'}
 
     def _llm_rag_commands(self, ctx):
         """질의와 태그 보너스가 동일한 명령 집합을 사용하도록 한 곳에서 결정."""
