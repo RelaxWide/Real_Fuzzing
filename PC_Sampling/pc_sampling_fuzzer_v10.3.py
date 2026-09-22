@@ -19372,6 +19372,15 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # RAG 설정 불일치는 검색 없는 생성으로 폴백할 사유가 아니다.
+    # NVMeFuzzer 생성/장치 초기화 전에 같은 인덱스를 검증하고 고정한다.
+    from rag.rag_retrieval import preflight as rag_preflight
+    try:
+        rag_preflight(_CFG, args.rag if args.rag is not None else RAG_ENABLED,
+                      args.rag_module or RAG_MODULE_PATH)
+    except Exception as exc:
+        parser.error(f"RAG 시작 전 검증 실패 — 퍼저를 시작하지 않습니다: {exc}")
+
     # CLI에서 지정한 제외 opcode 파싱 (상단 EXCLUDED_OPCODES 기본값 + CLI 추가분 병합)
     excluded_opcodes = list(EXCLUDED_OPCODES)
     if args.exclude_opcodes.strip():

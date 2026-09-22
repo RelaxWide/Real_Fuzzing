@@ -138,6 +138,23 @@ def embed(text, opts, cfg, deadline, shrink=2):
     raise RuntimeError("unreachable")
 
 
+def validate_index_model(manifest, opts, version):
+    # 인덱스를 만든 모델과 지금 질의를 임베딩할 모델이 다르면 **벡터 공간이 다르다**.
+    #   점수는 여전히 계산되므로 조용히 엉뚱한 문서가 뽑힌다 — 실행 시점에 막는다.
+    _built = manifest.get("embed_model")
+    if _built and _built != opts["embed_model"]:
+        raise ValueError(
+            f"인덱스 임베딩 모델 불일치: 인덱스={_built} 설정={opts['embed_model']} "
+            f"({version.name}) — 모델 설정과 인덱스를 확인하세요")
+    # revision 을 명시했으면 **누락도 불일치**다. 빠진 것을 통과시키면 revision 을
+    #   기록하지 않던 구형 인덱스를 새 모델 공간과 섞어 쓰는 것을 막지 못한다.
+    _rev, _want_rev = manifest.get("embed_model_revision"), opts.get("embed_model_revision")
+    if _want_rev and _rev != _want_rev:
+        raise ValueError(
+            f"인덱스 임베딩 모델 revision 불일치: 인덱스={_rev or '(기록 없음)'} "
+            f"설정={_want_rev} ({version.name}) — manifest와 설정을 확인하세요(생성 날짜와 모델 revision은 다릅니다)")
+
+
 def retrieve(meta, cfg, deadline):
     """(참고문서 텍스트, 진단) 반환. 실패는 예외로 올린다 — 호출부가 삼킨다."""
     opts = _settings(cfg)
@@ -150,20 +167,7 @@ def retrieve(meta, cfg, deadline):
 
     import numpy as np
     manifest, chunks, vectors, version = _load(opts["index_dir"])
-    # 인덱스를 만든 모델과 지금 질의를 임베딩할 모델이 다르면 **벡터 공간이 다르다**.
-    #   점수는 여전히 계산되므로 조용히 엉뚱한 문서가 뽑힌다 — 실행 시점에 막는다.
-    _built = manifest.get("embed_model")
-    if _built and _built != opts["embed_model"]:
-        raise ValueError(
-            f"인덱스 임베딩 모델 불일치: 인덱스={_built} 설정={opts['embed_model']} "
-            f"({version.name}) — tools/rag_ingest.py 로 다시 색인하세요")
-    # revision 을 명시했으면 **누락도 불일치**다. 빠진 것을 통과시키면 revision 을
-    #   기록하지 않던 구형 인덱스를 새 모델 공간과 섞어 쓰는 것을 막지 못한다.
-    _rev, _want_rev = manifest.get("embed_model_revision"), opts.get("embed_model_revision")
-    if _want_rev and _rev != _want_rev:
-        raise ValueError(
-            f"인덱스 임베딩 모델 revision 불일치: 인덱스={_rev or '(기록 없음)'} "
-            f"설정={_want_rev} ({version.name}) — 다시 색인하세요")
+    validate_index_model(manifest, opts, version)
     # 디스크 접근/메타데이터 확장은 LLM 워커에서 수행한다. 메인 퍼저 스레드는
     # 스키마만 전달하며 기존 인덱스(field_definitions 없음)는 원래 질의를 유지한다.
     schemas = (meta or {}).get('rag_query_schemas')
@@ -227,3 +231,20 @@ def retrieve(meta, cfg, deadline):
                   "context": text, "context_truncated": len(text) < len(full_context),
                   "index_version": version.name, "embed_model": manifest.get("embed_model"),
                   "hits": picked, "context_chars": len(text)}
+
+
+def preflight(config, enabled, module_path):
+    """장치 접근 전 로컬 인덱스를 검증·고정한다. 네트워크 호출 없음.
+
+    --rag는 LLM 기능 토글이다. 로컬 retrieval까지 활성인 vLLM 구성만 검사하며,
+    --no-rag/생성 전용/별도 브리지에는 로컬 인덱스를 요구하지 않는다.
+    """
+    if not enabled or module_path != 'rag.vllm_client':
+        return
+    from rag.vllm_client import _config
+    opts = _settings(_config({'config': config}))
+    if not opts['enabled']:
+        return
+    manifest, _, _, version = _load(opts['index_dir'])
+    validate_index_model(manifest, opts, version)
+    _log.warning('[LLM/rag] 시작 전 인덱스 검증 통과: %s', version.name)
