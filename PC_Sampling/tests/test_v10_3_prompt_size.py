@@ -151,5 +151,57 @@ class FavoredExamplesAreDistinct(unittest.TestCase):
                       '찍는 값과 다른 키로 중복을 판정하면 중복이 남는다')
 
 
+class PromptNumbersAreDecimal(unittest.TestCase):
+    """시스템 프롬프트가 numeric=DECIMAL 을 요구하는데 스키마가 16진을 보여주면
+    모델이 본 대로 0x 를 따라 써서 파싱이 깨진다. 보여주는 형식과 요구하는 형식이
+    같아야 한다."""
+
+    import re as _re
+    VALUE_RE = _re.compile(r'(valid|vendor|reserved)=([^\s,]+(?:,[^\s,]+)*)')
+
+    def test_hard_rule_asks_for_decimal(self):
+        src = (ROOT / 'pc_sampling_fuzzer_v10.3.py').read_text(encoding='utf-8')
+        self.assertIn('DECIMAL integers', src, '전제(10진수 요구)가 사라졌다')
+
+    def test_no_hex_in_field_values(self):
+        sb = bridge()
+        names = sorted(sb.commands)
+        for text in (sb.schemas_to_prompt(names),
+                     "\n".join(sb.schema_to_prompt(n) for n in names)):
+            found = [m.group(0) for m in self.VALUE_RE.finditer(text) if '0x' in m.group(2)]
+            self.assertEqual(found, [], f'필드 값이 아직 16진이다: {found[:3]}')
+
+    def test_valid_values_render_as_decimal(self):
+        sb = bridge()
+        text = sb.schemas_to_prompt(sorted(sb.commands))
+        self.assertRegex(text, r'valid=\d+(,\d+)*', '10진 valid 목록이 없다')
+
+    def test_opcode_stays_hex_as_a_spec_identifier(self):
+        """opcode 는 모델이 JSON 에 쓰는 값이 아니고 NVMe 규격 표기가 hex 다."""
+        sb = bridge()
+        self.assertRegex(sb.schemas_to_prompt(['Read']), r'opcode=0x[0-9a-f]{2}')
+
+    def test_repair_notes_are_decimal(self):
+        """보정 노트는 _llm_reject_block 으로 프롬프트에 되먹임된다."""
+        import ast
+        src = (ROOT / 'rag/rag_schema.py').read_text(encoding='utf-8')
+        tree = ast.parse(src)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == 'validate_and_repair')
+        seg = ast.get_source_segment(src, fn) or ''
+        self.assertIn('repaired.append', seg)
+        self.assertNotIn('0x{v:x}', seg, '보정 노트가 16진이다 — 모델이 따라 쓴다')
+
+    def test_danger_reason_field_value_is_decimal(self):
+        """is_dangerous 사유도 _llm_seq_reject 로 프롬프트에 실린다."""
+        import ast
+        src = (ROOT / 'rag/rag_schema.py').read_text(encoding='utf-8')
+        tree = ast.parse(src)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == 'is_dangerous')
+        seg = ast.get_source_segment(src, fn) or ''
+        self.assertNotIn('SECP 0x', seg, 'SECP 는 필드 값이라 10진수여야 한다')
+
+
 if __name__ == '__main__':
     unittest.main()

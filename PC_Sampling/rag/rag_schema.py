@@ -68,6 +68,9 @@ class SchemaBridge:
     def schema_to_prompt(self, cmd):
         """LLM 프롬프트용 필드 정의 표. 생성 모델이 schema-valid CDW 를 만들도록 주입."""
         c = self.commands.get(cmd, {})
+        # opcode 는 **규격 식별자**라 16진을 유지한다 — 모델이 JSON 에 쓰는 값이
+        #   아니고(command 는 이름으로 지정), NVMe 규격의 표준 표기가 hex 다.
+        #   반면 valid/vendor/reserved 는 모델이 그대로 따라 쓰는 **필드 값**이라 10진수.
         lines = [f"Command: {cmd} (opcode=0x{c.get('opcode', 0):02x}, "
                  f"type={c.get('cmd_type', '?')})"]
         fields = self.schemas.get(cmd, [])
@@ -80,13 +83,15 @@ class SchemaBridge:
                 #   앞 8개만 보여주고 나머지는 개수로 요약 — LLM 은 유효 범위의 '형태' 만 알면
                 #   되므로 전량 나열은 낭비다.
                 _vs = list(f["valid"])
-                s += " valid=" + ",".join(hex(v) for v in _vs[:8])
+                # 10진수로 보여준다. 16진(0x..)으로 보여주면 LLM 이 JSON 값도 0x 로
+                #   미러링해 파싱이 깨진다(HARD RULES: numeric=DECIMAL 과 일관).
+                s += " valid=" + ",".join(str(v) for v in _vs[:8])
                 if len(_vs) > 8:
                     s += f",...(+{len(_vs) - 8})"
             if f["vendor"]:
-                s += f" vendor=0x{f['vendor'][0]:x}-0x{f['vendor'][1]:x}"
+                s += f" vendor={f['vendor'][0]}-{f['vendor'][1]}"
             if f["reserved"]:
-                s += f" reserved=0x{f['reserved'][0]:x}-0x{f['reserved'][1]:x}"
+                s += f" reserved={f['reserved'][0]}-{f['reserved'][1]}"
             if f["ftype"] == "SLOT":
                 s += f" max={f['max_val']}"
             lines.append(s)
@@ -106,13 +111,14 @@ class SchemaBridge:
         s = f"CDW{f['word']}[{f['hi']}:{f['lo']}] ({f['ftype']})"
         if f["valid"]:
             vs = list(f["valid"])
-            s += " valid=" + ",".join(hex(v) for v in vs[:8])
+            # 10진수 — 프롬프트가 요구하는 출력 형식과 같아야 LLM 이 그대로 따라 쓴다.
+            s += " valid=" + ",".join(str(v) for v in vs[:8])
             if len(vs) > 8:
                 s += f",...(+{len(vs) - 8})"
         if f["vendor"]:
-            s += f" vendor=0x{f['vendor'][0]:x}-0x{f['vendor'][1]:x}"
+            s += f" vendor={f['vendor'][0]}-{f['vendor'][1]}"
         if f["reserved"]:
-            s += f" reserved=0x{f['reserved'][0]:x}-0x{f['reserved'][1]:x}"
+            s += f" reserved={f['reserved'][0]}-{f['reserved'][1]}"
         if f["ftype"] == "SLOT":
             s += f" max={f['max_val']}"
         return s
@@ -182,7 +188,9 @@ class SchemaBridge:
         if typ == "admin" and op == g["security_send_opcode"]:
             secp = (cdw10 >> 24) & 0xFF
             if secp in g["blocked_security_send_secp"]:
-                return True, f"locking SECP 0x{secp:02x}"
+                # SECP 는 cdw10 에서 뽑은 **필드 값**이고 이 사유는 _llm_seq_reject 로
+                #   프롬프트에 되먹임된다 → 10진수(HARD RULES: numeric=DECIMAL).
+                return True, f"locking SECP {secp}"
         if (typ == "admin" and op == g["ns_mgmt_opcode"]
                 and g["block_ns_delete"] and (cdw10 & 0xF) == 1):
             return True, "NamespaceManagement Delete(SEL=1)"
@@ -223,7 +231,9 @@ class SchemaBridge:
             # LBA / LBA_CNT / SIZE_DW / OFFSET_DW / OPAQUE: 자유값 허용
             if nv != v:
                 words[w] = self._set_bits(words[w], f["hi"], f["lo"], nv)
-                repaired.append(f"{key}.{f['name']}: 0x{v:x}->0x{nv:x}")
+                # 이 문자열은 _llm_reject_block 을 통해 **프롬프트로 되먹임된다**.
+                #   16진으로 보여주면 LLM 이 그 표기를 따라 써서 파싱이 깨진다.
+                repaired.append(f"{key}.{f['name']}: {v}->{nv}")
 
         for w, val in words.items():
             cdw[f"cdw{w}"] = val
