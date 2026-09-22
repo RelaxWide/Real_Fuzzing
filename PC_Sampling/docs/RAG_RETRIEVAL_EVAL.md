@@ -129,3 +129,32 @@ v10.3 CLI는 LLM이 활성(`--rag` 또는 rag.enabled)이고 로컬 vLLM 검색�
 일시적인 검색 API 오류의 기존 생성 폴백은 유지한다.
 revision은 인덱스 생성 날짜가 아니라 임베딩 모델 식별자이므로, 오류 시 먼저
 manifest와 설정을 비교한다. 실제 모델 변경이 없으면 날짜에 맞춰 revision을 바꾸지 않는다.
+
+## v2 추출 및 prompt 기록 수정
+
+`figure-field-definitions-v2`는 Figure 제목이 없는 원본 레코드에서도
+`Number of Dwords (NUMD):` 등의 명시적 정의를 수집한다. 같은 약칭의 전체명이
+일치하면 공통 조회 사전에 병합하고, 다르면 공통 확장에서 제외한다. 명령/Dword
+문맥이 있는 정의는 그 문맥에 한해 우선 사용한다. 위의 v1 제목 필수 제한과
+7개 고정 FIELD_NAMES 호환 사전은 더 이상 적용하지 않는다.
+
+구형/v1 인덱스는 `_load()`에서 전체 청크를 한 번 읽어 정의를 보충한다.
+디스크 파일을 수정하거나 임베딩 API를 호출하지 않는다. 따라서 코드를 갱신하고
+퍼저를 재시작하면 v1의 definitions=0 인덱스도 보충할 수 있다. 생성 파일 자체를
+갱신하려면 기존 입력으로 인덱서를 다시 실행한다.
+
+로그 진단:
+
+- `retrieval.field_definition_source`: manifest 또는 load_time_extraction
+- `retrieval.field_definition_count`: 실행 시 이용하는 정의 개수
+- `retrieval.field_expansion`: 해당 요청에서 실제 확장한 필드와 미확인 필드 목록/개수
+- `retrieval.metadata_extraction`: 디스크에 기록된 추출 정보. 로드 시 보충한 경우
+  여전히 v1/0건일 수 있으므로 위의 실행 시 정의 개수와 구분한다.
+
+아카이브 최상위 `prompt`는 이제 RAG 후 최종 호출 입력(교정 호출이 있으면 그 입력)을
+기록한다. 원래 요청은 `prompt_original`에 남기고, `prompt_source`로 실제 백엔드
+진단인지 구형 백엔드의 원본 폴백인지 구분한다. 기존에 기록된 JSONL은 변경하지 않는다.
+
+자동 추출은 명시적인 이름-약칭 정의에 한정된다. 전체 원문의 정의가 항상 이 형태라는
+보장은 없으므로 누락 목록으로 추가 형식을 확인한다. 다중 명령의 top-k 배분 정책은
+이번 수정에서 변경하지 않았다.

@@ -48,9 +48,9 @@ class QueryIntegrationTests(unittest.TestCase):
         from types import SimpleNamespace
         inst.config = SimpleNamespace(product='test')
         schemas = inst.llm.schema_bridge.schemas
-        expectations = {'Lockdown': ['Command Dword 10', 'OFI Opcode or Feature Identifier', 'IFC Interface', 'PRHBT Prohibit', 'SCP Scope'],
-                        'Sanitize': ['Command Dword 10', 'SANACT Sanitize Action'],
-                        'GetFeatures': ['Get Features command', 'FID Feature Identifier', 'SEL Select']}
+        expectations = {'Lockdown': ['Command Dword 10', 'OFI', 'IFC', 'PRHBT', 'SCP'],
+                        'Sanitize': ['Command Dword 10', 'SANACT'],
+                        'GetFeatures': ['Get Features command', 'FID', 'SEL']}
         for command, terms in expectations.items():
             query = enhanced_query([command], schemas)
             for term in terms:

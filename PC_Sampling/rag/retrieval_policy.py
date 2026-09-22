@@ -13,11 +13,6 @@ def tags(content):
     return sorted(set(m.group(1).strip() for m in CAPTION.finditer(
         re.sub(r'\s+', ' ', content))))
 
-# 전체명은 현재 CDWField에 없다. 아래는 사용자 평가에서 확인한 검색용 용어다.
-# 미등록 약칭은 그대로 사용한다. 실행 스키마/valid 값/명령 가드는 변경하지 않는다.
-FIELD_NAMES = {'OFI': 'Opcode or Feature Identifier', 'IFC': 'Interface',
-               'PRHBT': 'Prohibit', 'SCP': 'Scope', 'SANACT': 'Sanitize Action',
-               'FID': 'Feature Identifier', 'SEL': 'Select'}
 COMMAND_NAMES = {'FWCommit': 'Firmware Commit', 'FWDownload': 'Firmware Image Download',
                  'FirmwareDownload': 'Firmware Image Download',
                  'CreateIOSQ': 'Create I/O Submission Queue', 'CreateIOCQ': 'Create I/O Completion Queue',
@@ -48,28 +43,31 @@ def enhanced_query(commands, schemas, definitions=None):
         for term in terms:
             text += ' ' + term
             if definitions is None:
-                full = FIELD_NAMES.get(term)  # 기존 인덱스 호환
+                full = None  # 원문 근거 없는 고정 전체명은 사용하지 않는다.
             else:
-                candidates = {definitions[(canonical(spec_name(command)), f['word'], term)]
-                              for f in fields if f['name'] == term
-                              and (canonical(spec_name(command)), f['word'], term) in definitions}
+                candidates = {field_full_name(definitions, command, f['word'], term)
+                              for f in fields if f['name'] == term}
+                candidates.discard(None)
                 full = next(iter(candidates)) if len(candidates) == 1 else None
             if full:
                 text += ' ' + full
         parts.append(text + ' field encoding')
     return '\n'.join(parts) or None
 
-EXTRACTION_VERSION = 'figure-field-definitions-v1'
+EXTRACTION_VERSION = 'figure-field-definitions-v2'
 # 필드 표의 줄 시작/비트 범위 다음에 오는 "전체명 (약칭):"만 채택한다.
 # 일반 설명의 괄호나 임의 약칭을 전체명으로 추측하지 않는다.
 _SECTION = re.compile(r'Figure\s+\d+\s*:\s*([^:\n]{1,140}?)\s*[-–—]\s*Command\s+Dword\s+(\d+)', re.I)
 _FIELD = re.compile(r'(?m)^\s*(?:\|\s*)?(?:\d+(?::\d+)?\s*(?:\|\s*)?)?'
-                    r'([A-Za-z][A-Za-z0-9 /-]{2,100})\s*\(([A-Z][A-Z0-9_]{1,15})\)\s*(?::|\||$)')
+                    r'([A-Za-z][A-Za-z0-9 /-]{2,100}(?:\n[ \t]*[A-Za-z][A-Za-z0-9 /-]{0,60}){0,2})\s*\(([A-Z][A-Z0-9_]{1,15})\)\s*(?::|\||$)')
 
 
 def extract_definitions(content, source_file, source_doc_id, permission_groups=()):
-    """분할 전 원문에서 Figure 범위 내 명시적 정의만 읽고 원문 근거를 남긴다."""
+    """분할 전 원문의 명시적 정의를 읽는다. Figure가 없어도 공통 후보로 수집한다."""
     definitions = []
+    # Markdown 굵게/코드 표시와 HTML 줄바꿈을 제거하되 표/줄 경계는 유지한다.
+    content = re.sub(r'<br\s*/?>', '\n', content, flags=re.I)
+    content = content.replace('**', '').replace('`', '')
     # 다른 Figure가 나오면 문맥을 종료하여 다음 표에 잘못 귀속하지 않는다.
     starts = list(re.finditer(r'(?i)Figure\s+\d+\s*:', content))
     for i, start in enumerate(starts):
@@ -85,7 +83,29 @@ def extract_definitions(content, source_file, source_doc_id, permission_groups=(
                                     source_file=source_file, source_doc_id=source_doc_id,
                                     permission_groups=list(permission_groups),
                                     evidence=match.group(0).strip()[:240]))
+    # 이어지는 원본 청크에는 Figure 제목이 없을 수 있다. 명시적 정의는 전부
+    # 수집하되, 제목 없는 정의에 임의 명령/Dword를 붙이지 않는다.
+    seen = {(r['abbreviation'], r['full_name']) for r in definitions}
+    for match in _GLOBAL_FIELD.finditer(content):
+        name = ' '.join(match.group(1).split())
+        pair = (match.group(2), name)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        definitions.append(dict(command=None, dword=None, abbreviation=pair[0], full_name=name,
+                                source_file=source_file, source_doc_id=source_doc_id,
+                                permission_groups=list(permission_groups), evidence=match.group(0)[:240]))
     return definitions
+
+
+# 문장 전체가 아니라 제목식 전체명과 명시적인 '(약칭):' 경계를 읽는다.
+_GLOBAL_FIELD = re.compile(r'(?<![A-Za-z])([A-Z][A-Za-z0-9/-]*(?:[ \t\r\n]+(?:[A-Z][A-Za-z0-9/-]*|of|or|and|to|for|in|per)){0,12})'
+                           r'[ \t\r\n]*\(([A-Z][A-Z0-9_]{1,15})\)[ \t]*:')
+
+
+def field_full_name(lookup, command, word, abbreviation):
+    return lookup.get((canonical(spec_name(command)), word, abbreviation),
+                      lookup.get((None, None, abbreviation)))
 
 
 def definition_lookup(definitions, groups=None):
@@ -94,8 +114,9 @@ def definition_lookup(definitions, groups=None):
     for row in definitions:
         if groups and not set(groups) & set(row.get('permission_groups') or []):
             continue
-        key = (canonical(row['command']), row['dword'], row['abbreviation'])
+        key = (canonical(row['command']), row['dword'], row['abbreviation']) if row.get('command') else (None, None, row['abbreviation'])
         names.setdefault(key, set()).add(row['full_name'])
+        names.setdefault((None, None, row['abbreviation']), set()).add(row['full_name'])
     return {k: next(iter(v)) for k, v in names.items() if len(v) == 1}, sum(len(v) > 1 for v in names.values())
 
 
@@ -108,3 +129,18 @@ def cache_chunk_tags(chunks):
                 covers = tags(row.get('content', ''))
             row['covers_commands'] = covers
             row['_command_keys'] = frozenset(canonical(c) for c in covers)
+
+
+def expansion_report(commands, schemas, definitions, metadata_present):
+    """추출 총수와 실제 요청의 필드 적용률을 구분한다. 0건도 숨기지 않는다."""
+    matched, missing = [], []
+    for command in commands:
+        for field in schemas.get(command, []):
+            row = {'command': command, 'dword': field['word'], 'abbreviation': field['name']}
+            full = field_full_name(definitions, command, field['word'], field['name'])
+            if full:
+                matched.append(dict(row, full_name=full))
+            else:
+                missing.append(row)
+    return {'metadata_present': metadata_present, 'matched_fields': matched,
+            'missing_fields': missing, 'matched_count': len(matched), 'missing_count': len(missing)}

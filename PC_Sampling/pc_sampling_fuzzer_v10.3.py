@@ -8060,6 +8060,14 @@ class _V101Fuzzer:
                 p = _ld / f'llm_io_{_ts}.jsonl'
                 self._llm_io_fh = open(p, 'w', encoding='utf-8')
                 log.warning(f"[LLM] 원본 요청/응답 기록 시작: {p}")
+            # prompt는 최종 호출의 실제 입력이다. 원본은 별도 키에 보존한다.
+            diag = res.get('diagnostics') or {}
+            effective = None
+            current = diag
+            while isinstance(current, dict):
+                if isinstance(current.get('effective_user_prompt'), str):
+                    effective = current['effective_user_prompt']
+                current = current.get('correction')
             rec = {
                 'submitted_at': res.get('submitted_at'),
                 'task': res.get('task'),
@@ -8067,7 +8075,9 @@ class _V101Fuzzer:
                 'error': res.get('error'),
                 'parse_ok': isinstance(data, dict),
                 'injected': None if added_s is None else {'seeds': added_s, 'seqs': added_q},
-                'prompt': res.get('user'),
+                'prompt': effective if effective is not None else res.get('user'),
+                'prompt_original': res.get('user'),
+                'prompt_source': 'effective_user_prompt' if effective is not None else 'original_only',
                 'response': res.get('raw'),
                 # v10.3: 백엔드 진단(finish_reason/usage/검색 문서)은 **이 요청**에만 붙는다.
                 'diagnostics': res.get('diagnostics') or {},

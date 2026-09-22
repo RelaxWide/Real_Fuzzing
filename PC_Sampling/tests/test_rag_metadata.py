@@ -21,12 +21,12 @@ BODY = ('Figure 10: Get Features – Command Dword 10\n'
 class MetadataTests(unittest.TestCase):
     def test_scope_conflicts_and_permissions(self):
         rows = policy.extract_definitions(BODY, 'spec', 'a', ['private'])
-        self.assertEqual([r['abbreviation'] for r in rows], ['FID', 'SEL'])
+        self.assertEqual([r['abbreviation'] for r in rows if r['command']], ['FID', 'SEL'])
         lookup, conflicts = policy.definition_lookup(rows, ['public'])
         self.assertEqual(lookup, {})
         other = dict(rows[0], full_name='Conflicting Name')
         lookup, conflicts = policy.definition_lookup(rows + [other])
-        self.assertEqual(conflicts, 1)
+        self.assertEqual(conflicts, 2)
         self.assertNotIn(('getfeatures', 10, 'FID'), lookup)
         query = policy.enhanced_query(['GetFeatures'], {'GetFeatures': [{'word': 10, 'name': 'FID'}]}, lookup)
         self.assertNotIn('Feature Identifier', query)
@@ -43,11 +43,15 @@ class MetadataTests(unittest.TestCase):
             rr._PINNED.clear()
             with patch.object(policy, 'tags', wraps=policy.tags) as tagger, patch.object(rr, 'embed', return_value=[1, 0]):
                 cfg = {'base_url': 'unused', 'retrieval': {'index_dir': d}}
-                meta = {'rag_query': 'Get Features', 'rag_query_commands': ['GetFeatures']}
+                meta = {'rag_query': 'Get Features', 'rag_query_commands': ['GetFeatures'],
+                        'rag_query_schemas': {'GetFeatures': [{'word': 10, 'name': 'FID'}]}}
                 first = rr.retrieve(meta, cfg, time.monotonic()+10)
                 second = rr.retrieve(meta, cfg, time.monotonic()+10)
                 self.assertEqual(tagger.call_count, 1)
                 self.assertEqual(first, second)
+                self.assertIn('FID Feature Identifier', first[1]['query'])
+                self.assertEqual(first[1]['field_expansion']['matched_count'], 1)
+                self.assertEqual(first[1]['field_definition_source'], 'load_time_extraction')
             rr._PINNED.clear()
 
     def test_ingest_reuse_and_runtime_definition(self):
@@ -68,7 +72,7 @@ class MetadataTests(unittest.TestCase):
             version = index / (index / 'current').read_text().strip()
             self.assertEqual({p.name for p in version.iterdir()}, {'manifest.json', 'chunks.jsonl', 'vectors.f16.npy'})
             manifest = json.loads((version / 'manifest.json').read_text())
-            self.assertEqual(len(manifest['field_definitions']), 2)
+            self.assertEqual(len(manifest['field_definitions']), 3)
             row = json.loads((version / 'chunks.jsonl').read_text())
             self.assertEqual(row['covers_commands'], ['Get Features'])
             self.assertNotIn('_field_definitions', row)
@@ -80,3 +84,32 @@ class MetadataTests(unittest.TestCase):
                 self.assertIn('ABC Custom Field Name', embedder.call_args.args[0])
                 self.assertEqual(diag['query_source'], 'index_field_definitions')
             rr._PINNED.clear()
+
+    def test_headerless_user_examples_and_global_conflicts(self):
+        body = ('...Number of Dwords (NUMD): ... LBA Format Lower (LBAFL): ... '
+                'LBA Format Upper (LBAFU): ... Controller Identifier (CNTID): ...')
+        rows = policy.extract_definitions(body, 'source', 'a')
+        lookup, conflicts = policy.definition_lookup(rows + rows)
+        self.assertEqual(conflicts, 0)
+        schemas = {'Any': [{'word': 10, 'name': name} for name in ['NUMD', 'LBAFL', 'LBAFU', 'CNTID']]}
+        query = policy.enhanced_query(['Any'], schemas, lookup)
+        for phrase in ['NUMD Number of Dwords', 'LBAFL LBA Format Lower',
+                       'LBAFU LBA Format Upper', 'CNTID Controller Identifier']:
+            self.assertIn(phrase, query)
+        conflicting = policy.extract_definitions('Other Meaning (NUMD): example', 'source2', 'b')
+        lookup, _ = policy.definition_lookup(rows + conflicting)
+        self.assertIsNone(policy.field_full_name(lookup, 'Any', 10, 'NUMD'))
+
+    def test_archive_prompt_is_final_effective_input(self):
+        import io
+        from test_v10_2_learning import fuzzer
+        obj = fuzzer.NVMeFuzzer.__new__(fuzzer.NVMeFuzzer)
+        obj._llm_io_fh = io.StringIO()
+        diag = {'effective_user_prompt': 'original + RAG',
+                'correction': {'effective_user_prompt': 'correct JSON + RAG'}}
+        with patch.object(fuzzer, 'RAG_LOG_RESPONSES', True):
+            obj._llm_archive({'user': 'original', 'raw': '{}', 'diagnostics': diag})
+        row = json.loads(obj._llm_io_fh.getvalue())
+        self.assertEqual(row['prompt'], 'correct JSON + RAG')
+        self.assertEqual(row['prompt_original'], 'original')
+        self.assertEqual(row['prompt_source'], 'effective_user_prompt')

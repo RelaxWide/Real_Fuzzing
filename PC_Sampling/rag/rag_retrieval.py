@@ -34,7 +34,7 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
 import json
 import logging
 import math
-from rag.retrieval_policy import canonical, tags, spec_name, cache_chunk_tags, definition_lookup, enhanced_query
+from rag.retrieval_policy import canonical, tags, spec_name, cache_chunk_tags, definition_lookup, enhanced_query, expansion_report, extract_definitions, EXTRACTION_VERSION
 import re
 import time
 from pathlib import Path
@@ -109,6 +109,17 @@ def _load(index_dir):
     #   (10만 청크면 매 질의 400 MB). 한 번만 변환해 캐시한다.
     cache_chunk_tags(chunks)
     manifest["_field_lookups"] = {}
+    # v1의 definitions=0 인덱스도 재임베딩 없이 로드 시 1회 복구한다.
+    if (manifest.get('metadata_extraction') or {}).get('version') != EXTRACTION_VERSION:
+        definitions = list(manifest.get('field_definitions') or [])
+        for row in chunks:
+            definitions.extend(extract_definitions(row.get('content', ''), row.get('source_file', ''),
+                                                  row['doc_id'], row.get('permission_groups') or []))
+        manifest['field_definitions'] = definitions
+        manifest['_field_definition_source'] = 'load_time_extraction'
+    else:
+        manifest['_field_definition_source'] = 'manifest'
+
     matrix32 = vectors.astype(np.float32)
     _PINNED[key] = (manifest, chunks, matrix32, version)
     return _PINNED[key]
@@ -171,15 +182,24 @@ def retrieve(meta, cfg, deadline):
     # 디스크 접근/메타데이터 확장은 LLM 워커에서 수행한다. 메인 퍼저 스레드는
     # 스키마만 전달하며 기존 인덱스(field_definitions 없음)는 원래 질의를 유지한다.
     schemas = (meta or {}).get('rag_query_schemas')
+    field_expansion = None
     if schemas is not None and 'field_definitions' in manifest:
         group_key = tuple(sorted(opts['permission_groups'] or []))
         lookups = manifest.setdefault('_field_lookups', {})
         if group_key not in lookups:
             lookups[group_key] = definition_lookup(manifest['field_definitions'], group_key)[0]
+        field_expansion = expansion_report((meta or {}).get('rag_query_commands') or [], schemas, lookups[group_key], True)
         expanded = enhanced_query((meta or {}).get('rag_query_commands') or [], schemas, lookups[group_key])
         if expanded:
             q = expanded[:int(opts['query_max_chars'])]
             source = 'index_field_definitions'
+    if schemas is not None:
+        if field_expansion is None:
+            field_expansion = expansion_report((meta or {}).get('rag_query_commands') or [], schemas, {}, False)
+        if field_expansion['missing_count']:
+            _log.warning('[LLM/rag] 스펙 필드 확장 %d건 / 미확인 %d건 (metadata=%s)',
+                         field_expansion['matched_count'], field_expansion['missing_count'],
+                         field_expansion['metadata_present'])
     vec = np.asarray(embed(q, opts, cfg, deadline), dtype=np.float32)
     if vec.shape[0] != vectors.shape[1]:
         raise ValueError(f"질의 벡터 차원 불일치: 질의={vec.shape[0]} "
@@ -226,6 +246,9 @@ def retrieve(meta, cfg, deadline):
         offset += len(part) + 2
     return text, {"enabled": True, "query_source": source, "query": q, "query_chars": len(q),
                   "commands": commands, "command_tag_bonus": bonus,
+                  "field_expansion": field_expansion,
+                  "field_definition_source": manifest.get("_field_definition_source"),
+                  "field_definition_count": len(manifest.get("field_definitions") or []),
                   "query_version": (meta or {}).get("rag_query_version"),
                   "metadata_extraction": manifest.get("metadata_extraction"),
                   "context": text, "context_truncated": len(text) < len(full_context),
