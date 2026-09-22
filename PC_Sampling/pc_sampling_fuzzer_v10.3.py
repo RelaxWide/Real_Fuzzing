@@ -7901,12 +7901,8 @@ class _V101Fuzzer:
         except Exception:
             return []
 
-    def _llm_maybe_submit(self):
-        """활성 task 중 하나를 가중 라운드로빈(또는 plateau 시 seeds/seq 우선) 선택해 제출."""
-        if not self.llm.enabled:
-            return
-        if not self.llm.can_submit():
-            return
+    def _llm_active_tasks(self):
+        """지금 요청 가능한 LLM task 목록. 기동 시딩과 주기 선택이 같은 목록을 본다."""
         active = [t for t in ('new_group_seeds', 'sequences', 'corpus_eval')
                   if RAG_TASKS.get(t, True)]
         # io_patterns(I/O state 축)는 기존 3 task 와 함께 가중 회전에 상시 포함(설계 의도: additive,
@@ -7916,12 +7912,32 @@ class _V101Fuzzer:
                 and self.config.io_workload_enabled and IO_WL_ENABLED
                 and self._pending_workload is None):
             active.append('io_patterns')
-        if not active:
-            return
+        return active
+
+    def _llm_rr_next(self, active):
+        """가중 회전판에서 다음 task 를 꺼내며 순번을 **소비**한다.
+
+        기동 시딩도 이 판을 돌아야 한다. 예전엔 시딩이 new_group_seeds 를 하드코딩하고
+        커서는 건드리지 않아서, 기동 직후 1건째(시딩)와 2건째(회전판 0번)가 **둘 다**
+        new_group_seeds 로 나갔다.
+        """
         # 가중 라운드로빈: task_weights 만큼 반복해 비중을 준다(미설정=1).
         weighted = []
         for t in active:
             weighted += [t] * max(1, int(RAG_TASK_WEIGHTS.get(t, 1)))
+        task = weighted[self._llm_task_rr % len(weighted)]
+        self._llm_task_rr += 1
+        return task
+
+    def _llm_maybe_submit(self):
+        """활성 task 중 하나를 가중 라운드로빈(또는 plateau 시 seeds/seq 우선) 선택해 제출."""
+        if not self.llm.enabled:
+            return
+        if not self.llm.can_submit():
+            return
+        active = self._llm_active_tasks()
+        if not active:
+            return
         # plateau 감지: coverage 정체가 임계 초과면 상태의존 경로(시퀀스/신규군) 우선.
         cov_now = self._llm_cov_count()
         if cov_now > self._llm_last_cov:
@@ -7943,8 +7959,7 @@ class _V101Fuzzer:
         if _cand is not None:
             task = _cand
         else:
-            task = weighted[self._llm_task_rr % len(weighted)]
-            self._llm_task_rr += 1
+            task = self._llm_rr_next(active)
         if self.learning.enabled:
             task = self.learning.choose(active, task, RAG_MAX_CONSEC_TASK)
         # 연속 선택 추적
@@ -17831,15 +17846,18 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             self.llm.start()
             self._llm_last_cov = self._llm_cov_count()
             self._llm_plateau_since = 0
-            if RAG_SEED_AT_STARTUP and RAG_TASKS.get('new_group_seeds', True):
-                _built = self._llm_build_request('new_group_seeds')
+            _startup_active = self._llm_active_tasks() if RAG_SEED_AT_STARTUP else []
+            if _startup_active:
+                # 첫 건부터 회전판을 돈다. 순번도 여기서 소비하므로 다음 요청은 그 다음 칸이다.
+                _task0 = self._llm_rr_next(_startup_active)
+                _built = self._llm_build_request(_task0)
                 _ctx = getattr(self, '_llm_pending_ctx', None)
                 self._llm_pending_ctx = None
                 if _built and self.llm.submit(
-                        'new_group_seeds', _built[0], _built[1], 0, ctx=_ctx,
-                        meta=self._llm_backend_meta('new_group_seeds', _ctx)):
-                    self._learning_submitted('new_group_seeds', _built[0], _built[1], _ctx)
-                    log.warning("[LLM] 초기 시딩 요청 제출 (첫 결과는 다음 drain 에 적용)")
+                        _task0, _built[0], _built[1], 0, ctx=_ctx,
+                        meta=self._llm_backend_meta(_task0, _ctx)):
+                    self._learning_submitted(_task0, _built[0], _built[1], _ctx)
+                    log.warning(f"[LLM] 기동 요청 제출: task={_task0} (첫 결과는 다음 drain 에 적용)")
 
         nvme_dev = self.config.nvme_device
         # 사용자가 --nvme /dev/nvmeXnY 처럼 namespace 경로를 직접 명시했을 때,

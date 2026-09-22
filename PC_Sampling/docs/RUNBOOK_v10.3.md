@@ -562,10 +562,30 @@ Actual NSID distribution (1,303종): nsid=1:120394회, nsid=0:512회, … , …�
 
 | 단계 | 위치 | 하는 일 |
 |---|---|---|
-| 1 | `pc_sampling_fuzzer_v10.3.py` 기동부 | `seed_at_startup=true` 면 선택 로직을 거치지 않고 `new_group_seeds` 1건 |
+| 1 | 기동부 | `seed_at_startup=true` 면 **회전판 0번**을 꺼내 1건 요청(순번도 소비) |
 | 2 | `_llm_maybe_submit` | plateau 면 `sequences`/`new_group_seeds` 우선 (연속 `max_consec_task` 상한) |
-| 3 | `_llm_maybe_submit` | 가중 라운드로빈 — `rag.task_weights` |
+| 3 | `_llm_maybe_submit` | 가중 라운드로빈 `_llm_rr_next` — `rag.task_weights` |
 | 4 | `LearningState.choose` | `adaptive_tasks=true` 면 3단계 결과를 **폴백으로만** 쓰고 보상 최고 task 를 고름 |
+
+### 원인 ① — 기동 시딩이 회전판 밖에 있었다
+
+예전 1단계는 `new_group_seeds` 를 하드코딩하고 회전 커서(`_llm_task_rr`)를 건드리지 않았다.
+그래서 기동 직후 **1건째(시딩)와 2건째(회전판 0번)가 둘 다** `new_group_seeds` 로 나갔다.
+`_learning_submitted` 가 `turn`/`explore_cursor` 는 올리는데 회전 커서만 빠져 있었다.
+
+지금은 두 경로가 `_llm_rr_next()` 하나를 공유한다. 기동 시딩도 회전판에서 꺼내고 순번을
+소비하므로, 다음 요청은 그 다음 칸이다. `task_weights` 기본값 기준 회전판은 이렇게 돈다:
+
+```
+[new_group_seeds, sequences, sequences, corpus_eval, io_patterns, io_patterns]
+   ↑ 기동 시딩      ↑ 2건째
+```
+
+1건째가 여전히 `new_group_seeds` 인 것은 회전판 0번이 거기라서다. 바꾸려면 `seed_at_startup`
+을 끄는 게 아니라 **`rag.task_weights` 로 비중을 조절**한다 — 끄면 그 칸이 비어 첫 요청이
+늦어질 뿐 순서는 같다.
+
+### 원인 ② — 보상 표본 1건으로 탐욕 결정
 
 편중의 원인은 4단계였다. 1단계가 `new_group_seeds` 를 제일 먼저 보내므로 그 task 가
 완료 평가를 제일 먼저 채우고, **보상 표본이 있는 유일한 task** 가 되어 `max(ranked)` 를
@@ -593,7 +613,8 @@ Actual NSID distribution (1,303종): nsid=1:120394회, nsid=0:512회, … , …�
 를 내리는 쪽이 의도가 분명하다 — `min_reward_samples` 는 **초반 표본 부족**을 다루는 값이지
 task 비중을 정하는 값이 아니다.
 
-시험: `tests/test_v10_3_task_selection.py` (수정 전 8/2/1 재현 + 수정 후 분산).
+시험: `tests/test_v10_3_task_selection.py` — 수정 전 8/2/1 재현, 수정 후 분산,
+기동 시딩이 회전판을 쓰는지(AST), 순번이 두 번 나가지 않는지.
 
 ## 7. 트러블슈팅 — 실제로 걸렸던 것들
 
@@ -622,7 +643,7 @@ task 비중을 정하는 값이 아니다.
 
 ## 8. 검증 현황 — 무엇을 믿어도 되나
 
-### 시험으로 덮인 것 (276개, 전부 통과)
+### 시험으로 덮인 것 (289개, 전부 통과)
 
 `tests/test_v10_3_backend.py` 90개가 **가짜 HTTP 서버로 DGX 없이** 돈다.
 잘못되면 *인덱스가 조용히 망가지는* 것들이 여기 있다.
