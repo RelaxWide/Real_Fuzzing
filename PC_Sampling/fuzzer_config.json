@@ -377,7 +377,7 @@
     "staleness_floor": 0.05
   },
   "rag": {
-    "_comment_learning": "v10.2 전용. v10.1은 무시. 각 기능을 독립 비교할 수 있으며 enabled=false는 전체 확장을 끈다. 관측 실패/CQE 미확인 결과는 task 보상에서 제외한다.",
+    "_comment_learning": "v10.2 전용. v10.1은 무시. 각 기능을 독립 비교할 수 있으며 enabled=false는 전체 확장을 끈다. 관측 실패/CQE 미확인 결과는 task 보상에서 제외한다. min_reward_samples = adaptive_tasks 탐욕 선택에 참가하기 위한 최소 완료 평가 수(미달 task 는 가중 라운드로빈이 결정). 1 이면 v10.2 동작.",
     "learning": {
       "enabled": true,
       "evidence": true,
@@ -387,6 +387,7 @@
       "setup_preserve_ratio": 0.8,
       "evaluation_commands": 8,
       "exploration_every": 4,
+      "min_reward_samples": 2,
       "max_variants": 16,
       "random_seed": 102,
       "snapshot_min_interval_sec": 60

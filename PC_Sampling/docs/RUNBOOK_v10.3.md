@@ -553,6 +553,48 @@ Actual NSID distribution (1,303종): nsid=1:120394회, nsid=0:512회, … , …�
 "summary_nsid_top": 8      // 0 이면 전부 나열
 ```
 
+## 6-6. LLM task 선택 — 초반 편중
+
+기동 직후 첫 11회 요청이 `new_group_seeds` 8 / `sequences` 2 / `corpus_eval` 1 로 쏠리고
+`io_patterns` 는 한 번도 안 나오는 현상이 있었다. 라운드로빈이 고장 난 게 아니다.
+
+선택은 4단계고 **뒤가 앞을 덮는다**:
+
+| 단계 | 위치 | 하는 일 |
+|---|---|---|
+| 1 | `pc_sampling_fuzzer_v10.3.py` 기동부 | `seed_at_startup=true` 면 선택 로직을 거치지 않고 `new_group_seeds` 1건 |
+| 2 | `_llm_maybe_submit` | plateau 면 `sequences`/`new_group_seeds` 우선 (연속 `max_consec_task` 상한) |
+| 3 | `_llm_maybe_submit` | 가중 라운드로빈 — `rag.task_weights` |
+| 4 | `LearningState.choose` | `adaptive_tasks=true` 면 3단계 결과를 **폴백으로만** 쓰고 보상 최고 task 를 고름 |
+
+편중의 원인은 4단계였다. 1단계가 `new_group_seeds` 를 제일 먼저 보내므로 그 task 가
+완료 평가를 제일 먼저 채우고, **보상 표본이 있는 유일한 task** 가 되어 `max(ranked)` 를
+계속 이긴다. 라운드로빈은 연속 상한과 탐색 턴(`turn % exploration_every == 0`)에서만 살아난다.
+표본 1건은 추정치가 아닌데 그것으로 탐욕 결정을 내린 게 문제다.
+
+```jsonc
+"learning": {
+  "min_reward_samples": 2     // 이 수만큼 완료 평가가 쌓여야 순위 경쟁에 참가. 1 = v10.2 동작
+}
+```
+
+미달인 task 는 순위에서 빠지고 폴백(가중 라운드로빈)이 결정한다. 영구 배제가 아니라
+**표본 대기**라서, 쌓이면 원래대로 보상 높은 task 를 고른다.
+
+실제 `choose()` 를 11회 돌린 결과:
+
+| `min_reward_samples` | seeds | seq | eval | io |
+|---|---|---|---|---|
+| 1 (수정 전) | **8** | 2 | 1 | 0 |
+| 2 (기본) | 4 | 4 | 2 | 1 |
+| 3 | 2 | 6 | 2 | 1 |
+
+`new_group_seeds` 를 더 줄이고 싶으면 값을 올리기보다 `rag.task_weights.new_group_seeds`
+를 내리는 쪽이 의도가 분명하다 — `min_reward_samples` 는 **초반 표본 부족**을 다루는 값이지
+task 비중을 정하는 값이 아니다.
+
+시험: `tests/test_v10_3_task_selection.py` (수정 전 8/2/1 재현 + 수정 후 분산).
+
 ## 7. 트러블슈팅 — 실제로 걸렸던 것들
 
 증상이 원인을 안 가리키는 것들만 모았다. **위에서부터** 의심한다.
@@ -580,7 +622,7 @@ Actual NSID distribution (1,303종): nsid=1:120394회, nsid=0:512회, … , …�
 
 ## 8. 검증 현황 — 무엇을 믿어도 되나
 
-### 시험으로 덮인 것 (182개, 전부 통과)
+### 시험으로 덮인 것 (292개, 전부 통과)
 
 `tests/test_v10_3_backend.py` 90개가 **가짜 HTTP 서버로 DGX 없이** 돈다.
 잘못되면 *인덱스가 조용히 망가지는* 것들이 여기 있다.
@@ -590,8 +632,9 @@ Actual NSID distribution (1,303종): nsid=1:120394회, nsid=0:512회, … , …�
 - 게시 전 검증, 포인터 원자 교체, 사용 중 버전 미삭제, 단일 writer 락
 - 스키마↔파서 대조(AST), 실패 분류, 진단 귀속, 시간 예산
 - 입력 해석(글롭·디렉터리), 소스 식별, UTF-8 BOM
+- LLM task 선택 편중 — 실제 `choose()` 로 수정 전 8/2/1 재현, 수정 후 분산 (§6-6)
 
-고친 것은 **되돌리면 해당 시험이 깨지는 것까지** 확인했다(주입 시험 20건).
+고친 것은 **되돌리면 해당 시험이 깨지는 것까지** 확인했다(주입 시험 21건).
 
 ### 아직 검증 안 된 것
 

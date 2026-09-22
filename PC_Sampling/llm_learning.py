@@ -53,7 +53,7 @@ def query_block(task, commands=(), targets=()):
 CDWS = tuple(f'cdw{x}' for x in (2, 3, 10, 11, 12, 13, 14, 15))
 DEFAULTS = dict(enabled=True, evidence=True, preserve_setup=True, generators=True,
                 adaptive_tasks=True, setup_preserve_ratio=0.8, evaluation_commands=8,
-                exploration_every=4, max_targets=512, max_proposals=2048,
+                exploration_every=4, min_reward_samples=2, max_targets=512, max_proposals=2048,
                 max_generators=128, max_generator_keys=4096, recent_commands=256,
                 max_variants=16, random_seed=102, snapshot_min_interval_sec=60.0)
 
@@ -181,7 +181,8 @@ class LearningState:
         for k in ('enabled', 'evidence', 'preserve_setup', 'generators', 'adaptive_tasks'):
             if type(self.options[k]) is not bool:
                 raise ValueError(f'rag.learning.{k}={self.options[k]!r} must be boolean')
-        for k in ('evaluation_commands', 'exploration_every', 'max_targets', 'max_proposals',
+        for k in ('evaluation_commands', 'exploration_every', 'min_reward_samples',
+                  'max_targets', 'max_proposals',
                   'max_generators', 'max_generator_keys', 'recent_commands', 'max_variants'):
             checked_int(self.options[k], 1, 100000, f'rag.learning.{k}={self.options[k]!r}')
         if self.options['max_variants'] > 64:
@@ -254,13 +255,18 @@ class LearningState:
                 candidate = active[(self.explore_cursor + offset) % len(active)]
                 if candidate in allowed:
                     return candidate
+        # A single completed evaluation is not an estimate. Ranking on it made the first task
+        # to finish (always new_group_seeds, because startup seeding submits it before anything
+        # else) the greedy winner forever after, so the weighted round-robin below never ran
+        # except on the consecutive cap and the exploration turn. Require min_reward_samples
+        # observations before a task is allowed to compete; until then the fallback decides.
         ranked = []
         for task in allowed:
             # corpus_eval has indirect effects, so it only gets exploration slots.
             if task == 'corpus_eval':
                 continue
             rewards = self._task(task)['rewards']
-            if rewards:
+            if len(rewards) >= self.options['min_reward_samples']:
                 ranked.append((sum(rewards) / len(rewards), task))
         return max(ranked)[1] if ranked else (fallback if fallback in allowed else allowed[0])
 
