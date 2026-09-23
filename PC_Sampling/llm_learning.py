@@ -255,6 +255,24 @@ class LearningState:
                 candidate = active[(self.explore_cursor + offset) % len(active)]
                 if candidate in allowed:
                     return candidate
+        # Cold start. A task with no completed evaluation can never enter `ranked`, so once
+        # any other task has samples the greedy branch below wins every non-exploration turn
+        # and the newcomer starves — io_patterns was never requested at all. Give every
+        # competitor min_reward_samples *attempts* before ranking begins.
+        #   The gate counts requests, not rewards, on purpose. Gating on rewards livelocks:
+        #   a task whose proposals never complete an evaluation (an io_patterns descriptor
+        #   that is never consumed, say) would stay "cold" forever and pin every turn to
+        #   itself. Counting requests terminates after at most need * len(allowed) picks.
+        # The fallback (the weighted rotation's pick) wins ties, so task_weights still shapes
+        # the warm-up. corpus_eval stays out: it is exploration-only by design (see below).
+        _need = self.options['min_reward_samples']
+        _cold = [t for t in allowed
+                 if t != 'corpus_eval' and self._task(t)['requests'] < _need]
+        if _cold:
+            if fallback in _cold:
+                return fallback
+            return min(_cold, key=lambda t: (self._task(t)['requests'], t))
+
         # A single completed evaluation is not an estimate. Ranking on it made the first task
         # to finish (always new_group_seeds, because startup seeding submits it before anything
         # else) the greedy winner forever after, so the weighted round-robin below never ran

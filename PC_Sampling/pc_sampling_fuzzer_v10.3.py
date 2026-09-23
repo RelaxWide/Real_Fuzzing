@@ -7825,7 +7825,7 @@ class _V101Fuzzer:
                     + f"Coverage gaps (firmware functions NOT yet reached — target these):\n"
                     f"{cov or '  (static map unavailable)'}\n\n"
                     f"Available commands: {names}\n\nSchemas:\n{schema}\n\n"
-                    f"Task: emit up to {RAG_MAX_SEQS} multi-command \"sequences\", typically 3-6 commands "
+                    f"Task: emit up to {RAG_MAX_SEQS} multi-command \"sequences\", typically 6-10 commands "
                     f"but longer (up to {RAG_MAX_SEQ_LEN}) when the state setup genuinely needs it "
                     f"(e.g. ZNS zone lifecycle, multi-step reservations). "
                     f"Blind mutation CANNOT discover state-dependent paths — that is exactly your value. "
@@ -7982,20 +7982,24 @@ class _V101Fuzzer:
             active.append('io_patterns')
         return active
 
-    def _llm_rr_next(self, active):
-        """가중 회전판에서 다음 task 를 꺼내며 순번을 **소비**한다.
+    def _llm_rr_peek(self, active):
+        """가중 회전판의 현재 칸을 **소비하지 않고** 본다(task_weights 만큼 반복=미설정 1).
 
-        기동 시딩도 이 판을 돌아야 한다. 예전엔 시딩이 new_group_seeds 를 하드코딩하고
-        커서는 건드리지 않아서, 기동 직후 1건째(시딩)와 2건째(회전판 0번)가 **둘 다**
-        new_group_seeds 로 나갔다.
+        peek/consume 를 나눈 이유: 회전판이 고른 task 가 그대로 나가지 않는다. plateau 우선,
+        learning.choose 의 탐색 턴·탐욕 선택이 뒤에서 갈아치울 수 있고, 빌드 실패나 in-flight
+        거절로 아예 안 나갈 수도 있다. 예전엔 꺼내는 순간 순번을 올려서, **버려진 칸이 소비**
+        됐다 — 실측 30건에서 회전판이 io_patterns 를 10번 골랐는데 실제로 나간 건 5번뿐이었고
+        그 자리는 다시 오지 않았다. 그래서 io_patterns 가 굶었다.
+        순번은 그 칸의 task 가 **실제로 제출됐을 때만** _llm_rr_consume() 으로 올린다.
         """
-        # 가중 라운드로빈: task_weights 만큼 반복해 비중을 준다(미설정=1).
         weighted = []
         for t in active:
             weighted += [t] * max(1, int(RAG_TASK_WEIGHTS.get(t, 1)))
-        task = weighted[self._llm_task_rr % len(weighted)]
+        return weighted[self._llm_task_rr % len(weighted)]
+
+    def _llm_rr_consume(self):
+        """회전판이 고른 task 가 실제로 나갔을 때만 부른다(_llm_rr_peek 주석 참조)."""
         self._llm_task_rr += 1
-        return task
 
     def _llm_maybe_submit(self):
         """활성 task 중 하나를 가중 라운드로빈(또는 plateau 시 seeds/seq 우선) 선택해 제출."""
@@ -8024,10 +8028,8 @@ class _V101Fuzzer:
         if (_cand is not None and _cand == self._llm_last_task
                 and self._llm_task_consec >= RAG_MAX_CONSEC_TASK):
             _cand = None   # 연속 상한 도달 → 이번엔 라운드로빈에 양보(기아 방지)
-        if _cand is not None:
-            task = _cand
-        else:
-            task = self._llm_rr_next(active)
+        _rr_pick = self._llm_rr_peek(active)
+        task = _cand if _cand is not None else _rr_pick
         if self.learning.enabled:
             task = self.learning.choose(active, task, RAG_MAX_CONSEC_TASK)
         # 연속 선택 추적
@@ -8050,8 +8052,10 @@ class _V101Fuzzer:
         self._llm_pending_ctx = None      # 빌드↔제출 사이에서만 산다
         if self.llm.submit(task, sys_p, usr_p, self.executions, ctx=_ctx,
                            meta=self._llm_backend_meta(task, _ctx)):
+            if task == _rr_pick:
+                self._llm_rr_consume()   # 회전판 칸이 실제로 나갔을 때만 순번을 쓴다
             self._learning_submitted(task, sys_p, usr_p, _ctx)
-            log.info(f"[LLM] 요청 제출: task={task} (plateau={plateau})")
+            log.info(f"[LLM] 요청 제출: task={task} (plateau={plateau}, 회전판={_rr_pick})")
             if task == 'io_patterns':   # io_patterns 는 터미널에서도 보이게(진단)
                 log.warning("[LLM] io_patterns 요청 제출 — I/O 워크로드 descriptor 요청")
 
@@ -17936,7 +17940,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             _startup_active = self._llm_active_tasks() if RAG_SEED_AT_STARTUP else []
             if _startup_active:
                 # 첫 건부터 회전판을 돈다. 순번도 여기서 소비하므로 다음 요청은 그 다음 칸이다.
-                _task0 = self._llm_rr_next(_startup_active)
+                _task0 = self._llm_rr_peek(_startup_active)
                 # rag.startup_task 로 1건째만 고정할 수 있다. 순번은 위에서 이미 소비했으므로
                 #   고정하더라도 2건째는 회전판의 다음 칸이다.
                 if RAG_STARTUP_TASK.lower() != 'off':
@@ -17953,6 +17957,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                 if _built and self.llm.submit(
                         _task0, _built[0], _built[1], 0, ctx=_ctx,
                         meta=self._llm_backend_meta(_task0, _ctx)):
+                    self._llm_rr_consume()   # 실제로 나갔을 때만 순번 소비
                     self._learning_submitted(_task0, _built[0], _built[1], _ctx)
                     _pin = ' [startup_task 고정]' if RAG_STARTUP_TASK.lower() != 'off' else ''
                     log.warning(f"[LLM] 기동 요청 제출: task={_task0}{_pin}"

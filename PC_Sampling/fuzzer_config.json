@@ -430,7 +430,7 @@
     "max_seq_per_round": 6,
     "_comment_corpus_eval_sample": "corpus_eval 이 한 번에 평가시키는 시드 수(층화 표본). 하드코딩 40 이었다. task 마다 응답 1건당 항목 수가 크게 달라(seeds 8 / seq 6 / eval 40) 채택 수를 합산하면 평가가 총합을 지배한다 — [LLM/task] 는 task 별로 요청 대비로 본다.",
     "corpus_eval_sample": 40,
-    "max_seq_len": 16,
+    "max_seq_len": 24,
     "max_uncov_funcs": 40,
     "seed_at_startup": true,
     "_comment_startup_task": "기동 직후 1건째 LLM 요청의 task 를 고정한다. \"off\"(기본) = 가중 회전판이 정함(task_weights 순번 0번). task 이름(new_group_seeds/sequences/corpus_eval/io_patterns)을 주면 그것으로 고정하되 회전 순번은 그대로 소비하므로 2건째는 다음 칸이다. 비활성이거나 모르는 이름이면 경고 후 무시. seed_at_startup=false 면 기동 요청 자체가 없어 이 값도 무의미하다.",
