@@ -100,7 +100,7 @@ JSONL 한 줄 = `{"doc_id", "title", "content", "permission_groups"}`.
   "vllm": {
     "base_url": "http://192.168.10.1:8000/v1",
     "model": "nemotron-3-super",
-    "timeout_sec": 300.0,                    // 임베딩+생성+JSON교정 **전체** 예산
+    "timeout_sec": 400.0,                    // 임베딩+생성+JSON교정 **전체** 예산
     "max_tokens": 16384,
     "temperature": 0.7,
     "chat_template_kwargs": {                // Nemotron 추론 제어 (null=서버 기본값)

@@ -43,7 +43,7 @@ DEFAULTS = {
     # 요청 전체(임베딩+생성+JSON 교정)의 시간 예산. urllib 은 연결 단계만 따로
     #   제한하지 못해 별도 connect timeout 설정을 두지 않는다 — 있으면 지켜지는
     #   것처럼 보이지만 실제로는 아무것도 안 하는 값이 된다.
-    "timeout_sec": 300.0,
+    "timeout_sec": 400.0,
     "max_tokens": 16384,
     "temperature": 0.7,
     # Nemotron chat template 제어. 서버에 chat_template_kwargs 로 그대로 전달된다.
