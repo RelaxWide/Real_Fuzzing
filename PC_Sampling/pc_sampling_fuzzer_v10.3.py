@@ -5432,6 +5432,7 @@ class _V101Fuzzer:
         #   (평가 1건 ≠ 신규 시드 1건). task 마다 '요청 대비 얼마'로 봐야 한다.
         #   capped = 모델이 상한만큼 채워 보낸 횟수 → 상한이 실제로 무는지 판단.
         self._llm_by_task = {}
+        self._llm_unreachable_logged = False  # 영구 거절 명령 제외 로그는 1회만
         self._llm_last_task = None            # v9.5: 직전 선택 task(연속 상한 추적)
         self._llm_task_consec = 0             # v9.5: 같은 task 연속 선택 횟수(starvation-free cap)
         # v10: LLM 요청 주기를 시간 기반으로. 마지막 '시도' 시각(monotonic). 시작 ~interval 뒤 첫 시도.
@@ -7762,6 +7763,37 @@ class _V101Fuzzer:
                              f"be an ordering artifact rather than causation. Treat as a hint.)")
         return "\n".join(lines)
 
+    def _llm_unreachable_names(self, sb):
+        """CDW 값과 무관하게 **항상** 거절되는 명령 이름. 프롬프트 후보에서 뺀다.
+
+        빼지 않으면 되먹임이 닫힌 고리가 된다. 차단은 RC_SKIP 이라 cmd_stats 에 안 남고,
+        그래서 막힌 명령은 영원히 exercised 가 되지 않는다 → 'Never-sent command groups'
+        최상단에 고정 → LLM 이 매 라운드 그것만 다시 제안 → 또 차단. 실제로 Lockdown
+        (blocked admin opcode 0x24)과 FormatNVM/Sanitize(destructive)가 그 고리에 있었다.
+        시퀀스에서는 더 나쁘다 — 멤버 하나가 막히면 체인 전체가 폐기된다(부분 채택 금지).
+
+        판정은 is_dangerous 를 **cdw 없이** 부른다. 값에 의존하는 가드(SecuritySend SECP,
+        NamespaceManagement SEL, blocked_cdw_rules)는 cdw=0 에서 통과하므로 여기 안 들어온다
+        — 허용값으로는 실제로 나가고 스키마 valid 가 범위를 이미 강제하기 때문이다.
+        """
+        out = set()
+        for c in NVME_COMMANDS:
+            if c.name not in sb.commands:
+                continue
+            if c.opcode in self._excluded_opcodes:
+                out.add(c.name)
+                continue
+            try:
+                if sb.is_dangerous(c.name)[0]:
+                    out.add(c.name)
+            except Exception:
+                pass          # 판정 실패는 후보 유지(=기존 동작). 프롬프트가 죽지 않게.
+        if out and not self._llm_unreachable_logged:
+            self._llm_unreachable_logged = True
+            log.warning(f"[LLM] 영구 거절 명령을 프롬프트 후보에서 제외: {sorted(out)} "
+                        f"— 차단된 명령은 exercised 가 안 돼 never-sent 에 고정된다")
+        return out
+
     def _llm_build_request(self, task: str):
         """task 별 (system, user) 프롬프트 구성. 불가하면 None. 전부 메인 스레드 스냅샷.
 
@@ -7781,8 +7813,10 @@ class _V101Fuzzer:
             # v9.1: 확정 미구현(SC=0x01) 제외 — 죽은 명령이 후보 top 을 점거해 다른 명령을
             #   밀어내던 고착 제거(#1 digest 와도 일관). 스키마는 [:20] 캡 제거로 구현된 전부 노출
             #   → Read/Write 등 랭킹 바닥 명령도 항상 보임. never/explored 는 우선순위 힌트로만 유지.
+            _unreach = self._llm_unreachable_names(sb)
             known = [c.name for c in NVME_COMMANDS
-                     if c.name in sb.commands and c.name not in self._unimpl_cmds]
+                     if c.name in sb.commands and c.name not in self._unimpl_cmds
+                     and c.name not in _unreach]
             never = [n for n in known if n not in exercised]
             def _cmd_yield(name):
                 st = self.cmd_stats.get(name, {})
@@ -7815,8 +7849,9 @@ class _V101Fuzzer:
             return self._LLM_SYSTEM, user
         if task == 'sequences':
             # v9.1 #5: 확정 미구현 opcode 는 시퀀스 재료에서 제외(죽은 opcode 로 체인 조립 방지).
+            _unreach = self._llm_unreachable_names(self.llm.schema_bridge)
             names = [n for n in sorted(self.llm.schema_bridge.commands.keys())
-                     if n not in self._unimpl_cmds]
+                     if n not in self._unimpl_cmds and n not in _unreach]
             self._llm_pending_ctx = {"rag_query_commands": names[:3]}
             # 스키마에 실을 명령은 **관련도 순**으로 고른다. names 는 알파벳 순이라
             #   그대로 자르면 A~M 만 남는 임의 절단이 된다(캡이 명령 수보다 작을 때).
