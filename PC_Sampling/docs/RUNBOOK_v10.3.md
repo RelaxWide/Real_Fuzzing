@@ -564,7 +564,7 @@ Actual NSID distribution (1,303종): nsid=1:120394회, nsid=0:512회, … , …�
 |---|---|---|
 | 1 | 기동부 | `seed_at_startup=true` 면 **회전판 0번**을 꺼내 1건 요청(순번도 소비) |
 | 2 | `_llm_maybe_submit` | plateau 면 `sequences`/`new_group_seeds` 우선 (연속 `max_consec_task` 상한) |
-| 3 | `_llm_maybe_submit` | 가중 라운드로빈 `_llm_rr_next` — `rag.task_weights` |
+| 3 | `_llm_maybe_submit` | 가중 라운드로빈 `_llm_rr_peek` — `rag.task_weights` |
 | 4 | `LearningState.choose` | `adaptive_tasks=true` 면 3단계 결과를 **폴백으로만** 쓰고 보상 최고 task 를 고름 |
 
 ### 원인 ① — 기동 시딩이 회전판 밖에 있었다
@@ -573,7 +573,7 @@ Actual NSID distribution (1,303종): nsid=1:120394회, nsid=0:512회, … , …�
 그래서 기동 직후 **1건째(시딩)와 2건째(회전판 0번)가 둘 다** `new_group_seeds` 로 나갔다.
 `_learning_submitted` 가 `turn`/`explore_cursor` 는 올리는데 회전 커서만 빠져 있었다.
 
-지금은 두 경로가 `_llm_rr_next()` 하나를 공유한다. 기동 시딩도 회전판에서 꺼내고 순번을
+지금은 두 경로가 `_llm_rr_peek()` 하나를 공유한다. 기동 시딩도 회전판에서 꺼내고 순번을
 소비하므로, 다음 요청은 그 다음 칸이다. `task_weights` 기본값 기준 회전판은 이렇게 돈다:
 
 ```
@@ -623,8 +623,187 @@ Actual NSID distribution (1,303종): nsid=1:120394회, nsid=0:512회, … , …�
 를 내리는 쪽이 의도가 분명하다 — `min_reward_samples` 는 **초반 표본 부족**을 다루는 값이지
 task 비중을 정하는 값이 아니다.
 
-시험: `tests/test_v10_3_task_selection.py` 22건 — 수정 전 8/2/1 재현, 수정 후 분산,
-기동 블록 **소스를 그대로 실행**해 off/고정/비활성/오타 네 경우와 순번 소비를 확인.
+`new_group_seeds` 를 더 줄이고 싶으면 값을 올리기보다 `rag.task_weights.new_group_seeds`
+를 내리는 쪽이 의도가 분명하다 — `min_reward_samples` 는 **초반 표본 부족**을 다루는 값이지
+task 비중을 정하는 값이 아니다.
+
+### 원인 ③ — 회전판이 고른 칸을 버리면서 순번만 소비 (io_patterns 기아의 진짜 원인)
+
+①②를 고친 뒤에도 `io_patterns` 가 9건 동안 **한 번도** 안 나왔다. 남은 원인은 3단계와
+4단계 사이에 있었다.
+
+```python
+task = self._llm_rr_next(active)        # 꺼내는 순간 순번을 올린다
+task = self.learning.choose(...)        # 그 결과를 버릴 수 있다
+```
+
+`choose()` 는 회전판 결과를 **폴백으로만** 받는다. 탐색 턴이면 무시하고 `active[cursor]` 를,
+보상이 쌓였으면 `max(ranked)` 를 돌려준다. 빌드 실패나 in-flight 거절로 아예 안 나가기도
+한다. 그때마다 **버려진 칸이 소비**돼 그 자리는 다시 오지 않았다.
+
+실측 30건에서 회전판이 `io_patterns` 를 10번 골랐는데 실제로 나간 건 5번뿐이다.
+`task_weights.io_patterns = 2` 가 아무 효과가 없던 이유다.
+
+```python
+_rr_pick = self._llm_rr_peek(active)     # 소비하지 않고 본다
+task = _cand if _cand is not None else _rr_pick
+task = self.learning.choose(active, task, RAG_MAX_CONSEC_TASK)
+...
+if self.llm.submit(...):
+    if task == _rr_pick:
+        self._llm_rr_consume()           # 그 칸이 실제로 나갔을 때만
+```
+
+교체당하면 그 칸이 다음에 다시 온다. 기동 시딩도 같은 규칙을 따른다(①과 일관).
+
+### 원인 ④ — cold start
+
+보상이 없는 task 는 `ranked` 에 못 든다. 그래서 다른 task 에 보상이 붙는 순간 탐욕 분기가
+비탐색 턴을 전부 가져가고 신참은 굶는다. `io_patterns` 는 `active` 의 **마지막**이라
+탐색 턴으로도 4번째 탐색(=12번째 요청)에야 닿는다.
+
+경쟁 task 에 `min_reward_samples` 만큼의 **시도**를 먼저 준다.
+
+> ⚠ 게이트를 **보상 수**로 걸면 livelock 한다. 평가가 영영 완료되지 않는 task(소비되지 않는
+> `io_workload` descriptor 등)가 영원히 cold 로 남아 매 턴 자기를 고른다 — 실제로 30건 중
+> 18건을 먹었다. **요청 수**로 걸어야 `need × len(allowed)` 안에 끝난다.
+
+동률은 회전판 선택이 이겨서 `task_weights` 가 warm-up 도 지배한다. `corpus_eval` 은
+설계대로 탐색 슬롯 전용이라 제외한다.
+
+### 효과
+
+실제 `choose()` 를 구동한 결과:
+
+| | 9건 | 30건 |
+|---|---|---|
+| 전 | seed 2, seq 4, eval 2, **io 1** | io 순번 10 / 실제 제출 5 |
+| 후 | seed 2, seq 3, eval 2, **io 2** | seed 15, seq 4, eval 3, **io 8** |
+
+`io_patterns` 가 보상을 영영 못 받는 최악 조건에서도 40건 중 6건 — 굶지도, 독점하지도
+않는다.
+
+**측정상 기아를 푼 것은 ③이다.** ④는 캠페인을 이어받아 보상이 남은 상황에서 한 번도 안 돈
+task 가 밀리는 것을 막는 보조 장치다.
+
+### 선택 결과를 로그에서 본다
+
+`[LLM] 요청 제출` 에 회전판이 고른 것을 함께 남긴다. 교체가 일어났는지 바로 보인다.
+
+```
+[LLM] 요청 제출: task=sequences   (plateau=False, 회전판=io_patterns)   ← 교체됨
+[LLM] 요청 제출: task=io_patterns (plateau=False, 회전판=io_patterns)
+[LLM] io_patterns 요청 제출 — I/O 워크로드 descriptor 요청
+```
+
+시험: `tests/test_v10_3_task_selection.py` **35건** — 기동 블록과 `_llm_maybe_submit` 을
+**소스 그대로 실행**해 확인한다. peek/consume 를 따로만 시험하면 호출부가 무조건 consume
+해도 안 잡힌다(실제로 한 번 놓쳤다).
+
+## 6-7. 명령 차단 — 두 층
+
+### 6-7-1. 특정 (opcode, CDW 값) 조합 — `blocked_cdw_rules`
+
+`opcode` 하나로는 못 막고 **특정 값**이 장치를 못 쓰게 만드는 경우가 있다.
+
+> **vendor 0xC0 + CDW12=0x2 는 디버그 포트를 영구히 닫는다.** 전원 사이클로도 복구되지
+> 않아(공장 초기화 필요) 그 샘플로 더는 PC 샘플링을 못 한다 — **OpenOCD 포트 4444 대기
+> 타임아웃의 근본 원인**이다.
+
+`0xC0` 은 이름 붙은 명령이 아니라 opcode 변이 `randint(0xC0, 0xFF)` 로만 나온다. 스키마도
+`excluded_opcodes` 도 닿지 않고, 값을 볼 수 있는 곳은 발송 chokepoint 뿐이다.
+
+```jsonc
+"blocked_cdw_rules": [
+  { "opcode": "0xC0", "cdw": 12, "value": "0x2", "scope": "any",
+    "why": "디버그 포트 폐쇄" }
+]
+```
+
+- **전 제품 공통**이다(제품 프로필이 아니라 `strategy` 에 두는 이유)
+- `mask` 생략 = 전 비트 일치. 비트필드 일부만 볼 때 쓴다
+- `scope` 는 `admin` / `io` / `any`(기본) — 같은 번호가 큐에 따라 다른 의미일 때
+- 16진 문자열도 받는다. 잘못된 규칙은 기동 시 `sys.exit` 으로 즉시 죽는다(조용히 무시하면
+  안 막힌 채로 돈다)
+
+```
+[GUARD] opcode 0xc0 + CDW12=0x00000002 전송 차단 — 디버그 포트 폐쇄 (cmd=Identify, admin-passthru)
+```
+
+차단은 `RC_SKIP` 을 돌려준다 — **§6-7-3** 참조.
+
+v11(`pc_sampling_fuzzer_v11.py`)은 v10.3 을 `runpy` 로 실행하고 설정도 공유하므로 **자동
+적용**된다. mixin 의 `_send_nvme_command` 도 마지막이 `super()` 위임이라 가드를 건너뛰지
+않는다.
+
+### 6-7-2. 영원히 거절되는 명령은 프롬프트 목표에서 뺀다
+
+닫힌 되먹임 고리가 있었다.
+
+```
+가드 차단 → RC_SKIP → 회계 없이 continue → cmd_stats 에 안 남음
+  → exercised 안 됨 → 'Never-sent command groups' 최상단 고정
+  → LLM 이 매 라운드 그것만 제안 → 또 차단
+```
+
+걸려 있던 셋:
+
+| 명령 | 사유 |
+|---|---|
+| `Lockdown` | `blocked_admin_opcodes` 의 0x24 |
+| `FormatNVM` | `destructive` |
+| `Sanitize` | `destructive` |
+
+시퀀스에서는 더 나쁘다 — **멤버 하나가 막히면 체인 전체가 폐기된다**(부분 채택 금지).
+
+판정은 목록을 새로 들지 않고 `is_dangerous()` 를 **cdw 없이** 부른다. 손으로 든 목록은
+가드와 어긋난다. 값에 의존하는 가드(`SecuritySend` SECP, `NamespaceManagement` SEL,
+`blocked_cdw_rules`)는 `cdw=0` 에서 통과하므로 **후보로 남는다** — 허용값으로는 실제로
+나가고 스키마 `valid` 가 범위를 이미 강제한다.
+
+```
+[LLM] 영구 거절 명령을 프롬프트 후보에서 제외: ['FormatNVM', 'Lockdown', 'Sanitize']
+```
+
+**설정만 바꿔도 따라온다**(재시작 필요):
+
+| 출처 | 자동 반영 |
+|---|---|
+| `fuzzing.excluded_opcodes` | ✅ |
+| `strategy.blocked_admin_opcodes` | ✅ |
+| `destructive` | ❌ — `pc_sampling_fuzzer_v10.3.py` 에 하드코딩 |
+
+### 6-7-3. `RC_SKIP` 은 "실패" 가 아니다
+
+| | `rc >= 0` | `RC_ERROR` | **`RC_SKIP`** |
+|---|---|---|---|
+| `executions` 증가 | ✅ | ✅ | ❌ |
+| 커버리지 귀속 | ✅ | — | ❌ |
+| crash/timeout 판정 | ✅ | — | ❌ |
+| 실패 통계 | ✅ | ✅ | ❌ |
+
+차단을 실패로 세면 **가짜 불량률**이 생기고, 실행으로 세면 **LLM vs mutation yield 의
+분모가 오염**된다. 보내지도 않은 명령이 성과 지표를 망치는 것을 막는 장치다.
+
+`_learning_observe` 는 부른다 — LLM 제안이 차단됐다는 사실은 학습에 남겨야 한다(보상은
+안 붙는다).
+
+## 6-8. 시퀀스 길이 — 상한이 아니라 프롬프트 문구가 병목이었다
+
+`[LLM/task]` 가 `seq 3→7(2.3/6,캡0%)` 이면 **상한 6 에 평균 2.3, 한 번도 안 참** 이라
+길이를 늘릴 여지가 있다는 뜻이다. 그런데 `max_seq_len` 만 올려도 모델은 그대로 3-6 개를
+낸다 — 프롬프트가 그렇게 쓰여 있었기 때문이다.
+
+```
+"typically 3-6 commands"  →  "typically 6-10 commands"
+max_seq_len: 16 → 24
+```
+
+리플레이 비용이 최악 1.5배가 되지만, 보상식이 `device_seconds` 로 나누므로 긴 체인은
+스스로 페널티를 받는다.
+
+`eval 2→80(40.0/40, 캡100%)` 의 캡 100% 는 **정상**이다 — `corpus_eval` 은 표본 40개를
+전부 평가해 돌려줘야 하므로 항상 상한에 닿는다. 조치 대상이 아니다.
 
 ## 7. 트러블슈팅 — 실제로 걸렸던 것들
 
@@ -645,6 +824,9 @@ task 비중을 정하는 값이 아니다.
 | 검색 켠 뒤 퍼저가 **hang**, `sched_yield` busy-wait | OpenBLAS 스레드풀 스핀 | `*_NUM_THREADS=1` (§6-4). numpy import 보다 먼저 |
 | `swd: read data parity mismatch` + DPIDR 값이 매번 다름 | SWD 신호 무결성 | `adapter speed` 를 4000 → 1000 → 500 으로. 배선·GND 리턴 |
 | 재부팅·재삽입에도 **영영** 안 붙고 같은 DUT 는 다른 PC 에서 됨 | 마진이 아니라 **고장**. 프로브·USB 포트·접지 | 프로브 USB 30초 분리 → `VTarget` 확인 → USB 포트 변경 → 프로브를 정상 PC 로 교차 확인 → 호스트·DUT 접지 통일. **속도 조절은 이 단계에서 무의미** |
+| 수일 뒤 디버그 포트가 **영구히** 닫힘(전원 사이클 무효, 공장 초기화만 복구) | vendor `0xC0` + `CDW12=0x2` 가 나갔다 | `strategy.blocked_cdw_rules` 로 차단(§6-7-1). 이미 기본 규칙에 있다 |
+| LLM 이 `Lockdown`/`Sanitize`/`FormatNVM` 만 반복 제안 | 차단된 명령이 `exercised` 가 안 돼 never-sent 에 고정 | §6-7-2 — 이미 후보에서 제외된다. 기동 로그 `[LLM] 영구 거절 명령을 프롬프트 후보에서 제외` 확인 |
+| `io_patterns` 가 한 번도 요청 안 됨 | 회전판이 고른 칸을 `choose` 가 교체하며 순번만 소비 | §6-6 원인 ③. `[LLM] 요청 제출 ... 회전판=` 으로 교체 여부 확인 |
 | `JLinkExe` 의 `VTarget = 0.000V` | VTref 배선 또는 프로브 입력 손상 | 커넥터 1번 핀 방향·핀 휨 확인. 프로브 교체 |
 
 오류 번호가 층을 정확히 가리킨다 — **113=거부(REJECT), 111=포트 없음, 110=버려짐(DROP).**
@@ -653,7 +835,7 @@ task 비중을 정하는 값이 아니다.
 
 ## 8. 검증 현황 — 무엇을 믿어도 되나
 
-### 시험으로 덮인 것 (299개, 전부 통과)
+### 시험으로 덮인 것 (385개, 전부 통과)
 
 `tests/test_v10_3_backend.py` 90개가 **가짜 HTTP 서버로 DGX 없이** 돈다.
 잘못되면 *인덱스가 조용히 망가지는* 것들이 여기 있다.
@@ -663,7 +845,9 @@ task 비중을 정하는 값이 아니다.
 - 게시 전 검증, 포인터 원자 교체, 사용 중 버전 미삭제, 단일 writer 락
 - 스키마↔파서 대조(AST), 실패 분류, 진단 귀속, 시간 예산
 - 입력 해석(글롭·디렉터리), 소스 식별, UTF-8 BOM
-- LLM task 선택 편중 — 실제 `choose()` 로 수정 전 8/2/1 재현, 수정 후 분산 (§6-6)
+- LLM task 선택 — 회전판 순번 소비 조건, cold start, 기동 고정 (`test_v10_3_task_selection.py` 35)
+- 명령 차단 — 실제 `_send_nvme_command` 로 값/마스크/scope (`test_v10_3_cmd_block.py` 15)
+- 프롬프트 후보 필터 — 가드와 판정이 어긋나지 않는지 (`test_v10_3_prompt_targets.py` 7)
 
 고친 것은 **되돌리면 해당 시험이 깨지는 것까지** 확인했다(주입 시험 21건).
 
