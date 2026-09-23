@@ -790,9 +790,10 @@ _WPS_WRITE_PROTECT   = 0x1     # 유일하게 in-band 가역 확인된 상태(�
 WRITE_PROTECT_TEST   = bool(_ST.get('write_protect_test', True))  # False = WPS!=0 전부 차단
 
 # v10.3: (opcode, CDW 값) 조합 차단 — opcode 하나로는 못 막고 **특정 값**이 문제인 경우.
-#   PM9M1: vendor 0xC0 + CDW12=0x2 는 디버그 포트를 영구히 닫는다. 전원 사이클로도 복구되지
-#   않아(공장 초기화 필요) 그 샘플로 더는 PC 샘플링을 못 한다 — OpenOCD 포트 4444 대기
-#   타임아웃의 근본 원인이다. 0xC0 은 이름 붙은 명령이 아니라 opcode 변이
+#   **전 제품 공통 차단이다**(제품별 프로필이 아니라 strategy 에 두는 이유). vendor 0xC0 +
+#   CDW12=0x2 는 디버그 포트를 영구히 닫는다. 전원 사이클로도 복구되지 않아(공장 초기화
+#   필요) 그 샘플로 더는 PC 샘플링을 못 한다 — OpenOCD 포트 4444 대기 타임아웃의 근본
+#   원인이다. 0xC0 은 이름 붙은 명령이 아니라 opcode 변이
 #   (random.randint(0xC0, 0xFF))로만 나오므로 스키마로는 손댈 수 없다. 값을 보고 발송
 #   chokepoint 에서 막는 것이 유일한 자리다.
 #   형식: [{"opcode":192, "cdw":12, "value":2, "mask":null, "scope":"any", "why":"..."}]
@@ -844,7 +845,7 @@ def _parse_blocked_cdw_rules(raw):
 
 BLOCKED_CDW_RULES = _parse_blocked_cdw_rules(_ST.get('blocked_cdw_rules', [
     {"opcode": 0xC0, "cdw": 12, "value": 0x2,
-     "why": "PM9M1 디버그 포트 영구 폐쇄(전원 사이클로 복구 불가)"},
+     "why": "디버그 포트 폐쇄"},
 ]))
 
 # NSID override 정책(값 3종).

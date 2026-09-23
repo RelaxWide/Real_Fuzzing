@@ -1,8 +1,8 @@
 """(opcode, CDW 값) 조합 차단 — strategy.blocked_cdw_rules.
 
-PM9M1 에서 vendor 0xC0 + CDW12=0x2 가 디버그 포트를 영구히 닫았다. 전원 사이클로도
-복구되지 않아(공장 초기화 필요) 그 샘플로 더는 PC 샘플링을 못 한다 — OpenOCD 포트 4444
-대기 타임아웃의 근본 원인.
+vendor 0xC0 + CDW12=0x2 가 디버그 포트를 영구히 닫는다. 전원 사이클로도 복구되지 않아
+(공장 초기화 필요) 그 샘플로 더는 PC 샘플링을 못 한다 — OpenOCD 포트 4444 대기 타임아웃의
+근본 원인. **전 제품 공통 차단**이라 제품별 프로필이 아니라 strategy 에 둔다.
 
 0xC0 은 이름 붙은 명령이 아니라 opcode 변이(0xC0~0xFF)로만 나오므로 스키마·excluded_opcodes
 로는 막을 수 없다. 발송 chokepoint 가 유일한 자리다. 그래서 **실제 _send_nvme_command 를
