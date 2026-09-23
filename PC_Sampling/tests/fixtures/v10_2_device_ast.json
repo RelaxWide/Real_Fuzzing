@@ -40,12 +40,20 @@
       "date": "2026-09-21",
       "base_commit": "7bff55e",
       "reason": "Sampler failure diagnostics. (a) OpenOCD stdout/stderr go to a file instead of unread PIPEs — an undrained pipe blocks OpenOCD on write once the 64 KiB buffer fills, which silently kills the telnet path after days of error lines. (b) On read failure, DP DPIDR/CTRL-STAT are logged BEFORE the sticky clear that used to erase them (read-only, throttled, exception-proof). (c) Cumulative counters (uptime/reads/reinit/reconnect). (d) Restart ladder varies adapter speed instead of repeating one setting. (e) Optional RSS/fd trend thread. PC read path (framing, parsing, success path) is unchanged — additions only; deletions are confined to _launch_openocd/_reconnect and docstrings. Diagnostics never raise into the read path. Tests: test_v10_3_sampler_diag.py."
+    },
+    {
+      "path": "_V101Fuzzer._send_nvme_command",
+      "file": "pc_sampling_fuzzer_v10.3.py",
+      "date": "2026-09-23",
+      "base_commit": "80d01ce",
+      "reason": "Send-time block for (opcode, CDW value) pairs — strategy.blocked_cdw_rules. PM9M1: vendor 0xC0 with CDW12=0x2 permanently closes the debug port; a power cycle does not restore it (factory reset required), so the sample can no longer be sampled — the root cause behind the OpenOCD port 4444 wait timeout. 0xC0 is not a named command and only appears through opcode mutation (randint(0xC0,0xFF)), so neither CMD_SCHEMAS nor excluded_opcodes can reach it; the transport chokepoint is the only place that sees the value. The change is purely additive (81 insertions, 0 deletions): one early-return guard placed directly after the excluded_opcodes guard, before any command construction. Blocked commands return RC_SKIP, which the accounting path already treats as 'never sent' (no executions, coverage, or crash attribution). Every other transport guard, argument assembly, and rc handling is byte-identical. Frozen v10.2 hash unchanged. Tests: test_v10_3_cmd_block.py (15, real _send_nvme_command; injection-verified by removing the value comparison and the scope check)."
     }
   ],
   "overrides_note": "hashes 는 모든 DEVICE_AST_FILES 에 적용되는 기준선이다. overrides 는 검토를 거쳐 **특정 파일에서만** 의도적으로 달라진 경로를 기록한다. v10.2 는 검증된 fallback 이라 계속 기준선 그대로여야 하고, 여기 올라오지 않은 파일·경로는 전부 기준선에 묶인다.",
   "overrides": {
     "pc_sampling_fuzzer_v10.3.py": {
-      "OpenOCDPCSampler": "48865eb551960624265b061a897ddf8abdc2586862598bc2be3c97a3a69aba04"
+      "OpenOCDPCSampler": "48865eb551960624265b061a897ddf8abdc2586862598bc2be3c97a3a69aba04",
+      "_V101Fuzzer._send_nvme_command": "abbb7724003771f75ca6689206a27e4b208b29911540128c49254d8fcdc37bd3"
     }
   }
 }

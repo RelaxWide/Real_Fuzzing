@@ -789,6 +789,64 @@ _WRITE_PROTECT_FID   = 0x84
 _WPS_WRITE_PROTECT   = 0x1     # 유일하게 in-band 가역 확인된 상태(발송 허용 + auto-clear)
 WRITE_PROTECT_TEST   = bool(_ST.get('write_protect_test', True))  # False = WPS!=0 전부 차단
 
+# v10.3: (opcode, CDW 값) 조합 차단 — opcode 하나로는 못 막고 **특정 값**이 문제인 경우.
+#   PM9M1: vendor 0xC0 + CDW12=0x2 는 디버그 포트를 영구히 닫는다. 전원 사이클로도 복구되지
+#   않아(공장 초기화 필요) 그 샘플로 더는 PC 샘플링을 못 한다 — OpenOCD 포트 4444 대기
+#   타임아웃의 근본 원인이다. 0xC0 은 이름 붙은 명령이 아니라 opcode 변이
+#   (random.randint(0xC0, 0xFF))로만 나오므로 스키마로는 손댈 수 없다. 값을 보고 발송
+#   chokepoint 에서 막는 것이 유일한 자리다.
+#   형식: [{"opcode":192, "cdw":12, "value":2, "mask":null, "scope":"any", "why":"..."}]
+#     mask 생략 = 전 비트 일치. scope: admin|io|any(기본) — 같은 번호의 IO/admin 명령이
+#     다른 의미인 경우를 구분하기 위함.
+_BLOCKED_CDW_FIELDS = (2, 3, 10, 11, 12, 13, 14, 15)   # Seed 가 실제로 갖는 CDW 만
+
+
+def _cfg_int(v):
+    """설정값 정수화. 이 파일의 다른 안전 목록들처럼 "0xC0" 같은 16진 문자열도 받는다."""
+    return int(v, 0) if isinstance(v, str) else int(v)
+
+
+def _parse_blocked_cdw_rules(raw):
+    if not isinstance(raw, (list, tuple)):
+        sys.exit("[FATAL] strategy.blocked_cdw_rules 는 배열이어야 합니다.")
+    out = []
+    for i, r in enumerate(raw):
+        where = f"strategy.blocked_cdw_rules[{i}]"
+        if not isinstance(r, dict):
+            sys.exit(f"[FATAL] {where} 는 객체여야 합니다 ({type(r).__name__} 받음).")
+        try:
+            op, cdw, val = (_cfg_int(r['opcode']), _cfg_int(r['cdw']), _cfg_int(r['value']))
+        except KeyError as e:
+            sys.exit(f"[FATAL] {where}: {e} 키가 필요합니다 (opcode/cdw/value).")
+        except (TypeError, ValueError) as e:
+            sys.exit(f"[FATAL] {where}: opcode/cdw/value 는 정수여야 합니다 ({e}).")
+        _m = r.get('mask')
+        try:
+            mask = 0xFFFFFFFF if _m is None else _cfg_int(_m)
+        except (TypeError, ValueError):
+            sys.exit(f"[FATAL] {where}: mask 는 정수여야 합니다 ({_m!r} 받음).")
+        scope = str(r.get('scope', 'any')).strip().lower()
+        if not 0 <= op <= 0xFF:
+            sys.exit(f"[FATAL] {where}: opcode 는 0..255 여야 합니다 ({op} 받음).")
+        if cdw not in _BLOCKED_CDW_FIELDS:
+            sys.exit(f"[FATAL] {where}: cdw 는 {list(_BLOCKED_CDW_FIELDS)} 중 하나여야 "
+                     f"합니다 ({cdw} 받음).")
+        if not 0 <= mask <= 0xFFFFFFFF:
+            sys.exit(f"[FATAL] {where}: mask 는 0..0xFFFFFFFF 여야 합니다.")
+        if scope not in ('admin', 'io', 'any'):
+            sys.exit(f"[FATAL] {where}: scope 는 'admin'|'io'|'any' 여야 합니다 "
+                     f"({scope!r} 받음).")
+        # 비교는 마스크 적용 후 한 번만 — value 에 마스크 밖 비트가 있어도 무시한다.
+        out.append((op, cdw, val & mask & 0xFFFFFFFF, mask & 0xFFFFFFFF, scope,
+                    str(r.get('why', '') or '')))
+    return tuple(out)
+
+
+BLOCKED_CDW_RULES = _parse_blocked_cdw_rules(_ST.get('blocked_cdw_rules', [
+    {"opcode": 0xC0, "cdw": 12, "value": 0x2,
+     "why": "PM9M1 디버그 포트 영구 폐쇄(전원 사이클로 복구 불가)"},
+]))
+
 # NSID override 정책(값 3종).
 #   fuzz(기본): 0/broadcast/미존재/임의 NSID 변이를 제약 없이 그대로 FW에 전달한다.
 #   active_only: 시작 시 활성 namespace를 탐지하고 그 집합 안에서만 NSID mutation.
@@ -4939,6 +4997,10 @@ def _llm_schema_dict() -> dict:
         "security_send_opcode": _SECURITY_SEND_OPCODE,
         "ns_mgmt_opcode": _NS_MGMT_OPCODE, "ns_attach_opcode": _NS_ATTACH_OPCODE,
         "block_ns_delete": bool(BLOCK_NS_DELETE),
+        "blocked_cdw_rules": [
+            {"opcode": op, "cdw": cdw, "value": val, "mask": mask, "scope": scope, "why": why}
+            for op, cdw, val, mask, scope, why in BLOCKED_CDW_RULES
+        ],
     }
     return {"fuzzer_version": FUZZER_VERSION, "commands": commands,
             "schemas": schemas, "guards": guards}
@@ -13476,6 +13538,25 @@ class _V101Fuzzer:
             log.warning(f"[GUARD] excluded opcode 0x{actual_opcode:02x} 전송 차단 — "
                         f"config excluded_opcodes (cmd={cmd.name}, {passthru_type})")
             self.stats['blocked_excluded_opcode'] = self.stats.get('blocked_excluded_opcode', 0) + 1
+            return self.RC_SKIP
+
+        # v10.3: (opcode, CDW 값) 조합 차단 — 상단 BLOCKED_CDW_RULES 주석 참조.
+        #   excluded_opcodes 바로 뒤에 둔다. opcode 전체를 버리기엔 아까운데 특정 값 하나가
+        #   장치를 못 쓰게 만드는 경우가 여기 온다.
+        for _r_op, _r_cdw, _r_val, _r_mask, _r_scope, _r_why in BLOCKED_CDW_RULES:
+            if actual_opcode != _r_op:
+                continue
+            if _r_scope == 'admin' and passthru_type != "admin-passthru":
+                continue
+            if _r_scope == 'io' and passthru_type == "admin-passthru":
+                continue
+            _r_cur = getattr(seed, f'cdw{_r_cdw}', 0) & 0xFFFFFFFF
+            if (_r_cur & _r_mask) != _r_val:
+                continue
+            log.warning(f"[GUARD] opcode 0x{_r_op:02x} + CDW{_r_cdw}=0x{_r_cur:08x} 전송 차단"
+                        + (f" — {_r_why}" if _r_why else "")
+                        + f" (cmd={cmd.name}, {passthru_type})")
+            self.stats['blocked_cdw_rule'] = self.stats.get('blocked_cdw_rule', 0) + 1
             return self.RC_SKIP
 
         # 가성 불량 방지 가드: host(kernel) 소유 전송로를 깨는 admin opcode 는 전송하지 않는다.
