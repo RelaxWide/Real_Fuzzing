@@ -805,6 +805,52 @@ max_seq_len: 16 → 24
 `eval 2→80(40.0/40, 캡100%)` 의 캡 100% 는 **정상**이다 — `corpus_eval` 은 표본 40개를
 전부 평가해 돌려줘야 하므로 항상 상한에 닿는다. 조치 대상이 아니다.
 
+## 6-9. io_patterns — 규칙 대신 패턴별 성과표
+
+실행 중 LLM 이 14개 패턴 중 `overwrite_churn` 만 계속 골랐다. 예시 한 줄 탓이 아니라
+프롬프트 전체가 한 방향을 가리켰다.
+
+| 편향 원인 | 내용 |
+|---|---|
+| 목표 문단 | "DIRTY FTL", "WAF 가 직접 신호", "작은 랜덤 overwrite 를 bounded span 에" — `overwrite_churn` 의 설명 그대로 |
+| 예시 | `free_blocks` high → `overwrite_churn` (필드명도 실제는 `sec_free_blocks_pct`) |
+| 피드백 처방 | PARTIAL "Keep this pattern", WEAK "Use smaller random overwrites". 판정이 ΔWAF 라 읽기·경계 계열은 구조적으로 WEAK/NO EFFECT → 되돌려 보냄 |
+| 정보 부재 | 나머지 12개는 이름만. 기억은 직전 1건 |
+| 파라미터 | `lba_span` 이 먹는 패턴은 2개뿐인데 프롬프트가 bounded span 을 강조 |
+
+### 지금 프롬프트에 들어가는 것
+
+```
+I/O pattern results this run (cov/1k = new code coverage per 1000 commands, ...):
+  hot_cold           n=1   cov/1k=8.00   states=0   avg_dWAF=+4    last=latest
+  overwrite_churn    n=1   cov/1k=2.40   states=1   avg_dWAF=+30   last=1 ago
+  never tried: seq_write, rand_write, read_disturb, ...
+Last burst: pattern=hot_cold lba_span=4096 ... -> new_cov=8 over 1000 cmds, ... stop=walltime
+```
+
+- **판단 규칙을 주지 않는다.** telemetry(현재 상태) + 성과표(실측)만 주고 고르게 한다
+- `cov/1k` = 버스트 중 `llm/iowl` edge 증가 ÷ 명령 수 × 1000. 버스트 길이가 패턴마다
+  달라(조기 종료·walltime) **총량이 아니라 비율**로 비교한다. 정렬 기준이다
+- 안 써본 패턴은 이름만 한 줄. 전 패턴을 써도 표는 15줄
+- 직전 버스트는 **수치만**. SUCCESS/WEAK 판정과 처방 문구는 없앴다
+- 파라미터가 실제로 먹는 패턴(`IO_WL_PARAM_PATTERNS`)을 싣는다. 나머지에선 무시된다.
+  `_gen_workload_block` 을 고치면 이 표도 맞출 것 — 시험이 실제 생성기와 대조한다
+- `direction` 에 "노리는 내부 메커니즘 + 근거 telemetry" 를 적게 한다 → 로그로 사후 검증
+- 성과표는 **이번 실행 한정**(메모리). 재시작하면 비어서 다시 탐색한다
+
+로그: `[IO-WL/burst] ... cov=N cmds=M`.
+
+### 버스트 한 건의 길이와 판정 (바뀌지 않음)
+
+| | |
+|---|---|
+| 길이 | 최대 50 block × 100 = 5,000 명령. 5 block 마다 스냅샷 |
+| 조기 종료 | `ffm_frag` 가 오른 뒤 3회 연속 정체 → `saturated`. **FFM 을 안 올리는 패턴은 항상 끝까지(또는 120초)** |
+| 학습 보상 | task 단위, 버스트의 **처음 8개 명령**만 봄 — GC 처럼 늦게 발동하는 경로는 안 잡힌다. 별건 |
+
+시험: `tests/test_v10_3_io_table.py` 8건(파라미터 표 ↔ 실제 생성기 대조는 목록을 틀리게
+주입해 깨지는 것까지 확인).
+
 ## 7. 트러블슈팅 — 실제로 걸렸던 것들
 
 증상이 원인을 안 가리키는 것들만 모았다. **위에서부터** 의심한다.
@@ -827,6 +873,7 @@ max_seq_len: 16 → 24
 | 수일 뒤 디버그 포트가 **영구히** 닫힘(전원 사이클 무효, 공장 초기화만 복구) | vendor `0xC0` + `CDW12=0x2` 가 나갔다 | `strategy.blocked_cdw_rules` 로 차단(§6-7-1). 이미 기본 규칙에 있다 |
 | LLM 이 `Lockdown`/`Sanitize`/`FormatNVM` 만 반복 제안 | 차단된 명령이 `exercised` 가 안 돼 never-sent 에 고정 | §6-7-2 — 이미 후보에서 제외된다. 기동 로그 `[LLM] 영구 거절 명령을 프롬프트 후보에서 제외` 확인 |
 | `io_patterns` 가 한 번도 요청 안 됨 | 회전판이 고른 칸을 `choose` 가 교체하며 순번만 소비 | §6-6 원인 ③. `[LLM] 요청 제출 ... 회전판=` 으로 교체 여부 확인 |
+| io_patterns 가 한 패턴(`overwrite_churn`)만 고름 | 프롬프트 목표·예시·피드백 처방이 전부 그 패턴을 가리킴 | §6-9 — 성과표로 교체됨. `[IO-WL/burst] ... cov=` 로 패턴별 실적 확인 |
 | `JLinkExe` 의 `VTarget = 0.000V` | VTref 배선 또는 프로브 입력 손상 | 커넥터 1번 핀 방향·핀 휨 확인. 프로브 교체 |
 
 오류 번호가 층을 정확히 가리킨다 — **113=거부(REJECT), 111=포트 없음, 110=버려짐(DROP).**

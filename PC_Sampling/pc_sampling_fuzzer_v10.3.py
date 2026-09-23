@@ -595,6 +595,15 @@ _IW_DEFAULT_PATTERNS = [
     'strided_write', 'reverse_seq', 'boundary', 'bursty_mixed_size',
 ]
 IO_WL_PATTERNS = list(_IW.get('patterns', _IW_DEFAULT_PATTERNS))
+# descriptor 파라미터가 **실제로 먹는** 패턴(_gen_workload_block 기준). 나머지 패턴에선 무시된다.
+#   프롬프트에 그대로 싣는다 — 모르면 LLM 이 lba_span 이 먹는 패턴(overwrite_churn)으로 쏠린다.
+#   _gen_workload_block 을 바꾸면 여기도 맞출 것(test_v10_3_io_table 이 대조한다).
+IO_WL_PARAM_PATTERNS = {
+    'lba_span':     ('overwrite_churn', 'hot_cold'),
+    'block_size':   ('seq_write', 'reverse_seq', 'pingpong_write', 'bursty_mixed_size', 'mixed_rw'),
+    'hot_fraction': ('hot_cold',),
+    'read_ratio':   ('mixed_rw',),
+}
 
 # v9.3: LLM-구동 I/O 워크로드 버스트 — LLM descriptor(패턴+파라미터)를 받아 포화까지 증폭 실행.
 #   기존 round-robin 단일 블록과 공존: descriptor pending 이면 버스트, 없으면 기존 경로 무변경.
@@ -5751,6 +5760,10 @@ class _V101Fuzzer:
         # v9.3: LLM-구동 워크로드 버스트 상태
         self._pending_workload: Optional[dict] = None      # LLM 이 낸 descriptor(대기) → 다음 주입점에서 버스트
         self._last_workload_result: Optional[dict] = None  # 직전 버스트 결과(pattern·FFM 델타) → LLM 되먹임
+        # v10.3: 패턴별 누적 성과 → io_patterns 프롬프트의 성과표. 직전 1건 되먹임만으로는
+        #   "어느 패턴이 먹혔나 / 무엇을 안 써봤나" 를 LLM 이 알 수 없어 한 패턴에 고착됐다.
+        self._wl_pattern_stats: dict = {}                  # pattern → {n, cov, cmds, states, waf_sum, waf_n, last}
+        self._wl_burst_seq: int = 0                        # LLM 버스트 순번 (성과표 'last=N ago')
         # 사전생성 랜덤 write 버퍼 (per-cmd os.urandom 회피). 워크로드 활성 시에만 할당.
         self._wl_rand_buf: bytes = (
             os.urandom(max(1, IO_WL_RAND_BUF_MB) * 1024 * 1024)
@@ -7631,48 +7644,66 @@ class _V101Fuzzer:
         return "\n".join(lines)
 
     def _llm_workload_feedback(self) -> str:
-        """직전 버스트 결과를 되먹임 문장으로. 없으면 빈 문자열.
-        v9.5 Phase 0: '성공'을 FFM 상승 단방향이 아니라 **새 상태/전이 유발**로 재정의.
-        새 state 발견(new_states>0) 또는 FFM 이 양방향으로 유의미하게 움직임(ffm_range) = 내부 로직
-        자극 성공. FFM 방향(Δ)은 성공/실패가 아니라 '어느 쪽으로 밀렸나' 정보로만 전달한다."""
+        """직전 버스트 결과를 **수치로만** 되먹인다. 없으면 빈 문자열.
+
+        v10.3: 예전에는 판정문(SUCCESS/PARTIAL/WEAK/NO EFFECT)에 "Keep this pattern",
+        "Use smaller random overwrites over a bounded span" 같은 **처방**이 붙어 있었다.
+        판정 기준이 ΔWAF 라 읽기·경계 계열은 구조적으로 WEAK/NO EFFECT 를 받고, 처방이
+        overwrite_churn 으로 되돌려 보내 한 패턴에 고착됐다. 패턴 간 비교는 성과표
+        (_llm_workload_table)가 맡고, 여기는 직전 파라미터 조정용 사실만 준다."""
         r = self._last_workload_result
         if not r:
             return ""
         d = r.get('desc') or {}
-        _new_states = r.get('new_states') or 0
-        _ffm_range = r.get('ffm_range') or 0
-        _delta = r.get('ffm_delta')
-        _dir = ("up (fragmentation/GC pressure rising)" if (_delta or 0) > 0
-                else "down (GC/relocation completing, blocks reclaimed)" if (_delta or 0) < 0
-                else "flat")
-        # v10.1: PARTIAL 기준을 ffm_range → ΔWAF 로. ffm_range 는 GC 가 이미 끝나 free block 이
-        #   회복된 경우에도 커서 "임계 근처에 머무는 것"과 "지나쳐버린 것"을 구분 못 했고,
-        #   순차 쓰기(매핑 깨끗)에도 반응해 원하는 워크로드와 반대로 보상했다. ΔWAF 는
-        #   GC 가 valid page 를 실제로 옮겼을 때만 오른다 = 매핑이 꼬였다는 직접 증거.
-        _wd = r.get('waf_delta')
-        if _new_states > 0:
-            verdict = (f"SUCCESS: it drove {_new_states} NEW internal state(s) — this pattern reaches "
-                       f"un-exercised firmware logic. Push further / vary params around it.")
-        elif _wd and _wd > 0:
-            verdict = (f"PARTIAL: write amplification rose (WAF {r.get('waf_start')}→"
-                       f"{r.get('waf_peak')}, x100) — the FTL is copying valid pages, i.e. the "
-                       f"logical-to-physical mapping is getting fragmented. Keep this pattern and "
-                       f"push the working set / overwrite ratio further.")
-        elif _ffm_range and _ffm_range > 0:
-            verdict = ("WEAK: FTL state oscillated but write amplification did not rise — the mapping "
-                       "is probably still clean (sequential-like). Use smaller random overwrites over "
-                       "a bounded span to tangle the mapping instead of just filling the drive.")
-        else:
-            verdict = ("NO EFFECT: internal state did not move. Try a different pattern or a larger "
-                       "working-set / churn to force GC/wear/relocation.")
-        return (f"Feedback: your last workload {{pattern={r.get('pattern')}, "
-                f"lba_span={d.get('lba_span')}, block_size={d.get('block_size')}, "
-                f"hot_fraction={d.get('hot_fraction')}, read_ratio={d.get('read_ratio')}}} — "
-                f"FFM {r.get('ffm_start')}→peak {r.get('ffm_peak')}/trough {r.get('ffm_trough')} "
-                f"(Δ{_delta}, moved {_dir}, range {_ffm_range}), "
-                f"WAF(x100) {r.get('waf_start')}→{r.get('waf_peak')} (Δ{_wd}), "
-                f"new_states={_new_states} "
-                f"over {r.get('blocks')} blocks (stop={r.get('stop')}). {verdict}")
+        return (f"Last burst: pattern={r.get('pattern')} lba_span={d.get('lba_span')} "
+                f"block_size={d.get('block_size')} hot_fraction={d.get('hot_fraction')} "
+                f"read_ratio={d.get('read_ratio')} -> new_cov={r.get('cov')} "
+                f"over {r.get('cmds')} cmds, new_states={r.get('new_states') or 0}, "
+                f"WAF(x100) {r.get('waf_start')}->{r.get('waf_peak')}, "
+                f"FFM {r.get('ffm_start')}->peak {r.get('ffm_peak')}/trough {r.get('ffm_trough')}, "
+                f"stop={r.get('stop')}")
+
+    def _wl_record_pattern(self, pattern: str, cov: int, cmds: int,
+                           new_states: int, waf_delta) -> None:
+        """버스트 1건의 성과를 패턴별 누적에 더한다(성과표 원천)."""
+        self._wl_burst_seq += 1
+        st = self._wl_pattern_stats.setdefault(
+            pattern, {'n': 0, 'cov': 0, 'cmds': 0, 'states': 0,
+                      'waf_sum': 0, 'waf_n': 0, 'last': 0})
+        st['n'] += 1
+        st['cov'] += max(0, int(cov or 0))
+        st['cmds'] += max(0, int(cmds or 0))
+        st['states'] += max(0, int(new_states or 0))
+        if waf_delta is not None:
+            st['waf_sum'] += waf_delta
+            st['waf_n'] += 1
+        st['last'] = self._wl_burst_seq
+
+    def _llm_workload_table(self) -> str:
+        """패턴별 실측 성과표 — io_patterns 프롬프트의 선택 근거.
+
+        규칙("X 면 Y 패턴")을 주면 그 자체가 편향이 된다. 대신 이번 실행에서 각 패턴이
+        **실제로 낸 것**을 한 줄씩 준다. 커버리지는 버스트 길이가 패턴마다 달라(조기 종료·
+        walltime) 1k 명령당으로 정규화한다. 안 써본 패턴은 이름만 한 줄로 묶는다."""
+        stats = self._wl_pattern_stats
+        rows = []
+        for pat in IO_WL_PATTERNS:
+            st = stats.get(pat)
+            if not st:
+                continue
+            rate = st['cov'] * 1000.0 / st['cmds'] if st['cmds'] else 0.0
+            waf = (f"{st['waf_sum'] / st['waf_n']:+.0f}" if st['waf_n'] else "n/a")
+            ago = self._wl_burst_seq - st['last']
+            rows.append((rate, f"  {pat:<18} n={st['n']:<3} cov/1k={rate:<6.2f} "
+                               f"states={st['states']:<3} avg_dWAF={waf:<5} "
+                               f"last={'latest' if ago == 0 else f'{ago} ago'}"))
+        never = [p for p in IO_WL_PATTERNS if p not in stats]
+        lines = ["I/O pattern results this run (cov/1k = new code coverage per 1000 commands, "
+                 "the fuzzer's real goal; states = new internal states; last = bursts ago):"]
+        lines += [r for _, r in sorted(rows, key=lambda x: -x[0])] or ["  (no bursts yet)"]
+        if never:
+            lines.append("  never tried: " + ", ".join(never))
+        return "\n".join(lines)
 
     def _corpus_eval_stratified_sample(self, n: int = 40):
         """v9.5 Phase 0: corpus[:40](오래된-편향) 대신 strata 층화 표본.
@@ -7933,30 +7964,28 @@ class _V101Fuzzer:
             #   "지금 어떤 워크로드가 내부 상태를 미나"를 판단 → fuzzer 가 수천 I/O 로 증폭.
             tele = self._llm_telemetry_block()
             fb   = self._llm_workload_feedback()
-            _fb  = (fb + "\n\n") if fb else ""
-            user = (_gp + _fb
+            # v10.3: 목표 문단("DIRTY FTL", WAF 가 직접 신호, 작은 랜덤 overwrite 권장)과
+            #   예시(free_blocks high → overwrite_churn)를 뺐다. 둘 다 overwrite_churn 의 설명이라
+            #   14개 중 그것만 고르게 만들었다. 판단 규칙 대신 실측 성과표를 준다.
+            _table = self._llm_workload_table()
+            _params = "; ".join(f"{k} -> {', '.join(v)}" for k, v in IO_WL_PARAM_PATTERNS.items())
+            user = (_gp
                     + "SSD internal state (telemetry — name = value  [description]):\n"
                     + (tele or "  (telemetry unavailable)") + "\n\n"
-                    + "Your goal is a DIRTY FTL: a logical-to-physical mapping that is heavily "
-                      "fragmented, so the firmware must run GC / valid-page copy / relocation paths.\n"
-                      "  - waf_x100 = write amplification x100 (100 = 1.0). THIS is the direct signal: "
-                      "it only rises when the FTL copies valid pages, i.e. the mapping is tangled. "
-                      "Filling the drive sequentially does NOT raise it — the mapping stays clean.\n"
-                      "  - ffm_frag (0-100) combines WAF (main), GC/relocation activity, and fullness.\n"
-                      "  - slc_fold_pct = share of NAND writes that went to static SLC.\n"
-                      "Small random OVERWRITES over a bounded span tangle the mapping; large sequential "
-                      "writes mostly just fill it. Sustained Read/Write I/O — NOT admin commands — is "
-                      "what moves these fields.\n\n"
-                    + f"Available I/O patterns: {IO_WL_PATTERNS}\n\n"
-                    + "Task: emit ONE \"io_workload\" descriptor — a compact recipe the fuzzer will "
-                      "AMPLIFY into thousands of Read/Write commands to drive internal state toward "
-                      "un-exercised firmware logic (GC/wear/fragmentation). "
-                      "Fields: {\"pattern\": one of the list above, \"lba_span\": int LBAs (working-set "
-                      "size to churn), \"block_size\": int LBAs per command, \"hot_fraction\": 0..1 "
-                      "(hot/cold split), \"read_ratio\": 0..1, \"direction\": short semantic goal}. "
-                      "Choose pattern+params from the telemetry (e.g. if free_blocks is high, use "
-                      "overwrite_churn over a bounded lba_span to force GC; if read paths matter, "
-                      "read_disturb). Return JSON only: a single object with key \"io_workload\".")
+                    + _table + "\n"
+                    + (fb + "\n" if fb else "") + "\n"
+                    + "Task: emit ONE \"io_workload\" descriptor. The fuzzer amplifies it into "
+                      "thousands of Read/Write commands to reach un-exercised firmware logic "
+                      "(GC, wear leveling, read reclaim, SLC cache, mapping, boundary handling ...). "
+                      "Pick the pattern you expect to yield the most NEW coverage from the CURRENT "
+                      "telemetry state, using the results table as evidence; when current choices "
+                      "stall, try a never-tried pattern.\n"
+                    + "Fields: {\"pattern\": one of the patterns above, \"lba_span\": int LBAs "
+                      "(working set), \"block_size\": int LBAs per command, \"hot_fraction\": 0..1, "
+                      "\"read_ratio\": 0..1, \"direction\": the internal mechanism you target and "
+                      "the telemetry that motivated it}. "
+                    + f"Params apply only to these patterns (ignored elsewhere): {_params}. "
+                      "Return JSON only: a single object with key \"io_workload\".")
             return self._LLM_SYSTEM, user
         return None
 
@@ -13379,6 +13408,9 @@ class _V101Fuzzer:
             self._current_combo = restored
             self._current_ps    = restored.nvme_ps
         self._wl_active_pattern = pattern
+        # v10.3 성과표: 이 버스트가 만든 새 커버리지(llm/iowl edge)와 명령 수. pre-write 포함.
+        _edge0 = self._cov_by_src.get('llm/iowl', {}).get('edge', 0)
+        _exec0 = self.executions
         _wl_prov = desc.get('prov_id')   # v9.4 ledger: 이 descriptor(io_patterns 제안)의 계보 id
         # read 패턴: 타겟 1회 pre-write (v9.4 ledger: pre-write 도 이 proposal 계보로 귀속)
         if (pattern in ('read_disturb', 'pingpong_read')
@@ -13465,18 +13497,23 @@ class _V101Fuzzer:
         _ffm_range = ((ffm_max - ffm_min) if ffm0 is not None else None)
         _waf_delta = ((_waf_max - _waf0) if (_waf0 is not None and _waf_max is not None)
                       else None)
+        _cov = self._cov_by_src.get('llm/iowl', {}).get('edge', 0) - _edge0
+        _cmds = self.executions - _exec0
         self._last_workload_result = {
             'pattern': pattern, 'desc': desc, 'blocks': blocks, 'rc0': n_ok,
             'ffm_start': ffm0, 'ffm_peak': ffm_max, 'ffm_trough': ffm_min,
             'waf_start': _waf0, 'waf_peak': _waf_max, 'waf_delta': _waf_delta,
             'ffm_delta': ffm_delta, 'ffm_range': _ffm_range,
             'new_states': _new_states, 'stop': stop_reason,
+            'cov': _cov, 'cmds': _cmds,
         }
+        self._wl_record_pattern(pattern, _cov, _cmds, _new_states, _waf_delta)
         log.warning(f"[IO-WL/burst] pattern={pattern} blocks={blocks} rc0={n_ok} "
                     f"FFM {ffm0}→{ffm_max} (Δ{ffm_delta}) "
                     f"WAF(x100) {_waf0}→{_waf_max} (Δ{_waf_delta}) stop={stop_reason} "
                     f"span={desc.get('lba_span')} bs={desc.get('block_size')} "
-                    f"hot={desc.get('hot_fraction')} rd={desc.get('read_ratio')}")
+                    f"hot={desc.get('hot_fraction')} rd={desc.get('read_ratio')} "
+                    f"cov={_cov} cmds={_cmds}")
         # 워크로드 전후 telemetry 변화 요약(터미널) — 어느 내부 상태를 얼마나 밀었나.
         log.warning(f"[IO-WL/telemetry] pattern={pattern} 전후 변화 — "
                     f"{self._telemetry_delta_summary(_snap_start, _snap_last)}")
