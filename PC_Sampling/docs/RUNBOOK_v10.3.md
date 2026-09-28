@@ -4,7 +4,9 @@
 구현 현황 정본은 [pc_sampling_fuzzer_v10.3.md](pc_sampling_fuzzer_v10.3.md) 를 본다.
 이 문서는 **실제로 돌리는 방법**과 **걸렸던 함정**을 모은 것이다.
 
-작성 기준 2026-09-21. 시험 279개 통과, 인덱스 968청크 구축 완료.
+작성 기준 2026-09-28. v10.3 시험 358개 통과(v11 작업분 제외), 인덱스 968청크 구축 완료.
+`rag/` 패키지 상세는 [`../rag/README.md`](../rag/README.md), BM9K1 연결 도구는
+[`../risc-v/README.md`](../risc-v/README.md).
 
 ---
 
@@ -64,13 +66,26 @@ PC_Sampling/
 ├── pc_sampling_fuzzer_v10.3.py     실행 파일
 ├── fuzzer_config.json              ← 여기만 편집
 ├── llm_learning.py, riscv_cov.py, nvme_seeds.py   (버전 접미사 없는 공유 자산)
-├── rag/
-│   ├── __init__.py
+├── rag/                            상세: rag/README.md
+│   ├── __init__.py                 비어 있으면 안 된다(namespace package 방지)
 │   ├── vllm_client.py              module_path 가 가리키는 백엔드. 옮기지 말 것
+│   ├── rag_retrieval.py            질의 사다리 + numpy top-k + 기동 전 인덱스 검증
+│   ├── retrieval_policy.py         명령·CDW 필드 → 검색문, 필드 정의 추출, 명령 태그
 │   ├── llm_schema.py               task별 json_schema
-│   ├── rag_retrieval.py            질의 사다리 + numpy top-k
+│   ├── rag_schema.py               SchemaBridge — LLM 제안 검증·보정
+│   ├── rag_bridge_client.py        (구) Samba 브리지 클라이언트 — 되돌리기용
+│   ├── srag_llm_service.py         (구) 온라인 PC 용 서비스 — 퍼징 PC 에선 안 쓴다
 │   └── index/                      ← rag_ingest 가 만든다 (.gitignore)
-├── tools/rag_ingest.py
+├── risc-v/                         BM9K1 SJTAG 인증·SBA·PCSR 도구 (risc-v/README.md)
+├── dump/                           crash 덤프 도구·산출물 (dump/README.md)
+├── tools/
+│   ├── rag_ingest.py               인덱스 생성 (유일한 생성 도구)
+│   ├── rag_smoke_test.py           장치 없이 검색·생성 점검
+│   ├── rag_field_audit.py          스키마 필드 ↔ 인덱스 해석 감사
+│   ├── rag_retrieval_eval.py       검색 품질 평가(읽기 전용)
+│   ├── split_pdf.py                PDF 100쪽 분할(사내 PDF→JSONL 입력용)
+│   ├── check_bm9k1_setup.py / check_bm9k1_connect.py   BM9K1 준비·연결 점검
+│   └── coverage_growth_plot.py, compare_llm_learning.py …  오프라인 분석
 └── products/<제품>/                커버리지 자산 (사내 관리, 리포에 없음)
 ```
 
@@ -97,6 +112,12 @@ JSONL 한 줄 = `{"doc_id", "title", "content", "permission_groups"}`.
   "pass_system_prompt": true,                // 되돌리려면 false
   "fail_limit": 10,                          // 연속 실패 상한 → RAG 비활성
   "request_interval_sec": 60,
+  "json_retries": 2,                         // JSON 교정 재요청 횟수(같은 시간 예산 안)
+  "log_responses": true,                     // 요청/응답 원본 → output/<버전>/llm/llm_io.jsonl
+  "task_weights": {"new_group_seeds": 1, "sequences": 2, "corpus_eval": 1, "io_patterns": 2},  // §6-6
+  "startup_task": "off",                     // §6-6
+  "schema_max": 16,                          // §6-3
+  "max_seq_len": 24,                         // §6-8
   "vllm": {
     "base_url": "http://192.168.10.1:8000/v1",
     "model": "nemotron-3-super",
@@ -119,7 +140,9 @@ JSONL 한 줄 = `{"doc_id", "title", "content", "permission_groups"}`.
       "embed_model": "bge-m3",
       "embed_model_revision": null,          // ← 채워 두길 권함 (§9)
       "query_max_chars": 8000,
-      "context_max_chars": 60000
+      "command_tag_bonus": 0.1,              // 청크가 요청 명령을 다루면 점수 가산
+      "context_max_chars": 60000,
+      "permission_groups": null              // 청크 접근 그룹 필터
     }
   }
 }
@@ -127,7 +150,7 @@ JSONL 한 줄 = `{"doc_id", "title", "content", "permission_groups"}`.
 
 `--config PATH` 로 다른 파일을 쓸 수 있다. **퍼저가 검색할 때 쓰는 값과 인덱스를 만들 때
 쓰는 값이 같아야 한다** — 다르면 벡터 공간이 달라져 조용히 엉뚱한 문서가 뽑힌다. 그래서
-`rag_ingest` 도 같은 설정을 읽는다.
+`rag_ingest` 도 같은 설정을 읽는다. `vllm` 절의 전체 키 설명은 `rag/README.md` §6.
 
 ---
 
@@ -201,10 +224,16 @@ sudo 불필요하다(NVMe·JTAG 를 안 건드린다). root 로 돌리면 인덱
 rag/index/
 ├── current                        현재 버전 이름만 담은 포인터
 └── v20260916_xxxxxx/
-    ├── manifest.json              소스 sha256·모델·revision·차원·정규화·분할 설정
-    ├── chunks.jsonl               doc_id/title/content/permission_groups/source_file
+    ├── manifest.json              소스 sha256·모델·revision·차원·정규화·분할 설정·
+    │                              field_definitions·metadata_extraction
+    ├── chunks.jsonl               doc_id/title/content/permission_groups/source_file/covers_commands
     └── vectors.f16.npy            float16, L2 정규화
 ```
+
+`field_definitions` 는 스펙의 `Figure N: … Command Dword M` 표에서 뽑은 필드 약칭↔전체명이고,
+`covers_commands` 는 청크가 다루는 명령 태그다. 검색이 이 둘로 질의를 확장하고 가산점을 준다
+(`rag/README.md` §4). 이 메타데이터가 없는 구형 인덱스는 로드 때 한 번 추출하므로 재색인이
+필요 없다.
 
 새 버전을 완성·검증한 뒤 **포인터만 원자적으로 교체**한다. 이전 버전은 지우지 않는다 —
 실행 중 캠페인이 쓰고 있을 수 있다. 캠페인은 시작 시점에 해석한 버전을 끝까지 쓰므로,
@@ -244,12 +273,17 @@ sudo no_proxy=192.168.10.1 http_proxy= https_proxy= \
 실행 디렉터리는 상관없다(`sys.path` 에 스크립트 디렉터리를 넣는다).
 `--no-rag` 면 LLM 경로 없이 blind/mutation 퍼징만 한다.
 
+`--rag` + `rag.vllm_client` + `retrieval.enabled=true` 이면 **장치를 건드리기 전에** 인덱스를
+열어 모델·revision 을 대조한다. 틀리면 `RAG 시작 전 검증 실패 — 퍼저를 시작하지 않습니다` 로
+멈춘다 — 설정 불일치를 검색 없는 생성으로 조용히 넘기지 않는다.
+
 > ⚠ **`sudo` 는 기본이 `env_reset` 이라 셸의 `no_proxy` 를 버린다.** 프록시가 잡힌
 > 환경에서는 위처럼 명령줄에 함께 넘기지 않으면 LLM 호출이 프록시로 새어 나간다.
 
 ### 읽어야 할 로그
 
 ```
+[LLM/rag] 시작 전 인덱스 검증 통과: v20260916_xxxxxx                        ← P2 켰을 때만
 [LLM] 활성 — rag.vllm_client.generate_rag_response(system, user, meta) (interval=60s, ...)
 [LLM/rag] 인덱스 v20260916_xxxxxx — 청크 968개, 1024차원, 모델 bge-m3     ← P2 켰을 때만
 [LLM/funnel] 요청=270 → 통신ok=270 → JSONok=266 | 정상0건=61 연속실패=0/10
@@ -623,10 +657,6 @@ Actual NSID distribution (1,303종): nsid=1:120394회, nsid=0:512회, … , …�
 를 내리는 쪽이 의도가 분명하다 — `min_reward_samples` 는 **초반 표본 부족**을 다루는 값이지
 task 비중을 정하는 값이 아니다.
 
-`new_group_seeds` 를 더 줄이고 싶으면 값을 올리기보다 `rag.task_weights.new_group_seeds`
-를 내리는 쪽이 의도가 분명하다 — `min_reward_samples` 는 **초반 표본 부족**을 다루는 값이지
-task 비중을 정하는 값이 아니다.
-
 ### 원인 ③ — 회전판이 고른 칸을 버리면서 순번만 소비 (io_patterns 기아의 진짜 원인)
 
 ①②를 고친 뒤에도 `io_patterns` 가 9건 동안 **한 번도** 안 나왔다. 남은 원인은 3단계와
@@ -937,21 +967,32 @@ Last burst: pattern=hot_cold lba_span=4096 ... -> new_cov=8 over 1000 cmds, ... 
 
 ## 8. 검증 현황 — 무엇을 믿어도 되나
 
-### 시험으로 덮인 것 (385개, 전부 통과)
+### 시험으로 덮인 것 (358개, 전부 통과)
 
-`tests/test_v10_3_backend.py` 90개가 **가짜 HTTP 서버로 DGX 없이** 돈다.
-잘못되면 *인덱스가 조용히 망가지는* 것들이 여기 있다.
+v10.3 파일 기준이다(v11 작업분 63개는 별도). 전부 **장치·DGX 없이** 돈다.
+
+| 영역 | 파일 (건수) |
+|---|---|
+| LLM 백엔드·ingest | `test_v10_3_backend.py` (104) — 가짜 HTTP 서버 |
+| 검색 | `test_rag_hybrid.py` (7) · `test_rag_field_resolution.py` (6) · `test_rag_metadata.py` (5) · `test_rag_preflight.py` (3) · `test_rag_retrieval_eval.py` (4) · `test_rag_smoke.py` (4) |
+| LLM 호출·로그 | `test_llm_thinking.py` (3) · `test_llm_logging.py` (1) |
+| task 선택 | `test_v10_3_task_selection.py` (35) — §6-6 |
+| 명령 차단·프롬프트 | `test_v10_3_cmd_block.py` (15) · `test_v10_3_prompt_targets.py` (7) · `test_v10_3_prompt_size.py` (19) — §6-3·§6-7 |
+| io_patterns 성과표 | `test_v10_3_io_table.py` (8) — §6-9 |
+| crash 덤프 수집 | `test_v10_3_dump_collect.py` (16) — §6-10 |
+| 샘플러·프로브 | `test_v10_3_sampler_diag.py` (17) · `test_v10_3_probe_recovery.py` (12) · `test_v10_1_sampler_recovery.py` (6) · `test_v10_2_pcsr_response.py` (9) — §6-1·§6-2 |
+| 기타 | `test_v10_3_blas_threads.py` (8) · `test_v10_3_summary_size.py` (8) · `test_v10_2_*`(learning 31 · hardening 13 · timeout 8 · freeze 5 · chart 2 · commit 2) |
+
+`test_v10_3_backend.py` 에는 잘못되면 *인덱스가 조용히 망가지는* 것들이 모여 있다.
 
 - 본문↔벡터 1:1 (상한 초과 청크를 잘라내지 않고 쪼개서 양쪽 다 임베딩)
 - 벡터 재사용 키 = (소스, doc_id, **본문 sha256**) + 모델 + revision
 - 게시 전 검증, 포인터 원자 교체, 사용 중 버전 미삭제, 단일 writer 락
 - 스키마↔파서 대조(AST), 실패 분류, 진단 귀속, 시간 예산
 - 입력 해석(글롭·디렉터리), 소스 식별, UTF-8 BOM
-- LLM task 선택 — 회전판 순번 소비 조건, cold start, 기동 고정 (`test_v10_3_task_selection.py` 35)
-- 명령 차단 — 실제 `_send_nvme_command` 로 값/마스크/scope (`test_v10_3_cmd_block.py` 15)
-- 프롬프트 후보 필터 — 가드와 판정이 어긋나지 않는지 (`test_v10_3_prompt_targets.py` 7)
 
-고친 것은 **되돌리면 해당 시험이 깨지는 것까지** 확인했다(주입 시험 21건).
+장치 경로(샘플러 클래스·`_send_nvme_command`)는 `tests/fixtures/v10_2_device_ast.json` 의
+AST 해시로 동결돼 있다. 고친 것은 **되돌리면 해당 시험이 깨지는 것까지** 확인했다.
 
 ### 아직 검증 안 된 것
 
@@ -1022,6 +1063,7 @@ P1↔P2 비교는 **독립 실행들의 분포**로 본다. 한 번의 실행에
 - **v10.1 Spec outcome 분모** — 설계 완료·구현 0%. `V10_1_SPEC_OUTCOME_DENOMINATOR.md`.
   제품 비종속이라 적용 범위가 넓다.
 - **BM9K1 실기 확인** — 코드 완료, 실측 미완. `SESSION_HANDOFF_v10.0_overlay.md` §4/§9.
+  JTAG 을 꽂은 채 POR 하면 ROM 부팅으로 빠지던 하드웨어 문제는 2026-09-28 기준 해결됨.
   커버리지 자산은 사내 관리(`BM9K1_ASSETS.md` 규격, `tools/check_bm9k1_setup.py` 로 검증).
 - `mutate_sequence()`(시퀀스 레벨 삽입/삭제/교환), `ScenarioSeed`, `--unsafe-cmds`.
 
@@ -1042,5 +1084,5 @@ sudo no_proxy=192.168.10.1 http_proxy= https_proxy= \
   --product BM9K1 --nvme /dev/nvme0 --namespace 1 --rag
 
 # 시험
-python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 194 tests
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 358 tests (v11 파일이 있으면 +63)
 ```

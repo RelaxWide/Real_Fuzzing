@@ -1,201 +1,224 @@
-# Ghidra headless를 이용해서 ELF 파일을 이용해서 코드 커버리지 정보 추출 (코드 오버레이 포함)
-## 사용법
-overlay_map의 {label} 부분은 자동적으로 각 코어별로 교체되니 안 건드려도 됨. <PC_DIR>은 없어도 됨
-.sh의 인자는 다음과 같은 순서 <ELF_DIR> all <OUTDIR> <PC_DIR>
+# risc-v/ — BM9K1(SiFive SF-E76) 디버그 연결 · SJTAG 인증 · PCSR 도구
 
-아래와 같이 실행하면 현재 폴더에 코어별 Basic_Block, Functions, FileMap, CallGraph, Symbols 정보가 전부 추출되어 생성된다
-MAXMEM=16G OVL_MAP="/home/ssd/pc_sample/products/BM9K1/FW_{label}Core_overlay_map.json" ./run_ghidra_export.sh /home/ssd/pc_sample/products/BM9K1 all ./
+BM9K1 컨트롤러(SiFive E76, 4코어: HCORE / CMCore / Fcore / QCore)에 **cJTAG + Secure
+JTAG 인증**으로 들어가 **코어를 멈추지 않고 PC 를 샘플링**하기 위한 저수준 모듈과 도구다.
+퍼저(`../pc_sampling_fuzzer_v10.3.py` 의 `RiscvPcsrSampler`)가 이 폴더를 import 해서 쓴다.
 
-
-## 0. 최신 상태 (2026-09) — 방향이 PCSR 폴링으로 바뀜 ★
-
-아래 §1 이후는 **2026-08 시점의 N-Trace 중심 기록**이다. 그 뒤 실측으로 방향이 바뀌었다:
-
-- **per-core PC 샘플 레지스터 발견**: `TE + 0x1000×core + 0x17C`, **bit0 = valid**,
-  PC = `value & ~1`. 4코어(HCORE/CMCore/Fcore/QCore) 모두 ELF 와 **offset=0, 100% 매칭**.
-  → **비침습 PC 폴링이 가능**하다. §1 의 "폴링할 PC 소스가 없다"는 결론은 **반증됨**.
-- **동작하는 폴링 형태는 하나뿐**(I/O 부하 중 검증): SBA FIFO 모드 **셋업 1회 + DRW 반복**.
-  루프에 주기적 sbcs 확인 / clear_sticky / interval 지연을 넣으면 **실패율 폭증**.
-  → `sba_pin()` / `sba_read_pinned()`(raw fast-path) / `sba_unpin()` 로 고정.
-- **세션 붕괴**: 3만~11만 샘플 지점에서 전 코어가 무효가 되고 스스로 회복하지 않음.
-  `close()+open()+prepare_session` 전체 재생성만 회복 → `reopen_session()`.
-  (cJTAG 재초기화·prepare_session 단독·clear_sticky 로는 회복 안 됨)
-- 테스트: `test_pcsr_fastpath.py`(14개) — 핫루프 순수성·셋업 fail-closed·재생성 계약.
-
-**전체 설계는 `../docs/V10_BM9K1_PLAN.md`** 를 볼 것. N-Trace 경로(`TRACE_COVERAGE_PLAN.md`)는
-기술 자료로만 유효하다.
+작성 기준 2026-09-28. 전체 설계는 [`../docs/V10_BM9K1_PLAN.md`](../docs/V10_BM9K1_PLAN.md),
+실행 준비 자산 규격은 [`../docs/BM9K1_ASSETS.md`](../docs/BM9K1_ASSETS.md).
 
 ---
 
-## 1. 현재 상태 (2026-08)
+## 1. 한눈에
 
-### ✅ 완료 — secure JTAG 해제 → 디버그 → 트레이스 캡처
-
-전 구간 실기 검증됨:
 ```
-cJTAG warmup → 디버그 전원 → SJTAG PKC 인증(AUTH_PASS) → DM 활성(dmactive=1)
-→ hart halt → misa=0x40901105 식별(progbuf) → JLinkExe 'RISC-V identified'
-→ N-Trace 인코더 동작 확인 → 온칩 ETB 버퍼를 SBA 로 직접 덤프(trace.bin)
+J-Link ──cJTAG──► ARM DP ──► APB-AP ──► SJTAG 블록 (PKC 인증 → AUTH_PASS)
+                               └──► RISC-V DM(DMI) ──► SBA(System Bus Access)
+                                                         └──► 코어별 PC 샘플 레지스터(PCSR 등가) 폴링
 ```
-- **원스텝 실행**: `sudo ./run_debug.sh` → 인증→JLinkScript생성→JLinkExe autoconnect.
-- **트레이스 하드웨어 동작 확정**: TECTRL enable, ETB write pointer>0(버퍼 데이터 있음),
-  SBA(System Bus Access)로 ETB FIFO 를 읽어 raw Nexus 데이터 추출 성공.
 
-### 🔜 다음 (핸드오버 대상) — 트레이스 디코드 + 커버리지 시각화
+| 단계 | 담당 파일 | 비고 |
+|---|---|---|
+| J-Link 연결·cJTAG 초기화·DAP 전원 | `sfe76_link.py`, `dap_access.py` | checked API 만 노출 |
+| SJTAG 인증(challenge-response) | `sjtag_unlock.py` | **전원 사이클마다 다시** 해야 한다 |
+| SBA 로 PCSR 폴링 | `sjtag_unlock.py` (`sba_pin` / `sba_read_pinned` / `sba_unpin`) | 퍼저 경로 |
+| 세션 붕괴 복구 | `sjtag_unlock.py` (`reopen_session`) | close+open+prepare 전체 재생성만 회복 |
+| 관측 PC ↔ ELF 정합성 게이트 | `elf_map.py` | 임계(기본 95%) 미만이면 심볼화 거부 |
+| 코어별 커버리지 모델 | `../riscv_cov.py` (폴더 밖) | `PcsrSession` 이 이 폴더 모듈을 감싼다 |
 
-`trace.bin` 은 **raw Nexus(BTM/HTM) 메시지**라, 이걸 **실행 PC/커버리지로 디코드**해야 한다.
-- **Ozone 은 막힘**: 이 SiFive sink 는 표준 CoreSight ETB 가 아니라 **FIFO 레지스터 인터페이스**
-  (sink+0x24 Data 레지스터)라 J-Link 의 ETB 리더가 못 읽어 "No Data". Ozone 은 외부 .bin
-  import 도 없음 → **Ozone 경로 불가**.
-- **해야 할 일**: `trace.bin → 실행 PC 집합` 디코더 + `PC → 소스` 매핑 + 시각화.
-  자세한 계획은 §6.
+**방향 전환 기록:** 2026-08 에는 N-Trace(온칩 트레이스 버퍼 덤프 → Nexus 디코드)가 유일한
+비침습 경로라고 결론냈으나, 이후 **코어별 PC 샘플 레지스터가 실측으로 발견**되어 PCSR
+폴링으로 바뀌었다. 4코어 모두 ELF 와 offset=0 으로 100% 매칭된다. N-Trace 관련 기능
+(`--trace-*`)과 `TRACE_COVERAGE_PLAN.md` 는 기술 자료로만 남아 있다.
 
 ---
 
-## 2. 파일 & 역할
+## 2. 주소 단일 출처 원칙
+
+**SoC 실주소·오프셋·상태 비트는 `sjtag_addrs.json` 한 파일에만 있다.** `.py` / `.sh` /
+`.template` / 이 README 는 JSON 필드명만 가리킨다.
+
+- 목적: 사내 LLM 컨텍스트에서 `sjtag_addrs.json` **한 파일만 빼면** 주소가 노출되지 않는다.
+  git 에는 올라가 있다(리포 접근권자에게는 공개 허용).
+- `sjtag_addrs.example.json` 은 같은 구조의 placeholder 판이다. 새 환경은 이걸 복사해 채운다.
+- 생성물 `sf_e76.JLinkScript`(실주소가 채워진 것)는 `.gitignore` 대상이다.
+- `check_bm9k1_setup.py` 는 값을 찍지 않고 '채워짐/비어있음'과 개수만 보고한다 —
+  결과를 그대로 공유해도 안전하다.
+
+### `sjtag_addrs.json` 구조
+
+| 키 | 내용 | 누가 읽나 |
+|---|---|---|
+| `ap_map`, `core_base_main`, `core_base_ncore`, `chain_tap_id`, `apbap3_idr_expect`, `dead_fingerprints` | DAP/AP 토폴로지와 식별값 | `sfe76_link`, `sjtag_unlock` |
+| `sjtag_offsets.*` | SJTAG 레지스터 블록 오프셋(HW 버전·상태·chip ID·request/challenge/response·dbg_control) | `sjtag_unlock` |
+| `sjtag_state_bits.*` | `auth_pass`·`soft_lock`·`request_ready`·`response_ready` 등 상태 비트 | `sjtag_unlock` |
+| `runtime.sjtag_base` / `sign_tool` / `tool_prefix` / `word_order` | 실행 환경값(SJTAG 블록 주소, 서명 도구 경로, `wine`, 워드 순서) | `sjtag_unlock`, `run_debug.sh` |
+| `trace.*` | N-Trace 인코더·funnel·sink 주소, `mem_type` | `--trace-*` 모드(기술 자료용) |
+| `pcsr.offset` / `core_stride` / `valid_bit` | 코어별 PC 샘플 레지스터 위치 규칙 | 퍼저 |
+| `pcsr.cores[]` | `{id, name, elf, load_offset}` — **ELF 경로 포함이라 기밀** | 퍼저(`RiscvPcsrSampler.connect`) |
+
+`pcsr.cores[].elf` 의 상대경로는 퍼저 디렉터리 → `risc-v/` → `products/BM9K1/` → cwd 순으로
+찾는다(`RiscvPcsrSampler._resolve_elf`).
+
+---
+
+## 3. 파일별 설명
+
+### 파이썬 모듈
+
+| 파일 | 줄 | 역할 |
+|---|---|---|
+| `sfe76_link.py` | 678 | **연결 계층의 정식 모듈.** pylink 로 cJTAG 연결, DAP 전원, AP 맵, JSON 로더(`RISCV_ADDRS`, `ADDRS_REAL`). pylink 의 `halt()`/`restart()` 는 실패해도 `False` 만 돌려주므로 **반환값 + 사후 상태를 모두 확인하는 API**(`connect_checked` / `halt_checked` / `read_pc` / `resume_checked`)만 노출한다. raw `jl.halt()` 를 직접 부르지 말 것 — 멈춘 코어를 성공으로 오인하거나 resume 실패로 SSD 가 hang 된다 |
+| `dap_access.py` | 141 | ADIv6 DP/AP 원시 접근(`Dap`, MEM-AP read/write). CoreSight **표준** 인덱스·오프셋만 담고 SoC 주소는 없다 |
+| `sjtag_unlock.py` | 2,095 | **메인 도구.** T32 `clavis.cmm` 의 SJTAG PKC(ECDSA P-521) 인증을 J-Link 로 옮긴 것 + 진단 + RISC-V DM 접근 + SBA + 트레이스 + JLinkScript 생성. 퍼저가 쓰는 SBA 핫루프(`sba_pin` / `sba_read_pinned` / `sba_unpin`)와 세션 재생성(`reopen_session`)도 여기 있다. **기본은 읽기 전용** — `--execute` 를 줘야 인증(쓰기)을 한다 |
+| `elf_map.py` | 323 | ELF 실행영역 정합성 게이트 + 심볼화. `readelf -lW` 로 실행 세그먼트를 읽어 관측 PC 가 그 범위에 드는 비율을 계산하고, 임계 미만이면 **심볼화를 거부**하고 offset 후보를 제안한다. 런타임 주소가 ELF vaddr 과 어긋나도 addr2line 은 그럴듯한 이름을 내므로, 조용히 틀린 커버리지를 막는 장치다 |
+
+### 셸 스크립트
 
 | 파일 | 역할 |
 |---|---|
-| `run_debug.sh` | ★ 원스텝 오케스트레이터: 인증 → JLinkScript 생성 → JLinkExe connect |
-| `sjtag_unlock.py` | 메인 툴 — 인증 + 진단(diag/scan) + DM(dm-*) + 트레이스(trace-*) + gen |
-| `sfe76_link.py` | J-Link(pylink) 연결 계층. cJTAG init, DAP 전원, AP 맵, json 로더 |
-| `dap_access.py` | ADIv6 DP/AP 원시 접근(MEM-AP read/write) — 주소 없는 표준 primitive |
-| `sf_e76.JLinkScript.template` | JLinkScript 템플릿(placeholder). cJTAG init + DM 위치 + N-Trace 설정 |
-| `sjtag_addrs.json` | ★ **모든 실주소**(AP맵/DM/트레이스/오프셋/상태비트/runtime). 코드엔 주소 없음 |
-| `sjtag_addrs.example.json` | 위 템플릿(placeholder 값) |
-| `test_sjtag_unlock.py` | 단위 테스트(HW 불필요). 57개 |
+| `run_debug.sh` | **원스텝 오케스트레이터.** ① `sjtag_unlock.py --execute`(인증) → ② `--gen-jlinkscript`(JLinkScript 생성) → ③ `JLinkExe -autoconnect 1`. 환경변수 `WINEPREFIX`(기본 `/root/.wine32`), `JLINK`(`JLinkExe`/`JLinkGDBServer`), `JLINK_SCRIPT`, `NO_AUTH=1`(이미 인증됨) |
+| `run_sjtag_tracearm.sh` | N-Trace 측정 Phase 0 — 코어 하나의 트레이스 인코더를 무침습(StallEna=0)으로 켜고 버퍼·Wptr 기준선을 기록. sudoers NOPASSWD 용 고정 커맨드 |
+| `run_sjtag_tracedelta.sh` | 위 arm 이후 생성된 트레이스 바이트 수/overflow 를 보고. 명령 1개당 캡처가 가능한지 판정용 |
 
-### 핵심 설계 원칙 — 주소 단일 출처
-- **모든 SoC 실주소는 `sjtag_addrs.json` 에만** 있다. `.py`/`.sh`/`.template`/README 는 placeholder·
-  json 필드명만 참조(주소 리터럴 없음).
-- 목적: **사내 LLM 컨텍스트에서 `sjtag_addrs.json` 한 파일만 제외**하면 주소가 노출 안 됨.
-  git 노출은 허용. (misa=0x40901105 은 주소가 아니라 공개 ISA 값이라 무방)
-- 생성물 `sf_e76.JLinkScript`(실주소 채워짐)는 `.gitignore`.
+### 설정·템플릿·문서
+
+| 파일 | 역할 |
+|---|---|
+| `sjtag_addrs.json` | 실주소 단일 출처(§2) |
+| `sjtag_addrs.example.json` | 같은 구조의 placeholder 판 |
+| `sf_e76.JLinkScript.template` | JLinkScript 템플릿. `SetcJTAGInitMode=1`(SiFive short-form), `CORESIGHT_AddAP`/`SetCoreBaseAddr`(DM 위치), N-Trace 설정 |
+| `sf_e76.JLinkScript` | 템플릿에 실주소를 채운 **생성물**(`.gitignore`). `run_debug.sh` 가 매번 다시 만든다 |
+| `TRACE_COVERAGE_PLAN.md` | N-Trace 커버리지 계획(2026-08). 핵심 결론이 반증돼 **기술 자료로만** 유효 |
 
 ---
 
-## 3. 워크플로우 (실행법)
+## 4. 퍼저가 이 폴더를 쓰는 방식
 
-### 사전 1회 — 로컬 `sjtag_addrs.json` 채우기
-`runtime.sjtag_base`(=SJTAG_BASE), `runtime.sign_tool`(서명 .exe 경로) 를 실기값으로.
-(`tool_prefix`=wine, `word_order`=t32-negative, `ap_map`/`core_base`/`trace` 등은 이미 채워짐.)
+1. `RiscvPcsrSampler.connect()` 가 `riscv_cov.PcsrSession` 을 연다. 세션은 이 폴더의
+   `sjtag_unlock` 을 import 해 **cJTAG warmup → 디버그 전원 → SJTAG 인증 → DM 활성**을 수행한다.
+2. `pcsr.cores` 를 읽어 코어별로 `pin()`(해당 코어 PCSR 에 SBA FIFO 셋업 1회. 코어 전환 시 이전
+   FIFO 를 끄고 busy 완료를 확인 — 실패하면 fail-closed)을 하고, 실패한 코어는 샘플링에서 뺀다.
+3. `elf_map.check_gate()` 로 코어별 관측 PC 의 ELF 정합성을 검사하고, 통과한 코어만
+   `elf_map.Ranges` 로 실행영역 필터를 건다.
+4. 샘플링 워커가 코어별로 `sba_read_pinned()` 버스트를 돌린다(가중치·지터·seed 는
+   `fuzzer_config.json` 의 `riscv.sample_plan`). seed 는 로그에 남는다 — 재현하려면 설정에 넣는다.
+5. 링크가 죽으면 `_reinit_target()`(1회 재수립) → `_reconnect()`(settle + backoff 로 최대 N회).
+   전원 사이클 뒤에는 이 과정에서 **SJTAG 인증을 다시** 한다.
 
-### 원스텝 (인증 → connect)
+**동작이 확인된 폴링 형태는 하나뿐이다** — SBA FIFO 모드 **셋업 1회 + DRW 반복**. 루프 안에
+sbcs 확인·clear_sticky·지연을 넣으면 실패율이 폭증한다(I/O 부하 중 실측).
+**세션 붕괴**(수만~십수만 샘플 지점에서 전 코어 무효, 자가 회복 없음)는 `reopen_session()` 의
+전체 재생성으로만 회복된다.
+
+---
+
+## 5. 실행법
+
+### 사전 1회 — `sjtag_addrs.json` 채우기
+
+`runtime.sjtag_base`, `runtime.sign_tool`(서명 .exe 경로)을 실기값으로 채운다.
+`tool_prefix`(=`wine`)·`word_order`·`ap_map`·`pcsr` 등은 제품 기준값이 이미 들어 있다.
+
+서명 도구는 Windows 실행파일(PE32)이라 root 용 32비트 wine prefix 가 필요하다
+(`wine32 wine64` 설치 + `/root/.wine32`). 공개키는 `-s3 -f5`(정적 34워드), 서명은
+`-s1 -f5 <challenge>`(세션마다 다른 34워드)로 받는다.
+
+### 사람이 디버거로 붙을 때
+
 ```bash
-sudo ./run_debug.sh              # base/tool 은 json runtime, wine env 는 스크립트 기본값
-```
-- **인증은 전원사이클마다** 재수행(challenge-response nonce 설계상 세션/전원 단위).
-- 이미 인증됐으면 `NO_AUTH=1 sudo ./run_debug.sh`.
-- 환경변수: `WINEPREFIX`(기본 /root/.wine32), `JLINK`(기본 JLinkExe; JLinkGDBServer 가능),
-  `NO_AUTH=1`.
-
-### 서명 도구(.exe) — 리눅스에서 wine
-- `-s3 -f5`→공개키 34워드(정적), `-s1 -f5 <challenge>`→서명 34워드(세션마다 다름), 줄당 1 hex.
-- root 용 win32 wineprefix 필요(PE32 라 i386): `wine32 wine64` 설치 + `/root/.wine32`.
-
----
-
-## 4. 툴 레퍼런스 (`sjtag_unlock.py` 모드)
-
-base/tool/word-order 는 안 주면 json `runtime` 에서 읽음. `--power both` 권장.
-
-**인증**
-- `--execute` — 전체 SJTAG PKC 인증(쓰기). 없으면 read-only probe. 성공 후 dm_activate+dm_scan
-  이어서 실행. rc: 0/10/11 = AUTH_PASS 확보(각각 DM검증 수준 차이).
-
-**전원/링크 진단 (read-only)**
-- `--diag` — DAP 전원 req/ack + 6개 AP IDR 스윕 + sticky. (전원 ACK 실패해도 안 죽음)
-- `--read-burst N [--burst-delay MS]` — REQUEST 34워드 × N회 읽어 transport 안정성/드롭 판별.
-- `--scan [--scan-window]` — base 뒤 SJTAG 오프셋 live/dead 분류.
-- `--analyze-pubkey` — (오프라인) 서명도구 -s3 2회로 정적키 동일성 + word-order 후보.
-
-**DM (RISC-V Debug Module)**
-- `--dm-scan` — DM AP 로 dmstatus(version 2/3) 실측.
-- `--dm-activate` — dmcontrol.dmactive=1 로 DM 기동 후 dmstatus 확인.
-- `--dm-halt` — hart halt → dmstatus.allhalted → misa 읽기(abstract 실패 시 **progbuf** 폴백)
-  → resume. J-Link identify 재현.
-
-**트레이스 (N-Trace, SBA 경유)**
-- `--trace-status` — TECTRL/TFCTRL enable + ETB Wptr/Rptr 실측(No Data 원인 판별).
-- `--trace-dump [PATH]` — ETB 온칩버퍼를 SBA FIFO 로 덤프해 raw Nexus .bin 저장
-  (NexusTracedatadump.cmm 이식). 기본 trace.bin.
-
-**생성**
-- `--gen-jlinkscript [PATH]` — (오프라인) json 값으로 `sf_e76.JLinkScript` 생성
-  (SetcJTAGInitMode + CORESIGHT DM + RISCV_Set* 트레이스).
-
----
-
-## 5. 기술 노트 (막혔다 풀린 핵심)
-
-**인증 경로 (clavis.cmm 포팅)**
-- SJTAG 는 APBAP3(json ap_map)에서 PKC/ECDSA P-521 challenge-response. 34워드 공개키 주입 →
-  nonce+chipID challenge 읽기 → 서명 34워드 주입 → grant → AUTH_PASS. word-order 미확정이라
-  `--word-order`(t32-negative 기본).
-
-**콜드 DP warmup** — cJTAG 활성화 직후 DP 미동기라 첫 전원요청 write 가 안 먹음(CTRL/STAT=0).
-  `prepare_session` 이 DP SELECT/DPIDR priming + req 주기적 재기입으로 warmup 내장.
-
-**transport 견고성** — 일시적 STICKYERR(→CSW SUSPECT/TAR 잘림)를 rd/w/poll 에서 clear+재시도로
-  자가복구. (없으면 34워드 주입 중 끊김)
-
-**DM 접근** — DM 은 별도 AP(APBAP1, json core_base_main)의 memory-mapped 레지스터. dmactive=1 로
-  깨워야 dmstatus 유효. **CSR 은 abstract 직접접근 미지원(cmderr=2) → progbuf 경유**(progbufsize=16).
-
-**JLinkExe connect** — `SetcJTAGInitMode=1`(SiFive short-form, 없으면 TAP 스캔 IRPrint=0 →
-  'Failed to identify') + `CORESIGHT_AddAP/SetCoreBaseAddr`(DM 위치) + `-JTAGConf -1,-1`.
-
-**SBA (System Bus Access)** — 트레이스 레지스터(json trace.* 주소)는 **MEM-AP 로 안 닿고 DM 의
-  SBA 로만** 접근(T32 SB:, J-Link MemType=2). `sjtag_unlock.py` 에 sbcs/sbaddress0/sbdata0
-  (DMI 0x38/0x39/0x3C) 경유 read/write + FIFO 버스트 구현(`_sba_*`).
-
-**N-Trace / ETB (ViewNexusTracedump.cmm + NexusTracedatadump.cmm 유래)**
-- SiFive N-Trace(Nexus 5001): TE(인코더, 코어당 하나) → funnel → 온칩 SRAM sink.
-- 주소·mem_type 은 json `trace`(te_base/funnel_base/sram_sink_base/mem_type=2).
-- **ETB 레지스터맵**(sink 기준): `+0x1C`=Wptr(bit0=wrap), `+0x20`=Rptr, `+0x24`=Data(읽으면
-  자동 advance FIFO). TECTRL/TFCTRL `bit1`=enable. 버퍼 32KB(0x7FFF), 순환.
-
----
-
-## 6. 다음 작업 — 트레이스 디코드 → 커버리지 (핸드오버)
-
-**목표**: `trace.bin`(raw Nexus) → 실행 PC 집합 → 소스 매핑 → 시각화. 전부 리눅스/오픈소스.
-
-**파이프라인 (T32/Ozone 불필요)**:
-```
-trace.bin → ① 디코드(Nexus→PC) → ② 매핑(PC→소스, addr2line/DWARF) → ③ 시각화(lcov→genhtml)
+sudo ./run_debug.sh              # 인증 → JLinkScript 생성 → JLinkExe 접속
+NO_AUTH=1 sudo ./run_debug.sh    # 같은 전원 사이클에서 이미 인증했을 때
 ```
 
-**① 디코드 (유일한 실작업)**:
-- RISC-V N-Trace(Nexus 5001) BTM/HTM 파싱. 입력=trace.bin(+ 정확한 PC 복원엔 실행 코드 필요).
-- **권장**: 밑바닥 구현 대신 **레퍼런스 디코더**(`riscv-non-isa/riscv-trace-spec` 의 te_codec)에
-  맞춰 먹이기. `G:\RISC-V` 에 N-Trace Spec PDF 있음.
-- **커버리지 목적이면** 전체 명령어 복원 없이 **브랜치 타깃 주소 집합**만 뽑아도 충분(더 간단).
+### 점검 도구 (폴더 밖 `../tools/`)
 
-**② 매핑**: 트레이스한 코어의 **ELF**(심볼)로 `addr2line -e core.elf 0x<PC>` → 함수/파일:라인.
-  (코어마다 별도 ELF, 총 5개 — 트레이스 대상 코어 것 하나 사용.)
-
-**③ 시각화**: PC 히트 → **lcov `.info`** → `genhtml` → HTML 커버리지 리포트(gcov 스타일).
-
-**fuzzer 통합**: 시각화 불필요 — **실행 블록/PC 집합**을 상위 `PC_Sampling/` 루프에 연결(새 커버리지
-  준 입력을 favored). per-input: 트레이스 arm(TECTRL enable) → 입력 전송 → dump → 디코드 → 집합.
-
-**미구현 참고**:
-- `--trace-dump` 는 **기존 버퍼**를 덤프한다. per-input 캡처하려면 **트레이스 enable(arm)** 이 필요
-  (`--trace-arm` 미구현 — TECTRL/TFCTRL bit1=1 write). 인코더가 disabled 면 새 실행이 안 쌓임.
-- SBA FIFO 버스트(`_sba_fifo`)는 파이프라인(sbreadonaddr+readondata) 기반이라, 대용량에서
-  누락/타이밍 검증 필요할 수 있음(현재 32KB 덤프는 동작 확인).
-
----
-
-## 7. 테스트
 ```bash
-python3 -m unittest -v test_sjtag_unlock.py     # 57개, HW 불필요
+sudo python3 tools/check_bm9k1_setup.py     # 자산·설정 누락 점검(값은 안 찍음)
+sudo python3 tools/check_bm9k1_connect.py   # 퍼저 없이 import → 인증 → SBA → PCSR 단계별 격리 시험
 ```
 
-## 8. 관련 문서 (로컬 `G:\RISC-V`)
-- `SEGGER_UM08001_J-Link_J-Trace.pdf`, `SEGGER_J-Link_command_strings.md`(RISCV_Set*/SBA),
-  `SEGGER_J-Link_cJTAG_specifics.md`(KEEPER), `RISC-V_N-Trace_Specification.pdf`(디코드),
-  `SiFive_Trace_and_Debug.md`, `Arm_CoreSight_SoC-400.md`.
-- T32 원본(사용자 제공): `clavis.cmm`(인증), `ViewNexusTracedump.cmm`(트레이스 컴포넌트 주소),
-  `NexusTracedatadump.cmm`(ETB 덤프 절차).
+### `sjtag_unlock.py` 모드
+
+base/tool/word-order 를 안 주면 JSON `runtime` 에서 읽는다. `--power both` 를 권장한다.
+
+| 분류 | 옵션 | 내용 |
+|---|---|---|
+| 인증 | `--execute` | SJTAG PKC 인증(쓰기). 없으면 read-only probe. 성공하면 DM 활성·스캔까지. rc 0/10/11 = AUTH_PASS(DM 검증 수준 차이) |
+| | `--word-order`, `--tool`, `--tool-prefix`, `--base`, `--timeout` | 인증 파라미터 override |
+| 링크 진단 (읽기) | `--diag` | DAP 전원 req/ack + AP IDR 스윕 + sticky |
+| | `--read-burst N [--burst-delay MS]` | request 워드 반복 읽기로 transport 안정성 판별 |
+| | `--scan [--scan-window --scan-step]` | SJTAG 오프셋 live/dead 분류 |
+| | `--rom-scan` | CoreSight ROM 테이블을 걸어 메모리맵 PC 샘플 컴포넌트(EDPCSR/PMPCSR) 후보 탐색 |
+| | `--analyze-pubkey` | 서명도구 공개키가 정적인지·워드 순서 후보(오프라인) |
+| DM | `--dm-scan [--dm-window]`, `--dm-activate`, `--dm-halt` | dmstatus 실측 / dmactive=1 / halt → misa(abstract 실패 시 progbuf) → resume |
+| PC | `--pc-probe N` | 실행 중 abstract `dpc` 를 N회 읽어 비침습 PC 샘플링 가능 여부 판정(E76 은 cmderr=2 로 불가 — PCSR 폴링으로 간 이유) |
+| 트레이스 | `--trace-status`, `--trace-dump [PATH]`, `--trace-arm`, `--trace-delta`, `--trace-core N` | N-Trace(기술 자료용) |
+| 생성 | `--gen-jlinkscript [PATH]` | JSON 값으로 `sf_e76.JLinkScript` 생성(오프라인) |
+| 연결 | `--power` | DAP 전원 도메인(`both` 권장) |
+| | `--tif-init on/off` | cJTAG TIF 초기화(기본 on). off 는 이미 활성화된 링크 재사용 실험용 |
+| | `--tap-script on/off` | 수동 TAP 체인 선언(기본 off = CMM 방식) |
+
+### `elf_map.py` (단독 실행)
+
+```bash
+python3 elf_map.py --elf core.elf --pcs pcs.txt [--offset 0x0] [--threshold 95.0] [--top 20] [--force]
+```
+
+---
+
+## 6. 기술 노트 — 막혔다 풀린 것
+
+- **콜드 DP warmup**: cJTAG 활성 직후 DP 가 미동기라 첫 전원 요청이 안 먹는다(CTRL/STAT=0).
+  `prepare_session` 이 DP SELECT/DPIDR priming + 요청 재기입으로 warmup 을 내장한다.
+- **transport 견고성**: 일시적 STICKYERR 을 rd/w/poll 에서 clear + 재시도로 자가 복구한다.
+  없으면 34워드 주입 중 끊긴다.
+- **DM 접근**: DM 은 별도 AP 의 memory-mapped 레지스터. `dmactive=1` 로 깨워야 dmstatus 가
+  유효하다. CSR 은 abstract 직접 접근이 안 돼(cmderr=2) **progbuf 경유**로 읽는다.
+- **JLinkExe 접속**: `SetcJTAGInitMode=1` 이 없으면 TAP 스캔이 실패해 'Failed to identify'.
+- **SBA**: 트레이스·PCSR 레지스터는 MEM-AP 로 안 닿고 **DM 의 SBA 로만** 접근된다
+  (T32 `SB:`, J-Link MemType=2).
+- **인증 수명**: challenge-response nonce 가 세션/전원 단위라 **전원 사이클마다 재인증**.
+  퍼저의 `_reconnect` 가 전원 이벤트 뒤 이를 수행한다.
+- **POR ↔ JTAG 커넥터**: JTAG 을 꽂은 채 POR 하면 ROM 부팅으로 빠지던 하드웨어 문제
+  (커넥터 GND 핀이 부팅 스트랩 핀을 접지)는 2026-09-28 기준 **해결됨**. 재발하면 하드웨어부터 본다.
+
+---
+
+## 7. 커버리지 자산 (Ghidra 산출물)
+
+`../riscv_cov.py` 가 코어별로 다음을 읽는다(위치는 `products/BM9K1/`, 사내 관리 — 리포에 없음).
+
+```
+basic_blocks_core<X>.txt   0xSTART 0xEND        (END = 마지막 바이트 + 1)
+functions_core<X>.txt      0xENTRY <size> <name>
+callgraph_core<X>.txt      0xCALLER 0xCALLEE
+symbols.json               ELF 해시·exec 범위·개수(자가 검증)
+```
+
+생성은 Ghidra headless 로 `../tools/ghidra_export.py`(Jython 스크립트)를 코어별 ELF 에
+돌린다. 코드 오버레이가 있는 코어는 `FW_{label}Core_overlay_map.json` 을 함께 준다
+(`{label}` 은 코어 이름으로 자동 치환). 과거 README 에 있던 래퍼 `run_ghidra_export.sh` 는
+리포에 없다 — 사내 호스트에만 있다.
+
+---
+
+## 8. 테스트
+
+이 폴더의 단위 테스트(`test_sjtag_unlock.py`, `test_pcsr_fastpath.py`, `test_elf_map.py`)는
+커밋 `f532202`(v10.0 정리)에서 제거됐다. 현재 이 경로를 덮는 시험은 퍼저 쪽에 있다.
+
+```bash
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_v10_2_pcsr_response.py'
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_v10_1_sampler_recovery.py'
+```
+
+샘플러 클래스(`RiscvPcsrSampler` 등)는 `tests/fixtures/v10_2_device_ast.json` 의 AST 해시로
+동결돼 있다 — 의도한 변경이 아니면 해시가 달라지는 순간 시험이 깨진다.
+
+## 9. 관련 자료 (로컬 `G:\RISC-V`)
+
+- SEGGER: `UM08001_J-Link_J-Trace.pdf`, `J-Link_command_strings.md`(RISCV_Set*/SBA),
+  `J-Link_cJTAG_specifics.md`
+- `RISC-V_N-Trace_Specification.pdf`, `SiFive_Trace_and_Debug.md`, `Arm_CoreSight_SoC-400.md`
+- T32 원본(사용자 제공): `clavis.cmm`(인증), `ViewNexusTracedump.cmm`, `NexusTracedatadump.cmm`

@@ -3,24 +3,29 @@
 v10.3 은 v10.2 의 SSD FW 퍼징 기능을 그대로 두고, **LLM 백엔드를 사내 2노드 Samba
 브리지에서 로컬 vLLM 으로 옮기는** 버전이다.
 
-계획과 결정 근거는 [V10_3_LLM_BACKEND_PLAN.md](V10_3_LLM_BACKEND_PLAN.md) 를 따른다.
+계획과 결정 근거는 [V10_3_LLM_BACKEND_PLAN.md](V10_3_LLM_BACKEND_PLAN.md), 운용 절차는
+[RUNBOOK_v10.3.md](RUNBOOK_v10.3.md), 패키지 상세는 [`../rag/README.md`](../rag/README.md)
+와 [`../risc-v/README.md`](../risc-v/README.md) 를 본다.
+
+작성 기준 2026-09-28. 시험 358개 통과(v11 작업분 제외).
 
 ## 진행 상태
 
 | 단계 | 내용 | 상태 |
 |---|---|---|
 | **P0** | 버전 생성 | **완료** |
-| **P1** | vLLM 생성 교체 | **완료** (실기 미검증) |
-| **P2** | 로컬 RAG | **구현 완료** — 인덱스 생성 필요 |
-| P3 | 전환·측정 | 계측만 완료 |
+| **P1** | vLLM 생성 교체 | **완료** (실서버 구조화 출력 연기 시험 미실시) |
+| **P2** | 로컬 RAG | **완료** — 인덱스 968청크 구축(2026-09-16), 필드 확장·명령 태그 가산점·기동 전 검증 추가 |
+| P3 | 전환·측정 | 계측 완료 · **P1 기준선 측정 미착수** |
 
-실기(실제 SSD·JTAG), DGX vLLM 서버, 추출된 JSONL 품질은 아직 검증하지 않았다.
+P0~P2 이후 운용하며 고친 것들은 아래 [§P0~P2 이후 추가·수정](#p0p2-이후-추가수정) 에 모았다.
+실기(실제 SSD·JTAG)에서의 LLM 기여 측정, 백엔드 장애 시 퍼징 지속은 아직 검증하지 않았다.
 
 ## 지금 상태로 무엇이 되나
 
 `fuzzer_config.json` 의 `rag.module_path` 가 **`rag.vllm_client`** 를 가리킨다.
 `rag.vllm.base_url` 의 서버만 뜨면 LLM 경로가 동작한다. 검색은 기본 꺼짐
-(`rag.vllm.retrieval.enabled=false`) — P2 인덱스를 만든 뒤 켠다.
+(`rag.vllm.retrieval.enabled=false`) — 인덱스는 이미 있으므로 P1 기준선을 잰 뒤 켠다.
 
 되돌리기: `module_path` → `rag.rag_bridge_client`, `pass_system_prompt` → `false`.
 
@@ -59,10 +64,10 @@ sudo python3 PC_Sampling/pc_sampling_fuzzer_v10.3.py \
   --product BM9K1 --nvme /dev/nvme0 --namespace 1 --rag
 ```
 
-## 검증 (P0)
+## 검증 (P0 당시)
 
 ```bash
-python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 92 tests, OK
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 당시 92 tests, 현재 358
 python3 PC_Sampling/pc_sampling_fuzzer_v10.3.py --help
 ```
 
@@ -76,13 +81,15 @@ AST 보호가 실제로 v10.3 을 검사하는지는 **주입 시험으로 확�
 
 ```
 generate_rag_response(system, user, meta) -> {"raw": ..., "diagnostics": {...}}
-  meta = {task, req_id, rag_query, config(실제 로딩된 것), product}
+  meta = {task, req_id, config(실제 로딩된 것), product, budget_started,
+          rag_query, rag_query_commands, rag_query_schemas, rag_query_version}
 ```
 
 | 파일 | 역할 |
 |---|---|
 | `rag/vllm_client.py` | urllib 만 쓰는 OpenAI 호환 호출. 시간 예산·응답 크기 상한·HTTP 오류 본문 보존 |
 | `rag/llm_schema.py` | task별 `json_schema`. 최상위 키를 task 마다 `required` 로 둬 `{}` 를 막는다 |
+| `rag/rag_retrieval.py` · `rag/retrieval_policy.py` | 검색(P2) — `rag/README.md` §4 |
 
 **하위호환** — `meta` 없이 부른 v10.2 에는 기존대로 문자열을 주고 실패는 raise 한다.
 `fuzzer_config.json` 이 공유되므로 두 버전이 같은 설정으로 이 백엔드를 쓸 수 있다.
@@ -142,8 +149,13 @@ sequence 만 세면 정상 적용된 corpus_eval·io_patterns 라운드가 전�
 집계돼 P1↔P2 비교 지표가 처음부터 오염된다.
 
 ```
-[LLM/funnel] 요청=12 → 통신ok=12 → JSONok=11 → 항목=64 → 채택=31(시드 24/시퀀스 5/평가 2/워크로드 0) (정상0건=2, 연속실패=0/10)
+[LLM/funnel] 요청=270 → 통신ok=270 → JSONok=266 | 정상0건=61 연속실패=0/10
+[LLM/task] eval 57→2274(39.9/40,캡98%) seed 41→103(2.5/8,캡17%) seq 141→841(6.0/6,캡92%,잘림38) wl 31→31(1.0) | gen버려짐=97
 ```
+
+채택은 합산하지 않고 **task 별 요청 대비**로 본다 — 응답 1건당 상한이 task 마다 5배 넘게
+달라(seeds 8 / seq 6 / eval 40) 합계를 내면 corpus_eval 이 총합을 지배한다. 표기 해설은
+런북 §6.
 
 ## P2 — 로컬 RAG
 
@@ -231,13 +243,25 @@ setdefault 라 교정 호출에서도 덮이지 않는다.
 빌더가 고른 never-sent/low-yield 후보, corpus_eval 이면 표본 명령)을 먼저 쓰고, 없을 때만
 task 무관한 목록으로 채운다. `query_block()` 이 쓰는 키와 같다.
 
+**필드 확장·태그 가산점(추가)** — 퍼저는 대상 명령의 CDW 필드 스키마(`rag_query_schemas`)를
+함께 넘긴다. 인덱스 manifest 에 스펙 표에서 뽑은 필드 정의가 있으면 `retrieval_policy.
+enhanced_query` 가 `"<명령> command Command Dword N <약칭> <전체명> … field encoding"` 으로
+질의를 다시 만든다(전체명은 근거가 하나로 정해질 때만). 점수는 코사인 유사도에
+`command_tag_bonus`(청크의 `covers_commands` 가 요청 명령과 겹칠 때)를 더한다. 구형 인덱스는
+로드 때 한 번 메타데이터를 추출한다.
+
+**기동 전 검증(추가)** — `--rag` + `rag.vllm_client` + `retrieval.enabled` 이면 장치 초기화
+**전에** 인덱스를 열어 모델·revision 을 대조하고, 틀리면 퍼저를 시작하지 않는다
+(`rag_retrieval.preflight`). 설정 불일치를 검색 없는 생성으로 조용히 넘기지 않기 위해서다.
+
 ## 검증 (P1·P2)
 
 ```bash
-python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 182 tests, OK
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 358 tests, OK (P1·P2 당시 182)
 ```
 
-`tests/test_v10_3_backend.py` 90개가 가짜 HTTP 서버로 DGX 없이 돈다. 주요 항목:
+파일별 목록은 런북 §8. `tests/test_v10_3_backend.py` 104개가 가짜 HTTP 서버로 DGX 없이 돈다.
+주요 항목:
 
 - **스키마↔파서 대조**를 AST 로 강제 — 파서가 읽는 키가 스키마에 없으면 실패한다.
   계획 초안이 `data_len` 을 빠뜨렸던 것이 이 시험의 계기이고, 실제로 스키마에서 그
@@ -272,6 +296,30 @@ python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 182 tests, 
   revision 변경 시 재임베딩, doc_id 중복·영벡터 거부, 락, 모델 불일치 인덱스 거부
 
 각 시험은 **고친 코드를 되돌리면 실패하는 것**까지 확인했다(20건 주입 시험).
+
+## P0~P2 이후 추가·수정
+
+운용 중 발견해 고친 것들. 상세·근거·로그는 런북 해당 절에 있다.
+
+| 영역 | 내용 | 런북 |
+|---|---|---|
+| 디버그 프로브 | 복구 사다리 최후 칸에 J-Link USB 강제 복구(`probe_usb_reset`: uhubctl 명시 시 VBUS 차단 → `USBDEVFS_RESET`) | §6-1 |
+| 샘플러 진단 | OpenOCD 출력을 파이프 대신 파일로(64 KiB 파이프 버퍼가 차면 OpenOCD 가 블록되던 결함), 읽기 실패 시 DP CTRL/STAT 기록, 재시작 회차마다 adapter speed 하향, RSS/fd 추세 | §6-2 |
+| 프롬프트 | `schema_max` 48→16, 스키마 공통 필드 용어집화, 숫자 표기 10진 통일(되먹임 경로 포함), `chat_template_kwargs` 전달·검증 | §6-3 |
+| hang | OpenBLAS 스핀 — numpy import 전 BLAS 스레드 1개 고정, 인덱스 float32 변환 1회 캐시 | §6-4 |
+| 종료 요약 | NSID 분포를 횟수 상위만 + 꼬리 요약(`summary_nsid_top`) | §6-5 |
+| LLM task 선택 | 기동 시딩도 회전판 사용, `min_reward_samples`, 회전판 peek/consume 분리(io_patterns 기아의 원인), cold start, `startup_task` | §6-6 |
+| 명령 차단 | `strategy.blocked_cdw_rules`(0xC0 + CDW12=0x2 디버그 포트 영구 폐쇄 차단), 영구 거절 명령을 프롬프트 후보에서 제외, `RC_SKIP` 회계 분리 | §6-7 |
+| 시퀀스 | 프롬프트 "3-6 → 6-10 commands", `max_seq_len` 16→24 | §6-8 |
+| io_patterns | 규칙형 예시·처방형 피드백 제거, 패턴별 실측 성과표(`cov/1k`)와 파라미터 적용 목록(`IO_WL_PARAM_PATTERNS`) | §6-9 |
+| crash 덤프 | 덤프 함수가 전후 스냅샷 차이로 산출물·도구 로그를 `crash_<ts>/` 에 복사, 도구 출력을 텍스트 로그에 복원(앞/뒤 1,000줄) | §6-10 |
+| LLM 시간 예산 | `timeout_sec` 기본 300→400초 | §4 |
+| RAG | 필드 확장 질의, 명령 태그 가산점, 기동 전 인덱스 검증, 요청/응답 원본 `llm/llm_io.jsonl` | 위 P2 절, `rag/README.md` |
+
+**v11 확장점** — `pc_sampling_fuzzer_v11.py` 가 이 파일을 `runpy` 로 실행하며
+`_ENTRY_VERSION` / `_FUZZER_FACTORY` 를 주입해 예외 주입 mixin 을 끼운다. 명령 생성·가드·
+LLM 경로는 이 파일 것을 그대로 쓴다. v11 진입점 전용 hook 은 v11 작업과 함께 들어온다
+(`V11_EXCEPTION_INJECTION_PLAN.md`).
 
 ## 설정·JSONL 인코딩
 
