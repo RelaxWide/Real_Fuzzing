@@ -21,7 +21,8 @@
 - **`ufas_ini`** (`PM9M1_A815.ini`): UFAS 는 `cwd=script_dir` 로 실행되고 `--ini=<값>` 이
   그대로 전달된다. config 값을 `dump/PM9M1_A815.ini` 로 지정해 두었으니 **이 폴더에**
   두면 된다(PM9M1 계열과 BM9H1 이 공유하므로 제품 폴더가 아니라 도구 옆에 둔다).
-- **덤프 산출물**(`*_UFAS_Dump.bin`, J-Link 덤프)은 지금 **스크립트 루트에 쌓인다**.
-  `_find_latest_jlink_dump()` 의 탐색 기준이 `script_dir` 이라 코드 수정이 필요하다.
-  (v10 Phase 1 항목)
+- ~~덤프 산출물이 스크립트 루트에 쌓인다~~ → **해결(v10.3).** 도구는 산출물을 이 폴더에
+  쓰고, 퍼저가 덤프 전후 스냅샷 차이로 새 파일을 `crashes/crash_<ts>/` 에 **복사**한다
+  (원본은 여기 남는다 — 디스크가 차면 주기적으로 비울 것). 도구 stdout 로그도 crash
+  폴더에 쓴다. `_find_latest_jlink_dump()` 도 이 폴더를 본다. 런북 §6-10.
 - `paths.pmu_script`(`pmu_4_1.py`)는 전원 제어 도구라 덤프가 아니어서 옮기지 않았다.

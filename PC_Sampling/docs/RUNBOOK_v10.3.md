@@ -851,6 +851,60 @@ Last burst: pattern=hot_cold lba_span=4096 ... -> new_cov=8 over 1000 cmds, ... 
 시험: `tests/test_v10_3_io_table.py` 8건(파라미터 표 ↔ 실제 생성기 대조는 목록을 틀리게
 주입해 깨지는 것까지 확인).
 
+## 6-10. crash 덤프 수집 — `crash_<ts>/` 에 전부 모은다
+
+예전에는 덤프가 `dump/` 에 생성만 되고 crash 폴더로 오지 않았다.
+
+| 증상 | 원인 |
+|---|---|
+| `[ARTIFACT] 수집 폴더:` 로그만 있고 덤프 파일이 없음 | 수집이 `script_dir` **최상위**의 `*.bin`/`*dump*` 만 봤다. 도구는 `dump/` 에 쓴다 |
+| `UFAS_*.log`/`JLINK_DUMP_*.log` 가 crash 폴더 두 단계 위에 있음 | 도구 출력 로그를 `output_dir` 에 썼다 |
+| 텍스트 로그·터미널에 UFAS/JLink 도구 출력이 없음 | v10.2(`da5104b`) OOM 대응으로 출력을 파일로만 돌리며 주 로그 기록을 뺐다 |
+| FW 행(`[HANG]`)·v11 crash 폴더에 덤프 없음 | 그 경로는 최종 수집을 아예 부르지 않는다 |
+
+지금은 **덤프 함수 자체가** 수집한다(`_run_jlink_dump`/`_run_ufas_dump`/
+`_run_debug_tool_dump` 에 `dest_dir`). 타임아웃·FW 행·v11 세 경로가 모두 같다.
+
+- 덤프 **직전** 스냅샷 → 덤프 **후** 새로 생기거나 바뀐 파일을 `crash_<ts>/` 로 **복사**.
+  파일명·확장자를 추측하지 않는다
+- 탐색 범위: 도구 폴더(`dump/`) 재귀 + `script_dir` 최상위 파일 + `script_dir` 에
+  **덤프 중 새로 생긴 폴더**(cwd 에 폴더를 만들어 쓰는 도구 대비). 기존 하위 폴더
+  (`output/`·`products/` 등)는 안 본다
+- 폴더 구조 보존: `dump/SnapShot/a.bin` → `crash_<ts>/SnapShot/a.bin`
+- 도구 stdout 로그 파일은 crash 폴더에 바로 쓰고, 끝나면 **스트리밍으로 되읽어** 텍스트
+  로그에 INFO 로 남긴다(`[UFAS] | …`, `[JLINK DUMP] | …`). 앞 1,000줄 + 뒤 1,000줄,
+  사이는 생략 줄 수만. 터미널에는 마지막 10줄. RAM 에 전체를 올리지 않는다(OOM 대응 유지)
+- timeout 으로 포기한 덤프도 부분 파일·부분 출력을 남긴다
+- 타임아웃 경로의 최종 수집은 crash 시점 스냅샷과 비교해 래퍼 밖에서 생긴 것(미지원 판정
+  파서 출력 등)도 거둔다. 이미 받은 파일은 크기가 같으면 건너뜀
+- 이름이 겹치는데 내용이 다르면 덮지 않고 `이름_<시각>.확장자`
+
+### 제품별 경로
+
+| 제품 | 덤프 | 도구 | 호출 경로 |
+|---|---|---|---|
+| PM9M1 / PM9M1_LNB / PM9M1_HP / BM9H1 | JLink → UFAS | `dump/run_smi_mem_dump_JLINK_USB.sh`, `dump/ufas` | 타임아웃, FW 행(UFAS 만), v11(UFAS 만) |
+| BM9K1 | UFAS | `dump/unified_pcie_dump_tool` (mode 2) | 타임아웃, FW 행, v11 |
+| P7 / P9 | RDDump | `dump/Debug_Tool_v1.0.0.2` (cwd=`script_dir`) | 타임아웃만 — **FW 행·v11 경로는 RDDump 를 부르지 않는다**(기존 동작, 이번 범위 밖) |
+
+### 전후 위치
+
+| 산출물 | 이전 | 지금 |
+|---|---|---|
+| UFAS `.bin` | 도구가 경로를 지키면 `crash_<ts>/`, 무시하면 `dump/` 에만 | `crash_<ts>/` (원본은 `dump/` 에도) |
+| JLink 덤프 | `dump/` 에만 | `crash_<ts>/` (원본 `dump/`) |
+| RDDump 산출물 | 도구가 쓴 곳에만 | `crash_<ts>/` (`dump/`·`script_dir` 파일·새 폴더) |
+| `UFAS_*.log` / `JLINK_DUMP_*.log` | `output/<버전>/` | `crash_<ts>/` (래퍼 밖 호출이면 종전대로 `output/<버전>/`) |
+| 도구 출력 → 텍스트 로그 | 없음 | INFO 로 앞/뒤 1,000줄 |
+| 도구 출력 → 터미널 | 없음 | 마지막 10줄 |
+| 파서 출력(`g16arEventLog*`) | `dump/DebugPackage/…` 에만 | `crash_<ts>/DebugPackage/…` (타임아웃 경로) |
+
+> 원본은 `dump/` 에 **남는다**(복사). 덤프가 GB 단위면 디스크가 두 배로 든다 — 캠페인
+> 사이에 `dump/` 의 `*.bin` 을 비울 것. 로그 `[ARTIFACT] ... 덤프 복사:` 로 무엇이 왔는지,
+> `새 산출물 없음 (탐색: ...)` 이면 도구가 그 목록 밖에 썼다는 뜻이다.
+
+시험: `tests/test_v10_3_dump_collect.py` 16건(옛 동작으로 되돌리면 수집 7건·로그 4건이 깨짐).
+
 ## 7. 트러블슈팅 — 실제로 걸렸던 것들
 
 증상이 원인을 안 가리키는 것들만 모았다. **위에서부터** 의심한다.
@@ -874,6 +928,7 @@ Last burst: pattern=hot_cold lba_span=4096 ... -> new_cov=8 over 1000 cmds, ... 
 | LLM 이 `Lockdown`/`Sanitize`/`FormatNVM` 만 반복 제안 | 차단된 명령이 `exercised` 가 안 돼 never-sent 에 고정 | §6-7-2 — 이미 후보에서 제외된다. 기동 로그 `[LLM] 영구 거절 명령을 프롬프트 후보에서 제외` 확인 |
 | `io_patterns` 가 한 번도 요청 안 됨 | 회전판이 고른 칸을 `choose` 가 교체하며 순번만 소비 | §6-6 원인 ③. `[LLM] 요청 제출 ... 회전판=` 으로 교체 여부 확인 |
 | io_patterns 가 한 패턴(`overwrite_churn`)만 고름 | 프롬프트 목표·예시·피드백 처방이 전부 그 패턴을 가리킴 | §6-9 — 성과표로 교체됨. `[IO-WL/burst] ... cov=` 로 패턴별 실적 확인 |
+| crash 폴더에 덤프 `.bin` 이 없고 `[ARTIFACT] 수집 폴더` 로그만 있음 | 수집이 `dump/` 를 안 봤다 | §6-10 — 수정됨. `[ARTIFACT] ... 덤프 복사:` 확인 |
 | `JLinkExe` 의 `VTarget = 0.000V` | VTref 배선 또는 프로브 입력 손상 | 커넥터 1번 핀 방향·핀 휨 확인. 프로브 교체 |
 
 오류 번호가 층을 정확히 가리킨다 — **113=거부(REJECT), 111=포트 없음, 110=버려짐(DROP).**

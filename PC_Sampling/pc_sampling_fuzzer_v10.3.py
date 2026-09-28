@@ -14263,15 +14263,221 @@ class _V101Fuzzer:
             log.info(f"[Memory] snapshot 실패: {exc}")
 
     def _spawn_dump_logged(self, cmd, tag, **kwargs):
-        """Keep full dump output on disk, never in communicate()'s RAM buffers."""
-        path = self.output_dir / (tag + '_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.log')
+        """Keep full dump output on disk, never in communicate()'s RAM buffers.
+
+        덤프 래퍼(_run_dump_collected)가 crash 폴더를 정해 두었으면 그 안에 쓴다 —
+        예전에는 항상 output_dir(= crashes/crash_<ts>/ 의 두 단계 위)에 떨어졌다."""
+        _dir = getattr(self, '_dump_log_dir', None) or self.output_dir
+        path = Path(_dir) / (tag + '_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.log')
+        # 래퍼가 끝날 때 이 파일을 텍스트 로그로 되읽는다(_log_dump_output).
+        if not hasattr(self, '_dump_logs'):
+            self._dump_logs = []
+        self._dump_logs.append((path, tag))
         with open(path, 'wb') as stream:
             proc = subprocess.Popen(cmd, stdout=stream, stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL, **kwargs)
         log.warning(f"[{tag}] stdout/stderr → {path} (PID={proc.pid})")
         return proc
 
-    def _run_jlink_dump(self) -> None:
+    # ── 덤프 산출물 수집 ────────────────────────────────────────────────
+    # 덤프 도구(ufas / unified_pcie_dump_tool / run_smi_mem_dump_JLINK_USB.sh / Debug_Tool)는
+    # 산출물을 **자기 폴더(dump/)** 에 쓴다. UFAS 는 출력 경로 인자를 받지만 도구에 따라
+    # 무시하기도 한다. 예전 수집(_collect_crash_artifacts)은 script_dir 최상위만 봐서
+    # dump/ 의 산출물을 하나도 못 찾았고, "[ARTIFACT] 수집 폴더" 로그만 남았다.
+    # → 파일명/확장자를 추측하지 않고, 덤프 **전후 스냅샷 차이**(새로 생기거나 바뀐 파일)를
+    #   crash 폴더로 **복사**한다(원본은 dump/ 에 그대로 둔다).
+    _DUMP_SKIP_DIRS = frozenset({'__pycache__', '.git'})
+
+    def _dump_scan_dirs(self) -> list:
+        """(폴더, 재귀여부). 도구가 있는 폴더는 재귀, script_dir 는 최상위만
+        (script_dir 을 재귀하면 output/·products/ 까지 훑는다)."""
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        tools = [getattr(self.config, 'ufas_binary', None) or UFAS_BINARY,
+                 JLINK_DUMP_SCRIPT, DEBUG_TOOL_BINARY]
+        out, seen = [], set()
+        for d, rec in [(script_dir, False)] + [
+                (os.path.dirname(os.path.join(script_dir, t)), True) for t in tools if t]:
+            d = os.path.abspath(d)
+            if d == script_dir and rec:
+                continue                      # 도구가 루트에 있으면 최상위만(위에서 이미 포함)
+            if d not in seen and os.path.isdir(d):
+                seen.add(d)
+                out.append((d, rec))
+        return out
+
+    def _dump_snapshot(self) -> dict:
+        """{abs path: (mtime_ns, size)}. 실패는 조용히 건너뛴다(수집이 덤프를 막으면 안 됨).
+
+        최상위만 보는 폴더(script_dir)는 하위 폴더도 ('<dir>', 0) 로 기록한다 — 도구가
+        cwd 에 **새 폴더**를 만들어 쓰는 경우(RDDump 등)를 수집 때 알아보기 위해서다."""
+        snap: dict = {}
+        for root, rec in self._dump_scan_dirs():
+            try:
+                if rec:
+                    walker = os.walk(root)
+                else:
+                    files, dirs = [], []
+                    for e in os.scandir(root):
+                        if e.is_dir(follow_symlinks=False):
+                            snap[e.path] = ('<dir>', 0)
+                        elif e.is_file():
+                            files.append(e.name)
+                    walker = [(root, [], files)]
+                for dirpath, dirnames, filenames in walker:
+                    dirnames[:] = [x for x in dirnames if x not in self._DUMP_SKIP_DIRS]
+                    for name in filenames:
+                        path = os.path.join(dirpath, name)
+                        try:
+                            st = os.stat(path)
+                        except OSError:
+                            continue
+                        snap[path] = (st.st_mtime_ns, st.st_size)
+            except OSError as e:
+                log.warning(f"[ARTIFACT] 덤프 폴더 스캔 실패 {root}: {e}")
+        return snap
+
+    def _copy_new_dump_files(self, before: dict, dest: Path, tag: str) -> list:
+        """before 이후 새로 생기거나 바뀐 파일을 dest 로 복사. 복사한 dest 경로 목록 반환.
+
+        폴더 구조는 스캔 루트 기준 상대경로로 **보존**한다(dump/SnapShot/a.bin →
+        crash_<ts>/SnapShot/a.bin). 이름만 남기면 하위 폴더끼리 같은 이름이 부딪힌다."""
+        import shutil
+        dest = Path(dest)
+        dest_abs = os.path.abspath(dest)
+        roots = [d for d, _ in self._dump_scan_dirs()]
+        after = self._dump_snapshot()
+        changed = []
+        for p, sig in after.items():
+            if sig == ('<dir>', 0):
+                if p in before or os.path.basename(p) in self._DUMP_SKIP_DIRS:
+                    continue
+                if os.path.commonpath([p, dest_abs]) == p:
+                    continue                  # crash 폴더를 품은 새 폴더(첫 실행의 output/ 등)
+                for dirpath, dirnames, filenames in os.walk(p):   # 덤프 중 새로 생긴 폴더 통째로
+                    dirnames[:] = [x for x in dirnames if x not in self._DUMP_SKIP_DIRS]
+                    changed += [os.path.join(dirpath, f) for f in filenames]
+            elif before.get(p) != sig:
+                changed.append(p)
+        changed = sorted(p for p in set(changed) if not p.lower().endswith(('.pyc', '.pyo')))
+        copied = []
+        if not changed:
+            log.warning(f"[ARTIFACT] {tag}: 덤프 폴더에 새 산출물 없음 "
+                        f"(탐색: {[_logname(Path(d)) for d in roots]})")
+            return copied
+        for src in changed:
+            root = max((r for r in roots if os.path.commonpath([r, src]) == r),
+                       key=len, default=os.path.dirname(src))
+            dst = dest / os.path.relpath(src, root)
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.exists():
+                    if dst.stat().st_size == os.path.getsize(src):
+                        continue              # 같은 파일을 이미 받음(UFAS 가 dest 에 직접 쓴 경우 등)
+                    dst = dst.with_name(f"{dst.stem}_{datetime.now().strftime('%H%M%S_%f')}{dst.suffix}")
+                shutil.copy2(src, dst)
+                copied.append(dst)
+                log.warning(f"[ARTIFACT] {tag} 덤프 복사: {_logname(Path(src))} → "
+                            f"{_logname(dst)} ({os.path.getsize(dst):,} bytes)")
+            except Exception as e:
+                log.warning(f"[ARTIFACT] {tag} 덤프 복사 실패 {src}: {e}")
+        return copied
+
+    # 도구 출력 → 텍스트 로그. da5104b(v10.2) 가 OOM 대응으로 출력을 파일로만 돌리면서
+    #   "주 로그에 다시 합쳐 넣지 않는다" 로 정해 텍스트 로그에서 사라졌다. 문제는 RAM 누적
+    #   (communicate)이었지 로그 기록이 아니다 → 파일을 **스트리밍으로** 되읽어 INFO 로 남긴다.
+    #   출력이 거대해도 앞/뒤 일부만 남기고(뒤쪽 deque 만 메모리), 전체는 원본 파일에 있다.
+    _DUMP_LOG_HEAD = 1000     # 텍스트 로그에 남길 앞쪽 줄 수
+    _DUMP_LOG_TAIL = 1000     # 뒤쪽 줄 수 (오류는 대개 끝에 있다)
+    _DUMP_LOG_TERM = 10       # 터미널에 보일 마지막 줄 수
+    _DUMP_LOG_PREFIX = {'UFAS': '[UFAS]', 'JLINK_DUMP': '[JLINK DUMP]'}
+
+    def _log_dump_output(self, path, tag: str) -> None:
+        from collections import deque
+        prefix = self._DUMP_LOG_PREFIX.get(tag, f'[{tag}]')
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError as e:
+            log.warning(f"{prefix} 도구 출력 로그 열기 실패 {path}: {e}")
+            return
+        n, tail = 0, deque(maxlen=self._DUMP_LOG_TAIL)
+        log.info(f"{prefix} ---- 도구 출력 ({_logname(Path(path))}) ----")
+        try:
+            for raw in _bounded_output_lines(fd):
+                line = raw.decode(errors='replace').rstrip()
+                n += 1
+                if n <= self._DUMP_LOG_HEAD:
+                    log.info(f"{prefix} | {line}")
+                else:
+                    tail.append(line)
+        except Exception as e:
+            log.warning(f"{prefix} 도구 출력 읽기 오류: {e}")
+        finally:
+            os.close(fd)
+        if n > self._DUMP_LOG_HEAD:
+            skipped = n - self._DUMP_LOG_HEAD - len(tail)
+            if skipped > 0:
+                log.info(f"{prefix} | … {skipped:,}줄 생략 (전체는 {_logname(Path(path))})")
+            for line in tail:
+                log.info(f"{prefix} | {line}")
+        log.info(f"{prefix} ---- 도구 출력 끝 ({n:,}줄) ----")
+        # 터미널: 마지막 몇 줄만(결과·오류 확인용). 앞쪽 head 와 겹칠 수 있어 따로 모은다.
+        last = (list(tail)[-self._DUMP_LOG_TERM:] if tail
+                else self._dump_last_lines(path, self._DUMP_LOG_TERM) if n else [])
+        if last:
+            log.warning(f"{prefix} 도구 출력 마지막 {len(last)}줄 (전체 {n:,}줄 → 텍스트 로그/"
+                        f"{_logname(Path(path))}):")
+            for line in last:
+                if line.strip():
+                    log.warning(f"{prefix}   {line}")
+
+    @staticmethod
+    def _dump_last_lines(path, k: int) -> list:
+        from collections import deque
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return []
+        try:
+            return list(deque((r.decode(errors='replace').rstrip()
+                               for r in _bounded_output_lines(fd)), maxlen=k))
+        finally:
+            os.close(fd)
+
+    def _run_dump_collected(self, tag: str, dest_dir, run) -> None:
+        """덤프 1건 실행 → 도구 출력을 텍스트 로그로, 산출물·도구 로그를 dest_dir(crash_<ts>/)로.
+        dest_dir=None 이면 파일 수집만 생략(로그는 output_dir, 텍스트 로그 기록은 동일)."""
+        if not hasattr(self, '_dump_logs'):
+            self._dump_logs = []
+        n_logs = len(self._dump_logs)
+        before = self._dump_snapshot() if dest_dir is not None else None
+        prev = getattr(self, '_dump_log_dir', None)
+        if dest_dir is not None:
+            try:
+                Path(dest_dir).mkdir(parents=True, exist_ok=True)
+                self._dump_log_dir = Path(dest_dir)
+            except OSError:
+                pass
+        try:
+            return run()
+        finally:
+            self._dump_log_dir = prev
+            for path, ltag in self._dump_logs[n_logs:]:
+                try:
+                    self._log_dump_output(path, ltag)
+                except Exception as e:
+                    log.warning(f"[ARTIFACT] {tag} 도구 출력 기록 예외: {e}")
+            del self._dump_logs[n_logs:]
+            # timeout 으로 포기한 덤프도 부분 파일을 남긴다 — 없는 것보다 낫다.
+            if dest_dir is not None:
+                try:
+                    self._copy_new_dump_files(before, Path(dest_dir), tag)
+                except Exception as e:
+                    log.warning(f"[ARTIFACT] {tag} 덤프 수집 예외: {e}")
+
+    def _run_jlink_dump(self, dest_dir: Optional[Path] = None) -> None:
+        self._run_dump_collected('JLINK', dest_dir, self._run_jlink_dump_body)
+
+    def _run_jlink_dump_body(self) -> None:
         """crash 발생 시 JLink 메모리 덤프를 실행한다.
 
         실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./run_smi_mem_dump_JLINK_USB.sh
@@ -14361,26 +14567,16 @@ class _V101Fuzzer:
 
     def _find_latest_jlink_dump(self, script_dir: str,
                                  after_t: float) -> Optional[str]:
-        """script_dir 안 mtime ≥ (after_t - 5초) 인 .bin 중 가장 최근 1개. 없으면 None.
+        """덤프 폴더들(_dump_scan_dirs) 안 mtime ≥ (after_t - 5초) 인 .bin 중 가장 최근 1개.
+        script_dir 인자는 호환용(스캔 범위에 포함됨). 없으면 None.
         after_t = time.time() 의 Unix epoch (st_mtime 과 동일 도메인).
         .zip / .txt 는 제외 (parser 가 sibling 으로 함께 생성하지만 dump 본체는 .bin).
         """
+        # 도구가 dump/ 에 쓰므로 script_dir 만 보면 못 찾는다 — 덤프 폴더 전체를 본다.
         cand: list = []
-        try:
-            for entry in os.scandir(script_dir):
-                if not entry.is_file():
-                    continue
-                if not entry.name.lower().endswith('.bin'):
-                    continue
-                try:
-                    mt = entry.stat().st_mtime
-                except OSError:
-                    continue
-                if mt >= after_t - 5:
-                    cand.append((mt, entry.path))
-        except OSError as e:
-            log.warning(f"[UnsupChk] script_dir 스캔 실패: {e}")
-            return None
+        for path, (mtime_ns, _size) in self._dump_snapshot().items():
+            if path.lower().endswith('.bin') and mtime_ns / 1e9 >= after_t - 5:
+                cand.append((mtime_ns / 1e9, path))
         if not cand:
             return None
         cand.sort(reverse=True)
@@ -14411,7 +14607,7 @@ class _V101Fuzzer:
             log.warning(f"[UnsupChk] parser 없음 ({parser_sh} / {parser_py}) — 검사 건너뜀")
             return False
 
-        # 1) dump 파일 탐색 (J-Link dump 는 script_dir 에 생성됨)
+        # 1) dump 파일 탐색 (J-Link dump 는 도구 폴더 dump/ 에 생성됨)
         dump_path = self._find_latest_jlink_dump(script_dir, dump_start_t)
         if dump_path is None:
             log.warning("[UnsupChk] J-Link dump 파일 미발견 — 검사 건너뜀")
@@ -14660,6 +14856,9 @@ class _V101Fuzzer:
         return True
 
     def _run_ufas_dump(self, dest_dir: Optional[Path] = None) -> None:
+        self._run_dump_collected('UFAS', dest_dir, lambda: self._run_ufas_dump_body(dest_dir))
+
+    def _run_ufas_dump_body(self, dest_dir: Optional[Path] = None) -> None:
         """crash 발생 시 UFAS 펌웨어 덤프를 실행한다.
 
         실행 파일: paths.ufas_binary(기본 dump/ufas). 제품이 profile 의 ufas_binary 로
@@ -14783,7 +14982,10 @@ class _V101Fuzzer:
         else:
             log.warning(f"[UFAS] 덤프 실패 (rc={rc})")
 
-    def _run_debug_tool_dump(self) -> None:
+    def _run_debug_tool_dump(self, dest_dir: Optional[Path] = None) -> None:
+        self._run_dump_collected('RDDUMP', dest_dir, self._run_debug_tool_dump_body)
+
+    def _run_debug_tool_dump_body(self) -> None:
         """crash 발생 시 P9 Debug_Tool RDDump 를 실행한다 (UFAS 대체).
 
         실행 파일: fuzzer 스크립트와 같은 디렉토리의 ./Debug_Tool_v1.0.0.2
@@ -14950,7 +15152,7 @@ class _V101Fuzzer:
 
         수집 대상:
           - crashes_dir/ 내 crash_{name} 바이너리·JSON·dmesg 파일 (crash_time 이후 생성)
-          - script_dir/ 내 *.bin 및 *dump* 파일 (dump 시작 시각 기준 60초 여유)
+          - 덤프 폴더(dump/ 등, _dump_scan_dirs)에 crash 이후 새로 생긴 파일 전부
           - fuzzer 로그 파일 (self._log_file)
           - 현재 dmesg 스냅샷
         """
@@ -14962,7 +15164,6 @@ class _V101Fuzzer:
         log.warning(f"[ARTIFACT] 수집 폴더: {_logname(dest)}")
 
         crash_epoch = crash_time.timestamp()
-        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
 
         # 1) crashes_dir 내 crash 파일 (crash_time 5초 전부터)
         try:
@@ -14975,21 +15176,14 @@ class _V101Fuzzer:
         except Exception as e:
             log.warning(f"[ARTIFACT] crashes_dir 복사 오류: {e}")
 
-        # 2) script_dir 내 dump 파일 (crash_time 60초 전부터 — dump에 시간 소요)
-        try:
-            for entry in sorted(os.scandir(script_dir), key=lambda e: e.name):
-                if not entry.is_file():
-                    continue
-                name_lower = entry.name.lower()
-                if not (name_lower.endswith('.bin') or 'dump' in name_lower):
-                    continue
-                if entry.stat().st_mtime >= crash_epoch - 60:
-                    dst = dest / entry.name
-                    shutil.copy2(entry.path, dst)
-                    log.warning(f"[ARTIFACT] dump 복사: {entry.name} "
-                                f"({entry.stat().st_size:,} bytes)")
-        except Exception as e:
-            log.warning(f"[ARTIFACT] script_dir 복사 오류: {e}")
+        # 2) 덤프·파서 산출물 — crash 시점 스냅샷 이후 dump/ 등에 새로 생긴 파일 전부.
+        #    (각 덤프 래퍼가 이미 복사했으면 같은 크기라 건너뛴다. 여기서 추가로 잡히는 건
+        #     J-Link 뒤 미지원 판정 파서 출력 등 래퍼 밖에서 생긴 것.) 예전에는 script_dir
+        #    최상위의 *.bin/*dump* 만 봐서 dump/ 산출물을 하나도 못 찾았다.
+        _before = getattr(self, '_crash_dump_before', None)
+        if _before is not None:
+            self._copy_new_dump_files(_before, dest, 'CRASH')
+            self._crash_dump_before = None
 
         # 3) 로그 파일 (flush 후 복사)
         if self._log_file and os.path.isfile(self._log_file):
@@ -15786,6 +15980,11 @@ class _V101Fuzzer:
             self._snapshot_crash_context(_crash_dir, _crash_time)
         except Exception as _snap_exc:
             log.warning(f"[ARTIFACT] dump 전 선저장 예외: {_snap_exc}")
+        # 덤프 폴더 기준 스냅샷 — 최종 수집(3.8)이 덤프·파서 산출물 전체를 이 차이로 거둔다.
+        try:
+            self._crash_dump_before = self._dump_snapshot()
+        except Exception:
+            self._crash_dump_before = None
 
         # 3.6) JLink 사용 전 OpenOCD를 항상 종료 — J-Link USB 점유 해제.
         # dump를 스킵하더라도 후속 JLink PC 모니터링 루프가 J-Link에 접근하므로
@@ -15802,7 +16001,7 @@ class _V101Fuzzer:
         if self.config.enable_jlink_dump:
             log.warning("[TIMEOUT] JLink 메모리 덤프를 실행합니다...")
             try:
-                self._run_jlink_dump()
+                self._run_jlink_dump(dest_dir=_crash_dir)
             except Exception as _jlink_exc:
                 log.warning(f"[JLINK DUMP] 예기치 않은 예외: {_jlink_exc}")
             if self.config.unsupported_skip:
@@ -15871,7 +16070,7 @@ class _V101Fuzzer:
                     log.warning(f"[TIMEOUT] J-Link 해제 예외: {_rel_exc}")
             log.warning("[TIMEOUT] P9 Debug_Tool RDDump 를 실행합니다...")
             try:
-                self._run_debug_tool_dump()
+                self._run_debug_tool_dump(dest_dir=_crash_dir)
             except Exception as _dt_exc:
                 log.warning(f"[DebugTool] _run_debug_tool_dump 예기치 않은 예외: {_dt_exc}")
             log.warning("[DebugTool] _run_debug_tool_dump 반환")
