@@ -4,7 +4,7 @@
 구현 현황 정본은 [pc_sampling_fuzzer_v10.3.md](pc_sampling_fuzzer_v10.3.md) 를 본다.
 이 문서는 **실제로 돌리는 방법**과 **걸렸던 함정**을 모은 것이다.
 
-작성 기준 2026-09-28. v10.3 시험 358개 통과(v11 작업분 제외), 인덱스 968청크 구축 완료.
+작성 기준 2026-09-28. v10.3 시험 377개 통과(v11 작업분 제외), 인덱스 968청크 구축 완료.
 `rag/` 패키지 상세는 [`../rag/README.md`](../rag/README.md), BM9K1 연결 도구는
 [`../risc-v/README.md`](../risc-v/README.md).
 
@@ -935,6 +935,84 @@ Last burst: pattern=hot_cold lba_span=4096 ... -> new_cov=8 over 1000 cmds, ... 
 
 시험: `tests/test_v10_3_dump_collect.py` 16건(옛 동작으로 되돌리면 수집 7건·로그 4건이 깨짐).
 
+## 6-11. LLM 제안이 지시를 안 따를 때 — 4일 평가에서 나온 3건
+
+### 6-11-1. 저수확 명령 목록 → 요청마다 필수 지정
+
+"Under-explored command groups" 가 **서술형 나열**이라, 4일 동안 내용이 갱신돼도 제안 비중이
+바뀌지 않았다. `sequences` 에는 우선순위 정보가 아예 없었다(알파벳순 목록뿐).
+
+지금은 요청마다 **K개를 골라 명령형으로 요구**한다.
+
+```
+MANDATORY for this batch — you MUST include at least one seed for EACH of these 3 commands: ...
+MANDATORY for this batch — for EACH of these 3 commands you MUST emit at least one sequence
+whose FINAL (trigger) command is that command, ...
+```
+
+- 후보 = never-sent → 실행당 신규 커버리지 낮은 순, 상위 `focus_pool`(기본 15)
+- 지정은 **지금까지 덜 지정된 명령부터** 돌아간다. 준수 여부가 아니라 지정 횟수로 돌리므로
+  모델이 끝내 안 따르는 명령이 슬롯을 독점하지 않는다. 요청이 실패하면 같은 명령이 다시 온다
+- 지정 명령은 스키마 섹션과 검색 질의(`rag_query_commands`)에도 우선 실린다
+- 준수 여부를 센다 — **요청한 task 의 출력만**: new_group_seeds 는 seeds 의 명령 이름,
+  sequences 는 각 시퀀스의 **마지막(trigger) 명령**. sequences 요청에 단일 seed 로 답하면 0 이다
+
+```
+[LLM/task] seed 41→103(2.5/8,캡17%,지정98/123) seq 30→120(4.0/6,캡50%,지정61/90) ...
+[LLM/focus] task=sequences 지정=['GetLogPage', 'Read', 'Write'] 반영=['GetLogPage']   ← 파일 로그
+```
+
+`지정 hit/req` 가 낮으면 지시가 안 먹히는 것이다 — 4일을 돌리지 않아도 몇 요청 만에 보인다.
+
+```jsonc
+"rag": { "focus_commands": 3,   // 요청당 필수 명령 수(0=끔). seeds/seq 상한보다 크면 상한으로
+         "focus_pool": 15 }     // 후보 범위
+```
+
+설정 파일에 키가 없으면 위 기본값이다.
+
+### 6-11-2. JSON 중복 키 → 모델이 쓴 값 중 검증 통과값
+
+모델이 가끔 `{"command": "GetFeatures", "cdw10": 128, "cdw10": 0}` 처럼 같은 키를 두 번 쓴다.
+`json.loads` 는 **마지막 값**을 조용히 받는다 → FID=0(예약)이 검증에서 걸리고, 시퀀스는
+all-or-nothing 이라 **멀쩡한 멤버 7~8개가 함께 버려졌다.**
+
+- 파싱할 때 중복 키를 감지한다. 값이 같으면 무시, 다르면 **첫 값**을 두고 뒤 값들을 후보로
+  보관한다(`_dup_alternatives` — 학습 모듈의 재직렬화에도 살아남게 일반 JSON 키로)
+- 검증이 **바꾸는 필드 수가 적은 조합부터**(모델이 먼저 쓴 값 전부 → 한 필드만 교체 → …)
+  시도해 통과하는 첫 조합을 쓴다. 필드는 cdw 번호순으로 고정해 **JSON 필드 순서가 결과를
+  바꾸지 않는다.** 조합은 최대 64개까지 본다. **모델이 쓴 값 중에서만** 고르고 지어내지 않는다
+- 탈락 사유는 둘로 나뉜다 — `no candidate valid`(전부 검사했고 전부 실패) /
+  `candidate search limit reached: N of M combinations tried`(한도에 걸림)
+- 해소된 건은 보정 노트로 다음 요청에 되먹인다(`duplicate key cdw10: used 128 of [0, 128]
+  — write each key once`). 프롬프트에도 "Write each JSON key at most once per object" 를 넣었다
+- **all-or-nothing 은 유지한다** — 멤버를 빼고 체인을 만들면 setup 순서가 깨진다(§6-7-2)
+
+### 6-11-3. io_patterns 무효 패턴명 → 되먹임
+
+모델이 `rand_write` 대신 `random_write` 를 써서 제안이 조용히 드롭됐다.
+
+- 무효명은 다음 io_patterns 프롬프트에 **한 번** 알린다: `Your previous io_workload used
+  pattern "random_write", which is NOT a valid name, so it was DISCARDED.`
+- 매 요청 "pattern 은 이 목록에서 글자 그대로 복사" + 정확한 목록을 싣는다
+- `[LLM/task]` 의 `wl …,무효패턴N` 으로 센다
+- **별칭 추정(random_write→rand_write)은 하지 않는다.** 규칙이 늘면 추측이 섞인다
+
+### 먼저 확인할 것 — 구조화 출력이 실제로 강제되는가
+
+`structured_output=true` 면 `pattern` 은 스키마 enum 이고 16진 리터럴은 JSON 문법이 아니라,
+서버가 스키마를 강제한다면 **6-11-2·6-11-3 은 애초에 나올 수 없다.** 해당 응답의
+`llm/llm_io.jsonl` → `diagnostics.schema_enforced` 를 볼 것.
+
+| 값 | 뜻 | 조치 |
+|---|---|---|
+| `true` 인데 위반 | 서버가 스키마를 받고도 강제하지 않는다 | vLLM 로그·structured output 백엔드·reasoning parser 설정 확인. 스키마에 기대는 방어 전체가 무력 |
+| `false` | 스키마 없이 보냈다 | `rag.vllm.structured_output`, 스키마 생성 실패 경고(`[LLM/vllm] 스키마 생성 실패`) 확인 |
+
+위 세 수정은 강제가 안 될 때의 **안전망**이다. 원인이 서버면 서버를 고치는 게 먼저다.
+
+시험: `tests/test_v10_3_llm_prompt_fixes.py` 19건(예전 동작으로 되돌리면 실패함을 확인).
+
 ## 7. 트러블슈팅 — 실제로 걸렸던 것들
 
 증상이 원인을 안 가리키는 것들만 모았다. **위에서부터** 의심한다.
@@ -959,6 +1037,9 @@ Last burst: pattern=hot_cold lba_span=4096 ... -> new_cov=8 over 1000 cmds, ... 
 | `io_patterns` 가 한 번도 요청 안 됨 | 회전판이 고른 칸을 `choose` 가 교체하며 순번만 소비 | §6-6 원인 ③. `[LLM] 요청 제출 ... 회전판=` 으로 교체 여부 확인 |
 | io_patterns 가 한 패턴(`overwrite_churn`)만 고름 | 프롬프트 목표·예시·피드백 처방이 전부 그 패턴을 가리킴 | §6-9 — 성과표로 교체됨. `[IO-WL/burst] ... cov=` 로 패턴별 실적 확인 |
 | crash 폴더에 덤프 `.bin` 이 없고 `[ARTIFACT] 수집 폴더` 로그만 있음 | 수집이 `dump/` 를 안 봤다 | §6-10 — 수정됨. `[ARTIFACT] ... 덤프 복사:` 확인 |
+| LLM 제안 비중이 저수확 목록 갱신에도 안 바뀜 | 목록이 서술형 나열 | §6-11-1 — 필수 지정. `[LLM/task] …지정hit/req` 확인 |
+| 멀쩡한 시퀀스가 `schema invalid or reserved value` 로 통째 폐기 | JSON 중복 키의 마지막 값(예약값) 채택 | §6-11-2 — 수정됨. 먼저 `schema_enforced` 확인 |
+| io_patterns 제안이 조용히 사라짐 | 무효 패턴명(동의어) | §6-11-3 — 되먹임. `무효패턴N` 확인 |
 | `JLinkExe` 의 `VTarget = 0.000V` | VTref 배선 또는 프로브 입력 손상 | 커넥터 1번 핀 방향·핀 휨 확인. 프로브 교체 |
 
 오류 번호가 층을 정확히 가리킨다 — **113=거부(REJECT), 111=포트 없음, 110=버려짐(DROP).**
@@ -967,7 +1048,7 @@ Last burst: pattern=hot_cold lba_span=4096 ... -> new_cov=8 over 1000 cmds, ... 
 
 ## 8. 검증 현황 — 무엇을 믿어도 되나
 
-### 시험으로 덮인 것 (358개, 전부 통과)
+### 시험으로 덮인 것 (377개, 전부 통과)
 
 v10.3 파일 기준이다(v11 작업분 63개는 별도). 전부 **장치·DGX 없이** 돈다.
 
@@ -978,6 +1059,7 @@ v10.3 파일 기준이다(v11 작업분 63개는 별도). 전부 **장치·DGX �
 | LLM 호출·로그 | `test_llm_thinking.py` (3) · `test_llm_logging.py` (1) |
 | task 선택 | `test_v10_3_task_selection.py` (35) — §6-6 |
 | 명령 차단·프롬프트 | `test_v10_3_cmd_block.py` (15) · `test_v10_3_prompt_targets.py` (7) · `test_v10_3_prompt_size.py` (19) — §6-3·§6-7 |
+| 필수 지정·중복 키·무효 패턴명 | `test_v10_3_llm_prompt_fixes.py` (19) — §6-11 |
 | io_patterns 성과표 | `test_v10_3_io_table.py` (8) — §6-9 |
 | crash 덤프 수집 | `test_v10_3_dump_collect.py` (16) — §6-10 |
 | 샘플러·프로브 | `test_v10_3_sampler_diag.py` (17) · `test_v10_3_probe_recovery.py` (12) · `test_v10_1_sampler_recovery.py` (6) · `test_v10_2_pcsr_response.py` (9) — §6-1·§6-2 |
@@ -1084,5 +1166,5 @@ sudo no_proxy=192.168.10.1 http_proxy= https_proxy= \
   --product BM9K1 --nvme /dev/nvme0 --namespace 1 --rag
 
 # 시험
-python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 358 tests (v11 파일이 있으면 +63)
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 377 tests (v11 파일이 있으면 그만큼 추가)
 ```

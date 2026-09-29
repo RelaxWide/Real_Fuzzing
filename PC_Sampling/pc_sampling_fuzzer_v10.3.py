@@ -515,6 +515,11 @@ RAG_DEBUG            = bool(_RAG.get('debug', True))       # 단계별 [LLM/raw|
 #   불필요 → 전용 키로 분리하고 기본 off.
 RAG_DEBUG_EXEC       = bool(_RAG.get('debug_exec', False))  # [LLM/exec] 시드 선택마다 1줄(고빈도)
 RAG_JSON_RETRIES     = int(_RAG.get('json_retries', 2))   # 응답이 JSON 아니면 교정 리프롬프트 재시도 상한
+# v10.3: 저수확 명령 '필수 지정'. 목록을 서술형으로 나열하기만 하면 4일 평가 동안 내용이
+#   갱신돼도 제안 비중이 바뀌지 않았다 → 요청마다 K개를 골라 명령형으로 요구하고, 준수 여부를
+#   [LLM/task] 에 센다. 지정은 **덜 지정된 것부터** 돌아가므로 저수확 명령이 고르게 다뤄진다.
+RAG_FOCUS_COMMANDS   = max(0, int(_RAG.get('focus_commands', 3)))   # 요청당 필수 명령 수(0=끔)
+RAG_FOCUS_POOL       = max(1, int(_RAG.get('focus_pool', 15)))      # 후보 = 수확 낮은 순 상위 N
 RAG_SEQ_ENERGY_BOOST = float(_RAG.get('seq_energy_boost', RAG_ENERGY_BOOST))  # 시퀀스(llm_seq) 전용 부스트
 # v9.6: LLM 에너지 부스트 자동조정. 고정 상수(1.5)는 "LLM 계보를 얼마나 밀어줄까" 를 사람이
 #   정하는 값이었다 — LLM 이 실제로 커버리지를 뚫든 말든 항상 같은 배수였다. CSFuzz 의 p 가
@@ -5091,6 +5096,55 @@ def _sanitize_json(text: str) -> str:
     return ''.join(out)
 
 
+# 중복 키 후보 보관 키. 학습 모듈이 파싱 결과를 json.dumps 로 다시 직렬화해 넘기므로
+#   파이썬 속성이 아니라 **일반 JSON 키**로 들고 다녀야 끝까지 살아남는다.
+_LLM_DUP_KEY = '_dup_alternatives'
+
+
+def _llm_pairs_hook(pairs):
+    """JSON 객체의 중복 키를 감지한다(json.loads 기본은 마지막 값을 조용히 채택).
+
+    모델이 가끔 {"cdw10": 128, "cdw10": 0} 처럼 같은 키를 두 번 쓴다. 마지막 값만 받으면
+    FID=0(예약) 같은 값이 남아 검증에서 걸리고, 시퀀스는 all-or-nothing 이라 멀쩡한 멤버까지
+    통째로 버려졌다. **첫 값**을 키에 두고, 값이 다른 뒤쪽 후보는 순서대로
+    `_dup_alternatives` 에 보관한다 — 어느 값을 쓸지는 검증(_llm_make_seed)이 정한다.
+    값이 같은 중복은 문제가 아니므로 기록하지 않는다."""
+    out, alts = {}, {}
+    for k, v in pairs:
+        if k in out:
+            if v != out[k] and v not in alts.get(k, []):
+                alts.setdefault(k, []).append(v)
+            continue
+        out[k] = v
+    if alts:
+        out[_LLM_DUP_KEY] = alts
+    return out
+
+
+_LLM_DUP_SEARCH_LIMIT = 64     # 중복 키 후보 조합 검증 상한(조합 폭발 방지)
+
+
+def _llm_dup_candidates(base, dups, limit):
+    """중복 키 후보 조합을 **바꾸는 필드 수가 적은 것부터** 낸다.
+
+    필드는 cdw 번호순으로 고정한다 — JSON 에 나온 순서가 채택을 바꾸면 안 된다.
+    바꾸는 필드 0개(=모델이 먼저 쓴 값 전부) → 1개 → 2개 … 순이라, 필드 하나만 바꿔서
+    통과하는 경우는 (필드 수 × 후보 수)가 한도 안이면 반드시 검사된다. 예전엔 앞 필드의
+    곱이 한도를 먼저 채워 뒤 필드의 유효값을 한 번도 보지 못했다."""
+    import itertools
+    fields = sorted(dups, key=lambda k: int(k[3:]) if k[3:].isdigit() else 99)
+    n = 0
+    for r in range(len(fields) + 1):
+        for subset in itertools.combinations(fields, r):
+            for picks in itertools.product(*(dups[f][1:] for f in subset)):
+                if n >= limit:
+                    return
+                n += 1
+                cand = dict(base)
+                cand.update(zip(subset, picks))
+                yield cand
+
+
 def _llm_extract_json(text: str):
     """LLM 응답에서 **스키마 유효한** JSON 객체를 뽑아 파싱. prose 로 감싸도 견딤.
     맨 16진/트레일링콤마를 먼저 정규화하고, top-level 스키마 키가 없는 dict
@@ -5102,7 +5156,7 @@ def _llm_extract_json(text: str):
     s = _sanitize_json(text)
     # 1) 전체가 JSON 인 경우 (정규화 후)
     try:
-        obj = json.loads(s)
+        obj = json.loads(s, object_pairs_hook=_llm_pairs_hook)
         if _llm_schema_ok(obj):
             return obj
     except Exception:
@@ -5130,7 +5184,7 @@ def _llm_extract_json(text: str):
                 depth -= 1
                 if depth == 0:
                     try:
-                        obj = json.loads(s[start:i + 1])
+                        obj = json.loads(s[start:i + 1], object_pairs_hook=_llm_pairs_hook)
                         if _llm_schema_ok(obj):
                             return obj
                     except Exception:
@@ -5764,6 +5818,8 @@ class _V101Fuzzer:
         #   "어느 패턴이 먹혔나 / 무엇을 안 써봤나" 를 LLM 이 알 수 없어 한 패턴에 고착됐다.
         self._wl_pattern_stats: dict = {}                  # pattern → {n, cov, cmds, states, waf_sum, waf_n, last}
         self._wl_burst_seq: int = 0                        # LLM 버스트 순번 (성과표 'last=N ago')
+        self._llm_wl_invalid_last = None                   # 직전 무효 패턴명 → 다음 io_patterns 되먹임
+        self._llm_focus_hist: dict = {}                    # 필수 지정 명령별 지정 횟수(회전용)
         # 사전생성 랜덤 write 버퍼 (per-cmd os.urandom 회피). 워크로드 활성 시에만 할당.
         self._wl_rand_buf: bytes = (
             os.urandom(max(1, IO_WL_RAND_BUF_MB) * 1024 * 1024)
@@ -7825,6 +7881,73 @@ class _V101Fuzzer:
                         f"— 차단된 명령은 exercised 가 안 돼 never-sent 에 고정된다")
         return out
 
+    def _llm_cmd_yield(self, name):
+        """명령의 실행당 신규 커버리지 (수확, 누적 신규, 실행 수). 낮을수록 덜 탐색됨."""
+        st = self.cmd_stats.get(name, {})
+        runs = st.get('exec', 0) + st.get('cal_exec', 0)
+        gained = st.get('new_cov', 0)
+        return gained / max(1, runs), gained, runs
+
+    def _llm_focus_pick(self, pool, k):
+        """이번 요청의 **필수 명령** k개. 지금까지 덜 지정된 것부터, 동률이면 pool 순서
+        (never-sent → 수확 낮은 순). 지정 횟수는 응답 적용 시 올린다(_llm_focus_account)
+        — 요청이 실패하면 같은 명령이 다시 온다. 준수 여부가 아니라 **지정 횟수**로 돌리므로
+        모델이 끝내 안 따르는 명령이 슬롯을 독점하지 않는다."""
+        if k <= 0 or not pool:
+            return []
+        hist = getattr(self, '_llm_focus_hist', None)
+        if hist is None:
+            hist = self._llm_focus_hist = {}
+        order = sorted(range(len(pool)), key=lambda i: (hist.get(pool[i], 0), i))
+        return [pool[i] for i in order[:k]]
+
+    def _llm_focus_block(self, focus, kind):
+        """필수 지정 지시문(명령형). kind='seeds'|'sequences'."""
+        if not focus:
+            return ""
+        names = ", ".join(focus)
+        if kind == 'seeds':
+            return (f"MANDATORY for this batch — you MUST include at least one seed for EACH of "
+                    f"these {len(focus)} commands: {names}. Use CDW values that differ from what "
+                    f"has already been tried. A batch that omits any of them is non-compliant. "
+                    f"Only the remaining seeds are your free choice.\n\n")
+        return (f"MANDATORY for this batch — for EACH of these {len(focus)} commands you MUST emit "
+                f"at least one sequence whose FINAL (trigger) command is that command, with the "
+                f"earlier commands establishing the firmware state it needs: {names}. "
+                f"A batch that omits any of them is non-compliant. "
+                f"Only the remaining sequences are your free choice.\n\n")
+
+    def _llm_focus_account(self, res, shape):
+        """응답이 필수 지정을 따랐는지 센다(모델이 **보낸 원본** 기준). 지정 횟수도 올린다."""
+        focus = list(((res.get('ctx') or {}).get('focus_commands')) or [])
+        if not focus:
+            return
+        hist = getattr(self, '_llm_focus_hist', None)
+        if hist is None:
+            hist = self._llm_focus_hist = {}
+        for c in focus:
+            hist[c] = hist.get(c, 0) + 1
+        # task 가 **요구한 출력만** 센다 — sequences 요청에 단일 seed 로 답해도 요구한
+        #   setup→trigger 체인이 없으니 준수가 아니다(그 반대도 마찬가지).
+        used = set()
+        task = res.get('task')
+        if task == 'new_group_seeds':
+            for item in (shape.get('seeds') if isinstance(shape.get('seeds'), list) else []):
+                if isinstance(item, dict) and isinstance(item.get('command'), str):
+                    used.add(item['command'])
+        elif task == 'sequences':
+            for sq in (shape.get('sequences') if isinstance(shape.get('sequences'), list) else []):
+                cmds = sq.get('commands') if isinstance(sq, dict) else None
+                last = cmds[-1] if isinstance(cmds, list) and cmds else None
+                if isinstance(last, dict) and isinstance(last.get('command'), str):
+                    used.add(last['command'])
+        hit = [c for c in focus if c in used]
+        _bt = self._llm_by_task.setdefault(
+            str(res.get('task') or 'unknown'), {'req': 0, 'adopted': 0, 'capped': 0, 'cap': 0})
+        _bt['focus_req'] = _bt.get('focus_req', 0) + len(focus)
+        _bt['focus_hit'] = _bt.get('focus_hit', 0) + len(hit)
+        log.info(f"[LLM/focus] task={res.get('task')} 지정={focus} 반영={hit}")
+
     def _llm_build_request(self, task: str):
         """task 별 (system, user) 프롬프트 구성. 불가하면 None. 전부 메인 스레드 스냅샷.
 
@@ -7849,21 +7972,21 @@ class _V101Fuzzer:
                      if c.name in sb.commands and c.name not in self._unimpl_cmds
                      and c.name not in _unreach]
             never = [n for n in known if n not in exercised]
-            def _cmd_yield(name):
-                st = self.cmd_stats.get(name, {})
-                runs = st.get('exec', 0) + st.get('cal_exec', 0)
-                gained = st.get('new_cov', 0)
-                return gained / max(1, runs), gained, runs
-
+            _cmd_yield = self._llm_cmd_yield
             explored = sorted([n for n in known if n in exercised], key=_cmd_yield)
             candidates = never + explored            # never-entered 우선, 그다음 low-yield
-            self._llm_pending_ctx = {"rag_query_commands": candidates[:3]}
-            schema = self._llm_schema_summary(self._llm_schema_pick(candidates))
+            # 필수 지정 — 목록을 던지고 모델에 맡기면 비중이 안 바뀐다(4일 평가).
+            focus = self._llm_focus_pick(candidates[:RAG_FOCUS_POOL],
+                                         min(RAG_FOCUS_COMMANDS, RAG_MAX_SEEDS))
+            _ordered = focus + [c for c in candidates if c not in focus]
+            self._llm_pending_ctx = {"rag_query_commands": _ordered[:3],
+                                     "focus_commands": focus}
+            schema = self._llm_schema_summary(self._llm_schema_pick(_ordered))
             _low_lbl = []
             for n in explored[:15]:
                 _yield, _gain, _runs = _cmd_yield(n)
                 _low_lbl.append(
-                    f"{n}(exec={_runs},new_cov={_gain},cov/exec={_yield:.4f})")
+                    f"  - {n}: exec={_runs}, new_cov={_gain}, cov/exec={_yield:.4f}")
             _contrast = self._llm_contrastive_block()   # v9.5: field-relation 대조 예시
             _cb = (_contrast + "\n\n") if _contrast else ""
             _rb = self._llm_reject_block()             # v10: 거절·보정 되먹임
@@ -7871,26 +7994,39 @@ class _V101Fuzzer:
                     + f"Coverage gaps (firmware functions NOT yet reached — PRIMARY target):\n"
                     f"{cov or '  (static map unavailable)'}\n\n"
                     f"Never-sent command groups: {sorted(never)[:30]}\n\n"
-                    f"Under-explored command groups (sent but low new-coverage yield): {_low_lbl}\n\n"
-                    f"Schemas:\n{schema}\n\n"
+                    f"Under-explored command groups (sent, lowest new-coverage per execution first):\n"
+                    + ("\n".join(_low_lbl) or "  (none)") + "\n\n"
+                    + self._llm_focus_block(focus, 'seeds')
+                    + f"Schemas:\n{schema}\n\n"
                     f"Task: emit up to {RAG_MAX_SEEDS} \"seeds\" whose CDW parameters are most likely "
-                    f"to reach the un-reached functions above. Prefer never-sent groups, then "
-                    f"under-explored ones with NEW parameter values.{self._llm_data_directive()} "
-                    f"JSON only.")
+                    f"to reach the un-reached functions above. First satisfy the MANDATORY commands; "
+                    f"fill the rest from never-sent groups, then under-explored ones with NEW "
+                    f"parameter values.{self._llm_data_directive()} "
+                    f"Write each JSON key at most once per object. JSON only.")
             return self._LLM_SYSTEM, user
         if task == 'sequences':
             # v9.1 #5: 확정 미구현 opcode 는 시퀀스 재료에서 제외(죽은 opcode 로 체인 조립 방지).
             _unreach = self._llm_unreachable_names(self.llm.schema_bridge)
             names = [n for n in sorted(self.llm.schema_bridge.commands.keys())
                      if n not in self._unimpl_cmds and n not in _unreach]
-            self._llm_pending_ctx = {"rag_query_commands": names[:3]}
+            # 필수 지정 — seeds 와 같은 순위(never-sent → 수확 낮은 순)에서 고른다. 예전엔
+            #   이 task 에 우선순위 정보가 아예 없었다(알파벳순 목록만).
+            _ranked = ([n for n in names if n not in exercised]
+                       + sorted([n for n in names if n in exercised], key=self._llm_cmd_yield))
+            focus = self._llm_focus_pick(_ranked[:RAG_FOCUS_POOL],
+                                         min(RAG_FOCUS_COMMANDS, RAG_MAX_SEQS))
+            _ordered = focus + [n for n in names if n not in focus]
+            self._llm_pending_ctx = {"rag_query_commands": _ordered[:3],
+                                     "focus_commands": focus}
             # 스키마에 실을 명령은 **관련도 순**으로 고른다. names 는 알파벳 순이라
             #   그대로 자르면 A~M 만 남는 임의 절단이 된다(캡이 명령 수보다 작을 때).
-            schema = self._llm_schema_summary(self._llm_schema_pick(names))
+            schema = self._llm_schema_summary(self._llm_schema_pick(_ordered))
             user = (_gp + self._llm_reject_block()      # v10: 거절·보정 되먹임
                     + f"Coverage gaps (firmware functions NOT yet reached — target these):\n"
                     f"{cov or '  (static map unavailable)'}\n\n"
-                    f"Available commands: {names}\n\nSchemas:\n{schema}\n\n"
+                    f"Available commands: {names}\n\n"
+                    + self._llm_focus_block(focus, 'sequences')
+                    + f"Schemas:\n{schema}\n\n"
                     f"Task: emit up to {RAG_MAX_SEQS} multi-command \"sequences\", typically 6-10 commands "
                     f"but longer (up to {RAG_MAX_SEQ_LEN}) when the state setup genuinely needs it "
                     f"(e.g. ZNS zone lifecycle, multi-step reservations). "
@@ -7902,7 +8038,8 @@ class _V101Fuzzer:
                     f"ReservationRegister->ReservationAcquire->ReservationReport; "
                     f"DirectiveSend->DirectiveReceive->Write(stream). Prefer LONGER chains that build up "
                     f"state over single-shot commands. Do NOT use destructive/locking ops."
-                    f"{self._llm_data_directive()} JSON only.")
+                    f"{self._llm_data_directive()} Write each JSON key at most once per object. "
+                    f"JSON only.")
             return self._LLM_SYSTEM, user
         if task == 'corpus_eval':
             # v9.5 Phase 0: 층화 표본 + 풍부한 context(cdw11/data_len/origin/command_dominant_error/favored).
@@ -7968,6 +8105,10 @@ class _V101Fuzzer:
             #   예시(free_blocks high → overwrite_churn)를 뺐다. 둘 다 overwrite_churn 의 설명이라
             #   14개 중 그것만 고르게 만들었다. 판단 규칙 대신 실측 성과표를 준다.
             _table = self._llm_workload_table()
+            _bad = getattr(self, '_llm_wl_invalid_last', None)
+            self._llm_wl_invalid_last = None          # 한 번 알려 준다
+            _badline = (f"Your previous io_workload used pattern {json.dumps(_bad)}, which is NOT a "
+                        f"valid name, so it was DISCARDED.\n" if _bad is not None else "")
             _params = "; ".join(f"{k} -> {', '.join(v)}" for k, v in IO_WL_PARAM_PATTERNS.items())
             user = (_gp
                     + "SSD internal state (telemetry — name = value  [description]):\n"
@@ -7980,7 +8121,10 @@ class _V101Fuzzer:
                       "Pick the pattern you expect to yield the most NEW coverage from the CURRENT "
                       "telemetry state, using the results table as evidence; when current choices "
                       "stall, try a never-tried pattern.\n"
-                    + "Fields: {\"pattern\": one of the patterns above, \"lba_span\": int LBAs "
+                    + _badline
+                    + "The \"pattern\" value must be copied EXACTLY, character for character, from "
+                      f"this list (no synonyms, no abbreviations): {json.dumps(IO_WL_PATTERNS)}\n"
+                    + "Fields: {\"pattern\": one of the names in that list, \"lba_span\": int LBAs "
                       "(working set), \"block_size\": int LBAs per command, \"hot_fraction\": 0..1, "
                       "\"read_ratio\": 0..1, \"direction\": the internal mechanism you target and "
                       "the telemetry that motivated it}. "
@@ -8144,22 +8288,64 @@ class _V101Fuzzer:
                     log.warning(f"[LLM/item] drop {name!r} (unknown command)")
                 return None
             cdw = {f'cdw{w}': _coerce_int(item.get(f'cdw{w}', 0)) for w in (2, 3, 10, 11, 12, 13, 14, 15)}
-            repaired, _fixed, ok = self.llm.schema_bridge.validate_and_repair(name, cdw)
-            if not ok:
-                _why(f"{name}: schema invalid or reserved value rejected")
-                if RAG_DEBUG:
-                    log.warning(f"[LLM/item] drop {name} (schema invalid/reserved)")
+            # 중복 키 후보(_llm_pairs_hook). 모델이 **실제로 쓴 값들 중에서만** 고른다 —
+            #   첫 값부터 차례로 검증해 통과하는 첫 조합을 쓴다. 값을 지어내지 않는다.
+            _alts = item.get(_LLM_DUP_KEY) if isinstance(item.get(_LLM_DUP_KEY), dict) else {}
+            _dups = {k: [cdw[k]] + [_coerce_int(x) for x in v]
+                     for k, v in _alts.items() if k in cdw and isinstance(v, list) and v}
+            _other_dups = sorted(k for k in _alts if k not in cdw)
+            if _other_dups:
+                _why(f"{name}: duplicate key(s) {_other_dups} — first value kept")
+            _tried, _total, _limited = 0, 1, False
+            for _v in _dups.values():
+                _total *= len(_v)
+            chosen = None
+            for _cand in _llm_dup_candidates(cdw, _dups, _LLM_DUP_SEARCH_LIMIT):
+                _tried += 1
+                repaired, _fixed, ok = self.llm.schema_bridge.validate_and_repair(name, _cand)
+                if not ok:
+                    continue
+                danger, reason = self.llm.schema_bridge.is_dangerous(name, repaired)
+                if danger:
+                    continue
+                chosen = _cand
+                break
+            _limited = chosen is None and _tried < _total
+            if chosen is None:
+                # 전 후보 탈락 — 원인 보고는 첫 값(모델이 먼저 쓴 값) 기준.
+                repaired, _fixed, ok = self.llm.schema_bridge.validate_and_repair(name, cdw)
+                if _limited:
+                    # 한도에 걸린 것과 전부 실패한 것은 다른 사건이다 — 섞어 보고하지 않는다.
+                    _dnote = (f" (duplicate keys {_dups} — candidate search limit reached: "
+                              f"{_tried} of {_total} combinations tried)")
+                else:
+                    _dnote = f" (duplicate keys {_dups} — no candidate valid)" if _dups else ""
+                if not ok:
+                    _why(f"{name}: schema invalid or reserved value rejected{_dnote}")
+                    if RAG_DEBUG:
+                        log.warning(f"[LLM/item] drop {name} (schema invalid/reserved){_dnote}")
+                    return None
+                danger, reason = self.llm.schema_bridge.is_dangerous(name, repaired)
+                _why(f"{name}: blocked as dangerous ({reason}){_dnote}")
+                log.info(f"[LLM] drop dangerous {name}: {reason}")
                 return None
+            if _alts:
+                _picked = {k: chosen[k] for k in _alts if k in chosen}
+                if _picked:
+                    self._llm_stats['dup_keys'] = self._llm_stats.get('dup_keys', 0) + 1
+                    _note = [f"duplicate key {k}: used {v} of "
+                             f"{[cdw[k]] + [_coerce_int(x) for x in _alts[k]]} — write each key once"
+                             for k, v in _picked.items()]
+                    self._llm_repair_note(name, _note)
+                    _why(f"{name}: {'; '.join(_note)}")
+                    if RAG_DEBUG:
+                        log.warning(f"[LLM/item] {name} 중복 키 해소: {_picked} "
+                                    f"(후보 {_alts})")
             if _fixed:
                 # v10: 보정 내역을 되먹임 큐에 남긴다. 예전엔 _fixed 를 받아만 두고 버려서
                 #   LLM 이 '내 값이 고쳐져 나갔다'를 영영 몰랐고 같은 무효값을 반복했다.
                 self._llm_repair_note(name, _fixed)
                 _why(f"{name}: repaired {', '.join(_fixed[:3])}")
-            danger, reason = self.llm.schema_bridge.is_dangerous(name, repaired)
-            if danger:
-                _why(f"{name}: blocked as dangerous ({reason})")
-                log.info(f"[LLM] drop dangerous {name}: {reason}")
-                return None
             data = b''
             dh = item.get('data_hex')
             if dh:
@@ -8328,6 +8514,12 @@ class _V101Fuzzer:
             self._llm_stats['dropped'] += 1
             return
         self._llm_funnel['json_ok'] += 1
+        if getattr(self, '_llm_by_task', None) is None:
+            self._llm_by_task = {}
+        try:
+            self._llm_focus_account(res, _shape)
+        except Exception as _fe:
+            log.debug(f"[LLM/focus] 집계 예외: {_fe}")
         # task 별 집계. 상한 도달은 **절단 전 원본**(_shape)으로 센다 — 학습 모듈이
         #   먼저 잘라 넘기므로 정규화된 사본으로는 모델이 몇 개 보냈는지 알 수 없다.
         _tk = str(res.get('task') or 'unknown')
@@ -8528,6 +8720,11 @@ class _V101Fuzzer:
                         f"span={_wl.get('lba_span')} bs={_wl.get('block_size')} "
                         f"hot={_wl.get('hot_fraction')} rd={_wl.get('read_ratio')}")
         elif res.get('task') == 'io_patterns':
+            _io = data.get('io_workload')
+            if isinstance(_io, dict) and _io.get('pattern') not in IO_WL_PATTERNS:
+                _bt = self._llm_by_task.setdefault(
+                    _tk, {'req': 0, 'adopted': 0, 'capped': 0, 'cap': 0})
+                _bt['wl_invalid'] = _bt.get('wl_invalid', 0) + 1
             # io_patterns 응답인데 유효 descriptor 가 안 나옴(io_workload 키 없음/pattern enum 밖 등)
             #   → 조용히 버려지던 것을 터미널에 노출(진단: LLM 이 뭘 냈는지 확인).
             log.warning(f"[LLM] io_patterns 응답에 유효 descriptor 없음: "
@@ -8574,8 +8771,11 @@ class _V101Fuzzer:
         pat = obj.get('pattern')
         if not isinstance(pat, str) or pat not in IO_WL_PATTERNS:
             if obj:
-                log.info(f"[LLM] 워크로드 descriptor pattern 무효: {pat!r} "
-                         f"(허용={IO_WL_PATTERNS}) → drop")
+                # 조용히 버리지 않는다 — 다음 io_patterns 프롬프트에 되돌려 준다. 별칭 추정
+                #   (random_write→rand_write)은 하지 않는다: 규칙이 늘면 추측이 섞인다.
+                self._llm_wl_invalid_last = pat
+                log.warning(f"[LLM] 워크로드 descriptor pattern 무효: {pat!r} "
+                            f"(허용={IO_WL_PATTERNS}) → drop, 다음 요청에 되먹임")
             return None
         d: dict = {'pattern': pat}
         for k in ('lba_span', 'block_size'):
@@ -8826,6 +9026,11 @@ class _V101Fuzzer:
                         _seg += f"/{_d['cap']},캡{_d['capped'] * 100 // _r}%"
                         if _d.get('cut'):
                             _seg += f",잘림{_d['cut']}"
+                    if _d.get('focus_req'):
+                        # 필수 지정 준수: 지정한 명령 중 응답에 실제로 들어온 수
+                        _seg += f",지정{_d.get('focus_hit', 0)}/{_d['focus_req']}"
+                    if _d.get('wl_invalid'):
+                        _seg += f",무효패턴{_d['wl_invalid']}"
                     _parts.append(_seg + ")")
                 _gdrop = 0
                 try:

@@ -7,7 +7,7 @@ v10.3 은 v10.2 의 SSD FW 퍼징 기능을 그대로 두고, **LLM 백엔드를
 [RUNBOOK_v10.3.md](RUNBOOK_v10.3.md), 패키지 상세는 [`../rag/README.md`](../rag/README.md)
 와 [`../risc-v/README.md`](../risc-v/README.md) 를 본다.
 
-작성 기준 2026-09-28. 시험 358개 통과(v11 작업분 제외).
+작성 기준 2026-09-29. 시험 377개 통과(v11 작업분 제외).
 
 ## 진행 상태
 
@@ -257,7 +257,7 @@ enhanced_query` 가 `"<명령> command Command Dword N <약칭> <전체명> … 
 ## 검증 (P1·P2)
 
 ```bash
-python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 358 tests, OK (P1·P2 당시 182)
+python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 377 tests, OK (P1·P2 당시 182)
 ```
 
 파일별 목록은 런북 §8. `tests/test_v10_3_backend.py` 104개가 가짜 HTTP 서버로 DGX 없이 돈다.
@@ -314,6 +314,7 @@ python3 -m unittest discover -s PC_Sampling/tests -p 'test_*.py'   # 358 tests, 
 | io_patterns | 규칙형 예시·처방형 피드백 제거, 패턴별 실측 성과표(`cov/1k`)와 파라미터 적용 목록(`IO_WL_PARAM_PATTERNS`) | §6-9 |
 | crash 덤프 | 덤프 함수가 전후 스냅샷 차이로 산출물·도구 로그를 `crash_<ts>/` 에 복사, 도구 출력을 텍스트 로그에 복원(앞/뒤 1,000줄) | §6-10 |
 | LLM 시간 예산 | `timeout_sec` 기본 300→400초 | §4 |
+| LLM 지시 준수 | 저수확 명령을 요청마다 돌아가며 **필수 지정**(seeds·sequences, 준수율 `지정hit/req`), JSON 중복 키는 모델이 쓴 값 중 검증 통과값 채택, 무효 io 패턴명 되먹임 | §6-11 |
 | RAG | 필드 확장 질의, 명령 태그 가산점, 기동 전 인덱스 검증, 요청/응답 원본 `llm/llm_io.jsonl` | 위 P2 절, `rag/README.md` |
 
 **v11 확장점** — `pc_sampling_fuzzer_v11.py` 가 이 파일을 `runpy` 로 실행하며
