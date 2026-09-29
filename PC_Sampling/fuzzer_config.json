@@ -131,6 +131,80 @@
     "mopt_pilot_period": 5000,
     "mopt_core_period": 50000
   },
+  "exceptions": {
+    "_comment": "v11 전용. v10.3은 무시. 모든 기존 허용 명령에 실행 중 주입; PM 전환 제외. 종료된 이벤트부터 최소 간격을 계산. 명령 종류 추가 제한 없음. 종류별 사전시험 통과 profile만 선택. Warm=주전원 유지 PERST, REFCLK 강제 토글 없음. FLR/bus reset은 Linux 드라이버 협조 경로. Normal POR는 드라이버 orderly remove 후 차단, Sudden POR는 차단 후 remove. 실기 미검증.",
+    "enabled": false,
+    "min_interval_minutes": 5,
+    "initial_delay_minutes": 5,
+    "trigger_delay_ms": 0,
+    "cleanup_timeout_sec": 10,
+    "resume_timeout_sec": 30,
+    "recovery_observation_commands": 1,
+    "recovery_observation_sec": 0,
+    "preflight": {"enabled": true, "attempts_per_kind": 1},
+    "seed": 0,
+    "profiles": [
+      {
+        "name": "controller_reset",
+        "prefix": [],
+        "body": [{"action": "controller_reset"}],
+        "repeat": 1,
+        "suffix": [],
+        "timeout_sec": 30,
+        "ready_timeout_sec": 30
+      },
+      {"name": "nssr", "body": [{"action": "nssr"}], "timeout_sec": 30, "ready_timeout_sec": 30},
+      {"name": "flr", "body": [{"action": "flr"}], "timeout_sec": 30, "ready_timeout_sec": 30},
+      {"name": "hot_reset", "body": [{"action": "hot_reset"}], "timeout_sec": 30, "ready_timeout_sec": 30},
+      {
+        "name": "warm_reset_perst",
+        "body": [
+          {"action": "perst_assert", "hold_sec": 0.1},
+          {"action": "pci_remove"},
+          {"action": "perst_release", "hold_ref": "power.por_rescan_delay"},
+          {"action": "pci_rescan"}
+        ],
+        "timeout_sec": 60,
+        "ready_timeout_ref": "power.por_boot_wait"
+      },
+      {
+        "name": "sudden_por",
+        "body": [
+          {"action": "power_off"},
+          {"action": "pci_remove", "hold_ref": "power.por_poweroff_wait"},
+          {"action": "power_on", "hold_ref": "power.por_rescan_delay"},
+          {"action": "pci_rescan"}
+        ],
+        "timeout_sec": 60,
+        "ready_timeout_ref": "power.por_boot_wait"
+      },
+      {
+        "name": "normal_por",
+        "body": [
+          {"action": "pci_remove"},
+          {"action": "power_off", "hold_ref": "power.por_poweroff_wait"},
+          {"action": "power_on", "hold_ref": "power.por_rescan_delay"},
+          {"action": "pci_rescan"}
+        ],
+        "timeout_sec": 60,
+        "ready_timeout_ref": "power.por_boot_wait"
+      }
+    ],
+    "_comment_perst": "사용자 확인: devIdx=1, PERST pinNo=7, level=3300mV. 16=SetGpioLow(assert), 15=SetGpioHigh(deassert). 아래는 어댑터 등록이며 실제 주입 선택은 profiles에서 한다. 18=McToggle은 시간 단위/완료 의미 확인 후 연결.",
+    "adapters": {
+      "perst_assert": {
+        "argv": ["python3", "{pmu_script}", "16", "1", "7", "3300"],
+        "effect": "assert",
+        "readback": {"argv": ["python3", "{pmu_script}", "20", "1", "7"], "expected": 0}
+      },
+      "perst_release": {
+        "argv": ["python3", "{pmu_script}", "15", "1", "7", "3300"],
+        "effect": "deassert",
+        "readback": {"argv": ["python3", "{pmu_script}", "20", "1", "7"], "expected": 1}
+      }
+    },
+    "restore_actions": ["power_on", "perst_release"]
+  },
   "power": {
     "pm_rotate_interval": 100,
     "ps_entry_exit_margin_ms": 105,

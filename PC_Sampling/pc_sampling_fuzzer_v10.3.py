@@ -322,7 +322,7 @@ except Exception:
     _pylink = None
 
 # 버전
-FUZZER_VERSION = "10.3.0"
+FUZZER_VERSION = globals().get("_ENTRY_VERSION", "10.3.0")
 
 # ─────────────────────────────────────────────────────────────────────────
 # USER CONFIGURATION  — 값은 모두 fuzzer_config.json 에서 로드한다 (v8.3).
@@ -1807,7 +1807,7 @@ class _FuzzingTerminalFilter(logging.Filter):
     _ALLOW = _re.compile(
         r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
         r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]|\[DebugTool\]|\[State-Replay\]'
-        r'|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]|\[BootSweep\]|\[Probe-'
+        r'|\[Exception\]|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]|\[BootSweep\]|\[Probe-'
         r'|\[State-Snap\]|\[SMART\]'   # v8.3: 주기적 SMART/전체 state field 출력 터미널 노출
         r'|\[IO-WL\]'                   # v8.4: IO 워크로드 블록/검증 로그
         r'|\[DevInfo\]'                 # Device Information(주기 출력) 터미널 노출
@@ -5923,6 +5923,21 @@ class _V101Fuzzer:
             _, _sampler_ok = self._stop_sampling_checked(
                 f"calibration:{seed.cmd.name}:{run_i + 1}")
             self.executions += 1
+            if rc == getattr(self, 'RC_EXCEPTION', None):
+                self.stats['exception_interrupted'] = self.stats.get('exception_interrupted', 0) + 1
+                self._cal_last_rc = rc
+                if not _sampler_ok:
+                    break
+                continue  # no stability/coverage/reward observation for an interrupted run
+            if (getattr(self, '_exception_window_truncated', False)
+                    and rc not in (self.RC_TIMEOUT, self.RC_ERROR)):
+                self._cal_last_rc = rc
+                self.stats['coverage_unobserved'] = self.stats.get('coverage_unobserved', 0) + 1
+                self._learning_observe(seed, self._last_nvme_status, rc, set(), 0,
+                                       'calibration', False)
+                if not _sampler_ok:
+                    break
+                continue
             actual_runs += 1
             self._cal_last_rc = rc
             if not _sampler_ok:
@@ -14135,10 +14150,19 @@ class _V101Fuzzer:
                             f"— nvme-cli PID={process.pid} 보존 (fd 유지 → SSD 상태 보존)")
                 return self.RC_TIMEOUT
 
+            # v11 opt-in hook. v10.3 has no hook: its transport/watchdog stays unchanged.
+            _exception_elapsed = 0.0
+            _exception_hook = getattr(self, '_exception_on_spawn', None)
+            if _exception_hook is not None:
+                _exception_t0 = time.monotonic()
+                _exception_rc = _exception_hook(process, seed, timeout_ms)
+                _exception_elapsed = time.monotonic() - _exception_t0
+                if _exception_rc is not None:
+                    return _exception_rc
             _is_halt = self.sampler.INVASIVE
             if not _is_halt:
                 # 비침습(PCSR)/기타: 코어가 풀스피드 → 벽시계 ≈ 펌웨어시간. 기존 경로 그대로.
-                timeout_sec = timeout_ms / 1000.0 + 2.0
+                timeout_sec = max(0.001, timeout_ms / 1000.0 + 2.0 - _exception_elapsed)
                 try:
                     stdout, stderr = process.communicate(timeout=timeout_sec)
                 except subprocess.TimeoutExpired:
@@ -14149,7 +14173,7 @@ class _V101Fuzzer:
                 # (+10초 고정 마진 대신 명령마다 실제 프리즈를 빼므로 오버헤드가 얼마든 무관.)
                 fw_deadline  = timeout_ms / 1000.0                       # 펌웨어시간 기준(예: 30s)
                 wall_ceiling = fw_deadline + HALT_FWTIME_WALL_CEILING_SEC  # 폭주 방지 상한
-                _start_t = time.monotonic()
+                _start_t = time.monotonic() - _exception_elapsed
                 _freeze0 = self.sampler.halt_freeze_accum
                 while True:
                     try:
@@ -14249,7 +14273,7 @@ class _V101Fuzzer:
             return rc
 
         except KeyboardInterrupt:
-            if process:
+            if process and not getattr(self, '_exception_preserve', False):
                 try:
                     process.kill()
                     process.communicate(timeout=2)
@@ -14259,7 +14283,7 @@ class _V101Fuzzer:
 
         except Exception as e:
             log.error(f"NVMe subprocess error ({cmd.name}): {e}")
-            if process:
+            if process and not getattr(self, '_exception_preserve', False):
                 try:
                     process.kill()
                     process.communicate(timeout=2)
@@ -18884,15 +18908,16 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         if self.config.state_enabled:
             self._log_state_snapshot()
 
-        self._learning_baseline('fuzz_start')
-        self._learning_save()
-
-        # 메인 퍼징 루프 진입 — 터미널 출력을 [Stats]/[PM]/[+]/CRASH 로만 제한
-        for _h in log.handlers:
-            if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
-                _h.addFilter(_FuzzingTerminalFilter())
-
         try:
+            # v11 active preflight must share the campaign's interrupt/finally cleanup.
+            self._learning_baseline('fuzz_start')
+            self._learning_save()
+
+            # 메인 퍼징 루프 진입 — 터미널 출력을 [Stats]/[PM]/[+]/CRASH 로만 제한
+            for _h in log.handlers:
+                if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
+                    _h.addFilter(_FuzzingTerminalFilter())
+
             while True:
                 if self._timeout_crash or self._sampler_recovery_failed:
                     break
@@ -19306,7 +19331,8 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                     for _chunk_seed in self._fw_chunks:
                         rc = self._send_nvme_command(_chunk_seed.data, _chunk_seed)
                         # 청크 중간에 타임아웃/에러 발생 시 즉시 중단 — 그 청크로 회계
-                        if rc in (self.RC_TIMEOUT, self.RC_ERROR):
+                        if (rc in (self.RC_TIMEOUT, self.RC_ERROR, getattr(self, 'RC_EXCEPTION', None))
+                                or getattr(self, '_exception_window_truncated', False)):
                             _acct_seed, _acct_data = _chunk_seed, _chunk_seed.data
                             break
                     last_samples, _sampler_ok = self._stop_sampling_checked(
@@ -19345,6 +19371,9 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
 
 
         except KeyboardInterrupt:
+            _interrupt_hook = getattr(self, '_exception_user_interrupt', None)
+            if _interrupt_hook is not None:
+                _interrupt_hook()
             log.warning("Interrupted by user — 정리 작업 완료 후 종료합니다 (잠시 대기)...")
 
         finally:
@@ -19682,7 +19711,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
 
             # timeout crash: JLink PC 관측 최대 20회 (30초 간격, Ctrl+C로 조기 종료)
             # OpenOCD는 JLink dump 전에 이미 종료됨 → JLink 직접 연결로 PC 읽기
-            if self._timeout_crash:
+            if self._timeout_crash and not getattr(self, '_exception_preserve', False):
                 import threading as _threading
                 import re as _re
 
@@ -19773,10 +19802,12 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                     self.sampler.close()
                 except Exception:
                     pass
-                # timeout crash가 아닌 정상 종료 시에만 타임아웃/APST 복원
-                self._apst_restore()
-                self._keepalive_restore()
-                self._restore_nvme_timeouts()
+                # Release host probe handles even when preserving an exception fault.
+                # Device restoration is reserved for a normal/user-interrupted exit.
+                if not getattr(self, '_exception_preserve', False):
+                    self._apst_restore()
+                    self._keepalive_restore()
+                    self._restore_nvme_timeouts()
 
             # 정리 완료 — SIGINT 핸들러 복원
             if _old_sigint is not None:
@@ -20237,7 +20268,8 @@ if __name__ == "__main__":
         rag_func_name=(args.rag_func or RAG_FUNC_NAME),
     )
 
-    fuzzer = NVMeFuzzer(config)
+    _factory = globals().get('_FUZZER_FACTORY')
+    fuzzer = (_factory(NVMeFuzzer, _CFG) if _factory else NVMeFuzzer)(config)
     _trace_port = os.environ.get('PCFUZZ_FREEZE_TRACE')
     if _trace_port:
         try:
