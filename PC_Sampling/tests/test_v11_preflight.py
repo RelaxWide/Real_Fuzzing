@@ -8,8 +8,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from exception_control import ExceptionController, ExceptionFailure, compile_profiles
-from exception_probe import gpio_value, pci_method_support, subsystem_support
+from pc_sampling_fuzzer_v11 import ExceptionController, ExceptionFailure, compile_profiles
+from pc_sampling_fuzzer_v11 import gpio_value, pci_method_support, subsystem_support
 from test_v11_exceptions import options
 
 
@@ -158,7 +158,7 @@ class HardwareAdapters(unittest.TestCase):
         self.assertTrue(self.c.asserted)
 
     def test_post_on_rescan_inherits_same_ready_deadline(self):
-        from exception_control import Profile
+        from pc_sampling_fuzzer_v11 import Profile
         now = [10.0]
         self.c.clock = lambda: now[0]
         calls = []
@@ -180,7 +180,7 @@ class HardwareAdapters(unittest.TestCase):
         self.assertEqual(self.c.runner.run.call_args.args[0][2:], ['4', '1', '3300', '0', '12000', '0', '0'])
 
     def test_pending_pci_remove_does_not_prevent_supply_only_restore(self):
-        from exception_control import CommandRunner
+        from pc_sampling_fuzzer_v11 import CommandRunner
         runner = CommandRunner(Mock())
         runner.pending = [Mock(_exception_supply_control=False, poll=Mock(return_value=None))]
         self.assertTrue(runner.has_pending())
@@ -189,14 +189,14 @@ class HardwareAdapters(unittest.TestCase):
         self.assertTrue(runner.has_pending(supply_only=True))
 
     def test_timed_out_custom_adapter_blocks_supply_restore(self):
-        from exception_control import CommandRunner
+        from pc_sampling_fuzzer_v11 import CommandRunner
         for argv in (['gpioset', 'gpiochip0', '7=0'], ['helper', '--script=pmu.py']):
             with self.subTest(argv=argv):
                 self.c.options['adapters']['custom_assert'] = dict(argv=argv, effect='assert')
                 self.c.runner = CommandRunner(Mock())
                 proc = Mock(pid=42, poll=Mock(return_value=None))
                 proc.wait.side_effect = __import__('subprocess').TimeoutExpired(argv, 1)
-                with patch('exception_control.subprocess.Popen', return_value=proc) as launch:
+                with patch('pc_sampling_fuzzer_v11.subprocess.Popen', return_value=proc) as launch:
                     with self.assertRaises(__import__('subprocess').TimeoutExpired):
                         self.c._action('custom_assert', self.c.clock() + 1)
                     with self.assertRaises(ExceptionFailure):
@@ -218,7 +218,7 @@ class HardwareAdapters(unittest.TestCase):
 
     def test_exact_pci_reset_method_no_fallback_and_restore_in_child(self):
         self.c.runner.run.return_value = (0, b'', b'')
-        with patch('exception_control.pci_method_support', return_value=('AVAILABLE', 'ok')):
+        with patch('pc_sampling_fuzzer_v11.pci_method_support', return_value=('AVAILABLE', 'ok')):
             self.c._action('flr', self.c.clock() + 1)
         args = self.c.runner.run.call_args.args[0]
         self.assertEqual(args[-1], 'flr')
@@ -226,7 +226,7 @@ class HardwareAdapters(unittest.TestCase):
         self.assertIn("(p/'reset').write_text('1')", args[2])
 
     def test_pci_method_disappearance_not_silently_replaced(self):
-        with patch('exception_control.pci_method_support', return_value=('UNSUPPORTED', 'gone')):
+        with patch('pc_sampling_fuzzer_v11.pci_method_support', return_value=('UNSUPPORTED', 'gone')):
             with self.assertRaisesRegex(ExceptionFailure, 'gone'):
                 self.c._action('flr', self.c.clock() + 1)
         self.c.runner.run.assert_not_called()

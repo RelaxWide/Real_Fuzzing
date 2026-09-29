@@ -33,9 +33,7 @@ Linux NVMe 드라이버의 reset_prepare/reset_done은 I/O 정리와 재초기�
 
 | 파일 | 역할 |
 |---|---|
-| `pc_sampling_fuzzer_v11.py` | 독립 퍼징 엔진·CLI. 명령 생성·전송·가드·샘플링·LLM·PM·종료 처리 포함. v10.3 파일을 로드하지 않는다 |
-| `exception_control.py` | profile 컴파일, 스케줄러, 사전시험, 불량 보존, 복구, `ExceptionFuzzerMixin` |
-| `exception_probe.py` | 하드웨어 조회 순수 함수. import 시 장치를 건드리지 않는다 |
+| `pc_sampling_fuzzer_v11.py` | 독립 퍼징 엔진·CLI. 명령 생성·전송·가드·샘플링·LLM·PM·예외 주입·사전시험·불량 보존·복구·종료 처리 포함. v10.3 파일을 로드하지 않는다 |
 | `tests/test_v11_*.py` | 예외 제어·실제 v11 전송·복구·독립 실행 회귀 테스트 |
 
 MRO는 `NVMeFuzzer → ExceptionFuzzerMixin → LearningMixin → _V101Fuzzer`다.
@@ -45,8 +43,8 @@ v11에 포함했으며, v10.3 파일을 수정해도 v11에 자동 반영되지 
 `blocked_admin_opcodes`와 기존 LLM 프롬프트 필터·task 회전판을 유지한다.
 예외 mixin은 v11 내부 전송 구현에 `super()`로 위임해 동일한 가드를 통과한다.
 
-배포 시 `pc_sampling_fuzzer_v11.py`, 예외 모듈 2개와 기존 공통 모듈·설정·제품 자산을
-함께 둔다. **`pc_sampling_fuzzer_v10.3.py` 및 다른 구버전 퍼저 파일은 필요 없다.**
+배포 시 `pc_sampling_fuzzer_v11.py`와 기존 공통 모듈·설정·제품 자산을 함께 둔다.
+예외 제어와 capability 조회도 v11 파일에 포함되므로 별도 예외 모듈은 필요 없다. **`pc_sampling_fuzzer_v10.3.py` 및 다른 구버전 퍼저 파일은 필요 없다.**
 
 ## 설정 표면 — `exceptions` 절
 
@@ -485,3 +483,15 @@ v11 전송·calibration·종료·복구 테스트는 v11 모듈을 직접 검사
 
 독립화 후 전체 unittest **465개 통과**(46.613초). Python 구문 검사와
 `git diff --check` 통과. 실장치 검증은 미실시.
+
+
+## 2026-09-29 예외 모듈 통합
+
+`exception_control.py`와 `exception_probe.py`의 구현을 v11 파일 내부로 옮기고
+별도 파일은 삭제했다. 예외 제어·조회 함수를 v11 엔진과 한 파일에서 관리한다.
+기존 공통 학습/RAG/제품 모듈의 구조는 유지한다. v11 회귀 테스트와 patch 대상은
+통합된 모듈을 가리키며, 배포 테스트는 구버전과 예외 모듈 두 파일이 모두 없는
+환경에서 실행한다. 위의 분리 배포 설명은 이전 변경 이력이다.
+
+통합 후 전체 unittest **465개 통과**(51.934초). 기존 엔진과 예외 구현의 함수·클래스
+82개는 AST 동등함을 확인했다. Python 구문 검사와 `git diff --check` 통과.

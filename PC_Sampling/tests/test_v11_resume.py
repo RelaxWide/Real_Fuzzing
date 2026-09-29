@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from exception_control import ExceptionController, ExceptionFailure, compile_profiles
+from pc_sampling_fuzzer_v11 import ExceptionController, ExceptionFailure, compile_profiles
 import test_v11_exceptions as fixtures
 
 
@@ -248,10 +248,10 @@ class Integration(unittest.TestCase):
         f._exception_recovery_remaining = 0
         f._exception_recovery_until = 100
         self.case.proc.returncode = 0
-        with patch('exception_control.time.monotonic', return_value=99):
+        with patch('pc_sampling_fuzzer_v11.time.monotonic', return_value=99):
             self.assertEqual(self.case.send(), 0)
             self.assertTrue(f._exception_recovery_window)
-        with patch('exception_control.time.monotonic', return_value=101):
+        with patch('pc_sampling_fuzzer_v11.time.monotonic', return_value=101):
             self.assertEqual(self.case.send(), 0)
             self.assertFalse(f._exception_recovery_window)
 

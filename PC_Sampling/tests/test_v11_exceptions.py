@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from exception_control import (compile_profiles, csts_ready, ExceptionController,
+from pc_sampling_fuzzer_v11 import (compile_profiles, csts_ready, ExceptionController,
                                ExceptionFailure, ExceptionFuzzerMixin, CommandRunner)
 
 
@@ -233,7 +233,7 @@ class Readiness(unittest.TestCase):
                 (Path(d) / key).write_text(value)
             ctrl.runner = Mock()
             ctrl.runner.run.return_value = (0, b'{"csts": 1}', b'')
-            with patch('exception_control.Path.exists', return_value=True):
+            with patch('pc_sampling_fuzzer_v11.Path.exists', return_value=True):
                 ctrl.wait_ready(ctrl.clock() + 0.2)
             (Path(d) / 'serial').write_text('OTHER')
             with self.assertRaisesRegex(ExceptionFailure, 'identity'):
@@ -248,7 +248,7 @@ class Readiness(unittest.TestCase):
                 (Path(d) / key).write_text(value)
             ctrl.runner = Mock()
             ctrl.runner.run.return_value = (0, b'{"csts":0}', b'')
-            with patch('exception_control.Path.exists', return_value=True):
+            with patch('pc_sampling_fuzzer_v11.Path.exists', return_value=True):
                 with self.assertRaisesRegex(ExceptionFailure, 'deadline'):
                     ctrl.wait_ready(ctrl.clock() + 0.01)
 
@@ -328,7 +328,7 @@ class Runner(unittest.TestCase):
         proc = Mock(pid=42)
         proc.wait.side_effect = subprocess.TimeoutExpired('reset', 0.1)
         proc.poll.return_value = None
-        with patch('exception_control.subprocess.Popen', return_value=proc):
+        with patch('pc_sampling_fuzzer_v11.subprocess.Popen', return_value=proc):
             with self.assertRaises(subprocess.TimeoutExpired):
                 runner.run(['nvme', 'reset', '/dev/nvme0'], __import__('time').monotonic() + 0.1)
         self.assertTrue(runner.has_pending())
