@@ -20170,11 +20170,25 @@ class ExceptionController:
         self.run_started = False
 
     def emit(self, phase, **fields):
-        row = dict(event_id=self.active, phase=phase, monotonic=self.clock(), **fields)
-        if phase in ('preflight', 'begin', 'resumed', 'preserved_failure', 'capture', 'restore_failed'):
+        context = self.last_result or {}
+        event_id = self.active or context.get('event_id')
+        row = dict(event_id=event_id, phase=phase, monotonic=self.clock())
+        for key in ('profile', 'stage', 'action', 'index'):
+            if key in context:
+                row[key] = context[key]
+        row.update(fields)
+        visible = ('armed', 'preflight_start', 'preflight', 'preflight_failure',
+                   'preflight_complete', 'step_start', 'step_end', 'action_command',
+                   'ready_wait', 'ready_state', 'ready_timeout', 'ready_complete',
+                   'begin', 'resumed', 'preserved_failure', 'capture', 'restore_failed',
+                   'helper_pending')
+        if phase in visible:
             import logging
-            logging.getLogger('pcfuzz').warning('[Exception] %s %s %s', self.active, phase,
-                                                fields.get('reason', fields.get('profile', '')))
+            details = {k: v for k, v in row.items()
+                       if k not in ('event_id', 'phase', 'monotonic', 'options', 'profiles')}
+            logging.getLogger('pcfuzz').warning('[Exception] %s %s %s',
+                event_id or 'preflight-baseline', phase,
+                json.dumps(details, ensure_ascii=False, default=str))
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(row, ensure_ascii=False, default=str) + '\n')
@@ -20241,6 +20255,8 @@ class ExceptionController:
             self.powered = False
         elif effect == 'assert':
             self.asserted = True
+        self.emit('action_command', action=action, argv=argv,
+                  remaining_sec=max(0, deadline - self.clock()))
         rc, _, err = self.runner.run(
             argv, deadline, supply_control=(action in self.options.get('adapters', {})
                                             or effect in ('power_off', 'power_on', 'assert', 'deassert')))
@@ -20282,6 +20298,11 @@ class ExceptionController:
             raise ExceptionFailure('supply/assert state could not be restored')
 
     def wait_ready(self, deadline):
+        started = self.clock()
+        observation = dict(device=self.device, gate='deadline_before_first_probe')
+        previous = None
+        self.emit('ready_wait', device=self.device, expected_serial=self.serial,
+                  expected_bdf=self.bdf, remaining_sec=max(0, deadline - started))
         while self.clock() < deadline:
             # remove/rescan may change nvmeN. Resolve by the original serial AND
             # PCI function; do not assume that the old node still names the DUT.
@@ -20302,21 +20323,40 @@ class ExceptionController:
                 serial = (self.sysfs / 'serial').read_text().strip()
                 bdf = (self.sysfs / 'address').read_text().strip()
                 state = (self.sysfs / 'state').read_text().strip()
-            except OSError:
+            except OSError as exc:
                 serial = bdf = state = None
+                read_error = str(exc)
+            else:
+                read_error = None
+            node_exists = Path(self.device).exists()
+            observation = dict(device=self.device, serial=serial, bdf=bdf, state=state,
+                               node_exists=node_exists, sysfs_error=read_error)
+            observation['gate'] = ('sysfs_unreadable' if read_error else
+                                   'driver_not_live' if state != 'live' else
+                                   'device_node_missing' if not node_exists else 'controller_rdy')
             if serial and (serial != self.serial or bdf != self.bdf):
                 raise ExceptionFailure('DUT identity changed after reset')
-            if serial == self.serial and state == 'live' and Path(self.device).exists():
-                rc, out, _ = self.runner.run(['nvme', 'show-regs', self.device, '-o', 'json'], deadline)
+            if serial == self.serial and state == 'live' and node_exists:
+                rc, out, err = self.runner.run(['nvme', 'show-regs', self.device, '-o', 'json'], deadline)
+                observation.update(show_regs_rc=rc, stderr=err.decode(errors='replace')[:400])
+                if rc:
+                    observation['gate'] = 'show_regs_failed'
                 if not rc:
                     ready, value = csts_ready(out)
+                    observation.update(csts=value, rdy=bool(value & 1), cfs=bool(value & 2))
                     self.emit('ready_probe', csts=value, ready=ready)
                     if value & 2:
                         raise ExceptionFailure('CSTS.CFS=1')
                     if ready and self.clock() <= deadline:
+                        self.emit('ready_complete', elapsed_sec=self.clock() - started, **observation)
                         return
+            if observation != previous:
+                self.emit('ready_state', **observation)
+                previous = observation.copy()
             time.sleep(min(0.05, max(0, deadline - self.clock())))
-        raise ExceptionFailure('CTRL RDY/recognition deadline exceeded')
+        self.emit('ready_timeout', elapsed_sec=self.clock() - started, **observation)
+        raise ExceptionFailure('CTRL RDY/recognition deadline exceeded: '
+                               + json.dumps(observation, ensure_ascii=False))
 
     def _run_profile(self, profile):
         deadline = self.clock() + profile.timeout_sec
@@ -20324,6 +20364,8 @@ class ExceptionController:
         for index, (action, hold) in enumerate(profile.steps):
             if self.clock() >= deadline:
                 raise ExceptionFailure('profile deadline exceeded')
+            if self.last_result is not None:
+                self.last_result.update(stage='profile_action', action=action, index=index)
             self.emit('step_start', index=index, action=action)
             effect = action_effect(action, self.options.get('adapters', {}))
             # Start before ON/reset helper: command latency and trailing
@@ -20343,6 +20385,8 @@ class ExceptionController:
                 time.sleep(hold)
         if ready_deadline is None:
             ready_deadline = self.clock() + profile.ready_timeout_sec
+        if self.last_result is not None:
+            self.last_result['stage'] = 'ready_after_profile'
         self.wait_ready(ready_deadline)
         self._ready_deadline = ready_deadline
 
@@ -20425,10 +20469,12 @@ class ExceptionController:
         if isinstance(trials, bool) or not isinstance(trials, int) or not 1 <= trials <= 10:
             raise ValueError('preflight.attempts_per_kind must be 1..10')
         try:
+            self.last_result = dict(event_id='preflight-baseline', phase='preflight', stage='baseline_ready')
             self.wait_ready(self.clock() + min(p.ready_timeout_sec for p in self.profiles))
             for profile in self.profiles:
                 self.active = 'preflight-' + profile.name
-                self.last_result = dict(event_id=self.active, profile=profile.name, phase='preflight')
+                self.last_result = dict(event_id=self.active, profile=profile.name,
+                                        phase='preflight', stage='capability')
                 status, reason = self.capability(profile)
                 self.preflight_results[profile.name] = dict(status=status, reason=reason)
                 if status != 'AVAILABLE':
@@ -20437,12 +20483,15 @@ class ExceptionController:
                 if settings.get('enabled', True):
                     for attempt in range(trials):
                         self.emit('preflight_start', profile=vars(profile), attempt=attempt + 1)
+                        self.last_result['stage'] = 'sampler_stop'
                         before()
                         self._run_profile(profile)
+                        self.last_result['stage'] = 'identify_after_profile'
                         rc, out, err = self.runner.run(['nvme', 'id-ctrl', self.device, '-o', 'json'],
                                                        self.clock() + profile.ready_timeout_sec)
                         if rc or json.loads(out).get('sn', '').strip() != self.serial:
                             raise ExceptionFailure('preflight Identify failed or serial mismatch')
+                        self.last_result['stage'] = 'environment_sampler_resume'
                         resumed()
                     status, reason = 'PASS', 'profile applied; RDY, DUT identity, Identify and sampler verified'
                 else:
@@ -20588,7 +20637,8 @@ class ExceptionFuzzerMixin:
             except Exception as exc:
                 self._exception_capture(exc)
             import logging
-            logging.getLogger('pcfuzz').warning('[Exception] preflight complete; enabled=%s',
+            logging.getLogger('pcfuzz').warning('[Exception] preflight %s; enabled=%s',
+                'failed; campaign stopped' if self._exception_preserve else 'complete',
                 [] if self._exception_preserve else [p.name for p in self._exception_controller.profiles])
         return result
 

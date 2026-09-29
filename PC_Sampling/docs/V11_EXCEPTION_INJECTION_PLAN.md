@@ -511,3 +511,25 @@ v11 전송·calibration·종료·복구 테스트는 v11 모듈을 직접 검사
 2026-09-29 개발 기준 전환 검증: 공통 회귀 테스트를 v11 대상으로 실행해
 **465개 통과**(47.910초). v11 전송 함수에 메모리상 변조를 주면 AST 동결 검사가
 실패함을 별도로 확인했다. v10.3/v11 제품 코드 변경 없음.
+
+
+## 사전시험 실패 로그 판독 (2026-09-29)
+
+일반 로그에도 profile 시작, 단계 시작/완료, 실행 argv, RDY 대기 시작·상태 변화·실패를
+출력한다. `capture`는 active가 해제된 뒤에도 마지막 실패 이벤트 ID/profile/stage를 유지한다.
+`preflight ... PASS`는 해당 profile 성공을 뜻하며 뒤 profile까지 성공했다는 의미가 아니다.
+실패 종료는 `preflight failed; campaign stopped`로 표시한다.
+
+`ready_timeout`의 `gate`와 마지막 관측을 확인한다:
+- `sysfs_unreadable`: DUT의 sysfs 정보를 읽지 못함(`sysfs_error`).
+- `driver_not_live`: Linux 컨트롤러 state가 live가 아님(`state`).
+- `device_node_missing`: 장치 노드가 없음(`device`, `node_exists`).
+- `show_regs_failed`: show-regs 실패(`show_regs_rc`, `stderr`).
+- `controller_rdy`: CSTS의 RDY/CFS 확인 단계(`csts`, `rdy`, `cfs`).
+
+`ready_timeout`만으로 펌웨어 hang이라고 단정하지 않는다. `exceptions.jsonl`의 마지막
+`preflight_start`, `step_start`, `action_command`, `helper`, `ready_probe`, `preflight_failure`와
+덤프 폴더의 `exception.json`을 함께 확인한다. 추가 POR/reset이나 대기 예산 변경은 없다.
+
+진단 회귀 3개 추가(네 가지 RDY 대기 원인, 종료 후 이벤트 연결, helper 실행 전 argv 기록).
+전체 **468개 통과**(50.360초), `git diff --check` 통과. 실장치 확인은 미실시.
