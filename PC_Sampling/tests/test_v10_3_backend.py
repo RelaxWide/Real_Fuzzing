@@ -1615,21 +1615,21 @@ class FunnelIsPerTaskNotSummed(unittest.TestCase):
 
     def test_sample_size_is_not_hardcoded_at_the_call_site(self):
         import ast
-        src = (ROOT / 'pc_sampling_fuzzer_v10.3.py').read_text(encoding='utf-8')
+        src = (ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8')
         self.assertNotIn('_corpus_eval_stratified_sample(40)', src,
                          '표본 수가 여전히 하드코딩이다')
         self.assertIn('_corpus_eval_stratified_sample(CORPUS_EVAL_SAMPLE)', src)
 
     def test_generator_budget_squeeze_is_visible(self):
         """generators 는 seeds 와 같은 예산을 나눠 쓴다 — 버려진 수가 보여야 한다."""
-        src = (ROOT / 'pc_sampling_fuzzer_v10.3.py').read_text(encoding='utf-8')
+        src = (ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8')
         self.assertIn('generator_variants_budgeted_out', src,
                       '버려진 generator 변형이 어디에도 보고되지 않는다')
         self.assertIn('gen버려짐', src)
 
     def test_summary_is_two_lines_not_one_per_task(self):
         import ast
-        src = (ROOT / 'pc_sampling_fuzzer_v10.3.py').read_text(encoding='utf-8')
+        src = (ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8')
         self.assertIn('[LLM/task] ', src)
         # task 별로 log 를 따로 찍으면 줄이 길어진다 — 한 줄에 join 해야 한다
         self.assertIn('" ".join(_parts)', src)

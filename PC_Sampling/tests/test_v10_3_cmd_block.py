@@ -13,13 +13,13 @@ import unittest
 import unittest.mock
 from unittest.mock import Mock
 
-from test_v10_2_learning import ROOT, fuzzer      # noqa: F401
+from test_v10_2_learning import ROOT, fuzzer, harness      # noqa: F401
 
 RC_SKIP = fuzzer.NVMeFuzzer.RC_SKIP
 
 
 def _stub():
-    obj = fuzzer.NVMeFuzzer.__new__(fuzzer.NVMeFuzzer)
+    obj = harness()
     obj._max_xfer_bytes = lambda: 4096
     obj._excluded_opcodes = frozenset()
     obj._active_nsids = None

@@ -42,7 +42,7 @@ def env_setdefault_line(path):
 
 
 class LimitIsSetBeforeNumpy(unittest.TestCase):
-    FILES = ('pc_sampling_fuzzer_v10.3.py', 'rag/rag_retrieval.py', 'tools/rag_ingest.py')
+    FILES = ('pc_sampling_fuzzer_v11.py', 'rag/rag_retrieval.py', 'tools/rag_ingest.py')
 
     def test_every_numpy_user_sets_the_limit_first(self):
         for rel in self.FILES:
@@ -87,7 +87,7 @@ class ImportingTheFuzzerLimitsBlas(unittest.TestCase):
             "patcher = patch.object(sys, 'argv', ['x']); patcher.start();"
             "spec.loader.exec_module(m); patcher.stop();"
             "print(os.environ.get('OPENBLAS_NUM_THREADS'), 'numpy' in sys.modules)"
-        ) % (str(ROOT), str(ROOT / 'pc_sampling_fuzzer_v10.3.py'))
+        ) % (str(ROOT), str(ROOT / 'pc_sampling_fuzzer_v11.py'))
         out = subprocess.run([sys.executable, '-c', code], capture_output=True,
                              text=True, timeout=180, env={'PATH': '/usr/bin:/bin'})
         self.assertEqual(out.returncode, 0, out.stderr[-800:])

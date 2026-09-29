@@ -41,7 +41,7 @@ class PreflightTests(unittest.TestCase):
             config['rag']['vllm']['retrieval'].update(enabled=True, index_dir=str(root), embed_model_revision='new')
             path = root / 'config.json'
             path.write_text(json.dumps(config))
-            result = subprocess.run([sys.executable, str(ROOT / 'pc_sampling_fuzzer_v10.3.py'),
+            result = subprocess.run([sys.executable, str(ROOT / 'pc_sampling_fuzzer_v11.py'),
                                      '--config', str(path), '--rag'], capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn('revision 불일치', result.stderr)

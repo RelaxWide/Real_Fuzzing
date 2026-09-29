@@ -159,7 +159,7 @@ class UhubctlOnlyWhenLocationIsGiven(unittest.TestCase):
 class WiredAsTheLastRung(unittest.TestCase):
     def test_reconnect_calls_it_only_after_every_restart_failed(self):
         import ast
-        src = (ROOT / 'pc_sampling_fuzzer_v10.3.py').read_text(encoding='utf-8')
+        src = (ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8')
         tree = ast.parse(src)
         # _reconnect 는 여러 개다(기반 클래스의 no-op 포함). attempts 를 받는 실물만.
         fn = next(n for n in ast.walk(tree)

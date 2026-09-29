@@ -49,7 +49,7 @@ class ResolutionTests(unittest.TestCase):
 
     def test_all_schema_audit_includes_non_requested_commands(self):
         from tools.rag_field_audit import read_schemas
-        schemas = read_schemas(Path(__file__).resolve().parents[1] / 'pc_sampling_fuzzer_v10.3.py')
+        schemas = read_schemas(Path(__file__).resolve().parents[1] / 'pc_sampling_fuzzer_v11.py')
         lookup, _ = p.definition_lookup([])
         report = p.expansion_report(list(schemas), schemas, lookup, True)
         self.assertEqual(report['missing_count'], sum(map(len, schemas.values())))

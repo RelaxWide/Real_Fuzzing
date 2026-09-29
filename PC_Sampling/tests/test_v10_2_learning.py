@@ -18,9 +18,10 @@ from rag.rag_schema import SchemaBridge
 from riscv_cov import CoreMap, CoverageModel, pack
 
 # 활성 실행 파일의 단일 출처. 버전업 시 이 한 줄만 바꾼다.
-FUZZER_FILE = ROOT / 'pc_sampling_fuzzer_v10.3.py'
+FUZZER_FILE = ROOT / 'pc_sampling_fuzzer_v11.py'
 # 장치 경로 AST 는 과거 버전까지 같은 기준선으로 계속 검사한다(아래 고정 기준선 시험).
-DEVICE_AST_FILES = (ROOT / 'pc_sampling_fuzzer_v10.2.py', FUZZER_FILE)
+DEVICE_AST_FILES = (ROOT / 'pc_sampling_fuzzer_v10.2.py',
+                    ROOT / 'pc_sampling_fuzzer_v10.3.py', FUZZER_FILE)
 
 # Import the real entrypoint with CLI argv isolated; __main__ never executes.
 spec = importlib.util.spec_from_file_location('fuzzer_active_test', FUZZER_FILE)
@@ -42,6 +43,14 @@ def recipe():
 
 def harness(options=None):
     obj = fuzzer.NVMeFuzzer.__new__(fuzzer.NVMeFuzzer)
+    # __new__ bypasses v11's constructor; default to disabled injection.
+    obj._exception_controller = None
+    obj._exception_preserve = obj._exception_interrupted = False
+    obj._exception_window_truncated = obj._exception_recovery_window = False
+    obj._exception_recovery_remaining = obj._exception_recovery_until = 0
+    obj._exception_recovery_event = None
+    obj._exception_pm_depth = obj._exception_epoch = 0
+    obj._exception_sequence_events = []
     obj.learning = LearningState(options)
     obj._learning_apply_ctx = {}
     obj._learning_sequence = None
@@ -373,7 +382,7 @@ class IntegrationTests(unittest.TestCase):
                 obj = fuzzer.NVMeFuzzer(config)
             # 리터럴 대신 파일명에서 유도한다 — 버전업 때 안 고쳐도 되고, 파일명과
             # FUZZER_VERSION 이 어긋나는 실제 버그(복사 후 상수 미수정)를 잡는다.
-            expected = re.search(r'_v(\d+\.\d+)\.py$', FUZZER_FILE.name).group(1)
+            expected = re.search(r'_v(\d+(?:\.\d+)*)\.py$', FUZZER_FILE.name).group(1)
             self.assertTrue(obj.VERSION.startswith(expected + '.'),
                             f'{FUZZER_FILE.name} vs FUZZER_VERSION={obj.VERSION}')
             self.assertTrue(obj.learning.enabled)

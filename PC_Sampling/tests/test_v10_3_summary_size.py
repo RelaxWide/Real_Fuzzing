@@ -70,7 +70,7 @@ class NsidDistributionIsCapped(unittest.TestCase):
 
 class SummaryCodeUsesTheCap(unittest.TestCase):
     def test_summary_path_uses_the_helper(self):
-        src = (ROOT / 'pc_sampling_fuzzer_v10.3.py').read_text(encoding='utf-8')
+        src = (ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8')
         self.assertIn('_fmt_nsid_dist(stats.get(', src, '요약이 헬퍼를 안 쓴다')
         self.assertNotIn("for n, count in sorted(stats['actual_nsid_dist'].items())", src,
                          '여전히 전량 나열한다')
