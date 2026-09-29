@@ -338,15 +338,15 @@ class Runner(unittest.TestCase):
 
 
 class RealTransportIntegration(unittest.TestCase):
-    """Exercise the real v10.3 Popen hook with the v11 mixin, not a copy."""
+    """Exercise the standalone v11 transport and exception mixin."""
     def setUp(self):
-        from test_v10_2_learning import fuzzer, harness
-        from exception_control import make_fuzzer
+        from test_v10_2_learning import harness
+        import pc_sampling_fuzzer_v11 as fuzzer
         from collections import Counter, deque
         self.base = fuzzer
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        cls = make_fuzzer(fuzzer.NVMeFuzzer, {})
+        cls = fuzzer.NVMeFuzzer
         self.f = cls.__new__(cls)
         self.f.__dict__.update(harness().__dict__)
         f = self.f
@@ -506,10 +506,9 @@ class RealTransportIntegration(unittest.TestCase):
 
 class CampaignRegression(unittest.TestCase):
     def test_calibration_interruption_then_real_timeout_is_captured(self):
-        from test_v10_2_learning import fuzzer
-        from exception_control import make_fuzzer
+        import pc_sampling_fuzzer_v11 as fuzzer
         with tempfile.TemporaryDirectory() as d:
-            cls = make_fuzzer(fuzzer.NVMeFuzzer, {})
+            cls = fuzzer.NVMeFuzzer
             config = fuzzer.FuzzConfig(no_jlink=True, rag_enabled=False, state_enabled=False,
                                        output_dir=d, calibration_runs=2)
             with patch.object(cls, '_load_static_analysis'), patch.object(cls, '_load_riscv_coverage'):
@@ -526,10 +525,9 @@ class CampaignRegression(unittest.TestCase):
             self.assertEqual(f.stats['exception_interrupted'], 1)
 
     def test_truncated_calibration_excludes_only_incomplete_observation(self):
-        from test_v10_2_learning import fuzzer
-        from exception_control import make_fuzzer
+        import pc_sampling_fuzzer_v11 as fuzzer
         with tempfile.TemporaryDirectory() as d:
-            cls = make_fuzzer(fuzzer.NVMeFuzzer, {})
+            cls = fuzzer.NVMeFuzzer
             config = fuzzer.FuzzConfig(no_jlink=True, rag_enabled=False, state_enabled=False,
                                        output_dir=d, calibration_runs=2)
             with patch.object(cls, '_load_static_analysis'), patch.object(cls, '_load_riscv_coverage'):
@@ -553,11 +551,10 @@ class CampaignRegression(unittest.TestCase):
             self.assertTrue(f._learning_window_valid)
 
     def test_calibration_completion_retires_flags_before_pm(self):
-        from test_v10_2_learning import fuzzer
-        from exception_control import make_fuzzer
+        import pc_sampling_fuzzer_v11 as fuzzer
         for mode in ('interrupted', 'truncated', 'recovery'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
-                cls = make_fuzzer(fuzzer.NVMeFuzzer, {})
+                cls = fuzzer.NVMeFuzzer
                 config = fuzzer.FuzzConfig(no_jlink=True, rag_enabled=False, state_enabled=False,
                                            output_dir=d, calibration_runs=1)
                 with patch.object(cls, '_load_static_analysis'), patch.object(cls, '_load_riscv_coverage'):
@@ -588,7 +585,7 @@ class CampaignRegression(unittest.TestCase):
 
     def run_ast(self):
         import ast
-        from test_v10_2_learning import fuzzer
+        import pc_sampling_fuzzer_v11 as fuzzer
         tree = ast.parse(Path(fuzzer.__file__).read_text())
         base = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == '_V101Fuzzer')
         return ast, fuzzer, next(n for n in base.body if isinstance(n, ast.FunctionDef) and n.name == 'run')

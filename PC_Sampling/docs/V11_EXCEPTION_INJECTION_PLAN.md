@@ -31,26 +31,22 @@ Linux NVMe 드라이버의 reset_prepare/reset_done은 I/O 정리와 재초기�
 
 ## 파일 구성
 
-| 파일 | 줄 | 역할 |
-|---|---|---|
-| `pc_sampling_fuzzer_v11.py` | 14 | 진입점. **명령 전송 코드가 없다** — `runpy.run_path` 로 v10.3 을 그대로 실행하고 `_ENTRY_VERSION='11.0.0'`, `_FUZZER_FACTORY=make_fuzzer` 만 주입한다 |
-| `exception_control.py` | 813 | profile 컴파일, 스케줄러, `ExceptionFuzzerMixin`, `make_fuzzer` |
-| `exception_probe.py` | 79 | 하드웨어 조회 순수 함수 — `gpio_value`, `register_value`, `pci_method_support`, `subsystem_support`. import 시 장치를 건드리지 않는다 |
-| `tests/test_v11_exceptions.py` | 423 | 32건 |
-| `tests/test_v11_preflight.py` | 219 | 19건 |
+| 파일 | 역할 |
+|---|---|
+| `pc_sampling_fuzzer_v11.py` | 독립 퍼징 엔진·CLI. 명령 생성·전송·가드·샘플링·LLM·PM·종료 처리 포함. v10.3 파일을 로드하지 않는다 |
+| `exception_control.py` | profile 컴파일, 스케줄러, 사전시험, 불량 보존, 복구, `ExceptionFuzzerMixin` |
+| `exception_probe.py` | 하드웨어 조회 순수 함수. import 시 장치를 건드리지 않는다 |
+| `tests/test_v11_*.py` | 예외 제어·실제 v11 전송·복구·독립 실행 회귀 테스트 |
 
-```python
-def make_fuzzer(base, config):
-    return type('NVMeFuzzerV11', (ExceptionFuzzerMixin, base), {'exception_config': config})
-```
+MRO는 `NVMeFuzzer → ExceptionFuzzerMixin → LearningMixin → _V101Fuzzer`다.
+`_V101Fuzzer`는 v11 파일 내부에 포함된 엔진이다. v10.3에서 검증된 가드·LLM·PM 구현을
+v11에 포함했으며, v10.3 파일을 수정해도 v11에 자동 반영되지 않는다.
+`strategy.blocked_cdw_rules`(0xC0+CDW12=0x2 차단), `excluded_opcodes`,
+`blocked_admin_opcodes`와 기존 LLM 프롬프트 필터·task 회전판을 유지한다.
+예외 mixin은 v11 내부 전송 구현에 `super()`로 위임해 동일한 가드를 통과한다.
 
-MRO 는 `NVMeFuzzerV11 → ExceptionFuzzerMixin → NVMeFuzzer → LearningMixin` 이다.
-**v10.3 의 모든 가드·설정이 그대로 상속된다** — `strategy.blocked_cdw_rules`(0xC0+CDW12=0x2
-디버그 포트 폐쇄 차단), `excluded_opcodes`, `blocked_admin_opcodes`, LLM 프롬프트 후보 필터,
-task 회전판 수정이 v11 에서 따로 할 일 없이 적용된다. mixin 의 `_send_nvme_command` 는
-`_exception_preserve` 일 때 `RC_EXCEPTION` 으로 조기 반환(= 아무것도 안 보냄)할 뿐,
-나머지는 `super()` 위임이라 가드를 건너뛰지 않는다. v10.3 과 v11 클래스로 같은 명령을
-넣어 `RC_SKIP(-1003)` + `blocked_cdw_rule` 카운터가 동일함을 확인했다.
+배포 시 `pc_sampling_fuzzer_v11.py`, 예외 모듈 2개와 기존 공통 모듈·설정·제품 자산을
+함께 둔다. **`pc_sampling_fuzzer_v10.3.py` 및 다른 구버전 퍼저 파일은 필요 없다.**
 
 ## 설정 표면 — `exceptions` 절
 
@@ -340,7 +336,7 @@ worktree 에서 전체 358개 통과 확인). 로컬 `main` ref 는 여전히 �
 
 ### ⚠ 2026-09-29 — 다른 세션의 v10.3 수정 (LLM 지시 준수 3건, `d9cb5d1` push 완료)
 
-`RUNBOOK_v10.3.md` §6-11. v11 은 v10.3 을 그대로 실행하므로 자동 적용된다. v11 코드 수정 불필요.
+`RUNBOOK_v10.3.md` §6-11. 독립화 시점의 LLM 변경을 v11 엔진에도 포함했다. 이후 변경은 버전별로 명시적으로 반영해야 한다.
 v11 hunk 13개는 제외하고 이 변경 hunk 16개만 담았다(임시 worktree 에서 377개 통과 확인). 로컬 `main` ref 는 그대로 — `git reset --mixed origin/main` 절차 유효.
 
 - `pc_sampling_fuzzer_v10.3.py`: `RAG_FOCUS_COMMANDS`/`RAG_FOCUS_POOL`, `_llm_pairs_hook`/
@@ -473,3 +469,19 @@ OpenOCD 점유를 해제하고, Debug Tool 전에 필요한 JLink 세션을 닫�
 
 게시 전 검증: 원격 `d9cb5d1`에 v11을 합친 작업 공간에서 전체 unittest **464개 통과**
 (46.630초). Python 구문 검사와 `git diff --check` 통과.
+
+
+## 2026-09-29 독립 버전으로 전환
+
+v11 진입점에서 v10.3 파일을 runpy로 실행하던 구조를 제거했다. v11 파일이 전체 엔진을
+포함하고 `NVMeFuzzer(ExceptionFuzzerMixin, LearningMixin, _V101Fuzzer)`로 직접 구성된다.
+버전은 `11.0.0`으로 고정하며 차트 자식 프로세스도 v11 파일을 다시 실행한다.
+예외 제어·학습·제품 모듈 등 공통 의존성은 유지하지만 구버전 퍼저 파일은 필요 없다.
+
+검증: 구버전 퍼저 파일을 모두 제외한 임시 배포 폴더에서 `--help`, 엔진 생성,
+예외 주입 비활성/활성 초기화와 실제 전송 가드의 `RC_SKIP` 반환을 확인했다.
+v11 전송·calibration·종료·복구 테스트는 v11 모듈을 직접 검사한다. 엔진의 함수·클래스
+67개는 기존 검증된 구현과 AST 동등함을 확인했다(새 클래스 구성과 버전 상수 제외).
+
+독립화 후 전체 unittest **465개 통과**(46.613초). Python 구문 검사와
+`git diff --check` 통과. 실장치 검증은 미실시.

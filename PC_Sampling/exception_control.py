@@ -600,7 +600,7 @@ class ExceptionController:
 
 
 class ExceptionFuzzerMixin:
-    """Small v11 integration surface over the unchanged v10.3 command builders.
+    """Exception integration over the command builders embedded in the v11 engine.
 
     No command-name allowlist: every command reaching the common transport can
     be interrupted. Existing user-selected commands and transport guards remain.

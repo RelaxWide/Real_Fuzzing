@@ -233,7 +233,7 @@ class Integration(unittest.TestCase):
         from unittest.mock import patch
         def finalize():
             self.assertFalse(f._seq_sink['interesting'])
-        with patch.object(self.case.base.NVMeFuzzer, '_finalize_seq_sink', side_effect=finalize):
+        with patch.object(self.case.base._V101Fuzzer, '_finalize_seq_sink', side_effect=finalize):
             f._finalize_seq_sink()
 
     def test_time_window_and_guard_do_not_consume_command_quota(self):
@@ -339,7 +339,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(f._crash_nvme_pid, 42)
         # The timeout must go through the existing base crash accounting branch.
         from unittest.mock import patch
-        with patch.object(self.case.base.NVMeFuzzer, '_account_command', return_value=(False, 0, 'break')) as base:
+        with patch.object(self.case.base._V101Fuzzer, '_account_command', return_value=(False, 0, 'break')) as base:
             self.assertEqual(f._account_command(self.seed, b'', f.RC_TIMEOUT, 0)[2], 'break')
         base.assert_called_once()
 
