@@ -51,9 +51,11 @@ class Diagnostics(unittest.TestCase):
                         with self.assertRaisesRegex(ExceptionFailure, gate):
                             self.c.wait_ready(0.1)
                 text = '\n'.join(logs.output)
-                self.assertIn('preflight-flr ready_timeout', text)
-                self.assertIn('ready_after_profile', text)
-                self.assertIn(gate, text)
+                self.assertIn('[ready]', text)
+                self.assertIn('한도 초과', text)
+                # 사람용 줄에 JSON 덤프가 새지 않는다
+                self.assertNotIn('{"', text)
+                self.assertNotIn('\\"', text)
                 if state != 'live' or not exists:
                     self.c.runner.run.assert_not_called()
                 rows = [json.loads(line) for line in self.c.log_path.read_text().splitlines()]
@@ -65,8 +67,8 @@ class Diagnostics(unittest.TestCase):
     def test_capture_keeps_event_after_active_cleared(self):
         self.c.active = None
         with self.assertLogs('pcfuzz', level='WARNING') as logs:
-            self.c.emit('capture', reason='timeout')
-        self.assertIn('preflight-flr capture', '\n'.join(logs.output))
+            self.c.emit('capture', reason='timeout', directory='out/crashes/exception_x')
+        self.assertIn('증거 폴더: out/crashes/exception_x', '\n'.join(logs.output))
         row = json.loads(self.c.log_path.read_text())
         self.assertEqual(row['event_id'], 'preflight-flr')
         self.assertEqual(row['action'], 'flr')
@@ -81,5 +83,4 @@ class Diagnostics(unittest.TestCase):
         with self.assertLogs('pcfuzz', level='WARNING') as logs:
             with self.assertRaisesRegex(ExceptionFailure, 'helper stopped'):
                 self.c._action('controller_reset', 1)
-        self.assertIn('action_command', '\n'.join(logs.output))
-        self.assertIn('"nvme", "reset"', '\n'.join(logs.output))
+        self.assertIn('controller_reset : nvme reset', '\n'.join(logs.output))

@@ -249,7 +249,7 @@ class Readiness(unittest.TestCase):
             ctrl.runner = Mock()
             ctrl.runner.run.return_value = (0, b'{"csts":0}', b'')
             with patch('pc_sampling_fuzzer_v11.Path.exists', return_value=True):
-                with self.assertRaisesRegex(ExceptionFailure, 'deadline'):
+                with self.assertRaisesRegex(ExceptionFailure, '준비 시간 초과.*RDY=0.*gate=controller_rdy'):
                     ctrl.wait_ready(ctrl.clock() + 0.01)
 
 

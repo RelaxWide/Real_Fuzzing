@@ -1809,7 +1809,7 @@ class _FuzzingTerminalFilter(logging.Filter):
     _ALLOW = _re.compile(
         r'\[Stats\]|\[StatCov\]|\[PM\]|\[\+\]|CRASH|FAIL CMD|={5,}'
         r'|\[NVMe TIMEOUT\]|\[TIMEOUT\]|\[REPLAY\]|\[UFAS\]|\[DebugTool\]|\[State-Replay\]'
-        r'|\[Exception\]|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]|\[BootSweep\]|\[Probe-'
+        r'|\[Exception|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]|\[BootSweep\]|\[Probe-'
         r'|\[State-Snap\]|\[SMART\]'   # v8.3: 주기적 SMART/전체 state field 출력 터미널 노출
         r'|\[IO-WL\]'                   # v8.4: IO 워크로드 블록/검증 로그
         r'|\[DevInfo\]'                 # Device Information(주기 출력) 터미널 노출
@@ -20177,21 +20177,245 @@ class ExceptionController:
             if key in context:
                 row[key] = context[key]
         row.update(fields)
-        visible = ('armed', 'preflight_start', 'preflight', 'preflight_failure',
-                   'preflight_complete', 'step_start', 'step_end', 'action_command',
-                   'ready_wait', 'ready_state', 'ready_timeout', 'ready_complete',
-                   'begin', 'resumed', 'preserved_failure', 'capture', 'restore_failed',
-                   'helper_pending')
-        if phase in visible:
+        try:
+            self._present(phase, row)
+        except Exception as exc:          # 표시 실패가 예외 제어를 막으면 안 된다
             import logging
-            details = {k: v for k, v in row.items()
-                       if k not in ('event_id', 'phase', 'monotonic', 'options', 'profiles')}
-            logging.getLogger('pcfuzz').warning('[Exception] %s %s %s',
-                event_id or 'preflight-baseline', phase,
-                json.dumps(details, ensure_ascii=False, default=str))
+            logging.getLogger('pcfuzz').warning('[Exception] %s %s (표시 오류: %s)',
+                                                event_id or '-', phase, exc)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(row, ensure_ascii=False, default=str) + '\n')
+
+    # ── 사람이 읽는 출력 ────────────────────────────────────────────────
+    # exceptions.jsonl 은 기계용 원본(모든 필드)이다. 텍스트 로그·터미널에는 사람이 읽고
+    # 옮겨 적을 수 있게 **값만 정돈해** 찍는다 — JSON·중괄호·따옴표를 그대로 내보내지 않는다.
+    # 사전시험은 터미널 필터가 켜지기 전이라 --pm preflight 처럼 들여쓰기 줄을 쓰고,
+    # 캠페인 중 주입 이벤트는 필터를 통과하도록 모든 줄에 [Exception] 을 붙인다.
+    _RULE = "=" * 60
+    _STATUS_TEXT = {'PASS': 'PASS', 'FAIL_PRESERVED': 'FAIL', 'UNSUPPORTED': '지원 안 됨',
+                    'UNCONFIGURED': '설정 없음', 'UNVERIFIED': '미검증', 'NOT_RUN': '미실행'}
+    _FEATURE_TEXT = {0x0c: 'APST', 0x0f: 'Keep Alive', 0x02: 'Power Mgmt(PS)'}
+
+    def _say(self, text, error=False):
+        import logging
+        lg = logging.getLogger('pcfuzz')
+        (lg.error if error else lg.warning)(text)
+
+    def _line(self, text, error=False):
+        """사전시험 중엔 --pm 처럼 들여쓰기 줄, 캠페인 중엔 [Exception] 태그 줄."""
+        if getattr(self, '_in_preflight', False):
+            self._say(text, error)
+        else:
+            self._say('[Exception]' + (text if text.startswith(' ') else ' ' + text), error)
+
+    def _describe_argv(self, action, argv):
+        """실행 명령을 사람이 옮겨 적을 수 있는 한 줄로. python -c 도우미는 뜻으로 바꾼다."""
+        if not argv:
+            return str(action)
+        if len(argv) > 3 and argv[1] == '-c':
+            if action in ('flr', 'hot_reset'):
+                method = argv[4] if len(argv) > 4 else '?'
+                return f"sysfs PCI reset (reset_method={method}) {argv[3]}"
+            return f"echo 1 > {argv[3]}"
+        out = []
+        for a in argv:
+            if a == sys.executable:
+                out.append('python3')
+            elif self.pmu_script and a == self.pmu_script:
+                out.append(Path(a).name)
+            else:
+                out.append(str(a))
+        return ' '.join(out)
+
+    def _describe_observation(self, obs):
+        gate = obs.get('gate')
+        dev = obs.get('device') or self.device
+        moved = f" (노드 {dev})" if dev and dev != getattr(self, '_armed_device', dev) else ""
+        if gate == 'sysfs_unreadable':
+            return f"sysfs 읽기 실패 — {obs.get('sysfs_error')}"
+        if gate == 'driver_not_live':
+            return f"driver={obs.get('state')} (live 아님){moved}"
+        if gate == 'device_node_missing':
+            return f"driver=live 인데 {dev} 노드 없음"
+        if gate == 'show_regs_failed':
+            err = (obs.get('stderr') or '').strip().splitlines()
+            return (f"driver=live, show-regs 실패 rc={obs.get('show_regs_rc')}"
+                    + (f" — {err[0][:120]}" if err else ""))
+        if gate == 'controller_rdy':
+            if 'csts' in obs:
+                return (f"driver=live CSTS=0x{obs['csts']:08x} "
+                        f"RDY={int(bool(obs.get('rdy')))} CFS={int(bool(obs.get('cfs')))}{moved}")
+            return f"driver=live, CSTS 확인 전{moved}"
+        if gate == 'deadline_before_first_probe':
+            return "첫 확인 전에 한도 도달"
+        return str(gate)
+
+    def _present(self, phase, row):
+        h = getattr(self, '_show_' + phase, None)
+        if h is not None:
+            h(row)
+
+    # 공통
+    def _show_armed(self, r):
+        self._armed_device = r.get('device')
+        names = ', '.join(p['name'] if isinstance(p, dict) else str(p) for p in r.get('profiles') or [])
+        self._say(f"[Exception] 대상 DUT: {r.get('serial')} @ {r.get('bdf')} ({r.get('device')}) "
+                  f"— profile: {names}")
+
+    def _show_action_command(self, r):
+        self._step_t0 = self.clock()
+        idx, total = r.get('index'), getattr(self, '_step_total', None)
+        if getattr(self, '_restoring', False):
+            pos = "[restore]"
+        else:
+            pos = (f"[step {idx + 1}/{total}]" if isinstance(idx, int) and total
+                   else "[cmd]")
+        self._line(f"    {pos} {r.get('action')} : {self._describe_argv(r.get('action'), r.get('argv'))}")
+
+    def _show_step_end(self, r):
+        dt = self.clock() - getattr(self, '_step_t0', self.clock())
+        hold = r.get('hold')
+        self._line(f"      완료 ({dt:.1f}s)" + (f", 유지 {hold:g}s" if hold else ""))
+
+    def _show_gpio_readback(self, r):
+        ok = r.get('value') == r.get('expected')
+        self._line(f"      readback GPIO={r.get('value')} (기대 {r.get('expected')}) "
+                   f"{'OK' if ok else '불일치'}")
+
+    def _show_ready_wait(self, r):
+        self._ready_t0 = self.clock()
+        self._line(f"    [ready] 장치 준비 대기 (한도 {r.get('remaining_sec', 0):.0f}s)")
+
+    def _ready_dt(self):
+        return self.clock() - getattr(self, '_ready_t0', self.clock())
+
+    def _show_ready_state(self, r):
+        self._line(f"    [ready] {self._ready_dt():5.1f}s  {self._describe_observation(r)}")
+
+    def _show_ready_complete(self, r):
+        self._line(f"    [ready] {self._ready_dt():5.1f}s  준비 완료 — {self._describe_observation(r)}")
+
+    def _show_ready_timeout(self, r):
+        self._line(f"    [ready] {self._ready_dt():5.1f}s  한도 초과 — {self._describe_observation(r)}",
+                   error=True)
+
+    def _show_resume_feature(self, r):
+        name = self._FEATURE_TEXT.get(r.get('fid'), f"FID {r.get('fid')}")
+        if r.get('status') == 'UNSUPPORTED':
+            self._line(f"    [restore] {name}: 미지원 — 건너뜀")
+        else:
+            self._line(f"    [restore] {name}: {r.get('before')} → {r.get('after')} 확인")
+
+    def _show_restore_supply(self, r):
+        self._line(f"    [restore] 공급 복원: {r.get('action')}")
+
+    def _show_restore_failed(self, r):
+        self._line(f"    ⚠ 전원/PERST 복원 실패: {r.get('reason')}", error=True)
+
+    def _show_helper_pending(self, r):
+        self._line(f"    ⚠ 한도 안에 끝나지 않은 명령 — PID {r.get('pid')} 잔존: "
+                   f"{self._describe_argv(r.get('action'), r.get('argv'))}", error=True)
+
+    def _show_capture(self, r):
+        self._say(f"[Exception] 증거 폴더: {r.get('directory')}")
+
+    # 사전시험
+    def _show_preflight_begin(self, r):
+        self._say(self._RULE)
+        self._say(f"[Exception-Preflight] 예외 profile 사전 검증 시작 ({r.get('total')}개)")
+        self._say(f"  DUT: {self.serial} @ {self.bdf} ({self.device})")
+        self._say(self._RULE)
+
+    def _show_preflight_capability(self, r):
+        st = r.get('status')
+        avail = '가능' if st == 'AVAILABLE' else self._STATUS_TEXT.get(st, st)
+        self._say(f"  [{r.get('index')}/{r.get('total')}] {r.get('profile'):<18} 지원: {avail}"
+                  + ("" if st == 'AVAILABLE' else f" — {r.get('reason')}"))
+
+    def _show_preflight_start(self, r):
+        if r.get('attempts', 1) > 1:
+            self._say(f"    (시도 {r.get('attempt')}/{r.get('attempts')})")
+
+    def _show_preflight_identify(self, r):
+        self._say(f"    [check] Identify serial 일치 ({r.get('serial')})")
+
+    def _show_preflight_resumed(self, r):
+        self._say("    [check] 환경 복원·샘플러 재연결 OK")
+
+    def _show_preflight(self, r):
+        st = r.get('status')
+        if r.get('profile') == 'refclk_toggle':
+            return                              # 요약표에만 싣는다
+        if st == 'PASS':
+            self._say(f"    → PASS  ({r.get('elapsed_sec', 0):.1f}s)")
+        elif st == 'UNVERIFIED':
+            self._say("    → 미검증 (능동 시험을 설정으로 끔 — 지원 여부만 확인)")
+        else:
+            self._say(f"    → 건너뜀 ({self._STATUS_TEXT.get(st, st)})")
+
+    def _show_preflight_failure(self, r):
+        self._say(f"    → FAIL — 현상 보존  ({r.get('elapsed_sec', 0):.1f}s)", error=True)
+        self._say(f"      원인: {r.get('reason')}", error=True)
+        self._preflight_summary(failed=True)
+
+    def _show_preflight_complete(self, r):
+        self._preflight_summary(failed=False)
+
+    @staticmethod
+    def _pad(text, width, right=False):
+        """터미널 표시 폭 기준 패딩 — 한글은 두 칸을 차지해 str.ljust 로는 열이 어긋난다."""
+        import unicodedata
+        text = str(text)
+        w = sum(2 if unicodedata.east_asian_width(ch) in 'WF' else 1 for ch in text)
+        fill = ' ' * max(0, width - w)
+        return fill + text if right else text + fill
+
+    def _preflight_summary(self, failed):
+        rows = getattr(self, '_pf_rows', [])
+        P = self._pad
+        self._say(self._RULE)
+        self._say("[Exception-Preflight] 결과 요약")
+        self._say(f"  {P('Profile', 18)} {P('결과', 10)} {P('시간', 7, True)}  사유")
+        self._say("  " + "-" * 58)
+        for name, st, dt, reason in rows:
+            t = f"{dt:6.1f}s" if dt is not None else ""
+            self._say(f"  {P(name, 18)} {P(self._STATUS_TEXT.get(st, st), 10)} {P(t, 7, True)}  {reason}")
+        self._say("  " + "-" * 58)
+        tried = [r for r in rows if r[1] in ('PASS', 'FAIL_PRESERVED', 'UNVERIFIED')]
+        passed = [r for r in rows if r[1] in ('PASS', 'UNVERIFIED')]
+        if failed:
+            self._say(f"[Exception-Preflight] 통과 {len(passed)}/{len(tried)} — 실패로 캠페인 중단 "
+                      f"(복구 POR/리셋 없음, 현상 보존)", error=True)
+        elif passed:
+            self._say(f"[Exception-Preflight] 통과 {len(passed)}/{len(tried)} — 주입 후보: "
+                      + ', '.join(r[0] for r in passed))
+        else:
+            self._say("[Exception-Preflight] 주입 가능한 profile 없음 — 일반 퍼징만 진행")
+        self._say(self._RULE)
+
+    # 캠페인 중 주입
+    def _show_begin(self, r):
+        self._event_t0 = self.clock()
+        ctx = r.get('context') or {}
+        cmd = ctx.get('command') or {}
+        name = cmd.get('command') if isinstance(cmd, dict) else cmd
+        prof = r.get('profile')
+        prof = prof.get('name') if isinstance(prof, dict) else prof
+        self._say(f"[Exception] {r.get('event_id')} {prof} 주입 — 명령 {name or '?'} 실행 중 "
+                  f"(exec {ctx.get('exec', '?')})")
+
+    def _show_resumed(self, r):
+        dt = self.clock() - getattr(self, '_event_t0', self.clock())
+        self._say(f"[Exception] {r.get('event_id')} 재개 OK — 끊긴 명령 rc={r.get('command_rc')} "
+                  f"({dt:.1f}s)")
+
+    def _show_preserved_failure(self, r):
+        self._say(f"[Exception] {r.get('event_id')} 실패 — 현상 보존, 캠페인 중단: {r.get('reason')}",
+                  error=True)
+
+    def _show_interrupted(self, r):
+        self._say(f"[Exception] {r.get('event_id')} 사용자 중단(Ctrl+C) — 현상 보존", error=True)
 
     def arm(self):
         ctrl = re.fullmatch(r'/dev/(nvme\d+)(?:n\d+)?', self.device)
@@ -20289,11 +20513,15 @@ class ExceptionController:
         if self.runner.has_pending(supply_only=True):
             raise ExceptionFailure('hardware helper still running; cannot race supply cleanup')
         deadline = self.clock() + self.cleanup_timeout
-        for action in self.options.get('restore_actions', []):
-            effect = action_effect(action, self.options.get('adapters', {}))
-            if (effect == 'power_on' and not self.powered) or (effect == 'deassert' and self.asserted):
-                self.emit('restore_supply', action=action)
-                self._action(action, deadline)
+        self._restoring = True
+        try:
+            for action in self.options.get('restore_actions', []):
+                effect = action_effect(action, self.options.get('adapters', {}))
+                if (effect == 'power_on' and not self.powered) or (effect == 'deassert' and self.asserted):
+                    self.emit('restore_supply', action=action)
+                    self._action(action, deadline)
+        finally:
+            self._restoring = False
         if not self.powered or self.asserted:
             raise ExceptionFailure('supply/assert state could not be restored')
 
@@ -20355,10 +20583,12 @@ class ExceptionController:
                 previous = observation.copy()
             time.sleep(min(0.05, max(0, deadline - self.clock())))
         self.emit('ready_timeout', elapsed_sec=self.clock() - started, **observation)
-        raise ExceptionFailure('CTRL RDY/recognition deadline exceeded: '
-                               + json.dumps(observation, ensure_ascii=False))
+        raise ExceptionFailure(f"준비 시간 초과({self.clock() - started:.0f}s): "
+                               f"{self._describe_observation(observation)} "
+                               f"[gate={observation.get('gate')}]")
 
     def _run_profile(self, profile):
+        self._step_total = len(profile.steps)
         deadline = self.clock() + profile.timeout_sec
         ready_deadline = None
         for index, (action, hold) in enumerate(profile.steps):
@@ -20378,7 +20608,7 @@ class ExceptionController:
             if ready_deadline is not None:
                 action_deadline = min(deadline, ready_deadline)
             self._action(action, action_deadline)
-            self.emit('step_end', index=index, action=action)
+            self.emit('step_end', index=index, action=action, hold=hold)
             if hold:
                 if self.clock() + hold > action_deadline:
                     raise ExceptionFailure('hold would exceed profile/RDY deadline')
@@ -20468,21 +20698,33 @@ class ExceptionController:
         trials = settings.get('attempts_per_kind', 1)
         if isinstance(trials, bool) or not isinstance(trials, int) or not 1 <= trials <= 10:
             raise ValueError('preflight.attempts_per_kind must be 1..10')
+        total = len(self.profiles)
+        # 요약표 행: (profile, 상태, 소요 s 또는 None, 사유). 실패 시 남은 profile 은 '미실행'.
+        self._pf_rows = [[p.name, 'NOT_RUN', None, ''] for p in self.profiles]
+        self._in_preflight = True
+        self._pf_t0 = self.clock()
         try:
+            self.emit('preflight_begin', total=total, names=[p.name for p in self.profiles])
             self.last_result = dict(event_id='preflight-baseline', phase='preflight', stage='baseline_ready')
+            self._say("  [기준] 시작 전 장치 준비 확인")
             self.wait_ready(self.clock() + min(p.ready_timeout_sec for p in self.profiles))
-            for profile in self.profiles:
+            for pos, profile in enumerate(self.profiles, 1):
                 self.active = 'preflight-' + profile.name
                 self.last_result = dict(event_id=self.active, profile=profile.name,
                                         phase='preflight', stage='capability')
+                self._pf_t0 = self.clock()
                 status, reason = self.capability(profile)
                 self.preflight_results[profile.name] = dict(status=status, reason=reason)
+                self.emit('preflight_capability', profile=profile.name, index=pos, total=total,
+                          status=status, reason=reason)
                 if status != 'AVAILABLE':
+                    self._pf_rows[pos - 1][1:] = [status, None, reason]
                     self.emit('preflight', profile=profile.name, status=status, reason=reason)
                     continue
                 if settings.get('enabled', True):
                     for attempt in range(trials):
-                        self.emit('preflight_start', profile=vars(profile), attempt=attempt + 1)
+                        self.emit('preflight_start', profile=vars(profile), attempt=attempt + 1,
+                                  attempts=trials)
                         self.last_result['stage'] = 'sampler_stop'
                         before()
                         self._run_profile(profile)
@@ -20490,17 +20732,24 @@ class ExceptionController:
                         rc, out, err = self.runner.run(['nvme', 'id-ctrl', self.device, '-o', 'json'],
                                                        self.clock() + profile.ready_timeout_sec)
                         if rc or json.loads(out).get('sn', '').strip() != self.serial:
-                            raise ExceptionFailure('preflight Identify failed or serial mismatch')
+                            raise ExceptionFailure('사전시험 Identify 실패 또는 serial 불일치 '
+                                                   f'(rc={rc})')
+                        self.emit('preflight_identify', serial=self.serial)
                         self.last_result['stage'] = 'environment_sampler_resume'
                         resumed()
-                    status, reason = 'PASS', 'profile applied; RDY, DUT identity, Identify and sampler verified'
+                        self.emit('preflight_resumed')
+                    status, reason = 'PASS', 'RDY·identity·Identify·환경 복원·샘플러 확인'
                 else:
-                    status, reason = 'UNVERIFIED', 'active trial disabled explicitly; capability only'
+                    status, reason = 'UNVERIFIED', '능동 시험 꺼짐 — 지원 여부만 확인'
                 self.preflight_results[profile.name] = dict(status=status, reason=reason)
-                self.emit('preflight', profile=profile.name, status=status, reason=reason)
+                self._pf_rows[pos - 1][1:] = [status, self.clock() - self._pf_t0, reason]
+                self.emit('preflight', profile=profile.name, status=status, reason=reason,
+                          elapsed_sec=self.clock() - self._pf_t0)
                 passed.append(profile)
             self.preflight_results['refclk_toggle'] = dict(status='UNCONFIGURED',
-                reason='no platform REFCLK control; CLKREQ is not direct REFCLK gating')
+                reason='플랫폼 REFCLK 제어 없음 (CLKREQ 는 REFCLK 직접 제어가 아님)')
+            self._pf_rows.append(['refclk_toggle', 'UNCONFIGURED', None,
+                                  self.preflight_results['refclk_toggle']['reason']])
             self.emit('preflight', profile='refclk_toggle', **self.preflight_results['refclk_toggle'])
             self.profiles = passed
             self.next_at = self.clock() + self.initial_delay if passed else float('inf')
@@ -20512,15 +20761,26 @@ class ExceptionController:
             self.last_result.update(outcome='preserved_failure', reason=str(exc))
             failed = self.last_result.get('profile', 'baseline')
             self.preflight_results[failed] = dict(status='FAIL_PRESERVED', reason=str(exc))
+            _dt = self.clock() - getattr(self, '_pf_t0', self.clock())
+            _row = next((r for r in self._pf_rows if r[0] == failed), None)
+            if _row is None:                      # 시작 전 기준 확인에서 실패
+                _row = ['(시작 전 기준)', 'NOT_RUN', None, '']
+                self._pf_rows.insert(0, _row)
+            _row[1:] = ['FAIL_PRESERVED', _dt, str(exc)[:80]]
+            for _r in self._pf_rows:
+                if _r[1] == 'NOT_RUN' and not _r[3]:
+                    _r[3] = '앞 profile 실패로 중단'
             self.next_at = float('inf')
             try:
                 self.restore_supply()
             except Exception as cleanup:
                 self.emit('restore_failed', reason=str(cleanup))
-            self.emit('preflight_failure', reason=str(exc), results=self.preflight_results)
+            self.emit('preflight_failure', reason=str(exc), results=self.preflight_results,
+                      elapsed_sec=_dt)
             raise
         finally:
             self.active = None
+            self._in_preflight = False
 
     def execute(self, process, context, before, resumed):
         """Called only after Popen. None means sampling was left untouched.
@@ -20636,10 +20896,15 @@ class ExceptionFuzzerMixin:
                 raise
             except Exception as exc:
                 self._exception_capture(exc)
-            import logging
-            logging.getLogger('pcfuzz').warning('[Exception] preflight %s; enabled=%s',
-                'failed; campaign stopped' if self._exception_preserve else 'complete',
-                [] if self._exception_preserve else [p.name for p in self._exception_controller.profiles])
+            if not self._exception_preserve:
+                import logging
+                _c = self._exception_controller
+                _names = [p.name for p in _c.profiles]
+                logging.getLogger('pcfuzz').warning(
+                    '[Exception] 사전시험 완료 — 주입 후보: %s%s',
+                    ', '.join(_names) or '없음(일반 퍼징만)',
+                    f' (첫 주입은 {_c.initial_delay / 60:g}분 뒤, 이후 최소 {_c.interval / 60:g}분 간격)'
+                    if _names else '')
         return result
 
     def _llm_backend_meta(self, task, ctx):
@@ -20773,7 +21038,8 @@ class ExceptionFuzzerMixin:
                  powered=controller.powered, asserted=controller.asserted,
                  helper_pids=[p.pid for p in controller.runner.pending if p.poll() is None]),
             ensure_ascii=False, indent=2), encoding='utf-8')
-        logging.getLogger('pcfuzz').error('[Exception] stopped; no recovery POR/reset: %s', reason)
+        logging.getLogger('pcfuzz').error('[Exception] 캠페인 중단 — 복구 POR/리셋 없이 현상 보존')
+        logging.getLogger('pcfuzz').error('[Exception]   원인: %s', reason)
         try:
             self.sampler._stop_worker()
             self._snapshot_crash_context(dest, now)

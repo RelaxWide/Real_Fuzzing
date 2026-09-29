@@ -533,3 +533,55 @@ v11 전송·calibration·종료·복구 테스트는 v11 모듈을 직접 검사
 
 진단 회귀 3개 추가(네 가지 RDY 대기 원인, 종료 후 이벤트 연결, helper 실행 전 argv 기록).
 전체 **468개 통과**(50.360초), `git diff --check` 통과. 실장치 확인은 미실시.
+
+## 사람이 읽는 로그 형식 (2026-09-29)
+
+사전시험·주입 로그를 `--pm` preflight 와 같은 형식으로 바꿨다. **`exceptions.jsonl` 은 그대로**
+(기계용 원본, 모든 필드)이고, 텍스트 로그·터미널에는 값만 정돈해 찍는다 — JSON 덤프·중괄호·
+따옴표를 내보내지 않는다.
+
+```
+============================================================
+[Exception-Preflight] 예외 profile 사전 검증 시작 (7개)
+  DUT: S97TNE0L900259 @ 0000:02:00.0 (/dev/nvme0)
+============================================================
+  [기준] 시작 전 장치 준비 확인
+    [ready]   0.1s  준비 완료 — driver=live CSTS=0x00000001 RDY=1 CFS=0
+  [1/7] controller_reset   지원: 가능
+    [step 1/1] controller_reset : nvme reset /dev/nvme0
+      완료 (0.1s)
+    [ready]   0.8s  준비 완료 — driver=live CSTS=0x00000001 RDY=1 CFS=0
+    [check] Identify serial 일치 (S97TNE0L900259)
+    [check] 환경 복원·샘플러 재연결 OK
+    → PASS  (2.3s)
+  [2/7] nssr               지원: 가능
+    [step 1/1] nssr : nvme subsystem-reset /dev/nvme0
+      완료 (0.1s)
+    [ready]   0.0s  driver=resetting (live 아님)
+    [ready]  30.0s  한도 초과 — driver=resetting (live 아님)
+    → FAIL — 현상 보존  (30.1s)
+      원인: 준비 시간 초과(30s): driver=resetting (live 아님) [gate=driver_not_live]
+============================================================
+[Exception-Preflight] 결과 요약
+  Profile            결과          시간  사유
+  controller_reset   PASS          2.3s  RDY·identity·Identify·환경 복원·샘플러 확인
+  nssr               FAIL         30.1s  준비 시간 초과(30s): driver=resetting …
+  flr                미실행              앞 profile 실패로 중단
+[Exception-Preflight] 통과 1/2 — 실패로 캠페인 중단 (복구 POR/리셋 없음, 현상 보존)
+============================================================
+[Exception] 증거 폴더: output/pc_sampling_v11.0.0/crashes/exception_…
+[Exception] 캠페인 중단 — 복구 POR/리셋 없이 현상 보존
+[Exception]   원인: 준비 시간 초과(30s): …
+```
+
+- 단계 줄은 **명령을 실행하기 전에** 찍는다 — helper 가 멈춰도 무엇을 실행 중인지 보인다
+- python `-c` 도우미는 뜻으로 바꿔 보인다(`sysfs PCI reset (reset_method=flr) …`, `echo 1 > …/remove`)
+- `[ready]` 는 **상태가 바뀔 때만** 한 줄, 경과 시간과 함께. `gate` 코드는 실패 사유 끝에 남긴다
+- 사전시험은 터미널 필터 이전이라 들여쓰기 줄, 캠페인 중 주입은 모든 줄에 `[Exception]`
+  (`exception-000001 controller_reset 주입 — 명령 Write 실행 중` → 단계 → `재개 OK`)
+- 실패 사유(`ExceptionFailure`)도 사람용 문장으로 바꿨다. 원본 관측값은 `exceptions.jsonl` 의
+  `ready_timeout` 행에 그대로 있다
+- 요약표는 한글 표시 폭 기준으로 정렬한다
+
+위 `사전시험 실패 로그 판독` 절의 `preflight failed; campaign stopped` 문구는 `통과 N/M — 실패로
+캠페인 중단` 으로 바뀌었다.
