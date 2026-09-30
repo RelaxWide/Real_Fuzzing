@@ -585,3 +585,64 @@ v11 전송·calibration·종료·복구 테스트는 v11 모듈을 직접 검사
 
 위 `사전시험 실패 로그 판독` 절의 `preflight failed; campaign stopped` 문구는 `통과 N/M — 실패로
 캠페인 중단` 으로 바뀌었다.
+
+## 제품별 명령 timeout (2026-09-30)
+
+Write/WriteUncorrectable/WriteZeroes 에 전용 timeout 그룹 `write` 를 만들었다. 설정에 `write`
+키가 없는 제품은 예전처럼 `command` 값을 쓴다.
+
+| 제품 | write | flush | format | 그 외(command·selftest·verify 등) |
+|---|---|---|---|---|
+| BM9K1 | 30s | 2s | 180s | 8s |
+
+실제 판정 창 = 값 + `power.ps_entry_exit_margin_ms`(105ms). 시험: `test_v11_timeouts.py`.
+
+## 리셋/전원 복귀 타이밍 (2026-09-30)
+
+제품 블록 `exception_timing` 이 있으면 예외 profile 실행 뒤 복귀를 **구간별로** 잰다.
+
+| 키 | 구간 | BM9K1 | PM9M1·LNB·HP | P7·P9 |
+|---|---|---|---|---|
+| `cfg_after_ts_ms` | 링크 업(TS 완료) → 설정 요청 완료 | 200ms | 100ms | 30s |
+| `en_to_rdy_ms` | CC.EN=1 → CSTS.RDY=1 | 100ms | 10s | 30s |
+| `rdy_to_admin_ms` | RDY → admin 가능(커널 live) | 100ms | 10s | 30s |
+| `npo_io_ready_ms` | Normal POR: 전원 ON → I/O 서비스 가능 | 500ms | 10s | 30s |
+| `spo_io_ready_ms` | Sudden POR: 전원 ON → I/O 서비스 가능 | 20s | 10s | 30s |
+| `overrun_wait_sec` | 스펙 초과 시 실제 복귀 시간을 더 재는 상한 | 60s | 60s | 60s |
+
+BM9H1 은 블록이 없어 예전처럼 profile 의 준비 한도만 본다.
+
+**측정 방법** — 관측 스레드가 1ms 주기로 **첫 전환 시각**을 기록한다(읽기 전용).
+
+| 시각 | 출처 |
+|---|---|
+| 링크 다운/업 | 루트 포트 설정 공간 Link Status.DLLLA(bit 13) — DUT 가 remove 돼도 남는다 |
+| 설정 요청 완료 | DUT 설정 공간 Vendor ID 가 유효(≠0xFFFF)해진 순간 |
+| CC.EN / CSTS.RDY | DUT BAR0(`resource0`)를 읽기 전용 mmap 해 CC(0x14)·CSTS(0x1C) 직접 폴링(32비트 읽기). 장치가 사라지면 매핑을 닫고 다시 나타나면 연다 |
+| admin 가능 | 원래 serial+BDF 컨트롤러의 sysfs state 가 live 로 바뀐 순간 |
+| I/O 가능 | 네임스페이스 4KiB direct read(`dd iflag=direct`) 성공 순간 — npo/spo 만 |
+
+- 기준(t0): `controller_reset`/`nssr`/`flr`/`hot_reset` 은 **시작** 시각, 전원 ON·PERST 해제는 **반환** 시각
+- 전환(0→1)만 기록한다 — 이벤트 전부터 켜져 있던 비트를 복귀로 보지 않는다
+- 링크 구간은 실제로 링크가 내려갔을 때만 판정한다(FLR·controller_reset 은 해당 없음)
+- 시작 전환을 못 봤으면 '측정 불가' — 불량으로 세지 않는다
+
+**판정** — 스펙을 넘어도 곧바로 끊지 않고 `스펙 + overrun_wait_sec`까지 복귀를 끝까지 잰 뒤,
+하나라도 초과·미완료면 `복귀 스펙 초과: …` 로 **불량 루틴**(현상 보존·덤프·중단)을 탄다.
+
+```
+    [timing] 기준: power_on 반환  →  링크 다운 +0ms · 링크 업 +310ms · 설정 완료 +360ms · CC.EN +420ms · RDY +450ms · live +560ms · I/O +610ms
+    [timing] 설정 요청 완료 after TS         50ms / 스펙   200ms  OK
+    [timing] CC.EN→RDY                         30ms / 스펙   100ms  OK
+    [timing] RDY→admin 가능(live)             110ms / 스펙   100ms  ✗ 초과
+    [timing] 전원 ON→I/O 가능 (NPO)           610ms / 스펙   500ms  ✗ 초과
+```
+
+**profile 변경** — 전원 ON·PERST 해제 뒤 고정 대기(`por_rescan_delay` 10s)를 없애고
+`pci_rescan_wait`(장치가 버스에 나타날 때까지 rescan 반복: 처음 1s 는 20ms, 이후 100ms)로 바꿨다.
+`normal_por` 는 `timing: npo`, `sudden_por` 는 `timing: spo`.
+
+**한계** — RDY→admin 은 커널이 RDY 뒤에 하는 초기화 처리를 포함하므로 장치 시간보다 **길게**
+잰다. I/O 가능 시각에는 `dd` 실행 시간(수 ms)이 들어간다. PERST 해제 기준은 GPIO readback 이
+끝난 뒤라 실제 해제보다 늦다(구간이 짧게 잡히는 쪽). 첫 실기에서 오탐이 보이면 구간 기준을
+조정할 것. 시험: `test_v11_timing.py` 17건(모니터 전환 규칙·판정·초과 측정·t0·설정).

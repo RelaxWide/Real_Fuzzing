@@ -1096,7 +1096,7 @@ class NVMeCommand:
     cmd_type: NVMeCommandType
     needs_namespace: bool = True
     needs_data: bool = True
-    timeout_group: str = "command"   # NVME_TIMEOUTS 키 참조
+    timeout_group: str = "command"   # NVME_TIMEOUTS 키 참조. 설정에 그 키가 없으면 'command' 값을 쓴다
     description: str = ""
     weight: int = 1                  # 명령어 선택 가중치 (높을수록 자주 선택)
 
@@ -1480,7 +1480,7 @@ NVME_COMMANDS_DEFAULT = [
     NVMeCommand("GetFeatures", 0x0A, NVMeCommandType.ADMIN, needs_data=False),
     NVMeCommand("SetFeatures", 0x09, NVMeCommandType.ADMIN),
     NVMeCommand("Read",        0x02, NVMeCommandType.IO,    needs_data=False, weight=2),
-    NVMeCommand("Write",       0x01, NVMeCommandType.IO,    weight=2),
+    NVMeCommand("Write",       0x01, NVMeCommandType.IO,    weight=2, timeout_group="write"),
 ]
 
 # 전체 명령어 (위험/파괴적 포함) — --commands 또는 --all-commands로 활성화
@@ -1492,9 +1492,9 @@ NVME_COMMANDS_EXTENDED = [
     NVMeCommand("TelemetryHostInitiated",0x02, NVMeCommandType.ADMIN, needs_data=False, timeout_group="telemetry"),
     NVMeCommand("Flush",                 0x00, NVMeCommandType.IO,    needs_data=False, timeout_group="flush"),
     NVMeCommand("DatasetManagement",     0x09, NVMeCommandType.IO,    timeout_group="dsm"),
-    NVMeCommand("WriteZeroes",           0x08, NVMeCommandType.IO,    needs_data=False),
+    NVMeCommand("WriteZeroes",           0x08, NVMeCommandType.IO,    needs_data=False, timeout_group="write"),
     NVMeCommand("Compare",               0x05, NVMeCommandType.IO),
-    NVMeCommand("WriteUncorrectable",    0x04, NVMeCommandType.IO,    needs_data=False),
+    NVMeCommand("WriteUncorrectable",    0x04, NVMeCommandType.IO,    needs_data=False, timeout_group="write"),
     NVMeCommand("Verify",                0x0C, NVMeCommandType.IO,    needs_data=False, timeout_group="verify"),
     NVMeCommand("DeviceSelfTest",        0x14, NVMeCommandType.ADMIN, needs_data=False, needs_namespace=False, timeout_group="selftest_short"),
     NVMeCommand("SecuritySend",          0x81, NVMeCommandType.ADMIN, needs_namespace=False, timeout_group="security"),
@@ -19957,7 +19957,7 @@ def subsystem_support(cap, bdf, root=Path('/sys/class/nvme')):
 
 BUILTIN_EFFECTS = {
     'controller_reset': 'none', 'nssr': 'none', 'flr': 'none', 'hot_reset': 'none',
-    'pci_remove': 'none', 'pci_rescan': 'none',
+    'pci_remove': 'none', 'pci_rescan': 'none', 'pci_rescan_wait': 'none',
     'power_off': 'power_off', 'power_on': 'power_on', 'wait': 'none',
 }
 
@@ -19991,6 +19991,7 @@ class Profile:
     steps: tuple
     timeout_sec: float
     ready_timeout_sec: float
+    timing: str = 'reset'        # 'reset' | 'npo'(Normal POR) | 'spo'(Sudden POR) — 복귀 스펙 선택
 
 
 def compile_profiles(options, config):
@@ -20091,8 +20092,233 @@ def compile_profiles(options, config):
             raise ValueError(f'{name}: power profiles must reference existing POR timeout JSON key')
         else:
             ready = number(row.get('ready_timeout_sec', 30), name + '.ready_timeout_sec', 0.001)
-        profiles.append(Profile(name, tuple(steps), timeout, ready))
+        timing = row.get('timing', 'reset')
+        if timing not in ('reset', 'npo', 'spo'):
+            raise ValueError(f"{name}: timing must be 'reset', 'npo' or 'spo'")
+        if timing in ('npo', 'spo') and 'power_on' not in effects:
+            raise ValueError(f'{name}: timing={timing} requires a power_on step')
+        profiles.append(Profile(name, tuple(steps), timeout, ready, timing))
     return profiles
+
+
+# ── 복귀 타이밍 측정 (제품 exception_timing) ──────────────────────────────
+# 리셋/전원 이벤트 뒤 장치가 스펙 시간 안에 돌아오는지 **구간별로** 잰다.
+#   링크 업(TS 완료) → 설정 요청 완료 → CC.EN=1 → CSTS.RDY=1 → admin 가능(커널 live) → I/O 가능
+# 시각은 별도 스레드가 1ms 주기로 관측한다. 호스트가 CC.EN 을 직접 쓰지 않으므로(커널 드라이버가
+# 쓴다) BAR0 를 **읽기 전용**으로 매핑해 CC/CSTS 를 직접 본다 — nvme-cli show-regs 와 같은 접근이다.
+# 스펙을 넘으면 즉시 끊지 않고 overrun_wait_sec 까지 계속 측정한 뒤 불량으로 보고한다.
+
+_PCI_DEVICES = Path('/sys/bus/pci/devices')
+_NVME_CLASS = Path('/sys/class/nvme')
+
+
+@dataclass(frozen=True)
+class TimingSpec:
+    cfg_after_ts: float        # 링크 업(TS) → 설정 요청 완료
+    en_to_rdy: float           # CC.EN=1 → CSTS.RDY=1
+    rdy_to_admin: float        # CSTS.RDY=1 → admin 명령 가능(커널 live)
+    npo_io_ready: float        # Normal POR: 전원 ON → I/O 서비스 가능
+    spo_io_ready: float        # Sudden POR: 전원 ON → I/O 서비스 가능
+    overrun_wait: float        # 스펙 초과 시 실제 복귀 시간을 재려고 더 기다리는 상한
+
+    @classmethod
+    def parse(cls, raw, where='exception_timing'):
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError(f'{where} must be an object')
+        def ms(key):
+            return number(raw.get(key), f'{where}.{key}', 0.001) / 1000.0
+        return cls(ms('cfg_after_ts_ms'), ms('en_to_rdy_ms'), ms('rdy_to_admin_ms'),
+                   ms('npo_io_ready_ms'), ms('spo_io_ready_ms'),
+                   number(raw.get('overrun_wait_sec', 60), f'{where}.overrun_wait_sec', 0.001))
+
+
+def _fmt_dur(sec):
+    """1초 미만은 ms, 이상은 s."""
+    if sec is None:
+        return '-'
+    return f'{sec * 1000:.0f}ms' if sec < 1.0 else f'{sec:.2f}s'
+
+
+def _pcie_cap_offset(cfg):
+    """설정 공간 바이트에서 PCI Express capability(ID 0x10) 오프셋. 없으면 None."""
+    if len(cfg) < 0x40 or not (int.from_bytes(cfg[6:8], 'little') & 0x10):
+        return None
+    ptr, seen = cfg[0x34] & 0xFC, set()
+    while ptr and ptr not in seen and ptr + 1 < len(cfg):
+        seen.add(ptr)
+        if cfg[ptr] == 0x10:
+            return ptr
+        ptr = cfg[ptr + 1] & 0xFC
+    return None
+
+
+class RecoveryMonitor:
+    """복귀 구간의 **첫 발생 시각**을 기록하는 관측 스레드. 읽기만 한다.
+
+    marks: link_down / link_up / cfg_ok / cc_en / rdy / live — 모두 monitor 시작 이후 기준.
+    전환(0→1)으로만 기록한다 — 이벤트 전부터 켜져 있던 비트를 복귀로 오인하지 않기 위해.
+    """
+
+    def __init__(self, bdf, root_bdf, serial, clock=time.monotonic,
+                 pci=_PCI_DEVICES, nvme=_NVME_CLASS, period=0.001):
+        self.bdf, self.root_bdf, self.serial = bdf, root_bdf, serial
+        self.clock, self.pci, self.nvme, self.period = clock, Path(pci), Path(nvme), period
+        self.marks = {}
+        self._link_ever_down = False
+        self._cfg_bad = False
+        self._en_low = False
+        self._not_live = False
+        self._root_cap = None
+        self._ctrl = None
+        self._ctrl_checked = -1.0
+        self._mm = self._mv = self._fd = None
+        self._thread = None
+        self._stop = threading.Event()
+
+    # ── 개별 관측 ──
+    def _read(self, path, n):
+        try:
+            with open(path, 'rb') as f:
+                return f.read(n)
+        except OSError:
+            return None
+
+    def _dllla(self):
+        """루트 포트 Link Status.DLLLA(bit 13). 루트 포트를 못 읽으면 None."""
+        if not self.root_bdf:
+            return None
+        cfg = self._read(self.pci / self.root_bdf / 'config', 256)
+        if not cfg:
+            return None
+        if self._root_cap is None:
+            self._root_cap = _pcie_cap_offset(cfg)
+            if self._root_cap is None:
+                self.root_bdf = None       # PCIe 루트 포트가 아니면 링크 측정 포기
+                return None
+        off = self._root_cap + 0x12
+        if off + 2 > len(cfg):
+            return None
+        return bool(int.from_bytes(cfg[off:off + 2], 'little') & (1 << 13))
+
+    def _vendor(self):
+        cfg = self._read(self.pci / self.bdf / 'config', 2)
+        return int.from_bytes(cfg, 'little') if cfg and len(cfg) == 2 else None
+
+    def _close_bar(self):
+        for obj in (self._mv, self._mm):
+            try:
+                if obj is not None:
+                    obj.release() if hasattr(obj, 'release') else obj.close()
+            except Exception:
+                pass
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+        self._mm = self._mv = self._fd = None
+
+    def _regs(self):
+        """(CC, CSTS). BAR0 를 읽기 전용 mmap — 장치가 사라지면 매핑을 닫는다."""
+        import mmap
+        res = self.pci / self.bdf / 'resource0'
+        if not res.exists():
+            self._close_bar()
+            return None
+        if self._mv is None:
+            try:
+                self._fd = os.open(res, os.O_RDONLY)
+                self._mm = mmap.mmap(self._fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ)
+                self._mv = memoryview(self._mm).cast('I')     # 32비트 단위 읽기
+            except Exception:
+                self._close_bar()
+                return None
+        try:
+            return self._mv[0x14 // 4], self._mv[0x1C // 4]
+        except Exception:
+            self._close_bar()
+            return None
+
+    def _state(self, now):
+        """원래 serial+BDF 의 컨트롤러 state. 노드가 바뀌어도 따라간다."""
+        if self._ctrl is not None:
+            st = self._read(self._ctrl / 'state', 32)
+            if st is not None:
+                return st.decode(errors='replace').strip()
+            self._ctrl = None
+        if now - self._ctrl_checked < 0.02:        # glob 은 20ms 에 한 번만
+            return None
+        self._ctrl_checked = now
+        for c in self.nvme.glob('nvme[0-9]*'):
+            try:
+                if ((c / 'address').read_text().strip() == self.bdf
+                        and (c / 'serial').read_text().strip() == self.serial):
+                    self._ctrl = c
+                    return (c / 'state').read_text().strip()
+            except OSError:
+                continue
+        return None
+
+    # ── 한 번 관측 ──
+    def sample(self):
+        now, m = self.clock(), self.marks
+        dl = self._dllla()
+        if dl is False:
+            self._link_ever_down = True
+            m.setdefault('link_down', now)
+        elif dl and self._link_ever_down:
+            m.setdefault('link_up', now)
+        vid = self._vendor()
+        if vid is None or vid == 0xFFFF:
+            self._cfg_bad = True
+        elif self._cfg_bad or 'link_up' in m:
+            m.setdefault('cfg_ok', now)
+        regs = self._regs()
+        if regs and regs[0] != 0xFFFFFFFF:
+            cc, csts = regs
+            if not cc & 1:
+                self._en_low = True
+            elif self._en_low:
+                m.setdefault('cc_en', now)
+                if csts & 1 and csts != 0xFFFFFFFF:
+                    m.setdefault('rdy', now)
+        st = self._state(now)
+        if st != 'live':
+            if st is not None or self._ctrl is None:
+                self._not_live = True
+        elif self._not_live:
+            m.setdefault('live', now)
+
+    def snapshot(self):
+        """관측 스레드가 쓰는 중에도 안전한 사본."""
+        for _ in range(10):
+            try:
+                return dict(self.marks)
+            except RuntimeError:                      # 복사 중 크기 변경
+                continue
+        return {}
+
+    # ── 스레드 ──
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self.sample()
+            except Exception:
+                pass                                  # 관측 실패가 이벤트를 막지 않는다
+            self._stop.wait(self.period)
+
+    def start(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True, name='recovery-monitor')
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._close_bar()
 
 
 class CommandRunner:
@@ -20144,8 +20370,13 @@ def csts_ready(output):
 
 
 class ExceptionController:
-    def __init__(self, options, config, device, pmu_script, log_path, clock=time.monotonic):
+    def __init__(self, options, config, device, pmu_script, log_path, clock=time.monotonic,
+                 timing=None, namespace=1):
         self.options = options
+        # 제품 exception_timing(없으면 None → 예전처럼 profile 의 준비 한도만 본다)
+        self.timing = timing if isinstance(timing, TimingSpec) else TimingSpec.parse(timing)
+        self.namespace = int(namespace or 1)
+        self.root_bdf = None
         self.config = config
         self.clock = clock
         self.profiles = compile_profiles(options, config)
@@ -20317,6 +20548,24 @@ class ExceptionController:
         self._line(f"    ⚠ 한도 안에 끝나지 않은 명령 — PID {r.get('pid')} 잔존: "
                    f"{self._describe_argv(r.get('action'), r.get('argv'))}", error=True)
 
+    def _show_rescan_found(self, r):
+        self._line(f"      DUT 발견 — rescan {r.get('tries')}회 ({r.get('elapsed_sec', 0):.2f}s)")
+
+    _MARK_TEXT = (('link_down', '링크 다운'), ('link_up', '링크 업'), ('cfg_ok', '설정 완료'),
+                  ('cc_en', 'CC.EN'), ('rdy', 'RDY'), ('live', 'live'), ('io', 'I/O'))
+    _VERDICT_TEXT = {'OK': 'OK', 'OVER': '✗ 초과', 'MISSING': '✗ 미완료', 'N/A': '측정 불가'}
+
+    def _show_timing(self, r):
+        marks = r.get('marks') or {}
+        seq = ' · '.join(f"{name} +{_fmt_dur(marks[k])}" for k, name in self._MARK_TEXT if k in marks)
+        self._line(f"    [timing] 기준: {r.get('t0_what')}  →  {seq or '관측 없음'}")
+        for row in r.get('rows') or []:
+            meas = _fmt_dur(row.get('measured')) if row.get('measured') is not None else '-'
+            self._line(f"    [timing] {self._pad(row['label'], 26)} {self._pad(meas, 8, True)} / "
+                       f"스펙 {self._pad(_fmt_dur(row['spec']), 7, True)}  "
+                       f"{self._VERDICT_TEXT.get(row['verdict'], row['verdict'])}",
+                       error=row['verdict'] in ('OVER', 'MISSING'))
+
     def _show_capture(self, r):
         self._say(f"[Exception] 증거 폴더: {r.get('directory')}")
 
@@ -20427,6 +20676,12 @@ class ExceptionController:
         self.bdf = (self.sysfs / 'address').read_text().strip()
         if not self.serial or not self.bdf:
             raise ValueError('cannot establish DUT identity')
+        # 링크 업 시각은 루트 포트에서 본다(DUT 가 remove 돼도 루트 포트는 남는다).
+        try:
+            parent = (_PCI_DEVICES / self.bdf).resolve().parent.name
+            self.root_bdf = parent if BDF.fullmatch(parent) else None
+        except OSError:
+            self.root_bdf = None
         self.next_at = float('inf')
         self.emit('armed', serial=self.serial, bdf=self.bdf, device=self.device,
                   options=self.options, profiles=[vars(p) for p in self.profiles])
@@ -20456,6 +20711,10 @@ class ExceptionController:
                        "finally: m.write_text(old)\n")
             argv = [sys.executable, '-c', program, '/sys/bus/pci/devices/' + self.bdf, method]
             effect = 'none'
+        elif action == 'pci_rescan_wait':
+            self._reenumerated = True
+            self._rescan_until_present(deadline)
+            return
         elif action in ('pci_remove', 'pci_rescan'):
             self._reenumerated = True
             path = ('/sys/bus/pci/devices/' + self.bdf + '/remove' if action == 'pci_remove'
@@ -20505,6 +20764,30 @@ class ExceptionController:
                 raise ExceptionFailure(f'{action}: GPIO readback mismatch: {value}')
             if effect == 'deassert':
                 self.asserted = False
+
+    def _rescan_until_present(self, deadline):
+        """PCI rescan 을 짧은 주기로 반복해 DUT 가 버스에 나타나는 즉시 멈춘다.
+
+        예전엔 전원 ON/PERST 해제 뒤 고정 시간(por_rescan_delay, 10s)을 기다린 뒤 한 번
+        rescan 했다 — 그 대기만으로 NPO 0.5s 같은 스펙을 넘어 복귀 시간을 잴 수 없었다.
+        링크가 아직이면 rescan 은 아무것도 못 찾고 빨리 끝나므로 반복해도 무해하다.
+        처음 1초는 20ms, 이후 100ms 간격."""
+        argv = ['sh', '-c', 'echo 1 > /sys/bus/pci/rescan']
+        self.emit('action_command', action='pci_rescan_wait', argv=argv,
+                  remaining_sec=max(0, deadline - self.clock()))
+        start, tries = self.clock(), 0
+        while True:
+            if (_PCI_DEVICES / self.bdf).exists():
+                self.emit('rescan_found', tries=tries, elapsed_sec=self.clock() - start)
+                return
+            if self.clock() >= deadline:
+                raise ExceptionFailure(f'PCI rescan {tries}회 — 한도 안에 DUT({self.bdf})가 버스에 '
+                                       f'나타나지 않음')
+            rc, _, err = self.runner.run(argv, deadline)
+            tries += 1
+            if rc:
+                raise ExceptionFailure(f'PCI rescan 실패 rc={rc}: {err.decode(errors="replace")[:200]}')
+            time.sleep(0.02 if self.clock() - start < 1.0 else 0.1)
 
     def restore_supply(self):
         """Only ON/deassert; never cycle power or issue a recovery reset."""
@@ -20589,6 +20872,8 @@ class ExceptionController:
 
     def _run_profile(self, profile):
         self._step_total = len(profile.steps)
+        if self.timing is not None:
+            return self._run_profile_timed(profile)
         deadline = self.clock() + profile.timeout_sec
         ready_deadline = None
         for index, (action, hold) in enumerate(profile.steps):
@@ -20619,6 +20904,123 @@ class ExceptionController:
             self.last_result['stage'] = 'ready_after_profile'
         self.wait_ready(ready_deadline)
         self._ready_deadline = ready_deadline
+
+    # 복귀 스펙이 붙는 동작: 이 동작 **시작** 시각이 기준(t0)인 것 / **반환** 시각이 기준인 것
+    _T0_AT_START = ('controller_reset', 'nssr', 'flr', 'hot_reset')
+
+    def _run_profile_timed(self, profile):
+        """제품 exception_timing 이 있을 때의 실행: 관측 스레드를 켠 채 단계를 돌리고, 끝나면
+        구간별로 스펙과 비교한다. 스펙을 넘어도 overrun_wait 까지 **실제 복귀 시간을 끝까지
+        잰 뒤** 불량(ExceptionFailure)으로 보고한다 — 불량 루틴은 호출부가 탄다."""
+        spec = self.timing
+        adapters = self.options.get('adapters', {})
+        deadline = self.clock() + profile.timeout_sec
+        mon = RecoveryMonitor(self.bdf, self.root_bdf, self.serial, clock=self.clock).start()
+        t0 = t0_what = None
+        try:
+            for index, (action, hold) in enumerate(profile.steps):
+                if self.clock() >= deadline:
+                    raise ExceptionFailure('profile deadline exceeded')
+                if self.last_result is not None:
+                    self.last_result.update(stage='profile_action', action=action, index=index)
+                self.emit('step_start', index=index, action=action)
+                effect = action_effect(action, adapters)
+                if effect in ('power_off', 'assert'):
+                    t0 = t0_what = None                   # 새 OFF/assert 구간 — 기준 다시 잡음
+                started = self.clock()
+                # rescan 반복은 복귀 측정의 일부 — 스펙+초과 측정 시간까지 기다린다.
+                self._action(action, (t0 + self._timing_budget(profile) + spec.overrun_wait)
+                             if action == 'pci_rescan_wait' and t0 is not None else deadline)
+                if action in self._T0_AT_START:
+                    t0, t0_what = started, f'{action} 시작'
+                elif effect in ('power_on', 'deassert'):
+                    t0, t0_what = self.clock(), f'{action} 반환'
+                self.emit('step_end', index=index, action=action, hold=hold)
+                if hold:
+                    if self.clock() + hold > deadline:
+                        raise ExceptionFailure('hold would exceed profile deadline')
+                    time.sleep(hold)
+            if t0 is None:
+                t0, t0_what = self.clock(), '마지막 단계 반환'
+            if self.last_result is not None:
+                self.last_result['stage'] = 'ready_after_profile'
+            self._timing_wait(profile, mon, t0, t0_what)
+        finally:
+            mon.stop()
+
+    def _timing_segments(self, profile, marks):
+        """(키, 이름, 시작 mark, 끝 mark, 스펙 s). 링크가 실제로 내려갔을 때만 cfg 구간을 본다."""
+        spec = self.timing
+        segs = []
+        if 'link_down' in marks:
+            segs.append(('cfg_after_ts', '설정 요청 완료 after TS', 'link_up', 'cfg_ok', spec.cfg_after_ts))
+        segs.append(('en_to_rdy', 'CC.EN→RDY', 'cc_en', 'rdy', spec.en_to_rdy))
+        segs.append(('rdy_to_admin', 'RDY→admin 가능(live)', 'rdy', 'live', spec.rdy_to_admin))
+        if profile.timing == 'npo':
+            segs.append(('io_ready', '전원 ON→I/O 가능 (NPO)', 't0', 'io', spec.npo_io_ready))
+        elif profile.timing == 'spo':
+            segs.append(('io_ready', '전원 ON→I/O 가능 (SPO)', 't0', 'io', spec.spo_io_ready))
+        return segs
+
+    def _io_probe(self, deadline):
+        """I/O 서비스 가능 시각: 네임스페이스에서 4KiB direct read 1회가 성공한 순간."""
+        ns = f'{self.device}n{self.namespace}'
+        argv = ['dd', f'if={ns}', 'of=/dev/null', 'bs=4096', 'count=1', 'iflag=direct', 'status=none']
+        while self.clock() < deadline:
+            if Path(ns).exists():
+                rc, _, _ = self.runner.run(argv, deadline)
+                if rc == 0:
+                    return self.clock()
+            time.sleep(0.005)
+        return None
+
+    def _timing_budget(self, profile):
+        spec = self.timing
+        return (spec.npo_io_ready if profile.timing == 'npo' else
+                spec.spo_io_ready if profile.timing == 'spo' else
+                spec.cfg_after_ts + spec.en_to_rdy + spec.rdy_to_admin)
+
+    def _timing_wait(self, profile, mon, t0, t0_what):
+        spec = self.timing
+        io_needed = profile.timing in ('npo', 'spo')
+        hard = t0 + self._timing_budget(profile) + spec.overrun_wait   # 스펙 + 초과 측정 시간
+        self._ready_deadline = hard
+        # 1) 커널 live 까지(관측 스레드가 시각을 찍는다)
+        while 'live' not in mon.marks and self.clock() < hard:
+            time.sleep(0.005)
+        marks = mon.snapshot()
+        # 2) 원래 DUT 인지·CSTS 확인(이미 live 라 곧 끝난다)
+        if 'live' in marks:
+            self.wait_ready(hard)
+        # 3) I/O 서비스 가능
+        io_t = self._io_probe(hard) if (io_needed and 'live' in marks) else None
+        marks = mon.snapshot()
+        marks['t0'] = t0
+        if io_t is not None:
+            marks['io'] = io_t
+        rows, bad = [], []
+        for key, label, a, b, limit in self._timing_segments(profile, marks):
+            if b not in marks:
+                verdict, measured = 'MISSING', None
+            elif a not in marks:
+                verdict, measured = 'N/A', None       # 시작 전환을 못 봄 — 측정 불가(불량 아님)
+            else:
+                measured = marks[b] - marks[a]
+                verdict = 'OK' if measured <= limit else 'OVER'
+            rows.append(dict(key=key, label=label, measured=measured, spec=limit, verdict=verdict))
+            if verdict in ('OVER', 'MISSING'):
+                bad.append(rows[-1])
+        self.emit('timing', profile=profile.name, kind=profile.timing, t0_what=t0_what,
+                  marks={k: round(v - t0, 4) for k, v in marks.items()}, rows=rows,
+                  overrun_wait_sec=spec.overrun_wait)
+        if bad:
+            parts = []
+            for r in bad:
+                if r['verdict'] == 'MISSING':
+                    parts.append(f"{r['label']} — {spec.overrun_wait:g}s 추가 대기에도 미완료")
+                else:
+                    parts.append(f"{r['label']} {_fmt_dur(r['measured'])} > 스펙 {_fmt_dur(r['spec'])}")
+            raise ExceptionFailure('복귀 스펙 초과: ' + '; '.join(parts))
 
     def restore_nvme_environment(self):
         """After RDY only: fresh support/feature reads, bounded writes and readback.
@@ -20862,6 +21264,8 @@ class ExceptionFuzzerMixin:
             compile_profiles(options, self.exception_config)
             for name in ('min_interval_minutes', 'initial_delay_minutes', 'trigger_delay_ms'):
                 number(options.get(name, 0), name)
+            _p = (self.exception_config.get('products') or {}).get(getattr(config, 'product', None)) or {}
+            TimingSpec.parse(_p.get('exception_timing'), f"{getattr(config, 'product', '?')}.exception_timing")
         self._exception_controller = None
         self._exception_preserve = False
         self._exception_interrupted = False
@@ -20875,9 +21279,13 @@ class ExceptionFuzzerMixin:
         self._exception_sequence_events = []
         super().__init__(config)
         if enabled:
+            _prod = (self.exception_config.get('products') or {}).get(
+                getattr(config, 'product', None)) or {}
             self._exception_controller = ExceptionController(
                 options, self.exception_config, config.nvme_device, config.pmu_script,
-                self.output_dir / 'exceptions.jsonl')
+                self.output_dir / 'exceptions.jsonl',
+                timing=_prod.get('exception_timing'),
+                namespace=getattr(config, 'nvme_namespace', 1))
 
     def _learning_baseline(self, phase='first_request'):
         result = super()._learning_baseline(phase)

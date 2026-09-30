@@ -160,8 +160,8 @@
         "body": [
           {"action": "perst_assert", "hold_sec": 0.1},
           {"action": "pci_remove"},
-          {"action": "perst_release", "hold_ref": "power.por_rescan_delay"},
-          {"action": "pci_rescan"}
+          {"action": "perst_release"},
+          {"action": "pci_rescan_wait"}
         ],
         "timeout_sec": 60,
         "ready_timeout_ref": "power.por_boot_wait"
@@ -171,9 +171,10 @@
         "body": [
           {"action": "power_off"},
           {"action": "pci_remove", "hold_ref": "power.por_poweroff_wait"},
-          {"action": "power_on", "hold_ref": "power.por_rescan_delay"},
-          {"action": "pci_rescan"}
+          {"action": "power_on"},
+          {"action": "pci_rescan_wait"}
         ],
+        "timing": "spo",
         "timeout_sec": 60,
         "ready_timeout_ref": "power.por_boot_wait"
       },
@@ -182,13 +183,15 @@
         "body": [
           {"action": "pci_remove"},
           {"action": "power_off", "hold_ref": "power.por_poweroff_wait"},
-          {"action": "power_on", "hold_ref": "power.por_rescan_delay"},
-          {"action": "pci_rescan"}
+          {"action": "power_on"},
+          {"action": "pci_rescan_wait"}
         ],
+        "timing": "npo",
         "timeout_sec": 60,
         "ready_timeout_ref": "power.por_boot_wait"
       }
     ],
+    "_comment_timing": "profile.timing: reset(기본) | npo(Normal POR) | spo(Sudden POR). 제품 블록의 exception_timing 이 있으면 복귀를 구간별로 잰다(링크 업→설정 요청 완료, CC.EN→RDY, RDY→admin 가능(커널 live), npo/spo 는 전원 ON→I/O 가능). 스펙을 넘으면 overrun_wait_sec 까지 실제 복귀 시간을 더 잰 뒤 불량(현상 보존·덤프·중단). exception_timing 이 없는 제품은 profile 의 준비 한도만 본다. pci_rescan_wait = 장치가 버스에 나타날 때까지 rescan 반복(고정 대기 없음).",
     "_comment_perst": "아래 PERST adapter는 현재 시험 보드의 PMU devIdx=1, pinNo=7, 3300mV 설정이다. 다른 보드/슬롯에 그대로 적용할 수 있다는 뜻은 아니다. PMU 명령 16은 assert(Low), 15는 release(High), 20은 GPIO readback이다. 실제 주입 후보는 profiles로 선택한다. McToggle(18)과 직접 REFCLK 제어는 등록되어 있지 않다.",
     "adapters": {
       "perst_assert": {
@@ -2225,13 +2228,23 @@
       "enable_jlink_dump": false,
       "enable_debug_tool_dump": false,
       "state_fields": "bm9k1",
+      "_comment_nvme_timeouts": "퍼저가 crash(타임아웃)로 판정하는 명령별 창(ms). write = Write/WriteUncorrectable/WriteZeroes, flush = Flush, format = FormatNVM, 나머지 명령은 command. 여기 없는 그룹(fw_commit/sanitize/telemetry/dsm/security)도 command 값을 쓴다. 실제 창 = 값 + power.ps_entry_exit_margin_ms.",
       "nvme_timeouts": {
-        "command": 30000,
-        "format": 300000,
-        "flush": 30000,
-        "selftest_short": 30000,
-        "selftest_ext": 30000,
-        "verify": 30000
+        "command": 8000,
+        "write": 30000,
+        "flush": 2000,
+        "format": 180000,
+        "selftest_short": 8000,
+        "selftest_ext": 8000,
+        "verify": 8000
+      },
+      "exception_timing": {
+        "cfg_after_ts_ms": 200,
+        "en_to_rdy_ms": 100,
+        "rdy_to_admin_ms": 100,
+        "npo_io_ready_ms": 500,
+        "spo_io_ready_ms": 20000,
+        "overrun_wait_sec": 60
       }
     },
     "PM9M1": {
@@ -2244,6 +2257,14 @@
         "selftest_ext": 8000,
         "verify": 22000,
         "sanitize": 180000
+      },
+      "exception_timing": {
+        "cfg_after_ts_ms": 100,
+        "en_to_rdy_ms": 10000,
+        "rdy_to_admin_ms": 10000,
+        "npo_io_ready_ms": 10000,
+        "spo_io_ready_ms": 10000,
+        "overrun_wait_sec": 60
       },
       "interface": "swd",
       "openocd_config": "products/PM9M1/openocd.cfg",
@@ -2284,6 +2305,14 @@
         "verify": 22000,
         "sanitize": 180000
       },
+      "exception_timing": {
+        "cfg_after_ts_ms": 100,
+        "en_to_rdy_ms": 10000,
+        "rdy_to_admin_ms": 10000,
+        "npo_io_ready_ms": 10000,
+        "spo_io_ready_ms": 10000,
+        "overrun_wait_sec": 60
+      },
       "interface": "swd",
       "openocd_config": "products/PM9M1/openocd.cfg",
       "jlink_device": "Cortex-R8",
@@ -2323,6 +2352,14 @@
         "selftest_ext": 8000,
         "verify": 22000,
         "sanitize": 180000
+      },
+      "exception_timing": {
+        "cfg_after_ts_ms": 100,
+        "en_to_rdy_ms": 10000,
+        "rdy_to_admin_ms": 10000,
+        "npo_io_ready_ms": 10000,
+        "spo_io_ready_ms": 10000,
+        "overrun_wait_sec": 60
       },
       "interface": "swd",
       "openocd_config": "products/PM9M1/openocd.cfg",
@@ -2403,6 +2440,14 @@
         "verify": 30000,
         "aer": 600000
       },
+      "exception_timing": {
+        "cfg_after_ts_ms": 30000,
+        "en_to_rdy_ms": 30000,
+        "rdy_to_admin_ms": 30000,
+        "npo_io_ready_ms": 30000,
+        "spo_io_ready_ms": 30000,
+        "overrun_wait_sec": 60
+      },
       "interface": "swd",
       "jlink_device": "Cortex-R5",
       "sampler_type": "jlink_halt",
@@ -2436,6 +2481,14 @@
         "selftest_ext": 30000,
         "verify": 30000,
         "aer": 600000
+      },
+      "exception_timing": {
+        "cfg_after_ts_ms": 30000,
+        "en_to_rdy_ms": 30000,
+        "rdy_to_admin_ms": 30000,
+        "npo_io_ready_ms": 30000,
+        "spo_io_ready_ms": 30000,
+        "overrun_wait_sec": 60
       },
       "interface": "swd",
       "jlink_device": "Cortex-R5",
