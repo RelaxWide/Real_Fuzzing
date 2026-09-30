@@ -51,6 +51,17 @@ def query_block(task, commands=(), targets=()):
     return START + '\n' + build_query(task, commands, targets) + '\n' + END + '\n\n'
 
 CDWS = tuple(f'cdw{x}' for x in (2, 3, 10, 11, 12, 13, 14, 15))
+
+def _drop_zero(obj):
+    """프롬프트용: 값이 숫자 0 인 필드를 뺀다(중첩 dict/list 포함). 불리언 False 는 의미가 있어
+    남긴다(파이썬에선 False == 0 이라 따로 거른다). 프롬프트에 '0 은 생략' 을 명시한다."""
+    if isinstance(obj, dict):
+        return {k: _drop_zero(v) for k, v in obj.items()
+                if not (isinstance(v, (int, float)) and not isinstance(v, bool) and v == 0)}
+    if isinstance(obj, list):
+        return [_drop_zero(x) for x in obj]
+    return obj
+
 DEFAULTS = dict(enabled=True, evidence=True, preserve_setup=True, generators=True,
                 adaptive_tasks=True, setup_preserve_ratio=0.8, evaluation_commands=8,
                 exploration_every=4, min_reward_samples=2, max_targets=512, max_proposals=2048,
@@ -504,8 +515,9 @@ class LearningMixin:
         for tid in ids:
             target = self.learning.targets[tid]
             recent = [{k: v for k, v in r.items() if k != 'state_context'} for r in target['recent'][-3:]]
-            evidence.append(dict(target, recent=recent))
-        extra = '\n\nv10.2 execution evidence (PC observation is NOT execution frequency):\n'
+            evidence.append(_drop_zero(dict(target, recent=recent)))
+        extra = '\n\nv10.2 execution evidence (PC observation is NOT execution frequency; '
+        extra += 'numeric fields equal to 0 are omitted):\n'
         extra += json.dumps(evidence, ensure_ascii=False)
         extra += ('\nYou may attach target_id from this request to each seed, sequence, or generator. '
                   'An unobserved target is not proof that code did not execute. '

@@ -26,13 +26,18 @@ task별 스키마인 이유
 
 U32 = {"type": "integer", "minimum": 0, "maximum": 0xFFFFFFFF}
 CDWS = ("cdw2", "cdw3", "cdw10", "cdw11", "cdw12", "cdw13", "cdw14", "cdw15")
+# data_hex 생성 상한(hex 글자 수 = 2 × 바이트). 모델이 수만 자의 hex 를 쏟아내다 max_tokens 에서
+#   잘리는 폭주를 막는다. 퍼저의 실제 입력 상한(max_input_len)과는 별개 — 그 값은 변이·실행
+#   경로가 쓰는 한도라 프롬프트를 줄이려고 낮추면 안 된다. 프롬프트 문구도 이 상수를 쓴다.
+DATA_HEX_MAX_CHARS = 4096
 
 # 퍼저 파서가 읽는 키 — 출처를 주석으로 남긴다(시험이 이 목록과 파서를 대조한다).
 _SEED_PROPS = {
     "command":    {"type": "string"},                    # _llm_make_seed: item.get('command')
     **{k: U32 for k in CDWS},                            # _llm_make_seed: item.get(f'cdw{w}')
     "nsid":       U32,                                   # _llm_make_seed: item.get('nsid')
-    "data_hex":   {"type": "string", "pattern": "^[0-9a-fA-F]*$"},   # item.get('data_hex')
+    "data_hex":   {"type": "string", "pattern": "^[0-9a-fA-F]*$",
+                   "maxLength": DATA_HEX_MAX_CHARS},                  # item.get('data_hex')
     "data_len":   {"type": "integer", "minimum": 0},     # llm_learning: item['data_len']
     "seed_class": {"type": "string"},                    # _llm_apply_result: item.get('seed_class')
     "target_id":  {"type": "string"},                    # llm_learning: item.get('target_id')
@@ -67,7 +72,7 @@ _PARAM_EXPR = {"anyOf": [
 _GEN_PROPS = {
     "base": {"type": "object",
              "properties": {"command": {"type": "string"}, "nsid": U32,
-                            "data_hex": {"type": "string"},
+                            "data_hex": {"type": "string", "maxLength": DATA_HEX_MAX_CHARS},
                             **{k: U32 for k in CDWS}},
              "required": ["command"], "additionalProperties": False},
     "values":  {"type": "array", "minItems": 1, "items": U32},

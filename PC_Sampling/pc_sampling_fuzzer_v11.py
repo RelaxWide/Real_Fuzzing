@@ -5377,8 +5377,11 @@ class LlmBridge:
                               'budget_started': _llm_started})
                 text, _diag = self._call_llm(system, user, _meta)   # 수 초 — 여기서만 블록
                 # ② JSON 유효성 체크 → 무효면 교정 리프롬프트로 상한 재시도(회수율↑).
+                #   단 **출력 상한에서 잘린(finish_reason=length)** 응답은 재시도하지 않는다 —
+                #   같은 프롬프트면 또 같은 길이로 생성하다 잘려 시간 예산만 N 배로 태운다.
                 attempt = 0
-                while _llm_extract_json(text) is None and attempt < RAG_JSON_RETRIES:
+                while (_llm_extract_json(text) is None and attempt < RAG_JSON_RETRIES
+                       and _llm_final_finish_reason(_diag) != 'length'):
                     attempt += 1
                     if RAG_DEBUG:
                         log.warning(f"[LLM/retry] task={req['task']} JSON 무효 → 재요청 "
@@ -5389,6 +5392,10 @@ class LlmBridge:
                     text, _d2 = self._call_llm(system, corr, _meta)
                     if _d2:
                         _diag = dict(_diag, correction=_d2)
+                if (_llm_extract_json(text) is None
+                        and _llm_final_finish_reason(_diag) == 'length'):
+                    log.warning(f"[LLM] task={req['task']} 응답이 출력 상한(max_tokens)에서 잘림 "
+                                f"— JSON 교정 재시도 생략(같은 길이로 다시 잘릴 뿐)")
                 if RAG_DEBUG:
                     _head = (text or '')[:200].replace('\n', ' ')
                     log.warning(f"[LLM/raw] task={req['task']} len={len(text or '')} "
@@ -7568,17 +7575,28 @@ class _V101Fuzzer:
                    and c.name not in self._DATA_LLM_EXCLUDE]   # v9.2: FWDownload 등 실자산 명령 제외
         except Exception:
             return ""
+        # self.commands 는 가중치만큼 같은 명령이 반복돼 있다(Write weight 2 × I/O 비율 → 6개).
+        #   그대로 나열하면 같은 줄이 여러 번 찍힌다 — 순서를 유지하며 한 번씩만.
+        tgt = list(dict.fromkeys(tgt))
         if not tgt:
             return ""
+        try:
+            from rag.llm_schema import DATA_HEX_MAX_CHARS as _hex_max
+        except Exception:
+            _hex_max = 4096
         lines = ["\nFor these implemented data-transfer commands, ALSO emit a valid \"data_hex\" whose "
                  "BYTES match the command's spec data structure (not just CDWs) — this reaches "
                  "data-parsing firmware code that CDW mutation/dictionaries CANNOT:"]
         for n in tgt[:8]:
             lines.append(f"  {n}: {self._DATA_LAYOUTS.get(n, 'valid data per its spec structure')}")
         lines.append("Emit data_hex ONLY for the commands listed here; omit it for all others.")
+        # ★ 상한은 스키마 maxLength 와 같은 값. MAX_INPUT_LEN(퍼저 실제 입력 상한 131072)을 보여 주면
+        #   모델이 수십 KB 의 hex 를 쓰다 max_tokens 에서 잘린다.
         lines.append(f"data_hex MUST be a literal lowercase hex string (2 chars/byte, "
-                     f"<= {MAX_INPUT_LEN} bytes). Do NOT abbreviate with expressions/repeat()/'...' "
-                     "— write the exact bytes.")
+                     f"<= {_hex_max // 2} bytes = {_hex_max} hex chars). Do NOT abbreviate with "
+                     "expressions/repeat()/'...' — write the exact bytes.")
+        lines.append("If you are not sure of the exact byte structure, OMIT data_hex — the fuzzer "
+                     "supplies valid data itself.")
         return "\n".join(lines)
 
     def _llm_grounding_block(self) -> str:
@@ -7669,8 +7687,9 @@ class _V101Fuzzer:
                         _dist = ("at SUCCESS(depth 3)" if bd >= 3
                                  else f"response-depth heuristic {bd}/3 (estimated from the "
                                       f"returned status code, NOT measured firmware progress)")
-                        dig.append((rf, f"  {n} : dominant {self._sc_name(dom)}, {_dist} → "
-                                        f"fix the exact field to advance depth"))
+                        # 이미 SUCCESS 인 명령에 '필드를 고쳐 depth 를 올려라' 는 모순 지시다.
+                        _fix = "" if bd >= 3 else " → fix the exact field to advance depth"
+                        dig.append((rf, f"  {n} : dominant {self._sc_name(dom)}, {_dist}{_fix}"))
             dig.sort(reverse=True)
             if dig:
                 lines.append("\nPer-command device feedback (fix the exact issue to advance SC-depth; "
