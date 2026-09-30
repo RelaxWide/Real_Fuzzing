@@ -225,9 +225,9 @@ class CfgRestoreCompare(unittest.TestCase):
             self.assertTrue(rows[name]['ok'], name)
         self.assertEqual(rows['L1SS Ctl1']['after'], 0x4064000F)
         self.assertEqual(rows['BAR0']['reset'], 0)
-        self.assertEqual(sorted(rep['ext']), ['AER', 'L1SS', 'LTR'])
+        self.assertEqual([c['name'] for c in rep['caps'] if c['start'] >= 0x100], ['AER', 'LTR', 'L1SS'])
         # 복원 대상 외 차이(DevSta 오류 비트)는 영역 이름으로 보고
-        self.assertEqual([o['region'] for o in rep['other']], ['PCIe'])
+        self.assertEqual([(o['region'], o['off']) for o in rep['other']], [('PCIe', 0x7A)])
         # 순서: L1SS(ASPM 설정)가 LnkCtl 보다 먼저, Command 는 마지막
         names = [r['name'] for r in rep['rows']]
         self.assertLess(names.index('L1SS Ctl1'), names.index('PCIe LnkCtl'))
@@ -251,3 +251,173 @@ class CfgRestoreCompare(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def root_cfg():
+    """루트 포트: PCIe cap 0x40(DevCtl2 LTR enable, LnkCtl ASPM L1) + AER 0x100."""
+    cfg = bytearray(4096)
+    cfg[6] = 0x10
+    cfg[0x34] = 0x40
+    cfg[0x40] = 0x10
+    struct.pack_into('<H', cfg, 0x40 + 0x10, 0x0042)            # LnkCtl: ASPM L1 + CCC
+    struct.pack_into('<H', cfg, 0x40 + 0x12, 1 << 13)           # LnkSta: DLLLA
+    struct.pack_into('<H', cfg, 0x40 + 0x28, 0x0400)            # DevCtl2: LTR enable
+    struct.pack_into('<I', cfg, 0x100, 0x0001 | (1 << 16))
+    struct.pack_into('<I', cfg, 0x108, 0x00100000)              # UE mask (Surprise Down 안 가림)
+    return cfg
+
+
+class RootPort(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'config'
+        self.path.write_bytes(bytes(root_cfg()))
+
+    def rd(self, off, n):
+        return int.from_bytes(self.path.read_bytes()[off:off + n], 'little')
+
+    def test_guard_sequence(self):
+        g = v._RootPortGuard(self.path)
+        self.assertTrue(g.mask_surprise_down())
+        self.assertEqual(self.rd(0x108, 4), 0x00100020)
+        # NSSR 링크 다운: 하드웨어가 루트 DevCtl2 LTR enable 을 끄고 Surprise Down 을 기록
+        b = bytearray(self.path.read_bytes())
+        struct.pack_into('<H', b, 0x68, 0x0000)
+        struct.pack_into('<I', b, 0x104, (1 << 5) | (1 << 20))   # Surprise Down + UR
+        self.path.write_bytes(bytes(b))
+        self.assertEqual(g.restore_ltr(), (0x0000, 0x0400))
+        self.assertEqual(self.rd(0x68, 2), 0x0400)
+        self.assertTrue(g.aspm_l1_off())
+        self.assertEqual(self.rd(0x50, 2), 0x0040)
+        g.aspm_restore()
+        self.assertEqual(self.rd(0x50, 2), 0x0042)
+        aer = g.collect_aer()
+        self.assertEqual(aer, dict(surprise_down=True, ue_other=1 << 20, ce=0))
+        self.assertEqual(self.rd(0x104, 4), 1 << 5)              # RW1C 로 Surprise Down 만 씀
+        g.unmask()
+        self.assertEqual(self.rd(0x108, 4), 0x00100000)
+
+    def test_already_masked_is_left_alone(self):
+        b = root_cfg()
+        struct.pack_into('<I', b, 0x108, 1 << 5)
+        self.path.write_bytes(bytes(b))
+        g = v._RootPortGuard(self.path)
+        self.assertFalse(g.mask_surprise_down())
+        g.unmask()
+        self.assertEqual(self.rd(0x108, 4), 1 << 5)
+
+
+class NssrWithRootPort(unittest.TestCase):
+    """_nssr 전체 흐름에서 루트 포트 처리 순서: 마스크 → (링크 복귀) LTR·ASPM → 장치 복원 → 원복."""
+
+    def test_order_and_cleanup(self):
+        from test_v11_nssr import FakeBus, Runner
+        fs = FakeSys()
+        self.addCleanup(fs.tmp.cleanup)
+        rp = fs.rp_real / 'config'
+        rp.write_bytes(bytes(root_cfg()))
+        bus = FakeBus(fs)
+        c = v.ExceptionController(__import__('test_v11_exceptions').options(), {}, '/dev/nvme0', '',
+                                  Path(fs.tmp.name) / 'events')
+        c.serial, c.bdf, c.root_bdf = 'SN1', DUT, RP
+        r = Runner(fs, bus)
+        rd = lambda off, n: int.from_bytes(rp.read_bytes()[off:off + n], 'little')
+        seen = {}
+        orig_run, orig_tick = r.run, r.tick
+
+        def run(argv, deadline, **kw):
+            if argv[2:3] == [v._NSSR_HELPER] and argv[3] == 'arm':
+                seen['mask_at_arm'] = rd(0x108, 4)
+            if argv[2:3] == [v._CFG_RESTORE]:
+                seen['root_at_restore'] = (rd(0x68, 2), rd(0x50, 2))
+            return orig_run(argv, deadline, **kw)
+
+        def tick(*a):
+            if r.down:                                           # DL_Down 효과
+                b = bytearray(rp.read_bytes())
+                struct.pack_into('<H', b, 0x68, 0)
+                struct.pack_into('<I', b, 0x104, 1 << 5)
+                rp.write_bytes(bytes(b))
+            orig_tick(*a)
+        r.run, r.tick = run, tick
+        c.runner = r
+        with patch.object(v, '_PCI_DEVICES', fs.pci), patch.object(v, '_PCI_BUS', bus.root), \
+                patch.object(v.time, 'sleep', side_effect=tick):
+            with self.assertLogs('pcfuzz', level='WARNING') as logs:
+                c._nssr(c.clock() + 30)
+        self.assertEqual(seen['mask_at_arm'] & (1 << 5), 1 << 5)
+        self.assertEqual(seen['root_at_restore'], (0x0400, 0x0040))   # LTR 먼저 켬, ASPM L1 꺼 둠
+        self.assertEqual(rd(0x108, 4), 0x00100000)                    # 마스크 원복
+        self.assertEqual(rd(0x50, 2) & 0x2, 0x2)                       # ASPM L1 원복
+        text = '\n'.join(logs.output)
+        self.assertIn('Surprise Down 기록 있음(예상된 이벤트 — 지움)', text)
+        self.assertIn('LTR enable 해제돼 있었음', text)
+
+
+class RegionLabels(unittest.TestCase):
+    def test_offset_outside_caps_and_duplicate_vsec(self):
+        cfg = bytearray(4096)
+        struct.pack_into('<HHH', cfg, 0, 0x144D, 0xA80A, 0x0006)
+        cfg[6] = 0x10
+        cfg[0x34] = 0x70
+        cfg[0x70], cfg[0x71] = 0x10, 0xB0                        # PCIe → MSI-X
+        cfg[0xB0], cfg[0xB1] = 0x11, 0x00                        # MSI-X (12B: 0xB0~0xBB)
+        struct.pack_into('<I', cfg, 0x100, 0x000B | (1 << 16) | (0x148 << 20))   # VSEC len 0x18
+        struct.pack_into('<I', cfg, 0x104, 0x018 << 20)
+        struct.pack_into('<I', cfg, 0x148, 0x000B | (1 << 16) | (0x178 << 20))   # VSEC#2 len 0x20
+        struct.pack_into('<I', cfg, 0x14C, 0x020 << 20)
+        struct.pack_into('<I', cfg, 0x178, 0x001E | (1 << 16))                   # L1SS (16B)
+        final = bytearray(cfg)
+        final[0xE4] ^= 1                                         # MSI-X 뒤, 캡 밖
+        final[0x160] ^= 1                                        # 두 번째 VSEC 안
+        final[0x349] ^= 1                                        # L1SS(0x178~0x187) 밖
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'config'
+            path.write_bytes(bytes(final))
+            p = subprocess.run([sys.executable, '-c', v._CFG_RESTORE, str(path), bytes(cfg).hex()],
+                               capture_output=True, timeout=10)
+        rep = json.loads(p.stdout)
+        self.assertEqual([(o['region'], o['off']) for o in rep['other']],
+                         [('캡 밖', 0xE4), ('VSEC', 0x160), ('캡 밖', 0x349)])
+
+
+class PowerLossCounter(unittest.TestCase):
+    def run_check(self, timing, base, now):
+        c = controller(self)
+        c._smart_base = base
+        c._smart_counts = Mock(return_value=now)
+        prof = v.Profile('p', (('power_on', 0.0),), 60, 30, timing)
+        with self.assertLogs('pcfuzz', level='WARNING') as logs:
+            try:
+                c._check_power_loss(prof)
+                err = None
+            except v.ExceptionFailure as exc:
+                err = exc
+        rows = [json.loads(l) for l in c.log_path.read_text().splitlines() if 'power_loss_check' in l]
+        return rows[-1]['status'], err, '\n'.join(logs.output), c
+
+    def test_spor_must_increment_npor_must_not(self):
+        b = dict(unsafe=5, cycles=10)
+        self.assertEqual(self.run_check('spo', b, dict(unsafe=6, cycles=11))[0], 'OK')
+        self.assertEqual(self.run_check('npo', b, dict(unsafe=5, cycles=11))[0], 'OK')
+        st, err, text, _ = self.run_check('npo', b, dict(unsafe=6, cycles=11))
+        self.assertEqual(st, 'MISMATCH')
+        self.assertRegex(str(err), r'\[장치 측\] NPOR: SMART Unexpected Power Losses \+1 \(기대 \+0\)')
+        st, err, _, _ = self.run_check('spo', b, dict(unsafe=5, cycles=11))
+        self.assertIn('증가하지 않음', str(err))
+
+    def test_other_power_cycle_or_missing_is_not_judged(self):
+        b = dict(unsafe=5, cycles=10)
+        st, err, _, c = self.run_check('spo', b, dict(unsafe=7, cycles=12))
+        self.assertEqual((st, err), ('SKIPPED', None))
+        self.assertEqual(c._smart_base, dict(unsafe=7, cycles=12))   # 다음 기준 갱신
+        self.assertEqual(self.run_check('npo', None, dict(unsafe=5, cycles=11))[:2], ('UNAVAILABLE', None))
+
+    def test_json_keys_old_and_new_names(self):
+        c = controller(self)
+        del c._smart_counts
+        c.runner = Mock()
+        for key in ('unsafe_shutdowns', 'unexpected_power_losses'):
+            c.runner.run.return_value = (0, json.dumps({key: 3, 'power_cycles': '0x10'}).encode(), b'')
+            self.assertEqual(c._smart_counts(1e9), dict(unsafe=3, cycles=16))

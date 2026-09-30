@@ -20174,6 +20174,106 @@ def _pcie_cap_offset(cfg):
     return None
 
 
+def _ext_cap_offset(cfg, cap_id):
+    """확장 설정 공간(0x100~)에서 cap_id 의 첫 오프셋. 없으면 None."""
+    off, seen = 0x100, set()
+    while off and off not in seen and off + 4 <= len(cfg):
+        seen.add(off)
+        h = int.from_bytes(cfg[off:off + 4], 'little')
+        if h in (0, 0xFFFFFFFF):
+            return None
+        if h & 0xFFFF == cap_id:
+            return off
+        off = (h >> 20) & 0xFFC
+    return None
+
+
+class _RootPortGuard:
+    """NSSR 동안 루트 포트(Downstream Port) 쪽 처리 — 장치 설정 공간만 복원하면 빠지는 부분.
+
+    · Surprise Down: Surprise Down 보고 가능한 Downstream Port 는 DL_Active→DL_Inactive 를 Surprise
+      Down 오류로 처리해야 하고, NSSR 은 예외 목록(SBR·Link Disable·hotplug surprise 등)에 없다
+      (PCIe 5.0 §3.2.1 p.213). 기본 심각도가 fatal 이라 AER 드라이버가 복구(보조 버스 리셋)나 DPC 를
+      걸어 NSSR 측정 중에 **또 다른 리셋**이 끼어든다 → NSSR 전에 UE Mask 로 가리고(마스크된 오류는
+      신호하지 않음), 끝나면 상태를 '예상된 이벤트'로 기록·지운 뒤 마스크를 원복한다.
+    · LTR: Downstream Port 의 LTR Mechanism Enable 은 DL_Down 에서 기본값(0)으로 돌아가고(p.760),
+      꺼진 포트가 받은 LTR 메시지는 Unsupported Request 다. 켤 때는 루트 포트에 가까운 쪽부터
+      (p.609) → 장치 DevCtl2 를 복원하기 **전에** 루트 포트 DevCtl2 를 먼저 되쓴다.
+    · L1SS: ASPM L1 PM Substates 는 **양쪽 포트** 모두 ASPM L1 을 끈 상태에서 설정한다(p.488) →
+      장치 L1SS 복원 동안 루트 포트 ASPM L1 을 잠시 끄고 뒤에 원복한다.
+    설정 공간은 sysfs config 의 pread/pwrite(루트 포트는 사라지지 않고 리셋 잠금도 없다).
+    """
+    SURPRISE_DOWN = 1 << 5
+
+    def __init__(self, path):
+        self.path = str(path)
+        cfg = Path(self.path).read_bytes()
+        self.px = _pcie_cap_offset(cfg)
+        self.aer = _ext_cap_offset(cfg, 0x01)
+        rd = lambda off, n: int.from_bytes(cfg[off:off + n], 'little')
+        self.saved = {}
+        if self.px is not None:
+            self.saved.update(devctl2=rd(self.px + 0x28, 2), lnkctl=rd(self.px + 0x10, 2))
+        if self.aer is not None:
+            self.saved['ue_mask'] = rd(self.aer + 8, 4)
+        self.masked = self.aspm_off = False
+
+    def _rd(self, off, n):
+        fd = os.open(self.path, os.O_RDONLY)
+        try:
+            return int.from_bytes(os.pread(fd, n, off), 'little')
+        finally:
+            os.close(fd)
+
+    def _wr(self, off, n, value):
+        fd = os.open(self.path, os.O_RDWR)
+        try:
+            os.pwrite(fd, int(value).to_bytes(n, 'little'), off)
+        finally:
+            os.close(fd)
+
+    def mask_surprise_down(self):
+        if self.aer is not None and not self.saved['ue_mask'] & self.SURPRISE_DOWN:
+            self._wr(self.aer + 8, 4, self.saved['ue_mask'] | self.SURPRISE_DOWN)
+            self.masked = True
+        return self.masked
+
+    def restore_ltr(self):
+        """→ (링크 복귀 뒤 값, 저장값). 다르면 저장값으로 되쓴다."""
+        if self.px is None:
+            return None, None
+        cur = self._rd(self.px + 0x28, 2)
+        if cur != self.saved['devctl2']:
+            self._wr(self.px + 0x28, 2, self.saved['devctl2'])
+        return cur, self.saved['devctl2']
+
+    def aspm_l1_off(self):
+        if self.px is not None and self.saved['lnkctl'] & 0x2:
+            self._wr(self.px + 0x10, 2, self.saved['lnkctl'] & ~0x2 & ~0x20)
+            self.aspm_off = True
+        return self.aspm_off
+
+    def aspm_restore(self):
+        if self.aspm_off:
+            self._wr(self.px + 0x10, 2, self.saved['lnkctl'] & ~0x20)    # Retrain 비트는 쓰지 않음
+            self.aspm_off = False
+
+    def collect_aer(self):
+        """UE/CE 상태를 읽고 Surprise Down(예상된 이벤트)만 지운다. 나머지는 보고용으로 둔다."""
+        if self.aer is None:
+            return None
+        ue, ce = self._rd(self.aer + 4, 4), self._rd(self.aer + 0x10, 4)
+        if ue & self.SURPRISE_DOWN:
+            self._wr(self.aer + 4, 4, self.SURPRISE_DOWN)                # RW1C
+        return dict(surprise_down=bool(ue & self.SURPRISE_DOWN),
+                    ue_other=ue & ~self.SURPRISE_DOWN, ce=ce)
+
+    def unmask(self):
+        if self.masked:
+            self._wr(self.aer + 8, 4, self.saved['ue_mask'])
+            self.masked = False
+
+
 def _link_active(root_bdf, pci=None):
     """루트 포트 Link Status.DLLLA(bit 13). 루트 포트를 모르면 None."""
     if not root_bdf:
@@ -20206,17 +20306,18 @@ fd = os.open(path, os.O_RDWR)
 cur = os.pread(fd, len(saved), 0)
 def val(buf, off, n):
     return int.from_bytes(buf[off:off + n], 'little')
-std = {}
+std, ext, caps = {}, {}, []                 # caps: 같은 ID 여러 개 포함 (시작, ID, 표준 여부)
 if len(saved) >= 0x40 and val(saved, 6, 2) & 0x10:
     ptr, seen = saved[0x34] & 0xFC, set()
     while ptr and ptr not in seen and ptr + 1 < min(len(saved), 0x100):
-        seen.add(ptr); std.setdefault(saved[ptr], ptr); ptr = saved[ptr + 1] & 0xFC
-ext, off, seen = {}, 0x100, set()
+        seen.add(ptr); std.setdefault(saved[ptr], ptr); caps.append((ptr, saved[ptr], True))
+        ptr = saved[ptr + 1] & 0xFC
+off, seen = 0x100, set()
 while len(saved) >= 0x104 and off and off not in seen and off + 4 <= len(saved):
     seen.add(off); h = val(saved, off, 4)
     if h in (0, 0xFFFFFFFF):
         break
-    ext.setdefault(h & 0xFFFF, off); off = (h >> 20) & 0xFFC
+    ext.setdefault(h & 0xFFFF, off); caps.append((off, h & 0xFFFF, False)); off = (h >> 20) & 0xFFC
 plan = []                                   # (이름, 오프셋, 크기, 쓸 값 또는 None=저장값, 비교 마스크)
 rb = ext.get(0x15)
 if rb is not None:
@@ -20266,24 +20367,52 @@ covered = set()
 for r in rows:
     covered.update(range(r['off'], r['off'] + r['size']))
 names = {0x01: 'PM', 0x05: 'MSI', 0x11: 'MSI-X', 0x10: 'PCIe', 0x03: 'VPD', 0x09: 'Vendor'}
-xnames = {0x01: 'AER', 0x02: 'VC', 0x03: 'DSN', 0x04: 'PwrBudget', 0x0B: 'VSEC', 0x0F: 'ATS',
-          0x15: 'ReBAR', 0x18: 'LTR', 0x19: 'SecPCIe', 0x1E: 'L1SS', 0x1F: 'PTM', 0x25: 'DLF', 0x26: 'PL16G',
-          0x27: 'Margining', 0x2A: 'PL32G'}
-bounds = sorted([(o, names.get(i, 'cap%02x' % i)) for i, o in std.items()] +
-                [(o, xnames.get(i, 'ext%04x' % i)) for i, o in ext.items()] +
-                [(0, 'Header'), (0x40, 'cap?'), (0x100, 'ext?')])
+xnames = {0x01: 'AER', 0x02: 'VC', 0x03: 'DSN', 0x04: 'PwrBudget', 0x0B: 'VSEC', 0x0D: 'ACS', 0x0E: 'ARI',
+          0x0F: 'ATS', 0x10: 'SR-IOV', 0x15: 'ReBAR', 0x18: 'LTR', 0x19: 'SecPCIe', 0x1B: 'PASID',
+          0x1E: 'L1SS', 0x1F: 'PTM', 0x23: 'DVSEC', 0x25: 'DLF', 0x26: 'PL16G', 0x27: 'Margining',
+          0x2A: 'PL32G'}
+# 캡 크기(바이트) — 스펙의 고정 크기. 모르는 캡은 다음 캡 시작까지로 본다.
+std_size = {0x01: 8, 0x11: 12, 0x10: 0x3C, 0x03: 8}
+ext_size = {0x01: 0x48, 0x03: 0x0C, 0x04: 0x10, 0x0E: 8, 0x0F: 8, 0x10: 0x40, 0x18: 8, 0x1B: 8,
+            0x1E: 0x10, 0x1F: 0x0C, 0x25: 0x0C}
+def extent(start, cid, is_std):
+    if is_std:
+        if cid == 0x05:                        # MSI: 64비트·벡터 마스크 여부로 크기가 바뀐다
+            ctl = val(saved, start + 2, 2)
+            return (0x18 if ctl & 0x80 else 0x14) if ctl & 0x100 else (0x0E if ctl & 0x80 else 0x0A)
+        if cid == 0x09:
+            return saved[start + 2] if start + 2 < len(saved) else None
+        return std_size.get(cid)
+    if cid in (0x0B, 0x23):                    # VSEC/DVSEC: 헤더의 길이 필드
+        return (val(saved, start + 4, 4) >> 20) & 0xFFF or None
+    if cid == 0x15:
+        return 4 + 8 * ((val(saved, start + 8, 4) >> 5) & 7)
+    return ext_size.get(cid)
+spans = []
+order = sorted(caps)
+for i, (start, cid, is_std) in enumerate(order):
+    nxt = [o for o, _, st in order[i + 1:] if st == is_std]
+    limit = nxt[0] if nxt else (0x100 if is_std else len(saved))
+    size = extent(start, cid, is_std)
+    end = min(start + size, limit) if size else limit
+    spans.append((start, end, (names if is_std else xnames).get(cid, ('cap%02x' if is_std else 'ext%04x') % cid)))
 def region(o):
-    r = 'Header'
-    for b, n in bounds:
-        if b <= o:
-            r = n
-    return r
-other = {}
+    if o < 0x40:
+        return 'Header'
+    for a, b, n in spans:
+        if a <= o < b:
+            return n
+    return '캡 밖'
+other = []
 for o in range(min(len(saved), len(fin))):
     if o not in covered and saved[o] != fin[o]:
-        g = other.setdefault(region(o), dict(region=region(o), off=o, n=0)); g['n'] += 1
-print(json.dumps(dict(rows=rows, other=list(other.values()),
-                      ext=sorted(xnames.get(i, 'ext%04x' % i) for i in ext))))
+        name = region(o)
+        if other and other[-1]['region'] == name and o - other[-1]['last'] <= 4:
+            other[-1]['n'] += 1; other[-1]['last'] = o
+        else:
+            other.append(dict(region=name, off=o, n=1, last=o))
+print(json.dumps(dict(rows=rows, other=other,
+                      caps=[dict(name=n, start=a, end=b) for a, b, n in spans])))
 sys.exit(6 if fail else 0)
 """
 
@@ -20871,6 +21000,7 @@ class ExceptionController:
                    f"{self._describe_argv(r.get('action'), r.get('argv'))}", error=True)
 
     _NSSR_STEP_TEXT = {'unbind': '드라이버 unbind', 'nssr_write': 'BAR0 NSSR ← 4E564D65h',
+                       'root_mask': '루트 포트 AER: Surprise Down 마스크(NSSR 링크 다운이 AER 복구·DPC 를 부르지 않게)',
                        'cfg_restore': '설정 공간 복원(NSSR 전 저장값)',
                        'enable': '메모리 디코드 켬', 'disable': '메모리 디코드 끔(enable 횟수 원복)',
                        'probe': '드라이버 probe',
@@ -20881,6 +21011,41 @@ class ExceptionController:
         argv = r.get('argv')
         cmd = f" — {self._describe_argv(step, argv)}" if argv else ""
         self._line(f"      · {self._NSSR_STEP_TEXT.get(step, step)}{cmd}")
+
+    def _show_power_loss_check(self, r):
+        st, what = r.get('status'), ('SPOR' if r.get('kind') == 'spo' else 'NPOR')
+        if st == 'UNAVAILABLE':
+            self._line(f"    [check] SMART 전원 손실 카운터 읽기 실패/기준 없음 — {what} 구분 판정 생략")
+        elif st == 'SKIPPED':
+            self._line(f"    [check] SMART Power Cycles {r['d_cycles']:+d} (1 이어야 판정) — "
+                       f"사이에 다른 전원 사이클이 있거나 집계 안 됨, {what} 구분 판정 생략")
+        else:
+            ok = st == 'OK'
+            self._line(f"    [check] SMART Power Cycles +1 · Unexpected Power Losses {r['d_unsafe']:+d} "
+                       f"({what} 기대 {r['expect']:+d}) {'OK' if ok else '✗'}", error=not ok)
+
+    def _show_root_port(self, r):
+        parts = []
+        aer = r.get('aer')
+        if aer:
+            parts.append('Surprise Down 기록 ' + ('있음(예상된 이벤트 — 지움)' if aer['surprise_down'] else '없음'))
+        a, b = r.get('devctl2_after_link'), r.get('devctl2_saved')
+        if a is not None and b is not None:
+            if a != b:
+                ltr = ' (LTR enable 해제돼 있었음)' if (b & 0x400) and not (a & 0x400) else ''
+                parts.append(f'DevCtl2 {a:04x}→{b:04x} 복원{ltr}')
+            else:
+                parts.append('DevCtl2 유지')
+        if r.get('aspm_l1_toggled'):
+            parts.append('ASPM L1 끔→원복(L1SS 설정 동안)')
+        if r.get('masked') is False and aer is not None:
+            parts.append('마스크 원복')
+        self._line(f"      루트 포트 {r.get('bdf')}: " + (' · '.join(parts) or '처리 없음'))
+        if aer and (aer['ue_other'] or aer['ce']):
+            self._line(f"      ⚠ 루트 포트 AER 그 밖의 기록: UE=0x{aer['ue_other']:08x} CE=0x{aer['ce']:08x} "
+                       f"(지우지 않음 — 확인 필요)", error=True)
+        if r.get('error'):
+            self._line(f"      ⚠ 루트 포트 원복 실패: {r['error']}", error=True)
 
     def _show_cfg_restore(self, r):
         rows = r.get('rows') or []
@@ -20897,8 +21062,10 @@ class ExceptionController:
                    f" · 리셋으로 바뀌어 있던 것 {n_reset}", error=bool(n_bad))
         other = r.get('other') or []
         if other:
-            txt = ', '.join(f"{o['region']}(0x{o['off']:03x}~ {o['n']}B)" for o in other)
-            self._line(f"        복원 대상 외 저장본과 다른 곳: {txt} — 상태·오류·드라이버 설정 영역")
+            txt = ', '.join(f"{o['region']} 0x{o['off']:03x}" + (f"~0x{o['last']:03x}" if o.get('last', o['off']) != o['off'] else '')
+                            for o in other)
+            self._line(f"        복원 대상 외 저장본과 다른 곳: {txt} — 상태·오류·드라이버 설정 영역"
+                       f"(캡 밖 = 어느 캡 범위에도 들지 않는 오프셋)")
 
     def _show_nssr_result(self, r):
         def at(key):
@@ -21271,6 +21438,7 @@ class ExceptionController:
         except OSError:
             driver = None
         issued = enabled = False
+        root = None
         result = dict(driver=driver)
         try:
             if driver:
@@ -21284,6 +21452,13 @@ class ExceptionController:
                 raise ExceptionFailure(f'NSSR: 설정 공간 저장 실패: {exc}')
             if len(saved) < 64 or saved[:2] in (b'\xff\xff', b'\x00\x00'):
                 raise ExceptionFailure(f'NSSR: 설정 공간 저장 실패 ({len(saved)}B)')
+            if getattr(self, 'root_bdf', None):
+                try:
+                    root = _RootPortGuard(_PCI_DEVICES / self.root_bdf / 'config')
+                except OSError as exc:
+                    raise ExceptionFailure(f'NSSR: 루트 포트 설정 공간 읽기 실패: {exc}')
+                if root.mask_surprise_down():
+                    self.emit('nssr_step', step='root_mask', argv=None)
             # 2) NSSR
             trigger = getattr(self, '_nssr_trigger', None)
             t0 = self.clock()
@@ -21315,7 +21490,12 @@ class ExceptionController:
                                            '(Vendor/Device ID 불일치·FFFF)')
                 time.sleep(0.001)
             result['cfg_ok_sec'] = self.clock() - t0
-            # 4) 설정 공간 복원
+            # 4) 루트 포트 먼저: LTR enable(DL_Down 으로 해제됨) → 장치 L1SS 설정 동안 ASPM L1 끔
+            if root is not None:
+                ltr_before, ltr_saved = root.restore_ltr()
+                result.update(root_devctl2_after_link=ltr_before, root_devctl2_saved=ltr_saved)
+                result['root_aspm_l1_off'] = root.aspm_l1_off()
+            # 설정 공간 복원
             argv = [sys.executable, '-c', _CFG_RESTORE, str(dev / 'config'), saved.hex()]
             self.emit('nssr_step', step='cfg_restore', argv=None)
             rc, out, err = self.runner.run(argv, deadline)
@@ -21327,6 +21507,8 @@ class ExceptionController:
                 self.emit('cfg_restore', **report)
                 bad = [r['name'] for r in report['rows'] if not r['ok']]
                 result['cfg_mismatch'] = bad
+            if root is not None:
+                root.aspm_restore()
             if rc:
                 raise ExceptionFailure(f'NSSR 뒤 설정 공간 복원 실패 rc={rc}' +
                                        (f": 불일치 {', '.join(bad)}" if report else
@@ -21358,6 +21540,24 @@ class ExceptionController:
                 if driver:
                     self._sysfs_write('rebind', _PCI_BUS / 'drivers_probe', self.bdf, end, check=False)
             raise
+        finally:
+            if root is not None:
+                self._nssr_root_finish(root, issued, result)
+
+    def _nssr_root_finish(self, root, issued, result):
+        """루트 포트 원복: ASPM → (NSSR 이 나갔으면) AER 상태 수집·Surprise Down 지움 → 마스크 원복."""
+        info = dict(bdf=self.root_bdf, masked=root.masked,
+                    devctl2_after_link=result.get('root_devctl2_after_link'),
+                    devctl2_saved=result.get('root_devctl2_saved'),
+                    aspm_l1_toggled=bool(result.get('root_aspm_l1_off')))
+        try:
+            root.aspm_restore()
+            if issued:
+                info['aer'] = root.collect_aer()
+            root.unmask()
+        except OSError as exc:
+            info['error'] = str(exc)
+        self.emit('root_port', **info)
 
     def restore_supply(self):
         """Only ON/deassert; never cycle power or issue a recovery reset."""
@@ -21443,7 +21643,65 @@ class ExceptionController:
     def _run_profile(self, profile):
         self._step_total = len(profile.steps)
         if self.timing is not None:
-            return self._run_profile_timed(profile)
+            self._run_profile_timed(profile)
+        else:
+            self._run_profile_plain(profile)
+        if profile.timing in ('npo', 'spo'):
+            self._check_power_loss(profile)
+
+    # ── NPO/SPO 구분 검증: SMART Unexpected Power Losses (구 Unsafe Shutdowns) ──
+    #   NVMe Base 2.3 SMART/Health 로그(p.240): 이 카운터는 전원이 끊길 때 CSTS.SHST 가 10b 가
+    #   아니었으면, **그리고 그때만** 1 증가한다. SPOR(종료 통지 없이 차단) = +1, NPOR(SHN=01b →
+    #   SHST=10b 뒤 차단) = +0 이어야 한다. 사이에 다른 전원 사이클(퍼저 자체 POR 등)이 끼면
+    #   Power Cycles 가 +1 이 아니므로 판정하지 않는다.
+    _SMART_KEYS = {'unsafe': ('unsafe_shutdowns', 'unexpected_power_losses'),
+                   'cycles': ('power_cycles',)}
+
+    def _smart_counts(self, deadline):
+        try:
+            rc, out, _ = self.runner.run(['nvme', 'smart-log', self.device, '-o', 'json'], deadline)
+            if rc:
+                return None
+            data = json.loads(out)
+            got = {}
+            for name, keys in self._SMART_KEYS.items():
+                for key in keys:
+                    if key in data:
+                        v = data[key]
+                        got[name] = int(v, 0) if isinstance(v, str) else int(v)
+                        break
+            return got if len(got) == 2 else None
+        except Exception:
+            return None
+
+    def _smart_baseline(self):
+        self._smart_base = self._smart_counts(self.clock() + 10)
+
+    def _check_power_loss(self, profile):
+        base = getattr(self, '_smart_base', None)
+        now = self._smart_counts(self.clock() + 10)
+        self._smart_base = now                       # 다음 전원 이벤트의 기준
+        expect = 1 if profile.timing == 'spo' else 0
+        row = dict(kind=profile.timing, expect=expect, base=base, now=now)
+        if base is None or now is None:
+            self.emit('power_loss_check', status='UNAVAILABLE', **row)
+            return
+        dc, du = now['cycles'] - base['cycles'], now['unsafe'] - base['unsafe']
+        row.update(d_cycles=dc, d_unsafe=du)
+        if dc != 1:
+            self.emit('power_loss_check', status='SKIPPED', **row)
+            return
+        if du == expect:
+            self.emit('power_loss_check', status='OK', **row)
+            return
+        self.emit('power_loss_check', status='MISMATCH', **row)
+        what = 'SPOR' if expect else 'NPOR'
+        why = ('종료 통지 없이 전원이 끊겼는데 증가하지 않음' if expect else
+               '정상 종료(SHST=10b) 뒤 차단인데 증가함')
+        raise ExceptionFailure(f'[장치 측] {what}: SMART Unexpected Power Losses {du:+d} (기대 {expect:+d}) — '
+                               f'{why} (NVMe Base 2.3 SMART PWRC/UPL)')
+
+    def _run_profile_plain(self, profile):
         deadline = self.clock() + profile.timeout_sec
         ready_deadline = None
         for index, (action, hold) in enumerate(profile.steps):
@@ -21800,6 +22058,8 @@ class ExceptionController:
             self.last_result = dict(event_id='preflight-baseline', phase='preflight', stage='baseline_ready')
             self._say("  [기준] 시작 전 장치 준비 확인")
             self.wait_ready(self.clock() + min(p.ready_timeout_sec for p in self.profiles))
+            if any(p.timing in ('npo', 'spo') for p in self.profiles):
+                self._smart_baseline()                 # NPO/SPO 전원 손실 카운터 기준
             for pos, profile in enumerate(self.profiles, 1):
                 self.active = 'preflight-' + profile.name
                 self.last_result = dict(event_id=self.active, profile=profile.name,

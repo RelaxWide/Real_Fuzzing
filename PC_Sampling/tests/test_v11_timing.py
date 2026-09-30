@@ -223,6 +223,7 @@ def controller(tc, timing=BM9K1):
                               clock=Mock(return_value=0.0), timing=timing)
     c.serial, c.bdf = 'SN1', DUT
     c.wait_ready = Mock()
+    c._smart_counts = Mock(return_value=None)          # 실제 nvme smart-log 를 부르지 않는다
     return c
 
 

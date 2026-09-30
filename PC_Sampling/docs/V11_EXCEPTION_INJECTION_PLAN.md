@@ -169,6 +169,15 @@ v10.3 진입점은 exceptions를 사용하지 않는다. v11 출력은 `output/p
 | sudden_por | 전원 OFF → PERST assert(Tfail, 명령 간격만큼 늦음) → host remove → OFF 대기 → ON → **Tpvperl 0.1s** → PERST release → rescan 반복 |
 | normal_por | host orderly remove(CC.SHN=01b→**SHST=10b 확인**) → PERST assert → OFF → OFF 대기 → ON → **Tpvperl 0.1s** → PERST release → rescan 반복 |
 
+**SPOR 과 NPOR 의 차이와 검증** — 두 profile 모두 퍼징 명령이 도는 중에 주입된다. 차이는 전원을
+끊기 전의 정상 종료 통지다: NPOR 은 드라이버 orderly remove 가 I/O 큐를 지우고 CC.SHN=01b 를 쓴 뒤
+CSTS.SHST=10b 를 기다리고(Base 2.3 §3.6.2) PERST → 전원 OFF, SPOR 은 통지 없이 전원 OFF → PERST.
+이 차이는 장치의 **SMART Unexpected Power Losses**(구 Unsafe Shutdowns)로 확인한다 — "SHST 가 10b 가
+아닐 때 전원이 끊기면, 그리고 그때만 증가"(Base 2.3 p.240). 전원 이벤트 뒤 smart-log 를 읽어
+SPOR = +1, NPOR = +0 이 아니면 `[장치 측]` 실패. 기준은 사전시험 시작과 직전 전원 이벤트 뒤 값이고,
+그사이 Power Cycles 가 정확히 +1 이 아니면(퍼저 자체 POR 등) 판정하지 않는다. 복귀 스펙도 다르다
+(BM9K1: NPO 0.5s, SPO 20s).
+
 Normal POR의 의미는 **Linux 드라이버 orderly removal 이후 전원 차단**이다.
 별도 MMIO SHN/SHST 관측 시험이나 제품별 전기적 shutdown 인증과 동일시하지 않는다.
 NSSR의 NQN 범위 검사는 보수적이므로 placeholder NQN이 중복되면 실행을 제외할 수 있다.
@@ -204,7 +213,19 @@ NSSR의 NQN 범위 검사는 보수적이므로 placeholder NQN이 중복되면 
    복원하지 않는 것: MSI/MSI-X(드라이버가 probe 에서 다시 잡음), PMCSR(리셋 뒤 D0), VC(VC0 기본),
    상태·오류 로그(RW1C/하드웨어 값), 읽기 전용 영역.
    **저장본 → 리셋 후 → 복원 후** 를 레지스터마다 출력하고, 복원 대상 밖에서 저장본과 다른 영역도
-   이름으로 보고한다. BAR·Command 불일치는 실패, 그 외 불일치는 표시만
+   이름으로 보고한다(캡 범위는 스펙 고정 크기·VSEC 길이 필드로 계산 — 어느 캡에도 안 드는 오프셋은
+   `캡 밖`). BAR·Command 불일치는 실패, 그 외 불일치는 표시만
+   **루트 포트(Downstream Port)도 다룬다** — 장치만 복원하면 빠지는 부분:
+   - NSSR 전: 루트 포트 AER UE Mask 에 **Surprise Down 을 가림**. Surprise Down 보고 가능 포트는
+     DL_Active→DL_Inactive 를 오류로 처리해야 하고 NSSR 은 예외가 아니다(PCIe 5.0 §3.2.1 p.213).
+     기본 심각도 fatal 이라 AER 드라이버가 보조 버스 리셋·DPC 를 걸어 NSSR 측정 중 **다른 리셋이
+     끼어든다** — 복원 뒤에 지우는 것만으로는 늦다
+   - 링크 복귀 뒤, 장치 복원 **전**: 루트 포트 DevCtl2 를 저장값으로(LTR Mechanism Enable 은
+     Downstream Port 에서 DL_Down 시 0 으로 돌아가고 p.760, 켤 때는 루트 쪽부터 p.609 — 꺼진 포트가
+     받은 LTR 메시지는 UR). 장치 L1SS 를 설정하는 동안 루트 포트 ASPM L1 을 잠시 끔(양쪽 모두
+     ASPM L1 을 끈 상태에서 설정 p.488)
+   - 끝: ASPM 원복 → AER 상태 읽어 Surprise Down 은 **예상된 이벤트**로 기록·지움(RW1C), 그 밖의
+     UE/CE 는 지우지 않고 경고로 표시 → 마스크 원복(실패 경로 포함)
 5. CSTS 읽기: **NSSRO=1, CFS=0** 이어야 함. NSSRO=0 은 `[장치 측] NSSR 스펙 위반`,
    CFS=1·링크 미복귀·설정 무응답·CSTS 읽기 실패도 장치 측 불량
 6. enable 원복, `drivers_probe` → 드라이버가 CC.EN→RDY→live. 이후는 다른 profile 과 같은
