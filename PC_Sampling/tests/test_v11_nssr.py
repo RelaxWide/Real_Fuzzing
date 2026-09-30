@@ -5,6 +5,7 @@ unbind → BAR0 NSSR 쓰기(t0) → 링크 다운·업 → 설정 응답 → 설
 가짜 sysfs 와 가짜 runner 로 순서·판정·정리를 보고, BAR0 도우미 스크립트는 일반 파일에 대고
 실제로 실행한다. 장치 조작은 하지 않는다.
 """
+import json
 import struct
 import subprocess
 import sys
@@ -237,7 +238,11 @@ class CfgRestore(unittest.TestCase):
             p = subprocess.run([sys.executable, '-c', v._CFG_RESTORE, str(path), bytes(cfg).hex()],
                                capture_output=True, timeout=10)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-            self.assertIn(b'RESTORED cap=0x70', p.stdout)
+            rep = json.loads(p.stdout)
+            rows = {r['name']: r for r in rep['rows']}
+            self.assertTrue(all(r['ok'] for r in rep['rows']))
+            self.assertEqual((rows['BAR0']['reset'], rows['BAR0']['after']), (0, BAR0))
+            self.assertEqual(rows['PCIe DevCtl']['after'], 0x2950)
             self.assertEqual(path.read_bytes(), bytes(cfg))
 
 

@@ -367,6 +367,7 @@ class T0AndProfiles(unittest.TestCase):
         c._timing_wait = Mock()
         mon = Mock()
         mon.start.return_value = mon
+        mon.shutdown = {}
         c._new_monitor = Mock(return_value=mon)
         c._run_profile(v.Profile('x', steps, 60, 30, timing))
         self.cycles = mon.begin_cycle.call_count
@@ -440,10 +441,20 @@ class BarReaderIsolation(unittest.TestCase):
             w.poll()
             pid = w.proc.pid
             _t.sleep(0.3)
-            first = len(os.listdir(f'/proc/{pid}/fd'))
+
+            def peak():
+                # 재시도 중 잠깐 열린 fd 가 찍힐 수 있다 — 여러 번 본 최대값으로 비교(누수면 계속 는다)
+                n = 0
+                for _ in range(20):
+                    n = max(n, len(os.listdir(f'/proc/{pid}/fd')))
+                    _t.sleep(0.005)
+                return n
+            first = peak()
             _t.sleep(0.5)                                     # 그사이 수백 번 재시도
             self.assertIsNone(w.proc.poll(), '자식이 살아 있어야 한다')
-            self.assertEqual(len(os.listdir(f'/proc/{pid}/fd')), first)
+            # 부하가 크면 첫 측정이 자식 기동 중(루프 진입 전)이라 1개 적게 잡힌다. 누수라면 재시도
+            #   수백 번만큼 늘어난다 — 증가 폭으로 판정
+            self.assertLess(peak() - first, 3)
 
 
 class RescanLoop(unittest.TestCase):
@@ -480,8 +491,18 @@ class ProductConfig(unittest.TestCase):
         for n in ('normal_por', 'sudden_por', 'warm_reset_perst'):
             acts = [a for a, _ in profs[n].steps]
             self.assertEqual(acts[-1], 'pci_rescan_wait', n)
-            self.assertEqual(dict(profs[n].steps).get('power_on', dict(profs[n].steps).get('perst_release')),
-                             0.0, f'{n}: 전원 ON/PERST 해제 뒤 고정 대기가 없어야 한다')
+            steps = dict(profs[n].steps)
+            self.assertEqual(steps['perst_release'], 0.0, f'{n}: PERST 해제 뒤 고정 대기가 없어야 한다')
+            if n != 'warm_reset_perst':
+                # PCIe 5.0 §6.6.1 Tpvperl: 전원 ON 뒤 PERST# 를 100ms 유지하고 해제
+                acts = [a for a, _ in profs[n].steps]
+                self.assertEqual(steps['power_on'], 0.1, n)
+                self.assertEqual(acts[acts.index('power_on') + 1], 'perst_release', n)
+                self.assertLess(acts.index('perst_assert'), acts.index('power_on'), n)
+        acts = [a for a, _ in profs['normal_por'].steps]
+        self.assertEqual(acts[:3], ['pci_remove', 'perst_assert', 'power_off'])   # 정상 종료 → PERST → OFF
+        acts = [a for a, _ in profs['sudden_por'].steps]
+        self.assertEqual(acts[:2], ['power_off', 'perst_assert'])                  # 급차단 → PERST (Tfail)
 
 
 if __name__ == '__main__':

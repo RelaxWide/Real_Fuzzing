@@ -95,8 +95,7 @@ PMU 호출은 코드에 박혀 있지 않다. `adapters` 로 등록한다.
 "adapters": {
   "perst_assert": {
     "argv": ["python3", "{pmu_script}", "16", "1", "7", "3300"],
-    "effect": "assert",
-    "readback": { "argv": ["python3", "{pmu_script}", "20", "1", "7"], "expected": 0 }
+    "effect": "assert"
   }
 }
 ```
@@ -105,7 +104,11 @@ PMU 호출은 코드에 박혀 있지 않다. `adapters` 로 등록한다.
 - 치환은 `{device}` 와 `{pmu_script}` **둘뿐**이다. 다른 `{}` 는 기동 시 거부한다
   (임의 format 식을 받지 않는다)
 - 내장 이름과 겹치면 거부(`reserved adapter`)
-- `readback.expected` 는 0/1. 파싱 실패나 모순된 응답을 성공으로 보지 않는다
+- `readback`(선택) — `{"argv": [...], "expected": 0|1}`. 넣으면 엄격 확인(파싱 실패·모순 응답을
+  성공으로 보지 않음). **기본 config 에는 없다**: 시험 보드에서 GPIO 읽기(20)가 실패했고(명령 16/15
+  는 성공), 효과는 아래 링크 확인으로 대신한다
+- `power_off`·`assert` 효과는 명령 성공 뒤 **루트 포트 링크 다운(DLLLA=0, 1s 안)** 으로 확인한다.
+  안 내려가면 `[호스트 측] … 명령은 성공했지만 링크가 내려가지 않음` 실패. 루트 포트를 모르면 생략
 - `effect` 를 안 주면 `none`
 
 ### profile — 단계와 시간
@@ -162,9 +165,9 @@ v10.3 진입점은 exceptions를 사용하지 않는다. v11 출력은 `output/p
 | nssr | CAP.NSSRS 확인, 같은 subsystem NQN에 컨트롤러 하나만 보이고 루트 포트 DLLLA를 읽을 수 있는 경우. unbind → 설정 공간 저장 → BAR0 NSSR 쓰기 → 링크 다운·업·설정 응답 → 설정 공간 복원 → CSTS.NSSRO 확인 → 드라이버 probe (아래 **NSSR 절차**) |
 | flr | sysfs reset_method에 정확히 flr이 있을 때 실행 |
 | hot_reset | 정확히 bus 방식이 있고 같은 부모 버스 범위에 DUT 외 PCI 기능이 없을 때 실행 |
-| warm_reset_perst | PERST assert → host remove → release → 기존 rescan 대기 → rescan. 주전원/REFCLK 조작 없음 |
-| sudden_por | 전원 OFF → host remove → 기존 OFF 대기 → ON → 기존 rescan 대기 → rescan |
-| normal_por | host orderly remove → OFF → 기존 OFF 대기 → ON → 기존 rescan 대기 → rescan |
+| warm_reset_perst | PERST assert(링크 다운 확인, 0.1s 유지 ≥ Tperst) → host remove → release → rescan 반복. 주전원/REFCLK 조작 없음 |
+| sudden_por | 전원 OFF → PERST assert(Tfail, 명령 간격만큼 늦음) → host remove → OFF 대기 → ON → **Tpvperl 0.1s** → PERST release → rescan 반복 |
+| normal_por | host orderly remove(CC.SHN=01b→**SHST=10b 확인**) → PERST assert → OFF → OFF 대기 → ON → **Tpvperl 0.1s** → PERST release → rescan 반복 |
 
 Normal POR의 의미는 **Linux 드라이버 orderly removal 이후 전원 차단**이다.
 별도 MMIO SHN/SHST 관측 시험이나 제품별 전기적 shutdown 인증과 동일시하지 않는다.
@@ -194,9 +197,14 @@ NSSR의 NQN 범위 검사는 보수적이므로 placeholder NQN이 중복되면 
 3. 링크 다운(DLLLA 0, 최대 1s 관측) → 링크 업 → 설정 요청이 NSSR 전과 같은 Vendor/Device ID 로
    응답할 때까지(FFFF·CRS 0001 은 준비 안 됨). 이 구간은 호스트 개입이 없어 `cfg_after_ts` 가
    장치 시간 그대로 잡힌다
-4. **설정 공간 복원** — BAR0~5·ROM·캐시라인/지연·인터럽트 라인, PCIe DevCtl·LnkCtl·DevCtl2·LnkCtl2,
-   마지막에 Command. BAR 되읽기가 다르면 실패. (커널 pci_restore_state 의 최소 집합.
-   MSI/MSI-X 는 드라이버가 probe 에서 다시 잡는다)
+4. **설정 공간 복원** — 커널 `pci_restore_state` 가 복원하는 소프트웨어 설정을 되쓴다(순서 포함):
+   ReBAR 크기 → BAR0~5·ROM·캐시라인/지연·인터럽트 라인 → LTR 최대 지연 → L1SS(Ctl2 → Ctl1
+   enable 없이 → Ctl1) → PTM → ATS → AER(UE 마스크·심각도, CE 마스크, ECRC 제어) →
+   PCIe DevCtl·DevCtl2·LnkCtl·LnkCtl2(ASPM 은 L1SS 뒤) → Command 마지막.
+   복원하지 않는 것: MSI/MSI-X(드라이버가 probe 에서 다시 잡음), PMCSR(리셋 뒤 D0), VC(VC0 기본),
+   상태·오류 로그(RW1C/하드웨어 값), 읽기 전용 영역.
+   **저장본 → 리셋 후 → 복원 후** 를 레지스터마다 출력하고, 복원 대상 밖에서 저장본과 다른 영역도
+   이름으로 보고한다. BAR·Command 불일치는 실패, 그 외 불일치는 표시만
 5. CSTS 읽기: **NSSRO=1, CFS=0** 이어야 함. NSSRO=0 은 `[장치 측] NSSR 스펙 위반`,
    CFS=1·링크 미복귀·설정 무응답·CSTS 읽기 실패도 장치 측 불량
 6. enable 원복, `drivers_probe` → 드라이버가 CC.EN→RDY→live. 이후는 다른 profile 과 같은
@@ -226,10 +234,18 @@ Hot reset도 여러 DUT/기능으로 영향을 넓히지 않는다. PCI remove/r
 
 PERST assert: `python3 pmu_4_1.py 16 1 7 3300`
 PERST release: `python3 pmu_4_1.py 15 1 7 3300`
-Readback: `python3 pmu_4_1.py 20 1 7`
-`[GetGpio][OK]D1] 0/1` 형식을 파싱해 실제 읽은 디지털 값과 비교한다.
-파싱 실패/모순된 응답을 성공으로 보지 않는다. 해제 readback 실패는 assert 잔류 가능성을
-유지하므로 cleanup이 release를 재시도한다.
+Readback: `python3 pmu_4_1.py 20 1 7` — 시험 보드에서 실패(명령 16/15 는 성공)해 기본 config 에서
+뺐다. adapter 에 `readback` 을 넣으면 `[GetGpio][OK]D1] 0/1` 을 파싱해 엄격 확인하고, 해제 readback
+실패는 assert 잔류 가능성을 유지해 cleanup 이 release 를 재시도한다. 기본은 링크 다운으로 효과 확인.
+
+**전원 시퀀스 근거** — PCIe 5.0 §6.6.1(p.554)은 전원과 PERST# 를 공급하는 폼팩터가 정해야 할
+파라미터로 Tpvperl(전원 유효 뒤 PERST# 유지), Tperst(assert 최소 유지), Tfail(전원 무효 뒤 PERST#
+assert 까지), Tperst-clk(REFCLK 안정 뒤 PERST# 유지)를 둔다. 값은 CEM(이 폴더에 없음 — 통상
+Tpvperl 100ms, Tperst 100µs, Tfail 500ns, Tperst-clk 100µs). PMU 명령 4 는 전원만 켜고 PERST 를
+바꾸지 않으므로 POR profile 은 PERST 를 **명시적으로** 다룬다: 전원 ON 동안 assert 로 두고
+`exceptions.tpvperl_sec`(0.1s) 뒤 release. Tfail 500ns 는 PMU 명령 간격으로는 지킬 수 없어
+sudden_por 는 전원 OFF **직후** assert(전원 레일이 떨어지는 동안), normal_por 는 전원 OFF **전**
+assert. REFCLK 은 호스트가 계속 공급한다(Tperst-clk 충족).
 
 전원 OFF/ON argv는 기존 시작 POR 호출과 동일하다. ON voltage는 기존
 `runtime_hw.clkreq_voltage_mv` 값을 재사용하며 이름만으로 GPIO 제어라고 해석하지 않는다.
@@ -656,16 +672,30 @@ Write/WriteUncorrectable/WriteZeroes 에 전용 timeout 그룹 `write` 를 만�
 블록이 없는 제품은 예전처럼 profile 의 준비 한도만 본다(현재 설정된 제품은 모두 블록이 있다).
 
 **측정 방법** — 관측 스레드가 1ms 주기로 **첫 전환 시각**을 기록한다(읽기 전용).
+시각은 **읽기가 끝난 뒤** 찍고, 설정 공간 읽기(링크·Vendor)와 BAR·sysfs state 관측은 **다른
+스레드**에서 돈다. (예전엔 한 스레드가 읽기 전에 시각을 찍었다 — FLR/hot reset 중 커널이 설정 공간
+접근을 잠가(`pci_dev_lock`) Vendor 읽기가 막힌 동안 드라이버가 live 까지 가서 live 에 막히기 전
+시각이 붙었다. 실기: controller_reset −19ms, flr −133ms, hot_reset −190ms 의 RDY→admin.
+CC.EN 과 RDY 는 같은 자식 프로세스의 같은 읽기에서 나오므로 서로 역전되지 않는다)
 
 | 시각 | 출처 |
 |---|---|
 | 링크 다운/업 | 루트 포트 설정 공간 Link Status.DLLLA(bit 13) — DUT 가 remove 돼도 남는다 |
-| 설정 요청 완료 | DUT 설정 공간 Vendor ID 가 유효(≠0xFFFF)해진 순간 |
+| 설정 요청 완료 | DUT 설정 공간 Vendor ID 가 유효(≠0xFFFF, ≠0x0001 CRS)해진 순간 |
 | CC.EN / CSTS.RDY | DUT BAR0(`resource0`)를 읽기 전용 mmap 해 CC(0x14)·CSTS(0x1C) 직접 폴링(32비트 읽기). **별도 자식 프로세스**가 읽는다 — remove 와 읽기의 경쟁에서 나는 SIGBUS 가 퍼저 본체를 죽이지 않게(자식이 죽으면 관측 공백으로 기록하고 다시 띄움). 자식은 장치가 사라지면 매핑을 풀고 다시 나타나면 스스로 매핑한다 |
 | admin 가능 | 원래 serial+BDF 컨트롤러의 sysfs state 가 live 로 바뀐 순간 |
 | I/O 가능 | 네임스페이스 `nvme read` 1블록이 **완료된** 순간 — 성공이든 NVMe 오류 상태든(퍼징이 LBA 0 에 WriteUncorrectable 을 했으면 읽기 오류가 정상 결과). 응답 없음·ioctl 오류는 미완료. npo/spo 만 |
 
-- 기준(t0): `controller_reset`/`flr`/`hot_reset` 은 **시작** 시각, `nssr` 은 unbind 뒤 **NSSR 쓰기** 시각, 전원 ON·PERST 해제는 **반환** 시각
+- 기준(t0): `controller_reset`/`flr`/`hot_reset` 은 **시작** 시각, `nssr` 은 unbind 뒤 **NSSR 쓰기** 시각, 전원 ON·PERST 해제는 **반환** 시각.
+  단 전원 ON 뒤의 PERST 해제(Tpvperl)는 같은 전원 복귀의 일부라 NPO/SPO 기준은 **전원 ON** 그대로
+- 음수 구간(다른 관측원의 순서 역전)은 OK 로 세지 않고 `측정 불가 (관측 순서 역전 — 관측 오차)`
+- FLR·hot reset 의 설정 응답 구간은 `측정 불가` — 커널이 리셋이 끝날 때까지(드라이버 reset_done
+  포함) 사용자 설정 공간 접근을 잠가 장치 시간을 분리할 수 없다. 스펙상 FLR 은 100ms 안에 끝나야
+  하고(PCIe 5.0 §6.6.2) 커널이 100ms 기다린 뒤 접근한다
+- NPO 는 전원을 끊기 전에 **정상 종료 완료**를 확인한다(NVMe Base 2.3 §3.6.2 p.113: CC.SHN=01b 뒤
+  CSTS.SHST=10b 를 기다린 다음 전원 차단). BAR 관측으로 SHN·SHST 시각을 잡아 `정상 종료 확인:
+  … 250ms` 로 보이고, SHN 은 봤는데 SHST=10b 를 못 봤으면 `[장치 측] 정상 종료 미완료` 실패,
+  관측 공백이면 판정 생략
 - 전환(0→1)만 기록한다 — 이벤트 전부터 켜져 있던 비트를 복귀로 보지 않는다. 자식이 새로 매핑한
   직후의 첫 값도 전환으로 치지 않는다(언제 켜졌는지 모름)
 - **복귀 주기**: 리셋·전원 ON·PERST 해제마다 새 주기를 열고 이전 기록은 이력으로 넘긴다.
@@ -700,8 +730,9 @@ Write/WriteUncorrectable/WriteZeroes 에 전용 timeout 그룹 `write` 를 만�
 `normal_por` 는 `timing: npo`, `sudden_por` 는 `timing: spo`.
 
 **한계** — RDY→admin 은 커널이 RDY 뒤에 하는 초기화 처리를 포함하므로 장치 시간보다 **길게**
-잰다. I/O 가능 시각에는 `dd` 실행 시간(수 ms)이 들어간다. PERST 해제 기준은 GPIO readback 이
-끝난 뒤라 실제 해제보다 늦다(구간이 짧게 잡히는 쪽). 첫 실기에서 오탐이 보이면 구간 기준을
+잰다. I/O 가능 시각에는 `nvme read` 실행 시간(수 ms)이 들어간다. 스레드 관측(링크·설정·live)은
+파이썬 스케줄링으로 수 ms 늦게 찍힐 수 있다(이르게는 찍히지 않는다). NPO/SPO 전원 ON→I/O 에는
+Tpvperl 100ms 가 들어간다(실제 플랫폼도 그렇다). 첫 실기에서 오탐이 보이면 구간 기준을
 조정할 것. 보강(재리뷰): ① `wait_ready()` 가 실제 RDY·identity 를 확인했으면 BAR 관측 공백이 있어도
 복귀 성공으로 인정(전환 시각만 측정 불가) ② 주기 시작 전 이벤트가 파이프에서 늦게 와도 현재 주기
 전환 기록에 넣지 않음(상태만 따라감) ③ 자식의 mmap 실패 재시도에서 fd 를 닫음.

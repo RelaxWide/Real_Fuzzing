@@ -20190,38 +20190,101 @@ def _link_active(root_bdf, pci=None):
 
 
 # NSSR 뒤 설정 공간 복원 — 링크 다운(DL_Down)으로 초기화된 레지스터를 NSSR 전 값으로 되쓴다.
-#   커널의 pci_restore_state 에 해당하는 최소 집합: BAR0~5·ROM·캐시라인/지연·인터럽트 라인,
-#   PCIe DevCtl·LnkCtl·DevCtl2·LnkCtl2(MPS/MRRS·ASPM·목표 속도), 마지막에 Command(디코드 켜기).
-#   MSI/MSI-X 는 드라이버가 probe 에서 다시 잡는다. BAR 되읽기가 다르면 rc=6.
+#   커널 pci_restore_state 가 복원하는 소프트웨어 설정을 같은 순서 원칙으로 되쓴다:
+#     ReBAR 크기 → BAR0~5·ROM·캐시라인/지연·인터럽트 라인 → LTR 최대 지연 → L1SS(Ctl2, Ctl1 enable
+#     없이, Ctl1) → PTM → ATS → AER(UE 마스크·심각도, CE 마스크, ECRC 제어) → PCIe DevCtl·DevCtl2·
+#     LnkCtl·LnkCtl2(ASPM 은 L1SS 뒤) → Command(디코드) 마지막.
+#   복원하지 않는 것: MSI/MSI-X(드라이버가 probe 에서 다시 잡음), PM(PMCSR — 리셋 뒤 D0), VC(단일
+#     VC0 기본), 상태·오류 로그 레지스터(RW1C/하드웨어 값), ID·클래스 등 읽기 전용.
+#   출력: JSON 한 줄 {rows:[{name,off,size,saved,reset,after,ok}], other:[{region,off,n}], cap:..}
+#     reset = 복원 직전(리셋 뒤) 값, after = 복원 뒤 되읽은 값. BAR·Command 불일치면 rc=6.
 #   argv: 설정 공간 파일, 저장한 바이트(hex).
 _CFG_RESTORE = r"""
-import os, sys
+import json, os, sys
 path, saved = sys.argv[1], bytes.fromhex(sys.argv[2])
 fd = os.open(path, os.O_RDWR)
-def put(off, n):
-    if off + n <= len(saved):
-        os.pwrite(fd, saved[off:off + n], off)
-for off in range(0x10, 0x28, 4):
-    put(off, 4)
-put(0x30, 4); put(0x0C, 2); put(0x3C, 1)
-cap = None
-if len(saved) >= 0x40 and int.from_bytes(saved[6:8], 'little') & 0x10:
+cur = os.pread(fd, len(saved), 0)
+def val(buf, off, n):
+    return int.from_bytes(buf[off:off + n], 'little')
+std = {}
+if len(saved) >= 0x40 and val(saved, 6, 2) & 0x10:
     ptr, seen = saved[0x34] & 0xFC, set()
-    while ptr and ptr not in seen and ptr + 1 < len(saved):
-        seen.add(ptr)
-        if saved[ptr] == 0x10:
-            cap = ptr; break
-        ptr = saved[ptr + 1] & 0xFC
-if cap is not None:
-    for rel in (0x08, 0x10, 0x28, 0x30):
-        put(cap + rel, 2)
-put(0x04, 2)
-for off in range(0x10, 0x28, 4):
-    want = int.from_bytes(saved[off:off + 4], 'little') & ~0xF
-    got = int.from_bytes(os.pread(fd, 4, off), 'little') & ~0xF
-    if want != got:
-        print('ERR BAR@0x%02x %08x != %08x' % (off, got, want)); sys.exit(6)
-print('RESTORED cap=%s' % (hex(cap) if cap is not None else '-'))
+    while ptr and ptr not in seen and ptr + 1 < min(len(saved), 0x100):
+        seen.add(ptr); std.setdefault(saved[ptr], ptr); ptr = saved[ptr + 1] & 0xFC
+ext, off, seen = {}, 0x100, set()
+while len(saved) >= 0x104 and off and off not in seen and off + 4 <= len(saved):
+    seen.add(off); h = val(saved, off, 4)
+    if h in (0, 0xFFFFFFFF):
+        break
+    ext.setdefault(h & 0xFFFF, off); off = (h >> 20) & 0xFFC
+plan = []                                   # (이름, 오프셋, 크기, 쓸 값 또는 None=저장값, 비교 마스크)
+rb = ext.get(0x15)
+if rb is not None:
+    for i in range((val(saved, rb + 8, 4) >> 5) & 7):
+        plan.append(('ReBAR ctl%d' % i, rb + 8 + 8 * i, 4, None, 0x3F00))
+for i, o in enumerate(range(0x10, 0x28, 4)):
+    plan.append(('BAR%d' % i, o, 4, None, 0xFFFFFFF0))
+plan += [('ROM', 0x30, 4, None, 0xFFFFFFFF), ('CacheLine/Latency', 0x0C, 2, None, 0xFFFF),
+         ('IntLine', 0x3C, 1, None, 0xFF)]
+ltr = ext.get(0x18)
+if ltr is not None:
+    plan += [('LTR MaxSnoop', ltr + 4, 2, None, 0xFFFF), ('LTR MaxNoSnoop', ltr + 6, 2, None, 0xFFFF)]
+l1 = ext.get(0x1E)
+if l1 is not None:
+    c1 = val(saved, l1 + 8, 4)
+    plan += [('L1SS Ctl2', l1 + 0xC, 4, None, 0xFFFFFFFF),
+             ('L1SS Ctl1 (enable 없이)', l1 + 8, 4, c1 & ~0xF, None),
+             ('L1SS Ctl1', l1 + 8, 4, None, 0xFFFFFFFF)]
+if ext.get(0x1F) is not None:
+    plan.append(('PTM Ctl', ext[0x1F] + 8, 4, None, 0xFFFFFFFF))
+if ext.get(0x0F) is not None:
+    plan.append(('ATS Ctl', ext[0x0F] + 6, 2, None, 0xFFFF))
+aer = ext.get(0x01)
+if aer is not None:
+    plan += [('AER UE Mask', aer + 8, 4, None, 0xFFFFFFFF), ('AER UE Severity', aer + 0xC, 4, None, 0xFFFFFFFF),
+             ('AER CE Mask', aer + 0x14, 4, None, 0xFFFFFFFF), ('AER Cap/Ctl', aer + 0x18, 4, None, 0x1FE0)]
+px = std.get(0x10)
+if px is not None:
+    plan += [('PCIe DevCtl', px + 8, 2, None, 0x7FFF), ('PCIe DevCtl2', px + 0x28, 2, None, 0xFFFF),
+             ('PCIe LnkCtl', px + 0x10, 2, None, 0xFFDF), ('PCIe LnkCtl2', px + 0x30, 2, None, 0xFFFF)]
+plan.append(('Command', 0x04, 2, None, 0xFFFF))
+rows, fail = [], False
+for name, o, n, w, mask in plan:
+    if o + n > len(saved):
+        continue
+    data = saved[o:o + n] if w is None else w.to_bytes(n, 'little')
+    os.pwrite(fd, data, o)
+    if mask is None:
+        continue
+    got = int.from_bytes(os.pread(fd, n, o), 'little')
+    ok = (got & mask) == (val(saved, o, n) & mask)
+    rows.append(dict(name=name, off=o, size=n, saved=val(saved, o, n), reset=val(cur, o, n), after=got, ok=ok))
+    if not ok and (name.startswith('BAR') or name == 'Command'):
+        fail = True
+fin = os.pread(fd, len(saved), 0)
+covered = set()
+for r in rows:
+    covered.update(range(r['off'], r['off'] + r['size']))
+names = {0x01: 'PM', 0x05: 'MSI', 0x11: 'MSI-X', 0x10: 'PCIe', 0x03: 'VPD', 0x09: 'Vendor'}
+xnames = {0x01: 'AER', 0x02: 'VC', 0x03: 'DSN', 0x04: 'PwrBudget', 0x0B: 'VSEC', 0x0F: 'ATS',
+          0x15: 'ReBAR', 0x18: 'LTR', 0x19: 'SecPCIe', 0x1E: 'L1SS', 0x1F: 'PTM', 0x25: 'DLF', 0x26: 'PL16G',
+          0x27: 'Margining', 0x2A: 'PL32G'}
+bounds = sorted([(o, names.get(i, 'cap%02x' % i)) for i, o in std.items()] +
+                [(o, xnames.get(i, 'ext%04x' % i)) for i, o in ext.items()] +
+                [(0, 'Header'), (0x40, 'cap?'), (0x100, 'ext?')])
+def region(o):
+    r = 'Header'
+    for b, n in bounds:
+        if b <= o:
+            r = n
+    return r
+other = {}
+for o in range(min(len(saved), len(fin))):
+    if o not in covered and saved[o] != fin[o]:
+        g = other.setdefault(region(o), dict(region=region(o), off=o, n=0)); g['n'] += 1
+print(json.dumps(dict(rows=rows, other=list(other.values()),
+                      ext=sorted(xnames.get(i, 'ext%04x' % i) for i in ext))))
+sys.exit(6 if fail else 0)
 """
 
 
@@ -20385,6 +20448,7 @@ class RecoveryMonitor:
         self.clock, self.pci, self.nvme, self.period = clock, Path(pci), Path(nvme), period
         self.bar = bar if bar is not None else BarWatcher(self.pci / bdf / 'resource0')
         self.marks, self.history, self.gaps = {}, [], []
+        self.shutdown = {}                        # 정상 종료 관측: shn / shst 시각
         self._lock = threading.RLock()
         self._root_cap = None
         self._ctrl, self._ctrl_checked, self._ctrl_missing = None, -1.0, False
@@ -20464,6 +20528,15 @@ class RecoveryMonitor:
             self._fresh_map = True
             return
         valid = cc != 0xFFFFFFFF and csts != 0xFFFFFFFF
+        if valid:
+            # 정상 종료: CC.SHN(15:14)≠0 을 쓴 시각, CSTS.SHST(3:2)=10b(완료) 시각. 주기와 무관하게
+            #   남긴다 — NPO 는 종료 뒤 전원 ON 에서 새 주기를 연다.
+            if (cc >> 14) & 3:
+                self.shutdown.setdefault('shn', t)
+                self.shutdown['shn_type'] = (cc >> 14) & 3
+            if (csts >> 2) & 3 == 2 and 'shn' in self.shutdown:
+                self.shutdown.setdefault('shst', t)
+            self.shutdown['last_shst'] = (csts >> 2) & 3
         en = bool(cc & 1) if valid else None
         rdy = bool(csts & 1) if valid else None
         allow = not self._fresh_map               # 매핑 직후 첫 값: 상태만 갱신, 전환 아님
@@ -20482,25 +20555,39 @@ class RecoveryMonitor:
         if rdy is not None:
             self._edge('rdy', rdy, t, '_rdy_low', allow)
 
-    def sample(self):
+    # 시각은 **읽기가 끝난 뒤** 찍는다(읽기 전에 찍으면 그 사이의 지연만큼 이르게 기록된다 —
+    #   FLR/hot reset 중 커널이 설정 공간 접근을 잠가 Vendor 읽기가 수백 ms 막힌 동안 드라이버가
+    #   live 까지 가서, live 가 RDY 보다 앞선 음수 구간이 나왔다). 잠금은 반영할 때만 잡는다.
+    #   설정 공간 읽기(막힐 수 있음)와 BAR·state 관측(막히지 않음)은 **다른 스레드**에서 돈다.
+    def sample_cfg(self):
+        dl = self._dllla()
+        t_dl = self.clock()
+        ok = self._vendor_ok()
+        t_ok = self.clock()
         with self._lock:
-            now = self.clock()
-            dl = self._dllla()
             if dl is not None:
                 self._link = dl
                 if dl is False:
-                    self.marks.setdefault('link_down', now)
-                self._edge('link_up', dl, now, '_link_low')
-            ok = self._vendor_ok()
+                    self.marks.setdefault('link_down', t_dl)
+                self._edge('link_up', dl, t_dl, '_link_low')
             self._cfg = ok
-            self._edge('cfg_ok', ok, now, '_cfg_low')
-            for ev in self.bar.poll():
+            self._edge('cfg_ok', ok, t_ok, '_cfg_low')
+
+    def sample_fast(self):
+        events = self.bar.poll()                  # 시각은 자식이 읽은 직후 찍었다
+        st = self._state(self.clock())
+        t_st = self.clock()
+        with self._lock:
+            for ev in events:
                 self._on_regs(*ev)
-            st = self._state(now)
             live = (st == 'live') if st is not None else (False if self._ctrl_missing else None)
             if live is not None:
                 self._live = live
-                self._edge('live', live, now, '_live_low')
+                self._edge('live', live, t_st, '_live_low')
+
+    def sample(self):
+        self.sample_cfg()
+        self.sample_fast()
 
     def begin_cycle(self, t):
         """새 복귀 주기. '낮음' 플래그는 지금 상태에서 다시 잡는다(이후 0→1 만 기록)."""
@@ -20527,23 +20614,26 @@ class RecoveryMonitor:
             return dict(self.marks)
 
     # ── 스레드 ──
-    def _loop(self):
+    def _loop(self, fn):
         while not self._stop.is_set():
             try:
-                self.sample()
+                fn()
             except Exception:
                 pass
             self._stop.wait(self.period)
 
     def start(self):
-        self._thread = threading.Thread(target=self._loop, daemon=True, name='recovery-monitor')
-        self._thread.start()
+        self._threads = [threading.Thread(target=self._loop, args=(fn,), daemon=True, name=name)
+                         for fn, name in ((self.sample_cfg, 'recovery-cfg'),
+                                          (self.sample_fast, 'recovery-regs'))]
+        for t in self._threads:
+            t.start()
         return self
 
     def stop(self):
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
+        for t in getattr(self, '_threads', []):
+            t.join(timeout=1.0)
         try:
             self.bar.close()
         except Exception:
@@ -20781,7 +20871,7 @@ class ExceptionController:
                    f"{self._describe_argv(r.get('action'), r.get('argv'))}", error=True)
 
     _NSSR_STEP_TEXT = {'unbind': '드라이버 unbind', 'nssr_write': 'BAR0 NSSR ← 4E564D65h',
-                       'cfg_restore': '설정 공간 복원(BAR·Command·PCIe 제어, NSSR 전 저장값)',
+                       'cfg_restore': '설정 공간 복원(NSSR 전 저장값)',
                        'enable': '메모리 디코드 켬', 'disable': '메모리 디코드 끔(enable 횟수 원복)',
                        'probe': '드라이버 probe',
                        'rebind': '드라이버 재연결(NSSR 미실행)', 'rescan': 'PCI rescan 반복'}
@@ -20791,6 +20881,24 @@ class ExceptionController:
         argv = r.get('argv')
         cmd = f" — {self._describe_argv(step, argv)}" if argv else ""
         self._line(f"      · {self._NSSR_STEP_TEXT.get(step, step)}{cmd}")
+
+    def _show_cfg_restore(self, r):
+        rows = r.get('rows') or []
+        width = 2 * max((x['size'] for x in rows), default=4)
+        hx = lambda v, n: f"{v:0{2 * n}x}".rjust(width)
+        self._line("      설정 공간 — 저장본 → 리셋 후 → 복원 후")
+        for x in rows:
+            mark = 'OK' if x['ok'] else '✗ 불일치'
+            self._line(f"        {self._pad(x['name'], 22)} 0x{x['off']:03x}  {hx(x['saved'], x['size'])} → "
+                       f"{hx(x['reset'], x['size'])} → {hx(x['after'], x['size'])}  {mark}", error=not x['ok'])
+        n_bad = sum(not x['ok'] for x in rows)
+        n_reset = sum(x['reset'] != x['saved'] for x in rows)
+        self._line(f"        비교: 복원 {len(rows)}개 — 일치 {len(rows) - n_bad} · 불일치 {n_bad}"
+                   f" · 리셋으로 바뀌어 있던 것 {n_reset}", error=bool(n_bad))
+        other = r.get('other') or []
+        if other:
+            txt = ', '.join(f"{o['region']}(0x{o['off']:03x}~ {o['n']}B)" for o in other)
+            self._line(f"        복원 대상 외 저장본과 다른 곳: {txt} — 상태·오류·드라이버 설정 영역")
 
     def _show_nssr_result(self, r):
         def at(key):
@@ -20812,12 +20920,29 @@ class ExceptionController:
         self._line(f"      NSSR 확인: CSTS=0x{r['csts']:08x} NSSRO={int(bool(r.get('nssro')))} "
                    f"CFS={int(bool(r.get('cfs')))} {'OK' if ok else '✗'} — {link}", error=not ok)
 
+    def _show_link_check(self, r):
+        d = r.get('down_sec')
+        self._line(f"      링크 다운 확인 +{_fmt_dur(d)}" if d is not None else
+                   "      ✗ 링크가 내려가지 않음", error=d is None)
+
+    _SHN_TEXT = {1: '정상(01b)', 2: '급종료(10b)'}
+
+    def _show_shutdown_check(self, r):
+        st = r.get('status')
+        kind = self._SHN_TEXT.get(r.get('shn_type'), '')
+        if st == 'OK':
+            self._line(f"      정상 종료 확인: CC.SHN {kind} → CSTS.SHST=10b {_fmt_dur(r.get('elapsed'))}")
+        elif st == 'INCOMPLETE':
+            self._line(f"      ✗ 정상 종료 미완료: CC.SHN {kind} 뒤 SHST={r.get('last_shst')}", error=True)
+        else:
+            self._line("      정상 종료 관측 못함(BAR 관측 공백) — 판정 생략")
+
     def _show_rescan_found(self, r):
         self._line(f"      DUT 발견 — rescan {r.get('tries')}회 ({r.get('elapsed_sec', 0):.2f}s)")
 
     _MARK_TEXT = (('link_down', '링크 다운'), ('link_up', '링크 업'), ('cfg_ok', '설정 완료'),
                   ('cc_en', 'CC.EN'), ('rdy', 'RDY'), ('live', 'live'), ('io', 'I/O'))
-    _VERDICT_TEXT = {'OK': 'OK', 'OVER': '✗ 초과', 'MISSING': '✗ 미완료', 'N/A': '측정 불가(전환 미관측, 복귀는 됨)'}
+    _VERDICT_TEXT = {'OK': 'OK', 'OVER': '✗ 초과', 'MISSING': '✗ 미완료', 'N/A': '측정 불가'}
 
     def _show_timing(self, r):
         marks = r.get('marks') or {}
@@ -21020,6 +21145,15 @@ class ExceptionController:
             self.powered = True
         elif effect == 'deassert':
             self.asserted = False
+        if effect in ('power_off', 'assert') and not getattr(self, '_restoring', False):
+            # 명령 성공 ≠ 효과. 전원 차단·PERST assert 는 링크를 떨어뜨린다(Fundamental Reset) —
+            #   GPIO readback 대신 루트 포트 DLLLA 로 확인한다(루트 포트를 모르면 확인 생략).
+            down = self._wait_link(False, min(deadline, self.clock() + 1.0))
+            if down is not None:
+                self.emit('link_check', action=action, down_sec=down if down is not False else None)
+            if down is False:
+                raise ExceptionFailure(f'[호스트 측] {action} 명령은 성공했지만 1s 안에 링크가 내려가지 '
+                                       f'않음 — 배선·핀·전원 경로 확인')
         adapter = self.options.get('adapters', {}).get(action, {})
         if 'readback' in adapter:
             if effect == 'deassert':
@@ -21185,9 +21319,18 @@ class ExceptionController:
             argv = [sys.executable, '-c', _CFG_RESTORE, str(dev / 'config'), saved.hex()]
             self.emit('nssr_step', step='cfg_restore', argv=None)
             rc, out, err = self.runner.run(argv, deadline)
+            try:
+                report = json.loads(out.decode(errors='replace').strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                report = None
+            if report is not None:
+                self.emit('cfg_restore', **report)
+                bad = [r['name'] for r in report['rows'] if not r['ok']]
+                result['cfg_mismatch'] = bad
             if rc:
-                raise ExceptionFailure(f'NSSR 뒤 설정 공간 복원 실패 rc={rc}: '
-                                       f'{(out + err).decode(errors="replace").strip()[-200:]}')
+                raise ExceptionFailure(f'NSSR 뒤 설정 공간 복원 실패 rc={rc}' +
+                                       (f": 불일치 {', '.join(bad)}" if report else
+                                        f": {(out + err).decode(errors='replace').strip()[-200:]}"))
             # 5) NSSRO
             rc, info, err = self._nssr_helper('csts', deadline)
             csts = info.get('CSTS')
@@ -21347,7 +21490,8 @@ class ExceptionController:
         adapters = self.options.get('adapters', {})
         deadline = self.clock() + profile.timeout_sec
         mon = self._new_monitor().start()
-        t0 = t0_what = None
+        t0 = t0_what = t0_effect = None
+        self._t0_action = None
         cycles = 0
         try:
             for index, (action, hold) in enumerate(profile.steps):
@@ -21358,7 +21502,9 @@ class ExceptionController:
                 self.emit('step_start', index=index, action=action)
                 effect = action_effect(action, adapters)
                 if effect in ('power_off', 'assert'):
-                    t0 = t0_what = None                   # 새 OFF/assert 구간 — 기준 다시 잡음
+                    t0 = t0_what = t0_effect = None       # 새 OFF/assert 구간 — 기준 다시 잡음
+                if effect == 'power_off' and profile.timing == 'npo':
+                    self._check_shutdown(mon)            # 전원 차단 전 정상 종료 완료 확인
                 started = self.clock()
                 if action == 'nssr':
                     # unbind(드라이버 정상 종료)는 복귀 시간이 아니다 — NSSR 을 **쓰는** 순간이 t0
@@ -21367,21 +21513,26 @@ class ExceptionController:
                         mon.begin_cycle(t)
                         t0, t0_what = t, 'NSSR 쓰기'
                         cycles += 1
+                        self._t0_action = 'nssr'
                     self._nssr_trigger = _trigger
                 elif action in self._T0_AT_START:         # 리셋 시작 전에 주기를 연다
                     mon.begin_cycle(started)
                     t0, t0_what = started, f'{action} 시작'
                     cycles += 1
+                    self._t0_action = action
                 # rescan 반복은 복귀 측정의 일부 — 스펙+초과 측정 시간까지 기다린다.
                 try:
                     self._action(action, (t0 + self._timing_budget(profile) + spec.overrun_wait)
                                  if action == 'pci_rescan_wait' and t0 is not None else deadline)
                 finally:
                     self._nssr_trigger = None
-                if action not in self._T0_AT_START and effect in ('power_on', 'deassert'):
-                    t0, t0_what = self.clock(), f'{action} 반환'
+                # 전원 ON 뒤의 PERST 해제(Tpvperl)는 같은 전원 복귀의 일부 — NPO/SPO 기준은 전원 ON
+                if (action not in self._T0_AT_START and effect in ('power_on', 'deassert')
+                        and not (effect == 'deassert' and t0_effect == 'power_on')):
+                    t0, t0_what, t0_effect = self.clock(), f'{action} 반환', effect
                     mon.begin_cycle(t0)
                     cycles += 1
+                    self._t0_action = action
                 self.emit('step_end', index=index, action=action, hold=hold)
                 if hold:
                     if self.clock() + hold > deadline:
@@ -21395,6 +21546,21 @@ class ExceptionController:
             self._timing_wait(profile, mon, t0, t0_what, cycles)
         finally:
             mon.stop()
+
+    def _check_shutdown(self, mon):
+        """NPO: 전원을 끊기 전에 정상 종료가 끝났는가(Base 2.3 §3.6.2: CC.SHN=01b 뒤 CSTS.SHST=10b 를
+        기다린 다음 전원 차단). orderly remove 가 드라이버에 종료를 시킨다 — BAR 관측으로 확인한다."""
+        sd = dict(mon.shutdown)
+        if 'shst' in sd:
+            self.emit('shutdown_check', status='OK', shn_type=sd.get('shn_type'),
+                      elapsed=sd['shst'] - sd['shn'])
+        elif 'shn' in sd:
+            self.emit('shutdown_check', status='INCOMPLETE', shn_type=sd.get('shn_type'),
+                      last_shst=sd.get('last_shst'))
+            raise ExceptionFailure(f"[장치 측] 정상 종료 미완료 — CC.SHN 뒤 CSTS.SHST=10b 를 못 본 채 "
+                                   f"드라이버가 제거됨(마지막 SHST={sd.get('last_shst')})")
+        else:
+            self.emit('shutdown_check', status='UNOBSERVED')
 
     def _timing_segments(self, profile, marks):
         """(키, 이름, 시작 mark, 끝 mark, 스펙 s). 링크가 실제로 내려갔을 때만 cfg 구간을 본다."""
@@ -21497,16 +21663,28 @@ class ExceptionController:
         end_ok = {'cfg_ok': st.get('cfg_ok') or confirmed, 'rdy': st.get('rdy') or confirmed,
                   'live': st.get('live') or confirmed, 'io': io_t is not None}
         rows, bad = [], []
+        locked = getattr(self, '_t0_action', None) in ('flr', 'hot_reset')
         for key, label, a, b, limit in self._timing_segments(profile, marks):
             side = None
-            if b in marks and a in marks:
+            if key == 'cfg_after_ts' and locked:
+                # 커널 PCI 리셋은 끝날 때까지(드라이버 reset_done 포함) 사용자 설정 공간 접근을
+                #   잠근다(pci_dev_lock) — 설정 응답 시각이 커널 잠금 해제 시각으로 찍혀 장치 시간이 아니다
+                measured, verdict = None, 'N/A'
+                side = '커널이 리셋 중 설정 공간 접근을 잠가 장치 시간 분리 불가'
+            elif b in marks and a in marks:
                 measured = marks[b] - marks[a]
-                verdict = 'OK' if measured <= limit else 'OVER'
+                if measured < 0:
+                    # 서로 다른 관측원(BAR 자식 프로세스 / sysfs 스레드)의 순서가 뒤집힘 — 관측 오차
+                    verdict, side = 'N/A', f'관측 순서 역전({_fmt_dur(-measured)}) — 관측 오차'
+                    measured = None
+                else:
+                    verdict = 'OK' if measured <= limit else 'OVER'
                 if verdict == 'OVER':
                     side = self._OVER_SIDE.get(key)
             elif b in marks or end_ok.get(b):
                 # 끝은 왔다(전환 시각이 있거나 지금 만족) — 시작/끝 전환을 못 봤을 뿐 복귀는 됐다
                 measured, verdict = None, 'N/A'
+                side = '전환 미관측, 복귀는 됨'
             else:
                 measured, verdict = None, 'MISSING'
                 side = self._missing_side(key, marks, st, io_status)

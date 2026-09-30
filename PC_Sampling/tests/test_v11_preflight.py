@@ -137,13 +137,28 @@ class HardwareAdapters(unittest.TestCase):
         self.c.runner.has_pending.return_value = False
         self.c.bdf = '0000:02:00.0'
 
+    def with_readback(self):
+        # 기본 config 에는 readback 이 없다(보드에서 GPIO 읽기 실패 → 링크 다운으로 효과 확인).
+        #   adapter 에 명시하면 여전히 엄격하게 확인한다.
+        for name, want in (('perst_assert', 0), ('perst_release', 1)):
+            self.c.options['adapters'][name]['readback'] = dict(
+                argv=['python3', '{pmu_script}', '20', '1', '7'], expected=want)
+
+    def test_default_config_has_no_gpio_readback(self):
+        self.assertTrue(all('readback' not in a for a in self.cfg['exceptions']['adapters'].values()))
+        self.c.runner.run.return_value = (0, b'', b'')
+        self.c._action('perst_assert', self.c.clock() + 1)
+        self.assertEqual(self.c.runner.run.call_count, 1)          # 16 만, 20(readback) 없음
+
     def test_perst_readback_is_verified(self):
+        self.with_readback()
         self.c.runner.run.side_effect = [(0, b'', b''), (0, b'[GetGpio][OK]D1] 0', b'')]
         self.c._action('perst_assert', self.c.clock() + 1)
         self.assertTrue(self.c.asserted)
         self.assertEqual(self.c.runner.run.call_args.args[0][-3:], ['20', '1', '7'])
 
     def test_release_readback_mismatch_retains_cleanup_obligation(self):
+        self.with_readback()
         self.c.asserted = True
         self.c.runner.run.side_effect = [(0, b'', b''), (0, b'[GetGpio][OK]D1] 0', b'')]
         with self.assertRaisesRegex(ExceptionFailure, 'mismatch'):
@@ -151,6 +166,7 @@ class HardwareAdapters(unittest.TestCase):
         self.assertTrue(self.c.asserted)
 
     def test_malformed_release_readback_keeps_asserted_uncertain(self):
+        self.with_readback()
         self.c.asserted = True
         self.c.runner.run.side_effect = [(0, b'', b''), (0, b'unrecognized reply', b'')]
         with self.assertRaises(ValueError):
