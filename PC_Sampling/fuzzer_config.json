@@ -1,5 +1,5 @@
 {
-  "_comment": "PC Sampling Fuzzer 사용자 설정 (v8.3+). 버전 비종속 공유 파일 — fuzzer .py 통째 복사해도 이 파일은 그대로 재사용. 16진수는 \"0x..\" 문자열로 둬도 로더가 int 로 변환. --config PATH 로 다른 파일 지정 가능.",
+  "_comment": "v10.3과 v11이 공유하는 사용자 설정. 기능별 지원 범위는 각 절의 설명을 따른다. --config PATH로 다른 설정 파일을 선택한다. 로더는 0x로 시작하는 정수 문자열을 정수로 변환한다. _comment 계열 키는 설명용이며 실행 옵션이 아니다.",
   "globals": {
     "fw_addr_start": "0x0",
     "fw_addr_end": "0x3B7FFF",
@@ -10,14 +10,13 @@
     "openocd_config_jtag": "products/BM9H1/openocd.cfg",
     "openocd_telnet_host": "127.0.0.1",
     "openocd_telnet_port": 4444,
-    "_comment_probe_usb_reset": "v10.3: OpenOCD 재시작이 모두 실패한 뒤의 **최후 수단**. J-Link 는 자체 MCU 라 호스트 재부팅으로 리셋되지 않아, 고착되면 사람이 케이블을 뽑아야 했다. vendor_ids 에 일치하는 USB 장치만 만진다(DUT 는 NVMe/PCIe 라 무관). uhubctl 은 VBUS 를 실제로 끊어 재삽입과 동등하지만, 엉뚱한 포트를 끄면 위험하므로 location/port 를 명시했을 때만 쓴다. 전기적으로 죽은 링크는 이걸로도 안 살아난다.",
-    "_comment_schema_max": "프롬프트에 실을 명령 스키마 개수 상한. 예전 48 은 구현 명령 수(41)보다 커서 캡이 없는 것과 같았고, 관련도와 무관하게 매번 전 명령이 실렸다. 호출부가 never-sent → low-yield 순으로 준 앞쪽만 취한다. 0 이면 전부. 낮추면 프롬프트가 줄지만 LLM 이 보는 명령 종류도 줄어든다 — 커버리지 영향이 있으니 funnel 채택률을 보며 조정할 것.",
-    "_comment_sampler_diag": "v10.3 샘플러 진단 계측. 전부 읽기·기록만이라 퍼징 동작을 바꾸지 않는다. OpenOCD 출력은 파일로 받는다 — PIPE 는 아무도 안 읽으면 64KiB 에서 OpenOCD 를 write 에 블록시킨다. 읽기 실패 시 DP DPIDR/CTRL-STAT 을 sticky 클리어 **전에** 남긴다(STICKYORUN=속도과다, PWRUPACK 꺼짐=디버그전원, 못읽음=링크사망). resource_monitor 는 OpenOCD·퍼저의 RSS/fd 추세로 누수를 가린다.",
+    "_comment_probe_usb_reset": "OpenOCD 재연결 시도가 실패한 뒤 실행하는 선택적 프로브 USB 복구. enabled로 켜고 vendor_ids로 대상 USB 장치를 제한한다. uhubctl 전원 제어는 location과 port를 지정한 경우에 사용한다. 대상 USB 연결이 실제 프로브인지 확인해야 하며, 이 기능이 링크 복구를 보장하지는 않는다.",
+    "_comment_sampler_diag": "OpenOCD 샘플러 진단. 도구 출력은 파일로 저장하고, 읽기 실패 시 디버그 상태 레지스터를 기록한다. 레지스터 값은 진단 단서이며 원인 확정값이 아니다. resource_monitor는 퍼저와 OpenOCD의 RSS/fd 추세를 주기적으로 기록한다.",
     "sampler_diag": {
       "resource_monitor": true,
       "resource_interval_sec": 300
     },
-    "_comment_reconnect_speeds": "OpenOCD 재시작 회차별 adapter speed(kHz). null=cfg 기본값. 링크가 열화됐을 때 같은 속도로 재시도해도 소용없어 회차마다 낮춘다.",
+    "_comment_reconnect_speeds": "OpenOCD 재연결 시도에 사용할 adapter speed 목록(kHz). null은 OpenOCD 설정의 속도를 사용한다. 낮은 속도 재시도를 포함할 수 있지만 재연결 성공을 보장하지는 않는다.",
     "reconnect_speeds_khz": [null, 1000, 500],
     "probe_usb_reset": {
       "enabled": true,
@@ -28,7 +27,7 @@
       "uhubctl_port": null,
       "uhubctl_delay_sec": 2
     },
-    "_comment_summary_nsid_top": "종료 요약의 'Actual NSID distribution' 에 나열할 상위 개수(횟수 내림차순). nsid 는 퍼징 대상이라 값 종류가 계속 늘어, 긴 캠페인에서 전량 나열하면 이 한 줄이 요약을 덮는다. 나머지는 종수·합계로 접는다. 0 이면 전부 나열.",
+    "_comment_summary_nsid_top": "종료 요약의 Actual NSID distribution에 표시할 상위 NSID 개수(횟수 내림차순). 나머지는 종류 수와 합계로 요약한다. 0이면 전체를 표시한다.",
     "summary_nsid_top": 8,
     "openocd_startup_timeout": 10.0,
     "pcsr_core0": "0x80030084",
@@ -57,7 +56,7 @@
     "resume_coverage": null
   },
   "paths": {
-    "_comment": "파일명만 두면 fuzzer 스크립트 디렉토리 기준으로 해석됨. fw_bin=null 이면 더미 시드.",
+    "_comment": "PMU, 펌웨어, 덤프 도구 등 파일 위치. 주요 상대 경로는 퍼저 스크립트 디렉터리를 기준으로 해석한다. parser_script_*는 파서 작업 디렉터리에서 사용하는 파일명이다. fw_bin=null이면 실제 펌웨어 이미지 대신 더미 FirmwareDownload 시드를 사용한다.",
     "fw_bin": null,
     "pmu_script": "pmu_4_1.py",
     "ufas_binary": "dump/ufas",
@@ -83,9 +82,9 @@
     },
     "nvme_passthru_timeout_ms": 2592000000,
     "nvme_kernel_timeout_sec": 2592000,
-    "_comment_halt_fwtime_margin_sec": "P9 펌웨어시간 워치독이 crash 로 판정하는 여유(초). nvme_timeouts 값은 '진짜 문제 기준'(예: 30s)이고, 실제 발화는 각 카테고리마다 (기준 + 이 마진). 경계의 정상 명령을 오탐하지 않도록 1s. 늘리면 더 보수적(문제만 확실히 잡음), 줄이면 더 민감.",
+    "_comment_halt_fwtime_margin_sec": "halt 방식 샘플러의 펌웨어시간 워치독 여유(초). halt로 정지한 시간을 보정한 뒤 명령별 nvme_timeouts 기준에 이 여유를 적용한다. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 제품별 timeout override가 있으면 그것이 우선한다.",
     "halt_fwtime_margin_sec": 1.0,
-    "_comment_state_monitor_sec": "state 관측(smart-log/get-log/security) 명령의 wall-clock 상한(초). crash 보존 불필요한 관측이라 짧게. device 무응답 시 이 시간 후 프로세스 버리고 스킵(fuzzer 멈춤 방지).",
+    "_comment_state_monitor_sec": "SMART/get-log/security 등 state 관측용 nvme 명령의 최대 대기 시간(초). 시간 초과 시 관측 실패로 처리하고 무한 대기를 피한다. 시간 초과가 프로세스나 장치 내부 명령의 종료를 보장하는 것은 아니다.",
     "state_monitor_sec": 60
   },
   "sampling": {
@@ -132,7 +131,7 @@
     "mopt_core_period": 50000
   },
   "exceptions": {
-    "_comment": "v11 전용. v10.3은 무시. 모든 기존 허용 명령에 실행 중 주입; PM 전환 제외. 종료된 이벤트부터 최소 간격을 계산. 명령 종류 추가 제한 없음. 종류별 사전시험 통과 profile만 선택. Warm=주전원 유지 PERST, REFCLK 강제 토글 없음. FLR/bus reset은 Linux 드라이버 협조 경로. Normal POR는 드라이버 orderly remove 후 차단, Sudden POR는 차단 후 remove. 실기 미검증.",
+    "_comment": "v11 전용 예외 주입 설정이며 v10.3은 사용하지 않는다. enabled=false이면 주입하지 않는다. 켜면 사전시험에서 실제 profile을 실행하고 통과한 후보를 사용한다. preflight.enabled=false이면 능동 검증 없이 capability 확인만 거친 후보를 사용한다. PM 전환 구간은 제외한다. 주입은 nvme-cli 프로세스 생존을 기준으로 하며 장치 내부 명령과의 동시성은 보장하지 않는다. initial_delay_minutes는 사전시험 완료부터, min_interval_minutes는 이전 이벤트 완료부터 계산한다. 실패 시 추가 복구 POR/reset 없이 보존·덤프 후 중단한다. Warm은 전원 유지 PERST이며 REFCLK를 직접 토글하지 않는다. normal_por는 orderly remove 후 전원 차단, sudden_por는 전원 차단 후 remove한다. 실제 적용 가능 여부는 제품·호스트·배선에 따라 달라진다.",
     "enabled": false,
     "min_interval_minutes": 5,
     "initial_delay_minutes": 5,
@@ -190,7 +189,7 @@
         "ready_timeout_ref": "power.por_boot_wait"
       }
     ],
-    "_comment_perst": "사용자 확인: devIdx=1, PERST pinNo=7, level=3300mV. 16=SetGpioLow(assert), 15=SetGpioHigh(deassert). 아래는 어댑터 등록이며 실제 주입 선택은 profiles에서 한다. 18=McToggle은 시간 단위/완료 의미 확인 후 연결.",
+    "_comment_perst": "아래 PERST adapter는 현재 시험 보드의 PMU devIdx=1, pinNo=7, 3300mV 설정이다. 다른 보드/슬롯에 그대로 적용할 수 있다는 뜻은 아니다. PMU 명령 16은 assert(Low), 15는 release(High), 20은 GPIO readback이다. 실제 주입 후보는 profiles로 선택한다. McToggle(18)과 직접 REFCLK 제어는 등록되어 있지 않다.",
     "adapters": {
       "perst_assert": {
         "argv": ["python3", "{pmu_script}", "16", "1", "7", "3300"],
@@ -261,7 +260,7 @@
       "0x7C",
       "0x24"
     ],
-    "_comment_blocked_security_send_secp": "SecuritySend(0x81) 차단 Security Protocol(SECP=CDW10[31:24]). device 를 잠그거나 브릭할 수 있는 프로토콜. 0x01~0x06=TCG(Opal/Pyrite/Enterprise) Locking SP activate·credential set→잠금. 0xEC=ATA Device Server Password, 0xEF=ATA Security→SET PASSWORD/LOCK. 벤더(0xF0~0xFF)도 잠금 위험 있으면 추가 가능(단 fuzz 가치 높아 기본 미차단). SecurityReceive(0x82)는 read-only 라 미적용.",
+    "_comment_blocked_security_send_secp": "SecuritySend admin opcode 0x81의 SECP(CDW10[31:24]) 값이 아래 차단 목록에 있으면 전송하지 않는다. 잠금 등 상태를 바꿀 수 있는 프로토콜을 제한하기 위한 설정이다. SecurityReceive(0x82)는 이 가드의 대상이 아니다. 미차단 프로토콜의 무해함을 보장하는 목록은 아니다.",
     "blocked_security_send_secp": [
       "0x01",
       "0x02",
@@ -272,7 +271,7 @@
       "0xEC",
       "0xEF"
     ],
-    "_comment_blocked_cdw_rules": "opcode 하나로는 못 막고 특정 CDW 값이 문제인 조합을 발송 시점에 차단한다. 제품별 프로필이 아니라 strategy 에 두는 전 제품 공통 규칙이다. vendor 0xC0 + CDW12=0x2 가 디버그 포트를 영구히 닫는다(전원 사이클로 복구 불가, 공장 초기화 필요) — OpenOCD 포트 4444 대기 타임아웃의 근본 원인. 0xC0 은 이름 붙은 명령이 아니라 opcode 변이(0xC0~0xFF)로만 나와 스키마로는 못 막는다. mask 생략 = 전 비트 일치, scope 는 admin|io|any(기본). 16진 문자열도 받는다.",
+    "_comment_blocked_cdw_rules": "모든 제품의 실제 전송 경로에서 opcode와 CDW 비트값 조합을 차단한다. 현재 0xC0 + CDW12=0x2 규칙은 디버그 포트 폐쇄 사례 때문에 등록되어 있다. opcode 변이로 생긴 명령에도 적용한다. mask 생략 시 해당 CDW 전체를 비교하며 scope는 admin/io/any(생략 시 any)이다. 값은 정수 또는 16진 문자열로 지정한다.",
     "blocked_cdw_rules": [
       {
         "opcode": "0xC0",
@@ -282,12 +281,12 @@
         "why": "디버그 포트 폐쇄"
       }
     ],
-    "_comment_namespace_guard": "NamespaceManagement Delete(0x0D admin, SEL=cdw10[3:0]=1)는 namespace 영구 파괴(데이터 소멸+NSID 변경 위험) → block_ns_delete=true 로 send-time 차단. 제품이 NS Mgmt 지원·재생성 OK면 false 로. NamespaceAttachment Detach(0x15 admin, SEL=1)는 NS 보존이라 auto_reattach_ns=true 면 실행 후 즉시 attach-ns+ns-rescan 으로 복구(fuzzing 대상 device 유지).",
+    "_comment_namespace_guard": "block_ns_delete=true이면 NamespaceManagement Delete(admin 0x0D, CDW10[3:0]=1)를 전송 시 차단한다. auto_reattach_ns=true이면 NamespaceAttachment Detach 후 attach-ns와 ns-rescan으로 재연결을 시도한다. 삭제 허용이나 재연결 성공을 자동으로 보장하는 설정은 아니다.",
     "block_ns_delete": true,
     "auto_reattach_ns": true,
-    "_comment_nsid_override_policy": "NSID 검증 정책. 값 3종: active_only=시작 시 nvme list-ns와 /dev namespace node로 활성 NSID allowlist를 만들고 mutation/LLM/기존 corpus/replay를 그 안으로 제한(필터 ON). configured_only=현재 --namespace 하나로 고정. fuzz(기본/필터 OFF)=0/broadcast/미존재/임의 NSID 를 제약 없이 FW 에 전달.",
+    "_comment_nsid_override_policy": "NSID override 정책. active_only는 탐지한 활성 NSID로 제한한다. configured_only는 설정/--namespace의 NSID를 사용하도록 override를 제한한다. fuzz는 0, broadcast, 미존재 값 등도 퍼징에 허용한다. 이 설정은 NSID 정책이며 다른 opcode·CDW·전송 가드를 해제하지 않는다.",
     "nsid_override_policy": "fuzz",
-    "_comment_erase_guard": "전체 소거 발송 가드(v9.6). Sanitize SANACT=cdw10[2:0]: 001b=Exit Failure Mode / 010b=Block Erase / 011b=Overwrite / 100b=Crypto Erase / 101b=Exit Media Verification. 소거 액션은 사용자 데이터를 전소시키고, 진행 중 POR 이 겹치면 SSTAT=011b(Sanitize Operation Failed)로 래치돼 펌웨어가 미디어를 read-only 로 굳힌다(SMART critical_warning bit3) — 전원 사이클로 안 풀리고 Exit Failure Mode(001b)만이 해제. FormatNVM SES=cdw10[11:9]: 000b=없음 / 001b=User Data Erase / 010b=Crypto Erase. CMD_SCHEMAS 의 valid 로는 못 막는다(opcode 변이가 self.commands 와 무관하게 admin 0x84/0x80 을 만들고 그때 cdw10 은 랜덤). 소거 경로 커버리지가 필요하면 목록을 넓힐 것.",
+    "_comment_erase_guard": "소거 관련 admin 명령의 전송 가드. Sanitize(0x84)의 SANACT=CDW10[2:0]은 allowed_sanact, FormatNVM(0x80)의 SES=CDW10[11:9]는 allowed_format_ses로 제한한다. opcode 변이로 생성한 명령에도 적용한다. 허용 목록을 확대하면 해당 소거 동작이 실제로 실행될 수 있다.",
     "allowed_sanact": [
       "0x01",
       "0x05"
@@ -453,7 +452,7 @@
     "allowed_security_send_secp": [
       "0x00"
     ],
-    "_comment_v92_seq": "v9.2: 같은 명령-시퀀스 패턴 corpus 상한(단조 state flood 방지) + staleness 에너지(기본 off, A/B)",
+    "_comment_v92_seq": "max_seq_per_pattern은 같은 명령 패턴의 시퀀스 corpus 수를 제한한다. energy_staleness_on은 오래 새 커버리지를 얻지 못한 seed의 에너지 감쇠를 켠다. 활성 여부는 아래 실제 설정값을 따른다.",
     "max_seq_per_pattern": 2,
     "energy_staleness_on": true,
     "staleness_grace": 2,
@@ -461,7 +460,8 @@
     "staleness_floor": 0.05
   },
   "rag": {
-    "_comment_learning": "v10.2 전용. v10.1은 무시. 각 기능을 독립 비교할 수 있으며 enabled=false는 전체 확장을 끈다. 관측 실패/CQE 미확인 결과는 task 보상에서 제외한다. min_reward_samples = adaptive_tasks 탐욕 선택에 참가하기 위한 최소 완료 평가 수(미달 task 는 가중 라운드로빈이 결정). 1 이면 v10.2 동작.",
+    "_comment_schema_max": "rag.schema_max는 LLM 프롬프트에 포함할 명령 스키마 개수 상한이다. 0 이하는 후보 전체를 사용한다. 요청 빌더가 정한 우선순위(필수 지정 명령 등)를 유지하며 앞에서부터 선택한다. 값을 줄이면 입력은 짧아지지만 모델에 제공되는 명령 스키마도 줄어든다.",
+    "_comment_learning": "v10.2부터 도입되어 v10.3/v11에서도 사용하는 실행 근거 기반 학습 설정. learning.enabled=false는 이 학습 확장을 끄며 LLM 호출 자체를 끄는 rag.enabled와는 다르다. 각 하위 기능을 개별로 설정할 수 있다. min_reward_samples는 adaptive_tasks의 성과 기반 선택에 필요한 최소 완료 평가 수이며 미달 task는 가중 회전 선택을 사용한다.",
     "learning": {
       "enabled": true,
       "evidence": true,
@@ -476,9 +476,9 @@
       "random_seed": 102,
       "snapshot_min_interval_sec": 60
     },
-    "_comment": "v9.0 LLM-guided fuzzing. enabled=false 또는 --no-rag 면 이 섹션 전체 무시(v8.8 byte-동등). module_path/func_name = LLM callable. request_interval_sec(초)마다 백그라운드로 1 라운드 시도(in-flight 1건, 성능 무관 시간 기반 — request_cadence 실행수 기반은 v10에서 미사용). min_request_interval_sec = 전송 하한 안전 플로어(주기보다 작게). plateau_exec_threshold exec coverage 정체 시 우선 요청. LLM 산출물은 스키마 검증+위험필터 통과분만 corpus 주입.",
-    "_comment_call": "pass_system_prompt=true → func(system, user) 2-인자(개발 mock ask). false → func(system+user 결합) 1-인자. 실배포(2-PC Samba): 오프라인은 module_path='rag.rag_bridge_client'(drop-box 클라이언트), func_name='generate_rag_response', pass_system_prompt=false. 온라인은 srag_llm_service.py 가 실제 LLM 처리(rag/README 없음 — v9.0.md 참조).",
-    "_comment_debug": "debug=true → [LLM/raw](원본응답) [LLM/parse](파싱결과) [LLM/item](항목 accept/dup/drop) [LLM/stats](기여도 요약) 단계별 로그. log_responses=true → output/llm_io.jsonl 에 원본 전량 기록. 둘 다 분석/디버깅용 — 실운영은 false. json_retries=응답이 JSON 아니면 교정 리프롬프트 재시도 상한.",
+    "_comment": "LLM 호출 여부는 rag.enabled와 --rag/--no-rag로 결정하며 명령행 옵션이 우선한다. LLM 없이 퍼징하려면 enabled=false 또는 --no-rag를 사용한다(module_path를 바꿀 필요 없음). 인터넷이 없어도 접근 가능한 LAN 모델 서버나 사내 브리지가 있으면 LLM을 사용할 수 있다. request_interval_sec는 백그라운드 요청 주기, min_request_interval_sec는 최소 전송 간격이다. 퍼저 프로세스당 요청은 한 번에 1건만 진행하며 기다리는 동안 퍼징을 계속한다. request_cadence는 현재 실행수 기반 주기로 사용하지 않는다. plateau_exec_threshold는 탐색 정체 판단에 사용한다. 제안은 검증과 가드를 통과한 항목만 반영한다.",
+    "_comment_call": "연결 방식 선택: Spark 등 접근 가능한 vLLM 서버를 직접 호출하려면 module_path=rag.vllm_client, func_name=generate_rag_response, pass_system_prompt=true를 사용한다. 인터넷 없는 퍼징 PC에서 Samba 공유 폴더로 온라인 PC의 사내 API를 사용하려면 module_path=rag.rag_bridge_client, 같은 func_name, pass_system_prompt=false를 사용한다. 온라인 PC에는 srag_llm_service.py와 실제 srag_llm_guide.py가 필요하고 양쪽이 동일한 공유 폴더를 봐야 한다(RAG_BRIDGE_DIR). LLM을 사용하지 않는 실행은 rag.enabled=false 또는 --no-rag다. 호출 규약은 meta 지원 함수면 func(system,user,meta)가 우선이고, 그 외 true이면 func(system,user), false이면 system과 user를 합쳐 func(prompt)를 호출한다. 자세한 배치는 rag/README.md 참조.",
+    "_comment_debug": "debug는 LLM 요청·파싱·채택 진단 로그를, debug_exec는 명령 실행 단위의 상세 로그를 제어한다. log_responses=true이면 실행 출력 폴더의 llm/llm_io_<시각>.jsonl에 요청·응답을 보관한다. json_retries는 퍼저 워커의 JSON 파싱 실패 교정 재요청 상한이며 vllm.retries나 백엔드 내부 교정과 별개다.",
     "enabled": true,
     "fail_limit": 10,
     "debug": true,
@@ -491,7 +491,7 @@
     "request_interval_sec": 60,
     "min_request_interval_sec": 5,
     "plateau_exec_threshold": 20000,
-    "_comment_seq": "시퀀스 강화: task_weights 로 sequences 라운드 비중↑, seq_energy_boost 로 시퀀스 선택 불이익(/len 페널티) 상쇄. 단일시드보다 상태의존 시퀀스가 LLM 강점. 미설정 시 1:1:1 라운드로빈+일반부스트(기존동작).",
+    "_comment_seq": "task_weights는 활성 task의 가중 회전 비중이며 생략한 task 가중치는 1이다. io_patterns도 활성 조건을 만족하면 참여한다. 성과 기반 선택과 연속 선택 제한이 함께 적용될 수 있다. seq_energy_boost는 LLM 시퀀스 에너지 보정값이다. task 비활성화는 tasks 또는 해당 기능의 활성 설정을 사용한다.",
     "seq_energy_boost": 2.5,
     "cull_grace": 8,
     "task_weights": {
@@ -502,12 +502,12 @@
     },
     "max_seeds_per_round": 8,
     "max_seq_per_round": 6,
-    "_comment_corpus_eval_sample": "corpus_eval 이 한 번에 평가시키는 시드 수(층화 표본). 하드코딩 40 이었다. task 마다 응답 1건당 항목 수가 크게 달라(seeds 8 / seq 6 / eval 40) 채택 수를 합산하면 평가가 총합을 지배한다 — [LLM/task] 는 task 별로 요청 대비로 본다.",
+    "_comment_corpus_eval_sample": "corpus_eval 요청에 포함할 기존 seed 표본 수. task마다 응답 항목 단위와 개수가 다르므로 채택 총합만으로 성과를 비교하지 말고 [LLM/task]의 task별 요청·채택 통계를 함께 확인한다.",
     "corpus_eval_sample": 40,
     "max_seq_len": 24,
     "max_uncov_funcs": 40,
     "seed_at_startup": true,
-    "_comment_startup_task": "기동 직후 1건째 LLM 요청의 task 를 고정한다. \"off\"(기본) = 가중 회전판이 정함(task_weights 순번 0번). task 이름(new_group_seeds/sequences/corpus_eval/io_patterns)을 주면 그것으로 고정하되 회전 순번은 그대로 소비하므로 2건째는 다음 칸이다. 비활성이거나 모르는 이름이면 경고 후 무시. seed_at_startup=false 면 기동 요청 자체가 없어 이 값도 무의미하다.",
+    "_comment_startup_task": "seed_at_startup=true일 때 첫 LLM 요청 task를 지정한다. off이면 가중 회전판이 선택하며 LLM이나 기동 요청을 끄는 값이 아니다. 지정 가능한 값은 new_group_seeds/sequences/corpus_eval/io_patterns다. 알 수 없거나 현재 비활성인 task는 경고 후 무시한다. 기동 요청도 회전판 순번을 소비한다. seed_at_startup=false이면 이 설정은 사용하지 않는다.",
     "startup_task": "off",
     "llm_energy_boost": 1.5,
     "reserved_policy": "reject",
@@ -518,7 +518,7 @@
       "corpus_eval": true,
       "io_patterns": true
     },
-    "_comment_v91": "v9.1: SC=0x01(Invalid Opcode) 지배 명령 = 이 펌웨어 미구현 → LLM 제안 제외 + 에너지 바닥",
+    "_comment_v91": "Invalid Opcode(SC=0x01) 결과가 반복되어 미구현으로 판정된 명령은 LLM 후보에서 제외하고 에너지를 낮춘다. 판정은 실행 결과 통계에 근거하며 단일 오류가 해당 명령의 미구현을 확정한다는 뜻은 아니다.",
     "unimpl_min_exec": 5,
     "unimpl_ratio": 0.9,
     "unimpl_energy_floor": 0.05,
@@ -531,17 +531,17 @@
     "debug_exec": false,
     "boost_min_gain": 5,
     "max_hops": 3,
-    "_comment_max_hops": "미도달 함수 순위 = 도달 코드로부터의 콜그래프 홉 수. 이름 패턴 대신 데이터로 정한다. 홉 내 호출자가 없으면 후순위(제외 아님).",
+    "_comment_max_hops": "미도달 함수의 탐색 우선순위를 정할 때 도달 코드와의 콜그래프 거리를 참고하는 홉 상한. 가까운 호출자가 없는 함수는 후순위로 둘 수 있으며 이 값만으로 명령 전송을 차단하지 않는다.",
     "autoname_kw_off_products": [
       "BM9K1"
     ],
-    "_comment_autoname_kw": "(default|thunk|switch) 키워드 필터를 끌 제품 목록. 이 필터는 진짜 심볼(set_default_mode 등)도 지운다. 심볼 살아있는 펌웨어에서만 끄되, 제품별로 검증하고 추가한다. FUN_/sub_ 정규식은 어디서나 유지.",
-    "_comment_vllm": "v10.3: 로컬 vLLM(OpenAI 호환) 백엔드. base_url 은 IP 가 바뀔 수 있어 값으로 받는다. retrieval 은 P2 — tools/rag_ingest.py 로 인덱스를 만든 뒤 enabled=true. 사내 브리지로 되돌리려면 module_path=rag.rag_bridge_client, pass_system_prompt=false.",
+    "_comment_autoname_kw": "default/thunk/switch 키워드 기반 자동 이름 필터를 끌 제품 목록. 실제 심볼에 이 단어가 포함되는 제품에서 사용할 수 있다. FUN_/sub_ 형식의 자동 이름 정규식 필터는 이 목록과 별개로 유지한다.",
+    "_comment_vllm": "module_path=rag.vllm_client일 때 사용하는 직접 HTTP 호출 설정. base_url은 퍼징 PC에서 접근 가능한 서버 주소이며 Spark 전용 고정 주소가 아니다. model은 서버의 served-model-name과 일치시킨다. retrieval.enabled는 로컬 문서 검색 여부이고 LLM 호출 활성화 스위치가 아니다. 검색을 켜기 전에 tools/rag_ingest.py로 인덱스를 준비한다. 사내 Samba 브리지 선택 시 이 vllm 절의 서버·검색 설정을 사용하지 않으며 온라인 guide의 API/검색 설정을 따른다.",
     "vllm": {
       "base_url": "http://192.168.10.1:8000/v1",
       "api_key": "not-used",
       "model": "nemotron-3-super",
-      "_comment_chat_template_kwargs": "Nemotron chat template 제어. 서버로 chat_template_kwargs 로 그대로 전달된다. enable_thinking=추론 블록 생성 여부(끄면 응답이 짧고 빠르지만 형식 오류가 는다). low_effort=추론을 짧게(생성 토큰이 줄어 응답이 빨라진다). 둘 다 불리언만 허용하며, 클라이언트가 타입을 검증한다. null 로 두면 서버 기본값을 쓴다. ※ low_effort 를 켜면 JSON 품질이 떨어져 교정 호출이 늘 수 있고, 최초 호출과 교정 호출이 timeout_sec 하나를 나눠 쓰므로 예산 초과가 늘 수 있다 — diagnostics.correction 과 finish_reason 을 보며 json_retries/timeout_sec 를 함께 조정할 것.",
+      "_comment_chat_template_kwargs": "지원하는 모델의 chat template에 전달하는 옵션. 현재 클라이언트는 enable_thinking과 low_effort에 불리언만 허용하며 전체 값을 null로 두면 별도 옵션을 전달하지 않는다. 생성 길이·지연·JSON 품질에 미치는 효과는 모델과 요청에 따라 달라지므로 diagnostics로 확인한다. 백엔드 내 재시도/교정은 같은 timeout_sec 예산을 공유하며, 퍼저 워커의 json_retries는 별도 호출이다.",
       "chat_template_kwargs": {
         "enable_thinking": true,
         "low_effort": true
@@ -569,7 +569,7 @@
     }
   },
   "io_workload": {
-    "_comment": "v8.4 IO 워크로드 엔진. fuzz_gap 명령마다 rc=0 보장 Write/Read block_size 블록 주입(SSD 내부 동작 자극). rc=0 경계(nsze/mdts/lba)는 Identify 런타임 자동. enabled=false 또는 --no-io-workload 로 비활성.",
+    "_comment": "일반 퍼징 사이에 Write/Read 워크로드를 삽입한다. fuzz_gap은 실행 간격(퍼징 명령 수), block_size는 한 워크로드 블록의 명령 수다. Identify에서 얻은 namespace 크기·전송 한계로 유효 범위를 구성하지만 실제 rc=0 성공을 보장하지는 않는다. LLM descriptor의 block_size(LBA 단위)와 구분한다. enabled=false 또는 --no-io-workload로 비활성화한다.",
     "enabled": true,
     "block_size": 100,
     "fuzz_gap": 100,
@@ -603,13 +603,13 @@
     "burst_walltime_cap_sec": 120.0
   },
   "log_layouts": {
-    "_comment": "v10.1: 벤더 로그 페이지 전체 레이아웃 표(선택). 표가 있는 LID 는 State-Snap 에서 모니터링 대상뿐 아니라 전 필드를 출력한다(모니터링 중인 offset 에 '*' + 내부 필드명 표시). 표가 없는 LID(0x01/0xDF)·security_recv 는 레이아웃 미상이라 종전대로 모니터링 offset 만 출력한다 — 추측해서 찍지 않는다.",
+    "_comment": "관측한 벤더 로그를 사람이 읽는 State-Snap으로 출력할 때 사용할 필드 레이아웃. 레이아웃이 있는 로그는 정의된 필드를 출력하고 모니터링 대상 offset에는 내부 필드명과 표시를 붙인다. 레이아웃이 없는 로그는 알려진 모니터링 필드만 출력한다. 이 표에 추가하는 것만으로 해당 LID가 주기 관측 대상이 되지는 않는다.",
     "vendor_logs": [
       {
         "lid": "0xc0",
         "name": "Extended SMART / Health Information (BM9K1)",
         "log_len": 512,
-        "_comment": "BM9K1 전용. Get Log Page LID C0h. 표는 0..269 연속(Incomplete Shutdowns = 115:112). 16B 필드는 출력 시 hex, 모니터링은 하위 8B 만 읽는다.",
+        "_comment": "BM9K1 Get Log Page LID 0xC0의 출력 레이아웃. Incomplete Shutdowns는 바이트 112..115다. 16바이트 필드의 전체 출력과 state 모니터링 값의 폭을 구분한다. 제품 문서와 실제 로그 길이에 맞춰 유지한다.",
         "fields": [
           {
             "offset": 0,
@@ -822,7 +822,7 @@
         "lid": "0xdf",
         "name": "Vendor Log DFh",
         "log_len": 512,
-        "_comment": "명명된 필드만. 사이 빈 구간은 reserved 로 보고 출력 생략.",
+        "_comment": "아래 명명된 필드만 출력한다. 정의되지 않은 바이트 구간은 해석해 출력하지 않는다.",
         "fields": [
           {
             "offset": 224,
@@ -883,7 +883,7 @@
         "spsp": "0x3d",
         "name": "Vendor Security Log (SECP FEh / SPSP 3Dh)",
         "size": 4096,
-        "_comment": "명명된 필드만. 빈 구간은 reserved 로 보고 출력 생략. Bad User NAND Block Count 는 원자료 384:398 이 392:397(Bad System)과 겹쳐 Bad System 과 같은 6B(384..389)로 가정 — 확인 필요.",
+        "_comment": "아래 명명된 필드만 출력한다. Bad User NAND Block Count는 원자료의 384..398이 다른 필드와 겹쳐 현재 384..389(6바이트)로 가정한 값이다. 실제 제품 레이아웃 확인 전에는 확정값으로 취급하지 않는다.",
         "fields": [
           {
             "offset": 64,
@@ -1090,7 +1090,7 @@
     ]
   },
   "state_fields": {
-    "_comment_bm9k1": "BM9K1 전용(v10.1). r8 기준에서 4개 제외 — media_errors·sec_uncorr_read_errors 는 WriteUncorrectable 로 우리가 심고 우리가 읽어 올리는 자기유발 카운터, num_err_log_entries 는 실행수와 상관되는 단조 카운터라 novelty 0, sec_endurance_estimate 는 정적값. critical_warning 은 유지(안 변하는 동안 :=init 로 커버리지 영향 0, 비용 0, 뒤집히면 최상위 신호). + C0h Extended SMART 10개 추가. C0h 중 %% Free Blocks·System Data %% Used·Refresh Counts·User Erase·Soft ECC·E2E Correction·PCIe Corr·NAND Avg Erase 는 기존 sec_*/df_* 와 같은 물리량이라 모니터링에서 제외(중복 버킷 → 동시변경 필드 수가 늘어 전역이벤트 오탐). 출력에는 45 필드 전부 나온다.",
+    "_comment_bm9k1": "BM9K1 관측 세트. r8 세트에서 자기유발 가능성이 있거나 탐색 신호가 약한 media_errors, sec_uncorr_read_errors, num_err_log_entries, sec_endurance_estimate를 제외하고 critical_warning을 유지한다. C0h Extended SMART의 일부 필드를 추가하며 기존 sec_*/df_*와 중복되는 지표는 중복 상태 변화 집계를 피하려고 제외했다. State-Snap의 전체 레이아웃 출력과 탐색 보상용 관측 세트는 별개다.",
     "bm9k1": [
       {
         "name": "critical_warning",
@@ -1544,7 +1544,7 @@
         ]
       }
     ],
-    "_comment": "제품별 state 관측 필드 세트. 제품의 state_fields 키가 세트명을 가리킴. r8=PM9M1/BM9H1, p9=P9(LID 0xDF df_* 제외).",
+    "_comment": "제품 설정의 state_fields가 선택하는 관측 필드 세트. r8은 PM9M1/BM9H1 계열, p9는 P9용이며 bm9k1은 BM9K1용이다. 제품의 state_exclude_lids 설정이 있으면 선택한 세트에서 해당 LID 필드가 추가로 제외된다.",
     "r8": [
       {
         "name": "critical_warning",
@@ -2173,25 +2173,25 @@
   },
   "products": {
     "BM9K1": {
-      "_comment": "SiFive E76 RISC-V 4코어. 연결=cJTAG, 인증=SJTAG(secure JTAG, 전원사이클마다). 비침습 PCSR 폴링(SBA). ★ 기밀 주소(te_base/pcsr offset/코어 ELF 경로)는 risc-v/sjtag_addrs.json 에만 — 여기엔 두지 않는다.",
+      "_comment": "SiFive E76 RISC-V 4코어 제품 프로필. cJTAG 연결과 SJTAG 인증, SBA를 통한 PCSR 관측을 사용한다. 기밀 디버그 주소와 제품별 자산 경로는 risc-v/sjtag_addrs.json 등 별도 자산에서 관리한다.",
       "interface": "cjtag",
       "sampler_type": "riscv_pcsr",
       "arch": "riscv",
       "jlink_device": "E76",
       "jlink_speed": 10000,
       "riscv": {
-        "_comment": "cores[].elf/load_offset 은 sjtag_addrs.json 의 pcsr.cores 를 우선 사용. 여기 값은 비기밀 구조·튜닝값만.",
+        "_comment": "cores의 elf/load_offset 등 제품 자산은 sjtag_addrs.json의 pcsr.cores 설정을 우선 사용한다. 이 절에는 공유 가능한 구조와 튜닝값을 둔다.",
         "power": "both",
         "tap_script": false,
         "gate_threshold": 95.0,
         "interesting_policy": "primary",
-        "_comment_reconnect": "샘플링 장애 시 디버그 링크 재수립. _reinit_target(빠른 1회) 실패 후 _reconnect 가 close→settle→connect 를 reconnect_attempts 회, 점증 backoff(상한 cap). 컨트롤러는 살아있는데 J-Link USB 가 덜 풀려 즉시 재오픈이 실패하는 transient 대응. 전 구간 bounded.",
+        "_comment_reconnect": "샘플러 링크 장애 시 빠른 재초기화 후 필요하면 close→대기→connect로 재연결을 시도한다. reconnect_attempts와 backoff/cap으로 재시도 횟수와 대기 시간을 제한한다. 컨트롤러 복구나 프로브 재연결 성공을 보장하는 설정은 아니다.",
         "reconnect_attempts": 6,
         "reconnect_settle_sec": 0.5,
         "reconnect_backoff_sec": 1.0,
         "reconnect_backoff_cap_sec": 3.0,
         "sample_plan": {
-          "_comment": "weights=버스트 개수(코드 크기 비례 초기값 H:F:CM:Q). 순서는 매 윈도우 셔플되므로 편향 없음. seed=0 이면 무작위(로그에 기록) — 재현하려면 고정값 지정.",
+          "_comment": "weights는 코어별 버스트 배분의 초기 가중치다. 각 관측 구간에서 버스트 순서를 섞어 고정 순서 편향을 줄인다. seed=0이면 실행 시 무작위 seed를 정해 기록하며 동일한 난수 순서가 필요하면 기록된 값을 지정한다.",
           "weights": {
             "0": 8,
             "1": 1,
@@ -2203,7 +2203,7 @@
           "valid_bit": 1,
           "seed": 0,
           "adaptive": {
-            "_comment": "weights 는 출발점. 최근 수확률(감쇠 per1k)로 캠페인 중 예산을 옮긴다. 표본 적은 코어는 배제가 아니라 전체 평균으로 수축(prior_samples) — 배제하면 저가중치 코어가 문턱을 못 넘어 영원히 후보에서 빠진다. enabled=false 면 weights 고정.",
+            "_comment": "enabled=true이면 초기 weights에서 시작해 최근 커버리지 수확률에 따라 코어별 샘플 예산을 조정한다. prior_samples는 표본이 적은 코어의 추정치를 전체 평균 쪽으로 보정한다. false이면 적응 조정을 끄고 초기 가중치를 사용한다.",
             "enabled": true,
             "period": 500,
             "decay": 0.999,
@@ -2218,7 +2218,7 @@
       "invalid_pc_vals": [],
       "bb_file": "products/BM9K1/basic_blocks.txt",
       "func_file": "products/BM9K1/functions.txt",
-      "_comment_ufas": "UFAS 덤프 = dump/unified_pcie_dump_tool. PM9M1 루틴과 동일하되 실행 인자만 다름: 바이너리명·모드 2(PM9M1=1)·--ini 없음. 명령: sudo dump/unified_pcie_dump_tool <bus> 2 <ts>_UFAS_Dump.bin",
+      "_comment_ufas": "BM9K1 UFAS 덤프 도구는 dump/unified_pcie_dump_tool이며 제품 모드 2를 사용한다. PM9M1 모드 1과 인자가 다르며 --ini를 붙이지 않는다. 실제 명령 구성과 산출물 수집은 제품 프로필 및 덤프 함수가 담당한다.",
       "enable_ufas": true,
       "ufas_binary": "dump/unified_pcie_dump_tool",
       "ufas_mode": "2",
@@ -2235,7 +2235,7 @@
       }
     },
     "PM9M1": {
-      "_comment_timeouts": "nvme_timeouts/nvme_passthru_timeout_ms/nvme_kernel_timeout_sec 는 제품별 override (global timeouts 위에 덮어씀). 제품마다 다르게 조정 가능. 생략 시 global 사용.",
+      "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
       "nvme_timeouts": {
         "command": 8000,
         "format": 120000,
@@ -2274,7 +2274,7 @@
       "state_fields": "r8"
     },
     "PM9M1_LNB": {
-      "_comment_timeouts": "nvme_timeouts/nvme_passthru_timeout_ms/nvme_kernel_timeout_sec 는 제품별 override (global timeouts 위에 덮어씀). 제품마다 다르게 조정 가능. 생략 시 global 사용.",
+      "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
       "nvme_timeouts": {
         "command": 8000,
         "format": 120000,
@@ -2311,10 +2311,10 @@
       "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
       "enable_jlink_dump": true,
       "state_fields": "r8",
-      "_comment_variant": "PM9M1_LNB: 기존 PM9M1 동작(전 state 필드 관측, LID 0xDF snapshot 포함). PM9M1 과 동일."
+      "_comment_variant": "기존 PM9M1과 같은 프로필. state 관측에 LID 0xDF snapshot을 포함한다."
     },
     "PM9M1_HP": {
-      "_comment_timeouts": "nvme_timeouts/nvme_passthru_timeout_ms/nvme_kernel_timeout_sec 는 제품별 override (global timeouts 위에 덮어씀). 제품마다 다르게 조정 가능. 생략 시 global 사용.",
+      "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
       "nvme_timeouts": {
         "command": 8000,
         "format": 120000,
@@ -2354,7 +2354,7 @@
       "state_exclude_lids": [
         223
       ],
-      "_comment_variant": "PM9M1_HP: PM9M1_LNB 와 동일하되 LID 0xDF(223) snapshot 을 관측하지 않는다(state_exclude_lids). df_* 벤더필드가 빠져 get-log LID=0xDF 를 발행하지 않음."
+      "_comment_variant": "PM9M1_LNB와 같은 기본 설정에서 state_exclude_lids로 LID 0xDF(223)를 state snapshot 관측에서 제외한다. df_* 필드는 주기 관측에서 빠지지만, 일반 퍼징 명령으로 LID 0xDF를 보내는 것까지 차단하는 설정은 아니다."
     },
     "BM9H1": {
       "nvme_timeouts": {
@@ -2393,7 +2393,7 @@
       "state_fields": "r8"
     },
     "P7": {
-      "_comment_timeouts": "펌웨어시간 워치독(halt 프리즈 차감)이 halt 오버헤드를 명령마다 실측·보정하므로, 이 값은 '진짜 펌웨어 실행시간' 기준(구 +10s halt 마진 제거). 잔차 흡수는 코드 HALT_FWTIME_MARGIN_SEC(≈1s).",
+      "_comment_timeouts": "halt 샘플러의 명령 워치독은 샘플링으로 정지한 시간을 보정한다. nvme_timeouts는 명령별 기준 시간(밀리초)이며 halt_fwtime_margin_sec의 여유를 추가한다. passthru/kernel timeout은 이 워치독과 별도다.",
       "nvme_timeouts": {
         "command": 30000,
         "format": 300000,
@@ -2406,7 +2406,7 @@
       "interface": "swd",
       "jlink_device": "Cortex-R5",
       "sampler_type": "jlink_halt",
-      "_comment_sampling": "go_settle_ms/halt_poll_ms 는 halt 샘플링 밀도 튜닝. go_settle 이 낮을수록 코어가 halt 로 얼어있는 시간비율↑(프리즈1.8ms 기준: 50→3.5%, 5→26%, 1→64%). 이 값은 '샘플링 품질(해상도 vs 침습도)' 기준으로 고를 것 — 커버리지 촘촘히 필요하면 2~3, 펌웨어 자연스럽게 돌리려면 10. 주의: 호스트 OS freeze 는 halt-vs-컨트롤러 '타이밍 레이스'라 go_settle 로 튜닝 불가로 판명됨(freeze까지 명령수: 1ms=25만·37만/5ms=44만/10ms=18만·9만 — 노이즈, 상관 없음). freeze 는 값 조절이 아니라 corpus 체크포인트+재부팅 자동재시작으로 흡수. 상세: SESSION_HANDOFF_v9.0.md §4.",
+      "_comment_sampling": "go_settle_ms와 halt_poll_ms는 halt 관측의 대기 시간과 샘플링 밀도를 조정한다. 더 자주 halt하면 관측 밀도와 장치 실행에 대한 간섭이 함께 늘 수 있다. 이 값이 호스트 freeze를 방지하거나 자동 재시작을 켜는 것은 아니다. 기존 실험 기록은 backup/SESSION_HANDOFF_v9.0.md 참조.",
       "go_settle_ms": 5,
       "halt_poll_ms": 8,
       "jlink_speed": 2000,
@@ -2427,7 +2427,7 @@
       "state_fields": "p9"
     },
     "P9": {
-      "_comment_timeouts": "펌웨어시간 워치독(halt 프리즈 차감)이 halt 오버헤드를 명령마다 실측·보정하므로, 이 값은 '진짜 펌웨어 실행시간' 기준(구 +10s halt 마진 제거). 잔차 흡수는 코드 HALT_FWTIME_MARGIN_SEC(≈1s).",
+      "_comment_timeouts": "halt 샘플러의 명령 워치독은 샘플링으로 정지한 시간을 보정한다. nvme_timeouts는 명령별 기준 시간(밀리초)이며 halt_fwtime_margin_sec의 여유를 추가한다. passthru/kernel timeout은 이 워치독과 별도다.",
       "nvme_timeouts": {
         "command": 30000,
         "format": 300000,
@@ -2440,7 +2440,7 @@
       "interface": "swd",
       "jlink_device": "Cortex-R5",
       "sampler_type": "jlink_halt",
-      "_comment_sampling": "go_settle_ms/halt_poll_ms 는 halt 샘플링 밀도 튜닝. go_settle 이 낮을수록 코어가 halt 로 얼어있는 시간비율↑(프리즈1.8ms 기준: 50→3.5%, 5→26%, 1→64%). 이 값은 '샘플링 품질(해상도 vs 침습도)' 기준으로 고를 것 — 커버리지 촘촘히 필요하면 2~3, 펌웨어 자연스럽게 돌리려면 10. 주의: 호스트 OS freeze 는 halt-vs-컨트롤러 '타이밍 레이스'라 go_settle 로 튜닝 불가로 판명됨(freeze까지 명령수: 1ms=25만·37만/5ms=44만/10ms=18만·9만 — 노이즈, 상관 없음). freeze 는 값 조절이 아니라 corpus 체크포인트+재부팅 자동재시작으로 흡수. 상세: SESSION_HANDOFF_v9.0.md §4.",
+      "_comment_sampling": "go_settle_ms와 halt_poll_ms는 halt 관측의 대기 시간과 샘플링 밀도를 조정한다. 더 자주 halt하면 관측 밀도와 장치 실행에 대한 간섭이 함께 늘 수 있다. 이 값이 호스트 freeze를 방지하거나 자동 재시작을 켜는 것은 아니다. 기존 실험 기록은 backup/SESSION_HANDOFF_v9.0.md 참조.",
       "go_settle_ms": 5,
       "halt_poll_ms": 8,
       "jlink_speed": 2000,
