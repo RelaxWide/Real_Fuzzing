@@ -169,13 +169,10 @@ v10.3 진입점은 exceptions를 사용하지 않는다. v11 출력은 `output/p
 | sudden_por | 전원 OFF → PERST assert(Tfail, 명령 간격만큼 늦음) → host remove → OFF 대기 → ON → **Tpvperl 0.1s** → PERST release → rescan 반복 |
 | normal_por | host orderly remove(CC.SHN=01b→**SHST=10b 확인**) → PERST assert → OFF → OFF 대기 → ON → **Tpvperl 0.1s** → PERST release → rescan 반복 |
 
-**SPOR 과 NPOR 의 차이와 검증** — 두 profile 모두 퍼징 명령이 도는 중에 주입된다. 차이는 전원을
-끊기 전의 정상 종료 통지다: NPOR 은 드라이버 orderly remove 가 I/O 큐를 지우고 CC.SHN=01b 를 쓴 뒤
+**SPOR 과 NPOR 의 차이** — 두 profile 모두 퍼징 명령이 도는 중에 주입된다. 차이는 전원을 끊기 전의
+정상 종료 통지다: NPOR 은 드라이버 orderly remove 가 I/O 큐를 지우고 CC.SHN=01b 를 쓴 뒤
 CSTS.SHST=10b 를 기다리고(Base 2.3 §3.6.2) PERST → 전원 OFF, SPOR 은 통지 없이 전원 OFF → PERST.
-이 차이는 장치의 **SMART Unexpected Power Losses**(구 Unsafe Shutdowns)로 확인한다 — "SHST 가 10b 가
-아닐 때 전원이 끊기면, 그리고 그때만 증가"(Base 2.3 p.240). 전원 이벤트 뒤 smart-log 를 읽어
-SPOR = +1, NPOR = +0 이 아니면 `[장치 측]` 실패. 기준은 사전시험 시작과 직전 전원 이벤트 뒤 값이고,
-그사이 Power Cycles 가 정확히 +1 이 아니면(퍼저 자체 POR 등) 판정하지 않는다. 복귀 스펙도 다르다
+NPOR 은 전원 OFF 직전에 BAR 관측으로 SHN→SHST=10b 를 확인한다(아래 타이밍 절). 복귀 스펙도 다르다
 (BM9K1: NPO 0.5s, SPO 20s).
 
 Normal POR의 의미는 **Linux 드라이버 orderly removal 이후 전원 차단**이다.

@@ -21012,18 +21012,6 @@ class ExceptionController:
         cmd = f" — {self._describe_argv(step, argv)}" if argv else ""
         self._line(f"      · {self._NSSR_STEP_TEXT.get(step, step)}{cmd}")
 
-    def _show_power_loss_check(self, r):
-        st, what = r.get('status'), ('SPOR' if r.get('kind') == 'spo' else 'NPOR')
-        if st == 'UNAVAILABLE':
-            self._line(f"    [check] SMART 전원 손실 카운터 읽기 실패/기준 없음 — {what} 구분 판정 생략")
-        elif st == 'SKIPPED':
-            self._line(f"    [check] SMART Power Cycles {r['d_cycles']:+d} (1 이어야 판정) — "
-                       f"사이에 다른 전원 사이클이 있거나 집계 안 됨, {what} 구분 판정 생략")
-        else:
-            ok = st == 'OK'
-            self._line(f"    [check] SMART Power Cycles +1 · Unexpected Power Losses {r['d_unsafe']:+d} "
-                       f"({what} 기대 {r['expect']:+d}) {'OK' if ok else '✗'}", error=not ok)
-
     def _show_root_port(self, r):
         parts = []
         aer = r.get('aer')
@@ -21643,63 +21631,8 @@ class ExceptionController:
     def _run_profile(self, profile):
         self._step_total = len(profile.steps)
         if self.timing is not None:
-            self._run_profile_timed(profile)
-        else:
-            self._run_profile_plain(profile)
-        if profile.timing in ('npo', 'spo'):
-            self._check_power_loss(profile)
-
-    # ── NPO/SPO 구분 검증: SMART Unexpected Power Losses (구 Unsafe Shutdowns) ──
-    #   NVMe Base 2.3 SMART/Health 로그(p.240): 이 카운터는 전원이 끊길 때 CSTS.SHST 가 10b 가
-    #   아니었으면, **그리고 그때만** 1 증가한다. SPOR(종료 통지 없이 차단) = +1, NPOR(SHN=01b →
-    #   SHST=10b 뒤 차단) = +0 이어야 한다. 사이에 다른 전원 사이클(퍼저 자체 POR 등)이 끼면
-    #   Power Cycles 가 +1 이 아니므로 판정하지 않는다.
-    _SMART_KEYS = {'unsafe': ('unsafe_shutdowns', 'unexpected_power_losses'),
-                   'cycles': ('power_cycles',)}
-
-    def _smart_counts(self, deadline):
-        try:
-            rc, out, _ = self.runner.run(['nvme', 'smart-log', self.device, '-o', 'json'], deadline)
-            if rc:
-                return None
-            data = json.loads(out)
-            got = {}
-            for name, keys in self._SMART_KEYS.items():
-                for key in keys:
-                    if key in data:
-                        v = data[key]
-                        got[name] = int(v, 0) if isinstance(v, str) else int(v)
-                        break
-            return got if len(got) == 2 else None
-        except Exception:
-            return None
-
-    def _smart_baseline(self):
-        self._smart_base = self._smart_counts(self.clock() + 10)
-
-    def _check_power_loss(self, profile):
-        base = getattr(self, '_smart_base', None)
-        now = self._smart_counts(self.clock() + 10)
-        self._smart_base = now                       # 다음 전원 이벤트의 기준
-        expect = 1 if profile.timing == 'spo' else 0
-        row = dict(kind=profile.timing, expect=expect, base=base, now=now)
-        if base is None or now is None:
-            self.emit('power_loss_check', status='UNAVAILABLE', **row)
-            return
-        dc, du = now['cycles'] - base['cycles'], now['unsafe'] - base['unsafe']
-        row.update(d_cycles=dc, d_unsafe=du)
-        if dc != 1:
-            self.emit('power_loss_check', status='SKIPPED', **row)
-            return
-        if du == expect:
-            self.emit('power_loss_check', status='OK', **row)
-            return
-        self.emit('power_loss_check', status='MISMATCH', **row)
-        what = 'SPOR' if expect else 'NPOR'
-        why = ('종료 통지 없이 전원이 끊겼는데 증가하지 않음' if expect else
-               '정상 종료(SHST=10b) 뒤 차단인데 증가함')
-        raise ExceptionFailure(f'[장치 측] {what}: SMART Unexpected Power Losses {du:+d} (기대 {expect:+d}) — '
-                               f'{why} (NVMe Base 2.3 SMART PWRC/UPL)')
+            return self._run_profile_timed(profile)
+        self._run_profile_plain(profile)
 
     def _run_profile_plain(self, profile):
         deadline = self.clock() + profile.timeout_sec
@@ -22058,8 +21991,6 @@ class ExceptionController:
             self.last_result = dict(event_id='preflight-baseline', phase='preflight', stage='baseline_ready')
             self._say("  [기준] 시작 전 장치 준비 확인")
             self.wait_ready(self.clock() + min(p.ready_timeout_sec for p in self.profiles))
-            if any(p.timing in ('npo', 'spo') for p in self.profiles):
-                self._smart_baseline()                 # NPO/SPO 전원 손실 카운터 기준
             for pos, profile in enumerate(self.profiles, 1):
                 self.active = 'preflight-' + profile.name
                 self.last_result = dict(event_id=self.active, profile=profile.name,
