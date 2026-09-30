@@ -20128,6 +20128,7 @@ def compile_profiles(options, config):
 # 스펙을 넘으면 즉시 끊지 않고 overrun_wait_sec 까지 계속 측정한 뒤 불량으로 보고한다.
 
 _PCI_DEVICES = Path('/sys/bus/pci/devices')
+_PCI_BUS = Path('/sys/bus/pci')                  # drivers_autoprobe · drivers_probe · drivers/<name>/unbind
 _NVME_CLASS = Path('/sys/class/nvme')
 
 
@@ -20171,6 +20172,59 @@ def _pcie_cap_offset(cfg):
             return ptr
         ptr = cfg[ptr + 1] & 0xFC
     return None
+
+
+def _link_active(root_bdf, pci=None):
+    """루트 포트 Link Status.DLLLA(bit 13). 루트 포트를 모르면 None."""
+    if not root_bdf:
+        return None
+    try:
+        with open(Path(pci or _PCI_DEVICES) / root_bdf / 'config', 'rb') as f:
+            cfg = f.read(256)
+    except OSError:
+        return None
+    cap = _pcie_cap_offset(cfg)
+    if cap is None or cap + 0x14 > len(cfg):
+        return None
+    return bool(int.from_bytes(cfg[cap + 0x12:cap + 0x14], 'little') & (1 << 13))
+
+
+# NSSR 도우미 — BAR0 를 **쓰는** 부분이라 자식 프로세스에서 한다(링크 다운·remove 경쟁의 SIGBUS
+#   격리, _BAR_READER 와 같은 이유). argv: 모드('arm'|'csts'), PCI 장치 sysfs 경로.
+#   arm : CAP.NSSRS 확인 → 남아 있는 CSTS.NSSRO(RW1C)를 지움 → 'ARMED' 출력 후 NSSR(0x20)에
+#         4E564D65h("NVMe") 쓰기. 쓰기 뒤 매핑은 건드리지 않고 바로 끝낸다.
+#   csts: CSTS 한 번 읽기.
+#   출력: 'KEY 값' 줄. 메모리 디코드(Command.MSE)가 꺼져 있으면 읽기가 FFFFFFFFh 이므로 먼저 알린다.
+_NSSR_HELPER = r"""
+import mmap, os, sys
+mode, dev = sys.argv[1], sys.argv[2]
+def say(line):
+    sys.stdout.write(line + '\n'); sys.stdout.flush()
+with open(dev + '/config', 'rb') as f:
+    cmd = int.from_bytes(f.read(8)[4:6], 'little')
+say('CMD %d' % cmd)
+if not cmd & 2:
+    say('ERR memory space disabled (Command.MSE=0)'); os._exit(3)
+fd = os.open(dev + '/resource0', os.O_RDWR | os.O_SYNC)
+mm = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+mv = memoryview(mm).cast('I')
+cap = mv[0] | (mv[1] << 32)
+csts = mv[7]
+say('CAP %d' % cap)
+say('CSTS %d' % csts)
+if mode == 'arm':
+    if csts == 0xFFFFFFFF:
+        say('ERR BAR0 unreadable (CSTS=FFFFFFFFh)'); os._exit(4)
+    if not (cap >> 36) & 1:
+        say('ERR CAP.NSSRS=0'); os._exit(5)
+    if csts & 0x10:
+        mv[7] = 0x10
+        say('CLEARED %d' % mv[7])
+    say('ARMED')
+    mv[8] = 0x4E564D65
+    say('WROTE')
+os._exit(0)
+"""
 
 
 # BAR0 관측은 **별도 프로세스**에서 한다. 장치 remove 와 mmap 읽기 사이의 경쟁에서 커널이
@@ -20581,12 +20635,15 @@ class ExceptionController:
     def _describe_argv(self, action, argv):
         """실행 명령을 사람이 옮겨 적을 수 있는 한 줄로. python -c 도우미는 뜻으로 바꾼다."""
         if not argv:
-            return str(action)
+            return ('NVM Subsystem Reset (unbind → BAR0 NSSR → remove/rescan → NSSRO 확인 → probe)'
+                    if action == 'nssr' else str(action))
+        if argv[:2] == ['sh', '-c'] and len(argv) == 3:
+            return argv[2]
         if len(argv) > 3 and argv[1] == '-c':
             if action in ('flr', 'hot_reset'):
                 method = argv[4] if len(argv) > 4 else '?'
                 return f"sysfs PCI reset (reset_method={method}) {argv[3]}"
-            return f"echo 1 > {argv[3]}"
+            return f"echo {argv[4] if len(argv) > 4 else 1} > {argv[3]}"
         out = []
         for a in argv:
             if a == sys.executable:
@@ -20685,6 +20742,33 @@ class ExceptionController:
     def _show_helper_pending(self, r):
         self._line(f"    ⚠ 한도 안에 끝나지 않은 명령 — PID {r.get('pid')} 잔존: "
                    f"{self._describe_argv(r.get('action'), r.get('argv'))}", error=True)
+
+    _NSSR_STEP_TEXT = {'autoprobe_off': 'PCI 자동 probe 끔', 'unbind': '드라이버 unbind',
+                       'nssr_write': 'BAR0 NSSR ← 4E564D65h', 'remove': '장치 remove',
+                       'enable': '메모리 디코드 켬', 'disable': '메모리 디코드 끔',
+                       'autoprobe_restore': 'PCI 자동 probe 복원', 'probe': '드라이버 probe',
+                       'rebind': '드라이버 재연결(NSSR 미실행)', 'rescan': 'PCI rescan 반복'}
+
+    def _show_nssr_step(self, r):
+        step = r.get('step')
+        argv = r.get('argv')
+        cmd = f" — {self._describe_argv(step, argv)}" if argv else ""
+        self._line(f"      · {self._NSSR_STEP_TEXT.get(step, step)}{cmd}")
+
+    def _show_nssr_result(self, r):
+        def at(key):
+            v = r.get(key)
+            return '관측 불가' if v is None else ('안 떨어짐' if v is False else f'+{_fmt_dur(v)}')
+        if not r.get('issued'):
+            self._line("      NSSR 미실행", error=True)
+            return
+        link = f"링크 다운 {at('link_down_sec')} · 링크 업 {at('link_up_sec')}"
+        if 'csts' not in r:
+            self._line(f"      NSSR 쓰기 완료 — {link}", error=True)
+            return
+        ok = r.get('nssro') and not r.get('cfs')
+        self._line(f"      NSSR 확인: CSTS=0x{r['csts']:08x} NSSRO={int(bool(r.get('nssro')))} "
+                   f"CFS={int(bool(r.get('cfs')))} {'OK' if ok else '✗'} — {link}", error=not ok)
 
     def _show_rescan_found(self, r):
         self._line(f"      DUT 발견 — rescan {r.get('tries')}회 ({r.get('elapsed_sec', 0):.2f}s)")
@@ -20840,7 +20924,8 @@ class ExceptionController:
             argv = ['nvme', 'reset', self.device]
             effect = 'none'
         elif action == 'nssr':
-            argv, effect = ['nvme', 'subsystem-reset', self.device], 'none'
+            self._nssr(deadline)
+            return
         elif action in ('flr', 'hot_reset'):
             method = 'flr' if action == 'flr' else 'bus'
             status, reason = pci_method_support(self.bdf, method)
@@ -20909,7 +20994,7 @@ class ExceptionController:
             if effect == 'deassert':
                 self.asserted = False
 
-    def _rescan_until_present(self, deadline):
+    def _rescan_until_present(self, deadline, sub=False):
         """PCI rescan 을 짧은 주기로 반복해 DUT 가 버스에 나타나는 즉시 멈춘다.
 
         예전엔 전원 ON/PERST 해제 뒤 고정 시간(por_rescan_delay, 10s)을 기다린 뒤 한 번
@@ -20917,8 +21002,11 @@ class ExceptionController:
         링크가 아직이면 rescan 은 아무것도 못 찾고 빨리 끝나므로 반복해도 무해하다.
         처음 1초는 20ms, 이후 100ms 간격."""
         argv = ['sh', '-c', 'echo 1 > /sys/bus/pci/rescan']
-        self.emit('action_command', action='pci_rescan_wait', argv=argv,
-                  remaining_sec=max(0, deadline - self.clock()))
+        if sub:                                   # 다른 동작(nssr)의 한 단계
+            self.emit('nssr_step', step='rescan', argv=argv)
+        else:
+            self.emit('action_command', action='pci_rescan_wait', argv=argv,
+                      remaining_sec=max(0, deadline - self.clock()))
         start, tries = self.clock(), 0
         while True:
             if (_PCI_DEVICES / self.bdf).exists():
@@ -20932,6 +21020,137 @@ class ExceptionController:
             if rc:
                 raise ExceptionFailure(f'PCI rescan 실패 rc={rc}: {err.decode(errors="replace")[:200]}')
             time.sleep(0.02 if self.clock() - start < 1.0 else 0.1)
+
+    _SYSFS_WRITE = "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])"
+
+    def _sysfs_write(self, step, path, value, deadline, check=True):
+        argv = [sys.executable, '-c', self._SYSFS_WRITE, str(path), str(value)]
+        self.emit('nssr_step', step=step, argv=argv)
+        rc, _, err = self.runner.run(argv, deadline)
+        if rc and check:
+            raise ExceptionFailure(f'{step}: rc={rc}: {err.decode(errors="replace")[:200]}')
+        return rc
+
+    def _nssr_helper(self, mode, deadline):
+        argv = [sys.executable, '-c', _NSSR_HELPER, mode, str(_PCI_DEVICES / self.bdf)]
+        rc, out, err = self.runner.run(argv, deadline)
+        info = {}
+        for line in out.decode(errors='replace').splitlines():
+            key, _, val = line.partition(' ')
+            info[key] = int(val) if val.isdigit() else (val or True)
+        return rc, info, err.decode(errors='replace').strip()[-200:]
+
+    def _wait_link(self, want, deadline):
+        """루트 포트 DLLLA 가 want 가 될 때까지 1ms 폴링 → 걸린 시간(s). 루트 포트를 모르면 None,
+        한도 초과면 False."""
+        start = self.clock()
+        while True:
+            v = _link_active(getattr(self, 'root_bdf', None))
+            if v is None:
+                return None
+            if v is want:
+                return self.clock() - start
+            if self.clock() >= deadline:
+                return False
+            time.sleep(0.001)
+
+    def _nssr(self, deadline):
+        """NVM Subsystem Reset — 스펙 절차대로 호스트가 복구를 책임진다.
+
+        근거: Base 2.3 §3.7.1(모든 컨트롤러 CLR, NSSRO 보고), 1.4c §7.3.1(모든 PCIe 포트 Detect
+        진입 = 링크 다운), PCIe 5.0 §2.9.1(Upstream Port DL_Down = 리셋 → BAR·Command 초기화),
+        Base 2.3 §3.7.2(호스트가 transport 상태를 갱신한 뒤 CC.EN=1 → RDY 대기).
+        `nvme subsystem-reset` 을 쓰면 드라이버가 NSSR 직후 설정 복원 없이 곧바로 자체 리셋을 걸다
+        FFFFFFFFh 를 읽고 -ENODEV 로 컨트롤러를 dead 처리한다(6.8 실측). 그래서
+          1) drivers_autoprobe=0, 드라이버 unbind      — 드라이버 개입·재열거 뒤 자동 probe 차단
+          2) BAR0 NSSR 쓰기(자식 프로세스)             — t0
+          3) 링크 다운 → 장치 remove → 링크 업 대기     — 이전 설정 상태 폐기
+          4) rescan 반복                              — 설정 공간(BAR) 복원
+          5) CSTS 읽기: NSSRO=1·CFS=0 확인             — 드라이버가 지우기 전에
+          6) autoprobe 복원, drivers_probe            — 드라이버가 CC.EN→RDY→live
+        NSSR 을 쓴 뒤 실패하면 장치는 그 상태로 둔다(보존). autoprobe 는 항상 원래대로 돌린다."""
+        dev = _PCI_DEVICES / self.bdf
+        auto = _PCI_BUS / 'drivers_autoprobe'
+        self._reenumerated = True
+        self.emit('action_command', action='nssr', argv=None,
+                  remaining_sec=max(0, deadline - self.clock()))
+        try:
+            auto_old = auto.read_text().strip() or '1'
+        except OSError as exc:
+            raise ExceptionFailure(f'NSSR: drivers_autoprobe 읽기 실패: {exc}')
+        try:
+            driver = (dev / 'driver').resolve().name if (dev / 'driver').exists() else None
+        except OSError:
+            driver = None
+        issued = enabled = False
+        result = dict(driver=driver)
+        try:
+            self._sysfs_write('autoprobe_off', auto, '0', deadline)
+            if driver:
+                self._sysfs_write('unbind', _PCI_BUS / 'drivers' / driver / 'unbind', self.bdf, deadline)
+            # unbind 뒤 메모리 디코드가 꺼질 수 있다(커널마다 다름) — BAR0 에 쓰려면 켜 둔다
+            self._sysfs_write('enable', dev / 'enable', '1', deadline)
+            enabled = True
+            # 2) NSSR
+            trigger = getattr(self, '_nssr_trigger', None)
+            t0 = self.clock()
+            if trigger is not None:
+                trigger(t0)
+            self.emit('nssr_step', step='nssr_write', argv=None)
+            rc, info, err = self._nssr_helper('arm', deadline)
+            result.update(pre_csts=info.get('CSTS'), cleared_csts=info.get('CLEARED'), cap=info.get('CAP'))
+            if 'ARMED' not in info:
+                raise ExceptionFailure(f"NSSR 미실행: {info.get('ERR') or err or f'rc={rc}'}")
+            issued = True                     # 쓰기 직후 링크가 떨어져 자식이 신호로 죽어도 쓰기는 나갔다
+            # 3) 링크 다운 → remove → 링크 업
+            down = self._wait_link(False, min(deadline, self.clock() + 1.0))
+            result['link_down_sec'] = (self.clock() - t0) if down not in (None, False) else down
+            if dev.exists():
+                self._sysfs_write('remove', dev / 'remove', '1', deadline)
+            up = self._wait_link(True, deadline)
+            if up is False:
+                raise ExceptionFailure('[장치 측] NSSR 뒤 링크가 한도 안에 돌아오지 않음 (DLLLA=0)')
+            result['link_up_sec'] = None if up is None else self.clock() - t0
+            # 4) 설정 공간 복원
+            self._rescan_until_present(deadline, sub=True)
+            # 5) NSSRO — 재열거 직후엔 메모리 디코드가 꺼져 있으므로 잠깐 켜고 읽는다
+            self._sysfs_write('enable', dev / 'enable', '1', deadline)
+            try:
+                rc, info, err = self._nssr_helper('csts', deadline)
+            finally:
+                self._sysfs_write('disable', dev / 'enable', '0', deadline, check=False)
+            csts = info.get('CSTS')
+            if not isinstance(csts, int) or csts == 0xFFFFFFFF:
+                raise ExceptionFailure(f"[장치 측] NSSR 뒤 CSTS 읽기 실패: "
+                                       f"{info.get('ERR') or err or f'rc={rc} CSTS={csts}'}")
+            result.update(issued=True, csts=csts, nssro=bool(csts & 0x10), cfs=bool(csts & 2))
+            self.emit('nssr_result', **result)
+            if csts & 2:
+                raise ExceptionFailure(f'[장치 측] NSSR 뒤 CSTS.CFS=1 (CSTS=0x{csts:08x})')
+            if not csts & 0x10:
+                raise ExceptionFailure(f'[장치 측] NSSR 스펙 위반: 전원 인가 중 NSSR 인데 CSTS.NSSRO=0 '
+                                       f'(CSTS=0x{csts:08x}, Base 2.3 Fig.42)')
+            # 6) 드라이버 복귀
+            self._sysfs_write('autoprobe_restore', auto, auto_old, deadline)
+            self._sysfs_write('probe', _PCI_BUS / 'drivers_probe', self.bdf, deadline)
+        except BaseException:
+            if 'csts' not in result:
+                result['issued'] = issued
+                self.emit('nssr_result', **result)
+            if not issued:                     # 아무 일도 안 일어났으면 원래대로 돌려 둔다
+                end = self.clock() + self.cleanup_timeout
+                if enabled:
+                    self._sysfs_write('disable', dev / 'enable', '0', end, check=False)
+                if driver:
+                    self._sysfs_write('rebind', _PCI_BUS / 'drivers_probe', self.bdf, end, check=False)
+            raise
+        finally:
+            try:
+                if auto.read_text().strip() != auto_old:
+                    self._sysfs_write('autoprobe_restore', auto, auto_old,
+                                      self.clock() + self.cleanup_timeout, check=False)
+            except OSError:
+                pass
 
     def restore_supply(self):
         """Only ON/deassert; never cycle power or issue a recovery reset."""
@@ -21077,13 +21296,24 @@ class ExceptionController:
                 if effect in ('power_off', 'assert'):
                     t0 = t0_what = None                   # 새 OFF/assert 구간 — 기준 다시 잡음
                 started = self.clock()
-                if action in self._T0_AT_START:           # 리셋 시작 전에 주기를 연다
+                if action == 'nssr':
+                    # unbind(드라이버 정상 종료)는 복귀 시간이 아니다 — NSSR 을 **쓰는** 순간이 t0
+                    def _trigger(t):
+                        nonlocal t0, t0_what, cycles
+                        mon.begin_cycle(t)
+                        t0, t0_what = t, 'NSSR 쓰기'
+                        cycles += 1
+                    self._nssr_trigger = _trigger
+                elif action in self._T0_AT_START:         # 리셋 시작 전에 주기를 연다
                     mon.begin_cycle(started)
                     t0, t0_what = started, f'{action} 시작'
                     cycles += 1
                 # rescan 반복은 복귀 측정의 일부 — 스펙+초과 측정 시간까지 기다린다.
-                self._action(action, (t0 + self._timing_budget(profile) + spec.overrun_wait)
-                             if action == 'pci_rescan_wait' and t0 is not None else deadline)
+                try:
+                    self._action(action, (t0 + self._timing_budget(profile) + spec.overrun_wait)
+                                 if action == 'pci_rescan_wait' and t0 is not None else deadline)
+                finally:
+                    self._nssr_trigger = None
                 if action not in self._T0_AT_START and effect in ('power_on', 'deassert'):
                     t0, t0_what = self.clock(), f'{action} 반환'
                     mon.begin_cycle(t0)
@@ -21294,6 +21524,10 @@ class ExceptionController:
                 result = subsystem_support(register_value(out, 'cap'), self.bdf)
                 if result[0] != 'AVAILABLE':
                     return result
+                if not (_PCI_BUS / 'drivers_autoprobe').exists() or not (_PCI_BUS / 'drivers_probe').exists():
+                    return 'UNCONFIGURED', 'NSSR 복구에 필요한 drivers_autoprobe/drivers_probe 없음'
+                if _link_active(getattr(self, 'root_bdf', None)) is None:
+                    return 'UNCONFIGURED', 'NSSR 링크 관측용 루트 포트(DLLLA)를 찾을 수 없음'
             elif action in ('power_on', 'power_off') or action in self.options.get('adapters', {}):
                 adapter = self.options.get('adapters', {}).get(action, {})
                 uses_pmu = action in ('power_on', 'power_off') or any(

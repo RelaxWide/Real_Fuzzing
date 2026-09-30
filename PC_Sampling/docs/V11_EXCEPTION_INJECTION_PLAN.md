@@ -159,7 +159,7 @@ v10.3 진입점은 exceptions를 사용하지 않는다. v11 출력은 `output/p
 | 이름 | 동작 / 지원 판단 |
 |---|---|
 | controller_reset | `nvme reset`, RDY/정상 재개 확인 |
-| nssr | CAP.NSSRS 확인, 현재 호스트에서 같은 subsystem NQN에 컨트롤러 하나만 보이는 경우 `nvme subsystem-reset` |
+| nssr | CAP.NSSRS 확인, 같은 subsystem NQN에 컨트롤러 하나만 보이고 루트 포트 DLLLA를 읽을 수 있는 경우. unbind → BAR0 NSSR 쓰기 → 링크 다운·remove·링크 업 → rescan → CSTS.NSSRO 확인 → 드라이버 probe (아래 **NSSR 절차**) |
 | flr | sysfs reset_method에 정확히 flr이 있을 때 실행 |
 | hot_reset | 정확히 bus 방식이 있고 같은 부모 버스 범위에 DUT 외 PCI 기능이 없을 때 실행 |
 | warm_reset_perst | PERST assert → host remove → release → 기존 rescan 대기 → rescan. 주전원/REFCLK 조작 없음 |
@@ -169,6 +169,38 @@ v10.3 진입점은 exceptions를 사용하지 않는다. v11 출력은 `output/p
 Normal POR의 의미는 **Linux 드라이버 orderly removal 이후 전원 차단**이다.
 별도 MMIO SHN/SHST 관측 시험이나 제품별 전기적 shutdown 인증과 동일시하지 않는다.
 NSSR의 NQN 범위 검사는 보수적이므로 placeholder NQN이 중복되면 실행을 제외할 수 있다.
+
+### NSSR 절차
+
+`nvme subsystem-reset` 은 쓰지 않는다. 드라이버가 NSSR 을 쓴 직후 설정 공간 복원 없이 자체
+컨트롤러 리셋을 걸다가 FFFFFFFFh 를 읽고 `-ENODEV` 로 컨트롤러를 dead 처리한다
+(커널 6.8.12 실측: state=resetting 고정, 설정 공간 ffffffff). 스펙상 NSSR 뒤 복구는 호스트 책임이다.
+
+| 근거 | 내용 |
+|---|---|
+| Base 2.3 §3.7.1 (p.119) | NSSRC 에 4E564D65h → 모든 컨트롤러 CLR, PMR 비활성, transport 별 동작 |
+| 1.4c §7.3.1 (p.293) | 위 + **모든 PCIe 포트가 Detect LTSSM 으로** = 링크 다운 |
+| PCIe 5.0 §2.9.1 (p.206) | Upstream Port DL_Down = 리셋 → BAR·Command 포함 PCIe 레지스터 초기화 |
+| PCIe 5.0 §6.6.1 (p.553) | 설정 요청은 링크 학습 완료 뒤, 장치는 리셋 뒤 1.0s 안에 정상 완료해야 함 |
+| Base 2.3 §3.7.2 (p.120) | CLR 뒤 호스트: transport 상태 갱신 → CC.EN=1 → RDY 대기 → admin/I/O 큐 |
+| Base 2.3 Fig.42 (p.88) | 전원 인가 중 NSSR 이면 CSTS.NSSRO 초기값 1 |
+| Base 2.3 §9.5 (p.743) | NSSR 은 링크 다운을 일으킬 수 있고 호스트에 따라 위험 |
+
+실행 순서(모든 sysfs 쓰기·BAR0 접근은 한도가 있는 자식 프로세스):
+
+1. `drivers_autoprobe=0`, 드라이버 unbind — 드라이버 개입과 재열거 뒤 자동 probe(=NSSRO 클리어) 차단.
+   unbind 는 드라이버 정상 종료(CC.SHN)를 보내므로 NSSR 은 **I/O 가 없는 상태**에서 나간다
+2. 메모리 디코드 켬(unbind 뒤 꺼질 수 있음) → BAR0 NSSR 쓰기 — 남아 있던 NSSRO 를 먼저
+   지우고(RW1C) 4E564D65h. **이 순간이 t0**
+3. 링크 다운(DLLLA 0, 최대 1s 관측) → 장치 remove(이전 설정 상태 폐기) → 링크 업 대기
+4. `pci_rescan_wait` 과 같은 rescan 반복 — 설정 공간(BAR) 복원
+5. 메모리 디코드를 잠깐 켜고 CSTS 읽기: **NSSRO=1, CFS=0** 이어야 함.
+   NSSRO=0 은 `[장치 측] NSSR 스펙 위반`, CFS=1·읽기 실패도 장치 측 불량
+6. autoprobe 복원, `drivers_probe` → 드라이버가 CC.EN→RDY→live. 이후는 다른 profile 과 같은
+   RDY/타이밍/Identify/환경 복원
+
+NSSR 을 쓰기 전에 실패하면 드라이버를 다시 붙인다. 쓴 뒤 실패하면 현상 보존(장치를 그대로 둠).
+`drivers_autoprobe` 는 어느 경우든 원래 값으로 돌린다(호스트 전역 설정이므로).
 Hot reset도 여러 DUT/기능으로 영향을 넓히지 않는다. PCI remove/rescan을 reset 자체로
 이름 붙이지 않으며 실제 PMU/PCI reset 동작과 host 재인식을 별도 단계로 기록한다.
 
@@ -555,17 +587,25 @@ v11 전송·calibration·종료·복구 테스트는 v11 모듈을 직접 검사
     [check] 환경 복원·샘플러 재연결 OK
     → PASS  (2.3s)
   [2/7] nssr               지원: 가능
-    [step 1/1] nssr : nvme subsystem-reset /dev/nvme0
-      완료 (0.1s)
-    [ready]   0.0s  driver=resetting (live 아님)
-    [ready]  30.0s  한도 초과 — driver=resetting (live 아님)
-    → FAIL — 현상 보존  (30.1s)
-      원인: 준비 시간 초과(30s): driver=resetting (live 아님) [gate=driver_not_live]
+    [step 1/1] nssr : NVM Subsystem Reset (unbind → BAR0 NSSR → remove/rescan → NSSRO 확인 → probe)
+      · PCI 자동 probe 끔 — echo 0 > /sys/bus/pci/drivers_autoprobe
+      · 드라이버 unbind — echo 0000:02:00.0 > /sys/bus/pci/drivers/nvme/unbind
+      · 메모리 디코드 켬 — echo 1 > /sys/bus/pci/devices/0000:02:00.0/enable
+      · BAR0 NSSR ← 4E564D65h
+      · 장치 remove — echo 1 > /sys/bus/pci/devices/0000:02:00.0/remove
+      · PCI rescan 반복 — echo 1 > /sys/bus/pci/rescan
+      DUT 발견 — rescan 3회 (0.05s)
+      · 메모리 디코드 켬 — echo 1 > /sys/bus/pci/devices/0000:02:00.0/enable
+      · 메모리 디코드 끔 — echo 0 > /sys/bus/pci/devices/0000:02:00.0/enable
+      NSSR 확인: CSTS=0x00000000 NSSRO=0 CFS=0 ✗ — 링크 다운 +2ms · 링크 업 +180ms
+      · PCI 자동 probe 복원 — echo 1 > /sys/bus/pci/drivers_autoprobe
+    → FAIL — 현상 보존  (0.6s)
+      원인: [장치 측] NSSR 스펙 위반: 전원 인가 중 NSSR 인데 CSTS.NSSRO=0 (CSTS=0x00000000, Base 2.3 Fig.42)
 ============================================================
 [Exception-Preflight] 결과 요약
   Profile            결과          시간  사유
   controller_reset   PASS          2.3s  RDY·identity·Identify·환경 복원·샘플러 확인
-  nssr               FAIL         30.1s  준비 시간 초과(30s): driver=resetting …
+  nssr               FAIL          0.6s  [장치 측] NSSR 스펙 위반: 전원 인가 중 NSSR 인데 …
   flr                미실행              앞 profile 실패로 중단
 [Exception-Preflight] 통과 1/2 — 실패로 캠페인 중단 (복구 POR/리셋 없음, 현상 보존)
 ============================================================
@@ -622,7 +662,7 @@ Write/WriteUncorrectable/WriteZeroes 에 전용 timeout 그룹 `write` 를 만�
 | admin 가능 | 원래 serial+BDF 컨트롤러의 sysfs state 가 live 로 바뀐 순간 |
 | I/O 가능 | 네임스페이스 `nvme read` 1블록이 **완료된** 순간 — 성공이든 NVMe 오류 상태든(퍼징이 LBA 0 에 WriteUncorrectable 을 했으면 읽기 오류가 정상 결과). 응답 없음·ioctl 오류는 미완료. npo/spo 만 |
 
-- 기준(t0): `controller_reset`/`nssr`/`flr`/`hot_reset` 은 **시작** 시각, 전원 ON·PERST 해제는 **반환** 시각
+- 기준(t0): `controller_reset`/`flr`/`hot_reset` 은 **시작** 시각, `nssr` 은 unbind 뒤 **NSSR 쓰기** 시각, 전원 ON·PERST 해제는 **반환** 시각
 - 전환(0→1)만 기록한다 — 이벤트 전부터 켜져 있던 비트를 복귀로 보지 않는다. 자식이 새로 매핑한
   직후의 첫 값도 전환으로 치지 않는다(언제 켜졌는지 모름)
 - **복귀 주기**: 리셋·전원 ON·PERST 해제마다 새 주기를 열고 이전 기록은 이력으로 넘긴다.
@@ -636,10 +676,10 @@ Write/WriteUncorrectable/WriteZeroes 에 전용 timeout 그룹 `write` 를 만�
 **판정** — 스펙을 넘어도 곧바로 끊지 않고 `스펙 + overrun_wait_sec`까지 복귀를 끝까지 잰 뒤,
 하나라도 초과·미완료면 `복귀 스펙 위반: [장치 측|호스트 측 …] …` 로 **불량 루틴**(현상 보존·덤프·중단)을 탄다.
 
-nssr 처럼 장치는 링크·설정까지 돌아왔는데 드라이버가 컨트롤러를 다시 켜지 않은 경우의 표시:
+장치는 링크·설정까지 돌아왔는데 드라이버가 컨트롤러를 다시 켜지 않은 경우의 표시:
 
 ```
-    [timing] 기준: nssr 시작  →  링크 다운 +0ms · 링크 업 +210ms · 설정 완료 +260ms
+    [timing] 기준: hot_reset 시작  →  링크 다운 +0ms · 링크 업 +210ms · 설정 완료 +260ms
     [timing] 설정 요청 완료 after TS        50ms / 스펙   200ms  OK
     [timing] CC.EN→RDY                         - / 스펙   100ms  ✗ 미완료  (호스트 측 — 드라이버가 CC.EN 을 다시 켜지 않음)
 ```
