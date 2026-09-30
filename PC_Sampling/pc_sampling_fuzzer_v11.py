@@ -20154,26 +20154,137 @@ def _pcie_cap_offset(cfg):
     return None
 
 
-class RecoveryMonitor:
-    """복귀 구간의 **첫 발생 시각**을 기록하는 관측 스레드. 읽기만 한다.
+# BAR0 관측은 **별도 프로세스**에서 한다. 장치 remove 와 mmap 읽기 사이의 경쟁에서 커널이
+#   SIGBUS 를 보낼 수 있는데, 퍼저 본체에서 나면 except 로 못 잡고 덤프·정리 없이 죽는다.
+#   fork 가 아니라 새 인터프리터를 띄운다(퍼저의 os.fork 는 호스트 재부팅 이력이 있다).
+#   자식은 장치 파일이 사라지면 매핑을 풀고 다시 나타나면 스스로 매핑한다. 값이 바뀔 때만
+#   'R <monotonic> <cc> <csts>', 매핑/해제 때 'M <t>' / 'U <t>' 를 쓴다(시계는 같은 CLOCK_MONOTONIC).
+_BAR_READER = r"""
+import mmap, os, sys, time
+path, period = sys.argv[1], float(sys.argv[2])
+out = sys.stdout
+def say(line):
+    out.write(line + '\n'); out.flush()
+while True:
+    if not os.path.exists(path):
+        time.sleep(period); continue
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        mm = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ)
+    except (OSError, ValueError):
+        if fd is not None:
+            os.close(fd)                         # 매핑 실패에도 fd 는 닫는다(재시도마다 누수 방지)
+        time.sleep(period); continue
+    mv = memoryview(mm).cast('I')
+    say('M %.6f' % time.monotonic())
+    last = None
+    while os.path.exists(path):
+        cur = (mv[5], mv[7])                     # CC(0x14), CSTS(0x1C) — 32비트 읽기
+        if cur != last:
+            say('R %.6f %d %d' % (time.monotonic(), cur[0], cur[1]))
+            last = cur
+        time.sleep(period)
+    mv.release(); mm.close(); os.close(fd)
+    say('U %.6f' % time.monotonic())
+"""
 
-    marks: link_down / link_up / cfg_ok / cc_en / rdy / live — 모두 monitor 시작 이후 기준.
-    전환(0→1)으로만 기록한다 — 이벤트 전부터 켜져 있던 비트를 복귀로 오인하지 않기 위해.
+
+class BarWatcher:
+    """BAR0 읽기 자식 프로세스 관리. poll() → [(kind, t, cc, csts)] (kind: M/U/R/X).
+
+    자식이 죽으면(SIGBUS 등) 'X' 이벤트로 알리고 50ms 뒤 다시 띄운다 — 관측 공백일 뿐
+    장치 실패가 아니다. 퍼저 본체는 영향을 받지 않는다."""
+
+    def __init__(self, path, period=0.0005):
+        self.path, self.period = str(path), period
+        self.proc, self._buf, self._next_spawn = None, b'', 0.0
+        self.deaths = []
+
+    def _spawn(self):
+        self.proc = subprocess.Popen([sys.executable, '-c', _BAR_READER, self.path, str(self.period)],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     stdin=subprocess.DEVNULL)
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        self._buf = b''
+
+    def poll(self):
+        out = []
+        if self.proc is None:
+            if time.monotonic() >= self._next_spawn:
+                self._spawn()
+            return out
+        try:
+            while True:
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                self._buf += chunk
+        except BlockingIOError:
+            pass
+        except OSError:
+            pass
+        *lines, self._buf = self._buf.split(b'\n')
+        for line in lines:
+            f = line.split()
+            try:
+                if f[0] == b'R' and len(f) == 4:
+                    out.append(('R', float(f[1]), int(f[2]), int(f[3])))
+                elif f[0] in (b'M', b'U') and len(f) == 2:
+                    out.append((f[0].decode(), float(f[1]), None, None))
+            except (ValueError, IndexError):
+                continue
+        rc = self.proc.poll()
+        if rc is not None:
+            self.deaths.append(rc)
+            out.append(('X', time.monotonic(), rc, None))
+            try:
+                self.proc.stdout.close()
+            except OSError:
+                pass
+            self.proc = None
+            self._next_spawn = time.monotonic() + 0.05
+        return out
+
+    def close(self):
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=1)
+            except Exception:
+                pass
+            try:
+                self.proc.stdout.close()
+            except Exception:
+                pass
+            self.proc = None
+
+
+class RecoveryMonitor:
+    """복귀 구간의 전환 시각을 **복귀 주기 단위로** 기록하는 관측 스레드. 읽기만 한다.
+
+    marks(현재 주기): link_down / link_up / cfg_ok / cc_en / rdy / live — 0→1 전환만 기록.
+    begin_cycle(t): 리셋·전원 ON·PERST 해제마다 새 주기를 연다. 이전 주기 기록은 history 로
+      넘기고, '낮음' 플래그를 **현재 상태**에서 다시 잡는다 — 반복 profile 에서 첫 복귀 시각으로
+      뒤 복귀를 판정하던 문제를 막는다.
+    status(): 지금 조건이 만족되는지(전환 시각을 못 봤어도 복귀 여부는 판단할 수 있게).
     """
 
     def __init__(self, bdf, root_bdf, serial, clock=time.monotonic,
-                 pci=_PCI_DEVICES, nvme=_NVME_CLASS, period=0.001):
+                 pci=_PCI_DEVICES, nvme=_NVME_CLASS, period=0.001, bar=None):
         self.bdf, self.root_bdf, self.serial = bdf, root_bdf, serial
         self.clock, self.pci, self.nvme, self.period = clock, Path(pci), Path(nvme), period
-        self.marks = {}
-        self._link_ever_down = False
-        self._cfg_bad = False
-        self._en_low = False
-        self._not_live = False
+        self.bar = bar if bar is not None else BarWatcher(self.pci / bdf / 'resource0')
+        self.marks, self.history, self.gaps = {}, [], []
+        self._lock = threading.RLock()
         self._root_cap = None
-        self._ctrl = None
-        self._ctrl_checked = -1.0
-        self._mm = self._mv = self._fd = None
+        self._ctrl, self._ctrl_checked, self._ctrl_missing = None, -1.0, False
+        # 현재 상태(None = 모름)
+        self._link = self._cfg = self._en = self._rdy = self._live = None
+        self._fresh_map = False                  # 새 매핑 직후 첫 값은 전환으로 치지 않는다
+        self._cycle_t = float('-inf')            # 현재 복귀 주기 시작 시각
+        # 낮음 관측 플래그(이번 주기)
+        self._link_low = self._cfg_low = self._en_low = self._rdy_low = self._live_low = False
         self._thread = None
         self._stop = threading.Event()
 
@@ -20186,7 +20297,6 @@ class RecoveryMonitor:
             return None
 
     def _dllla(self):
-        """루트 포트 Link Status.DLLLA(bit 13). 루트 포트를 못 읽으면 None."""
         if not self.root_bdf:
             return None
         cfg = self._read(self.pci / self.root_bdf / 'config', 256)
@@ -20195,110 +20305,116 @@ class RecoveryMonitor:
         if self._root_cap is None:
             self._root_cap = _pcie_cap_offset(cfg)
             if self._root_cap is None:
-                self.root_bdf = None       # PCIe 루트 포트가 아니면 링크 측정 포기
+                self.root_bdf = None
                 return None
         off = self._root_cap + 0x12
         if off + 2 > len(cfg):
             return None
         return bool(int.from_bytes(cfg[off:off + 2], 'little') & (1 << 13))
 
-    def _vendor(self):
+    def _vendor_ok(self):
         cfg = self._read(self.pci / self.bdf / 'config', 2)
-        return int.from_bytes(cfg, 'little') if cfg and len(cfg) == 2 else None
-
-    def _close_bar(self):
-        for obj in (self._mv, self._mm):
-            try:
-                if obj is not None:
-                    obj.release() if hasattr(obj, 'release') else obj.close()
-            except Exception:
-                pass
-        if self._fd is not None:
-            try:
-                os.close(self._fd)
-            except OSError:
-                pass
-        self._mm = self._mv = self._fd = None
-
-    def _regs(self):
-        """(CC, CSTS). BAR0 를 읽기 전용 mmap — 장치가 사라지면 매핑을 닫는다."""
-        import mmap
-        res = self.pci / self.bdf / 'resource0'
-        if not res.exists():
-            self._close_bar()
-            return None
-        if self._mv is None:
-            try:
-                self._fd = os.open(res, os.O_RDONLY)
-                self._mm = mmap.mmap(self._fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ)
-                self._mv = memoryview(self._mm).cast('I')     # 32비트 단위 읽기
-            except Exception:
-                self._close_bar()
-                return None
-        try:
-            return self._mv[0x14 // 4], self._mv[0x1C // 4]
-        except Exception:
-            self._close_bar()
-            return None
+        return bool(cfg and len(cfg) == 2 and int.from_bytes(cfg, 'little') not in (0xFFFF, 0))
 
     def _state(self, now):
-        """원래 serial+BDF 의 컨트롤러 state. 노드가 바뀌어도 따라간다."""
         if self._ctrl is not None:
             st = self._read(self._ctrl / 'state', 32)
             if st is not None:
                 return st.decode(errors='replace').strip()
             self._ctrl = None
-        if now - self._ctrl_checked < 0.02:        # glob 은 20ms 에 한 번만
+        if now - self._ctrl_checked < 0.02:
             return None
         self._ctrl_checked = now
         for c in self.nvme.glob('nvme[0-9]*'):
             try:
                 if ((c / 'address').read_text().strip() == self.bdf
                         and (c / 'serial').read_text().strip() == self.serial):
-                    self._ctrl = c
+                    self._ctrl, self._ctrl_missing = c, False
                     return (c / 'state').read_text().strip()
             except OSError:
                 continue
+        self._ctrl_missing = True                       # 컨트롤러 노드 없음 = 아직 live 아님
         return None
 
-    # ── 한 번 관측 ──
+    # ── 전환 기록 ──
+    def _edge(self, name, value, t, low_attr, allow=True):
+        """value(True/False) 로 '낮음' 을 기록하고, 낮음을 본 뒤의 첫 True 를 mark 로 남긴다."""
+        if value is False:
+            setattr(self, low_attr, True)
+        elif value and getattr(self, low_attr) and allow:
+            self.marks.setdefault(name, t)
+
+    def _on_regs(self, kind, t, cc, csts):
+        if kind in ('U', 'X'):
+            self._en = self._rdy = None
+            if kind == 'X':
+                self.gaps.append(('reader_died', t, cc))
+            return
+        if kind == 'M':
+            self._fresh_map = True
+            return
+        valid = cc != 0xFFFFFFFF and csts != 0xFFFFFFFF
+        en = bool(cc & 1) if valid else None
+        rdy = bool(csts & 1) if valid else None
+        allow = not self._fresh_map               # 매핑 직후 첫 값: 상태만 갱신, 전환 아님
+        self._fresh_map = False
+        self._en, self._rdy = en, rdy
+        if t < self._cycle_t:
+            # 파이프에 남아 있다가 늦게 도착한 **이전 주기** 이벤트 — 상태만 따라가고 전환 기록은
+            #   하지 않는다. '낮음' 플래그는 begin_cycle 과 같은 규칙(그 시점 상태)으로 맞춘다.
+            if en is not None:
+                self._en_low = en is not True
+            if rdy is not None:
+                self._rdy_low = rdy is not True
+            return
+        if en is not None:
+            self._edge('cc_en', en, t, '_en_low', allow)
+        if rdy is not None:
+            self._edge('rdy', rdy, t, '_rdy_low', allow)
+
     def sample(self):
-        now, m = self.clock(), self.marks
-        dl = self._dllla()
-        if dl is False:
-            self._link_ever_down = True
-            m.setdefault('link_down', now)
-        elif dl and self._link_ever_down:
-            m.setdefault('link_up', now)
-        vid = self._vendor()
-        if vid is None or vid == 0xFFFF:
-            self._cfg_bad = True
-        elif self._cfg_bad or 'link_up' in m:
-            m.setdefault('cfg_ok', now)
-        regs = self._regs()
-        if regs and regs[0] != 0xFFFFFFFF:
-            cc, csts = regs
-            if not cc & 1:
-                self._en_low = True
-            elif self._en_low:
-                m.setdefault('cc_en', now)
-                if csts & 1 and csts != 0xFFFFFFFF:
-                    m.setdefault('rdy', now)
-        st = self._state(now)
-        if st != 'live':
-            if st is not None or self._ctrl is None:
-                self._not_live = True
-        elif self._not_live:
-            m.setdefault('live', now)
+        with self._lock:
+            now = self.clock()
+            dl = self._dllla()
+            if dl is not None:
+                self._link = dl
+                if dl is False:
+                    self.marks.setdefault('link_down', now)
+                self._edge('link_up', dl, now, '_link_low')
+            ok = self._vendor_ok()
+            self._cfg = ok
+            self._edge('cfg_ok', ok, now, '_cfg_low')
+            for ev in self.bar.poll():
+                self._on_regs(*ev)
+            st = self._state(now)
+            live = (st == 'live') if st is not None else (False if self._ctrl_missing else None)
+            if live is not None:
+                self._live = live
+                self._edge('live', live, now, '_live_low')
+
+    def begin_cycle(self, t):
+        """새 복귀 주기. '낮음' 플래그는 지금 상태에서 다시 잡는다(이후 0→1 만 기록)."""
+        with self._lock:
+            if self.marks:
+                self.history.append(dict(self.marks))
+            self.marks = {}
+            self._cycle_t = t
+            self._link_low = self._link is False
+            if self._link is False:
+                self.marks['link_down'] = t             # 이미 내려가 있는 링크
+            self._cfg_low = self._cfg is False
+            self._en_low = self._en is not True
+            self._rdy_low = self._rdy is not True
+            self._live_low = self._live is not True
+
+    def status(self):
+        with self._lock:
+            return dict(link_up=self._link, cfg_ok=self._cfg, cc_en=self._en,
+                        rdy=self._rdy, live=self._live)
 
     def snapshot(self):
-        """관측 스레드가 쓰는 중에도 안전한 사본."""
-        for _ in range(10):
-            try:
-                return dict(self.marks)
-            except RuntimeError:                      # 복사 중 크기 변경
-                continue
-        return {}
+        with self._lock:
+            return dict(self.marks)
 
     # ── 스레드 ──
     def _loop(self):
@@ -20306,7 +20422,7 @@ class RecoveryMonitor:
             try:
                 self.sample()
             except Exception:
-                pass                                  # 관측 실패가 이벤트를 막지 않는다
+                pass
             self._stop.wait(self.period)
 
     def start(self):
@@ -20318,7 +20434,10 @@ class RecoveryMonitor:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
-        self._close_bar()
+        try:
+            self.bar.close()
+        except Exception:
+            pass
 
 
 class CommandRunner:
@@ -20553,18 +20672,24 @@ class ExceptionController:
 
     _MARK_TEXT = (('link_down', '링크 다운'), ('link_up', '링크 업'), ('cfg_ok', '설정 완료'),
                   ('cc_en', 'CC.EN'), ('rdy', 'RDY'), ('live', 'live'), ('io', 'I/O'))
-    _VERDICT_TEXT = {'OK': 'OK', 'OVER': '✗ 초과', 'MISSING': '✗ 미완료', 'N/A': '측정 불가'}
+    _VERDICT_TEXT = {'OK': 'OK', 'OVER': '✗ 초과', 'MISSING': '✗ 미완료', 'N/A': '측정 불가(전환 미관측, 복귀는 됨)'}
 
     def _show_timing(self, r):
         marks = r.get('marks') or {}
         seq = ' · '.join(f"{name} +{_fmt_dur(marks[k])}" for k, name in self._MARK_TEXT if k in marks)
-        self._line(f"    [timing] 기준: {r.get('t0_what')}  →  {seq or '관측 없음'}")
+        cyc = f" (복귀 {r.get('cycles')}회 중 마지막)" if (r.get('cycles') or 0) > 1 else ""
+        self._line(f"    [timing] 기준: {r.get('t0_what')}{cyc}  →  {seq or '관측 없음'}")
         for row in r.get('rows') or []:
             meas = _fmt_dur(row.get('measured')) if row.get('measured') is not None else '-'
+            tail = f"  ({row['side']})" if row.get('side') else ""
             self._line(f"    [timing] {self._pad(row['label'], 26)} {self._pad(meas, 8, True)} / "
                        f"스펙 {self._pad(_fmt_dur(row['spec']), 7, True)}  "
-                       f"{self._VERDICT_TEXT.get(row['verdict'], row['verdict'])}",
+                       f"{self._VERDICT_TEXT.get(row['verdict'], row['verdict'])}{tail}",
                        error=row['verdict'] in ('OVER', 'MISSING'))
+        if r.get('io_status'):
+            self._line(f"    [timing] I/O 확인: {r['io_status']}")
+        if r.get('reader_gaps'):
+            self._line(f"    [timing] ⚠ BAR 관측 프로세스 재시작 {r['reader_gaps']}회 — 해당 구간은 관측 공백")
 
     def _show_capture(self, r):
         self._say(f"[Exception] 증거 폴더: {r.get('directory')}")
@@ -20908,15 +21033,20 @@ class ExceptionController:
     # 복귀 스펙이 붙는 동작: 이 동작 **시작** 시각이 기준(t0)인 것 / **반환** 시각이 기준인 것
     _T0_AT_START = ('controller_reset', 'nssr', 'flr', 'hot_reset')
 
+    def _new_monitor(self):
+        return RecoveryMonitor(self.bdf, self.root_bdf, self.serial, clock=self.clock)
+
     def _run_profile_timed(self, profile):
         """제품 exception_timing 이 있을 때의 실행: 관측 스레드를 켠 채 단계를 돌리고, 끝나면
-        구간별로 스펙과 비교한다. 스펙을 넘어도 overrun_wait 까지 **실제 복귀 시간을 끝까지
-        잰 뒤** 불량(ExceptionFailure)으로 보고한다 — 불량 루틴은 호출부가 탄다."""
+        **마지막 복귀 주기**를 구간별로 스펙과 비교한다. 리셋·전원 ON·PERST 해제마다 새 주기를
+        연다(반복 profile 의 앞 복귀 시각으로 뒤 복귀를 판정하지 않는다). 스펙을 넘어도
+        overrun_wait 까지 실제 복귀 시간을 끝까지 잰 뒤 불량(ExceptionFailure)으로 보고한다."""
         spec = self.timing
         adapters = self.options.get('adapters', {})
         deadline = self.clock() + profile.timeout_sec
-        mon = RecoveryMonitor(self.bdf, self.root_bdf, self.serial, clock=self.clock).start()
+        mon = self._new_monitor().start()
         t0 = t0_what = None
+        cycles = 0
         try:
             for index, (action, hold) in enumerate(profile.steps):
                 if self.clock() >= deadline:
@@ -20928,13 +21058,17 @@ class ExceptionController:
                 if effect in ('power_off', 'assert'):
                     t0 = t0_what = None                   # 새 OFF/assert 구간 — 기준 다시 잡음
                 started = self.clock()
+                if action in self._T0_AT_START:           # 리셋 시작 전에 주기를 연다
+                    mon.begin_cycle(started)
+                    t0, t0_what = started, f'{action} 시작'
+                    cycles += 1
                 # rescan 반복은 복귀 측정의 일부 — 스펙+초과 측정 시간까지 기다린다.
                 self._action(action, (t0 + self._timing_budget(profile) + spec.overrun_wait)
                              if action == 'pci_rescan_wait' and t0 is not None else deadline)
-                if action in self._T0_AT_START:
-                    t0, t0_what = started, f'{action} 시작'
-                elif effect in ('power_on', 'deassert'):
+                if action not in self._T0_AT_START and effect in ('power_on', 'deassert'):
                     t0, t0_what = self.clock(), f'{action} 반환'
+                    mon.begin_cycle(t0)
+                    cycles += 1
                 self.emit('step_end', index=index, action=action, hold=hold)
                 if hold:
                     if self.clock() + hold > deadline:
@@ -20942,9 +21076,10 @@ class ExceptionController:
                     time.sleep(hold)
             if t0 is None:
                 t0, t0_what = self.clock(), '마지막 단계 반환'
+                mon.begin_cycle(t0)
             if self.last_result is not None:
                 self.last_result['stage'] = 'ready_after_profile'
-            self._timing_wait(profile, mon, t0, t0_what)
+            self._timing_wait(profile, mon, t0, t0_what, cycles)
         finally:
             mon.stop()
 
@@ -20962,17 +21097,61 @@ class ExceptionController:
             segs.append(('io_ready', '전원 ON→I/O 가능 (SPO)', 't0', 'io', spec.spo_io_ready))
         return segs
 
+    # 초과(OVER)일 때 그 구간 시간에 누가 들어가는가
+    _OVER_SIDE = {'cfg_after_ts': '장치 측', 'en_to_rdy': '장치 측',
+                  'rdy_to_admin': '장치+호스트 측(커널 초기화 포함)',
+                  'io_ready': '장치+호스트 측'}
+
+    def _missing_side(self, key, marks, st, io_status):
+        """끝나지 않은 구간에서 **누가 멈춰 있었나**. 앞 단계가 끝났는데 다음이 안 오면 그 다음의
+        주체다: 링크/설정/RDY 는 장치, CC.EN 을 켜는 것과 live 로 올리는 것은 호스트 드라이버."""
+        present = st.get('cfg_ok') or 'cfg_ok' in marks or st.get('link_up')
+        if key == 'cfg_after_ts':
+            if 'link_up' not in marks and not st.get('link_up'):
+                return '장치 측 — 링크가 돌아오지 않음'
+            return '장치 측 — 설정 요청이 완료되지 않음'
+        if key == 'en_to_rdy':
+            if not present:
+                return '장치 측 — 장치가 버스에 돌아오지 않음'
+            if 'cc_en' not in marks and not st.get('cc_en'):
+                return '호스트 측 — 드라이버가 CC.EN 을 다시 켜지 않음'
+            return '장치 측 — CC.EN 이후 RDY 가 서지 않음'
+        if key == 'rdy_to_admin':
+            if 'rdy' in marks or st.get('rdy'):
+                return '호스트 측 — RDY 이후 드라이버 초기화(live)가 끝나지 않음'
+            return self._missing_side('en_to_rdy', marks, st, io_status)
+        if key == 'io_ready':
+            if 'live' in marks or st.get('live'):
+                return f"장치 측 — I/O 명령이 완료되지 않음 ({io_status or '응답 없음'})"
+            return self._missing_side('rdy_to_admin', marks, st, io_status)
+        return '알 수 없음'
+
+    def _lba_size(self, ns):
+        try:
+            return int((Path('/sys/block') / Path(ns).name / 'queue' / 'logical_block_size').read_text())
+        except (OSError, ValueError):
+            return 4096
+
     def _io_probe(self, deadline):
-        """I/O 서비스 가능 시각: 네임스페이스에서 4KiB direct read 1회가 성공한 순간."""
+        """I/O 서비스 가능 시각: 네임스페이스 Read 1블록이 **완료된** 순간(성공이든 NVMe 오류
+        상태든). 퍼징이 그 영역에 WriteUncorrectable 을 했으면 읽기 오류가 정상 결과다 —
+        완료된 오류와 '응답 없음'을 구분한다. → (시각, 설명) 또는 (None, 마지막 설명)."""
         ns = f'{self.device}n{self.namespace}'
-        argv = ['dd', f'if={ns}', 'of=/dev/null', 'bs=4096', 'count=1', 'iflag=direct', 'status=none']
+        last = '네임스페이스 노드 없음'
         while self.clock() < deadline:
             if Path(ns).exists():
-                rc, _, _ = self.runner.run(argv, deadline)
+                argv = ['nvme', 'read', ns, '--start-block=0', '--block-count=0',
+                        f'--data-size={self._lba_size(ns)}', '--data=/dev/null']
+                rc, out, err = self.runner.run(argv, deadline)
+                text = (out + err).decode(errors='replace')
                 if rc == 0:
-                    return self.clock()
+                    return self.clock(), '읽기 성공'
+                m = re.search(r'NVMe status:?\s*([^\n]+)', text)
+                if m:                                   # 장치가 상태를 돌려줬다 = I/O 서비스 가능
+                    return self.clock(), f'오류 상태로 완료: {m.group(1).strip()[:80]}'
+                last = f'rc={rc} {text.strip().splitlines()[-1][:80] if text.strip() else ""}'.strip()
             time.sleep(0.005)
-        return None
+        return None, last
 
     def _timing_budget(self, profile):
         spec = self.timing
@@ -20980,47 +21159,63 @@ class ExceptionController:
                 spec.spo_io_ready if profile.timing == 'spo' else
                 spec.cfg_after_ts + spec.en_to_rdy + spec.rdy_to_admin)
 
-    def _timing_wait(self, profile, mon, t0, t0_what):
+    def _timing_wait(self, profile, mon, t0, t0_what, cycles=1):
         spec = self.timing
         io_needed = profile.timing in ('npo', 'spo')
         hard = t0 + self._timing_budget(profile) + spec.overrun_wait   # 스펙 + 초과 측정 시간
         self._ready_deadline = hard
-        # 1) 커널 live 까지(관측 스레드가 시각을 찍는다)
-        while 'live' not in mon.marks and self.clock() < hard:
+        # 1) 커널 live 까지 — 전환 시각이 찍히거나, 지금 live 이면 된다
+        while ('live' not in mon.snapshot() and not mon.status().get('live')
+               and self.clock() < hard):
             time.sleep(0.005)
-        marks = mon.snapshot()
-        # 2) 원래 DUT 인지·CSTS 확인(이미 live 라 곧 끝난다)
-        if 'live' in marks:
+        live_now = 'live' in mon.snapshot() or bool(mon.status().get('live'))
+        # 2) 원래 DUT 인지·CSTS 확인(이미 live 라 곧 끝난다). 여기서 통과하면 RDY·live 는
+        #   **직접 확인된 복귀**다 — BAR 관측 자식이 죽어 관측 상태가 비어 있어도 불량이 아니다.
+        confirmed = False
+        if live_now:
             self.wait_ready(hard)
+            confirmed = True
         # 3) I/O 서비스 가능
-        io_t = self._io_probe(hard) if (io_needed and 'live' in marks) else None
-        marks = mon.snapshot()
+        io_t, io_status = (self._io_probe(hard) if (io_needed and live_now) else (None, None))
+        marks, st = mon.snapshot(), mon.status()
         marks['t0'] = t0
         if io_t is not None:
             marks['io'] = io_t
+        end_ok = {'cfg_ok': st.get('cfg_ok') or confirmed, 'rdy': st.get('rdy') or confirmed,
+                  'live': st.get('live') or confirmed, 'io': io_t is not None}
         rows, bad = [], []
         for key, label, a, b, limit in self._timing_segments(profile, marks):
-            if b not in marks:
-                verdict, measured = 'MISSING', None
-            elif a not in marks:
-                verdict, measured = 'N/A', None       # 시작 전환을 못 봄 — 측정 불가(불량 아님)
-            else:
+            side = None
+            if b in marks and a in marks:
                 measured = marks[b] - marks[a]
                 verdict = 'OK' if measured <= limit else 'OVER'
-            rows.append(dict(key=key, label=label, measured=measured, spec=limit, verdict=verdict))
+                if verdict == 'OVER':
+                    side = self._OVER_SIDE.get(key)
+            elif b in marks or end_ok.get(b):
+                # 끝은 왔다(전환 시각이 있거나 지금 만족) — 시작/끝 전환을 못 봤을 뿐 복귀는 됐다
+                measured, verdict = None, 'N/A'
+            else:
+                measured, verdict = None, 'MISSING'
+                side = self._missing_side(key, marks, st, io_status)
+            rows.append(dict(key=key, label=label, measured=measured, spec=limit,
+                             verdict=verdict, side=side))
             if verdict in ('OVER', 'MISSING'):
                 bad.append(rows[-1])
         self.emit('timing', profile=profile.name, kind=profile.timing, t0_what=t0_what,
-                  marks={k: round(v - t0, 4) for k, v in marks.items()}, rows=rows,
+                  cycles=cycles, marks={k: round(v - t0, 4) for k, v in marks.items()},
+                  status=st, rows=rows, io_status=io_status, reader_gaps=len(mon.gaps),
+                  history=[{k: round(v - t0, 4) for k, v in h.items()} for h in mon.history],
                   overrun_wait_sec=spec.overrun_wait)
         if bad:
             parts = []
             for r in bad:
                 if r['verdict'] == 'MISSING':
-                    parts.append(f"{r['label']} — {spec.overrun_wait:g}s 추가 대기에도 미완료")
+                    parts.append(f"[{r['side']}] {r['label']} — 스펙 {_fmt_dur(r['spec'])} + "
+                                 f"{spec.overrun_wait:g}s 추가 대기에도 미완료")
                 else:
-                    parts.append(f"{r['label']} {_fmt_dur(r['measured'])} > 스펙 {_fmt_dur(r['spec'])}")
-            raise ExceptionFailure('복귀 스펙 초과: ' + '; '.join(parts))
+                    parts.append(f"[{r['side']}] {r['label']} {_fmt_dur(r['measured'])} > "
+                                 f"스펙 {_fmt_dur(r['spec'])}")
+            raise ExceptionFailure('복귀 스펙 위반: ' + '; '.join(parts))
 
     def restore_nvme_environment(self):
         """After RDY only: fresh support/feature reads, bounded writes and readback.

@@ -2402,6 +2402,14 @@
         "selftest_ext": 900000,
         "verify": 20000
       },
+      "exception_timing": {
+        "cfg_after_ts_ms": 100,
+        "en_to_rdy_ms": 10000,
+        "rdy_to_admin_ms": 10000,
+        "npo_io_ready_ms": 10000,
+        "spo_io_ready_ms": 10000,
+        "overrun_wait_sec": 60
+      },
       "interface": "jtag",
       "openocd_config": "products/BM9H1/openocd.cfg",
       "jlink_device": "Cortex-R8",
