@@ -159,7 +159,7 @@ v10.3 진입점은 exceptions를 사용하지 않는다. v11 출력은 `output/p
 | 이름 | 동작 / 지원 판단 |
 |---|---|
 | controller_reset | `nvme reset`, RDY/정상 재개 확인 |
-| nssr | CAP.NSSRS 확인, 같은 subsystem NQN에 컨트롤러 하나만 보이고 루트 포트 DLLLA를 읽을 수 있는 경우. unbind → BAR0 NSSR 쓰기 → 링크 다운·remove·링크 업 → rescan → CSTS.NSSRO 확인 → 드라이버 probe (아래 **NSSR 절차**) |
+| nssr | CAP.NSSRS 확인, 같은 subsystem NQN에 컨트롤러 하나만 보이고 루트 포트 DLLLA를 읽을 수 있는 경우. unbind → 설정 공간 저장 → BAR0 NSSR 쓰기 → 링크 다운·업·설정 응답 → 설정 공간 복원 → CSTS.NSSRO 확인 → 드라이버 probe (아래 **NSSR 절차**) |
 | flr | sysfs reset_method에 정확히 flr이 있을 때 실행 |
 | hot_reset | 정확히 bus 방식이 있고 같은 부모 버스 범위에 DUT 외 PCI 기능이 없을 때 실행 |
 | warm_reset_perst | PERST assert → host remove → release → 기존 rescan 대기 → rescan. 주전원/REFCLK 조작 없음 |
@@ -188,19 +188,28 @@ NSSR의 NQN 범위 검사는 보수적이므로 placeholder NQN이 중복되면 
 
 실행 순서(모든 sysfs 쓰기·BAR0 접근은 한도가 있는 자식 프로세스):
 
-1. `drivers_autoprobe=0`, 드라이버 unbind — 드라이버 개입과 재열거 뒤 자동 probe(=NSSRO 클리어) 차단.
+1. 드라이버 unbind, 메모리 디코드 켬(unbind 뒤 꺼질 수 있음), **설정 공간 저장**.
    unbind 는 드라이버 정상 종료(CC.SHN)를 보내므로 NSSR 은 **I/O 가 없는 상태**에서 나간다
-2. 메모리 디코드 켬(unbind 뒤 꺼질 수 있음) → BAR0 NSSR 쓰기 — 남아 있던 NSSRO 를 먼저
-   지우고(RW1C) 4E564D65h. **이 순간이 t0**
-3. 링크 다운(DLLLA 0, 최대 1s 관측) → 장치 remove(이전 설정 상태 폐기) → 링크 업 대기
-4. `pci_rescan_wait` 과 같은 rescan 반복 — 설정 공간(BAR) 복원
-5. 메모리 디코드를 잠깐 켜고 CSTS 읽기: **NSSRO=1, CFS=0** 이어야 함.
-   NSSRO=0 은 `[장치 측] NSSR 스펙 위반`, CFS=1·읽기 실패도 장치 측 불량
-6. autoprobe 복원, `drivers_probe` → 드라이버가 CC.EN→RDY→live. 이후는 다른 profile 과 같은
+2. BAR0 NSSR 쓰기 — 남아 있던 NSSRO 를 먼저 지우고(RW1C) 4E564D65h. **이 순간이 t0**
+3. 링크 다운(DLLLA 0, 최대 1s 관측) → 링크 업 → 설정 요청이 NSSR 전과 같은 Vendor/Device ID 로
+   응답할 때까지(FFFF·CRS 0001 은 준비 안 됨). 이 구간은 호스트 개입이 없어 `cfg_after_ts` 가
+   장치 시간 그대로 잡힌다
+4. **설정 공간 복원** — BAR0~5·ROM·캐시라인/지연·인터럽트 라인, PCIe DevCtl·LnkCtl·DevCtl2·LnkCtl2,
+   마지막에 Command. BAR 되읽기가 다르면 실패. (커널 pci_restore_state 의 최소 집합.
+   MSI/MSI-X 는 드라이버가 probe 에서 다시 잡는다)
+5. CSTS 읽기: **NSSRO=1, CFS=0** 이어야 함. NSSRO=0 은 `[장치 측] NSSR 스펙 위반`,
+   CFS=1·링크 미복귀·설정 무응답·CSTS 읽기 실패도 장치 측 불량
+6. enable 원복, `drivers_probe` → 드라이버가 CC.EN→RDY→live. 이후는 다른 profile 과 같은
    RDY/타이밍/Identify/환경 복원
 
-NSSR 을 쓰기 전에 실패하면 드라이버를 다시 붙인다. 쓴 뒤 실패하면 현상 보존(장치를 그대로 둠).
-`drivers_autoprobe` 는 어느 경우든 원래 값으로 돌린다(호스트 전역 설정이므로).
+**remove/rescan 을 쓰지 않는 이유** — 리눅스는 rescan 으로 추가한 장치에 `drivers_autoprobe`
+와 무관하게 드라이버를 붙인다(`pci_bus_add_device()` → `device_attach()`). 드라이버는 probe 중
+NSSRO 를 지우고, 드라이버가 붙은 장치에는 sysfs `enable` 이 EBUSY 로 거부된다(실측).
+링크 다운 중 hotplug(pciehp)가 장치를 빼고 다시 넣어 드라이버가 먼저 붙으면 NSSRO 는
+**확인 불가**로 기록하고(불량 아님) 복귀 판정은 그대로 한다.
+
+NSSR 을 쓰기 전에 실패하면 enable 을 되돌리고 드라이버를 다시 붙인다. 쓴 뒤 실패하면 현상
+보존(장치를 그대로 둠).
 Hot reset도 여러 DUT/기능으로 영향을 넓히지 않는다. PCI remove/rescan을 reset 자체로
 이름 붙이지 않으며 실제 PMU/PCI reset 동작과 host 재인식을 별도 단계로 기록한다.
 
@@ -587,18 +596,12 @@ v11 전송·calibration·종료·복구 테스트는 v11 모듈을 직접 검사
     [check] 환경 복원·샘플러 재연결 OK
     → PASS  (2.3s)
   [2/7] nssr               지원: 가능
-    [step 1/1] nssr : NVM Subsystem Reset (unbind → BAR0 NSSR → remove/rescan → NSSRO 확인 → probe)
-      · PCI 자동 probe 끔 — echo 0 > /sys/bus/pci/drivers_autoprobe
+    [step 1/1] nssr : NVM Subsystem Reset (unbind → BAR0 NSSR → 설정 복원 → NSSRO 확인 → probe)
       · 드라이버 unbind — echo 0000:02:00.0 > /sys/bus/pci/drivers/nvme/unbind
       · 메모리 디코드 켬 — echo 1 > /sys/bus/pci/devices/0000:02:00.0/enable
       · BAR0 NSSR ← 4E564D65h
-      · 장치 remove — echo 1 > /sys/bus/pci/devices/0000:02:00.0/remove
-      · PCI rescan 반복 — echo 1 > /sys/bus/pci/rescan
-      DUT 발견 — rescan 3회 (0.05s)
-      · 메모리 디코드 켬 — echo 1 > /sys/bus/pci/devices/0000:02:00.0/enable
-      · 메모리 디코드 끔 — echo 0 > /sys/bus/pci/devices/0000:02:00.0/enable
-      NSSR 확인: CSTS=0x00000000 NSSRO=0 CFS=0 ✗ — 링크 다운 +2ms · 링크 업 +180ms
-      · PCI 자동 probe 복원 — echo 1 > /sys/bus/pci/drivers_autoprobe
+      · 설정 공간 복원(BAR·Command·PCIe 제어, NSSR 전 저장값)
+      NSSR 확인: CSTS=0x00000000 NSSRO=0 CFS=0 ✗ — 링크 다운 +2ms · 링크 업 +180ms · 설정 응답 +230ms
     → FAIL — 현상 보존  (0.6s)
       원인: [장치 측] NSSR 스펙 위반: 전원 인가 중 NSSR 인데 CSTS.NSSRO=0 (CSTS=0x00000000, Base 2.3 Fig.42)
 ============================================================
