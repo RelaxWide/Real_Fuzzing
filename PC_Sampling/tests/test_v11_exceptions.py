@@ -136,16 +136,27 @@ class Events(unittest.TestCase):
         self.before.assert_not_called()
         self.ctrl.runner.run.assert_not_called()
 
-    def test_finished_command_cancels_late_injection(self):
+    def test_finished_command_is_still_injected(self):
+        # 주기가 되면 명령 상태와 무관하게 강제 주입 — 이미 끝난 명령이어도 리셋한다
         self.proc.poll.return_value = 0
-        self.assertIsNone(self.execute())
-        self.ctrl.runner.run.assert_not_called()
+        result = self.execute()
+        self.assertEqual(result['outcome'], 'resumed')
+        self.assertFalse(result['in_flight'])
+        self.assertEqual(self.ctrl.runner.run.call_args.args[0], ['nvme', 'reset', '/dev/nvme0'])
         self.assertFalse(self.ctrl.due())
+        begin = next(r for r in self.records() if r['phase'] == 'begin')
+        self.assertFalse(begin['in_flight'])
+        self.assertFalse(any(r['phase'] == 'missed_window' for r in self.records()))
 
-    def test_completion_during_before_does_not_reset_next_command(self):
-        self.proc.poll.side_effect = [None, 0]
-        self.assertEqual(self.execute()['outcome'], 'missed_window')
-        self.ctrl.runner.run.assert_not_called()
+    def test_completion_during_before_is_still_injected(self):
+        self.proc.poll.side_effect = [None, 0, 0, 0]
+        result = self.execute()
+        self.assertEqual(result['outcome'], 'resumed')
+        self.assertFalse(result['in_flight'])                  # 리셋 시점엔 이미 끝나 있었음
+        self.assertEqual(self.ctrl.runner.run.call_count, 1)
+
+    def test_in_flight_recorded(self):
+        self.assertTrue(self.execute()['in_flight'])
 
     def test_ready_failure_no_retry_reset_no_resume(self):
         self.ctrl.wait_ready.side_effect = ExceptionFailure('not ready')
@@ -395,6 +406,30 @@ class RealTransportIntegration(unittest.TestCase):
         self.assertEqual(f._crash_nvme_pid, 42)
         self.proc.kill.assert_not_called()
 
+    def test_pm_combo_recorded_in_event_context(self):
+        f = self.f
+        combo = next(c for c in self.base.POWER_COMBOS
+                     if c.nvme_ps == 4 and int(c.pcie_l) == 1 and int(c.pcie_d) == 0)
+        f._current_combo = combo
+        f.config.pm_inject_prob = 1.0
+        f._detect_pcie_info = Mock()
+        f._set_pcie_l_state = Mock(return_value=True)
+        f._set_pcie_d_state = Mock(return_value=True)
+        f._setpci_read = Mock(return_value=0)
+        f._pcie_bdf = f._pcie_root_bdf = None
+        f._pcie_cap_offset = f._pcie_root_cap_offset = None
+        with self.assertLogs('pcfuzz', level='WARNING') as logs:
+            self.assertEqual(self.send(), f.RC_EXCEPTION)
+        rows = [json.loads(l) for l in f._exception_controller.log_path.read_text().splitlines()]
+        begin = next(r for r in rows if r['phase'] == 'begin')
+        self.assertEqual(begin['context']['pm_combo'], combo.label)
+        self.assertIn(f'PM {combo.label}', '\n'.join(logs.output))
+        f.config.pm_inject_prob = 0
+        f._exception_controller.next_at = 0
+        self.send()
+        rows = [json.loads(l) for l in f._exception_controller.log_path.read_text().splitlines()]
+        self.assertIsNone([r for r in rows if r['phase'] == 'begin'][-1]['context']['pm_combo'])
+
     def test_real_failure_path_dumps_without_killing_command_or_power_reset(self):
         f = self.f
         f.crashes_dir = f.output_dir / 'crashes'
@@ -459,49 +494,27 @@ class RealTransportIntegration(unittest.TestCase):
         self.assertEqual(self.f.config.nvme_device, '/dev/nvme1')
         self.assertEqual(self.f.state_monitor._device, '/dev/nvme1')
 
-    def test_completion_after_sampler_stop_is_unobservable_not_zero_reward(self):
+    def test_completed_command_is_still_forced_into_exception(self):
+        # 주기가 되면 명령이 샘플러 정지 전·후 어느 때 끝났든 강제로 주입한다. 그 명령은
+        #   RC_EXCEPTION 으로 회계되어 커버리지·학습 보상에 쓰이지 않는다.
         from collections import defaultdict, Counter
-        f = self.f
-        self.seed.prov_id = 42
-        f.learning.register(42, 'new_group_seeds', {})
-        f.cmd_stats = defaultdict(lambda: {'exec': 0})
-        f.rc_stats = defaultdict(Counter)
-        f._fw_commit_reset_pending = False
-        f.sampler.openocd_error.is_set.return_value = False
-        f.sampler.current_trace = {123}
-        self.proc.poll.side_effect = [None, 0]
-        self.proc.returncode = 0
-        self.assertEqual(self.send(), 0)
-        f._exception_controller.runner.run.assert_not_called()
-        f._stop_sampling_checked()
-        self.assertFalse(f._learning_window_valid)
-        self.assertEqual(f.sampler.current_trace, set())
-        self.assertEqual(f._account_command(self.seed, b'', 0, 0)[2], 'continue')
-        self.assertEqual(f.learning.proposals[42]['evaluated'], 0)
-        self.assertFalse(f.learning.recent[-1]['observable'])
-        self.assertEqual(f.learning.recent[-1]['submission'], 'completion')
-        self.assertEqual(f.stats['coverage_unobserved'], 1)
-        self.assertNotIn('exception_interrupted', f.stats)
-        label = f._tracking_label(self.seed.cmd, self.seed)
-        self.assertEqual(f.cmd_stats[label]['coverage_unobserved'], 1)
-        self.assertEqual(f.rc_stats[label][0], 1)
-        f.sampler.evaluate_coverage.assert_not_called()
-        self.proc.poll.side_effect = None
-        self.proc.poll.return_value = 0
-        self.assertEqual(self.send(), 0)
-        f._stop_sampling_checked()
-        self.assertFalse(f._exception_window_truncated)
-        self.assertTrue(f._learning_window_valid)
-
-    def test_completion_before_sampler_stop_keeps_valid_window(self):
-        self.proc.poll.return_value = 0
-        self.proc.returncode = 0
-        self.f.sampler.openocd_error.is_set.return_value = False
-        self.assertEqual(self.send(), 0)
-        self.f._stop_sampling_checked()
-        self.assertTrue(self.f._learning_window_valid)
-        self.assertFalse(self.f._exception_window_truncated)
-        self.f.sampler._stop_worker.assert_not_called()
+        for poll in ([0, 0, 0, 0], [None, 0, 0, 0]):          # 정지 전 완료 / 정지 중 완료
+            with self.subTest(poll=poll):
+                f = self.f
+                f._exception_controller.next_at = 0
+                f._exception_controller.runner.run.reset_mock()
+                f.cmd_stats = defaultdict(lambda: {'exec': 0})
+                f.rc_stats = defaultdict(Counter)
+                f._fw_commit_reset_pending = False
+                f.sampler.openocd_error.is_set.return_value = False
+                self.proc.poll.side_effect = poll
+                self.proc.returncode = 0
+                self.assertEqual(self.send(), f.RC_EXCEPTION)
+                f._exception_controller.runner.run.assert_called()
+                self.assertFalse(f._exception_controller.last_result['in_flight'])
+                f._stop_sampling_checked()
+                f._account_command(self.seed, b'', f.RC_EXCEPTION, 0)
+                f.sampler.evaluate_coverage.assert_not_called()
 
 
 class CampaignRegression(unittest.TestCase):

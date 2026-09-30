@@ -131,7 +131,7 @@
     "mopt_core_period": 50000
   },
   "exceptions": {
-    "_comment": "v11 전용 예외 주입 설정이며 v10.3은 사용하지 않는다. enabled=false이면 주입하지 않는다. 켜면 사전시험에서 실제 profile을 실행하고 통과한 후보를 사용한다. preflight.enabled=false이면 능동 검증 없이 capability 확인만 거친 후보를 사용한다. PM 전환 구간은 제외한다. 주입은 nvme-cli 프로세스 생존을 기준으로 하며 장치 내부 명령과의 동시성은 보장하지 않는다. initial_delay_minutes는 사전시험 완료부터, min_interval_minutes는 이전 이벤트 완료부터 계산한다. 실패 시 추가 복구 POR/reset 없이 보존·덤프 후 중단한다. Warm은 전원 유지 PERST이며 REFCLK를 직접 토글하지 않는다. normal_por는 orderly remove 후 전원 차단, sudden_por는 전원 차단 후 remove한다. 실제 적용 가능 여부는 제품·호스트·배선에 따라 달라진다.",
+    "_comment": "v11 전용 예외 주입 설정이며 v10.3은 사용하지 않는다. enabled=false이면 주입하지 않는다. 켜면 사전시험에서 실제 profile을 실행하고 통과한 후보를 사용한다. preflight.enabled=false이면 능동 검증 없이 capability 확인만 거친 후보를 사용한다. PM 전환 구간은 제외한다. 주입은 주기가 되면 명령 상태와 무관하게 강제로 한다(주기 뒤 첫 명령 전송 시점, 명령이 실행 중이었는지는 in_flight 로 기록). 장치 내부 명령과의 동시성은 보장하지 않는다. initial_delay_minutes는 사전시험 완료부터, min_interval_minutes는 이전 이벤트 완료부터 계산한다. 실패 시 추가 복구 POR/reset 없이 보존·덤프 후 중단한다. Warm은 전원 유지 PERST이며 REFCLK를 직접 토글하지 않는다. normal_por는 orderly remove 후 전원 차단, sudden_por는 전원 차단 후 remove한다. 실제 적용 가능 여부는 제품·호스트·배선에 따라 달라진다.",
     "enabled": false,
     "min_interval_minutes": 5,
     "initial_delay_minutes": 5,

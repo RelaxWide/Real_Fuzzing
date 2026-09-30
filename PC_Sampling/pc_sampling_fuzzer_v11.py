@@ -21201,8 +21201,10 @@ class ExceptionController:
         name = cmd.get('command') if isinstance(cmd, dict) else cmd
         prof = r.get('profile')
         prof = prof.get('name') if isinstance(prof, dict) else prof
-        self._say(f"[Exception] {r.get('event_id')} {prof} 주입 — 명령 {name or '?'} 실행 중 "
-                  f"(exec {ctx.get('exec', '?')})")
+        state = '실행 중' if r.get('in_flight', True) else '완료 직후'
+        pm = f", PM {ctx['pm_combo']}" if ctx.get('pm_combo') else ""
+        self._say(f"[Exception] {r.get('event_id')} {prof} 주입 — 명령 {name or '?'} {state} "
+                  f"(exec {ctx.get('exec', '?')}{pm})")
 
     def _show_resumed(self, r):
         dt = self.clock() - getattr(self, '_event_t0', self.clock())
@@ -22066,10 +22068,12 @@ class ExceptionController:
             self._in_preflight = False
 
     def execute(self, process, context, before, resumed):
-        """Called only after Popen. None means sampling was left untouched.
+        """Called only after Popen. None means no injection was due.
 
-        A missed_window result means before() stopped sampling but no reset ran;
-        the caller retains normal command completion with invalid coverage.
+        주기가 되면 **명령 상태와 무관하게 강제로** 주입한다. 예전엔 nvme-cli 가 이미 끝났으면
+        missed_window 로 건너뛰고 다음 기회를 한 주기 뒤로 미뤘다 — 짧은 명령이 대부분이면
+        실제 주입이 설정 주기보다 훨씬 드물었다. 주입된 명령의 결과·커버리지는 어차피 쓰지
+        않으므로(RC_EXCEPTION) 명령이 리셋 시점에 실행 중이었는지(in_flight)만 기록한다.
         `before` stops sampling without reconnect/reset. `resumed` reconnects the
         observation infrastructure only AFTER DUT RDY and identity are verified.
         """
@@ -22080,23 +22084,17 @@ class ExceptionController:
                 process.wait(timeout=self.delay)
             except subprocess.TimeoutExpired:
                 pass
-        if process.poll() is not None:
-            self.emit('missed_window', pid=process.pid, context=context)
-            # Avoid a per-command log storm when commands are all shorter than the delay.
-            self.next_at = self.clock() + self.interval
-            return None
         self.counter += 1
         self.active = f'exception-{self.counter:06d}'
         profile = self.rng.choice(self.profiles)
         self.last_result = dict(event_id=self.active, profile=profile.name, context=context)
         self.emit('begin', profile=vars(profile), context=context, pid=process.pid,
-                  overlap='host_process_alive_only')
+                  in_flight=process.poll() is None)
         try:
             before()
-            if process.poll() is not None:
-                self.last_result['outcome'] = 'missed_window'
-                self.emit('missed_window', pid=process.pid, observation_valid=False)
-                return self.last_result
+            # 리셋 직전에 명령이 아직 돌고 있었나(= 명령 도중 주입). 끝났어도 주입은 한다.
+            self.last_result['in_flight'] = process.poll() is None
+            self.emit('inject_point', in_flight=self.last_result['in_flight'])
             self._run_profile(profile)
             ready_deadline = self._ready_deadline
             # Interrupted commands are not replayed and never counted as success.
@@ -22106,6 +22104,7 @@ class ExceptionController:
             except subprocess.TimeoutExpired as exc:
                 raise ExceptionFailure('original command still pending after RDY') from exc
             self.emit('interrupted_command', rc=process.returncode,
+                      in_flight=self.last_result.get('in_flight'),
                       stdout=out.decode(errors='replace')[:8192], stderr=err.decode(errors='replace')[:8192])
             resumed()
             self.last_result['outcome'] = 'resumed'
@@ -22271,15 +22270,14 @@ class ExceptionFuzzerMixin:
                        wire=getattr(self, '_last_wire', None),
                        sequence_index=(self._learning_sequence or {}).get('index'),
                        workload=getattr(self, '_wl_active_pattern', None),
-                       device_epoch=self._exception_epoch)
+                       device_epoch=self._exception_epoch,
+                       # 주입 당시 PM 조합(--pm 일 때). D3hot·L1.2 는 명령 전에 복귀하므로 항상 D0
+                       pm_combo=(self._current_combo.label
+                                 if self.config.pm_inject_prob > 0
+                                 and getattr(self, '_current_combo', None) is not None else None))
         try:
             result = controller.execute(process, context, self._exception_before, self._exception_resumed)
             if result is None:
-                return None
-            if result.get('outcome') == 'missed_window':
-                # No reset took place. Keep the actual command status, but the
-                # stopped observation window cannot measure its coverage yield.
-                self._exception_window_truncated = True
                 return None
         except KeyboardInterrupt:
             # Do not kill a still-pending ioctl and accidentally provoke kernel

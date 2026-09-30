@@ -297,13 +297,14 @@ class Integration(unittest.TestCase):
         f._account_command(self.seed, b'', f.RC_EXCEPTION, 0)
         self.assert_pm_windows_are_independent()
 
-    def test_accounted_missed_window_does_not_consume_later_pm_windows(self):
+    def test_command_finished_before_reset_is_still_an_exception(self):
+        # 강제 주입: 샘플러를 멈추는 사이 명령이 끝났어도 리셋하고 RC_EXCEPTION 으로 회계한다
         f = self.f
-        self.case.proc.poll.side_effect = [None, 0]
+        self.case.proc.poll.side_effect = [None, 0, 0, 0]
         self.case.proc.returncode = 0
-        self.assertEqual(self.case.send(), 0)
+        self.assertEqual(self.case.send(), f.RC_EXCEPTION)
         f._stop_sampling_checked()
-        f._account_command(self.seed, b'', 0, 0)
+        f._account_command(self.seed, b'', f.RC_EXCEPTION, 0)
         self.assert_pm_windows_are_independent()
 
     def test_guard_has_no_recovery_record_or_sequence_mark(self):

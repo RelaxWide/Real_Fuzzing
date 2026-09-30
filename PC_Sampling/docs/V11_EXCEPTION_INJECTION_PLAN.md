@@ -39,7 +39,11 @@ FLR/hot reset은 kernel `reset_method`를 각각 `flr`/`bus` 하나로 지정하
 실행한 뒤 원래 설정으로 복원한다. 다른 방식으로 자동 fallback하지 않는다.
 Linux NVMe 드라이버의 reset_prepare/reset_done은 I/O 정리와 재초기화를 수행하므로,
 이를 갑작스러운 전기적 단절이나 SSD 내부 명령 처리 중 주입으로 단정하지 않는다.
-실제 기록은 `host_process_alive_only`다.
+주입은 **주기가 되면 명령 상태와 무관하게 강제**로 한다(주기 뒤 첫 명령 전송 시점). 명령이 리셋
+시점에 실행 중이었는지는 `in_flight` 로만 기록한다(이벤트 `begin`·`inject_point`·결과). 예전엔
+nvme-cli 가 이미 끝났으면 `missed_window` 로 건너뛰고 한 주기를 미뤄, 짧은 명령이 대부분이면 실제
+주입이 설정 주기보다 훨씬 드물었다. 주입된 명령은 끝났든 아니든 `RC_EXCEPTION` 으로 회계해
+커버리지·학습 보상에 쓰지 않는다.
 
 ## 파일 구성
 
@@ -281,7 +285,8 @@ profile은 `prefix → body × repeat → suffix`다. 앞뒤 절차는 한 번�
 
 - 최소 간격: `min_interval_minutes`. 이전 이벤트 완료 후 다음 이벤트까지의 하한.
 - 최초 지연: `initial_delay_minutes`. fuzz_start 사전시험 종료 뒤 계산.
-- 명령 시작 후 예약 지연: `trigger_delay_ms`. 완료된 대상에 늦게 주입하지 않음.
+- 명령 시작 후 예약 지연: `trigger_delay_ms`(최대 이만큼 명령 완료를 기다렸다가 주입). 그사이
+  명령이 끝나도 주입은 한다(강제 주입).
 - POR 재개 기준: **기존 `power.por_boot_wait` 직접 참조**. 별도 Normal/Sudden 숫자 복사 없음.
 - OFF/재검색 대기: 기존 `power.por_poweroff_wait` / `power.por_rescan_delay` 직접 참조.
 - ON/reset/release 시작부터 RDY 예산을 센다. 뒤따르는 hold/rescan도 같은 예산을 사용한다.
@@ -484,8 +489,9 @@ Python 구문 검사 및 git diff --check 통과. 기존 전송/샘플러 AST �
   공급 ON/release의 제한된 복원만 시도하며, 실행 중인 제어 helper와의 경합 차단은 유지한다.
   이후 캠페인 finally는 통계·커버리지 저장과 sampler.close를 수행하되 SMART 조회,
   APST/keepalive 명령 및 커널 timeout 복원을 실행하지 않는다.
-- **낮음 — 샘플러 정지 후 주입 기회 상실:** before() 이후 명령이 끝난 경우를
-  명시적인 missed_window 결과로 전달한다. 실제 명령 반환 코드·완료 상태는 유지하지만
+- **낮음 — 샘플러 정지 후 주입 기회 상실:** (2026-09-30 이후 폐기 — 주입은 명령 상태와 무관하게
+  강제하므로 missed_window 는 없다.) 당시에는 before() 이후 명령이 끝난 경우를
+  명시적인 missed_window 결과로 전달했다. 실제 명령 반환 코드·완료 상태는 유지하지만
   잘린 관측은 coverage_unobserved로 분리하며 커버리지 평가·학습 보상에 사용하지 않는다.
   명령별 통계에는 실행 수·원래 rc·coverage_unobserved를 기록한다. Calibration의 해당
   관측도 안정성 계산에서 제외하고, FW 청크는 해당 청크에서 회계하여 플래그 유실을 막는다.
