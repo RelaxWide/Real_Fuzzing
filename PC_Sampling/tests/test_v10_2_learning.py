@@ -17,18 +17,11 @@ from llm_learning import LearningState, compile_recipe, seed_item
 from rag.rag_schema import SchemaBridge
 from riscv_cov import CoreMap, CoverageModel, pack
 
-# 활성 실행 파일의 단일 출처. 버전업 시 이 한 줄만 바꾼다.
-FUZZER_FILE = ROOT / 'pc_sampling_fuzzer_v11.py'
+# 활성 실행 파일의 단일 출처는 tests/fuzzer_target.py (버전업 시 그 한 줄만 바꾼다).
+from fuzzer_target import FUZZER_FILE, fuzzer             # noqa: E402
 # 장치 경로 AST 는 과거 버전까지 같은 기준선으로 계속 검사한다(아래 고정 기준선 시험).
-DEVICE_AST_FILES = (ROOT / 'pc_sampling_fuzzer_v10.2.py',
-                    ROOT / 'pc_sampling_fuzzer_v10.3.py', FUZZER_FILE)
-
-# Import the real entrypoint with CLI argv isolated; __main__ never executes.
-spec = importlib.util.spec_from_file_location('fuzzer_active_test', FUZZER_FILE)
-fuzzer = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = fuzzer
-with patch.object(sys, 'argv', [str(FUZZER_FILE)]):
-    spec.loader.exec_module(fuzzer)
+DEVICE_AST_FILES = (ROOT / 'pc_sampling_fuzzer_v10.2.py', ROOT / 'pc_sampling_fuzzer_v10.3.py',
+                    ROOT / 'pc_sampling_fuzzer_v11.py', FUZZER_FILE)
 
 
 def recipe():

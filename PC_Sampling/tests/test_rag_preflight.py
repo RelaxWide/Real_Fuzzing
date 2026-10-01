@@ -10,6 +10,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from rag import rag_retrieval as rr
+from fuzzer_target import FUZZER_FILE                      # noqa: E402
 
 
 class PreflightTests(unittest.TestCase):
@@ -41,7 +42,7 @@ class PreflightTests(unittest.TestCase):
             config['rag']['vllm']['retrieval'].update(enabled=True, index_dir=str(root), embed_model_revision='new')
             path = root / 'config.json'
             path.write_text(json.dumps(config))
-            result = subprocess.run([sys.executable, str(ROOT / 'pc_sampling_fuzzer_v11.py'),
+            result = subprocess.run([sys.executable, str(FUZZER_FILE),
                                      '--config', str(path), '--rag'], capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn('revision 불일치', result.stderr)

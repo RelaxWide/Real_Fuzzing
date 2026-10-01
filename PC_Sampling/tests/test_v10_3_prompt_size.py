@@ -13,6 +13,7 @@ from test_v10_2_learning import ROOT, fuzzer, harness   # noqa: F401
 
 sys.path.insert(0, str(ROOT))
 from rag.rag_schema import SchemaBridge                 # noqa: E402
+from fuzzer_target import FUZZER_FILE                      # noqa: E402
 
 
 def bridge():
@@ -109,7 +110,7 @@ class SchemaCapIsEffective(unittest.TestCase):
 
         상한 적용은 _llm_schema_pick 한 곳에서만 일어나야 한다.
         """
-        src = (ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8')
+        src = FUZZER_FILE.read_text(encoding='utf-8')
         users = [ln.strip() for ln in src.splitlines() if 'RAG_SCHEMA_MAX' in ln]
         slicing = [ln for ln in users if '[:RAG_SCHEMA_MAX]' in ln]
         self.assertEqual(slicing, [], f'호출부가 직접 자르고 있다: {slicing}')
@@ -130,7 +131,7 @@ class FavoredExamplesAreDistinct(unittest.TestCase):
 
     def test_duplicate_command_cdw_pairs_are_collapsed(self):
         import ast
-        src = (ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8')
+        src = FUZZER_FILE.read_text(encoding='utf-8')
         tree = ast.parse(src)
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == '_llm_grounding_block')
@@ -142,7 +143,7 @@ class FavoredExamplesAreDistinct(unittest.TestCase):
     def test_dedup_key_matches_what_is_printed(self):
         """중복 판정 키는 프롬프트에 실제로 찍히는 값과 같아야 한다."""
         import ast
-        src = (ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8')
+        src = FUZZER_FILE.read_text(encoding='utf-8')
         tree = ast.parse(src)
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == '_llm_grounding_block')
@@ -160,7 +161,7 @@ class PromptNumbersAreDecimal(unittest.TestCase):
     VALUE_RE = _re.compile(r'(valid|vendor|reserved)=([^\s,]+(?:,[^\s,]+)*)')
 
     def test_hard_rule_asks_for_decimal(self):
-        src = (ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8')
+        src = FUZZER_FILE.read_text(encoding='utf-8')
         self.assertIn('DECIMAL integers', src, '전제(10진수 요구)가 사라졌다')
 
     def test_no_hex_in_field_values(self):

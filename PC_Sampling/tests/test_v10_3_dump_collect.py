@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from test_v10_2_learning import fuzzer   # noqa: F401
+from fuzzer_target import FUZZER_FILE                      # noqa: E402
 
 
 class Env:
@@ -28,7 +29,7 @@ class Env:
         (self.root / 'out' / 'crashes').mkdir(parents=True)
         self.dest = self.root / 'out' / 'crashes' / 'crash_20260928_120000'
         self.patches = [
-            patch.object(sys, 'argv', [str(self.root / 'pc_sampling_fuzzer_v11.py')]),
+            patch.object(sys, 'argv', [str(self.root / FUZZER_FILE.name)]),
             patch.object(fuzzer, 'UFAS_BINARY', 'dump/ufas'),
             patch.object(fuzzer, 'JLINK_DUMP_SCRIPT', 'dump/run_smi_mem_dump_JLINK_USB.sh'),
             patch.object(fuzzer, 'DEBUG_TOOL_BINARY', 'Debug_Tool_v1.0.0.2'),

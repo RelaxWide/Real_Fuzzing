@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 from test_v10_2_learning import ROOT, fuzzer      # noqa: F401
 
 sys.path.insert(0, str(ROOT))
+from fuzzer_target import FUZZER_FILE                      # noqa: E402
 
 
 def sampler():
@@ -25,7 +26,7 @@ def sampler():
 def method_ast(name, cls='OpenOCDPCSampler'):
     """해당 **클래스 안의** 메서드 AST. 샘플러마다 동명 메서드가 있어 모듈 전체를
     walk 하면 기반 클래스의 no-op 을 집는다."""
-    tree = ast.parse((ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8'))
+    tree = ast.parse(FUZZER_FILE.read_text(encoding='utf-8'))
     node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
     return next(n for n in node.body
                 if isinstance(n, ast.FunctionDef) and n.name == name)

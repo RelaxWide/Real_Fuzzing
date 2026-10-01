@@ -6,7 +6,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from test_v11_exceptions import options
-from pc_sampling_fuzzer_v11 import ExceptionController, ExceptionFailure
+import fuzzer_target                                       # noqa: F401,E402  (파일 경로로 대상 퍼저 로드)
+from fuzzer_active_test import ExceptionController, ExceptionFailure
 
 
 class Diagnostics(unittest.TestCase):
@@ -46,7 +47,7 @@ class Diagnostics(unittest.TestCase):
                     Path(self.c.device).unlink()
                 self.c.runner.reset_mock()
                 self.c.runner.run.return_value = (rc, out, b'probe-error' if rc else b'')
-                with patch('pc_sampling_fuzzer_v11.time.sleep', side_effect=self.sleep):
+                with patch('fuzzer_active_test.time.sleep', side_effect=self.sleep):
                     with self.assertLogs('pcfuzz', level='WARNING') as logs:
                         with self.assertRaisesRegex(ExceptionFailure, gate):
                             self.c.wait_ready(0.1)

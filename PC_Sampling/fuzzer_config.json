@@ -722,7 +722,9 @@
     "calibration_runs": 3
   },
   "visualization": {
-    "graph_refresh_interval": 5000
+    "graph_refresh_interval": 5000,
+    "_comment_extra_charts": "true면 부가 차트(command_comparison, coverage_heatmap_1d, mutation_chart)도 그린다. 기본은 핵심 차트(coverage_growth: 출처별 몫 포함, firmware_map, csfuzz_dynamics)만.",
+    "extra_charts": false
   },
   "mutation": {
     "opcode": 0.1,

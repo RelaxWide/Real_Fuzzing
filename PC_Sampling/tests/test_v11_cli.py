@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-with patch.object(sys, 'argv', ['pc_sampling_fuzzer_v11.py']):
-    import pc_sampling_fuzzer_v11 as v                     # noqa: E402
+from fuzzer_target import fuzzer as v                   # noqa: E402
+from fuzzer_target import FUZZER_FILE                      # noqa: E402
 
 
 class ExceptionFlag(unittest.TestCase):
@@ -29,7 +29,7 @@ class ExceptionFlag(unittest.TestCase):
         self.assertIs(cfg['exceptions']['enabled'], False)
 
     def test_help_lists_flag(self):
-        out = subprocess.run([sys.executable, str(ROOT / 'pc_sampling_fuzzer_v11.py'), '--help'],
+        out = subprocess.run([sys.executable, str(FUZZER_FILE), '--help'],
                              cwd=ROOT, capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr[-500:])
         self.assertIn('--exception', out.stdout)

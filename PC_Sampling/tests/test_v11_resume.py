@@ -9,7 +9,8 @@ import unittest
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from pc_sampling_fuzzer_v11 import ExceptionController, ExceptionFailure, compile_profiles
+import fuzzer_target                                       # noqa: F401,E402  (파일 경로로 대상 퍼저 로드)
+from fuzzer_active_test import ExceptionController, ExceptionFailure, compile_profiles
 import test_v11_exceptions as fixtures
 
 
@@ -248,10 +249,10 @@ class Integration(unittest.TestCase):
         f._exception_recovery_remaining = 0
         f._exception_recovery_until = 100
         self.case.proc.returncode = 0
-        with patch('pc_sampling_fuzzer_v11.time.monotonic', return_value=99):
+        with patch('fuzzer_active_test.time.monotonic', return_value=99):
             self.assertEqual(self.case.send(), 0)
             self.assertTrue(f._exception_recovery_window)
-        with patch('pc_sampling_fuzzer_v11.time.monotonic', return_value=101):
+        with patch('fuzzer_active_test.time.monotonic', return_value=101):
             self.assertEqual(self.case.send(), 0)
             self.assertFalse(f._exception_recovery_window)
 

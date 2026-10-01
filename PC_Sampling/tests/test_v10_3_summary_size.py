@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from test_v10_2_learning import ROOT, fuzzer      # noqa: F401
+from fuzzer_target import FUZZER_FILE                      # noqa: E402
 
 
 def render(dist, top=None):
@@ -70,7 +71,7 @@ class NsidDistributionIsCapped(unittest.TestCase):
 
 class SummaryCodeUsesTheCap(unittest.TestCase):
     def test_summary_path_uses_the_helper(self):
-        src = (ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8')
+        src = FUZZER_FILE.read_text(encoding='utf-8')
         self.assertIn('_fmt_nsid_dist(stats.get(', src, '요약이 헬퍼를 안 쓴다')
         self.assertNotIn("for n, count in sorted(stats['actual_nsid_dist'].items())", src,
                          '여전히 전량 나열한다')

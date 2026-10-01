@@ -10,7 +10,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from pc_sampling_fuzzer_v11 import (compile_profiles, csts_ready, ExceptionController,
+import fuzzer_target                                       # noqa: F401,E402  (파일 경로로 대상 퍼저 로드)
+from fuzzer_active_test import (compile_profiles, csts_ready, ExceptionController,
                                ExceptionFailure, ExceptionFuzzerMixin, CommandRunner)
 
 
@@ -244,7 +245,7 @@ class Readiness(unittest.TestCase):
                 (Path(d) / key).write_text(value)
             ctrl.runner = Mock()
             ctrl.runner.run.return_value = (0, b'{"csts": 1}', b'')
-            with patch('pc_sampling_fuzzer_v11.Path.exists', return_value=True):
+            with patch('fuzzer_active_test.Path.exists', return_value=True):
                 ctrl.wait_ready(ctrl.clock() + 0.2)
             (Path(d) / 'serial').write_text('OTHER')
             with self.assertRaisesRegex(ExceptionFailure, 'identity'):
@@ -259,7 +260,7 @@ class Readiness(unittest.TestCase):
                 (Path(d) / key).write_text(value)
             ctrl.runner = Mock()
             ctrl.runner.run.return_value = (0, b'{"csts":0}', b'')
-            with patch('pc_sampling_fuzzer_v11.Path.exists', return_value=True):
+            with patch('fuzzer_active_test.Path.exists', return_value=True):
                 with self.assertRaisesRegex(ExceptionFailure, '준비 시간 초과.*RDY=0.*gate=controller_rdy'):
                     ctrl.wait_ready(ctrl.clock() + 0.01)
 
@@ -339,7 +340,7 @@ class Runner(unittest.TestCase):
         proc = Mock(pid=42)
         proc.wait.side_effect = subprocess.TimeoutExpired('reset', 0.1)
         proc.poll.return_value = None
-        with patch('pc_sampling_fuzzer_v11.subprocess.Popen', return_value=proc):
+        with patch('fuzzer_active_test.subprocess.Popen', return_value=proc):
             with self.assertRaises(subprocess.TimeoutExpired):
                 runner.run(['nvme', 'reset', '/dev/nvme0'], __import__('time').monotonic() + 0.1)
         self.assertTrue(runner.has_pending())
@@ -352,7 +353,7 @@ class RealTransportIntegration(unittest.TestCase):
     """Exercise the standalone v11 transport and exception mixin."""
     def setUp(self):
         from test_v10_2_learning import harness
-        import pc_sampling_fuzzer_v11 as fuzzer
+        from fuzzer_target import fuzzer as fuzzer
         from collections import Counter, deque
         self.base = fuzzer
         self.tmp = tempfile.TemporaryDirectory()
@@ -519,7 +520,7 @@ class RealTransportIntegration(unittest.TestCase):
 
 class CampaignRegression(unittest.TestCase):
     def test_calibration_interruption_then_real_timeout_is_captured(self):
-        import pc_sampling_fuzzer_v11 as fuzzer
+        from fuzzer_target import fuzzer as fuzzer
         with tempfile.TemporaryDirectory() as d:
             cls = fuzzer.NVMeFuzzer
             config = fuzzer.FuzzConfig(no_jlink=True, rag_enabled=False, state_enabled=False,
@@ -538,7 +539,7 @@ class CampaignRegression(unittest.TestCase):
             self.assertEqual(f.stats['exception_interrupted'], 1)
 
     def test_truncated_calibration_excludes_only_incomplete_observation(self):
-        import pc_sampling_fuzzer_v11 as fuzzer
+        from fuzzer_target import fuzzer as fuzzer
         with tempfile.TemporaryDirectory() as d:
             cls = fuzzer.NVMeFuzzer
             config = fuzzer.FuzzConfig(no_jlink=True, rag_enabled=False, state_enabled=False,
@@ -564,7 +565,7 @@ class CampaignRegression(unittest.TestCase):
             self.assertTrue(f._learning_window_valid)
 
     def test_calibration_completion_retires_flags_before_pm(self):
-        import pc_sampling_fuzzer_v11 as fuzzer
+        from fuzzer_target import fuzzer as fuzzer
         for mode in ('interrupted', 'truncated', 'recovery'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
                 cls = fuzzer.NVMeFuzzer
@@ -598,7 +599,7 @@ class CampaignRegression(unittest.TestCase):
 
     def run_ast(self):
         import ast
-        import pc_sampling_fuzzer_v11 as fuzzer
+        from fuzzer_target import fuzzer as fuzzer
         tree = ast.parse(Path(fuzzer.__file__).read_text())
         base = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == '_V101Fuzzer')
         return ast, fuzzer, next(n for n in base.body if isinstance(n, ast.FunctionDef) and n.name == 'run')

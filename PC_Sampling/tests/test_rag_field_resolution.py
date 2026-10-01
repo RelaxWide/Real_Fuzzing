@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from rag import retrieval_policy as p
+from fuzzer_target import FUZZER_FILE                      # noqa: E402
 
 
 class ResolutionTests(unittest.TestCase):
@@ -49,7 +50,7 @@ class ResolutionTests(unittest.TestCase):
 
     def test_all_schema_audit_includes_non_requested_commands(self):
         from tools.rag_field_audit import read_schemas
-        schemas = read_schemas(Path(__file__).resolve().parents[1] / 'pc_sampling_fuzzer_v11.py')
+        schemas = read_schemas(FUZZER_FILE)
         lookup, _ = p.definition_lookup([])
         report = p.expansion_report(list(schemas), schemas, lookup, True)
         self.assertEqual(report['missing_count'], sum(map(len, schemas.values())))

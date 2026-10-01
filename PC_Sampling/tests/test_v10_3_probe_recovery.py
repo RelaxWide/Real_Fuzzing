@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 from test_v10_2_learning import ROOT, fuzzer      # noqa: F401
 
 sys.path.insert(0, str(ROOT))
+from fuzzer_target import FUZZER_FILE                      # noqa: E402
 
 
 def sysfs(root, name, vid, pid, bus, dev):
@@ -159,7 +160,7 @@ class UhubctlOnlyWhenLocationIsGiven(unittest.TestCase):
 class WiredAsTheLastRung(unittest.TestCase):
     def test_reconnect_calls_it_only_after_every_restart_failed(self):
         import ast
-        src = (ROOT / 'pc_sampling_fuzzer_v11.py').read_text(encoding='utf-8')
+        src = FUZZER_FILE.read_text(encoding='utf-8')
         tree = ast.parse(src)
         # _reconnect 는 여러 개다(기반 클래스의 no-op 포함). attempts 를 받는 실물만.
         fn = next(n for n in ast.walk(tree)

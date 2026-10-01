@@ -13,8 +13,7 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-with patch.object(sys, 'argv', ['pc_sampling_fuzzer_v11.py']):
-    import pc_sampling_fuzzer_v11 as v                     # noqa: E402
+from fuzzer_target import fuzzer as v                   # noqa: E402
 
 from test_v11_exceptions import options                    # noqa: E402
 

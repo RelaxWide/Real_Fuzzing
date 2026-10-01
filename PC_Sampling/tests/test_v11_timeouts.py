@@ -11,8 +11,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-with patch.object(sys, 'argv', ['pc_sampling_fuzzer_v11.py']):
-    import pc_sampling_fuzzer_v11 as v                      # noqa: E402
+from fuzzer_target import fuzzer as v                   # noqa: E402
 
 CFG = json.loads((ROOT / 'fuzzer_config.json').read_text(encoding='utf-8-sig'))
 
