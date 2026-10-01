@@ -130,10 +130,60 @@ class NormalShutdown(unittest.TestCase):
         with self.assertLogs('pcfuzz', level='WARNING') as logs:
             c._check_shutdown(Mock(shutdown_snapshot=Mock(return_value={'shn': 1.0, 'shst': 1.25, 'shn_type': 1})))
         self.assertIn('정상 종료 확인: CC.SHN 정상(01b) → CSTS.SHST=10b 250ms', '\n'.join(logs.output))
-        with self.assertLogs('pcfuzz', level='WARNING'):
-            with self.assertRaisesRegex(v.ExceptionFailure, r'\[장치 측\] 정상 종료 미완료'):
-                c._check_shutdown(Mock(shutdown_snapshot=Mock(return_value={'shn': 1.0, 'shn_type': 1, 'last_shst': 1})))
+        with self.assertLogs('pcfuzz', level='WARNING'), \
+                patch.object(v.ExceptionController, '_kernel_shutdown_timeout', return_value=5.0), \
+                patch.object(v.time, 'sleep'):
+            # 커널 대기 하한(5s) 이상 SHN 을 보며 SHST≠10b → 미완료 확정
+            with self.assertRaisesRegex(v.ExceptionFailure, r'\[장치 측\] 정상 종료 미완료 — CC.SHN 뒤 5.5s'):
+                c._check_shutdown(Mock(shutdown_snapshot=Mock(return_value={
+                    'shn': 1.0, 'shn_type': 1, 'last_shst': 1, 'last_seen': 6.5, 'observation_gap': True})))
             c._check_shutdown(Mock(shutdown_snapshot=Mock(return_value={})))          # 관측 못함 = 판정 생략
+
+    def test_lagging_observation_is_not_a_failure(self):
+        # 리뷰 지적: remove 직후 마지막 샘플이 SHN=1·SHST=01b 뿐이고 공백 통지도 아직 안 왔다.
+        #   완료 샘플이 늦게 올 수 있으므로 기다렸다 판정하고, 짧게 봤으면 UNOBSERVED.
+        c = controller(self)
+        c.emit = Mock()
+        snap = {'shn': 1.0, 'shn_type': 1, 'last_shst': 1, 'last_seen': 1.05}
+        with patch.object(v.time, 'sleep'):
+            c._check_shutdown(Mock(shutdown_snapshot=Mock(return_value=snap)))
+        self.assertEqual(c.emit.call_args.kwargs['status'], 'UNOBSERVED')
+        # 기다리는 사이 완료 샘플이 도착하면 OK
+        late = [snap] * 3 + [dict(snap, shst=1.08, last_shst=2)]
+        c.emit.reset_mock()
+        with patch.object(v.time, 'sleep'):
+            c._check_shutdown(Mock(shutdown_snapshot=Mock(side_effect=late + [late[-1]] * 60)))
+        self.assertEqual(c.emit.call_args.kwargs['status'], 'OK')
+
+
+class RootPortRestoreIsIndependent(unittest.TestCase):
+    """리뷰 지적: 원복 단계가 한 try 에 묶여 앞 단계 실패 시 마스크 원복을 건너뛰었다."""
+
+    def guard(self, fail=None):
+        g = Mock(masked=True)
+        def unmask():
+            g.masked = False
+        g.unmask.side_effect = unmask
+        if fail:
+            getattr(g, fail).side_effect = OSError('config read failed')
+        return g
+
+    def test_unmask_runs_even_when_aer_read_fails(self):
+        c = controller(self)
+        c.root_bdf = RP
+        g = self.guard('collect_aer')
+        with self.assertLogs('pcfuzz', level='WARNING'):
+            errors = c._nssr_root_finish(g, True, {})
+        g.unmask.assert_called_once()
+        self.assertEqual(errors, ['AER 상태 수집: config read failed'])
+
+    def test_mask_left_is_reported(self):
+        c = controller(self)
+        c.root_bdf = RP
+        g = self.guard('unmask')
+        with self.assertLogs('pcfuzz', level='WARNING'):
+            errors = c._nssr_root_finish(g, True, {})
+        self.assertIn('Surprise Down 마스크가 남아 있음', errors)
 
 
 class EffectByLink(unittest.TestCase):
@@ -354,6 +404,33 @@ class NssrWithRootPort(unittest.TestCase):
         text = '\n'.join(logs.output)
         self.assertIn('Surprise Down 기록 있음(예상된 이벤트 — 지움)', text)
         self.assertIn('LTR enable 해제돼 있었음', text)
+
+    def test_restore_failure_after_successful_nssr_is_not_a_normal_resume(self):
+        from test_v11_nssr import FakeBus, Runner
+        fs = FakeSys()
+        self.addCleanup(fs.tmp.cleanup)
+        (fs.rp_real / 'config').write_bytes(bytes(root_cfg()))
+        bus = FakeBus(fs)
+        c = v.ExceptionController(__import__('test_v11_exceptions').options(), {}, '/dev/nvme0', '',
+                                  Path(fs.tmp.name) / 'events')
+        c.serial, c.bdf, c.root_bdf = 'SN1', DUT, RP
+        r = Runner(fs, bus)
+        c.runner = r
+        unmasked = []
+        real_unmask = v._RootPortGuard.unmask
+        def unmask(g):
+            unmasked.append(True)
+            real_unmask(g)
+        with patch.object(v, '_PCI_DEVICES', fs.pci), patch.object(v, '_PCI_BUS', bus.root), \
+                patch.object(v.time, 'sleep', side_effect=r.tick), \
+                patch.object(v._RootPortGuard, 'collect_aer', side_effect=OSError('config read failed')), \
+                patch.object(v._RootPortGuard, 'unmask', unmask):
+            with self.assertLogs('pcfuzz', level='WARNING'):
+                with self.assertRaisesRegex(v.ExceptionFailure, r'\[호스트 측\] NSSR 뒤 루트 포트 원복 실패'):
+                    c._nssr(c.clock() + 30)
+        self.assertEqual(unmasked, [True])                              # 그래도 마스크 원복은 시도
+        self.assertEqual(int.from_bytes((fs.rp_real / 'config').read_bytes()[0x108:0x10C], 'little'),
+                         0x00100000)
 
 
 class RegionLabels(unittest.TestCase):

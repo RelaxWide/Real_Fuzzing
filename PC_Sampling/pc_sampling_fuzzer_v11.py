@@ -20715,6 +20715,7 @@ class RecoveryMonitor:
             if shn:
                 self.shutdown.setdefault('shn', t)
                 self.shutdown['shn_type'] = shn
+                self.shutdown['last_seen'] = t      # SHN 이 보이는 유효 샘플의 마지막 시각
             if shst == 2 and 'shn' in self.shutdown:
                 self.shutdown.setdefault('shst', t)
             elif 'shst' in self.shutdown:
@@ -21156,7 +21157,10 @@ class ExceptionController:
         elif st == 'INCOMPLETE':
             self._line(f"      ✗ 정상 종료 미완료: CC.SHN {kind} 뒤 SHST={r.get('last_shst')}", error=True)
         else:
-            self._line("      정상 종료 관측 못함(BAR 관측 공백) — 판정 생략")
+            w = r.get('watched')
+            seen = (f" — SHN 뒤 {_fmt_dur(w)}만 관측, 마지막 SHST={r.get('last_shst')}"
+                    if w is not None else '')
+            self._line(f"      정상 종료 완료 관측 못함(관측 공백·지연){seen} — 판정 생략")
 
     def _show_rescan_found(self, r):
         self._line(f"      DUT 발견 — rescan {r.get('tries')}회 ({r.get('elapsed_sec', 0):.2f}s)")
@@ -21553,7 +21557,7 @@ class ExceptionController:
             driver = (dev / 'driver').resolve().name if (dev / 'driver').exists() else None
         except OSError:
             driver = None
-        issued = enabled = unbound = False
+        issued = enabled = unbound = completed = False
         root = None
         result = dict(driver=driver)
         try:
@@ -21603,6 +21607,7 @@ class ExceptionController:
             if (dev / 'driver').exists():
                 result.update(issued=True, nssro_unverified='링크 다운 중 hotplug 가 재열거해 드라이버가 먼저 붙음')
                 self.emit('nssr_result', **result)
+                completed = True
                 return
             while not self._config_valid(saved):
                 if self.clock() >= deadline:
@@ -21649,6 +21654,7 @@ class ExceptionController:
             # 6) 드라이버 복귀 — 켜 둔 enable 을 먼저 되돌려 사용 횟수를 맞춘다
             self._sysfs_write('disable', dev / 'enable', '0', deadline, check=False)
             self._sysfs_write('probe', _PCI_BUS / 'drivers_probe', self.bdf, deadline)
+            completed = True
         except BaseException:
             if 'csts' not in result and 'nssro_unverified' not in result:
                 result['issued'] = issued
@@ -21662,22 +21668,37 @@ class ExceptionController:
             raise
         finally:
             if root is not None:
-                self._nssr_root_finish(root, issued, result)
+                errors = self._nssr_root_finish(root, issued, result)
+                # NSSR 자체는 성공했는데 루트 포트 원복이 안 됐으면 정상 재개로 넘기지 않는다
+                #   (Surprise Down 보고가 가려진 채 캠페인이 계속되면 이후 링크 이상을 못 본다).
+                #   이미 실패로 나가는 중이면 원래 예외를 유지하고 원복 실패는 이벤트로만 남긴다.
+                if errors and completed:
+                    raise ExceptionFailure('[호스트 측] NSSR 뒤 루트 포트 원복 실패: ' + '; '.join(errors))
 
     def _nssr_root_finish(self, root, issued, result):
-        """루트 포트 원복: ASPM → (NSSR 이 나갔으면) AER 상태 수집·Surprise Down 지움 → 마스크 원복."""
+        """루트 포트 원복: ASPM → (NSSR 이 나갔으면) AER 상태 수집·Surprise Down 지움 → 마스크 원복.
+        단계마다 따로 시도한다 — 앞 단계가 실패해도 마스크 원복은 반드시 시도한다. → 실패 목록."""
         info = dict(bdf=self.root_bdf, masked=root.masked,
                     devctl2_after_link=result.get('root_devctl2_after_link'),
                     devctl2_saved=result.get('root_devctl2_saved'),
                     aspm_l1_toggled=bool(result.get('root_aspm_l1_off')))
-        try:
-            root.aspm_restore()
-            if issued:
-                info['aer'] = root.collect_aer()
-            root.unmask()
-        except OSError as exc:
-            info['error'] = str(exc)
+        errors = []
+        steps = [('ASPM 원복', root.aspm_restore)]
+        if issued:
+            steps.append(('AER 상태 수집', lambda: info.__setitem__('aer', root.collect_aer())))
+        steps.append(('Surprise Down 마스크 원복', root.unmask))
+        for name, fn in steps:
+            try:
+                fn()
+            except Exception as exc:
+                errors.append(f'{name}: {exc}')
+        if root.masked:                      # unmask 가 예외 없이 끝났어도 상태로 한 번 더 확인
+            errors.append('Surprise Down 마스크가 남아 있음')
+        info['masked'] = root.masked
+        if errors:
+            info['error'] = '; '.join(errors)
         self.emit('root_port', **info)
+        return errors
 
     def restore_supply(self):
         """Only ON/deassert; never cycle power or issue a recovery reset."""
@@ -21872,20 +21893,47 @@ class ExceptionController:
         finally:
             mon.stop()
 
+    _SHUTDOWN_SETTLE_SEC = 0.5               # 관측(자식 프로세스→파이프→스레드)이 따라올 시간
+
+    @staticmethod
+    def _kernel_shutdown_timeout():
+        """커널이 SHST=10b 를 기다리는 최소 시간(s). nvme_core.shutdown_timeout(기본 5).
+        커널은 이 값과 RTD3E 중 큰 쪽(최대 60s)을 쓰므로 이 값은 '적어도 이만큼은 기다린다'의 하한이다."""
+        try:
+            return float(Path('/sys/module/nvme_core/parameters/shutdown_timeout').read_text().strip())
+        except (OSError, ValueError):
+            return 5.0
+
     def _check_shutdown(self, mon):
         """NPO: 전원을 끊기 전에 정상 종료가 끝났는가(Base 2.3 §3.6.1: CC.SHN=01b 뒤 CSTS.SHST=10b 를
-        기다린 다음 전원 차단). orderly remove 가 드라이버에 종료를 시킨다 — BAR 관측으로 확인한다."""
+        기다린 다음 전원 차단). orderly remove 가 드라이버에 종료를 시킨다 — BAR 관측으로 확인한다.
+
+        관측은 별도 프로세스·스레드라 늦게 따라온다. 그리고 remove 가 끝나면 BAR 파일이 사라져
+        관측 공백은 **항상** 생긴다 — 공백 여부로는 미완료를 가를 수 없다. 그래서
+          · 완료(SHST=10b)를 봤으면 OK
+          · SHN 뒤 **커널 종료 대기 하한 이상** SHST≠10b 를 계속 봤으면 미완료 확정(커널이 기다리다
+            포기하고 제거한 것)
+          · 그 밖(관측이 짧았거나 공백)은 UNOBSERVED — 불량으로 세지 않는다."""
         sd = mon.shutdown_snapshot()
+        for _ in range(int(self._SHUTDOWN_SETTLE_SEC / 0.01)):     # 횟수로 상한(시계가 멈춘 시험에서도 끝남)
+            if 'shst' in sd or sd.get('observation_gap'):
+                break
+            time.sleep(0.01)
+            sd = mon.shutdown_snapshot()
         if 'shst' in sd and sd.get('shn_type') == 1:
             self.emit('shutdown_check', status='OK', shn_type=sd.get('shn_type'),
                       elapsed=sd['shst'] - sd['shn'])
-        elif 'shn' in sd and not sd.get('observation_gap'):
+            return
+        watched = (sd['last_seen'] - sd['shn']) if 'shn' in sd and 'last_seen' in sd else 0.0
+        limit = self._kernel_shutdown_timeout()
+        if 'shn' in sd and watched >= limit:
             self.emit('shutdown_check', status='INCOMPLETE', shn_type=sd.get('shn_type'),
-                      last_shst=sd.get('last_shst'))
-            raise ExceptionFailure(f"[장치 측] 정상 종료 미완료 — CC.SHN 뒤 CSTS.SHST=10b 를 못 본 채 "
-                                   f"드라이버가 제거됨(마지막 SHST={sd.get('last_shst')})")
-        else:
-            self.emit('shutdown_check', status='UNOBSERVED')
+                      last_shst=sd.get('last_shst'), watched=watched, kernel_timeout=limit)
+            raise ExceptionFailure(f"[장치 측] 정상 종료 미완료 — CC.SHN 뒤 {watched:.1f}s(커널 대기 하한 "
+                                   f"{limit:g}s) 동안 CSTS.SHST=10b 가 되지 않은 채 드라이버가 제거됨"
+                                   f"(마지막 SHST={sd.get('last_shst')})")
+        self.emit('shutdown_check', status='UNOBSERVED', shn_type=sd.get('shn_type'),
+                  last_shst=sd.get('last_shst'), watched=watched if 'shn' in sd else None)
 
     def _timing_segments(self, profile, marks):
         """(키, 이름, 시작 mark, 끝 mark, 스펙 s). cfg 구간은 스펙이 설정돼 있고 링크가 실제로
