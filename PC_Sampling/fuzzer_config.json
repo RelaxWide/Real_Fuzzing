@@ -143,7 +143,7 @@
     "preflight": {"enabled": true, "attempts_per_kind": 1},
     "seed": 0,
     "tpvperl_sec": 0.1,
-    "_comment_power_seq": "전원 시퀀스는 PCIe 5.0 §6.6.1 의 Fundamental Reset 파라미터(값은 CEM): 전원 ON 뒤 PERST# 를 tpvperl_sec(Tpvperl, 100ms) 이상 유지하고 해제, 전원 차단 시 PERST# assert(Tfail — PMU 명령 간격 때문에 sudden_por 는 전원 OFF 직후 assert), normal_por 는 orderly remove(CC.SHN=01b→SHST=10b, 타이밍 측정 시 확인) → PERST# assert → 전원 OFF. PERST assert·전원 OFF 는 명령 성공 뒤 루트 포트 링크 다운(DLLLA=0)으로 효과를 확인한다(GPIO readback 대신).",
+    "_comment_power_seq": "전원 시퀀스는 PCIe 5.0 §6.6.1 의 Fundamental Reset 파라미터(값은 CEM): 전원 ON 뒤 PERST# 를 tpvperl_sec(Tpvperl, 100ms) 이상 유지하고 해제, 전원 차단 시 PERST# assert(Tfail — PMU 명령 간격 때문에 sudden_por 는 전원 OFF 직후 assert), normal_por 는 orderly remove(CC.SHN=01b→SHST=10b, 관측 가능 시 확인) → 전원 OFF → PERST# assert. 종료와 전원 OFF 사이에 reset을 넣지 않는다. 별도 PMU 호출로 Tfail 준수를 보장하지 않으며 보드 하드웨어 검증이 필요하다. PERST assert·전원 OFF는 루트 포트 DLLLA의 전/후 상태를 구분해 기록한다. 이미 다운이거나 관측 불가이면 이번 주입 효과는 미검증이다.",
     "profiles": [
       {
         "name": "controller_reset",
@@ -186,8 +186,8 @@
         "name": "normal_por",
         "body": [
           {"action": "pci_remove"},
-          {"action": "perst_assert"},
-          {"action": "power_off", "hold_ref": "power.por_poweroff_wait"},
+          {"action": "power_off"},
+          {"action": "perst_assert", "hold_ref": "power.por_poweroff_wait"},
           {"action": "power_on", "hold_ref": "exceptions.tpvperl_sec"},
           {"action": "perst_release"},
           {"action": "pci_rescan_wait"}
@@ -197,7 +197,7 @@
         "ready_timeout_ref": "power.por_boot_wait"
       }
     ],
-    "_comment_timing": "profile.timing: reset(기본) | npo(Normal POR) | spo(Sudden POR). 제품 블록의 exception_timing 이 있으면 복귀를 구간별로 잰다(링크 업→설정 요청 완료, CC.EN→RDY, RDY→admin 가능(커널 live), npo/spo 는 전원 ON→I/O 가능). 스펙을 넘으면 overrun_wait_sec 까지 실제 복귀 시간을 더 잰 뒤 불량(현상 보존·덤프·중단). exception_timing 이 없는 제품은 profile 의 준비 한도만 본다. pci_rescan_wait = 장치가 버스에 나타날 때까지 rescan 반복(고정 대기 없음).",
+    "_comment_timing": "profile.timing: reset(기본) | npo(Normal POR) | spo(Sudden POR). 제품 블록의 exception_timing 이 있으면 복귀를 구간별로 잰다(CC.EN→RDY, RDY→admin 가능(커널 live), npo/spo 는 전원 ON→I/O 가능). 스펙을 넘으면 overrun_wait_sec 까지 실제 복귀 시간을 더 잰 뒤 불량(현상 보존·덤프·중단). exception_timing 이 없는 제품은 profile 의 준비 한도만 본다. 설정 응답 시간은 최소 대기·커널 복원이 포함되어 측정 불가로 표시한다. pci_rescan_wait = 링크 업 연속 100ms 확인 후 장치가 나타날 때까지 rescan 반복.",
     "_comment_perst": "아래 PERST adapter는 현재 시험 보드의 PMU devIdx=1, pinNo=7, 3300mV 설정이다. 다른 보드/슬롯에 그대로 적용할 수 있다는 뜻은 아니다. PMU 명령 16은 assert(Low), 15는 release(High)이다. GPIO readback(20)은 이 보드에서 실패해 쓰지 않고, 효과는 링크 다운으로 확인한다(adapter 에 readback 을 넣으면 여전히 엄격 확인). 실제 주입 후보는 profiles로 선택한다. McToggle(18)과 직접 REFCLK 제어는 등록되어 있지 않다.",
     "adapters": {
       "perst_assert": {

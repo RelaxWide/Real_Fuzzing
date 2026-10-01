@@ -20116,6 +20116,17 @@ def compile_profiles(options, config):
             raise ValueError(f"{name}: timing must be 'reset', 'npo' or 'spo'")
         if timing in ('npo', 'spo') and 'power_on' not in effects:
             raise ValueError(f'{name}: timing={timing} requires a power_on step')
+        if timing == 'npo':
+            shutdown_requested = False
+            for action, _ in steps:
+                effect = action_effect(action, adapters)
+                if action == 'pci_remove':
+                    shutdown_requested = True
+                elif effect in ('power_off', 'power_on'):
+                    shutdown_requested = False
+                elif shutdown_requested and (effect == 'assert' or action in
+                                               ('controller_reset', 'nssr', 'flr', 'hot_reset')):
+                    raise ValueError(f'{name}: reset between orderly remove and power_off invalidates NPO shutdown')
         profiles.append(Profile(name, tuple(steps), timeout, ready, timing))
     return profiles
 
@@ -20286,7 +20297,41 @@ def _link_active(root_bdf, pci=None):
     cap = _pcie_cap_offset(cfg)
     if cap is None or cap + 0x14 > len(cfg):
         return None
+    if not int.from_bytes(cfg[cap + 0x0c:cap + 0x10], 'little') & (1 << 20):
+        return None                             # DLL Active Reporting 미지원은 링크 다운이 아님
     return bool(int.from_bytes(cfg[cap + 0x12:cap + 0x14], 'little') & (1 << 13))
+
+
+class _ResetLinkWatch:
+    """커널 reset 중 루트 포트만 관측한다. 다운 미관측은 링크 유지 규격 통과가 아니다."""
+    def __init__(self, root_bdf):
+        self.root_bdf = root_bdf
+        self.before = None
+        self.down = False
+        self.unknown = False
+        self._stop = threading.Event()
+
+    def sample(self):
+        state = _link_active(self.root_bdf)
+        self.down |= state is False
+        self.unknown |= state is None
+        return state
+
+    def start(self):
+        self.before = self.sample()
+        def loop():
+            while not self._stop.wait(0.001):
+                self.sample()
+        self._thread = threading.Thread(target=loop, daemon=True, name='reset-link')
+        self._thread.start()
+        return self
+
+    def finish(self):
+        self._stop.set()
+        self._thread.join(timeout=1)
+        after = self.sample()
+        return dict(before=self.before, after=after, down_observed=self.down,
+                    observation_gap=self.unknown or self._thread.is_alive())
 
 
 # NSSR 뒤 설정 공간 복원 — 링크 다운(DL_Down)으로 초기화된 레지스터를 NSSR 전 값으로 되쓴다.
@@ -20572,10 +20617,14 @@ class RecoveryMonitor:
     """
 
     def __init__(self, bdf, root_bdf, serial, clock=time.monotonic,
-                 pci=_PCI_DEVICES, nvme=_NVME_CLASS, period=0.001, bar=None):
+                 pci=_PCI_DEVICES, nvme=_NVME_CLASS, period=0.001, bar=None,
+                 observe_config=False):
         self.bdf, self.root_bdf, self.serial = bdf, root_bdf, serial
         self.clock, self.pci, self.nvme, self.period = clock, Path(pci), Path(nvme), period
         self.bar = bar if bar is not None else BarWatcher(self.pci / bdf / 'resource0')
+        # DUT 설정 접근은 리셋/링크 훈련 후 최소 대기가 필요하다. 배포 경로에서는 폴링하지
+        # 않는다. 명시적 접근은 ExceptionController._wait_config_access 뒤에서만 수행한다.
+        self.observe_config = observe_config
         self.marks, self.history, self.gaps = {}, [], []
         self.shutdown = {}                        # 정상 종료 관측: shn / shst 시각
         self._lock = threading.RLock()
@@ -20611,6 +20660,8 @@ class RecoveryMonitor:
                 return None
         off = self._root_cap + 0x12
         if off + 2 > len(cfg):
+            return None
+        if not int.from_bytes(cfg[self._root_cap + 0xc:self._root_cap + 0x10], 'little') & (1 << 20):
             return None
         return bool(int.from_bytes(cfg[off:off + 2], 'little') & (1 << 13))
 
@@ -20650,6 +20701,7 @@ class RecoveryMonitor:
     def _on_regs(self, kind, t, cc, csts):
         if kind in ('U', 'X'):
             self._en = self._rdy = None
+            self.shutdown['observation_gap'] = True
             if kind == 'X':
                 self.gaps.append(('reader_died', t, cc))
             return
@@ -20660,12 +20712,19 @@ class RecoveryMonitor:
         if valid:
             # 정상 종료: CC.SHN(15:14)≠0 을 쓴 시각, CSTS.SHST(3:2)=10b(완료) 시각. 주기와 무관하게
             #   남긴다 — NPO 는 종료 뒤 전원 ON 에서 새 주기를 연다.
-            if (cc >> 14) & 3:
+            shn, shst = (cc >> 14) & 3, (csts >> 2) & 3
+            if not shn and not shst:
+                self.shutdown.clear()           # CLR/새 동작 뒤에 옛 종료 완료를 재사용하지 않음
+            if shn:
                 self.shutdown.setdefault('shn', t)
-                self.shutdown['shn_type'] = (cc >> 14) & 3
-            if (csts >> 2) & 3 == 2 and 'shn' in self.shutdown:
+                self.shutdown['shn_type'] = shn
+            if shst == 2 and 'shn' in self.shutdown:
                 self.shutdown.setdefault('shst', t)
-            self.shutdown['last_shst'] = (csts >> 2) & 3
+            elif 'shst' in self.shutdown:
+                self.shutdown.pop('shst')
+            self.shutdown['last_shst'] = shst
+        else:
+            self.shutdown['observation_gap'] = True
         en = bool(cc & 1) if valid else None
         rdy = bool(csts & 1) if valid else None
         allow = not self._fresh_map               # 매핑 직후 첫 값: 상태만 갱신, 전환 아님
@@ -20691,7 +20750,7 @@ class RecoveryMonitor:
     def sample_cfg(self):
         dl = self._dllla()
         t_dl = self.clock()
-        ok = self._vendor_ok()
+        ok = self._vendor_ok() if self.observe_config else None
         t_ok = self.clock()
         with self._lock:
             if dl is not None:
@@ -20741,6 +20800,10 @@ class RecoveryMonitor:
     def snapshot(self):
         with self._lock:
             return dict(self.marks)
+
+    def shutdown_snapshot(self):
+        with self._lock:
+            return dict(self.shutdown)
 
     # ── 스레드 ──
     def _loop(self, fn):
@@ -21076,9 +21139,15 @@ class ExceptionController:
                    f"CFS={int(bool(r.get('cfs')))} {'OK' if ok else '✗'} — {link}", error=not ok)
 
     def _show_link_check(self, r):
-        d = r.get('down_sec')
-        self._line(f"      링크 다운 확인 +{_fmt_dur(d)}" if d is not None else
-                   "      ✗ 링크가 내려가지 않음", error=d is None)
+        self._line(f"      {r.get('action')}: 링크 {r.get('before')} → {r.get('after')} "
+                   f"[{r.get('status')}] {r.get('reason', '')}", error=r.get('status') == 'FAILED')
+
+    def _show_reset_link(self, r):
+        self._line(f"      {r['action']} 링크 관측: {r['status']} — "
+                   "복귀 성공과 reset 규격 전체 검증은 별개", error=r['status'] == 'ANOMALY')
+
+    def _show_config_access(self, r):
+        self._line("      설정 접근: 링크 업 연속 100ms 확인 후 접근 허용")
 
     _SHN_TEXT = {1: '정상(01b)', 2: '급종료(10b)'}
 
@@ -21147,7 +21216,7 @@ class ExceptionController:
         if r.get('profile') == 'refclk_toggle':
             return                              # 요약표에만 싣는다
         if st == 'PASS':
-            self._say(f"    → PASS  ({r.get('elapsed_sec', 0):.1f}s)")
+            self._say(f"    → PASS  ({r.get('elapsed_sec', 0):.1f}s, 복귀 확인 — 세부 주입 관측은 별도)")
         elif st == 'UNVERIFIED':
             self._say("    → 미검증 (능동 시험을 설정으로 끔 — 지원 여부만 확인)")
         else:
@@ -21269,6 +21338,8 @@ class ExceptionController:
             self._rescan_until_present(deadline)
             return
         elif action in ('pci_remove', 'pci_rescan'):
+            if action == 'pci_rescan':
+                self._wait_config_access(deadline)
             self._reenumerated = True
             path = ('/sys/bus/pci/devices/' + self.bdf + '/remove' if action == 'pci_remove'
                     else '/sys/bus/pci/rescan')
@@ -21285,6 +21356,10 @@ class ExceptionController:
             argv = [x.replace('{device}', self.device).replace('{pmu_script}', self.pmu_script)
                     for x in adapter['argv']]
             effect = adapter.get('effect', 'none')
+        checking_link = effect in ('power_off', 'assert', 'deassert') and not getattr(self, '_restoring', False)
+        before_link = _link_active(self.root_bdf) if checking_link else None
+        watch = None
+        link_result = None
         # Track uncertain OFF/assert BEFORE execution: even a failing helper may
         # have changed the board. ON/deassert become confirmed only after rc=0.
         if effect == 'power_off':
@@ -21293,24 +21368,47 @@ class ExceptionController:
             self.asserted = True
         self.emit('action_command', action=action, argv=argv,
                   remaining_sec=max(0, deadline - self.clock()))
-        rc, _, err = self.runner.run(
-            argv, deadline, supply_control=(action in self.options.get('adapters', {})
-                                            or effect in ('power_off', 'power_on', 'assert', 'deassert')))
+        watch = _ResetLinkWatch(self.root_bdf).start() if action in ('flr', 'hot_reset') else None
+        try:
+            rc, _, err = self.runner.run(
+                argv, deadline, supply_control=(action in self.options.get('adapters', {})
+                                                or effect in ('power_off', 'power_on', 'assert', 'deassert')))
+        finally:
+            if watch is not None:
+                link_result = watch.finish()
+                anomalous = action == 'flr' and link_result['before'] is True and link_result['down_observed']
+                status = ('ANOMALY' if anomalous else 'UNVERIFIED' if
+                          link_result['before'] is not True or link_result['observation_gap'] else
+                          'DOWN_OBSERVED' if link_result['down_observed'] else 'NO_DROP_OBSERVED')
+                self.emit('reset_link', action=action, status=status, **link_result)
         if rc:
             raise ExceptionFailure(f'{action}: rc={rc}: {err.decode(errors="replace")[:300]}')
+        if watch is not None and anomalous:
+            raise ExceptionFailure('FLR 중 링크 다운 관측 — 정상 복귀해도 이상을 보존함 '
+                                   '(장치/호스트 원인은 별도 분석 필요)')
+        self._supply_return_at = self.clock()     # 아래 링크 대기는 전원/해제 기준 시각에 넣지 않음
         if effect == 'power_on':
             self.powered = True
         elif effect == 'deassert':
-            self.asserted = False
-        if effect in ('power_off', 'assert') and not getattr(self, '_restoring', False):
-            # 명령 성공 ≠ 효과. 전원 차단·PERST assert 는 링크를 떨어뜨린다(Fundamental Reset) —
-            #   GPIO readback 대신 루트 포트 DLLLA 로 확인한다(루트 포트를 모르면 확인 생략).
-            down = self._wait_link(False, min(deadline, self.clock() + 1.0))
-            if down is not None:
-                self.emit('link_check', action=action, down_sec=down if down is not False else None)
-            if down is False:
+            self.asserted = checking_link        # 링크 업 실패면 해제 미확인 상태를 유지
+        if checking_link:
+            want = effect == 'deassert'
+            elapsed = self._wait_link(want, deadline if want else min(deadline, self.clock() + 1.0))
+            verified = elapsed is not None and elapsed is not False and before_link is (not want)
+            status = 'FAILED' if elapsed is False else 'OBSERVED' if verified else 'UNVERIFIED'
+            reason = ('전환 관측' if verified else '기한 내 원하는 링크 상태에 도달하지 않음' if elapsed is False
+                      else '루트 포트 관측 불가' if elapsed is None or before_link is None
+                      else '주입 전부터 같은 상태 — 이번 동작의 효과는 미검증')
+            self.emit('link_check', action=action, before=before_link,
+                      after=want if elapsed is not None and elapsed is not False else None,
+                      status=status, reason=reason, elapsed_sec=elapsed)
+            if elapsed is False:
+                if want:
+                    raise ExceptionFailure(f'{action}: 해제 뒤 링크 업 기한 초과')
                 raise ExceptionFailure(f'[호스트 측] {action} 명령은 성공했지만 1s 안에 링크가 내려가지 '
                                        f'않음 — 배선·핀·전원 경로 확인')
+            if want:
+                self.asserted = False
         adapter = self.options.get('adapters', {}).get(action, {})
         if 'readback' in adapter:
             if effect == 'deassert':
@@ -21334,6 +21432,7 @@ class ExceptionController:
         rescan 했다 — 그 대기만으로 NPO 0.5s 같은 스펙을 넘어 복귀 시간을 잴 수 없었다.
         링크가 아직이면 rescan 은 아무것도 못 찾고 빨리 끝나므로 반복해도 무해하다.
         처음 1초는 20ms, 이후 100ms 간격."""
+        self._wait_config_access(deadline)
         argv = ['sh', '-c', 'echo 1 > /sys/bus/pci/rescan']
         if sub:                                   # 다른 동작(nssr)의 한 단계
             self.emit('nssr_step', step='rescan', argv=argv)
@@ -21387,6 +21486,36 @@ class ExceptionController:
                 return False
             time.sleep(0.001)
 
+    def _wait_config_access(self, deadline):
+        """PCIe 5.0 §6.6.1: DUT 구성 요청 전 링크 업을 100ms 연속 확인.
+
+        Root Port만 읽는다. 다운/관측 공백이면 대기를 다시 시작한다. 저속 포트에도 같은
+        보수적 기준을 사용하며, 관측 불가를 대기 완료로 취급하지 않는다.
+        """
+        since = None
+        while self.clock() < deadline:
+            up = _link_active(self.root_bdf)
+            now = self.clock()
+            if up is None:
+                raise ExceptionFailure('설정 접근 보류: 루트 포트 링크 관측 불가(호스트 설정 확인 필요)')
+            if up:
+                if since is None:
+                    since = now
+                if now - since >= 0.1:
+                    self.emit('config_access', link_up_sec=now - since)
+                    return
+            else:
+                since = None
+            time.sleep(min(0.005, max(0, deadline - self.clock())))
+        raise ExceptionFailure('설정 접근 대기 초과: 링크 업 연속 100ms를 확인하지 못함')
+
+    def _pending_firmware_slot(self, deadline):
+        # Firmware Slot Information log AFI[6:4]: next-reset activation slot. 0도 '미보고'이며
+        # 활성화가 없다는 증거가 아니다(Base 2.3 Fig.212). helper timeout은 삼키지 않는다.
+        rc, out, _ = self.runner.run(['nvme', 'get-log', self.device, '--log-id=3',
+                                      '--log-len=512', '--raw-binary'], deadline)
+        return ((out[0] >> 4) & 7) if rc == 0 and len(out) == 512 else None
+
     def _config_valid(self, saved):
         """DUT 설정 공간이 NSSR 전과 같은 Vendor/Device ID 로 읽히는가. FFFF(응답 없음)·0001(CRS
         소프트웨어 가시성 — 아직 준비 중)은 아니다."""
@@ -21427,12 +21556,15 @@ class ExceptionController:
             driver = (dev / 'driver').resolve().name if (dev / 'driver').exists() else None
         except OSError:
             driver = None
-        issued = enabled = False
+        issued = enabled = unbound = False
         root = None
         result = dict(driver=driver)
         try:
+            pending_slot = self._pending_firmware_slot(deadline)
+            result['pending_firmware_slot'] = pending_slot
             if driver:
                 self._sysfs_write('unbind', _PCI_BUS / 'drivers' / driver / 'unbind', self.bdf, deadline)
+                unbound = True
             # unbind 뒤 메모리 디코드가 꺼질 수 있다(커널마다 다름) — BAR0 에 쓰려면 켜 둔다
             self._sysfs_write('enable', dev / 'enable', '1', deadline)
             enabled = True
@@ -21462,11 +21594,12 @@ class ExceptionController:
             issued = True                     # 쓰기 직후 링크가 떨어져 자식이 신호로 죽어도 쓰기는 나갔다
             # 3) 링크 다운 → 링크 업 → 설정 응답
             down = self._wait_link(False, min(deadline, self.clock() + 1.0))
-            result['link_down_sec'] = (self.clock() - t0) if down not in (None, False) else down
+            result['link_down_sec'] = (self.clock() - t0) if down is not None and down is not False else down
             up = self._wait_link(True, deadline)
             if up is False:
                 raise ExceptionFailure('[장치 측] NSSR 뒤 링크가 한도 안에 돌아오지 않음 (DLLLA=0)')
             result['link_up_sec'] = None if up is None else self.clock() - t0
+            self._wait_config_access(deadline)
             if not dev.exists():
                 # hotplug 가 장치를 뺐다 — 커널이 다시 넣게 두고(없으면 rescan) 그 결과를 따른다
                 self._rescan_until_present(deadline, sub=True)
@@ -21510,12 +21643,12 @@ class ExceptionController:
                 raise ExceptionFailure(f"[장치 측] NSSR 뒤 CSTS 읽기 실패: "
                                        f"{info.get('ERR') or err or f'rc={rc} CSTS={csts}'}")
             result.update(issued=True, csts=csts, nssro=bool(csts & 0x10), cfs=bool(csts & 2))
+            if not csts & 0x10:
+                result['nssro_unverified'] = ('새 펌웨어 활성화 예정 — NSSRO=0 허용 예외 가능' if pending_slot
+                                              else '펌웨어 활성화 예정 상태 미확인/미보고 — NSSRO=0 단독 불량 판정 불가')
             self.emit('nssr_result', **result)
             if csts & 2:
                 raise ExceptionFailure(f'[장치 측] NSSR 뒤 CSTS.CFS=1 (CSTS=0x{csts:08x})')
-            if not csts & 0x10:
-                raise ExceptionFailure(f'[장치 측] NSSR 스펙 위반: 전원 인가 중 NSSR 인데 CSTS.NSSRO=0 '
-                                       f'(CSTS=0x{csts:08x}, Base 2.3 Fig.42)')
             # 6) 드라이버 복귀 — 켜 둔 enable 을 먼저 되돌려 사용 횟수를 맞춘다
             self._sysfs_write('disable', dev / 'enable', '0', deadline, check=False)
             self._sysfs_write('probe', _PCI_BUS / 'drivers_probe', self.bdf, deadline)
@@ -21527,7 +21660,7 @@ class ExceptionController:
                 end = self.clock() + self.cleanup_timeout
                 if enabled:
                     self._sysfs_write('disable', dev / 'enable', '0', end, check=False)
-                if driver:
+                if unbound:
                     self._sysfs_write('rebind', _PCI_BUS / 'drivers_probe', self.bdf, end, check=False)
             raise
         finally:
@@ -21714,6 +21847,7 @@ class ExceptionController:
                     cycles += 1
                     self._t0_action = action
                 # rescan 반복은 복귀 측정의 일부 — 스펙+초과 측정 시간까지 기다린다.
+                self._supply_return_at = None
                 try:
                     self._action(action, (t0 + self._timing_budget(profile) + spec.overrun_wait)
                                  if action == 'pci_rescan_wait' and t0 is not None else deadline)
@@ -21722,7 +21856,8 @@ class ExceptionController:
                 # 전원 ON 뒤의 PERST 해제(Tpvperl)는 같은 전원 복귀의 일부 — NPO/SPO 기준은 전원 ON
                 if (action not in self._T0_AT_START and effect in ('power_on', 'deassert')
                         and not (effect == 'deassert' and t0_effect == 'power_on')):
-                    t0, t0_what, t0_effect = self.clock(), f'{action} 반환', effect
+                    t0 = self._supply_return_at if self._supply_return_at is not None else self.clock()
+                    t0_what, t0_effect = f'{action} 반환', effect
                     mon.begin_cycle(t0)
                     cycles += 1
                     self._t0_action = action
@@ -21741,13 +21876,13 @@ class ExceptionController:
             mon.stop()
 
     def _check_shutdown(self, mon):
-        """NPO: 전원을 끊기 전에 정상 종료가 끝났는가(Base 2.3 §3.6.2: CC.SHN=01b 뒤 CSTS.SHST=10b 를
+        """NPO: 전원을 끊기 전에 정상 종료가 끝났는가(Base 2.3 §3.6.1: CC.SHN=01b 뒤 CSTS.SHST=10b 를
         기다린 다음 전원 차단). orderly remove 가 드라이버에 종료를 시킨다 — BAR 관측으로 확인한다."""
-        sd = dict(mon.shutdown)
-        if 'shst' in sd:
+        sd = mon.shutdown_snapshot()
+        if 'shst' in sd and sd.get('shn_type') == 1:
             self.emit('shutdown_check', status='OK', shn_type=sd.get('shn_type'),
                       elapsed=sd['shst'] - sd['shn'])
-        elif 'shn' in sd:
+        elif 'shn' in sd and not sd.get('observation_gap'):
             self.emit('shutdown_check', status='INCOMPLETE', shn_type=sd.get('shn_type'),
                       last_shst=sd.get('last_shst'))
             raise ExceptionFailure(f"[장치 측] 정상 종료 미완료 — CC.SHN 뒤 CSTS.SHST=10b 를 못 본 채 "
@@ -21805,9 +21940,8 @@ class ExceptionController:
             return 4096
 
     def _io_probe(self, deadline):
-        """I/O 서비스 가능 시각: 네임스페이스 Read 1블록이 **완료된** 순간(성공이든 NVMe 오류
-        상태든). 퍼징이 그 영역에 WriteUncorrectable 을 했으면 읽기 오류가 정상 결과다 —
-        완료된 오류와 '응답 없음'을 구분한다. → (시각, 설명) 또는 (None, 마지막 설명)."""
+        """Read 성공 또는 unrecovered read error 완료 시각. WriteUncorrectable로 인한 오류는
+        허용하지만 Namespace Not Ready 등 다른 실패를 서비스 가능으로 세지 않는다."""
         ns = f'{self.device}n{self.namespace}'
         last = '네임스페이스 노드 없음'
         while self.clock() < deadline:
@@ -21819,7 +21953,10 @@ class ExceptionController:
                 if rc == 0:
                     return self.clock(), '읽기 성공'
                 m = re.search(r'NVMe status:?\s*([^\n]+)', text)
-                if m:                                   # 장치가 상태를 돌려줬다 = I/O 서비스 가능
+                code = re.search(r'\(0x([0-9a-fA-F]+)\)', m.group(1)) if m else None
+                read_error = (int(code.group(1), 16) & 0x7ff) == 0x281 if code else bool(
+                    m and 'UNRECOVERED_READ_ERROR' in m.group(1))
+                if read_error:
                     return self.clock(), f'오류 상태로 완료: {m.group(1).strip()[:80]}'
                 last = f'rc={rc} {text.strip().splitlines()[-1][:80] if text.strip() else ""}'.strip()
             time.sleep(0.005)
@@ -21859,11 +21996,11 @@ class ExceptionController:
         locked = getattr(self, '_t0_action', None) in ('flr', 'hot_reset')
         for key, label, a, b, limit in self._timing_segments(profile, marks):
             side = None
-            if key == 'cfg_after_ts' and locked:
+            if key == 'cfg_after_ts' and (locked or getattr(mon, 'observe_config', False) is False):
                 # 커널 PCI 리셋은 끝날 때까지(드라이버 reset_done 포함) 사용자 설정 공간 접근을
                 #   잠근다(pci_dev_lock) — 설정 응답 시각이 커널 잠금 해제 시각으로 찍혀 장치 시간이 아니다
                 measured, verdict = None, 'N/A'
-                side = '커널이 리셋 중 설정 공간 접근을 잠가 장치 시간 분리 불가'
+                side = '설정 접근 최소 대기/커널 복원 포함 — 장치 준비 시간 별도 측정 불가'
             elif b in marks and a in marks:
                 measured = marks[b] - marks[a]
                 if measured < 0:
@@ -21946,6 +22083,9 @@ class ExceptionController:
             self.emit('resume_feature', fid=fid, before=before, after=after, status='VERIFIED')
 
     def capability(self, profile):
+        if (any(a in ('pci_rescan', 'pci_rescan_wait') for a, _ in profile.steps)
+                and _link_active(getattr(self, 'root_bdf', None)) is None):
+            return 'UNCONFIGURED', '설정 접근 대기에 필요한 루트 포트 DLLLA 관측 불가'
         for action, _ in profile.steps:
             if action in ('flr', 'hot_reset'):
                 result = pci_method_support(self.bdf, 'flr' if action == 'flr' else 'bus')

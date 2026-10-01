@@ -40,6 +40,7 @@ class FakeSys:
         cfg[6] = 0x10                    # status: capability list
         cfg[0x34] = 0x40
         cfg[0x40] = 0x10                 # PCI Express cap
+        cfg[0x4C:0x50] = struct.pack('<I', 1 << 20)  # DLL Active Reporting capable
         (self.rp_real / 'config').write_bytes(bytes(cfg))
         (self.pci / RP).symlink_to(self.rp_real)
         self.add_dut()
@@ -118,7 +119,7 @@ class Monitor(unittest.TestCase):
         self.now = 0.0
         clock = lambda: self.now
         self.m = v.RecoveryMonitor(DUT, RP, 'SN1', clock=clock, pci=self.fs.pci, nvme=self.fs.nvme,
-                                   bar=FakeBar(self.fs.pci / DUT / 'resource0', clock))
+                                   bar=FakeBar(self.fs.pci / DUT / 'resource0', clock), observe_config=True)
 
     def at(self, t):
         self.now = t
@@ -208,6 +209,7 @@ class Monitor(unittest.TestCase):
 class FakeMon:
     def __init__(self, marks, status=None):
         self.marks, self._status, self.gaps, self.history = marks, status or {}, [], []
+        self.observe_config = True  # synthetic timestamps; no real configuration requests
 
     def snapshot(self):
         return dict(self.marks)
@@ -367,7 +369,7 @@ class T0AndProfiles(unittest.TestCase):
         c._timing_wait = Mock()
         mon = Mock()
         mon.start.return_value = mon
-        mon.shutdown = {}
+        mon.shutdown_snapshot.return_value = {}
         c._new_monitor = Mock(return_value=mon)
         c._run_profile(v.Profile('x', steps, 60, 30, timing))
         self.cycles = mon.begin_cycle.call_count
@@ -471,6 +473,7 @@ class RescanLoop(unittest.TestCase):
                 fs.add_dut()
             return 0, b'', b''
         c.runner.run = run
+        c._wait_config_access = Mock()  # gate is tested separately
         with patch.object(v, '_PCI_DEVICES', fs.pci), patch.object(v.time, 'sleep'):
             c._rescan_until_present(10.0)
         self.assertEqual(len(calls), 3)
@@ -500,7 +503,7 @@ class ProductConfig(unittest.TestCase):
                 self.assertEqual(acts[acts.index('power_on') + 1], 'perst_release', n)
                 self.assertLess(acts.index('perst_assert'), acts.index('power_on'), n)
         acts = [a for a, _ in profs['normal_por'].steps]
-        self.assertEqual(acts[:3], ['pci_remove', 'perst_assert', 'power_off'])   # 정상 종료 → PERST → OFF
+        self.assertEqual(acts[:3], ['pci_remove', 'power_off', 'perst_assert'])   # 종료와 OFF 사이 CLR 금지
         acts = [a for a, _ in profs['sudden_por'].steps]
         self.assertEqual(acts[:2], ['power_off', 'perst_assert'])                  # 급차단 → PERST (Tfail)
 

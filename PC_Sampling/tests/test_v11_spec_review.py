@@ -26,7 +26,7 @@ class StampAfterRead(unittest.TestCase):
         self.now = [0.0]
         clock = lambda: self.now[0]
         self.m = v.RecoveryMonitor(DUT, RP, 'SN1', clock=clock, pci=self.fs.pci, nvme=self.fs.nvme,
-                                   bar=FakeBar(self.fs.pci / DUT / 'resource0', clock))
+                                   bar=FakeBar(self.fs.pci / DUT / 'resource0', clock), observe_config=True)
 
     def test_blocked_config_read_does_not_backdate_marks(self):
         self.m.sample()
@@ -99,7 +99,7 @@ class PowerSequenceT0(unittest.TestCase):
         c._timing_wait = Mock()
         mon = Mock()
         mon.start.return_value = mon
-        mon.shutdown = {'shn': 1.0, 'shst': 1.2, 'shn_type': 1}
+        mon.shutdown_snapshot.return_value = {'shn': 1.0, 'shst': 1.2, 'shn_type': 1}
         c._new_monitor = Mock(return_value=mon)
         c._run_profile(v.Profile('x', steps, 60, 30, timing))
         return c, mon
@@ -128,12 +128,12 @@ class NormalShutdown(unittest.TestCase):
     def test_check(self):
         c = controller(self)
         with self.assertLogs('pcfuzz', level='WARNING') as logs:
-            c._check_shutdown(Mock(shutdown={'shn': 1.0, 'shst': 1.25, 'shn_type': 1}))
+            c._check_shutdown(Mock(shutdown_snapshot=Mock(return_value={'shn': 1.0, 'shst': 1.25, 'shn_type': 1})))
         self.assertIn('정상 종료 확인: CC.SHN 정상(01b) → CSTS.SHST=10b 250ms', '\n'.join(logs.output))
         with self.assertLogs('pcfuzz', level='WARNING'):
             with self.assertRaisesRegex(v.ExceptionFailure, r'\[장치 측\] 정상 종료 미완료'):
-                c._check_shutdown(Mock(shutdown={'shn': 1.0, 'shn_type': 1, 'last_shst': 1}))
-            c._check_shutdown(Mock(shutdown={}))          # 관측 못함 = 판정 생략
+                c._check_shutdown(Mock(shutdown_snapshot=Mock(return_value={'shn': 1.0, 'shn_type': 1, 'last_shst': 1})))
+            c._check_shutdown(Mock(shutdown_snapshot=Mock(return_value={})))          # 관측 못함 = 판정 생략
 
 
 class EffectByLink(unittest.TestCase):
@@ -167,7 +167,7 @@ class EffectByLink(unittest.TestCase):
         self.fs.link(False)
         with patch.object(v.time, 'sleep'), self.assertLogs('pcfuzz', level='WARNING') as logs:
             self.c._action('power_off', self.c.clock() + 30)
-        self.assertIn('링크 다운 확인', '\n'.join(logs.output))
+        self.assertIn('UNVERIFIED', '\n'.join(logs.output))
 
     def test_no_root_port_skips_check(self):
         self.c.root_bdf = None
@@ -259,6 +259,7 @@ def root_cfg():
     cfg[6] = 0x10
     cfg[0x34] = 0x40
     cfg[0x40] = 0x10
+    struct.pack_into('<I', cfg, 0x4C, 1 << 20)                # DLL Active Reporting capable
     struct.pack_into('<H', cfg, 0x40 + 0x10, 0x0042)            # LnkCtl: ASPM L1 + CCC
     struct.pack_into('<H', cfg, 0x40 + 0x12, 1 << 13)           # LnkSta: DLLLA
     struct.pack_into('<H', cfg, 0x40 + 0x28, 0x0400)            # DevCtl2: LTR enable

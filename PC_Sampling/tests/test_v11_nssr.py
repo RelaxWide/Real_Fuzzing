@@ -52,6 +52,7 @@ class Runner:
         self.csts_after, self.hotplug = csts_after, hotplug
         self.arm_out = arm_out or f'CMD 6\nCAP {NSSRS | 0xFF}\nCSTS 1\nARMED\nWROTE\n'
         self.pending = []
+        self.fw_log = bytes(512)
         self.down = False
         (fs.dut_real / 'config').write_bytes(CONFIG)
 
@@ -71,6 +72,9 @@ class Runner:
                 (self.fs.dut_real / 'config').write_bytes(CONFIG[:0x10] + bytes(len(CONFIG) - 0x10))
 
     def run(self, argv, deadline, **_):
+        if argv[:2] == ['nvme', 'get-log']:
+            self.log.append('fw-log')
+            return 0, self.fw_log, b''
         if argv[:2] == ['sh', '-c']:
             self.log.append('rescan')
             return 0, b'', b''
@@ -135,11 +139,11 @@ class NssrSequence(unittest.TestCase):
         self.c._nssr_trigger = lambda t: order.append(list(r.log))
         err, text = self.run_nssr(r)
         self.assertIsNone(err, text)
-        self.assertEqual(r.log, ['unbind', 'enable=1', 'helper:arm', 'cfg_restore', 'helper:csts',
+        self.assertEqual(r.log, ['fw-log', 'unbind', 'enable=1', 'helper:arm', 'cfg_restore', 'helper:csts',
                                  'enable=0', 'drivers_probe'])
         self.assertNotIn('remove', r.log)
         self.assertNotIn('rescan', r.log)                          # 재열거 = 드라이버 자동 연결
-        self.assertEqual(order, [['unbind', 'enable=1']])         # t0: unbind 뒤 NSSR 쓰기 직전
+        self.assertEqual(order, [['fw-log', 'unbind', 'enable=1']])         # t0: unbind 뒤 NSSR 쓰기 직전
         # 설정 공간이 NSSR 전 값으로 돌아왔다(BAR0·Command)
         self.assertEqual((self.fs.dut_real / 'config').read_bytes(), CONFIG)
         self.assertTrue((self.fs.dut_real / 'driver').exists())
@@ -148,11 +152,12 @@ class NssrSequence(unittest.TestCase):
         self.assertTrue(self.c._reenumerated)                      # nvmeN 재해석
         self.assertNotIn('subsystem-reset', text)
 
-    def test_nssro_clear_is_device_spec_violation_and_preserved(self):
+    def test_nssro_clear_with_slot_zero_is_unverified_not_device_failure(self):
         r = Runner(self.fs, self.bus, csts_after=0x0)
         err, text = self.run_nssr(r)
-        self.assertRegex(str(err), r'\[장치 측\] NSSR 스펙 위반.*NSSRO=0')
-        self.assertNotIn('drivers_probe', r.log)                  # 현상 보존: 드라이버 붙이지 않음
+        self.assertIsNone(err)
+        self.assertIn('NSSRO 확인 불가', text)
+        self.assertIn('drivers_probe', r.log)  # AFI.NAFS=0 means not reported, not no activation
 
     def test_cfs_after_reset_fails(self):
         r = Runner(self.fs, self.bus, csts_after=0x12)

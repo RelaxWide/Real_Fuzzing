@@ -171,11 +171,11 @@ v10.3 진입점은 exceptions를 사용하지 않는다. v11 출력은 `output/p
 | hot_reset | 정확히 bus 방식이 있고 같은 부모 버스 범위에 DUT 외 PCI 기능이 없을 때 실행 |
 | warm_reset_perst | PERST assert(링크 다운 확인, 0.1s 유지 ≥ Tperst) → host remove → release → rescan 반복. 주전원/REFCLK 조작 없음 |
 | sudden_por | 전원 OFF → PERST assert(Tfail, 명령 간격만큼 늦음) → host remove → OFF 대기 → ON → **Tpvperl 0.1s** → PERST release → rescan 반복 |
-| normal_por | host orderly remove(CC.SHN=01b→**SHST=10b 확인**) → PERST assert → OFF → OFF 대기 → ON → **Tpvperl 0.1s** → PERST release → rescan 반복 |
+| normal_por | host orderly remove(CC.SHN=01b→**SHST=10b 관측 가능 시 확인**) → OFF → PERST assert → OFF 대기 → ON → **Tpvperl 0.1s** → PERST release → rescan 반복 |
 
 **SPOR 과 NPOR 의 차이** — 두 profile 모두 퍼징 명령이 도는 중에 주입된다. 차이는 전원을 끊기 전의
 정상 종료 통지다: NPOR 은 드라이버 orderly remove 가 I/O 큐를 지우고 CC.SHN=01b 를 쓴 뒤
-CSTS.SHST=10b 를 기다리고(Base 2.3 §3.6.2) PERST → 전원 OFF, SPOR 은 통지 없이 전원 OFF → PERST.
+CSTS.SHST=10b 를 기다리고(Base 2.3 §3.6.1) 전원 OFF → PERST, SPOR 은 통지 없이 전원 OFF → PERST.
 NPOR 은 전원 OFF 직전에 BAR 관측으로 SHN→SHST=10b 를 확인한다(아래 타이밍 절). 복귀 스펙도 다르다
 (BM9K1: NPO 0.5s, SPO 20s).
 
@@ -196,17 +196,17 @@ NSSR의 NQN 범위 검사는 보수적이므로 placeholder NQN이 중복되면 
 | PCIe 5.0 §2.9.1 (p.206) | Upstream Port DL_Down = 리셋 → BAR·Command 포함 PCIe 레지스터 초기화 |
 | PCIe 5.0 §6.6.1 (p.553) | 설정 요청은 링크 학습 완료 뒤, 장치는 리셋 뒤 1.0s 안에 정상 완료해야 함 |
 | Base 2.3 §3.7.2 (p.120) | CLR 뒤 호스트: transport 상태 갱신 → CC.EN=1 → RDY 대기 → admin/I/O 큐 |
-| Base 2.3 Fig.42 (p.88) | 전원 인가 중 NSSR 이면 CSTS.NSSRO 초기값 1 |
+| Base 2.3 Fig.42 (p.63) | 전원 인가 중 NSSR은 NSSRO=1. 새 펌웨어 활성화를 일으킨 NSSR은 0 예외 |
 | Base 2.3 §9.5 (p.743) | NSSR 은 링크 다운을 일으킬 수 있고 호스트에 따라 위험 |
 
 실행 순서(모든 sysfs 쓰기·BAR0 접근은 한도가 있는 자식 프로세스):
 
-1. 드라이버 unbind, 메모리 디코드 켬(unbind 뒤 꺼질 수 있음), **설정 공간 저장**.
+1. Firmware Slot Information log의 AFI.NAFS를 진단용으로 읽고, 드라이버 unbind, 메모리 디코드 켬(unbind 뒤 꺼질 수 있음), **설정 공간 저장**.
    unbind 는 드라이버 정상 종료(CC.SHN)를 보내므로 NSSR 은 **I/O 가 없는 상태**에서 나간다
 2. BAR0 NSSR 쓰기 — 남아 있던 NSSRO 를 먼저 지우고(RW1C) 4E564D65h. **이 순간이 t0**
-3. 링크 다운(DLLLA 0, 최대 1s 관측) → 링크 업 → 설정 요청이 NSSR 전과 같은 Vendor/Device ID 로
-   응답할 때까지(FFFF·CRS 0001 은 준비 안 됨). 이 구간은 호스트 개입이 없어 `cfg_after_ts` 가
-   장치 시간 그대로 잡힌다
+3. 링크 다운(DLLLA 0, 최대 1s 관측) → 링크 업 연속 100ms 확인 → 설정 요청이 NSSR 전과 같은 Vendor/Device ID로
+   응답할 때까지 대기(FFFF·CRS 0001은 준비 안 됨). PCIe §6.6.1의 최소 대기 중 DUT 설정 접근은 하지 않는다.
+   실제 장치의 최초 준비 시각은 분리할 수 없으므로 `cfg_after_ts` 규격 판정은 측정 불가다.
 4. **설정 공간 복원** — 커널 `pci_restore_state` 가 복원하는 소프트웨어 설정을 되쓴다(순서 포함):
    ReBAR 크기 → BAR0~5·ROM·캐시라인/지연·인터럽트 라인 → LTR 최대 지연 → L1SS(Ctl2 → Ctl1
    enable 없이 → Ctl1) → PTM → ATS → AER(UE 마스크·심각도, CE 마스크, ECRC 제어) →
@@ -227,8 +227,9 @@ NSSR의 NQN 범위 검사는 보수적이므로 placeholder NQN이 중복되면 
      ASPM L1 을 끈 상태에서 설정 p.488)
    - 끝: ASPM 원복 → AER 상태 읽어 Surprise Down 은 **예상된 이벤트**로 기록·지움(RW1C), 그 밖의
      UE/CE 는 지우지 않고 경고로 표시 → 마스크 원복(실패 경로 포함)
-5. CSTS 읽기: **NSSRO=1, CFS=0** 이어야 함. NSSRO=0 은 `[장치 측] NSSR 스펙 위반`,
-   CFS=1·링크 미복귀·설정 무응답·CSTS 읽기 실패도 장치 측 불량
+5. CSTS 읽기: **CFS=0** 확인. NSSRO=1이면 발생 증거로 기록한다. NSSRO=0은 새 펌웨어 활성화 시 허용된다
+   (Base 2.3 Fig.42). AFI.NAFS=0도 활성화 예정 **미보고**일 뿐 없음의 증거가 아니므로(Fig.212),
+   NSSRO=0 단독으로 불량을 선언하지 않고 미검증 사유를 기록한다. CFS=1·링크 미복귀·설정 무응답·CSTS 읽기 실패는 중단한다.
 6. enable 원복, `drivers_probe` → 드라이버가 CC.EN→RDY→live. 이후는 다른 profile 과 같은
    RDY/타이밍/Identify/환경 복원
 
@@ -641,14 +642,14 @@ v11 전송·calibration·종료·복구 테스트는 v11 모듈을 직접 검사
       · 메모리 디코드 켬 — echo 1 > /sys/bus/pci/devices/0000:02:00.0/enable
       · BAR0 NSSR ← 4E564D65h
       · 설정 공간 복원(BAR·Command·PCIe 제어, NSSR 전 저장값)
-      NSSR 확인: CSTS=0x00000000 NSSRO=0 CFS=0 ✗ — 링크 다운 +2ms · 링크 업 +180ms · 설정 응답 +230ms
+      NSSR 확인: CSTS=0x00000002 NSSRO=0 CFS=1 ✗ — 링크 다운 +2ms · 링크 업 +180ms · 설정 응답 +230ms
     → FAIL — 현상 보존  (0.6s)
-      원인: [장치 측] NSSR 스펙 위반: 전원 인가 중 NSSR 인데 CSTS.NSSRO=0 (CSTS=0x00000000, Base 2.3 Fig.42)
+      원인: [장치 측] NSSR 뒤 CSTS.CFS=1 (CSTS=0x00000002)
 ============================================================
 [Exception-Preflight] 결과 요약
   Profile            결과          시간  사유
   controller_reset   PASS          2.3s  RDY·identity·Identify·환경 복원·샘플러 확인
-  nssr               FAIL          0.6s  [장치 측] NSSR 스펙 위반: 전원 인가 중 NSSR 인데 …
+  nssr               FAIL          0.6s  [장치 측] NSSR 뒤 CSTS.CFS=1 …
   flr                미실행              앞 profile 실패로 중단
 [Exception-Preflight] 통과 1/2 — 실패로 캠페인 중단 (복구 POR/리셋 없음, 현상 보존)
 ============================================================
@@ -696,8 +697,8 @@ Write/WriteUncorrectable/WriteZeroes 에 전용 timeout 그룹 `write` 를 만�
 블록이 없는 제품은 예전처럼 profile 의 준비 한도만 본다(현재 설정된 제품은 모두 블록이 있다).
 
 **측정 방법** — 관측 스레드가 1ms 주기로 **첫 전환 시각**을 기록한다(읽기 전용).
-시각은 **읽기가 끝난 뒤** 찍고, 설정 공간 읽기(링크·Vendor)와 BAR·sysfs state 관측은 **다른
-스레드**에서 돈다. (예전엔 한 스레드가 읽기 전에 시각을 찍었다 — FLR/hot reset 중 커널이 설정 공간
+시각은 **읽기가 끝난 뒤** 찍고, 루트 포트 링크 읽기와 BAR·sysfs state 관측은 **다른
+스레드**에서 돈다. 현재 배포 경로의 DUT Vendor 폴링은 제거했다. (예전엔 한 스레드가 읽기 전에 시각을 찍었다 — FLR/hot reset 중 커널이 설정 공간
 접근을 잠가(`pci_dev_lock`) Vendor 읽기가 막힌 동안 드라이버가 live 까지 가서 live 에 막히기 전
 시각이 붙었다. 실기: controller_reset −19ms, flr −133ms, hot_reset −190ms 의 RDY→admin.
 CC.EN 과 RDY 는 같은 자식 프로세스의 같은 읽기에서 나오므로 서로 역전되지 않는다)
@@ -705,21 +706,21 @@ CC.EN 과 RDY 는 같은 자식 프로세스의 같은 읽기에서 나오므로
 | 시각 | 출처 |
 |---|---|
 | 링크 다운/업 | 루트 포트 설정 공간 Link Status.DLLLA(bit 13) — DUT 가 remove 돼도 남는다 |
-| 설정 요청 완료 | DUT 설정 공간 Vendor ID 가 유효(≠0xFFFF, ≠0x0001 CRS)해진 순간 |
+| 설정 요청 완료 | 배포 모니터는 DUT 설정 공간을 폴링하지 않음. 명시적 설정 접근은 링크 업 연속 100ms 이후만 수행하고 장치 고유 준비 시간은 측정 불가 |
 | CC.EN / CSTS.RDY | DUT BAR0(`resource0`)를 읽기 전용 mmap 해 CC(0x14)·CSTS(0x1C) 직접 폴링(32비트 읽기). **별도 자식 프로세스**가 읽는다 — remove 와 읽기의 경쟁에서 나는 SIGBUS 가 퍼저 본체를 죽이지 않게(자식이 죽으면 관측 공백으로 기록하고 다시 띄움). 자식은 장치가 사라지면 매핑을 풀고 다시 나타나면 스스로 매핑한다 |
 | admin 가능 | 원래 serial+BDF 컨트롤러의 sysfs state 가 live 로 바뀐 순간 |
-| I/O 가능 | 네임스페이스 `nvme read` 1블록이 **완료된** 순간 — 성공이든 NVMe 오류 상태든(퍼징이 LBA 0 에 WriteUncorrectable 을 했으면 읽기 오류가 정상 결과). 응답 없음·ioctl 오류는 미완료. npo/spo 만 |
+| I/O 가능 | 네임스페이스 `nvme read` 1블록이 **성공 또는 Unrecovered Read Error로 완료된** 순간(WriteUncorrectable로 만든 읽기 오류는 허용). Namespace Not Ready·기타 오류·응답 없음은 복귀 완료로 세지 않고 기한 내 재시도. npo/spo 만 |
 
 - 기준(t0): `controller_reset`/`flr`/`hot_reset` 은 **시작** 시각, `nssr` 은 unbind 뒤 **NSSR 쓰기** 시각, 전원 ON·PERST 해제는 **반환** 시각.
   단 전원 ON 뒤의 PERST 해제(Tpvperl)는 같은 전원 복귀의 일부라 NPO/SPO 기준은 **전원 ON** 그대로
 - 음수 구간(다른 관측원의 순서 역전)은 OK 로 세지 않고 `측정 불가 (관측 순서 역전 — 관측 오차)`
-- FLR·hot reset 의 설정 응답 구간은 `측정 불가` — 커널이 리셋이 끝날 때까지(드라이버 reset_done
-  포함) 사용자 설정 공간 접근을 잠가 장치 시간을 분리할 수 없다. 스펙상 FLR 은 100ms 안에 끝나야
-  하고(PCIe 5.0 §6.6.2) 커널이 100ms 기다린 뒤 접근한다
-- NPO 는 전원을 끊기 전에 **정상 종료 완료**를 확인한다(NVMe Base 2.3 §3.6.2 p.113: CC.SHN=01b 뒤
+- 설정 응답 구간은 `측정 불가` — 커널 복원 및 설정 접근 전 최소 대기 때문에 장치의 최초 준비 시각을 분리할 수 없다.
+  스펙상 FLR은 100ms 안에 끝나야 하지만(PCIe 5.0 §6.6.2), helper 전체 실행 시간을 그 값과 비교하지 않는다.
+- NPO 는 전원을 끊기 전에 **정상 종료 완료**를 확인한다(NVMe Base 2.3 §3.6.1 p.113: CC.SHN=01b 뒤
   CSTS.SHST=10b 를 기다린 다음 전원 차단). BAR 관측으로 SHN·SHST 시각을 잡아 `정상 종료 확인:
-  … 250ms` 로 보이고, SHN 은 봤는데 SHST=10b 를 못 봤으면 `[장치 측] 정상 종료 미완료` 실패,
-  관측 공백이면 판정 생략
+  … 250ms`로 보인다. SHN=01b와 완료를 관측해야 성공이며, CLR 뒤에는 옛 완료 기록을 버린다.
+  SHN 이후 BAR 관측이 끊겼으면 종료 실패로 단정하지 않는다. 연속 관측 중 미완료만 실패로 판정한다.
+  NPO는 orderly remove와 OFF 사이에 PERST/다른 reset을 넣을 수 없다(설정 검증에서 거부).
 - 전환(0→1)만 기록한다 — 이벤트 전부터 켜져 있던 비트를 복귀로 보지 않는다. 자식이 새로 매핑한
   직후의 첫 값도 전환으로 치지 않는다(언제 켜졌는지 모름)
 - **복귀 주기**: 리셋·전원 ON·PERST 해제마다 새 주기를 열고 이전 기록은 이력으로 넘긴다.
@@ -736,21 +737,21 @@ CC.EN 과 RDY 는 같은 자식 프로세스의 같은 읽기에서 나오므로
 장치는 링크·설정까지 돌아왔는데 드라이버가 컨트롤러를 다시 켜지 않은 경우의 표시:
 
 ```
-    [timing] 기준: hot_reset 시작  →  링크 다운 +0ms · 링크 업 +210ms · 설정 완료 +260ms
-    [timing] 설정 요청 완료 after TS        50ms / 스펙   200ms  OK
+    [timing] 기준: hot_reset 시작  →  링크 다운 +0ms · 링크 업 +210ms
+    [timing] 설정 요청 완료 after TS           - / 스펙   200ms  측정 불가 (설정 접근 최소 대기/커널 복원 포함)
     [timing] CC.EN→RDY                         - / 스펙   100ms  ✗ 미완료  (호스트 측 — 드라이버가 CC.EN 을 다시 켜지 않음)
 ```
 
 ```
-    [timing] 기준: power_on 반환  →  링크 다운 +0ms · 링크 업 +310ms · 설정 완료 +360ms · CC.EN +420ms · RDY +450ms · live +560ms · I/O +610ms
-    [timing] 설정 요청 완료 after TS         50ms / 스펙   200ms  OK
+    [timing] 기준: power_on 반환  →  링크 다운 +0ms · 링크 업 +310ms  · CC.EN +420ms · RDY +450ms · live +560ms · I/O +610ms
+    [timing] 설정 요청 완료 after TS            - / 스펙   200ms  측정 불가 (설정 접근 최소 대기/커널 복원 포함)
     [timing] CC.EN→RDY                         30ms / 스펙   100ms  OK
     [timing] RDY→admin 가능(live)             110ms / 스펙   100ms  ✗ 초과
     [timing] 전원 ON→I/O 가능 (NPO)           610ms / 스펙   500ms  ✗ 초과
 ```
 
 **profile 변경** — 전원 ON·PERST 해제 뒤 고정 대기(`por_rescan_delay` 10s)를 없애고
-`pci_rescan_wait`(장치가 버스에 나타날 때까지 rescan 반복: 처음 1s 는 20ms, 이후 100ms)로 바꿨다.
+`pci_rescan_wait`(링크 업 연속 100ms 대기 후 rescan 반복: 처음 1s는 20ms, 이후 100ms)로 바꿨다.
 `normal_por` 는 `timing: npo`, `sudden_por` 는 `timing: spo`.
 
 **한계** — RDY→admin 은 커널이 RDY 뒤에 하는 초기화 처리를 포함하므로 장치 시간보다 **길게**
@@ -764,3 +765,32 @@ Tpvperl 100ms 가 들어간다(실제 플랫폼도 그렇다). 첫 실기에서 
 이벤트, 관측 공백 + 확인된 복귀, mmap 반복 실패 fd 유지,
 EN 전환 놓침(측정 불가), 두 번째 주기만 초과, 읽기 오류 완료 = I/O 가능, 응답 없음 ≠ I/O 가능,
 장치/호스트 측 구분, **자식 BAR 읽기 프로세스의 실제 SIGBUS(-7) 격리**. 수정 전 동작 주입 시 실패 확인.
+
+
+## Reset/POR 관측 보강 (2026-10-01)
+
+기준 커밋 `61e5fd0`의 SMART 전원 손실 판정 제거를 유지한다.
+
+- **설정 접근:** 루트 포트 DLL Active Reporting 지원을 확인한다. NSSR 복원·rescan 전에
+  링크 업을 100ms 연속 확인하며, 다운/관측 공백을 성공으로 보지 않는다. DLLLA가 없으면
+  해당 profile은 사전 capability 검사에서 제외한다. 배포 RecoveryMonitor는 DUT config를
+  읽지 않아 리셋 중 최소 대기를 우회하지 않는다. `observe_config=True`는 가짜 파일 회귀용이다.
+- **PERST:** 주입 전 링크 상태, assert 뒤 다운, release 뒤 업을 `link_check`로 기록한다.
+  전환 확인은 `OBSERVED`, 이미 같은 상태/관측 불가는 `UNVERIFIED`, 기한 초과는 `FAILED`다.
+  전원 OFF 뒤 PERST assert처럼 이미 다운인 경우를 새 주입 효과로 세지 않는다. 해제 실패 시
+  asserted 상태를 유지해 공급 정리에서 재확인할 수 있게 한다.
+- **FLR:** 커널 reset helper 실행 동안 루트 포트를 별도로 관측한다. 처음 업이던 링크가
+  다운되면 helper가 성공했어도 `ANOMALY`로 기록하고 보존·중단한다. 원인을 장치로 단정하지 않는다.
+  다운을 못 본 결과는 `NO_DROP_OBSERVED`이며 링크 유지 규격 통과를 뜻하지 않는다.
+  hot reset의 다운 관측 역시 어떤 TS가 전송됐는지의 증명은 아니다.
+- **검증 범위:** 사전시험 PASS는 RDY/identity/Identify/환경/샘플러 복귀 확인이다.
+  FLR 100ms 정밀 검증, TP, 복원 전 reset/유지 레지스터 전체 검증은 구현하지 않는다.
+- **Normal POR:** orderly remove → OFF → PERST assert → OFF 유지 → ON → Tpvperl 유지 → release.
+  종료와 OFF 사이 reset을 제거한다. 독립 PMU 호출은 전원/신호의 전기적 Tfail 준수를
+  보장하지 않으므로 제품/보드의 파형 검증을 대체하지 않는다.
+
+회귀: `test_v11_reset_observation.py`에서 설정 접근 대기, 관측 불가, NSSRO 펌웨어 예외,
+Namespace Not Ready 재시도, 종료 뒤 CLR/관측 손실, PERST 상태 구분, FLR 이상 보존을 검증한다.
+
+통합 검증: 원격 `66ba34f`의 주기별 강제 주입·PM 조합 기록을 보존한 상태에서 전체 **563개 테스트 통과**.
+실장치 reset/PMU 조작은 수행하지 않았다.
