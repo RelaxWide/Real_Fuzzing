@@ -16,7 +16,7 @@
 산출물(--out, 기본은 첫 입력 폴더 아래 compare/):
   compare_coverage.png  — 그룹별 커버리지 성장(중앙값 + 최소~최대 음영, 실행별 얇은 선)
   compare_speedup.png   — 커버리지 수준별 도달 시간 비율(기준 그룹 시간 / 비교 그룹 시간)
-  compare_llm_share.png — LLM 실행의 '새 BB 중 LLM 몫' vs '명령 중 LLM 몫'
+  compare_llm_share.png — LLM 실행의 효율 배수(명령 1개당 새 BB, LLM ÷ mutation. 1 위 = LLM 이 더 찾음)
   compare_summary.md    — 최종 커버리지 중앙값·범위, 차이, A12, 기준 최종값 도달 시간·배속, 고유 BB
 
 퍼징은 실행마다 편차가 커서 그룹당 3~5회를 권한다. 1회씩이면 표에 그렇게 표시한다.
@@ -309,7 +309,7 @@ def _plots(groups, data, labels, ref, ref_final, metric, xaxis, out):
     ax.set_ylabel(yl)
     ax.set_title('Coverage growth by group (median, band = min..max over runs)')
     ax.grid(True, alpha=0.3)
-    ax.legend(loc='lower right', fontsize=8)
+    ax.legend(loc='upper left', fontsize=8)
     fig.savefig(out / 'compare_coverage.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
 
@@ -330,7 +330,7 @@ def _plots(groups, data, labels, ref, ref_final, metric, xaxis, out):
                 drew = True
         ax.axhline(1.0, color='gray', linewidth=1)
         if drew:
-            ax.legend(fontsize=8)
+            ax.legend(loc='upper left', fontsize=8)
     ax.set_xlabel(f'Coverage level ({yl}) — up to {ref} common-budget median')
     ax.set_ylabel('Speedup (x)')
     ax.set_title('Time-to-coverage speedup (median reach time; a majority of runs must reach each level)')
@@ -338,37 +338,40 @@ def _plots(groups, data, labels, ref, ref_final, metric, xaxis, out):
     fig.savefig(out / 'compare_speedup.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
 
-    # 3) LLM 몫(LLM 을 쓴 실행만)
+    # 3) LLM 효율 배수(LLM 을 쓴 실행만): 명령 1개당 새 BB — LLM ÷ mutation.
+    #   퍼징 시작 후 corpus 에서 골라 실행한 명령만(시작 전 보정·LLM 이 패턴만 고른 워크로드 제외).
+    #   1 보다 위 = 같은 명령으로 LLM 이 더 찾음. 'sel' 이 없는 옛 기록은 그리지 않는다.
     fig, ax = plt.subplots(figsize=(11, 4.5))
     drew = False
     for g in labels:
         for r in groups[g]:
             if not (r.get('conditions') or {}).get('llm'):
                 continue
-            xs, sc, sm = [], [], []
+            xs, ys = [], []
             for pt in r.get('series') or []:
                 x = pt.get('t') if xaxis == 'time' else pt.get('exec')
-                ne, cm = pt.get('new_edge') or {}, pt.get('cmds') or {}
-                tn = (ne.get('llm', 0) + ne.get('mutation', 0))
-                tc = (cm.get('llm', 0) + cm.get('mutation', 0))
-                if x is None or not tn or not tc:
+                sel = pt.get('sel') or {}
+                (nl, cl), (nm, cm) = sel.get('llm', (0, 0)), sel.get('mutation', (0, 0))
+                if x is None or not cl or not cm or not nm:
                     continue
                 xs.append(float(x) / (3600.0 if xaxis == 'time' else 1.0))
-                sc.append(100.0 * ne.get('llm', 0) / tn)
-                sm.append(100.0 * cm.get('llm', 0) / tc)
+                ys.append(max((nl / cl) / (nm / cm), 0.01))
             if xs:
-                ax.plot(xs, sc, color='#e6550d', alpha=0.7, linewidth=1.2)
-                ax.plot(xs, sm, color='#636363', alpha=0.7, linewidth=1.0, linestyle='--')
+                ax.plot(xs, ys, color='#e6550d', alpha=0.75, linewidth=1.3)
                 drew = True
+    ax.axhline(1.0, color='gray', linewidth=1)
     if drew:
-        ax.plot([], [], color='#e6550d', label='LLM share of new BBs')
-        ax.plot([], [], color='#636363', linestyle='--', label='LLM share of commands (budget)')
-        ax.legend(fontsize=8)
-    ax.set_ylim(0, 100)
+        ax.plot([], [], color='#e6550d', label='LLM / mutation new BB per command (each LLM run)')
+        ax.legend(loc='upper left', fontsize=8)
+    ax.set_yscale('log')
+    ax.set_ylim(0.01, 100)
+    ax.set_yticks([0.01, 0.1, 1, 10, 100])
+    ax.set_yticklabels(['0.01x', '0.1x', '1x', '10x', '100x'])
+    ax.minorticks_off()
     ax.set_xlabel(xl)
-    ax.set_ylabel('Share (%)')
-    ax.set_title('LLM contribution within LLM runs (new-BB share above budget share = efficient)')
-    ax.grid(True, alpha=0.3)
+    ax.set_ylabel('Efficiency ratio (x)')
+    ax.set_title('LLM efficiency vs mutation within LLM runs (above 1 = LLM finds more per command)')
+    ax.grid(True, alpha=0.3, which='both')
     fig.savefig(out / 'compare_llm_share.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
 

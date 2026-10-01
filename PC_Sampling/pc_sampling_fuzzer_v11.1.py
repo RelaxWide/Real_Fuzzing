@@ -5667,7 +5667,17 @@ class _V101Fuzzer:
         # v11.1: 출처별 **누적** 실행 명령 수(origin/form → n). 부스트용 _boost_exec 는 구간마다
         #   비워지므로 'LLM 이 명령 예산의 몇 %를 썼나'를 그리려면 따로 센다.
         self._exec_by_src: dict = {}
-        # v11.1: 차트용 출처별 몫 이력 (exec, llm 새 BB, mutation 새 BB, llm 명령, mutation 명령)
+        # v11.1: LLM 효과 집계 — **퍼징 시작 후**만 센다(시작 전 보정이 찾은 BB 는 출처 비교에서 뺀다).
+        #   found[o]   : 시작 후 origin o 가 처음 찾은 BB(모든 경로 — 위 그래프 면적용)
+        #   sel_new[o] : 시작 후 corpus 에서 골라 실행한 명령(cmd|seq)이 찾은 BB
+        #   sel_cmd[o] : 시작 후 corpus 에서 골라 실행한 명령(cmd|seq) 수
+        #   → 효율 = sel_new/sel_cmd. iowl(LLM 이 패턴만 고른 워크로드)·replay 는 효율 비교에서 뺀다
+        #     (부스트 _boost_exec/_boost_gain 과 같은 모집단).
+        self._fz_found: dict = {'llm': 0, 'mutation': 0}
+        self._fz_sel_new: dict = {'llm': 0, 'mutation': 0}
+        self._fz_sel_cmd: dict = {'llm': 0, 'mutation': 0}
+        self._bb_at_start: int = 0
+        # 차트용 이력: (exec, found_llm, found_mut, sel_new_llm, sel_new_mut, sel_cmd_llm, sel_cmd_mut)
         self._cov_share_hist: list = []
         # v11.1: 실행 기록(run_record_<run_id>.json) — 실행 간 비교 도구의 입력
         self._run_record_series: list = []
@@ -6052,6 +6062,8 @@ class _V101Fuzzer:
             _origin = _cal_src.partition('/')[0]
             self._boost_exec[_origin] = self._boost_exec.get(_origin, 0) + (
                 _learning_cal_valid_runs if self.learning.enabled else actual_runs)
+            # v11.1: 런타임 보정 명령도 효율 분모에 넣는다(분자 BB 는 _cov_credit 이 센다)
+            self._fz_sel_cmd[_origin] = self._fz_sel_cmd.get(_origin, 0) + actual_runs
         if _new_count:
             self._cov_credit(_cal_src, 'edge', _new_count,
                              affect_boost=_runtime_cal and not self.learning.enabled)
@@ -8869,6 +8881,11 @@ class _V101Fuzzer:
         """v9.4: 소스별 커버리지 누적(스택 그래프용). axis ∈ {'edge','sc','state'}."""
         d = self._cov_by_src.setdefault(src, {'edge': 0, 'sc': 0, 'state': 0})
         d[axis] = d.get(axis, 0) + n
+        if axis == 'edge' and getattr(self, 'start_time', None) is not None:
+            _o, _, _f = src.partition('/')
+            self._fz_found[_o] = self._fz_found.get(_o, 0) + n
+            if _f in ('cmd', 'seq'):
+                self._fz_sel_new[_o] = self._fz_sel_new.get(_o, 0) + n
         # v9.6: 부스트 자동조정 분자. 두 가지로 한정한다.
         #   ① edge 만 — sc/state 를 섞으면 단위가 달라 가중치를 사람이 정해야 하고, 그러면
         #      '사람 개입 제거' 라는 목적과 어긋난다.
@@ -8958,7 +8975,11 @@ class _V101Fuzzer:
                     bb_pct=row.get('bb_pct'), func_pct=row.get('func_pct'), bb=row.get('bb_count'),
                     sc=row.get('sc_count'), state=row.get('state_count'),
                     new_edge=self._by_origin(row.get('by_src'), 'edge'),
-                    cmds=self._by_origin(row.get('exec_by_src'))))
+                    cmds=self._by_origin(row.get('exec_by_src')),
+                    # v11.1: 퍼징 시작 후 출처별 발견(모든 경로) / corpus 선택 명령의 새 BB·명령 수
+                    found=dict(self._fz_found),
+                    sel={o: [self._fz_sel_new.get(o, 0), self._fz_sel_cmd.get(o, 0)]
+                         for o in ('llm', 'mutation')}))
                 self._run_record_last_t = now
             elif row is not None:
                 return
@@ -8978,7 +8999,7 @@ class _V101Fuzzer:
                 elapsed_s=round(now, 1), executions=self.executions,
                 conditions=self._run_record_conditions(),
                 coverage_unit='BB' if bbt > 0 else 'PC',
-                totals=dict(bb_total=bbt, func_total=fnt),
+                totals=dict(bb_total=bbt, func_total=fnt, bb_at_start=getattr(self, '_bb_at_start', 0)),
                 final_coverage=dict(bb=bbc, bb_pct=(100.0 * bbc / bbt) if bbt else None,
                                     func=fnc, func_pct=(100.0 * fnc / fnt) if fnt else None,
                                     new_edge=self._by_origin(self._cov_by_src, 'edge'),
@@ -9804,6 +9825,9 @@ class _V101Fuzzer:
         try:
             _xs = self._cov_src_tag(seed, source, seq_member=seq_member)
             self._exec_by_src[_xs] = self._exec_by_src.get(_xs, 0) + 1
+            _xo, _, _xf = _xs.partition('/')
+            if _xf in ('cmd', 'seq') and self.start_time is not None:
+                self._fz_sel_cmd[_xo] = self._fz_sel_cmd.get(_xo, 0) + 1
         except Exception:
             pass
 
@@ -10243,9 +10267,10 @@ class _V101Fuzzer:
                 'llm_boost': round(self._llm_boost, 3),   # v9.6: 자동조정된 부스트 추이
             }
             self._cov_growth_hist.append(_snap_row)
-            _ne, _nc = self._by_origin(self._cov_by_src, 'edge'), self._by_origin(self._exec_by_src)
-            self._cov_share_hist.append((self.executions, _ne['llm'], _ne['mutation'],
-                                         _nc['llm'], _nc['mutation']))
+            self._cov_share_hist.append((self.executions,
+                                         self._fz_found.get('llm', 0), self._fz_found.get('mutation', 0),
+                                         self._fz_sel_new.get('llm', 0), self._fz_sel_new.get('mutation', 0),
+                                         self._fz_sel_cmd.get('llm', 0), self._fz_sel_cmd.get('mutation', 0)))
             try:
                 with open(self.output_dir / 'coverage_growth.jsonl', 'a') as _gf:
                     _gf.write(json.dumps(_snap_row) + '\n')
@@ -17084,7 +17109,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
 
     # v8.8: 차트 5종이 읽는 self 데이터 속성 전부 (subprocess 렌더에 넘길 대상)
     _CHART_SNAPSHOT_ATTRS = (
-        '_csfuzz_history', '_sa_bb_starts', '_sa_cov_history', '_sa_covered_bbs', '_cov_share_hist',
+        '_csfuzz_history', '_sa_bb_starts', '_sa_cov_history', '_sa_covered_bbs', '_cov_share_hist', '_bb_at_start',
         '_sa_entered_funcs', '_sa_func_ends', '_sa_func_entries', '_sa_func_names',
         '_sa_loaded', '_sa_total_bbs', '_sa_total_funcs', 'cmd_pcs', 'cmd_cov_keys', 'cmd_core_yield', 'cmd_core_samples', 'cmd_stats',
         'cmd_traces', 'executions', 'mopt_finds', 'mopt_uses', 'mutation_stats',
@@ -17389,20 +17414,33 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             )
             # v11.1: 출처별 몫 — 같은 스냅샷의 coverage_growth 행(by_src·exec_by_src)을 exec 로 맞춘다.
             #   share_cov = LLM 계보가 처음 찾은 BB 비율, share_cmd = LLM 계보가 쓴 명령 비율.
+            # v11.1: 출처별 몫 — 퍼징 시작 후만(시작 전 보정이 찾은 BB 는 회색 띠로 따로).
+            #   위: 시작 전 보정 / mutation / LLM 이 찾은 BB 를 겹치지 않게 쌓는다.
+            #   아래: 명령 1개당 새 BB — LLM ÷ mutation 배수(corpus 에서 골라 실행한 명령만, 부스트와 같은 기준).
             _gh = {r[0]: r for r in (getattr(self, '_cov_share_hist', None) or [])}
-            share_cov, share_cmd = [], []
-            for _e in execs:
-                _, _nl, _nm, _cl, _cm = _gh.get(_e) or (_e, 0, 0, 0, 0)
-                share_cov.append(_nl / (_nl + _nm) if (_nl + _nm) else None)
-                share_cmd.append(_cl / (_cl + _cm) if (_cl + _cm) else None)
-            _has_llm = any(v for v in share_cov if v) or any(v for v in share_cmd if v)
+            _base_pct = (100.0 * getattr(self, '_bb_at_start', 0) / total_bbs) if total_bbs > 0 else 0.0
+            _rows = [(_gh.get(_e) or (_e, 0, 0, 0, 0, 0, 0)) for _e in execs]
+            _has_llm = any(r[1] or r[5] for r in _rows)
             if total_bbs > 0 and _has_llm:
-                _llm_part = [c * (sv or 0.0) for c, sv in zip(c_pcts, share_cov)]
-                _mut_part = [c - l for c, l in zip(c_pcts, _llm_part)]
-                ax_top.fill_between(execs, 0, _mut_part, color='#9ecae1', alpha=0.55,
-                                    linewidth=0, label='found by mutation')
-                ax_top.fill_between(execs, _mut_part, c_pcts, color='#fd8d3c', alpha=0.55,
-                                    linewidth=0, label='found by LLM lineage')
+                _b = [min(_base_pct, c) for c in c_pcts]
+                _mtop = []
+                for c, b, r in zip(c_pcts, _b, _rows):
+                    _f = r[1] + r[2]
+                    _mtop.append(b + (c - b) * (r[2] / _f if _f else 1.0))
+                ax_top.fill_between(execs, 0, _b, color='#d9d9d9', linewidth=0, zorder=1)
+                ax_top.fill_between(execs, _b, _mtop, color='#6baed6', linewidth=0, zorder=1)
+                ax_top.fill_between(execs, _mtop, c_pcts, color='#fd8d3c', linewidth=0, zorder=1)
+            # 효율 배수: 누적(굵은 선)과 최근 구간(얇은 선)
+            def _eff(nl, nm, cl, cm):
+                if cl <= 0 or cm <= 0 or nm <= 0:
+                    return None
+                return (nl / cl) / (nm / cm)
+            eff_cum = [_eff(r[3], r[4], r[5], r[6]) for r in _rows]
+            _w = max(3, len(_rows) // 20)
+            eff_win = [None] * len(_rows)
+            for _i in range(_w, len(_rows)):
+                _a, _z = _rows[_i - _w], _rows[_i]
+                eff_win[_i] = _eff(_z[3] - _a[3], _z[4] - _a[4], _z[5] - _a[5], _z[6] - _a[6])
             if total_bbs > 0:
                 ax_top.plot(execs, c_pcts, color='steelblue', linewidth=1.7,
                             label=f'Basic Blocks ({total_bbs:,})')
@@ -17412,7 +17450,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
 
             ax_top.set_ylabel('Coverage (%)')
             ax_top.set_title('Coverage Growth')
-            ax_top.legend(loc='lower right')
+            ax_top.legend(loc='upper left')
             _ymax = max(max(c_pcts, default=0), max(f_pcts, default=0)) * 1.15 + 1
             ax_top.set_ylim(0, _ymax)
             ax_top.grid(True, alpha=0.3)
@@ -17460,10 +17498,12 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                         if _in_plateau:
                             _in_plateau = False
                             ax_top.axvspan(execs[_plateau_start_idx], execs[i],
-                                           color='#ffd966', alpha=0.18, zorder=0)
+                                           fill=False, hatch='//', edgecolor='#d0d0d0',
+                                           linewidth=0, zorder=2)
                 if _in_plateau:
                     ax_top.axvspan(execs[_plateau_start_idx], execs[-1],
-                                   color='#ffd966', alpha=0.18, zorder=0)
+                                   fill=False, hatch='//', edgecolor='#d0d0d0',
+                                   linewidth=0, zorder=2)
 
             # 최종 값 annotation
             if c_pcts:
@@ -17482,19 +17522,33 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             # 막대 높이가 클수록 그 시간 동안 진행이 빨랐다는 뜻.
             # 0에 가까우면 포화 — 위 plateau 음영과 같은 정보를 다른 형태로 보여줌.
             if _has_llm:
-                # v11.1: LLM 몫 — 커버리지 몫이 명령(예산) 몫보다 위면 LLM 이 효율적
-                _sc = [v * 100 if v is not None else float('nan') for v in share_cov]
-                _sm = [v * 100 if v is not None else float('nan') for v in share_cmd]
-                ax_bot.plot(execs, _sc, color='#e6550d', linewidth=1.5,
-                            label='LLM share of new BBs')
-                ax_bot.plot(execs, _sm, color='#636363', linewidth=1.2, linestyle='--',
-                            label='LLM share of commands (budget)')
-                ax_bot.set_ylim(0, 100)
-                ax_bot.set_ylabel('LLM share (%)', fontsize=8)
-                ax_bot.set_title('LLM contribution — new-BB share above budget share = LLM more '
-                                 'efficient than mutation', fontsize=9, loc='left', pad=2)
-                ax_bot.legend(loc='upper right', fontsize=7)
-                ax_bot.grid(True, alpha=0.25)
+                # v11.1: 명령 1개당 새 BB 의 LLM ÷ mutation 배수. 1 보다 위 = LLM 이 같은 명령으로 더 찾음
+                _floor = 0.01
+                _cum = [max(v, _floor) if v is not None else float('nan') for v in eff_cum]
+                _win = [max(v, _floor) if v is not None else float('nan') for v in eff_win]
+                ax_bot.axhline(1.0, color='gray', linewidth=1.0, zorder=1)
+                ax_bot.plot(execs, _win, color='#fdae6b', linewidth=0.9,
+                            label=f'recent window ({_w} snapshots)')
+                ax_bot.plot(execs, _cum, color='#e6550d', linewidth=1.8, label='since fuzzing start')
+                ax_bot.set_yscale('log')
+                ax_bot.set_ylim(_floor, 100)
+                ax_bot.set_yticks([0.01, 0.1, 1, 10, 100])
+                ax_bot.set_yticklabels(['0.01x', '0.1x', '1x', '10x', '100x'])
+                ax_bot.minorticks_off()
+                ax_bot.set_ylabel('LLM / mutation\n(new BB per cmd)', fontsize=8)
+                _r = _rows[-1]
+                if _r[5] and _r[6]:
+                    _txt = (f'LLM {1000.0 * _r[3] / _r[5]:.2f} vs mutation {1000.0 * _r[4] / _r[6]:.2f} '
+                            f'new BB per 1k cmds')
+                    if eff_cum[-1] is not None:
+                        _txt += f'  ->  {eff_cum[-1]:.2f}x'
+                    ax_bot.annotate(_txt, xy=(0.99, 0.06), xycoords='axes fraction', ha='right',
+                                    fontsize=7, color='#333333')
+                ax_bot.set_title('LLM efficiency vs mutation — above 1 = LLM finds more new BBs per '
+                                 'command (corpus-selected commands, after calibration)',
+                                 fontsize=9, loc='left', pad=2)
+                ax_bot.legend(loc='upper left', fontsize=7)
+                ax_bot.grid(True, alpha=0.25, which='both')
                 ax_bot.tick_params(labelsize=8)
             elif total_bbs > 0 and len(execs) >= 2:
                 _bar_x = execs[1:]
@@ -17558,13 +17612,12 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                     [], [], color='coral', linewidth=1.7,
                     label=f'Functions ({total_funcs:,})'))
             _legend_handles.append(mpatches.Patch(
-                color='#ffd966', alpha=0.4, label='Plateau (Δ<0.5%/window)'))
+                fill=False, hatch='//', edgecolor='#d0d0d0', label='Plateau (Δ<0.5%/window)'))
             if total_bbs > 0 and _has_llm:
-                _legend_handles.append(mpatches.Patch(color='#9ecae1', alpha=0.7,
-                                                      label='BB found by mutation'))
-                _legend_handles.append(mpatches.Patch(color='#fd8d3c', alpha=0.7,
-                                                      label='BB found by LLM lineage'))
-            ax_top.legend(handles=_legend_handles, loc='lower right', fontsize=8)
+                _legend_handles.append(mpatches.Patch(color='#d9d9d9', label='BB before fuzzing (calibration)'))
+                _legend_handles.append(mpatches.Patch(color='#6baed6', label='BB found by mutation'))
+                _legend_handles.append(mpatches.Patch(color='#fd8d3c', label='BB found by LLM lineage'))
+            ax_top.legend(handles=_legend_handles, loc='upper left', fontsize=8)
 
             growth_file = graph_dir / 'coverage_growth.png'
             plt.savefig(growth_file, dpi=150, bbox_inches='tight')
@@ -19112,6 +19165,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         except Exception as _e:
             log.warning(f"[CoverageReport] 초기 보고서 생성 실패(퍼징은 계속): {_e}")
 
+        self._bb_at_start = self._cov_totals()[0]   # v11.1: 시작 전 보정이 찾은 BB(출처 비교에서 분리)
         self.start_time = datetime.now()
         self._window_t0 = self.start_time          # 구간별 exec/s 계산용
         self._window_exec0: int = 0

@@ -32,6 +32,10 @@ def fuzz_obj(tmp):
     o._cov_by_src = {'llm/cmd': {'edge': 30, 'sc': 0, 'state': 0},
                      'mutation/cmd': {'edge': 70, 'sc': 0, 'state': 0}}
     o._exec_by_src = {'llm/cmd': 100, 'mutation/cmd': 900}
+    o._fz_found = {'llm': 30, 'mutation': 70}
+    o._fz_sel_new = {'llm': 30, 'mutation': 70}
+    o._fz_sel_cmd = {'llm': 100, 'mutation': 900}
+    o._bb_at_start = 1
     o._run_record_series, o._run_record_last_t = [], -1e18
     o._run_record_cond, o._run_record_warned = None, False
     o._sa_loaded, o._sa_covered_bbs = True, {0x100, 0x200}
@@ -59,6 +63,8 @@ class RunRecord(unittest.TestCase):
             pt = rec['series'][0]
             self.assertEqual(pt['new_edge'], {'llm': 30, 'mutation': 70})
             self.assertEqual(pt['cmds'], {'llm': 100, 'mutation': 900})
+            self.assertEqual(pt['sel'], {'llm': [30, 100], 'mutation': [70, 900]})
+            self.assertEqual(pt['found'], {'llm': 30, 'mutation': 70})
             self.assertTrue(rec['conditions']['llm'])
             self.assertEqual(rec['conditions']['product'], 'PM9M1')
             self.assertEqual(rec['covered_kind'], 'bb_start')
@@ -75,6 +81,35 @@ class RunRecord(unittest.TestCase):
         o = fuzz_obj('/nonexistent/dir')
         with self.assertLogs('pcfuzz', level='WARNING'):
             o._run_record_update(None, final=True)               # 예외 없이 경고 1회
+
+
+class FuzzPhaseAttribution(unittest.TestCase):
+    """효율 비교는 퍼징 시작 후·corpus 에서 골라 실행한 명령(cmd|seq)만 — 시작 전 보정이 찾은 BB 와
+    LLM 이 패턴만 고른 워크로드(iowl)는 섞지 않는다(그래프에서 LLM 이 예산만 쓰는 것처럼 보이던 원인)."""
+
+    def obj(self):
+        o = fuzzer.NVMeFuzzer.__new__(fuzzer.NVMeFuzzer)
+        o._cov_by_src, o._boost_gain = {}, {}
+        o._fz_found = {'llm': 0, 'mutation': 0}
+        o._fz_sel_new = {'llm': 0, 'mutation': 0}
+        o._fz_sel_cmd = {'llm': 0, 'mutation': 0}
+        return o
+
+    def test_calibration_before_start_is_not_attributed(self):
+        o = self.obj()
+        o.start_time = None
+        o._cov_credit('mutation/cmd', 'edge', 500, affect_boost=False)
+        self.assertEqual(o._fz_found, {'llm': 0, 'mutation': 0})
+        self.assertEqual(o._cov_by_src['mutation/cmd']['edge'], 500)      # 원래 누적은 그대로
+
+    def test_after_start_iowl_counts_as_found_but_not_selected(self):
+        o = self.obj()
+        o.start_time = datetime.now()
+        o._cov_credit('llm/iowl', 'edge', 4)
+        o._cov_credit('llm/cmd', 'edge', 3)
+        o._cov_credit('mutation/seq', 'edge', 2)
+        self.assertEqual(o._fz_found, {'llm': 7, 'mutation': 2})
+        self.assertEqual(o._fz_sel_new, {'llm': 3, 'mutation': 2})
 
 
 class CsfuzzP(unittest.TestCase):

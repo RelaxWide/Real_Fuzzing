@@ -34,7 +34,7 @@ python3 tools/compare_runs.py <폴더> [--out DIR] [--group llm] [--metric bb_pc
 |---|---|
 | `compare_coverage.png` | 그룹별 커버리지 성장(중앙값 굵은 선, 최소~최대 음영, 실행별 얇은 선). 기준 그룹(LLM OFF) 최종 중앙값 수평선과, 다른 그룹이 그 값에 도달한 시각 |
 | `compare_speedup.png` | 커버리지 수준별 도달 시간 비율(OFF 시간 ÷ ON 시간). 1 보다 크면 그 수준까지 LLM 이 빠름 — 어느 구간에서 효과가 나는지 |
-| `compare_llm_share.png` | LLM 실행 안에서 '새 BB 중 LLM 몫' vs '명령 중 LLM 몫(예산)' |
+| `compare_llm_share.png` | LLM 실행마다 효율 배수(명령 1개당 새 BB, LLM ÷ mutation) 추이. 1x 위 = LLM 이 같은 명령으로 더 찾음 |
 | `compare_summary.md` | 그룹별 실행 수·최종 중앙값·범위·기준 대비 차이·A12·기준 최종값 도달 시간·배속·고유 BB, 실행 목록 |
 
 - **A12**(Vargha-Delaney): 비교 그룹의 한 실행이 기준 그룹의 한 실행보다 최종 커버리지가 높을 확률.
@@ -48,7 +48,7 @@ python3 tools/compare_runs.py <폴더> [--out DIR] [--group llm] [--metric bb_pc
 
 | 그래프 | 변경 |
 |---|---|
-| `coverage_growth.png` | 상단: BB % 를 **mutation 이 찾은 몫 / LLM 계보가 찾은 몫**으로 나눠 쌓은 면적. 하단: LLM 몫(새 BB 중 % vs 명령 중 %) — 새 BB 몫이 명령 몫보다 위면 LLM 이 mutation 보다 효율적. LLM 기록이 없는 실행은 예전 velocity 막대 |
+| `coverage_growth.png` | 상단: BB % 를 **시작 전 보정(회색) / mutation(파랑) / LLM 계보(주황)** 가 찾은 몫으로 겹치지 않게 쌓은 면적. 하단: **LLM 효율 배수** = 명령 1개당 새 BB, LLM ÷ mutation(로그 축, 1x 기준선). 굵은 선은 퍼징 시작부터 누적, 얇은 선은 최근 구간. 오른쪽 아래에 1k 명령당 새 BB 수. LLM 기록이 없는 실행은 예전 velocity 막대. 범례는 왼쪽 위, plateau 는 빗금 |
 | `firmware_map.png` | 그대로 |
 | `csfuzz_dynamics.png` | 그대로(아래 p 수정으로 의미가 생김) |
 | `command_comparison.png`, `coverage_heatmap_1d.png`, `mutation_chart.png` | **기본 끔.** `visualization.extra_charts: true` 일 때만 |
@@ -84,3 +84,13 @@ state 재생이 **최대로** 선택되던 상태였다.
 
 저장은 별도 타이머가 아니라 100명령 회계 스냅샷에서 수행한다. 따라서 느린 명령이나 복구 중에는
 60초보다 길어질 수 있고, 첫 100명령 전에는 주기 기록이 없다. 종료 정리에서는 마지막 기록을 저장한다.
+
+### LLM 몫·효율의 집계 기준
+
+- **퍼징 시작 후만** 센다. 시작 전 초기 시드 보정이 찾은 BB 는 출처 비교에서 빼고 위 그래프의 회색 띠로
+  따로 보인다(예전엔 mutation 몫에 들어가 있었는데 그 명령은 명령 수에 없어 mutation 이 과대평가됐다).
+- 효율은 **corpus 에서 골라 실행한 명령(cmd·seq)**만 비교한다 — LLM 이 패턴만 고른 I/O 워크로드(iowl)·
+  state 재생(replay)은 뺀다(부스트 계산과 같은 기준). 예전엔 워크로드 명령까지 LLM 예산으로 세어
+  '명령 중 LLM 몫'이 실제보다 크게 보였다. 런타임 LLM 시드 보정 명령은 분모에 넣는다.
+- 위 그래프 주황 면적(발견 몫)은 모든 경로를 포함한다(iowl 로 찾은 BB 도 LLM 몫).
+- 실행 기록 `series[]` 에 `found{llm,mutation}`, `sel{llm:[새 BB, 명령], mutation:[…]}`, `totals.bb_at_start` 가 남는다.
