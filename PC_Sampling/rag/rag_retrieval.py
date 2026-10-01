@@ -166,11 +166,17 @@ def validate_index_model(manifest, opts, version):
             f"설정={_want_rev} ({version.name}) — manifest와 설정을 확인하세요(생성 날짜와 모델 revision은 다릅니다)")
 
 
+# 시작 전 검증에서 검색을 이번 실행 동안 끈 이유(인덱스 파일 없음·numpy 없음). None = 끄지 않음.
+_OFF_REASON = None
+
+
 def retrieve(meta, cfg, deadline):
     """(참고문서 텍스트, 진단) 반환. 실패는 예외로 올린다 — 호출부가 삼킨다."""
     opts = _settings(cfg)
     if not opts["enabled"]:
         return "", {"enabled": False}
+    if _OFF_REASON:
+        return "", {"enabled": False, "disabled_at_start": _OFF_REASON}
     q, source = query_from(meta, (meta or {}).get("user_prompt", ""),
                            int(opts["query_max_chars"]))
     if q is None:
@@ -258,17 +264,29 @@ def retrieve(meta, cfg, deadline):
 
 
 def preflight(config, enabled, module_path):
-    """장치 접근 전 로컬 인덱스를 검증·고정한다. 네트워크 호출 없음.
+    """장치 접근 전 로컬 인덱스를 검증·고정한다. 네트워크 호출 없음. → 'ok' | 'off' | None(검사 대상 아님)
 
     --rag는 LLM 기능 토글이다. 로컬 retrieval까지 활성인 vLLM 구성만 검사하며,
     --no-rag/생성 전용/별도 브리지에는 로컬 인덱스를 요구하지 않는다.
+
+    인덱스 **파일이 없거나**(새 PC, 아직 rag_ingest 안 함) numpy 가 없으면 이번 실행은 검색 없이
+    생성하도록 retrieval 을 끄고 계속한다('off'). 인덱스가 **있는데** 모델·revision 이 다르거나
+    청크/벡터 수가 안 맞으면 여전히 시작을 막는다 — 엉뚱한 문서를 조용히 뽑기 때문이다.
     """
+    global _OFF_REASON
+    _OFF_REASON = None
     if not enabled or module_path != 'rag.vllm_client':
-        return
+        return None
     from rag.vllm_client import _config
     opts = _settings(_config({'config': config}))
     if not opts['enabled']:
-        return
-    manifest, _, _, version = _load(opts['index_dir'])
+        return None
+    try:
+        manifest, _, _, version = _load(opts['index_dir'])
+    except (FileNotFoundError, ImportError) as exc:
+        _OFF_REASON = f'{type(exc).__name__}: {exc}'
+        _log.warning('[LLM/rag] 검색 인덱스를 쓸 수 없어 이번 실행은 검색 없이 생성합니다 — %s', exc)
+        return 'off'
     validate_index_model(manifest, opts, version)
     _log.warning('[LLM/rag] 시작 전 인덱스 검증 통과: %s', version.name)
+    return 'ok'

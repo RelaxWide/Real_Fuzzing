@@ -282,7 +282,7 @@
       "include_generators_in_schema": true,
       "retries": 1,
       "retrieval": {
-        "enabled": false,
+        "enabled": true,
         "index_dir": "rag/index",
         "top_k": 5,
         "embed_base_url": "http://192.168.10.1:8001/v1",

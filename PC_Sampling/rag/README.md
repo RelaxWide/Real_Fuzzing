@@ -113,6 +113,8 @@ generate_rag_response(system, user, meta) -> {"raw": "<JSON 문자열>", "diagno
 검색이 실패해도 생성은 막지 않는다(문서 없이 생성하고 진단에 오류를 남긴다).
 단, **기동 전 검증**(`rag_retrieval.preflight`)은 `--rag` + `rag.vllm_client` + `retrieval.enabled`
 일 때 장치에 손대기 전에 인덱스를 열어 모델·revision 을 대조하고, 틀리면 퍼저가 시작하지 않는다.
+인덱스 **파일이 없거나**(새 PC, 아직 `tools/rag_ingest.py` 안 함) numpy 가 없으면 시작은 하고 그 실행만
+검색 없이 생성한다(`[LLM/rag] 검색 인덱스를 쓸 수 없어 이번 실행은 검색 없이 생성합니다` 경고).
 
 **인덱스 버전 고정:** 캠페인은 시작할 때 `current` 가 가리킨 버전을 끝까지 쓴다. 도는 중에
 재색인해도 안전하다.
