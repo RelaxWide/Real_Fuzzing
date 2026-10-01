@@ -453,7 +453,6 @@ RAG_ENABLED          = bool(_RAG.get('enabled', False))
 RAG_MODULE_PATH      = str(_RAG.get('module_path', 'rag.rag_bridge_client'))
 RAG_FUNC_NAME        = str(_RAG.get('func_name', 'ask'))
 RAG_PASS_SYSTEM      = bool(_RAG.get('pass_system_prompt', True))  # False=단일인자 func(system+user)
-RAG_REQUEST_CADENCE  = int(_RAG.get('request_cadence', 5000))   # (v10 미사용) 실행수 기반 주기 — 아래 시간기반으로 대체
 RAG_REQUEST_INTERVAL = float(_RAG.get('request_interval_sec', 60.0))  # v10: LLM 요청 주기(벽시계 초). 성능과 무관하게 ≤이 간격마다 1회 시도(실행수 기반은 편차가 커서 대체)
 RAG_PLATEAU_EXECS    = int(_RAG.get('plateau_exec_threshold', 20000))
 RAG_MAX_SEEDS        = int(_RAG.get('max_seeds_per_round', 8))
@@ -592,7 +591,6 @@ IO_WL_SELECTION      = str(_IW.get('selection', 'round_robin'))
 IO_WL_MDTS_FALLBACK  = int(_IW.get('mdts_fallback_bytes', 262144))   # mdts=0(무제한) 시 전송 상한
 IO_WL_WORKING_FRAC   = float(_IW.get('working_set_frac', 0.02))      # churn/rand 영역 = nsze 비율
 IO_WL_HOT_WINDOW_B   = int(_IW.get('hot_window_bytes', 8 * 1024 * 1024))
-IO_WL_GC_UNIT_B      = int(_IW.get('gc_unit_bytes', 1024 * 1024))
 IO_WL_STRIDE_LBAS    = int(_IW.get('strided_period_lbas', 32))
 IO_WL_RAND_BUF_MB    = int(_IW.get('rand_buf_mb', 8))                # 사전생성 랜덤 write 버퍼 크기
 # 패턴 목록 (없으면 전체 기본). 순서 = round_robin 회전 순서.
@@ -640,10 +638,7 @@ PROBE_USB_RESET   = _G.get('probe_usb_reset', {}) or {}
 RECONNECT_SPEEDS_KHZ = _G.get('reconnect_speeds_khz', [None, 1000, 500])
 SAMPLER_DIAG      = _G.get('sampler_diag', {}) or {}
 
-# PCSR 주소 (CoreBase + 0x084, APB-AP ap-num 0)
-PCSR_CORE0      = _G['pcsr_core0']
-PCSR_CORE1      = _G['pcsr_core1']
-PCSR_CORE2      = _G['pcsr_core2']
+# PCSR 전원 도메인 (코어별 PCSR 주소는 globals.pcsr_addrs_swd/jtag)
 PCSR_POWER_ADDR = _G['pcsr_power_addr']
 PCSR_POWER_MASK = _G['pcsr_power_mask']
 PCSR_ADDRS_SWD  = list(_G['pcsr_addrs_swd'])
@@ -1049,10 +1044,8 @@ IDLE_RATIO_THRESH = _DI['idle_ratio_thresh']
 
 CALIBRATION_RUNS  = _DI['calibration_runs']
 
-DETERMINISTIC_ENABLED = _MU['deterministic_enabled']
 DETERMINISTIC_ARITH_MAX = _MU['deterministic_arith_max']
 
-MOPT_ENABLED      = _MU['mopt_enabled']
 MOPT_PILOT_PERIOD = _MU['mopt_pilot_period']
 MOPT_CORE_PERIOD  = _MU['mopt_core_period']
 
@@ -20145,7 +20138,7 @@ _NVME_CLASS = Path('/sys/class/nvme')
 
 @dataclass(frozen=True)
 class TimingSpec:
-    cfg_after_ts: float        # 링크 업(TS) → 설정 요청 완료
+    cfg_after_ts: Optional[float]  # 링크 업(TS) → 설정 요청 완료. None = 판정 안 함(시각은 정보로만)
     en_to_rdy: float           # CC.EN=1 → CSTS.RDY=1
     rdy_to_admin: float        # CSTS.RDY=1 → admin 명령 가능(커널 live)
     npo_io_ready: float        # Normal POR: 전원 ON → I/O 서비스 가능
@@ -20160,7 +20153,9 @@ class TimingSpec:
             raise ValueError(f'{where} must be an object')
         def ms(key):
             return number(raw.get(key), f'{where}.{key}', 0.001) / 1000.0
-        return cls(ms('cfg_after_ts_ms'), ms('en_to_rdy_ms'), ms('rdy_to_admin_ms'),
+        # cfg_after_ts_ms 는 선택: 없거나 null 이면 '설정 요청 완료 after TS' 구간을 판정하지 않는다
+        cfg = None if raw.get('cfg_after_ts_ms') is None else ms('cfg_after_ts_ms')
+        return cls(cfg, ms('en_to_rdy_ms'), ms('rdy_to_admin_ms'),
                    ms('npo_io_ready_ms'), ms('spo_io_ready_ms'),
                    number(raw.get('overrun_wait_sec', 60), f'{where}.overrun_wait_sec', 0.001))
 
@@ -21891,10 +21886,11 @@ class ExceptionController:
             self.emit('shutdown_check', status='UNOBSERVED')
 
     def _timing_segments(self, profile, marks):
-        """(키, 이름, 시작 mark, 끝 mark, 스펙 s). 링크가 실제로 내려갔을 때만 cfg 구간을 본다."""
+        """(키, 이름, 시작 mark, 끝 mark, 스펙 s). cfg 구간은 스펙이 설정돼 있고 링크가 실제로
+        내려갔을 때만 본다."""
         spec = self.timing
         segs = []
-        if 'link_down' in marks:
+        if 'link_down' in marks and spec.cfg_after_ts is not None:
             segs.append(('cfg_after_ts', '설정 요청 완료 after TS', 'link_up', 'cfg_ok', spec.cfg_after_ts))
         segs.append(('en_to_rdy', 'CC.EN→RDY', 'cc_en', 'rdy', spec.en_to_rdy))
         segs.append(('rdy_to_admin', 'RDY→admin 가능(live)', 'rdy', 'live', spec.rdy_to_admin))
@@ -21966,7 +21962,7 @@ class ExceptionController:
         spec = self.timing
         return (spec.npo_io_ready if profile.timing == 'npo' else
                 spec.spo_io_ready if profile.timing == 'spo' else
-                spec.cfg_after_ts + spec.en_to_rdy + spec.rdy_to_admin)
+                (spec.cfg_after_ts or 0) + spec.en_to_rdy + spec.rdy_to_admin)
 
     def _timing_wait(self, profile, mon, t0, t0_what, cycles=1):
         spec = self.timing
@@ -22670,6 +22666,14 @@ class ExceptionFuzzerMixin:
 
 
 
+def apply_exception_flag(cfg, flag):
+    """--exception 이면 exceptions.enabled 를 true 로. 끄는 방향으로는 바꾸지 않는다(config 가 기본).
+    NVMeFuzzer.exception_config 는 _CFG 를 그대로 가리키므로 생성 전에 바꾸면 반영된다."""
+    if flag:
+        cfg.setdefault('exceptions', {})['enabled'] = True
+    return bool(flag)
+
+
 class NVMeFuzzer(ExceptionFuzzerMixin, LearningMixin, _V101Fuzzer):
     """Standalone v11 engine with optional exception injection and LLM learning."""
     exception_config = _CFG
@@ -22800,8 +22804,14 @@ if __name__ == "__main__":
                         help='LLM callable 모듈 경로 override (기본: config rag.module_path)')
     parser.add_argument('--rag-func', default=None,
                         help='LLM callable 함수명 override (기본: config rag.func_name)')
+    # v11: 예외(리셋·POR) 주입. 기본은 config exceptions.enabled(false). 이 옵션은 켜기만 한다.
+    parser.add_argument('--exception', action='store_true', default=False,
+                        help='예외 주입(리셋·NSSR·FLR·PERST·POR) 활성 — config exceptions.enabled 를 '
+                             'true 로 덮어씀 (기본: config 값, 기본 false)')
 
     args = parser.parse_args()
+    if apply_exception_flag(_CFG, args.exception):
+        print("[Exception] --exception: 예외 주입 활성 (config exceptions.enabled 무시)")
 
     # RAG 설정 불일치는 검색 없는 생성으로 폴백할 사유가 아니다.
     # NVMeFuzzer 생성/장치 초기화 전에 같은 인덱스를 검증하고 고정한다.

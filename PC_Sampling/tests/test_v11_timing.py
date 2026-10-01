@@ -341,6 +341,14 @@ class Judgement(unittest.TestCase):
         self.assertNotIn('cfg_after_ts', segs)
         segs = [s[0] for s in c._timing_segments(profile('reset'), {'link_down': 0.1})]
         self.assertIn('cfg_after_ts', segs)
+        # 제품 설정에 cfg_after_ts_ms 가 없으면 링크가 내려가도 판정하지 않는다(시각은 정보로만)
+        c2 = controller(self, timing=dict(BM9K1, cfg_after_ts_ms=None))
+        self.assertIsNone(c2.timing.cfg_after_ts)
+        segs = [s[0] for s in c2._timing_segments(profile('reset'), {'link_down': 0.1})]
+        self.assertNotIn('cfg_after_ts', segs)
+        self.assertAlmostEqual(c2._timing_budget(profile('reset')), 0.2)
+        no_key = {k: v_ for k, v_ in BM9K1.items() if k != 'cfg_after_ts_ms'}
+        self.assertIsNone(v.TimingSpec.parse(no_key).cfg_after_ts)
 
     def test_npo_io_ready_against_power_on(self):
         c = controller(self)
@@ -484,11 +492,11 @@ class ProductConfig(unittest.TestCase):
     def test_products(self):
         cfg = json.loads((ROOT / 'fuzzer_config.json').read_text(encoding='utf-8-sig'))
         spec = {n: v.TimingSpec.parse(p.get('exception_timing')) for n, p in cfg['products'].items()}
-        self.assertEqual(spec['BM9K1'], v.TimingSpec(0.2, 0.1, 0.1, 0.5, 20.0, 60))
+        self.assertEqual(spec['BM9K1'], v.TimingSpec(None, 0.1, 0.1, 0.5, 20.0, 60))
         for n in ('PM9M1', 'PM9M1_LNB', 'PM9M1_HP', 'BM9H1'):
-            self.assertEqual(spec[n], v.TimingSpec(0.1, 10.0, 10.0, 10.0, 10.0, 60), n)
+            self.assertEqual(spec[n], v.TimingSpec(None, 10.0, 10.0, 10.0, 10.0, 60), n)
         for n in ('P7', 'P9'):
-            self.assertEqual(spec[n], v.TimingSpec(30.0, 30.0, 30.0, 30.0, 30.0, 60), n)
+            self.assertEqual(spec[n], v.TimingSpec(None, 30.0, 30.0, 30.0, 30.0, 60), n)
         profs = {p.name: p for p in v.compile_profiles(cfg['exceptions'], cfg)}
         self.assertEqual((profs['normal_por'].timing, profs['sudden_por'].timing), ('npo', 'spo'))
         for n in ('normal_por', 'sudden_por', 'warm_reset_perst'):

@@ -30,9 +30,6 @@
     "_comment_summary_nsid_top": "종료 요약의 Actual NSID distribution에 표시할 상위 NSID 개수(횟수 내림차순). 나머지는 종류 수와 합계로 요약한다. 0이면 전체를 표시한다.",
     "summary_nsid_top": 8,
     "openocd_startup_timeout": 10.0,
-    "pcsr_core0": "0x80030084",
-    "pcsr_core1": "0x80032084",
-    "pcsr_core2": "0x80034084",
     "pcsr_power_addr": "0x30313f30",
     "pcsr_power_mask": "0x00010101",
     "pcsr_addrs_swd": [
@@ -52,6 +49,11 @@
     ],
     "nvme_device": "/dev/nvme0",
     "nvme_namespace": 1,
+    "_comment_v10_3_only": "아래 키는 v11 이 읽지 않는다. v10.3 이 필수로 읽으므로 지우지 않는다(호환용).",
+    "pcsr_core0": "0x80030084",
+    "pcsr_core1": "0x80032084",
+    "pcsr_core2": "0x80034084",
+    "_comment_unused": "아래는 현재 쓰지 않는 기능의 설정이다(값을 바꾸지 않으면 동작에 영향 없음). v10.3·v11 이 필수로 읽으므로 지우지 않는다.",
     "seed_dir": null,
     "resume_coverage": null
   },
@@ -87,48 +89,25 @@
     "_comment_state_monitor_sec": "SMART/get-log/security 등 state 관측용 nvme 명령의 최대 대기 시간(초). 시간 초과 시 관측 실패로 처리하고 무한 대기를 피한다. 시간 초과가 프로세스나 장치 내부 명령의 종료를 보장하는 것은 아니다.",
     "state_monitor_sec": 60
   },
-  "sampling": {
-    "sample_interval_us": 0,
-    "max_samples_per_run": 500,
-    "saturation_limit": 10,
-    "global_saturation_limit": 20,
-    "post_cmd_delay_ms": 0
-  },
-  "diagnose_idle_calibration": {
-    "diagnose_stability": 100,
-    "diagnose_max": 10000,
-    "diagnose_sample_ms": 10,
-    "idle_window_size": 30,
-    "idle_ratio_thresh": 0.8,
-    "calibration_runs": 3
-  },
-  "fuzzing": {
-    "max_input_len": 131072,
-    "total_runtime_sec": 604800,
-    "max_energy": 16.0,
-    "random_gen_ratio": 0.2,
-    "det_budget": 0.2,
-    "io_admin_ratio": 3,
-    "corpus_epoch_size": 0,
-    "max_sequence_corpus": 50,
-    "max_corpus_hard_limit": 0,
-    "excluded_opcodes": []
-  },
-  "mutation": {
-    "opcode": 0.1,
-    "nsid": 0.1,
-    "admin_swap": 0.05,
-    "datalen": 0.08,
-    "schema": 0.3,
-    "lba_pair": 0.15,
-    "struct_payload": 0.1,
-    "seq_prob": 0.05,
-    "seq_max_per_100": 10,
-    "deterministic_enabled": true,
-    "deterministic_arith_max": 10,
-    "mopt_enabled": true,
-    "mopt_pilot_period": 5000,
-    "mopt_core_period": 50000
+  "power": {
+    "pm_rotate_interval": 100,
+    "ps_entry_exit_margin_ms": 105,
+    "l1_settle": 0.05,
+    "l1_2_settle": 2.0,
+    "restore_settle_s": 1.0,
+    "d3_restore_settle_s": 3.0,
+    "d3_extra_s": 0.2,
+    "ps_settle_fallback": {
+      "0": 0.05,
+      "1": 0.05,
+      "2": 0.05,
+      "3": 0.5,
+      "4": 2.0
+    },
+    "enable_por": true,
+    "por_poweroff_wait": 3.0,
+    "por_boot_wait": 30.0,
+    "por_rescan_delay": 10.0
   },
   "exceptions": {
     "_comment": "v11 전용 예외 주입 설정이며 v10.3은 사용하지 않는다. enabled=false이면 주입하지 않는다. 켜면 사전시험에서 실제 profile을 실행하고 통과한 후보를 사용한다. preflight.enabled=false이면 능동 검증 없이 capability 확인만 거친 후보를 사용한다. PM 전환 구간은 제외한다. 주입은 주기가 되면 명령 상태와 무관하게 강제로 한다(주기 뒤 첫 명령 전송 시점, 명령이 실행 중이었는지는 in_flight 로 기록). 장치 내부 명령과의 동시성은 보장하지 않는다. initial_delay_minutes는 사전시험 완료부터, min_interval_minutes는 이전 이벤트 완료부터 계산한다. 실패 시 추가 복구 POR/reset 없이 보존·덤프 후 중단한다. Warm은 전원 유지 PERST이며 REFCLK를 직접 토글하지 않는다. normal_por는 orderly remove 후 전원 차단, sudden_por는 전원 차단 후 remove한다. 실제 적용 가능 여부는 제품·호스트·배선에 따라 달라진다.",
@@ -197,7 +176,7 @@
         "ready_timeout_ref": "power.por_boot_wait"
       }
     ],
-    "_comment_timing": "profile.timing: reset(기본) | npo(Normal POR) | spo(Sudden POR). 제품 블록의 exception_timing 이 있으면 복귀를 구간별로 잰다(CC.EN→RDY, RDY→admin 가능(커널 live), npo/spo 는 전원 ON→I/O 가능). 스펙을 넘으면 overrun_wait_sec 까지 실제 복귀 시간을 더 잰 뒤 불량(현상 보존·덤프·중단). exception_timing 이 없는 제품은 profile 의 준비 한도만 본다. 설정 응답 시간은 최소 대기·커널 복원이 포함되어 측정 불가로 표시한다. pci_rescan_wait = 링크 업 연속 100ms 확인 후 장치가 나타날 때까지 rescan 반복.",
+    "_comment_timing": "profile.timing: reset(기본) | npo(Normal POR) | spo(Sudden POR). 제품 블록의 exception_timing 이 있으면 복귀를 구간별로 잰다(CC.EN→RDY, RDY→admin 가능(커널 live), npo/spo 는 전원 ON→I/O 가능). 스펙을 넘으면 overrun_wait_sec 까지 실제 복귀 시간을 더 잰 뒤 불량(현상 보존·덤프·중단). exception_timing 이 없는 제품은 profile 의 준비 한도만 본다. 설정 요청 완료 after TS 는 판정하지 않는다(최소 대기·커널 복원이 섞여 장치 시간이 아님) — 제품 블록에 cfg_after_ts_ms 를 넣으면 다시 판정한다. pci_rescan_wait = 링크 업 연속 100ms 확인 후 장치가 나타날 때까지 rescan 반복.",
     "_comment_perst": "아래 PERST adapter는 현재 시험 보드의 PMU devIdx=1, pinNo=7, 3300mV 설정이다. 다른 보드/슬롯에 그대로 적용할 수 있다는 뜻은 아니다. PMU 명령 16은 assert(Low), 15는 release(High)이다. GPIO readback(20)은 이 보드에서 실패해 쓰지 않고, 효과는 링크 다운으로 확인한다(adapter 에 readback 을 넣으면 여전히 엄격 확인). 실제 주입 후보는 profiles로 선택한다. McToggle(18)과 직접 REFCLK 제어는 등록되어 있지 않다.",
     "adapters": {
       "perst_assert": {
@@ -211,28 +190,504 @@
     },
     "restore_actions": ["power_on", "perst_release"]
   },
-  "power": {
-    "pm_rotate_interval": 100,
-    "ps_entry_exit_margin_ms": 105,
-    "l1_settle": 0.05,
-    "l1_2_settle": 2.0,
-    "restore_settle_s": 1.0,
-    "d3_restore_settle_s": 3.0,
-    "d3_extra_s": 0.2,
-    "ps_settle_fallback": {
-      "0": 0.05,
-      "1": 0.05,
-      "2": 0.05,
-      "3": 0.5,
-      "4": 2.0
+  "rag": {
+    "_comment_schema_max": "rag.schema_max는 LLM 프롬프트에 포함할 명령 스키마 개수 상한이다. 0 이하는 후보 전체를 사용한다. 요청 빌더가 정한 우선순위(필수 지정 명령 등)를 유지하며 앞에서부터 선택한다. 값을 줄이면 입력은 짧아지지만 모델에 제공되는 명령 스키마도 줄어든다.",
+    "_comment_learning": "v10.2부터 도입되어 v10.3/v11에서도 사용하는 실행 근거 기반 학습 설정. learning.enabled=false는 이 학습 확장을 끄며 LLM 호출 자체를 끄는 rag.enabled와는 다르다. 각 하위 기능을 개별로 설정할 수 있다. min_reward_samples는 adaptive_tasks의 성과 기반 선택에 필요한 최소 완료 평가 수이며 미달 task는 가중 회전 선택을 사용한다.",
+    "learning": {
+      "enabled": true,
+      "evidence": true,
+      "preserve_setup": true,
+      "generators": true,
+      "adaptive_tasks": true,
+      "setup_preserve_ratio": 0.8,
+      "evaluation_commands": 8,
+      "exploration_every": 4,
+      "min_reward_samples": 2,
+      "max_variants": 16,
+      "random_seed": 102,
+      "snapshot_min_interval_sec": 60
     },
-    "enable_por": true,
-    "por_poweroff_wait": 3.0,
-    "por_boot_wait": 30.0,
-    "por_rescan_delay": 10.0
+    "_comment": "LLM 호출 여부는 rag.enabled와 --rag/--no-rag로 결정하며 명령행 옵션이 우선한다. LLM 없이 퍼징하려면 enabled=false 또는 --no-rag를 사용한다(module_path를 바꿀 필요 없음). 인터넷이 없어도 접근 가능한 LAN 모델 서버나 사내 브리지가 있으면 LLM을 사용할 수 있다. request_interval_sec는 백그라운드 요청 주기, min_request_interval_sec는 최소 전송 간격이다. 퍼저 프로세스당 요청은 한 번에 1건만 진행하며 기다리는 동안 퍼징을 계속한다. plateau_exec_threshold는 탐색 정체 판단에 사용한다. 제안은 검증과 가드를 통과한 항목만 반영한다.",
+    "_comment_call": "연결 방식 선택: Spark 등 접근 가능한 vLLM 서버를 직접 호출하려면 module_path=rag.vllm_client, func_name=generate_rag_response, pass_system_prompt=true를 사용한다. 인터넷 없는 퍼징 PC에서 Samba 공유 폴더로 온라인 PC의 사내 API를 사용하려면 module_path=rag.rag_bridge_client, 같은 func_name, pass_system_prompt=false를 사용한다. 온라인 PC에는 srag_llm_service.py와 실제 srag_llm_guide.py가 필요하고 양쪽이 동일한 공유 폴더를 봐야 한다(RAG_BRIDGE_DIR). LLM을 사용하지 않는 실행은 rag.enabled=false 또는 --no-rag다. 호출 규약은 meta 지원 함수면 func(system,user,meta)가 우선이고, 그 외 true이면 func(system,user), false이면 system과 user를 합쳐 func(prompt)를 호출한다. 자세한 배치는 rag/README.md 참조.",
+    "_comment_debug": "debug는 LLM 요청·파싱·채택 진단 로그를, debug_exec는 명령 실행 단위의 상세 로그를 제어한다. log_responses=true이면 실행 출력 폴더의 llm/llm_io_<시각>.jsonl에 요청·응답을 보관한다. json_retries는 퍼저 워커의 JSON 파싱 실패 교정 재요청 상한이며 vllm.retries나 백엔드 내부 교정과 별개다.",
+    "enabled": true,
+    "fail_limit": 10,
+    "debug": true,
+    "json_retries": 2,
+    "log_responses": true,
+    "module_path": "rag.vllm_client",
+    "func_name": "generate_rag_response",
+    "pass_system_prompt": true,
+    "request_interval_sec": 60,
+    "min_request_interval_sec": 5,
+    "plateau_exec_threshold": 20000,
+    "_comment_seq": "task_weights는 활성 task의 가중 회전 비중이며 생략한 task 가중치는 1이다. io_patterns도 활성 조건을 만족하면 참여한다. 성과 기반 선택과 연속 선택 제한이 함께 적용될 수 있다. seq_energy_boost는 LLM 시퀀스 에너지 보정값이다. task 비활성화는 tasks 또는 해당 기능의 활성 설정을 사용한다.",
+    "seq_energy_boost": 2.5,
+    "cull_grace": 8,
+    "task_weights": {
+      "new_group_seeds": 1,
+      "sequences": 2,
+      "corpus_eval": 1,
+      "io_patterns": 2
+    },
+    "max_seeds_per_round": 8,
+    "max_seq_per_round": 6,
+    "_comment_corpus_eval_sample": "corpus_eval 요청에 포함할 기존 seed 표본 수. task마다 응답 항목 단위와 개수가 다르므로 채택 총합만으로 성과를 비교하지 말고 [LLM/task]의 task별 요청·채택 통계를 함께 확인한다.",
+    "corpus_eval_sample": 40,
+    "max_seq_len": 24,
+    "max_uncov_funcs": 40,
+    "seed_at_startup": true,
+    "llm_energy_boost": 1.5,
+    "reserved_policy": "reject",
+    "result_stale_execs": 50000,
+    "tasks": {
+      "new_group_seeds": true,
+      "sequences": true,
+      "corpus_eval": true,
+      "io_patterns": true
+    },
+    "_comment_v91": "Invalid Opcode(SC=0x01) 결과가 반복되어 미구현으로 판정된 명령은 LLM 후보에서 제외하고 에너지를 낮춘다. 판정은 실행 결과 통계에 근거하며 단일 오류가 해당 명령의 미구현을 확정한다는 뜻은 아니다.",
+    "unimpl_min_exec": 5,
+    "unimpl_ratio": 0.9,
+    "unimpl_energy_floor": 0.05,
+    "unimpl_energy_floor_on": true,
+    "schema_max": 16,
+    "boost_lr": 0.3,
+    "boost_min": 0.5,
+    "boost_max": 5.0,
+    "boost_min_samples": 50,
+    "debug_exec": false,
+    "boost_min_gain": 5,
+    "max_hops": 3,
+    "_comment_max_hops": "미도달 함수의 탐색 우선순위를 정할 때 도달 코드와의 콜그래프 거리를 참고하는 홉 상한. 가까운 호출자가 없는 함수는 후순위로 둘 수 있으며 이 값만으로 명령 전송을 차단하지 않는다.",
+    "autoname_kw_off_products": [
+      "BM9K1"
+    ],
+    "_comment_autoname_kw": "default/thunk/switch 키워드 기반 자동 이름 필터를 끌 제품 목록. 실제 심볼에 이 단어가 포함되는 제품에서 사용할 수 있다. FUN_/sub_ 형식의 자동 이름 정규식 필터는 이 목록과 별개로 유지한다.",
+    "_comment_vllm": "module_path=rag.vllm_client일 때 사용하는 직접 HTTP 호출 설정. base_url은 퍼징 PC에서 접근 가능한 서버 주소이며 Spark 전용 고정 주소가 아니다. model은 서버의 served-model-name과 일치시킨다. retrieval.enabled는 로컬 문서 검색 여부이고 LLM 호출 활성화 스위치가 아니다. 검색을 켜기 전에 tools/rag_ingest.py로 인덱스를 준비한다. 사내 Samba 브리지 선택 시 이 vllm 절의 서버·검색 설정을 사용하지 않으며 온라인 guide의 API/검색 설정을 따른다.",
+    "vllm": {
+      "base_url": "http://192.168.10.1:8000/v1",
+      "api_key": "not-used",
+      "model": "nemotron-3-super",
+      "_comment_chat_template_kwargs": "지원하는 모델의 chat template에 전달하는 옵션. 현재 클라이언트는 enable_thinking과 low_effort에 불리언만 허용하며 전체 값을 null로 두면 별도 옵션을 전달하지 않는다. 생성 길이·지연·JSON 품질에 미치는 효과는 모델과 요청에 따라 달라지므로 diagnostics로 확인한다. 백엔드 내 재시도/교정은 같은 timeout_sec 예산을 공유하며, 퍼저 워커의 json_retries는 별도 호출이다.",
+      "chat_template_kwargs": {
+        "enable_thinking": true,
+        "low_effort": true
+      },
+      "timeout_sec": 400.0,
+      "max_tokens": 16384,
+      "temperature": 0.7,
+      "max_response_bytes": 8388608,
+      "structured_output": true,
+      "include_generators_in_schema": true,
+      "retries": 1,
+      "retrieval": {
+        "enabled": false,
+        "index_dir": "rag/index",
+        "top_k": 5,
+        "embed_base_url": "http://192.168.10.1:8001/v1",
+        "embed_model": "bge-m3",
+        "embed_model_revision": null,
+        "query_max_chars": 8000,
+        "command_tag_bonus": 0.1,
+        "context_max_chars": 60000
+      }
+    }
   },
-  "visualization": {
-    "graph_refresh_interval": 5000
+  "io_workload": {
+    "_comment": "일반 퍼징 사이에 Write/Read 워크로드를 삽입한다. fuzz_gap은 실행 간격(퍼징 명령 수), block_size는 한 워크로드 블록의 명령 수다. Identify에서 얻은 namespace 크기·전송 한계로 유효 범위를 구성하지만 실제 rc=0 성공을 보장하지는 않는다. LLM descriptor의 block_size(LBA 단위)와 구분한다. enabled=false 또는 --no-io-workload로 비활성화한다.",
+    "enabled": true,
+    "block_size": 100,
+    "fuzz_gap": 100,
+    "selection": "round_robin",
+    "patterns": [
+      "seq_write",
+      "rand_write",
+      "overwrite_churn",
+      "hot_cold",
+      "read_disturb",
+      "mixed_rw",
+      "pingpong_write",
+      "pingpong_read",
+      "subpage_rmw",
+      "single_lba_hammer",
+      "strided_write",
+      "reverse_seq",
+      "boundary",
+      "bursty_mixed_size"
+    ],
+    "mdts_fallback_bytes": 262144,
+    "working_set_frac": 0.02,
+    "hot_window_bytes": 8388608,
+    "strided_period_lbas": 32,
+    "rand_buf_mb": 8,
+    "burst_blocks_max": 50,
+    "burst_snap_blocks": 5,
+    "burst_patience_k": 3,
+    "ffm_field": "ffm_frag",
+    "burst_walltime_cap_sec": 120.0
+  },
+  "products": {
+    "BM9K1": {
+      "_comment": "SiFive E76 RISC-V 4코어 제품 프로필. cJTAG 연결과 SJTAG 인증, SBA를 통한 PCSR 관측을 사용한다. 기밀 디버그 주소와 제품별 자산 경로는 risc-v/sjtag_addrs.json 등 별도 자산에서 관리한다.",
+      "interface": "cjtag",
+      "sampler_type": "riscv_pcsr",
+      "arch": "riscv",
+      "jlink_device": "E76",
+      "jlink_speed": 10000,
+      "riscv": {
+        "_comment": "cores의 elf/load_offset 등 제품 자산은 sjtag_addrs.json의 pcsr.cores 설정을 우선 사용한다. 이 절에는 공유 가능한 구조와 튜닝값을 둔다.",
+        "power": "both",
+        "tap_script": false,
+        "gate_threshold": 95.0,
+        "interesting_policy": "primary",
+        "_comment_reconnect": "샘플러 링크 장애 시 빠른 재초기화 후 필요하면 close→대기→connect로 재연결을 시도한다. reconnect_attempts와 backoff/cap으로 재시도 횟수와 대기 시간을 제한한다. 컨트롤러 복구나 프로브 재연결 성공을 보장하는 설정은 아니다.",
+        "reconnect_attempts": 6,
+        "reconnect_settle_sec": 0.5,
+        "reconnect_backoff_sec": 1.0,
+        "reconnect_backoff_cap_sec": 3.0,
+        "sample_plan": {
+          "_comment": "weights는 코어별 버스트 배분의 초기 가중치다. 각 관측 구간에서 버스트 순서를 섞어 고정 순서 편향을 줄인다. seed=0이면 실행 시 무작위 seed를 정해 기록하며 동일한 난수 순서가 필요하면 기록된 값을 지정한다.",
+          "weights": {
+            "0": 8,
+            "1": 1,
+            "2": 4,
+            "3": 1
+          },
+          "burst_len": 256,
+          "primary_core": 0,
+          "valid_bit": 1,
+          "seed": 0,
+          "adaptive": {
+            "_comment": "enabled=true이면 초기 weights에서 시작해 최근 커버리지 수확률에 따라 코어별 샘플 예산을 조정한다. prior_samples는 표본이 적은 코어의 추정치를 전체 평균 쪽으로 보정한다. false이면 적응 조정을 끄고 초기 가중치를 사용한다.",
+            "enabled": true,
+            "period": 500,
+            "decay": 0.999,
+            "min_weight": 1,
+            "max_step": 2.0,
+            "exponent": 2.0,
+            "prior_samples": 2000
+          },
+          "jitter_pct": 20.0
+        }
+      },
+      "invalid_pc_vals": [],
+      "bb_file": "products/BM9K1/basic_blocks.txt",
+      "func_file": "products/BM9K1/functions.txt",
+      "_comment_ufas": "BM9K1 UFAS 덤프 도구는 dump/unified_pcie_dump_tool이며 제품 모드 2를 사용한다. PM9M1 모드 1과 인자가 다르며 --ini를 붙이지 않는다. 실제 명령 구성과 산출물 수집은 제품 프로필 및 덤프 함수가 담당한다.",
+      "enable_ufas": true,
+      "ufas_binary": "dump/unified_pcie_dump_tool",
+      "ufas_mode": "2",
+      "enable_jlink_dump": false,
+      "enable_debug_tool_dump": false,
+      "state_fields": "bm9k1",
+      "_comment_nvme_timeouts": "퍼저가 crash(타임아웃)로 판정하는 명령별 창(ms). write = Write/WriteUncorrectable/WriteZeroes, flush = Flush, format = FormatNVM, 나머지 명령은 command. 여기 없는 그룹(fw_commit/sanitize/telemetry/dsm/security)도 command 값을 쓴다. 실제 창 = 값 + power.ps_entry_exit_margin_ms.",
+      "nvme_timeouts": {
+        "command": 8000,
+        "write": 30000,
+        "flush": 2000,
+        "format": 180000,
+        "selftest_short": 8000,
+        "selftest_ext": 8000,
+        "verify": 8000
+      },
+      "exception_timing": {
+        "en_to_rdy_ms": 100,
+        "rdy_to_admin_ms": 100,
+        "npo_io_ready_ms": 500,
+        "spo_io_ready_ms": 20000,
+        "overrun_wait_sec": 60
+      }
+    },
+    "PM9M1": {
+      "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
+      "nvme_timeouts": {
+        "command": 8000,
+        "format": 120000,
+        "flush": 8000,
+        "selftest_short": 8000,
+        "selftest_ext": 8000,
+        "verify": 22000,
+        "sanitize": 180000
+      },
+      "exception_timing": {
+        "en_to_rdy_ms": 10000,
+        "rdy_to_admin_ms": 10000,
+        "npo_io_ready_ms": 10000,
+        "spo_io_ready_ms": 10000,
+        "overrun_wait_sec": 60
+      },
+      "interface": "swd",
+      "openocd_config": "products/PM9M1/openocd.cfg",
+      "jlink_device": "Cortex-R8",
+      "tcl_prefix": "r8",
+      "pcsr_addrs": [
+        "0x80030084",
+        "0x80032084",
+        "0x80034084"
+      ],
+      "sampler_type": "pcsr",
+      "go_settle_ms": 0,
+      "power_addr": "0x30313f30",
+      "power_mask": "0x00010101",
+      "invalid_pc_vals": [
+        "0x6ba02476",
+        "0x6ba02477",
+        "0x6ba00476",
+        "0x6ba00477"
+      ],
+      "fw_addr_start": "0x0",
+      "fw_addr_end": "0x3B7FFF",
+      "bb_file": "products/PM9M1/basic_blocks.txt",
+      "func_file": "products/PM9M1/functions.txt",
+      "enable_ufas": true,
+      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
+      "enable_jlink_dump": true,
+      "state_fields": "r8"
+    },
+    "PM9M1_LNB": {
+      "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
+      "nvme_timeouts": {
+        "command": 8000,
+        "format": 120000,
+        "flush": 8000,
+        "selftest_short": 8000,
+        "selftest_ext": 8000,
+        "verify": 22000,
+        "sanitize": 180000
+      },
+      "exception_timing": {
+        "en_to_rdy_ms": 10000,
+        "rdy_to_admin_ms": 10000,
+        "npo_io_ready_ms": 10000,
+        "spo_io_ready_ms": 10000,
+        "overrun_wait_sec": 60
+      },
+      "interface": "swd",
+      "openocd_config": "products/PM9M1/openocd.cfg",
+      "jlink_device": "Cortex-R8",
+      "tcl_prefix": "r8",
+      "pcsr_addrs": [
+        "0x80030084",
+        "0x80032084",
+        "0x80034084"
+      ],
+      "sampler_type": "pcsr",
+      "go_settle_ms": 0,
+      "power_addr": "0x30313f30",
+      "power_mask": "0x00010101",
+      "invalid_pc_vals": [
+        "0x6ba02476",
+        "0x6ba02477",
+        "0x6ba00476",
+        "0x6ba00477"
+      ],
+      "fw_addr_start": "0x0",
+      "fw_addr_end": "0x3B7FFF",
+      "bb_file": "products/PM9M1/basic_blocks.txt",
+      "func_file": "products/PM9M1/functions.txt",
+      "enable_ufas": true,
+      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
+      "enable_jlink_dump": true,
+      "state_fields": "r8",
+      "_comment_variant": "기존 PM9M1과 같은 프로필. state 관측에 LID 0xDF snapshot을 포함한다."
+    },
+    "PM9M1_HP": {
+      "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
+      "nvme_timeouts": {
+        "command": 8000,
+        "format": 120000,
+        "flush": 8000,
+        "selftest_short": 8000,
+        "selftest_ext": 8000,
+        "verify": 22000,
+        "sanitize": 180000
+      },
+      "exception_timing": {
+        "en_to_rdy_ms": 10000,
+        "rdy_to_admin_ms": 10000,
+        "npo_io_ready_ms": 10000,
+        "spo_io_ready_ms": 10000,
+        "overrun_wait_sec": 60
+      },
+      "interface": "swd",
+      "openocd_config": "products/PM9M1/openocd.cfg",
+      "jlink_device": "Cortex-R8",
+      "tcl_prefix": "r8",
+      "pcsr_addrs": [
+        "0x80030084",
+        "0x80032084",
+        "0x80034084"
+      ],
+      "sampler_type": "pcsr",
+      "go_settle_ms": 0,
+      "power_addr": "0x30313f30",
+      "power_mask": "0x00010101",
+      "invalid_pc_vals": [
+        "0x6ba02476",
+        "0x6ba02477",
+        "0x6ba00476",
+        "0x6ba00477"
+      ],
+      "fw_addr_start": "0x0",
+      "fw_addr_end": "0x3B7FFF",
+      "bb_file": "products/PM9M1/basic_blocks.txt",
+      "func_file": "products/PM9M1/functions.txt",
+      "enable_ufas": true,
+      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
+      "enable_jlink_dump": true,
+      "state_fields": "r8",
+      "state_exclude_lids": [
+        223
+      ],
+      "_comment_variant": "PM9M1_LNB와 같은 기본 설정에서 state_exclude_lids로 LID 0xDF(223)를 state snapshot 관측에서 제외한다. df_* 필드는 주기 관측에서 빠지지만, 일반 퍼징 명령으로 LID 0xDF를 보내는 것까지 차단하는 설정은 아니다."
+    },
+    "BM9H1": {
+      "nvme_timeouts": {
+        "command": 8000,
+        "format": 120000,
+        "flush": 2000,
+        "selftest_short": 120000,
+        "selftest_ext": 900000,
+        "verify": 20000
+      },
+      "exception_timing": {
+        "en_to_rdy_ms": 10000,
+        "rdy_to_admin_ms": 10000,
+        "npo_io_ready_ms": 10000,
+        "spo_io_ready_ms": 10000,
+        "overrun_wait_sec": 60
+      },
+      "interface": "jtag",
+      "openocd_config": "products/BM9H1/openocd.cfg",
+      "jlink_device": "Cortex-R8",
+      "tcl_prefix": "r8",
+      "pcsr_addrs": [
+        "0x80030084",
+        "0x80032084"
+      ],
+      "sampler_type": "pcsr",
+      "go_settle_ms": 0,
+      "power_addr": "0x30313f30",
+      "power_mask": "0x00010101",
+      "invalid_pc_vals": [
+        "0x6ba02476",
+        "0x6ba02477",
+        "0x6ba00476",
+        "0x6ba00477"
+      ],
+      "fw_addr_start": "0x0",
+      "fw_addr_end": "0x3B7FFF",
+      "bb_file": "products/BM9H1/basic_blocks.txt",
+      "func_file": "products/BM9H1/functions.txt",
+      "enable_ufas": true,
+      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
+      "enable_jlink_dump": true,
+      "state_fields": "r8"
+    },
+    "P7": {
+      "_comment_timeouts": "halt 샘플러의 명령 워치독은 샘플링으로 정지한 시간을 보정한다. nvme_timeouts는 명령별 기준 시간(밀리초)이며 halt_fwtime_margin_sec의 여유를 추가한다. passthru/kernel timeout은 이 워치독과 별도다.",
+      "nvme_timeouts": {
+        "command": 30000,
+        "format": 300000,
+        "flush": 30000,
+        "selftest_short": 30000,
+        "selftest_ext": 30000,
+        "verify": 30000,
+        "aer": 600000
+      },
+      "exception_timing": {
+        "en_to_rdy_ms": 30000,
+        "rdy_to_admin_ms": 30000,
+        "npo_io_ready_ms": 30000,
+        "spo_io_ready_ms": 30000,
+        "overrun_wait_sec": 60
+      },
+      "interface": "swd",
+      "jlink_device": "Cortex-R5",
+      "sampler_type": "jlink_halt",
+      "_comment_sampling": "go_settle_ms와 halt_poll_ms는 halt 관측의 대기 시간과 샘플링 밀도를 조정한다. 더 자주 halt하면 관측 밀도와 장치 실행에 대한 간섭이 함께 늘 수 있다. 이 값이 호스트 freeze를 방지하거나 자동 재시작을 켜는 것은 아니다. 기존 실험 기록은 backup/SESSION_HANDOFF_v9.0.md 참조.",
+      "go_settle_ms": 5,
+      "halt_poll_ms": 8,
+      "jlink_speed": 2000,
+      "jlink_ap_index": 0,
+      "pc_reg_index": null,
+      "por_remove_bdf": "auto-root",
+      "invalid_pc_vals": [
+        "0x6ba02476",
+        "0x6ba02477"
+      ],
+      "fw_addr_start": "0x0",
+      "fw_addr_end": "0x9cffff",
+      "bb_file": "products/P7/basic_blocks.txt",
+      "func_file": "products/P7/functions.txt",
+      "enable_ufas": false,
+      "enable_debug_tool_dump": true,
+      "enable_jlink_dump": false,
+      "state_fields": "p9"
+    },
+    "P9": {
+      "_comment_timeouts": "halt 샘플러의 명령 워치독은 샘플링으로 정지한 시간을 보정한다. nvme_timeouts는 명령별 기준 시간(밀리초)이며 halt_fwtime_margin_sec의 여유를 추가한다. passthru/kernel timeout은 이 워치독과 별도다.",
+      "nvme_timeouts": {
+        "command": 30000,
+        "format": 300000,
+        "flush": 30000,
+        "selftest_short": 30000,
+        "selftest_ext": 30000,
+        "verify": 30000,
+        "aer": 600000
+      },
+      "exception_timing": {
+        "en_to_rdy_ms": 30000,
+        "rdy_to_admin_ms": 30000,
+        "npo_io_ready_ms": 30000,
+        "spo_io_ready_ms": 30000,
+        "overrun_wait_sec": 60
+      },
+      "interface": "swd",
+      "jlink_device": "Cortex-R5",
+      "sampler_type": "jlink_halt",
+      "_comment_sampling": "go_settle_ms와 halt_poll_ms는 halt 관측의 대기 시간과 샘플링 밀도를 조정한다. 더 자주 halt하면 관측 밀도와 장치 실행에 대한 간섭이 함께 늘 수 있다. 이 값이 호스트 freeze를 방지하거나 자동 재시작을 켜는 것은 아니다. 기존 실험 기록은 backup/SESSION_HANDOFF_v9.0.md 참조.",
+      "go_settle_ms": 5,
+      "halt_poll_ms": 8,
+      "jlink_speed": 2000,
+      "jlink_ap_index": 0,
+      "pc_reg_index": null,
+      "por_remove_bdf": "auto-root",
+      "invalid_pc_vals": [
+        "0x6ba02476",
+        "0x6ba02477"
+      ],
+      "fw_addr_start": "0x0",
+      "fw_addr_end": "0x9cffff",
+      "bb_file": "products/P9/basic_blocks.txt",
+      "func_file": "products/P9/functions.txt",
+      "enable_ufas": false,
+      "enable_debug_tool_dump": true,
+      "enable_jlink_dump": false,
+      "state_fields": "p9"
+    }
+  },
+  "sampling": {
+    "sample_interval_us": 0,
+    "max_samples_per_run": 500,
+    "saturation_limit": 10,
+    "global_saturation_limit": 20,
+    "_comment_unused": "아래는 현재 쓰지 않는 기능의 설정이다(값을 바꾸지 않으면 동작에 영향 없음). v10.3·v11 이 필수로 읽으므로 지우지 않는다.",
+    "post_cmd_delay_ms": 0
+  },
+  "fuzzing": {
+    "max_input_len": 131072,
+    "total_runtime_sec": 604800,
+    "max_energy": 16.0,
+    "random_gen_ratio": 0.2,
+    "det_budget": 0.2,
+    "io_admin_ratio": 3,
+    "max_sequence_corpus": 50,
+    "excluded_opcodes": [],
+    "_comment_unused": "아래는 현재 쓰지 않는 기능의 설정이다(값을 바꾸지 않으면 동작에 영향 없음). v10.3·v11 이 필수로 읽으므로 지우지 않는다.",
+    "corpus_epoch_size": 0,
+    "max_corpus_hard_limit": 0
   },
   "runtime_hw": {
     "clkreq_assert_pin": 16,
@@ -242,6 +697,8 @@
     "fw_slot": 1,
     "prefill_bs": 4194304,
     "boot_sweep_s": 10.0,
+    "nvme_lba_size": 0,
+    "_comment_unused": "아래는 현재 쓰지 않는 기능의 설정이다(값을 바꾸지 않으면 동작에 영향 없음). v10.3·v11 이 필수로 읽으므로 지우지 않는다.",
     "settle_sweep": false,
     "settle_sweep_reps": 20,
     "settle_sweep_values": [
@@ -254,8 +711,35 @@
       0.01,
       0.005
     ],
-    "nvme_lba_size": 0,
     "pm_test_cycles": 0
+  },
+  "diagnose_idle_calibration": {
+    "diagnose_stability": 100,
+    "diagnose_max": 10000,
+    "diagnose_sample_ms": 10,
+    "idle_window_size": 30,
+    "idle_ratio_thresh": 0.8,
+    "calibration_runs": 3
+  },
+  "visualization": {
+    "graph_refresh_interval": 5000
+  },
+  "mutation": {
+    "opcode": 0.1,
+    "nsid": 0.1,
+    "admin_swap": 0.05,
+    "datalen": 0.08,
+    "schema": 0.3,
+    "lba_pair": 0.15,
+    "struct_payload": 0.1,
+    "seq_prob": 0.05,
+    "seq_max_per_100": 10,
+    "deterministic_arith_max": 10,
+    "mopt_pilot_period": 5000,
+    "mopt_core_period": 50000,
+    "_comment_v10_3_only": "아래 키는 v11 이 읽지 않는다. v10.3 이 필수로 읽으므로 지우지 않는다(호환용).",
+    "deterministic_enabled": true,
+    "mopt_enabled": true
   },
   "strategy": {
     "blocked_admin_opcodes": [
@@ -465,149 +949,6 @@
     "staleness_grace": 2,
     "staleness_k": 8.0,
     "staleness_floor": 0.05
-  },
-  "rag": {
-    "_comment_schema_max": "rag.schema_max는 LLM 프롬프트에 포함할 명령 스키마 개수 상한이다. 0 이하는 후보 전체를 사용한다. 요청 빌더가 정한 우선순위(필수 지정 명령 등)를 유지하며 앞에서부터 선택한다. 값을 줄이면 입력은 짧아지지만 모델에 제공되는 명령 스키마도 줄어든다.",
-    "_comment_learning": "v10.2부터 도입되어 v10.3/v11에서도 사용하는 실행 근거 기반 학습 설정. learning.enabled=false는 이 학습 확장을 끄며 LLM 호출 자체를 끄는 rag.enabled와는 다르다. 각 하위 기능을 개별로 설정할 수 있다. min_reward_samples는 adaptive_tasks의 성과 기반 선택에 필요한 최소 완료 평가 수이며 미달 task는 가중 회전 선택을 사용한다.",
-    "learning": {
-      "enabled": true,
-      "evidence": true,
-      "preserve_setup": true,
-      "generators": true,
-      "adaptive_tasks": true,
-      "setup_preserve_ratio": 0.8,
-      "evaluation_commands": 8,
-      "exploration_every": 4,
-      "min_reward_samples": 2,
-      "max_variants": 16,
-      "random_seed": 102,
-      "snapshot_min_interval_sec": 60
-    },
-    "_comment": "LLM 호출 여부는 rag.enabled와 --rag/--no-rag로 결정하며 명령행 옵션이 우선한다. LLM 없이 퍼징하려면 enabled=false 또는 --no-rag를 사용한다(module_path를 바꿀 필요 없음). 인터넷이 없어도 접근 가능한 LAN 모델 서버나 사내 브리지가 있으면 LLM을 사용할 수 있다. request_interval_sec는 백그라운드 요청 주기, min_request_interval_sec는 최소 전송 간격이다. 퍼저 프로세스당 요청은 한 번에 1건만 진행하며 기다리는 동안 퍼징을 계속한다. request_cadence는 현재 실행수 기반 주기로 사용하지 않는다. plateau_exec_threshold는 탐색 정체 판단에 사용한다. 제안은 검증과 가드를 통과한 항목만 반영한다.",
-    "_comment_call": "연결 방식 선택: Spark 등 접근 가능한 vLLM 서버를 직접 호출하려면 module_path=rag.vllm_client, func_name=generate_rag_response, pass_system_prompt=true를 사용한다. 인터넷 없는 퍼징 PC에서 Samba 공유 폴더로 온라인 PC의 사내 API를 사용하려면 module_path=rag.rag_bridge_client, 같은 func_name, pass_system_prompt=false를 사용한다. 온라인 PC에는 srag_llm_service.py와 실제 srag_llm_guide.py가 필요하고 양쪽이 동일한 공유 폴더를 봐야 한다(RAG_BRIDGE_DIR). LLM을 사용하지 않는 실행은 rag.enabled=false 또는 --no-rag다. 호출 규약은 meta 지원 함수면 func(system,user,meta)가 우선이고, 그 외 true이면 func(system,user), false이면 system과 user를 합쳐 func(prompt)를 호출한다. 자세한 배치는 rag/README.md 참조.",
-    "_comment_debug": "debug는 LLM 요청·파싱·채택 진단 로그를, debug_exec는 명령 실행 단위의 상세 로그를 제어한다. log_responses=true이면 실행 출력 폴더의 llm/llm_io_<시각>.jsonl에 요청·응답을 보관한다. json_retries는 퍼저 워커의 JSON 파싱 실패 교정 재요청 상한이며 vllm.retries나 백엔드 내부 교정과 별개다.",
-    "enabled": true,
-    "fail_limit": 10,
-    "debug": true,
-    "json_retries": 2,
-    "log_responses": true,
-    "module_path": "rag.vllm_client",
-    "func_name": "generate_rag_response",
-    "pass_system_prompt": true,
-    "request_cadence": 5000,
-    "request_interval_sec": 60,
-    "min_request_interval_sec": 5,
-    "plateau_exec_threshold": 20000,
-    "_comment_seq": "task_weights는 활성 task의 가중 회전 비중이며 생략한 task 가중치는 1이다. io_patterns도 활성 조건을 만족하면 참여한다. 성과 기반 선택과 연속 선택 제한이 함께 적용될 수 있다. seq_energy_boost는 LLM 시퀀스 에너지 보정값이다. task 비활성화는 tasks 또는 해당 기능의 활성 설정을 사용한다.",
-    "seq_energy_boost": 2.5,
-    "cull_grace": 8,
-    "task_weights": {
-      "new_group_seeds": 1,
-      "sequences": 2,
-      "corpus_eval": 1,
-      "io_patterns": 2
-    },
-    "max_seeds_per_round": 8,
-    "max_seq_per_round": 6,
-    "_comment_corpus_eval_sample": "corpus_eval 요청에 포함할 기존 seed 표본 수. task마다 응답 항목 단위와 개수가 다르므로 채택 총합만으로 성과를 비교하지 말고 [LLM/task]의 task별 요청·채택 통계를 함께 확인한다.",
-    "corpus_eval_sample": 40,
-    "max_seq_len": 24,
-    "max_uncov_funcs": 40,
-    "seed_at_startup": true,
-    "_comment_startup_task": "seed_at_startup=true일 때 첫 LLM 요청 task를 지정한다. off이면 가중 회전판이 선택하며 LLM이나 기동 요청을 끄는 값이 아니다. 지정 가능한 값은 new_group_seeds/sequences/corpus_eval/io_patterns다. 알 수 없거나 현재 비활성인 task는 경고 후 무시한다. 기동 요청도 회전판 순번을 소비한다. seed_at_startup=false이면 이 설정은 사용하지 않는다.",
-    "startup_task": "off",
-    "llm_energy_boost": 1.5,
-    "reserved_policy": "reject",
-    "result_stale_execs": 50000,
-    "tasks": {
-      "new_group_seeds": true,
-      "sequences": true,
-      "corpus_eval": true,
-      "io_patterns": true
-    },
-    "_comment_v91": "Invalid Opcode(SC=0x01) 결과가 반복되어 미구현으로 판정된 명령은 LLM 후보에서 제외하고 에너지를 낮춘다. 판정은 실행 결과 통계에 근거하며 단일 오류가 해당 명령의 미구현을 확정한다는 뜻은 아니다.",
-    "unimpl_min_exec": 5,
-    "unimpl_ratio": 0.9,
-    "unimpl_energy_floor": 0.05,
-    "unimpl_energy_floor_on": true,
-    "schema_max": 16,
-    "boost_lr": 0.3,
-    "boost_min": 0.5,
-    "boost_max": 5.0,
-    "boost_min_samples": 50,
-    "debug_exec": false,
-    "boost_min_gain": 5,
-    "max_hops": 3,
-    "_comment_max_hops": "미도달 함수의 탐색 우선순위를 정할 때 도달 코드와의 콜그래프 거리를 참고하는 홉 상한. 가까운 호출자가 없는 함수는 후순위로 둘 수 있으며 이 값만으로 명령 전송을 차단하지 않는다.",
-    "autoname_kw_off_products": [
-      "BM9K1"
-    ],
-    "_comment_autoname_kw": "default/thunk/switch 키워드 기반 자동 이름 필터를 끌 제품 목록. 실제 심볼에 이 단어가 포함되는 제품에서 사용할 수 있다. FUN_/sub_ 형식의 자동 이름 정규식 필터는 이 목록과 별개로 유지한다.",
-    "_comment_vllm": "module_path=rag.vllm_client일 때 사용하는 직접 HTTP 호출 설정. base_url은 퍼징 PC에서 접근 가능한 서버 주소이며 Spark 전용 고정 주소가 아니다. model은 서버의 served-model-name과 일치시킨다. retrieval.enabled는 로컬 문서 검색 여부이고 LLM 호출 활성화 스위치가 아니다. 검색을 켜기 전에 tools/rag_ingest.py로 인덱스를 준비한다. 사내 Samba 브리지 선택 시 이 vllm 절의 서버·검색 설정을 사용하지 않으며 온라인 guide의 API/검색 설정을 따른다.",
-    "vllm": {
-      "base_url": "http://192.168.10.1:8000/v1",
-      "api_key": "not-used",
-      "model": "nemotron-3-super",
-      "_comment_chat_template_kwargs": "지원하는 모델의 chat template에 전달하는 옵션. 현재 클라이언트는 enable_thinking과 low_effort에 불리언만 허용하며 전체 값을 null로 두면 별도 옵션을 전달하지 않는다. 생성 길이·지연·JSON 품질에 미치는 효과는 모델과 요청에 따라 달라지므로 diagnostics로 확인한다. 백엔드 내 재시도/교정은 같은 timeout_sec 예산을 공유하며, 퍼저 워커의 json_retries는 별도 호출이다.",
-      "chat_template_kwargs": {
-        "enable_thinking": true,
-        "low_effort": true
-      },
-      "timeout_sec": 400.0,
-      "max_tokens": 16384,
-      "temperature": 0.7,
-      "max_response_bytes": 8388608,
-      "structured_output": true,
-      "include_generators_in_schema": true,
-      "freeform_retry": false,
-      "retries": 1,
-      "retrieval": {
-        "enabled": false,
-        "index_dir": "rag/index",
-        "top_k": 5,
-        "embed_base_url": "http://192.168.10.1:8001/v1",
-        "embed_model": "bge-m3",
-        "embed_model_revision": null,
-        "query_max_chars": 8000,
-        "command_tag_bonus": 0.1,
-        "context_max_chars": 60000,
-        "permission_groups": null
-      }
-    }
-  },
-  "io_workload": {
-    "_comment": "일반 퍼징 사이에 Write/Read 워크로드를 삽입한다. fuzz_gap은 실행 간격(퍼징 명령 수), block_size는 한 워크로드 블록의 명령 수다. Identify에서 얻은 namespace 크기·전송 한계로 유효 범위를 구성하지만 실제 rc=0 성공을 보장하지는 않는다. LLM descriptor의 block_size(LBA 단위)와 구분한다. enabled=false 또는 --no-io-workload로 비활성화한다.",
-    "enabled": true,
-    "block_size": 100,
-    "fuzz_gap": 100,
-    "selection": "round_robin",
-    "patterns": [
-      "seq_write",
-      "rand_write",
-      "overwrite_churn",
-      "hot_cold",
-      "read_disturb",
-      "mixed_rw",
-      "pingpong_write",
-      "pingpong_read",
-      "subpage_rmw",
-      "single_lba_hammer",
-      "strided_write",
-      "reverse_seq",
-      "boundary",
-      "bursty_mixed_size"
-    ],
-    "mdts_fallback_bytes": 262144,
-    "working_set_frac": 0.02,
-    "hot_window_bytes": 8388608,
-    "gc_unit_bytes": 1048576,
-    "strided_period_lbas": 32,
-    "rand_buf_mb": 8,
-    "burst_blocks_max": 50,
-    "burst_snap_blocks": 5,
-    "burst_patience_k": 3,
-    "ffm_field": "ffm_frag",
-    "burst_walltime_cap_sec": 120.0
   },
   "log_layouts": {
     "_comment": "관측한 벤더 로그를 사람이 읽는 State-Snap으로 출력할 때 사용할 필드 레이아웃. 레이아웃이 있는 로그는 정의된 필드를 출력하고 모니터링 대상 offset에는 내부 필드명과 표시를 붙인다. 레이아웃이 없는 로그는 알려진 모니터링 필드만 출력한다. 이 표에 추가하는 것만으로 해당 LID가 주기 관측 대상이 되지는 않는다.",
@@ -2177,353 +2518,5 @@
         ]
       }
     ]
-  },
-  "products": {
-    "BM9K1": {
-      "_comment": "SiFive E76 RISC-V 4코어 제품 프로필. cJTAG 연결과 SJTAG 인증, SBA를 통한 PCSR 관측을 사용한다. 기밀 디버그 주소와 제품별 자산 경로는 risc-v/sjtag_addrs.json 등 별도 자산에서 관리한다.",
-      "interface": "cjtag",
-      "sampler_type": "riscv_pcsr",
-      "arch": "riscv",
-      "jlink_device": "E76",
-      "jlink_speed": 10000,
-      "riscv": {
-        "_comment": "cores의 elf/load_offset 등 제품 자산은 sjtag_addrs.json의 pcsr.cores 설정을 우선 사용한다. 이 절에는 공유 가능한 구조와 튜닝값을 둔다.",
-        "power": "both",
-        "tap_script": false,
-        "gate_threshold": 95.0,
-        "interesting_policy": "primary",
-        "_comment_reconnect": "샘플러 링크 장애 시 빠른 재초기화 후 필요하면 close→대기→connect로 재연결을 시도한다. reconnect_attempts와 backoff/cap으로 재시도 횟수와 대기 시간을 제한한다. 컨트롤러 복구나 프로브 재연결 성공을 보장하는 설정은 아니다.",
-        "reconnect_attempts": 6,
-        "reconnect_settle_sec": 0.5,
-        "reconnect_backoff_sec": 1.0,
-        "reconnect_backoff_cap_sec": 3.0,
-        "sample_plan": {
-          "_comment": "weights는 코어별 버스트 배분의 초기 가중치다. 각 관측 구간에서 버스트 순서를 섞어 고정 순서 편향을 줄인다. seed=0이면 실행 시 무작위 seed를 정해 기록하며 동일한 난수 순서가 필요하면 기록된 값을 지정한다.",
-          "weights": {
-            "0": 8,
-            "1": 1,
-            "2": 4,
-            "3": 1
-          },
-          "burst_len": 256,
-          "primary_core": 0,
-          "valid_bit": 1,
-          "seed": 0,
-          "adaptive": {
-            "_comment": "enabled=true이면 초기 weights에서 시작해 최근 커버리지 수확률에 따라 코어별 샘플 예산을 조정한다. prior_samples는 표본이 적은 코어의 추정치를 전체 평균 쪽으로 보정한다. false이면 적응 조정을 끄고 초기 가중치를 사용한다.",
-            "enabled": true,
-            "period": 500,
-            "decay": 0.999,
-            "min_weight": 1,
-            "max_step": 2.0,
-            "exponent": 2.0,
-            "prior_samples": 2000
-          },
-          "jitter_pct": 20.0
-        }
-      },
-      "invalid_pc_vals": [],
-      "bb_file": "products/BM9K1/basic_blocks.txt",
-      "func_file": "products/BM9K1/functions.txt",
-      "_comment_ufas": "BM9K1 UFAS 덤프 도구는 dump/unified_pcie_dump_tool이며 제품 모드 2를 사용한다. PM9M1 모드 1과 인자가 다르며 --ini를 붙이지 않는다. 실제 명령 구성과 산출물 수집은 제품 프로필 및 덤프 함수가 담당한다.",
-      "enable_ufas": true,
-      "ufas_binary": "dump/unified_pcie_dump_tool",
-      "ufas_mode": "2",
-      "enable_jlink_dump": false,
-      "enable_debug_tool_dump": false,
-      "state_fields": "bm9k1",
-      "_comment_nvme_timeouts": "퍼저가 crash(타임아웃)로 판정하는 명령별 창(ms). write = Write/WriteUncorrectable/WriteZeroes, flush = Flush, format = FormatNVM, 나머지 명령은 command. 여기 없는 그룹(fw_commit/sanitize/telemetry/dsm/security)도 command 값을 쓴다. 실제 창 = 값 + power.ps_entry_exit_margin_ms.",
-      "nvme_timeouts": {
-        "command": 8000,
-        "write": 30000,
-        "flush": 2000,
-        "format": 180000,
-        "selftest_short": 8000,
-        "selftest_ext": 8000,
-        "verify": 8000
-      },
-      "exception_timing": {
-        "cfg_after_ts_ms": 200,
-        "en_to_rdy_ms": 100,
-        "rdy_to_admin_ms": 100,
-        "npo_io_ready_ms": 500,
-        "spo_io_ready_ms": 20000,
-        "overrun_wait_sec": 60
-      }
-    },
-    "PM9M1": {
-      "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
-      "nvme_timeouts": {
-        "command": 8000,
-        "format": 120000,
-        "flush": 8000,
-        "selftest_short": 8000,
-        "selftest_ext": 8000,
-        "verify": 22000,
-        "sanitize": 180000
-      },
-      "exception_timing": {
-        "cfg_after_ts_ms": 100,
-        "en_to_rdy_ms": 10000,
-        "rdy_to_admin_ms": 10000,
-        "npo_io_ready_ms": 10000,
-        "spo_io_ready_ms": 10000,
-        "overrun_wait_sec": 60
-      },
-      "interface": "swd",
-      "openocd_config": "products/PM9M1/openocd.cfg",
-      "jlink_device": "Cortex-R8",
-      "tcl_prefix": "r8",
-      "pcsr_addrs": [
-        "0x80030084",
-        "0x80032084",
-        "0x80034084"
-      ],
-      "sampler_type": "pcsr",
-      "go_settle_ms": 0,
-      "power_addr": "0x30313f30",
-      "power_mask": "0x00010101",
-      "invalid_pc_vals": [
-        "0x6ba02476",
-        "0x6ba02477",
-        "0x6ba00476",
-        "0x6ba00477"
-      ],
-      "fw_addr_start": "0x0",
-      "fw_addr_end": "0x3B7FFF",
-      "bb_file": "products/PM9M1/basic_blocks.txt",
-      "func_file": "products/PM9M1/functions.txt",
-      "enable_ufas": true,
-      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
-      "enable_jlink_dump": true,
-      "state_fields": "r8"
-    },
-    "PM9M1_LNB": {
-      "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
-      "nvme_timeouts": {
-        "command": 8000,
-        "format": 120000,
-        "flush": 8000,
-        "selftest_short": 8000,
-        "selftest_ext": 8000,
-        "verify": 22000,
-        "sanitize": 180000
-      },
-      "exception_timing": {
-        "cfg_after_ts_ms": 100,
-        "en_to_rdy_ms": 10000,
-        "rdy_to_admin_ms": 10000,
-        "npo_io_ready_ms": 10000,
-        "spo_io_ready_ms": 10000,
-        "overrun_wait_sec": 60
-      },
-      "interface": "swd",
-      "openocd_config": "products/PM9M1/openocd.cfg",
-      "jlink_device": "Cortex-R8",
-      "tcl_prefix": "r8",
-      "pcsr_addrs": [
-        "0x80030084",
-        "0x80032084",
-        "0x80034084"
-      ],
-      "sampler_type": "pcsr",
-      "go_settle_ms": 0,
-      "power_addr": "0x30313f30",
-      "power_mask": "0x00010101",
-      "invalid_pc_vals": [
-        "0x6ba02476",
-        "0x6ba02477",
-        "0x6ba00476",
-        "0x6ba00477"
-      ],
-      "fw_addr_start": "0x0",
-      "fw_addr_end": "0x3B7FFF",
-      "bb_file": "products/PM9M1/basic_blocks.txt",
-      "func_file": "products/PM9M1/functions.txt",
-      "enable_ufas": true,
-      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
-      "enable_jlink_dump": true,
-      "state_fields": "r8",
-      "_comment_variant": "기존 PM9M1과 같은 프로필. state 관측에 LID 0xDF snapshot을 포함한다."
-    },
-    "PM9M1_HP": {
-      "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
-      "nvme_timeouts": {
-        "command": 8000,
-        "format": 120000,
-        "flush": 8000,
-        "selftest_short": 8000,
-        "selftest_ext": 8000,
-        "verify": 22000,
-        "sanitize": 180000
-      },
-      "exception_timing": {
-        "cfg_after_ts_ms": 100,
-        "en_to_rdy_ms": 10000,
-        "rdy_to_admin_ms": 10000,
-        "npo_io_ready_ms": 10000,
-        "spo_io_ready_ms": 10000,
-        "overrun_wait_sec": 60
-      },
-      "interface": "swd",
-      "openocd_config": "products/PM9M1/openocd.cfg",
-      "jlink_device": "Cortex-R8",
-      "tcl_prefix": "r8",
-      "pcsr_addrs": [
-        "0x80030084",
-        "0x80032084",
-        "0x80034084"
-      ],
-      "sampler_type": "pcsr",
-      "go_settle_ms": 0,
-      "power_addr": "0x30313f30",
-      "power_mask": "0x00010101",
-      "invalid_pc_vals": [
-        "0x6ba02476",
-        "0x6ba02477",
-        "0x6ba00476",
-        "0x6ba00477"
-      ],
-      "fw_addr_start": "0x0",
-      "fw_addr_end": "0x3B7FFF",
-      "bb_file": "products/PM9M1/basic_blocks.txt",
-      "func_file": "products/PM9M1/functions.txt",
-      "enable_ufas": true,
-      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
-      "enable_jlink_dump": true,
-      "state_fields": "r8",
-      "state_exclude_lids": [
-        223
-      ],
-      "_comment_variant": "PM9M1_LNB와 같은 기본 설정에서 state_exclude_lids로 LID 0xDF(223)를 state snapshot 관측에서 제외한다. df_* 필드는 주기 관측에서 빠지지만, 일반 퍼징 명령으로 LID 0xDF를 보내는 것까지 차단하는 설정은 아니다."
-    },
-    "BM9H1": {
-      "nvme_timeouts": {
-        "command": 8000,
-        "format": 120000,
-        "flush": 2000,
-        "selftest_short": 120000,
-        "selftest_ext": 900000,
-        "verify": 20000
-      },
-      "exception_timing": {
-        "cfg_after_ts_ms": 100,
-        "en_to_rdy_ms": 10000,
-        "rdy_to_admin_ms": 10000,
-        "npo_io_ready_ms": 10000,
-        "spo_io_ready_ms": 10000,
-        "overrun_wait_sec": 60
-      },
-      "interface": "jtag",
-      "openocd_config": "products/BM9H1/openocd.cfg",
-      "jlink_device": "Cortex-R8",
-      "tcl_prefix": "r8",
-      "pcsr_addrs": [
-        "0x80030084",
-        "0x80032084"
-      ],
-      "sampler_type": "pcsr",
-      "go_settle_ms": 0,
-      "power_addr": "0x30313f30",
-      "power_mask": "0x00010101",
-      "invalid_pc_vals": [
-        "0x6ba02476",
-        "0x6ba02477",
-        "0x6ba00476",
-        "0x6ba00477"
-      ],
-      "fw_addr_start": "0x0",
-      "fw_addr_end": "0x3B7FFF",
-      "bb_file": "products/BM9H1/basic_blocks.txt",
-      "func_file": "products/BM9H1/functions.txt",
-      "enable_ufas": true,
-      "ufas_ini": "dump/SnapShot/PM9M1_A815.ini",
-      "enable_jlink_dump": true,
-      "state_fields": "r8"
-    },
-    "P7": {
-      "_comment_timeouts": "halt 샘플러의 명령 워치독은 샘플링으로 정지한 시간을 보정한다. nvme_timeouts는 명령별 기준 시간(밀리초)이며 halt_fwtime_margin_sec의 여유를 추가한다. passthru/kernel timeout은 이 워치독과 별도다.",
-      "nvme_timeouts": {
-        "command": 30000,
-        "format": 300000,
-        "flush": 30000,
-        "selftest_short": 30000,
-        "selftest_ext": 30000,
-        "verify": 30000,
-        "aer": 600000
-      },
-      "exception_timing": {
-        "cfg_after_ts_ms": 30000,
-        "en_to_rdy_ms": 30000,
-        "rdy_to_admin_ms": 30000,
-        "npo_io_ready_ms": 30000,
-        "spo_io_ready_ms": 30000,
-        "overrun_wait_sec": 60
-      },
-      "interface": "swd",
-      "jlink_device": "Cortex-R5",
-      "sampler_type": "jlink_halt",
-      "_comment_sampling": "go_settle_ms와 halt_poll_ms는 halt 관측의 대기 시간과 샘플링 밀도를 조정한다. 더 자주 halt하면 관측 밀도와 장치 실행에 대한 간섭이 함께 늘 수 있다. 이 값이 호스트 freeze를 방지하거나 자동 재시작을 켜는 것은 아니다. 기존 실험 기록은 backup/SESSION_HANDOFF_v9.0.md 참조.",
-      "go_settle_ms": 5,
-      "halt_poll_ms": 8,
-      "jlink_speed": 2000,
-      "jlink_ap_index": 0,
-      "pc_reg_index": null,
-      "por_remove_bdf": "auto-root",
-      "invalid_pc_vals": [
-        "0x6ba02476",
-        "0x6ba02477"
-      ],
-      "fw_addr_start": "0x0",
-      "fw_addr_end": "0x9cffff",
-      "bb_file": "products/P7/basic_blocks.txt",
-      "func_file": "products/P7/functions.txt",
-      "enable_ufas": false,
-      "enable_debug_tool_dump": true,
-      "enable_jlink_dump": false,
-      "state_fields": "p9"
-    },
-    "P9": {
-      "_comment_timeouts": "halt 샘플러의 명령 워치독은 샘플링으로 정지한 시간을 보정한다. nvme_timeouts는 명령별 기준 시간(밀리초)이며 halt_fwtime_margin_sec의 여유를 추가한다. passthru/kernel timeout은 이 워치독과 별도다.",
-      "nvme_timeouts": {
-        "command": 30000,
-        "format": 300000,
-        "flush": 30000,
-        "selftest_short": 30000,
-        "selftest_ext": 30000,
-        "verify": 30000,
-        "aer": 600000
-      },
-      "exception_timing": {
-        "cfg_after_ts_ms": 30000,
-        "en_to_rdy_ms": 30000,
-        "rdy_to_admin_ms": 30000,
-        "npo_io_ready_ms": 30000,
-        "spo_io_ready_ms": 30000,
-        "overrun_wait_sec": 60
-      },
-      "interface": "swd",
-      "jlink_device": "Cortex-R5",
-      "sampler_type": "jlink_halt",
-      "_comment_sampling": "go_settle_ms와 halt_poll_ms는 halt 관측의 대기 시간과 샘플링 밀도를 조정한다. 더 자주 halt하면 관측 밀도와 장치 실행에 대한 간섭이 함께 늘 수 있다. 이 값이 호스트 freeze를 방지하거나 자동 재시작을 켜는 것은 아니다. 기존 실험 기록은 backup/SESSION_HANDOFF_v9.0.md 참조.",
-      "go_settle_ms": 5,
-      "halt_poll_ms": 8,
-      "jlink_speed": 2000,
-      "jlink_ap_index": 0,
-      "pc_reg_index": null,
-      "por_remove_bdf": "auto-root",
-      "invalid_pc_vals": [
-        "0x6ba02476",
-        "0x6ba02477"
-      ],
-      "fw_addr_start": "0x0",
-      "fw_addr_end": "0x9cffff",
-      "bb_file": "products/P9/basic_blocks.txt",
-      "func_file": "products/P9/functions.txt",
-      "enable_ufas": false,
-      "enable_debug_tool_dump": true,
-      "enable_jlink_dump": false,
-      "state_fields": "p9"
-    }
   }
 }

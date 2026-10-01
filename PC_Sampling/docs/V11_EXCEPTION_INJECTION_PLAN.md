@@ -60,6 +60,7 @@ v11에 포함했으며, v10.3 파일을 수정해도 v11에 자동 반영되지 
 예외 mixin은 v11 내부 전송 구현에 `super()`로 위임해 동일한 가드를 통과한다.
 
 배포 시 `pc_sampling_fuzzer_v11.py`와 기존 공통 모듈·설정·제품 자산을 함께 둔다.
+예외 주입은 config `exceptions.enabled`(기본 false) 또는 `--exception` 으로 켠다.
 예외 제어와 capability 조회도 v11 파일에 포함되므로 별도 예외 모듈은 필요 없다. **`pc_sampling_fuzzer_v10.3.py` 및 다른 구버전 퍼저 파일은 필요 없다.**
 
 ## 설정 표면 — `exceptions` 절
@@ -206,7 +207,7 @@ NSSR의 NQN 범위 검사는 보수적이므로 placeholder NQN이 중복되면 
 2. BAR0 NSSR 쓰기 — 남아 있던 NSSRO 를 먼저 지우고(RW1C) 4E564D65h. **이 순간이 t0**
 3. 링크 다운(DLLLA 0, 최대 1s 관측) → 링크 업 연속 100ms 확인 → 설정 요청이 NSSR 전과 같은 Vendor/Device ID로
    응답할 때까지 대기(FFFF·CRS 0001은 준비 안 됨). PCIe §6.6.1의 최소 대기 중 DUT 설정 접근은 하지 않는다.
-   실제 장치의 최초 준비 시각은 분리할 수 없으므로 `cfg_after_ts` 규격 판정은 측정 불가다.
+   실제 장치의 최초 준비 시각은 분리할 수 없으므로 `cfg_after_ts` 는 판정하지 않는다(제품 설정에서 뺐다).
 4. **설정 공간 복원** — 커널 `pci_restore_state` 가 복원하는 소프트웨어 설정을 되쓴다(순서 포함):
    ReBAR 크기 → BAR0~5·ROM·캐시라인/지연·인터럽트 라인 → LTR 최대 지연 → L1SS(Ctl2 → Ctl1
    enable 없이 → Ctl1) → PTM → ATS → AER(UE 마스크·심각도, CE 마스크, ECRC 제어) →
@@ -687,7 +688,7 @@ Write/WriteUncorrectable/WriteZeroes 에 전용 timeout 그룹 `write` 를 만�
 
 | 키 | 구간 | BM9K1 | PM9M1·LNB·HP·BM9H1 | P7·P9 |
 |---|---|---|---|---|
-| `cfg_after_ts_ms` | 링크 업(TS 완료) → 설정 요청 완료 | 200ms | 100ms | 30s |
+| `cfg_after_ts_ms` | 링크 업(TS 완료) → 설정 요청 완료 — **선택, 현재 미설정(판정 안 함)** | (200ms) | (100ms) | (30s) |
 | `en_to_rdy_ms` | CC.EN=1 → CSTS.RDY=1 | 100ms | 10s | 30s |
 | `rdy_to_admin_ms` | RDY → admin 가능(커널 live) | 100ms | 10s | 30s |
 | `npo_io_ready_ms` | Normal POR: 전원 ON → I/O 서비스 가능 | 500ms | 10s | 30s |
@@ -695,6 +696,11 @@ Write/WriteUncorrectable/WriteZeroes 에 전용 timeout 그룹 `write` 를 만�
 | `overrun_wait_sec` | 스펙 초과 시 실제 복귀 시간을 더 재는 상한 | 60s | 60s | 60s |
 
 블록이 없는 제품은 예전처럼 profile 의 준비 한도만 본다(현재 설정된 제품은 모두 블록이 있다).
+
+`cfg_after_ts_ms` 는 2026-10-01 부터 **선택 항목**이고 모든 제품에서 뺐다. 측정값에 PCIe 최소 대기와
+커널 복원이 섞여 장치 시간을 분리할 수 없어 어차피 '측정 불가'였다 — 이제 판정 행 자체를 만들지
+않는다. 링크 다운·업·설정 완료 시각은 `[timing] 기준` 줄에 정보로 남는다. 괄호 안 값은 원래 제품
+스펙이며, 블록에 다시 넣으면 그 구간을 판정한다.
 
 **측정 방법** — 관측 스레드가 1ms 주기로 **첫 전환 시각**을 기록한다(읽기 전용).
 시각은 **읽기가 끝난 뒤** 찍고, 루트 포트 링크 읽기와 BAR·sysfs state 관측은 **다른
@@ -738,13 +744,11 @@ CC.EN 과 RDY 는 같은 자식 프로세스의 같은 읽기에서 나오므로
 
 ```
     [timing] 기준: hot_reset 시작  →  링크 다운 +0ms · 링크 업 +210ms
-    [timing] 설정 요청 완료 after TS           - / 스펙   200ms  측정 불가 (설정 접근 최소 대기/커널 복원 포함)
     [timing] CC.EN→RDY                         - / 스펙   100ms  ✗ 미완료  (호스트 측 — 드라이버가 CC.EN 을 다시 켜지 않음)
 ```
 
 ```
     [timing] 기준: power_on 반환  →  링크 다운 +0ms · 링크 업 +310ms  · CC.EN +420ms · RDY +450ms · live +560ms · I/O +610ms
-    [timing] 설정 요청 완료 after TS            - / 스펙   200ms  측정 불가 (설정 접근 최소 대기/커널 복원 포함)
     [timing] CC.EN→RDY                         30ms / 스펙   100ms  OK
     [timing] RDY→admin 가능(live)             110ms / 스펙   100ms  ✗ 초과
     [timing] 전원 ON→I/O 가능 (NPO)           610ms / 스펙   500ms  ✗ 초과

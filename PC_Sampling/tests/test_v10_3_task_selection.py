@@ -214,7 +214,8 @@ class StartupTaskPinIsOptional(unittest.TestCase):
         import json
         from test_v10_2_learning import ROOT
         cfg = json.loads((ROOT / 'fuzzer_config.json').read_text(encoding='utf-8'))
-        self.assertEqual(cfg['rag']['startup_task'], 'off')
+        # 2026-10-01: 쓰지 않는 기능이라 설정에서 뺐다 — 없으면 off(아래 테스트가 보장)
+        self.assertIn(cfg['rag'].get('startup_task', 'off'), ('off', None, ''))
 
     def test_missing_key_falls_back_to_off(self):
         # 설정에 없거나 null 이어도 켜지면 안 된다.
