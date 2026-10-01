@@ -26,22 +26,29 @@ task별 스키마인 이유
 
 U32 = {"type": "integer", "minimum": 0, "maximum": 0xFFFFFFFF}
 CDWS = ("cdw2", "cdw3", "cdw10", "cdw11", "cdw12", "cdw13", "cdw14", "cdw15")
-# data_hex 생성 상한(hex 글자 수 = 2 × 바이트). 모델이 수만 자의 hex 를 쏟아내다 max_tokens 에서
-#   잘리는 폭주를 막는다. 퍼저의 실제 입력 상한(max_input_len)과는 별개 — 그 값은 변이·실행
-#   경로가 쓰는 한도라 프롬프트를 줄이려고 낮추면 안 된다. 프롬프트 문구도 이 상수를 쓴다.
-DATA_HEX_MAX_CHARS = 4096
+# data_hex 생성 상한(hex 글자 수 = 2 × 바이트). 모델이 같은 글자를 끝없이 반복하다(예: '0' 15216개)
+#   종료 따옴표 없이 max_tokens 에서 잘리는 반복 퇴행을 막는다. 퍼저의 실제 입력 상한
+#   (max_input_len)과는 별개 — 그 값은 변이·실행 경로가 쓰는 한도라 낮추면 안 된다.
+#   ★ 상한은 **정규식 안에** 둔다. vLLM 의 문법 엔진(xgrammar)은 pattern 이 있으면 maxLength 를
+#   무시한다(서버에서 확인: maxLength 4096 인데 15216자가 나옴). 정규식 반복 상한은 강제된다.
+#   512자(256B) — 시드 8개 × 512자도 max_tokens 안에 들어가고, APST 표(256B) 같은 구조체도 담긴다.
+#   짝수 길이는 문법으로 강제하지 않는다(그룹 반복 정규식은 서버 검증 전) — 퍼저가 홀수면 끝 1글자를 버린다.
+DATA_HEX_MAX_CHARS = 512
+_DATA_HEX = {"type": "string", "pattern": "^[0-9a-f]{0,%d}$" % DATA_HEX_MAX_CHARS}
+# pattern 없는 자유 문자열은 maxLength 가 강제된다 — 같은 반복 퇴행이 다른 필드로 옮겨 가지 않게 상한.
+_NAME = {"type": "string", "maxLength": 64}
+_TEXT = {"type": "string", "maxLength": 400}
 
 # 퍼저 파서가 읽는 키 — 출처를 주석으로 남긴다(시험이 이 목록과 파서를 대조한다).
 _SEED_PROPS = {
-    "command":    {"type": "string"},                    # _llm_make_seed: item.get('command')
+    "command":    _NAME,                                 # _llm_make_seed: item.get('command')
     **{k: U32 for k in CDWS},                            # _llm_make_seed: item.get(f'cdw{w}')
     "nsid":       U32,                                   # _llm_make_seed: item.get('nsid')
-    "data_hex":   {"type": "string", "pattern": "^[0-9a-fA-F]*$",
-                   "maxLength": DATA_HEX_MAX_CHARS},                  # item.get('data_hex')
+    "data_hex":   _DATA_HEX,                             # item.get('data_hex')
     "data_len":   {"type": "integer", "minimum": 0},     # llm_learning: item['data_len']
-    "seed_class": {"type": "string"},                    # _llm_apply_result: item.get('seed_class')
-    "target_id":  {"type": "string"},                    # llm_learning: item.get('target_id')
-    "rationale":  {"type": "string"},                    # 프롬프트가 요청. 파서는 안 읽음
+    "seed_class": _NAME,                                 # _llm_apply_result: item.get('seed_class')
+    "target_id":  _NAME,                                 # llm_learning: item.get('target_id')
+    "rationale":  _TEXT,                                 # 프롬프트가 요청. 파서는 안 읽음
 }
 
 _SEQ_PROPS = {
@@ -50,10 +57,10 @@ _SEQ_PROPS = {
                                   "properties": _SEED_PROPS,
                                   "required": ["command"],
                                   "additionalProperties": False}},
-    "setup_id":        {"type": "string"},                       # llm_learning: sq.get('setup_id')
-    "preserve_fields": {"type": "array", "items": {"type": "string"}},   # sq.get('preserve_fields')
-    "target_id":       {"type": "string"},                       # sq.get('target_id')
-    "seed_class":      {"type": "string"},                       # 호스트가 'llm_seq' 로 덮어씀
+    "setup_id":        _NAME,                                    # llm_learning: sq.get('setup_id')
+    "preserve_fields": {"type": "array", "items": _NAME},        # sq.get('preserve_fields')
+    "target_id":       _NAME,                                    # sq.get('target_id')
+    "seed_class":      _NAME,                                    # 호스트가 'llm_seq' 로 덮어씀
 }
 
 _EVAL_PROPS = {
@@ -71,8 +78,8 @@ _PARAM_EXPR = {"anyOf": [
 ]}
 _GEN_PROPS = {
     "base": {"type": "object",
-             "properties": {"command": {"type": "string"}, "nsid": U32,
-                            "data_hex": {"type": "string", "maxLength": DATA_HEX_MAX_CHARS},
+             "properties": {"command": _NAME, "nsid": U32,
+                            "data_hex": _DATA_HEX,
                             **{k: U32 for k in CDWS}},
              "required": ["command"], "additionalProperties": False},
     "values":  {"type": "array", "minItems": 1, "items": U32},
@@ -91,7 +98,7 @@ _GEN_PROPS = {
                            "required": ["field", "lo", "bits", "value"],
                            "additionalProperties": False}},
     "break_length": {"type": "integer"},
-    "target_id":    {"type": "string"},
+    "target_id":    _NAME,
 }
 
 # task → (필수 최상위 키, 선택 최상위 키). '{}' 를 막으려면 required 가 비면 안 된다.
@@ -110,7 +117,7 @@ def _workload_props(patterns):
         "block_size":   {"type": "integer", "minimum": 1},
         "hot_fraction": {"type": "number"},
         "read_ratio":   {"type": "number"},
-        "direction":    {"type": "string"},
+        "direction":    _NAME,
     }
 
 

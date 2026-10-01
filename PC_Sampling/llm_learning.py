@@ -138,7 +138,7 @@ def compile_recipe(recipe, max_bytes, max_variants=16):
         raw_hex = item.get('data_hex', '')
         if not isinstance(raw_hex, str) or len(raw_hex) > max_bytes * 2:
             raise ValueError('base payload exceeds limit')
-        payload = bytes.fromhex(raw_hex)
+        payload = bytes.fromhex(raw_hex[:len(raw_hex) & ~1])   # 홀수 길이는 끝 반 바이트를 버린다
         if record:
             packed = bytearray()
             for field in record:

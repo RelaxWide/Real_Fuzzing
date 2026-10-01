@@ -7576,7 +7576,7 @@ class _V101Fuzzer:
         try:
             from rag.llm_schema import DATA_HEX_MAX_CHARS as _hex_max
         except Exception:
-            _hex_max = 4096
+            _hex_max = 512
         lines = ["\nFor these implemented data-transfer commands, ALSO emit a valid \"data_hex\" whose "
                  "BYTES match the command's spec data structure (not just CDWs) — this reaches "
                  "data-parsing firmware code that CDW mutation/dictionaries CANNOT:"]
@@ -8379,7 +8379,9 @@ class _V101Fuzzer:
             dh = item.get('data_hex')
             if dh:
                 try:
-                    data = bytes.fromhex(dh)[:MAX_INPUT_LEN]
+                    # 스키마는 길이 상한만 강제하고 짝수 길이는 보장하지 못한다. 홀수면 fromhex 가
+                    #   실패해 데이터가 통째로 빈 값이 되므로 끝 1글자(반 바이트)만 버린다.
+                    data = bytes.fromhex(dh[:len(dh) & ~1])[:MAX_INPUT_LEN]
                 except Exception:
                     data = b''
             nsid = item.get('nsid')
