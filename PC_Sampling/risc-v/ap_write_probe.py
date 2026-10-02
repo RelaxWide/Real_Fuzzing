@@ -24,7 +24,11 @@ CSW 비트도 풀어 찍는다 — TrInProg(bit7)=1 이면 이전 전송이 끝�
   CTRL/STAT 의 요청(req)·응답(ack) 비트를 따로 찍는다:
     req=1 ack=0 → 요청은 살아 있는데 칩이 디버그 전원을 회수
     req=0       → DP 가 리셋돼 요청이 지워짐(디버그 도메인 리셋/전원 강하)
+  ※ CTRL/STAT 이 0x80000000 이면 실제 값이 아니라 J-Link 의 읽기 실패 표식이다(링크 끊김).
 --reassert: 매 회 ABORT(0x1E)·전원요청을 다시 써서 회복되는지 본다.
+tx 열 = watch 시작 후 누적 DP/AP 전송 수. --interval 을 바꿔 돌렸을 때 끊기는 시점이
+  같은 '초' 에 맞으면 시간 기반(칩 쪽), 같은 'tx' 에 맞으면 전송 기반(링크 동기 상실)이다.
+--speed: cJTAG 속도(kHz). 기본은 sfe76_link 의 값(10000).
 
 사용: sudo python3 risc-v/ap_write_probe.py [--power both|dbg-only|sys-only] [--dap-abort]
       sudo python3 risc-v/ap_write_probe.py --watch 120 [--interval 2]
@@ -37,7 +41,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import sjtag_unlock as sj                                    # noqa: E402
-from sfe76_link import Link, AP_MAP, CORE_BASE_MAIN          # noqa: E402
+from sfe76_link import Link, AP_MAP, CORE_BASE_MAIN, SPEED_KHZ  # noqa: E402
 from dap_access import (OFF_CSW, OFF_TAR, OFF_IDR,           # noqa: E402
                         DP_ABORT, DP_CTRL_STAT, DP_RDBUF, hx)
 
@@ -150,16 +154,33 @@ def pwr_bits(ctrl):
     return f"  {b(28)}/{b(29)} {b(30)}/{b(31)}"
 
 
+class TxCounter:
+    """jl.coresight_read/write 호출 수를 센다(인스턴스 속성으로 감싼다)."""
+    def __init__(self, jl):
+        self.n = 0
+        for name in ('coresight_read', 'coresight_write'):
+            fn = getattr(jl, name)
+            setattr(jl, name, self._wrap(fn))
+
+    def _wrap(self, fn):
+        def call(*a, **k):
+            self.n += 1
+            return fn(*a, **k)
+        return call
+
+
 def watch(dap, seconds, interval, reassert=False, req=0x50000000):
     names = [n for n, _b, _k in AP_MAP]
     print(f"\n  [watch] {seconds:.0f}초, {interval:.1f}초 간격"
           + (", 매 회 전원요청 재기입" if reassert else "")
           + "  (O=일치 X=불일치 E=링크에러)")
-    print("    t(s)   DPIDR       CTRL/STAT   CDBG CSYS(req/ack)  "
+    print("    t(s)      tx   DPIDR       CTRL/STAT   CDBG CSYS(req/ack)  "
           + " ".join(f"{n:>7}" for n in names) + "   nvme")
+    tx = TxCounter(dap.jl)
     t0 = time.monotonic()
     while True:
         t = time.monotonic() - t0
+        n0 = tx.n
         if reassert:
             dap.dp_write(DP_ABORT, 0x0000001E)
             dap.dp_write(DP_CTRL_STAT, req)
@@ -167,7 +188,7 @@ def watch(dap, seconds, interval, reassert=False, req=0x50000000):
         dpidr = dap.dp_read(0)
         ctrl = dap.dp_read(DP_CTRL_STAT)
         marks = [quick_ap(dap, b) for _n, b, _k in AP_MAP]
-        print(f"    {t:6.1f}  {hx(dpidr):>10}  {hx(ctrl):>10}  {pwr_bits(ctrl):>16}  "
+        print(f"    {t:6.1f}  {n0:6d}  {hx(dpidr):>10}  {hx(ctrl):>10}  {pwr_bits(ctrl):>16}  "
               + " ".join(f"{m:>7}" for m in marks) + f"   {nvme_state()}", flush=True)
         if t >= seconds:
             return
@@ -184,6 +205,8 @@ def main():
                     help="한 세션으로 SEC 초 동안 AP 별 TAR 쓰기를 반복해 시간 변화를 본다")
     ap.add_argument("--interval", type=float, default=2.0, metavar="SEC",
                     help="--watch 반복 간격(초)")
+    ap.add_argument("--speed", type=int, default=SPEED_KHZ, metavar="KHZ",
+                    help=f"cJTAG 속도(kHz, 기본 {SPEED_KHZ})")
     ap.add_argument("--reassert", action="store_true",
                     help="--watch 매 회 ABORT·전원요청을 다시 써서 회복 여부를 본다")
     a = ap.parse_args()
@@ -191,14 +214,14 @@ def main():
     if not AP_MAP:
         print("AP_MAP 비어 있음 — risc-v/sjtag_addrs.json 확인", file=sys.stderr)
         return 9
-    lk = Link(core_base=CORE_BASE_MAIN)
+    lk = Link(core_base=CORE_BASE_MAIN, speed=a.speed)
     try:
         lk.open(tap_script=False)
     except Exception as e:
         print(f"  J-Link open 실패: {e}")
         return 3
     try:
-        print(f"  [J-Link] {jlink_info(lk.jl)}")
+        print(f"  [J-Link] {jlink_info(lk.jl)}  speed={a.speed}kHz")
         try:
             sj.prepare_session(lk, a.power, "off", tif_init=True, strict=False)
         except sj.SecureJtagError as e:
