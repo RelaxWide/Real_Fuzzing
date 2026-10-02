@@ -9509,11 +9509,8 @@ class _V101Fuzzer:
             _interesting, _new_pcs, _action = self._account_command(
                 _seed, _data, rc, last_samples, source='c2')
             _replay_new_pcs += _new_pcs if isinstance(_new_pcs, int) else 0
-            # v11.1: C2 보상은 C1 과 같은 기준 — 재생한 **명령마다** 새 edge 를 찾았나(1/0).
-            #   예전엔 시퀀스 1회당 '같은 state 를 재현했나'였다. 재현은 쉬워 거의 1 이고 C1(새 edge,
-            #   거의 0)과 비교하면 C2 가 늘 이겨 p 가 하한 0.1 에 붙었다(성과 없이 state 재생만 최대).
-            if self.config.state_enabled:
-                self._csfuzz_c2_rewards.append(1 if isinstance(_new_pcs, int) and _new_pcs > 0 else 0)
+            # v11.1: C2 보상은 _account_command 안에서 C1 과 **같은 지점**에 쌓인다(_csfuzz_reward).
+            #   가드 차단·예외 주입·timeout/error 는 양쪽 모두 보상 전에 반환되므로 같은 모집단이다.
             if _action == 'break':
                 return False
 
@@ -9602,6 +9599,14 @@ class _V101Fuzzer:
         self._boost_exec.clear()
         self._boost_sel.clear()
         self._boost_gain.clear()
+
+    def _csfuzz_reward(self, source: str, new_pcs) -> None:
+        """v11.1: CSFuzz 보상 — 이 명령이 새 edge 를 찾았나(1/0). source 'c1'(corpus 선택)·'c2'(state 재생)만.
+        _account_command 의 같은 지점에서만 불려 양쪽 모집단이 같다(차단·주입·timeout 은 그 전에 반환)."""
+        if not self.config.state_enabled or source not in ('c1', 'c2'):
+            return
+        hit = 1 if isinstance(new_pcs, int) and new_pcs > 0 else 0
+        (self._csfuzz_c1_rewards if source == 'c1' else self._csfuzz_c2_rewards).append(hit)
 
     # v11.1: p 갱신 — 두 corpus 의 **명령당 새 edge 비율**을 직접 비교한다.
     _CSFUZZ_LR = 0.1                 # 한 번에 움직이는 최대 폭
@@ -10139,13 +10144,11 @@ class _V101Fuzzer:
                 if new_pcs > 0:
                     self._cov_credit(self._cov_src_tag(seed, source, seq_member=True),
                                      'edge', new_pcs)
-                if self.config.state_enabled and source == 'c1':
-                    self._csfuzz_c1_rewards.append(1 if new_pcs > 0 else 0)
+                self._csfuzz_reward(source, new_pcs)
                 log.info(f"[+][Seq-Acc] cmd={cmd.name} +{new_pcs} PCs "
                          f"(seq_acc={self._seq_sink['new_pcs']})")
             else:
-                if self.config.state_enabled and source == 'c1':
-                    self._csfuzz_c1_rewards.append(0)
+                self._csfuzz_reward(source, 0)
         elif is_interesting:
             self.sampler.interesting_inputs += 1
             self.cmd_stats[track_key]["interesting"] += 1
@@ -10190,8 +10193,7 @@ class _V101Fuzzer:
                     f"[+][SC-depth] cmd={cmd.name}  src={_edge_src}  new_{_cov_label}=0 (프론티어 진입, edge-cov 불변)  "
                     f"total_{_cov_label}={_total_cov}  "
                     f"corpus={len(self.corpus)}  exec={self.executions:,}")
-            if self.config.state_enabled and source == 'c1':
-                self._csfuzz_c1_rewards.append(1 if new_pcs > 0 else 0)
+            self._csfuzz_reward(source, new_pcs)
 
             input_hash = hashlib.md5(fuzz_data).hexdigest()[:12]
             corpus_file = self.output_dir / 'corpus' / f"input_{cmd.name}_{hex(cmd.opcode)}_{input_hash}"
@@ -10211,10 +10213,8 @@ class _V101Fuzzer:
                 log.info(f"[Det] Queued {new_seed.cmd.name} "
                          f"(queue size: {len(self._det_queue)})")
         else:
-            # C1: non-interesting도 0으로 기록 (분모 정확성)
-            if self.config.state_enabled and source == 'c1':
-                self._csfuzz_c1_rewards.append(0)
-            # C2 reward는 replay 단위로만 기록 (여기서는 추가하지 않음)
+            # non-interesting 도 0 으로 기록(분모 정확성) — C1·C2 모두
+            self._csfuzz_reward(source, 0)
 
         # MOpt
         if self._current_mutations:
@@ -18961,223 +18961,228 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                 if not _rescan_and_l0():
                     return
 
-        # APST / Keep-Alive 비활성화 — NVMe 접근 가능 상태에서 실행
-        # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
-        # Keep-Alive: 주기적 admin cmd → PS3/PS4 wake-up → L1 진입 불가
-        self._apst_disable()
-        self._keepalive_disable()
-        # 이전 실행/외부에서 namespace 가 write-protect(FID 0x84)로 잠겨 있으면 해제.
-        # (발송 가드가 이후 설정은 막으므로 startup 1회 복구로 충분.)
-        self._write_protect_clear()
-
-        # J-Link PC 읽기 진단 + idle PC 감지 — POR + APST/Keep-Alive disable 직후의
-        # 가장 깨끗한 idle 상태에서 수집. PM preflight (30 PowerCombo + 17 S1/S2
-        # perturb) 직후엔 firmware cleanup/recovery PC 가 idle universe 에 오염
-        # 들어갈 수 있으므로 이 시점이 적절.
-        _diag_ok = self.sampler.diagnose()
-        # ★ 배경(무명령) 커버리지를 **미리** 반영한다. 안 하면 idle 루프·인터럽트·타
-        #   코어 housekeeping 이 밟는 블록이 매 윈도우 '새 커버리지' 로 잡혀 모든 입력이
-        #   interesting 이 된다(1000 exec 에 corpus 1000). 총계에는 정직하게 포함된다.
-        if (self.cov is not None and _diag_ok
-                and getattr(self.sampler, '_idle_obs', None)):
-            _before = len(self.cov.covered_bbs)
-            self._idle_cov_keys = set(
-                self.cov.project(self.sampler._idle_obs).seed_keys)
-            self.cov.update(self.sampler._idle_obs)
-            log.warning(f"[Diagnose] 배경 커버리지 선반영: "
-                        f"{len(self.cov.covered_bbs) - _before:,} 블록 "
-                        f"(이후 이 블록들은 '새 커버리지'로 치지 않는다)")
-        if not _diag_ok:
-            log.error("J-Link PC read diagnosis failed, aborting")
-            return
-
-        if self.sampler.idle_pcs:
-            # idle_pcs를 BB/func 커버리지에 반영 (global_coverage엔 추가 안 함 — saturation 설계 유지)
-            self._update_static_coverage(self.sampler.idle_pcs)
-            pcs_str = ', '.join(hex(p) for p in sorted(self.sampler.idle_pcs))
-            log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
-        else:
-            log.warning("Idle PCs    : not detected (saturation = global PC only)")
-
-        # idle 유니버스 수집 완료 → 디바이스 정보 한 번에 출력
-        self._log_device_info()
-
-        # PM preflight: idle 유니버스 수집 직후 전체 PowerCombo 검증.
-        # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
-        self._pm_preflight_check()
-
-        # v7.7: S1/S2 perturbation preflight — PCIe bit + CLKREQ# 1회씩 검증.
-        if self.config.pm_inject_prob > 0:
-            self._pm_preflight_s1_s2()
-
-        # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
-        # _log_smart() 이후에 설정: 이전에 실행하면 admin_timeout=30일 상태에서
-        # smart-log ioctl이 제출되어, SSD 응답이 조금 느릴 때 커널이 계속 기다리고
-        # Python 10초 timeout이 먼저 터지는 문제 방지.
-        self._configure_nvme_timeouts()
-
-        # FormatNVM + Sanitize 1회 실행 — calibration 직전 FTL 상태 초기화
-        # Read/Write로 쌓인 mapping 복잡도를 알려진 깨끗한 상태로 리셋한 뒤 fuzzing 시작.
-        # 이후 self.commands에서 제거 → 메인 루프에서는 절대 선택되지 않음.
-        _fmt_cmd = next((c for c in NVME_COMMANDS if c.name == "FormatNVM"), None)
-        if _fmt_cmd and any(c.name == "FormatNVM" for c in self.commands):
-            log.warning("[Calibration] FormatNVM 1회 실행 (SES=0, FTL 리셋) ...")
-            _fmt_seed = Seed(data=b'', cmd=_fmt_cmd, cdw10=0x0000)
-            _fmt_rc = self._send_nvme_command(b'', _fmt_seed)
-            _, _sampler_ok = self._stop_sampling_checked("startup:FormatNVM")
-            if not _sampler_ok:
-                return
-            log.warning(f"[Calibration] FormatNVM 완료 (rc={_fmt_rc})")
-            _san_cmd = next((c for c in NVME_COMMANDS if c.name == "Sanitize"), None)
-            if _san_cmd:
-                # ★ SANACT = CDW10[2:0]. 001b=Exit Failure Mode / 010b=Block Erase /
-                #   011b=Overwrite / 100b=Crypto Erase.
-                #   v9.6 이전은 cdw10=0x04 (=100b=Crypto Erase) 를 보내면서 주석/로그만
-                #   "SANACT=001 Exit Failure Mode" 라고 적어 뒀다. 즉 --all-commands 실행마다
-                #   실제 전체 소거가 나갔고, 완료 대기도 없어 진행 중에 prefill/POR 이 겹치면
-                #   SSTAT=011b(Sanitize Operation Failed) 로 래치 → 펌웨어가 미디어를 read-only
-                #   로 전환(SMART critical_warning bit3) → 전원 사이클로도 안 풀림.
-                #   Exit Failure Mode(001b)는 소거를 하지 않고 그 래치를 해제하는 명령이라,
-                #   원래 의도(안전한 SANACT)와도 시작 시 상태 정리 목적에도 이게 맞다.
-                log.warning("[Calibration] Sanitize 1회 실행 (SANACT=001b, Exit Failure Mode "
-                            "— 소거 아님, sanitize-failed 래치 해제) ...")
-                _san_seed = Seed(data=b'', cmd=_san_cmd, cdw10=0x01)
-                _san_rc = self._send_nvme_command(b'', _san_seed)
-                _, _sampler_ok = self._stop_sampling_checked("startup:Sanitize")
-                if not _sampler_ok:
-                    return
-                log.warning(f"[Calibration] Sanitize(Exit Failure Mode) 전송 완료 (rc={_san_rc})")
-            # 메인 루프에서 재실행되지 않도록 제거
-            self.commands = [c for c in self.commands if c.name not in ("FormatNVM", "Sanitize")]
-            log.info("[Calibration] FormatNVM/Sanitize self.commands에서 제거됨")
-
-        # config fw_bin 을 (쓰기 가능) 모든 firmware slot 에 프리로드 → 이후 FWCommit 이 어떤 슬롯을
-        # 활성화(CA=2/3)해도 같은 이미지 → 다른 FW 활성화 방지. FWCommit fuzz + fw_bin 있을 때만.
-        if self._fw_chunks and any(c.name == 'FWCommit' for c in self.commands):
-            self._preload_fw_slots()
-            if self._sampler_recovery_failed:
-                log.error("[FW] sampler 복구 실패 — prefill/calibration/퍼징 중단")
-                return
-
-        # Prefill: FormatNVM/Sanitize 이후 드라이브 전체 쓰기 (Verify 등이 참조할 데이터 확보)
-        # FormatNVM이 LBA 맵핑을 초기화하므로 prefill은 반드시 format 완료 후 실행해야 의미 있음.
-        if self.config.prefill:
-            self._prefill_drive()
-        else:
-            log.info("[Prefill] 비활성화됨 (--prefill 로 활성화)")
-
-        if self.config.calibration_runs > 0:
-            total_seeds = len(self.corpus)
-            _cal_unit = ('bbs' if (getattr(self.sampler, 'PER_CORE_COVERAGE', False)
-                                    or (self._sa_loaded and self._sa_bb_starts))
-                         else 'pcs')
-            log.warning(f"[Calibration] {total_seeds} seeds × "
-                        f"{self.config.calibration_runs} runs each ...")
-            calibrated_corpus = []
-            cal_results = []  # (index, cmd_name, stability, stable_pcs, all_pcs)
-
-            # J-Link DLL이 stderr로 직접 출력하는 "CPU is not halted" 등의
-            # 타이밍 경고를 calibration 구간에서만 fd 수준으로 억제한다.
-            devnull_fd = os.open(os.devnull, os.O_WRONLY)
-            saved_stderr_fd = os.dup(2)
-            os.dup2(devnull_fd, 2)
-            # devnull_fd를 닫지 않고 유지 → 루프 중 [Cal] 로그 출력 후 재억제에 재사용
-            # _handle_timeout_crash()이 log.error() 전에 stderr를 복원할 수 있도록
-            # 인스턴스 변수에 보관 (fd 수명: finally의 os.close까지)
-            self._cal_saved_stderr_fd = saved_stderr_fd
-            _cal_idx_w = len(str(total_seeds))  # 숫자 폭 (예: 총 47개 → 폭 2)
-            try:
-                for i, seed in enumerate(self.corpus):
-                    if not isinstance(seed, Seed):
-                        calibrated_corpus.append(seed)
-                        continue
-                    seed = self._calibrate_seed(seed)
-                    if self._sampler_recovery_failed:
-                        os.dup2(saved_stderr_fd, 2)
-                        log.error("[Calibration] sampler 복구 실패 — calibration/퍼징 중단")
-                        return
-                    calibrated_corpus.append(seed)
-                    stable_cnt = len(seed.stable_pcs) if seed.stable_pcs else 0
-                    all_cnt    = len(seed.covered_pcs) if seed.covered_pcs else 0
-                    cal_results.append((i + 1, seed.cmd.name, seed.stability,
-                                        stable_cnt, all_cnt))
-
-                    # 시드별 진행 로그 ─────────────────────────────────────────
-                    # stderr가 억제된 상태이므로 출력 전에 복원 후 다시 억제
-                    _rc = getattr(self, '_cal_last_rc', 0)
-                    _rc_str = (f"rc=TIMEOUT" if _rc == self.RC_TIMEOUT
-                               else f"rc=ERR"    if _rc == self.RC_ERROR
-                               else f"rc={_rc}")
-                    _tag = " ← FAIL" if _rc not in (0,) else ""
-                    os.dup2(saved_stderr_fd, 2)   # stderr 복원
-                    log.warning(
-                        f"[Cal {i+1:{_cal_idx_w}}/{total_seeds}] "
-                        f"{seed.cmd.name:<20} "
-                        f"cdw10=0x{seed.cdw10:08x}  "
-                        f"stab={seed.stability*100:3.0f}%  "
-                        f"{_cal_unit}={all_cnt:5}  "
-                        f"{_rc_str}{_tag}"
-                    )
-                    os.dup2(devnull_fd, 2)        # 다시 억제
-
-                    if self._timeout_crash:
-                        os.dup2(saved_stderr_fd, 2)
-                        log.error("[Calibration] timeout during calibration — aborting")
-                        return
-            finally:
-                self._cal_saved_stderr_fd = None
-                os.dup2(saved_stderr_fd, 2)
-                os.close(devnull_fd)
-                os.close(saved_stderr_fd)
-
-            self.corpus = calibrated_corpus
-
-            avg_stab = sum(r[2] for r in cal_results) / max(len(cal_results), 1)
-            log.warning(f"[Calibration] Done — "
-                        f"Seeds: {total_seeds}  |  "
-                        f"Global PCs: {len(self.sampler.global_coverage)}  |  "
-                        f"Avg stability: {avg_stab*100:.1f}%")
-
-            for seed in self.corpus:
-                if not isinstance(seed, Seed):
-                    continue
-                if not seed.det_done:
-                    gen = self._deterministic_stage(seed)
-                    self._det_queue.append((seed, gen))
-            log.warning(f"[Det] Queued {len(self._det_queue)} seeds for deterministic stage")
-
-            # calibration 중 SetFeatures(APST/KeepAlive) 시드가 실행되면
-            # preflight의 _apst_disable()/_keepalive_disable() 효과가 무력화됨.
-            # → calibration 완료 후 다시 비활성화하여 퍼징 중 자율 PS 전환 방지.
-            # SetFeatures PS 시드(PS0~PS2)가 실행된 후 컨트롤러가 PS0이 아닌 상태일
-            # 수 있으므로 명시적으로 PS0으로 복구.
+        # v11.1: 정리 범위 시작 — 여기부터 장치(APST·keepalive·write-protect·FormatNVM)와 호스트
+        #   (커널 nvme timeout) 설정을 바꾸고 초기 calibration 을 돈다. 예전엔 메인 try 가 calibration
+        #   뒤에서 시작해, 그 사이 Ctrl+C·timeout·return 이면 finally(샘플러 종료·통계·차트·실행 기록,
+        #   정상/사용자 중단 시 APST·keepalive·커널 timeout 복원)가 통째로 빠졌다. 복원 함수들은 설정
+        #   전이면 아무 것도 하지 않는다. 불량 보존(timeout crash·예외 보존)은 finally 가 이미 구분한다.
+        try:
+            # APST / Keep-Alive 비활성화 — NVMe 접근 가능 상태에서 실행
+            # APST: 자율 PS 전환 → PCIe 트래픽 → L1/L1.2 idle window 방해
+            # Keep-Alive: 주기적 admin cmd → PS3/PS4 wake-up → L1 진입 불가
             self._apst_disable()
             self._keepalive_disable()
-            self._pm_set_state(0)   # calibration 중 PS 변경 → PS0 복구
-            log.warning("[Calibration] Complete. Starting fuzzing...\n")
-        else:
-            log.info("[Calibration] Disabled (calibration_runs=0)")
+            # 이전 실행/외부에서 namespace 가 write-protect(FID 0x84)로 잠겨 있으면 해제.
+            # (발송 가드가 이후 설정은 막으므로 startup 1회 복구로 충분.)
+            self._write_protect_clear()
 
-        # 첫 주기 차트 전에 프로세스가 중단돼도 baseline 산출물이 남도록, idle/calibration
-        # 회계가 끝난 시점에 HTML/CSV/코어 요약을 한 번 생성한다(matplotlib 무관).
-        try:
-            self._generate_riscv_reports()
-        except Exception as _e:
-            log.warning(f"[CoverageReport] 초기 보고서 생성 실패(퍼징은 계속): {_e}")
+            # J-Link PC 읽기 진단 + idle PC 감지 — POR + APST/Keep-Alive disable 직후의
+            # 가장 깨끗한 idle 상태에서 수집. PM preflight (30 PowerCombo + 17 S1/S2
+            # perturb) 직후엔 firmware cleanup/recovery PC 가 idle universe 에 오염
+            # 들어갈 수 있으므로 이 시점이 적절.
+            _diag_ok = self.sampler.diagnose()
+            # ★ 배경(무명령) 커버리지를 **미리** 반영한다. 안 하면 idle 루프·인터럽트·타
+            #   코어 housekeeping 이 밟는 블록이 매 윈도우 '새 커버리지' 로 잡혀 모든 입력이
+            #   interesting 이 된다(1000 exec 에 corpus 1000). 총계에는 정직하게 포함된다.
+            if (self.cov is not None and _diag_ok
+                    and getattr(self.sampler, '_idle_obs', None)):
+                _before = len(self.cov.covered_bbs)
+                self._idle_cov_keys = set(
+                    self.cov.project(self.sampler._idle_obs).seed_keys)
+                self.cov.update(self.sampler._idle_obs)
+                log.warning(f"[Diagnose] 배경 커버리지 선반영: "
+                            f"{len(self.cov.covered_bbs) - _before:,} 블록 "
+                            f"(이후 이 블록들은 '새 커버리지'로 치지 않는다)")
+            if not _diag_ok:
+                log.error("J-Link PC read diagnosis failed, aborting")
+                return
 
-        self._bb_at_start = self._cov_totals()[0]   # v11.1: 시작 전 보정이 찾은 BB(출처 비교에서 분리)
-        self.start_time = datetime.now()
-        self._window_t0 = self.start_time          # 구간별 exec/s 계산용
-        self._window_exec0: int = 0
-        # calibration 실행 횟수를 제외하고 main loop 기준으로 카운트 재시작
-        self.executions = 0
+            if self.sampler.idle_pcs:
+                # idle_pcs를 BB/func 커버리지에 반영 (global_coverage엔 추가 안 함 — saturation 설계 유지)
+                self._update_static_coverage(self.sampler.idle_pcs)
+                pcs_str = ', '.join(hex(p) for p in sorted(self.sampler.idle_pcs))
+                log.warning(f"Idle PCs    : {pcs_str} ({len(self.sampler.idle_pcs)} addrs)")
+            else:
+                log.warning("Idle PCs    : not detected (saturation = global PC only)")
 
-        # 퍼징 시작 직전 초기 상태 스냅샷
-        self._log_smart()
-        if self.config.state_enabled:
-            self._log_state_snapshot()
+            # idle 유니버스 수집 완료 → 디바이스 정보 한 번에 출력
+            self._log_device_info()
 
-        try:
+            # PM preflight: idle 유니버스 수집 직후 전체 PowerCombo 검증.
+            # --pm 활성화 시에만 실행. 실패 조합 있어도 abort하지 않고 경고만 출력.
+            self._pm_preflight_check()
+
+            # v7.7: S1/S2 perturbation preflight — PCIe bit + CLKREQ# 1회씩 검증.
+            if self.config.pm_inject_prob > 0:
+                self._pm_preflight_s1_s2()
+
+            # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
+            # _log_smart() 이후에 설정: 이전에 실행하면 admin_timeout=30일 상태에서
+            # smart-log ioctl이 제출되어, SSD 응답이 조금 느릴 때 커널이 계속 기다리고
+            # Python 10초 timeout이 먼저 터지는 문제 방지.
+            self._configure_nvme_timeouts()
+
+            # FormatNVM + Sanitize 1회 실행 — calibration 직전 FTL 상태 초기화
+            # Read/Write로 쌓인 mapping 복잡도를 알려진 깨끗한 상태로 리셋한 뒤 fuzzing 시작.
+            # 이후 self.commands에서 제거 → 메인 루프에서는 절대 선택되지 않음.
+            _fmt_cmd = next((c for c in NVME_COMMANDS if c.name == "FormatNVM"), None)
+            if _fmt_cmd and any(c.name == "FormatNVM" for c in self.commands):
+                log.warning("[Calibration] FormatNVM 1회 실행 (SES=0, FTL 리셋) ...")
+                _fmt_seed = Seed(data=b'', cmd=_fmt_cmd, cdw10=0x0000)
+                _fmt_rc = self._send_nvme_command(b'', _fmt_seed)
+                _, _sampler_ok = self._stop_sampling_checked("startup:FormatNVM")
+                if not _sampler_ok:
+                    return
+                log.warning(f"[Calibration] FormatNVM 완료 (rc={_fmt_rc})")
+                _san_cmd = next((c for c in NVME_COMMANDS if c.name == "Sanitize"), None)
+                if _san_cmd:
+                    # ★ SANACT = CDW10[2:0]. 001b=Exit Failure Mode / 010b=Block Erase /
+                    #   011b=Overwrite / 100b=Crypto Erase.
+                    #   v9.6 이전은 cdw10=0x04 (=100b=Crypto Erase) 를 보내면서 주석/로그만
+                    #   "SANACT=001 Exit Failure Mode" 라고 적어 뒀다. 즉 --all-commands 실행마다
+                    #   실제 전체 소거가 나갔고, 완료 대기도 없어 진행 중에 prefill/POR 이 겹치면
+                    #   SSTAT=011b(Sanitize Operation Failed) 로 래치 → 펌웨어가 미디어를 read-only
+                    #   로 전환(SMART critical_warning bit3) → 전원 사이클로도 안 풀림.
+                    #   Exit Failure Mode(001b)는 소거를 하지 않고 그 래치를 해제하는 명령이라,
+                    #   원래 의도(안전한 SANACT)와도 시작 시 상태 정리 목적에도 이게 맞다.
+                    log.warning("[Calibration] Sanitize 1회 실행 (SANACT=001b, Exit Failure Mode "
+                                "— 소거 아님, sanitize-failed 래치 해제) ...")
+                    _san_seed = Seed(data=b'', cmd=_san_cmd, cdw10=0x01)
+                    _san_rc = self._send_nvme_command(b'', _san_seed)
+                    _, _sampler_ok = self._stop_sampling_checked("startup:Sanitize")
+                    if not _sampler_ok:
+                        return
+                    log.warning(f"[Calibration] Sanitize(Exit Failure Mode) 전송 완료 (rc={_san_rc})")
+                # 메인 루프에서 재실행되지 않도록 제거
+                self.commands = [c for c in self.commands if c.name not in ("FormatNVM", "Sanitize")]
+                log.info("[Calibration] FormatNVM/Sanitize self.commands에서 제거됨")
+
+            # config fw_bin 을 (쓰기 가능) 모든 firmware slot 에 프리로드 → 이후 FWCommit 이 어떤 슬롯을
+            # 활성화(CA=2/3)해도 같은 이미지 → 다른 FW 활성화 방지. FWCommit fuzz + fw_bin 있을 때만.
+            if self._fw_chunks and any(c.name == 'FWCommit' for c in self.commands):
+                self._preload_fw_slots()
+                if self._sampler_recovery_failed:
+                    log.error("[FW] sampler 복구 실패 — prefill/calibration/퍼징 중단")
+                    return
+
+            # Prefill: FormatNVM/Sanitize 이후 드라이브 전체 쓰기 (Verify 등이 참조할 데이터 확보)
+            # FormatNVM이 LBA 맵핑을 초기화하므로 prefill은 반드시 format 완료 후 실행해야 의미 있음.
+            if self.config.prefill:
+                self._prefill_drive()
+            else:
+                log.info("[Prefill] 비활성화됨 (--prefill 로 활성화)")
+
+            if self.config.calibration_runs > 0:
+                total_seeds = len(self.corpus)
+                _cal_unit = ('bbs' if (getattr(self.sampler, 'PER_CORE_COVERAGE', False)
+                                        or (self._sa_loaded and self._sa_bb_starts))
+                             else 'pcs')
+                log.warning(f"[Calibration] {total_seeds} seeds × "
+                            f"{self.config.calibration_runs} runs each ...")
+                calibrated_corpus = []
+                cal_results = []  # (index, cmd_name, stability, stable_pcs, all_pcs)
+
+                # J-Link DLL이 stderr로 직접 출력하는 "CPU is not halted" 등의
+                # 타이밍 경고를 calibration 구간에서만 fd 수준으로 억제한다.
+                devnull_fd = os.open(os.devnull, os.O_WRONLY)
+                saved_stderr_fd = os.dup(2)
+                os.dup2(devnull_fd, 2)
+                # devnull_fd를 닫지 않고 유지 → 루프 중 [Cal] 로그 출력 후 재억제에 재사용
+                # _handle_timeout_crash()이 log.error() 전에 stderr를 복원할 수 있도록
+                # 인스턴스 변수에 보관 (fd 수명: finally의 os.close까지)
+                self._cal_saved_stderr_fd = saved_stderr_fd
+                _cal_idx_w = len(str(total_seeds))  # 숫자 폭 (예: 총 47개 → 폭 2)
+                try:
+                    for i, seed in enumerate(self.corpus):
+                        if not isinstance(seed, Seed):
+                            calibrated_corpus.append(seed)
+                            continue
+                        seed = self._calibrate_seed(seed)
+                        if self._sampler_recovery_failed:
+                            os.dup2(saved_stderr_fd, 2)
+                            log.error("[Calibration] sampler 복구 실패 — calibration/퍼징 중단")
+                            return
+                        calibrated_corpus.append(seed)
+                        stable_cnt = len(seed.stable_pcs) if seed.stable_pcs else 0
+                        all_cnt    = len(seed.covered_pcs) if seed.covered_pcs else 0
+                        cal_results.append((i + 1, seed.cmd.name, seed.stability,
+                                            stable_cnt, all_cnt))
+
+                        # 시드별 진행 로그 ─────────────────────────────────────────
+                        # stderr가 억제된 상태이므로 출력 전에 복원 후 다시 억제
+                        _rc = getattr(self, '_cal_last_rc', 0)
+                        _rc_str = (f"rc=TIMEOUT" if _rc == self.RC_TIMEOUT
+                                   else f"rc=ERR"    if _rc == self.RC_ERROR
+                                   else f"rc={_rc}")
+                        _tag = " ← FAIL" if _rc not in (0,) else ""
+                        os.dup2(saved_stderr_fd, 2)   # stderr 복원
+                        log.warning(
+                            f"[Cal {i+1:{_cal_idx_w}}/{total_seeds}] "
+                            f"{seed.cmd.name:<20} "
+                            f"cdw10=0x{seed.cdw10:08x}  "
+                            f"stab={seed.stability*100:3.0f}%  "
+                            f"{_cal_unit}={all_cnt:5}  "
+                            f"{_rc_str}{_tag}"
+                        )
+                        os.dup2(devnull_fd, 2)        # 다시 억제
+
+                        if self._timeout_crash:
+                            os.dup2(saved_stderr_fd, 2)
+                            log.error("[Calibration] timeout during calibration — aborting")
+                            return
+                finally:
+                    self._cal_saved_stderr_fd = None
+                    os.dup2(saved_stderr_fd, 2)
+                    os.close(devnull_fd)
+                    os.close(saved_stderr_fd)
+
+                self.corpus = calibrated_corpus
+
+                avg_stab = sum(r[2] for r in cal_results) / max(len(cal_results), 1)
+                log.warning(f"[Calibration] Done — "
+                            f"Seeds: {total_seeds}  |  "
+                            f"Global PCs: {len(self.sampler.global_coverage)}  |  "
+                            f"Avg stability: {avg_stab*100:.1f}%")
+
+                for seed in self.corpus:
+                    if not isinstance(seed, Seed):
+                        continue
+                    if not seed.det_done:
+                        gen = self._deterministic_stage(seed)
+                        self._det_queue.append((seed, gen))
+                log.warning(f"[Det] Queued {len(self._det_queue)} seeds for deterministic stage")
+
+                # calibration 중 SetFeatures(APST/KeepAlive) 시드가 실행되면
+                # preflight의 _apst_disable()/_keepalive_disable() 효과가 무력화됨.
+                # → calibration 완료 후 다시 비활성화하여 퍼징 중 자율 PS 전환 방지.
+                # SetFeatures PS 시드(PS0~PS2)가 실행된 후 컨트롤러가 PS0이 아닌 상태일
+                # 수 있으므로 명시적으로 PS0으로 복구.
+                self._apst_disable()
+                self._keepalive_disable()
+                self._pm_set_state(0)   # calibration 중 PS 변경 → PS0 복구
+                log.warning("[Calibration] Complete. Starting fuzzing...\n")
+            else:
+                log.info("[Calibration] Disabled (calibration_runs=0)")
+
+            # 첫 주기 차트 전에 프로세스가 중단돼도 baseline 산출물이 남도록, idle/calibration
+            # 회계가 끝난 시점에 HTML/CSV/코어 요약을 한 번 생성한다(matplotlib 무관).
+            try:
+                self._generate_riscv_reports()
+            except Exception as _e:
+                log.warning(f"[CoverageReport] 초기 보고서 생성 실패(퍼징은 계속): {_e}")
+
+            self._bb_at_start = self._cov_totals()[0]   # v11.1: 시작 전 보정이 찾은 BB(출처 비교에서 분리)
+            self.start_time = datetime.now()
+            self._window_t0 = self.start_time          # 구간별 exec/s 계산용
+            self._window_exec0: int = 0
+            # calibration 실행 횟수를 제외하고 main loop 기준으로 카운트 재시작
+            self.executions = 0
+
+            # 퍼징 시작 직전 초기 상태 스냅샷
+            self._log_smart()
+            if self.config.state_enabled:
+                self._log_state_snapshot()
+
             # v11 active preflight must share the campaign's interrupt/finally cleanup.
             self._learning_baseline('fuzz_start')
             self._learning_save()
@@ -19494,6 +19499,11 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                                     and not base_seed.is_calibrated
                                     and not base_seed.covered_pcs):
                                 base_seed = self._calibrate_seed(base_seed)
+                                # v11.1: calibration 안에서 timeout crash(덤프까지 끝남)·샘플러 복구 실패가
+                                #   나면 여기서 멈춘다. 예전엔 그대로 변이·전송까지 가서 크래시를 캡처한
+                                #   장치에 명령을 하나 더 보냈다(다음 반복 시작에서야 멈춤).
+                                if self._timeout_crash or self._sampler_recovery_failed:
+                                    break
                             # ① 가시성: LLM 시드 선택 시 exec/covered_pcs/favored 상태
                             if (RAG_DEBUG_EXEC and base_seed is not None
                                     and self._is_llm_seed(base_seed)):

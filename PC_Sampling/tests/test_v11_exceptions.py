@@ -620,6 +620,48 @@ class CampaignRegression(unittest.TestCase):
             self.assertIs(env['_acct_seed'], seed)
             self.assertEqual(env['rc'], rc)
 
+    @staticmethod
+    def exec_protected(ast, protected, env, from_fuzz_start=True):
+        """run() 의 정리 try 를 함수로 감싸 실행한다(본문에 return 이 있다). from_fuzz_start 면 본문을
+        _learning_baseline('fuzz_start') 문장부터만 쓴다 — 그 앞은 장치 초기화·calibration 이라 모의 객체로
+        돌 수 없고, 이 시험들의 관심사는 사전시험 이후의 정리 경로다."""
+        import copy
+        node = copy.deepcopy(protected)
+        if from_fuzz_start:
+            def has_baseline(stmt):
+                return any(isinstance(c, ast.Call) and getattr(c.func, 'attr', '') == '_learning_baseline'
+                           for c in ast.walk(stmt))
+            k = next(i for i, st in enumerate(node.body) if has_baseline(st))
+            node.body = node.body[k:]
+        fn = ast.FunctionDef(name='_protected', args=ast.arguments(
+            posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+            body=[node], decorator_list=[], returns=None, type_comment=None)
+        mod = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+        exec(compile(mod, '<actual-run-cleanup>', 'exec'), env)
+        env['_protected']()
+
+    def test_startup_interrupt_runs_campaign_cleanup(self):
+        # v11.1 리뷰: 초기화(APST/keepalive 끄기·커널 timeout·calibration) 중 Ctrl+C 도 정리 범위 안
+        from unittest.mock import MagicMock
+        ast, module, run = self.run_ast()
+        protected = next(n for n in run.body if isinstance(n, ast.Try) and n.finalbody)
+        with tempfile.TemporaryDirectory() as d:
+            f = MagicMock()
+            f._wp_held_nsid = None
+            f._timeout_crash = f._exception_preserve = False
+            f.output_dir = Path(d)
+            f._apst_disable.side_effect = KeyboardInterrupt        # 정리 범위 첫 동작에서 중단
+            f._collect_stats.side_effect = RuntimeError('no stats in harness')
+            env = dict(vars(module), self=f)
+            with patch('signal.signal'):
+                self.exec_protected(ast, protected, env, from_fuzz_start=False)
+            f._learning_baseline.assert_not_called()
+            f.sampler.close.assert_called_once()
+            f.sampler.save_coverage.assert_called_once()
+            f._apst_restore.assert_called_once()
+            f._keepalive_restore.assert_called_once()
+            f._restore_nvme_timeouts.assert_called_once()
+
     def test_preflight_interrupt_and_preserved_exit_run_final_cleanup(self):
         from unittest.mock import MagicMock
         ast, module, run = self.run_ast()
@@ -635,7 +677,7 @@ class CampaignRegression(unittest.TestCase):
                 f._collect_stats.side_effect = RuntimeError('no stats in harness')
                 env = dict(vars(module), self=f)
                 with patch('signal.signal'):
-                    exec(compile(ast.Module(body=[protected], type_ignores=[]), '<actual-run-cleanup>', 'exec'), env)
+                    self.exec_protected(ast, protected, env)
                 f._learning_baseline.assert_called_once_with('fuzz_start')
                 f._learning_save.assert_called_with(force=True)
                 f.sampler.save_coverage.assert_called_once()
@@ -672,8 +714,7 @@ class CampaignRegression(unittest.TestCase):
         f._collect_stats.side_effect = RuntimeError('no stats in harness')
         with tempfile.TemporaryDirectory() as d, patch('signal.signal'):
             f.output_dir = Path(d)
-            exec(compile(ast.Module(body=[protected], type_ignores=[]), '<actual-run-cleanup>', 'exec'),
-                 dict(vars(module), self=f))
+            self.exec_protected(ast, protected, dict(vars(module), self=f))
         self.assertTrue(f._exception_preserve)
         self.assertTrue(f._timeout_crash)
         f._exception_controller.restore_supply.assert_called()

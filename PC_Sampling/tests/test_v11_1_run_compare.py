@@ -307,3 +307,67 @@ class CompareTool(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReviewFixes(unittest.TestCase):
+    """2026-10-02 리뷰: 런타임 calibration 뒤 중단, 초기화 이후 전체가 정리 범위, C1·C2 보상 모집단."""
+
+    def test_runtime_calibration_crash_stops_before_next_send(self):
+        import re
+        from fuzzer_target import FUZZER_FILE
+        src = FUZZER_FILE.read_text(encoding='utf-8')
+        m = re.search(r"base_seed = self\._calibrate_seed\(base_seed\)\n((?:\s*#[^\n]*\n)*)"
+                      r"\s*if self\._timeout_crash or self\._sampler_recovery_failed:\n\s*break", src)
+        self.assertIsNotNone(m, '런타임 calibration 직후 중단 확인이 없다')
+
+    def test_startup_device_changes_are_inside_cleanup_scope(self):
+        import ast
+        from fuzzer_target import FUZZER_FILE
+        tree = ast.parse(FUZZER_FILE.read_text(encoding='utf-8'))
+        run = next(n for c in tree.body if isinstance(c, ast.ClassDef)
+                   for n in c.body if isinstance(n, ast.FunctionDef) and n.name == 'run'
+                   and any(isinstance(a, ast.Call) and getattr(a.func, 'attr', '') == '_calibrate_seed'
+                           for a in ast.walk(n)))
+
+        def calls(nodes):
+            return {getattr(c.func, 'attr', '') for n in nodes for c in ast.walk(n) if isinstance(c, ast.Call)}
+        tries = [t for t in run.body if isinstance(t, ast.Try) and '_restore_nvme_timeouts' in calls(t.finalbody)]
+        self.assertEqual(len(tries), 1)
+        body = calls(tries[0].body)
+        for name in ('_apst_disable', '_keepalive_disable', '_configure_nvme_timeouts', '_calibrate_seed',
+                     '_learning_baseline'):
+            self.assertIn(name, body, f'{name} 이 정리 범위 밖에 있다')
+        # 정리 범위 앞(샘플러 연결 전)에는 장치·호스트 설정 변경이 없다
+        before = calls(run.body[:run.body.index(tries[0])])
+        for name in ('_apst_disable', '_configure_nvme_timeouts', '_calibrate_seed'):
+            self.assertNotIn(name, before)
+
+    def test_blocked_and_interrupted_commands_reward_neither_corpus(self):
+        from collections import Counter, defaultdict
+        from test_v11_exceptions import RealTransportIntegration
+        tc = RealTransportIntegration('test_actual_transport_injects_and_next_normal_timeout_is_restored')
+        tc.setUp()
+        self.addCleanup(tc.tmp.cleanup)
+        f = tc.f
+        f.config.state_enabled = True
+        f.cmd_stats = defaultdict(lambda: {'exec': 0})
+        f.rc_stats = defaultdict(Counter)
+        f._fw_commit_reset_pending = False
+        for source in ('c1', 'c2'):
+            f._csfuzz_c1_rewards, f._csfuzz_c2_rewards = [], []
+            f._account_command(tc.seed, b'', f.RC_SKIP, 0, source=source)            # 가드 차단
+            f._exception_interrupted = True
+            f._account_command(tc.seed, b'', f.RC_EXCEPTION, 0, source=source)       # 예외 주입
+            f._exception_window_truncated = True
+            f._account_command(tc.seed, b'', 0, 0, source=source)                    # 복구 관측 구간
+            self.assertEqual((f._csfuzz_c1_rewards, f._csfuzz_c2_rewards), ([], []), source)
+
+    def test_reward_helper_routes_by_source(self):
+        o = fuzzer.NVMeFuzzer.__new__(fuzzer.NVMeFuzzer)
+        o.config = SimpleNamespace(state_enabled=True)
+        o._csfuzz_c1_rewards, o._csfuzz_c2_rewards = [], []
+        for src, n in (('c1', 3), ('c1', 0), ('c2', 1), ('c2', 0), ('workload', 5)):
+            o._csfuzz_reward(src, n)
+        self.assertEqual((o._csfuzz_c1_rewards, o._csfuzz_c2_rewards), ([1, 0], [1, 0]))
+        src = Path(fuzzer.__file__).read_text(encoding='utf-8')
+        self.assertEqual(src.count('_csfuzz_c2_rewards.append'), 0)          # 재생 루프에서 따로 쌓지 않음
