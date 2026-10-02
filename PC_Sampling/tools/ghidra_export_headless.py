@@ -22,14 +22,15 @@ r"""펌웨어 커버리지 추출 — BIN / ELF 공통 진입점 (호스트 Pyth
 -----------------------------------------
   python3 tools/ghidra_export_headless.py analyze /fw/FW.bin /out/bin \
     --ghidra /opt/ghidra --processor ARM:LE:32:v7 \
-    --cut 0x200 --base 0x10000000
+    --cut 0xA4000
 
   --cut N: 앞 N바이트를 제거한 임시 파일을 분석한다. 원본은 변경하지 않는다.
            dd bs=1M iflag=skip_bytes skip=N과 같은 바이트 절단이다.
            N은 10진수 또는 0x 접두사의 16진수. 파일 전체를 자르는 값은 거부한다.
-  --base A: 잘라낸 뒤 첫 바이트의 메모리 주소. 파일을 자르는 옵션이 아니다.
-           위 예에서는 원본 오프셋 0x200이 Ghidra 주소 0x10000000에 대응한다.
-  헤더 제거가 없으면 --cut 0. 주소는 실제 로드 주소로 지정한다.
+  위 예는 앞 0xA4000바이트를 제거하고, 남은 첫 바이트를 주소 0에 배치한다.
+  base가 0이면 --base는 생략한다(BASE 환경변수도 미설정일 때 기본값 0).
+  다른 주소가 필요할 때만 --base A를 지정한다. 이 옵션은 파일을 자르지 않는다.
+  헤더 제거가 없으면 --cut 0을 사용한다.
   OUTDIR 생략 시 현재 폴더 아래 BIN 파일명(확장자 제외)을 사용한다.
   출력: basic_blocks.txt (시작/끝 주소, 끝 주소 exclusive),
         functions.txt (진입 주소/10진수 크기/함수 이름).
