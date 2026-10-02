@@ -196,10 +196,18 @@ callgraph_core<X>.txt      0xCALLER 0xCALLEE
 symbols.json               ELF 해시·exec 범위·개수(자가 검증)
 ```
 
-생성은 Ghidra headless 로 `../tools/ghidra_export.py`(Jython 스크립트)를 코어별 ELF 에
-돌린다. 코드 오버레이가 있는 코어는 `FW_{label}Core_overlay_map.json` 을 함께 준다
-(`{label}` 은 코어 이름으로 자동 치환). 과거 README 에 있던 래퍼 `run_ghidra_export.sh` 는
-리포에 없다 — 사내 호스트에만 있다.
+생성은 `../tools/ghidra_export_headless.py`와 같은 폴더의 `GhidraExportMaps.java`로 수행한다.
+ELF 폴더에는 `FW_HCore.elf`처럼 `FW_*Core.elf` 파일을 둔다:
+
+```bash
+MAXMEM=16G OVL_MAP='/maps/FW*{label}Core_overlay_map.json' \
+  python3 ../tools/ghidra_export_headless.py symbols /fw/elfs all /out/coverage \
+  --ghidra /opt/ghidra
+```
+
+코드 오버레이가 없으면 `OVL_MAP`을 생략한다. `{label}`은 코어 이름으로 자동 치환한다.
+별도 shell wrapper는 필요 없다. BIN/ELF 사용법과 옵션은 실행 파일 상단 docstring 및
+`python3 ../tools/ghidra_export_headless.py --help`에 있다.
 
 ---
 
