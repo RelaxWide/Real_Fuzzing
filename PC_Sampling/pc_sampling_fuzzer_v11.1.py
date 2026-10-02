@@ -4416,6 +4416,10 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
     LINK_LABEL = '[cJTAG/SBA]'
     PER_CORE_COVERAGE = True               # _account_command 가 CoverageModel 경로를 탄다
     _EMPTY_BURST_LIMIT = 8                 # 연속 빈 버스트 허용치(무한 루프 방지)
+    # v11.1: 오버레이 bank 를 못 읽어(읽기 실패/해석 불가) 연속으로 버린 버스트 한도.
+    #   넘으면 그 코어의 bank 판별을 끄고 bank 0 으로 수집한다(시작 때 프로브 실패와 같은 처리).
+    #   스왑(앞뒤 bank 다름)은 정상 폐기라 세지 않는다.
+    _OVL_FAIL_LIMIT = 32
 
     def __init__(self, config: 'FuzzConfig') -> None:
         super().__init__(config)
@@ -4461,6 +4465,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         self._ovl_probe = {}
         self._ovl_dropped = 0
         self._ovl_kept = 0        # 태깅에 성공한 샘플 — ovl-drop 비율의 분모
+        self._ovl_fail_streak = {}   # 코어별 연속 bank 판별 실패(스왑 제외) 버스트 수
         self.collapse_count = 0
         self.recover_ok = 0
         self.recover_fail = 0
@@ -4649,6 +4654,27 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                 time.sleep(delay)
         return None, last_w, kind
 
+    def _ovl_note_fail(self, core, addr, w0, w1):
+        """bank 판별 실패(읽기 실패·해석 불가)로 버린 버스트를 센다. 연속 한도를 넘으면 그
+        코어의 bank 판별을 끈다 — 링크가 흔들려 프로브 읽기가 계속 실패하면 그 코어 샘플이
+        **전부** 조용히 버려져 커버리지가 0 이 된다(2026-10 실측: ovl-drop 100%).
+        끈 뒤엔 오버레이 창의 PC 가 bank 0 으로 합쳐진다. 재연결 시 프로브를 다시 확인한다."""
+        streak = getattr(self, '_ovl_fail_streak', None)
+        if streak is None:
+            streak = self._ovl_fail_streak = {}
+        n = streak.get(core, 0) + 1
+        streak[core] = n
+        if n < self._OVL_FAIL_LIMIT:
+            return
+        self._ovl_probe.pop(core, None)
+        streak[core] = 0
+
+        def _desc(w):
+            return '읽기 실패' if w is None else f'0x{w:08X}'
+        log.error(f"[Overlay] core{core}: bank 판별 {n}회 연속 실패(마지막 프로브 0x{addr:X} "
+                  f"앞={_desc(w0)} 뒤={_desc(w1)}) — 이 코어 bank 판별 끔, bank 0 으로 수집. "
+                  f"읽기 실패면 링크 불안정, 값이 있으면 오버레이 맵이 이 펌웨어 것인지 확인")
+
     def _init_overlay_probe(self):
         """오버레이가 있는 코어마다 프로브를 **실제로 읽어** 본다.
 
@@ -4659,6 +4685,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
           꺼지지 않도록 유효 bank 가 나올 때까지 재시도한다(_probe_overlay_bank).
         """
         self._ovl_probe = {}
+        self._ovl_fail_streak = {}
         if self.cov is None or self.session is None:
             return
         rv = getattr(self.config, 'riscv', None) or {}
@@ -4762,9 +4789,10 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                         #   같은 PC 라도 오버레이가 다르면 다른 코드다. 버스트 **경계**
                         #   에서만 읽는다(핫루프에 넣으면 실측 폴링 제약을 깬다).
                         _pa = self._ovl_probe.get(core)
-                        _bank = None
+                        _bank = _w0 = None
                         if _pa is not None:
-                            _bank = self._resolve_bank(core, self.session.read_word(_pa))
+                            _w0 = self.session.read_word(_pa)
+                            _bank = self._resolve_bank(core, _w0)
                         obs = self.session.burst(core, n, self._valid_bit)
                         # transport 실패는 valid=0(WFI)와 별개다. 오버레이 폐기보다
                         # 먼저 확인해야 bank 미검출 continue에 장애가 가려지지 않는다.
@@ -4779,11 +4807,17 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                         if _pa is not None and obs:
                             # 버스트 도중 스왑이 일어났으면 이 샘플들이 어느 오버레이의
                             # 것인지 알 수 없다 → 틀린 귀속보다 버리는 게 낫다.
-                            _after = self._resolve_bank(core, self.session.read_word(_pa))
+                            _w1 = self.session.read_word(_pa)
+                            _after = self._resolve_bank(core, _w1)
                             if _bank is None or _after != _bank:
                                 self._ovl_dropped += len(obs)
                                 total += len(obs)      # 진행은 시켜야 무한루프가 안 난다
+                                if _bank is not None and _after is not None:
+                                    continue           # 정상 스왑 — 판별 실패가 아니다
+                                self._ovl_note_fail(core, _pa, _w0, _w1)
                                 continue
+                            if getattr(self, '_ovl_fail_streak', None):
+                                self._ovl_fail_streak[core] = 0
                             self._ovl_kept += len(obs)
                             obs = [o._replace(bank=_bank) for o in obs]
                         if not obs:
