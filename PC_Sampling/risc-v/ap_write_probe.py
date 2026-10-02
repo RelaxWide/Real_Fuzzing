@@ -18,11 +18,17 @@ CSW 비트도 풀어 찍는다 — TrInProg(bit7)=1 이면 이전 전송이 끝�
 --dap-abort: 시험 전에 DP ABORT.DAPABORT(bit0)로 걸린 AP 전송을 취소하고 전후 상태를 찍는다.
   (평소 sticky 클리어는 ABORT=0x1E 로 bit0 을 쓰지 않아 멈춘 전송을 풀지 못한다.)
 
+--watch N: 한 세션을 유지한 채 N 초 동안 --interval 간격으로 AP 마다 TAR 쓰기/되읽기를
+  반복하고 한 줄씩 찍는다(전원 ON·부팅 이후 시간에 따라 어떻게 변하는지). 기호:
+  O=일치  X=되읽기 불일치(0 등)  E=읽기 실패/0x80000000(링크 수준 에러)
+
 사용: sudo python3 risc-v/ap_write_probe.py [--power both|dbg-only|sys-only] [--dap-abort]
+      sudo python3 risc-v/ap_write_probe.py --watch 120 [--interval 2]
 """
 import argparse
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -109,12 +115,57 @@ def probe_ap(dap, name, base):
     return idr, csw_ok, all(tar_ok), any(tar_ok)
 
 
+def quick_ap(dap, base):
+    """TAR 한 번 쓰고 되읽기 → 'O'/'X'/'E'."""
+    dap.clear_sticky()
+    dap.ap_write(base, OFF_TAR, 0x00000004)
+    dap.dp_read(DP_RDBUF)
+    back = dap.ap_read(base, OFF_TAR)
+    if back is None or back == 0x80000000:
+        return 'E'
+    return 'O' if back == 0x00000004 else 'X'
+
+
+def nvme_state():
+    """호스트가 본 컨트롤러 상태(있으면) — 링크 변화와 rescan/드라이버 시점을 맞춰 보기 위함."""
+    try:
+        names = sorted(os.listdir('/sys/class/nvme'))
+        if not names:
+            return '-'
+        with open(f'/sys/class/nvme/{names[0]}/state') as f:
+            return f"{names[0]}:{f.read().strip()}"
+    except OSError:
+        return '-'
+
+
+def watch(dap, seconds, interval):
+    names = [n for n, _b, _k in AP_MAP]
+    print(f"\n  [watch] {seconds:.0f}초, {interval:.1f}초 간격  (O=일치 X=불일치 E=링크에러)")
+    print("    t(s)   DPIDR       CDBG  " + " ".join(f"{n:>7}" for n in names) + "   nvme")
+    t0 = time.monotonic()
+    while True:
+        t = time.monotonic() - t0
+        dpidr = dap.dp_read(0)
+        ctrl = dap.dp_read(DP_CTRL_STAT)
+        ack = '-' if ctrl is None else str((ctrl >> 29) & 1)
+        marks = [quick_ap(dap, b) for _n, b, _k in AP_MAP]
+        print(f"    {t:6.1f}  {hx(dpidr):>10}  {ack:>4}  "
+              + " ".join(f"{m:>7}" for m in marks) + f"   {nvme_state()}", flush=True)
+        if t >= seconds:
+            return
+        time.sleep(interval)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--power", choices=("dbg-only", "both", "sys-only"), default="both",
                     help="DAP 전원요청 (퍼저 기본 both)")
     ap.add_argument("--dap-abort", action="store_true",
                     help="시험 전에 DP ABORT.DAPABORT(bit0)로 AP 에 걸린 전송을 취소")
+    ap.add_argument("--watch", type=float, default=0, metavar="SEC",
+                    help="한 세션으로 SEC 초 동안 AP 별 TAR 쓰기를 반복해 시간 변화를 본다")
+    ap.add_argument("--interval", type=float, default=2.0, metavar="SEC",
+                    help="--watch 반복 간격(초)")
     a = ap.parse_args()
 
     if not AP_MAP:
@@ -142,6 +193,10 @@ def main():
             dap.clear_sticky()
             print(f"  [DAPABORT] ABORT<=0x1 쓰기={'OK' if ok else '실패'}")
             print(f"  [DAPABORT 후] APBAP3 {ap_state(dap, sj.APBAP3_BASE)}")
+
+        if a.watch:
+            watch(dap, a.watch, max(0.2, a.interval))
+            return 0
 
         rows = [(name,) + probe_ap(dap, name, base) for name, base, _k in AP_MAP]
 
