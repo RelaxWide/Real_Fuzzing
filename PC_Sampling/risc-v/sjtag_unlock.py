@@ -293,12 +293,66 @@ def _decode_tool_output(raw):
     return raw.decode("utf-8", "replace")
 
 
-def run_tool(tool, args, want, label, prefix=()):
+HEARTBEAT_SEC = 0.2        # 서명 도구 대기 중 STATE 읽기 간격
+
+
+def _run_with_heartbeat(cmd, heartbeat):
+    """도구를 돌리는 동안 heartbeat() 를 HEARTBEAT_SEC 마다 부른다.
+    도구 실행(wine 기동 포함)이 수 초 걸리는 동안 디버그 링크가 완전히 놀면, 직후 첫
+    쓰기가 CSW 0x80000000 으로 죽는 현상이 [4]/[6] 직후에서 반복 관측됐다. 읽기만 하므로
+    상태머신에는 영향이 없고(poll_bit 와 같은 STATE 읽기), 같은 handle 을 쓰는 것은 이
+    스레드뿐이라 동시 접근도 없다."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + TOOL_TIMEOUT
+    while True:
+        try:
+            out, err = proc.communicate(timeout=HEARTBEAT_SEC)
+            return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline:
+                proc.kill()
+                proc.communicate()
+                raise
+            heartbeat()
+
+
+class _LinkHeartbeat:
+    """도구 대기 중 STATE 를 읽어 링크를 깨워 두고, 언제 끊겼는지 기록한다."""
+
+    def __init__(self, dap, addr):
+        self.dap, self.addr = dap, addr
+        self.t0 = time.monotonic()
+        self.n = self.fail = 0
+        self.first_fail = None
+
+    def __call__(self):
+        self.n += 1
+        if self.dap.mem_read32(APBAP3_BASE, self.addr) is None:
+            self.fail += 1
+            if self.first_fail is None:
+                self.first_fail = (time.monotonic() - self.t0,
+                                   self.dap.last.get('why'), self.dap.sticky())
+            self.dap.clear_sticky()
+
+    def report(self, label):
+        dt = time.monotonic() - self.t0
+        msg = f"    [{label}] 도구 대기 {dt:.1f}s 동안 링크 유지 읽기 {self.n}회, 실패 {self.fail}회"
+        if self.first_fail:
+            t, why, st = self.first_fail
+            msg += f" — 첫 실패 +{t:.1f}s ({why}; {st})"
+        print(msg)
+
+
+def run_tool(tool, args, want, label, prefix=(), heartbeat=None):
     # prefix = wine 등 런처(리눅스에서 .exe 를 돌릴 때). 비면 도구를 직접 exec.
     cmd = [*prefix, tool, *args]
     try:
         # bytes 로 받아 우리가 인코딩을 판별한다(로케일 자동디코드에 맡기지 않음).
-        proc = subprocess.run(cmd, capture_output=True, timeout=TOOL_TIMEOUT)
+        if heartbeat is None:
+            proc = subprocess.run(cmd, capture_output=True, timeout=TOOL_TIMEOUT)
+        else:
+            proc = _run_with_heartbeat(cmd, heartbeat)
+            heartbeat.report(label)
     except (OSError, subprocess.TimeoutExpired) as e:
         hint = ""
         if isinstance(e, OSError) and not prefix and str(tool).lower().endswith(".exe") \
@@ -399,7 +453,8 @@ def w(dap, addr, val, label, retries=3):
             return
         dap.clear_sticky()
     raise SecureJtagError(
-        f"{label}: APBAP3 쓰기 {retries}회 실패 ({dap.last.get('why')})", EXIT_CONFIG)
+        f"{label}: APBAP3 쓰기 {retries}회 실패 ({dap.last.get('why')}; {dap.sticky()})",
+        EXIT_CONFIG)
 
 
 def rd(dap, addr, label, retries=3):
@@ -546,7 +601,8 @@ def unlock(dap, base, tool, word_order, timeout=60.0, tool_prefix=()):
     poll_bit(dap, A(OFF_STATE), REQUEST_READY, REQUEST_READY, timeout, "REQUEST_READY")
 
     print("  [4] 공개키 수신·주입")
-    pub = order_words(run_tool(tool, PUBKEY_FLAGS, PUBKEY_WORDS, "pubkey", tool_prefix), word_order)
+    pub = order_words(run_tool(tool, PUBKEY_FLAGS, PUBKEY_WORDS, "pubkey", tool_prefix,
+                               heartbeat=_LinkHeartbeat(dap, A(OFF_STATE))), word_order)
     for k, word in enumerate(pub):
         w(dap, A(OFF_REQUEST) + 4 * k, word, f"REQUEST[{k}]")
     time.sleep(0.5)
@@ -561,7 +617,8 @@ def unlock(dap, base, tool, word_order, timeout=60.0, tool_prefix=()):
     chal_args = [f"0x{x:08X}" for x in reversed(challenge)]       # no[20]..no[0]
 
     print("  [6] 서명 수신·주입")
-    sig = order_words(run_tool(tool, SIGN_FLAGS + chal_args, SIG_WORDS, "sign", tool_prefix), word_order)
+    sig = order_words(run_tool(tool, SIGN_FLAGS + chal_args, SIG_WORDS, "sign", tool_prefix,
+                               heartbeat=_LinkHeartbeat(dap, A(OFF_STATE))), word_order)
     for k, word in enumerate(sig):
         w(dap, A(OFF_RESPONSE) + 4 * k, word, f"RESPONSE[{k}]")
 
