@@ -21,6 +21,10 @@ CSW 비트도 풀어 찍는다 — TrInProg(bit7)=1 이면 이전 전송이 끝�
 --watch N: 한 세션을 유지한 채 N 초 동안 --interval 간격으로 AP 마다 TAR 쓰기/되읽기를
   반복하고 한 줄씩 찍는다(전원 ON·부팅 이후 시간에 따라 어떻게 변하는지). 기호:
   O=일치  X=되읽기 불일치(0 등)  E=읽기 실패/0x80000000(링크 수준 에러)
+  CTRL/STAT 의 요청(req)·응답(ack) 비트를 따로 찍는다:
+    req=1 ack=0 → 요청은 살아 있는데 칩이 디버그 전원을 회수
+    req=0       → DP 가 리셋돼 요청이 지워짐(디버그 도메인 리셋/전원 강하)
+--reassert: 매 회 ABORT(0x1E)·전원요청을 다시 써서 회복되는지 본다.
 
 사용: sudo python3 risc-v/ap_write_probe.py [--power both|dbg-only|sys-only] [--dap-abort]
       sudo python3 risc-v/ap_write_probe.py --watch 120 [--interval 2]
@@ -138,18 +142,32 @@ def nvme_state():
         return '-'
 
 
-def watch(dap, seconds, interval):
+def pwr_bits(ctrl):
+    """CTRL/STAT → 'Dr/Da Sr/Sa' (CDBG req/ack, CSYS req/ack)."""
+    if ctrl is None:
+        return '  ?/? ?/?'
+    b = lambda n: (ctrl >> n) & 1
+    return f"  {b(28)}/{b(29)} {b(30)}/{b(31)}"
+
+
+def watch(dap, seconds, interval, reassert=False, req=0x50000000):
     names = [n for n, _b, _k in AP_MAP]
-    print(f"\n  [watch] {seconds:.0f}초, {interval:.1f}초 간격  (O=일치 X=불일치 E=링크에러)")
-    print("    t(s)   DPIDR       CDBG  " + " ".join(f"{n:>7}" for n in names) + "   nvme")
+    print(f"\n  [watch] {seconds:.0f}초, {interval:.1f}초 간격"
+          + (", 매 회 전원요청 재기입" if reassert else "")
+          + "  (O=일치 X=불일치 E=링크에러)")
+    print("    t(s)   DPIDR       CTRL/STAT   CDBG CSYS(req/ack)  "
+          + " ".join(f"{n:>7}" for n in names) + "   nvme")
     t0 = time.monotonic()
     while True:
         t = time.monotonic() - t0
+        if reassert:
+            dap.dp_write(DP_ABORT, 0x0000001E)
+            dap.dp_write(DP_CTRL_STAT, req)
+            dap._select = None
         dpidr = dap.dp_read(0)
         ctrl = dap.dp_read(DP_CTRL_STAT)
-        ack = '-' if ctrl is None else str((ctrl >> 29) & 1)
         marks = [quick_ap(dap, b) for _n, b, _k in AP_MAP]
-        print(f"    {t:6.1f}  {hx(dpidr):>10}  {ack:>4}  "
+        print(f"    {t:6.1f}  {hx(dpidr):>10}  {hx(ctrl):>10}  {pwr_bits(ctrl):>16}  "
               + " ".join(f"{m:>7}" for m in marks) + f"   {nvme_state()}", flush=True)
         if t >= seconds:
             return
@@ -166,6 +184,8 @@ def main():
                     help="한 세션으로 SEC 초 동안 AP 별 TAR 쓰기를 반복해 시간 변화를 본다")
     ap.add_argument("--interval", type=float, default=2.0, metavar="SEC",
                     help="--watch 반복 간격(초)")
+    ap.add_argument("--reassert", action="store_true",
+                    help="--watch 매 회 ABORT·전원요청을 다시 써서 회복 여부를 본다")
     a = ap.parse_args()
 
     if not AP_MAP:
@@ -195,7 +215,8 @@ def main():
             print(f"  [DAPABORT 후] APBAP3 {ap_state(dap, sj.APBAP3_BASE)}")
 
         if a.watch:
-            watch(dap, a.watch, max(0.2, a.interval))
+            req = 0x10000000 if a.power == "dbg-only" else 0x50000000
+            watch(dap, a.watch, max(0.2, a.interval), a.reassert, req)
             return 0
 
         rows = [(name,) + probe_ap(dap, name, base) for name, base, _k in AP_MAP]
