@@ -124,6 +124,13 @@ sbcs 확인·clear_sticky·지연을 넣으면 실패율이 폭증한다(I/O 부
 (`wine32 wine64` 설치 + `/root/.wine32`). 공개키는 `-s3 -f5`(정적 34워드), 서명은
 `-s1 -f5 <challenge>`(세션마다 다른 34워드)로 받는다.
 
+`sjtag_unlock.py` 는 서명 도구를 `WINEDLLOVERRIDES=wineusb.sys=d` 로 실행한다(기존 값이 있으면 덧붙임).
+root 로 뜬 wine 의 USB 드라이버(wineusb)가 호스트 USB 를 전부 등록하면서 pylink 가 쓰던 J-Link 까지
+잡아, 도구 실행 1~2초 뒤 DP 까지 링크가 끊긴다(증상: `fixme:wineusb:add_usb_device` 출력 뒤
+`APBAP3 쓰기 3회 실패 (CSW 의심값 0x80000000)`). 도구 대기 중에는 0.2초마다 STATE 를 읽어
+`[pubkey]/[sign] 도구 대기 …s 동안 링크 유지 읽기 N회, 실패 M회` 를 찍는다 — 실패가 있으면 첫 실패 시각과
+CTRL/STAT 로 원인을 가른다.
+
 ### 사람이 디버거로 붙을 때
 
 ```bash

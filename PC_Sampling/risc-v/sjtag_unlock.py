@@ -296,13 +296,28 @@ def _decode_tool_output(raw):
 HEARTBEAT_SEC = 0.2        # 서명 도구 대기 중 STATE 읽기 간격
 
 
+def _tool_env():
+    """서명 도구 실행 환경. wine 의 USB 드라이버(wineusb)를 항상 끈다.
+    sudo(root)로 뜬 wine 은 wineusb 가 호스트 USB 장치를 전부 열어 등록하는데, 이때
+    pylink 가 쓰고 있던 J-Link 까지 잡아 도구 실행 1~2초 뒤 DP 까지 링크가 끊겼다
+    (2026-10 실측: 'fixme:wineusb:add_usb_device' 출력 후 CTRL/STAT 읽기 실패).
+    서명 도구는 USB 가 필요 없다. wine 이 아닌 도구에는 이 변수가 아무 영향이 없다.
+    사용자가 WINEDLLOVERRIDES 를 이미 줬으면 거기에 덧붙인다(wineusb 를 직접 지정했으면 존중)."""
+    env = dict(os.environ)
+    cur = env.get("WINEDLLOVERRIDES", "")
+    if "wineusb" not in cur.lower():
+        env["WINEDLLOVERRIDES"] = f"{cur};wineusb.sys=d" if cur else "wineusb.sys=d"
+    return env
+
+
 def _run_with_heartbeat(cmd, heartbeat):
     """도구를 돌리는 동안 heartbeat() 를 HEARTBEAT_SEC 마다 부른다.
     도구 실행(wine 기동 포함)이 수 초 걸리는 동안 디버그 링크가 완전히 놀면, 직후 첫
     쓰기가 CSW 0x80000000 으로 죽는 현상이 [4]/[6] 직후에서 반복 관측됐다. 읽기만 하므로
     상태머신에는 영향이 없고(poll_bit 와 같은 STATE 읽기), 같은 handle 을 쓰는 것은 이
     스레드뿐이라 동시 접근도 없다."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=_tool_env())
     deadline = time.monotonic() + TOOL_TIMEOUT
     while True:
         try:
@@ -349,7 +364,8 @@ def run_tool(tool, args, want, label, prefix=(), heartbeat=None):
     try:
         # bytes 로 받아 우리가 인코딩을 판별한다(로케일 자동디코드에 맡기지 않음).
         if heartbeat is None:
-            proc = subprocess.run(cmd, capture_output=True, timeout=TOOL_TIMEOUT)
+            proc = subprocess.run(cmd, capture_output=True, timeout=TOOL_TIMEOUT,
+                                  env=_tool_env())
         else:
             proc = _run_with_heartbeat(cmd, heartbeat)
             heartbeat.report(label)
