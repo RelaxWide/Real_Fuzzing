@@ -72,6 +72,12 @@
       "date": "2026-10-02",
       "base_commit": "b389e28",
       "reason": "RiscvPcsrSampler: overlay bank probe failures (read fail / unresolvable word, not swaps) are counted per core; after _OVL_FAIL_LIMIT consecutive failed bursts the core's bank resolution is turned off and samples are kept as bank 0 instead of being silently dropped (field: ovl-drop 100% after recovery = zero PC collection). Streak resets on success and on re-probe at connect. Reviewed; only this class hash changes for v11.1."
+    },
+    {
+      "file": "pc_sampling_fuzzer_v11.1.py",
+      "date": "2026-10-02",
+      "base_commit": "5d14977",
+      "reason": "_send_nvme_command: after an errno-only failure (no NVMe status) whose message is a device-loss errno (No such device / No such file / EAGAIN / EINTR / EIO), check /sys/class/nvme/<ctrl>/state (wait up to 10s for live); if the controller is gone or dead, set _device_lost_reason and return RC_TIMEOUT so the existing crash capture runs (crash_reason=device_lost) and the run stops. Field: kernel 'Disabling device after reset failure: -19' left the fuzzer looping on ENODEV. Reviewed; ordinary errno failures and live controllers are unchanged."
     }
   ],
   "overrides_note": "hashes 는 모든 DEVICE_AST_FILES 에 적용되는 기준선이다. overrides 는 검토를 거쳐 **특정 파일에서만** 의도적으로 달라진 경로를 기록한다. v10.2 는 검증된 fallback 이라 계속 기준선 그대로여야 하고, 여기 올라오지 않은 파일·경로는 전부 기준선에 묶인다.",
@@ -86,7 +92,7 @@
     },
     "pc_sampling_fuzzer_v11.1.py": {
       "OpenOCDPCSampler": "48865eb551960624265b061a897ddf8abdc2586862598bc2be3c97a3a69aba04",
-      "_V101Fuzzer._send_nvme_command": "7abc961d8a41815a0c354581e6bc8eb89ee0449be5d8baae692dca55ccae61ef",
+      "_V101Fuzzer._send_nvme_command": "0357c5f8d049a5f11bb1491af57d766508970f4680124247624e441a3b336b24",
       "RiscvPcsrSampler": "9280510ac75b6f7913d34848059f0dd1c098517edfdc0b017e013c83aabcb538"
     }
   }

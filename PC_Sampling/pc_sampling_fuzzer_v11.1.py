@@ -7082,6 +7082,41 @@ class _V101Fuzzer:
             found = (found & node_nsids) if found else node_nsids
         return tuple(sorted(n for n in found if 1 <= n <= 0xFFFFFFFE))
 
+    # errno 문구 중 '장치가 없거나 준비되지 않음'을 뜻하는 것 — 이것만 컨트롤러 상태 확인을 부른다.
+    _DEVICE_LOSS_ERRNO_MARKERS = ('no such device', 'no such file or directory',
+                                  'resource temporarily unavailable',
+                                  'interrupted system call', 'input/output error')
+    _DEVICE_LOST_STATES = ('dead', 'deleting', 'deleting (no io)')
+
+    def _check_device_lost(self, err_text: str, settle_sec: float = 10.0) -> Optional[str]:
+        """장치가 사라졌으면 사유 문자열, 아니면 None.
+
+        커널이 컨트롤러를 리셋하다 실패하면 명령이 EINTR → ENODEV → EAGAIN 순으로 실패하고
+        이후 영영 돌아오지 않는다(2026-10 실측: 'Disabling device after reset failure: -19').
+        일시적인 reset(상태 resetting/connecting)은 settle_sec 동안 live 로 돌아오는지 기다린다.
+        errno 문구가 해당 계열이 아니면 sysfs 를 보지 않는다(일반 Invalid argument 등은 계속)."""
+        if not any(m in (err_text or '').lower() for m in self._DEVICE_LOSS_ERRNO_MARKERS):
+            return None
+        ctrl = os.path.basename(self._ctrl_device())
+        state_path = f"/sys/class/nvme/{ctrl}/state"
+        deadline = time.monotonic() + max(0.0, settle_sec)
+        state = None
+        while True:
+            try:
+                with open(state_path) as f:
+                    state = f.read().strip().lower()
+            except OSError:
+                state = None
+            if state == 'live':
+                return None
+            if state is None:
+                return f"컨트롤러 {ctrl} 가 사라짐(sysfs 없음)"
+            if state in self._DEVICE_LOST_STATES:
+                return f"컨트롤러 {ctrl} 상태={state}"
+            if time.monotonic() >= deadline:
+                return f"컨트롤러 {ctrl} 상태={state} ({settle_sec:.0f}s 내 live 복귀 없음)"
+            time.sleep(0.5)
+
     def _ctrl_device(self) -> str:
         """컨트롤러 레벨 admin feature(APST FID 0x0C / KeepAlive 0x0F 등) 대상 디바이스.
 
@@ -14504,6 +14539,16 @@ class _V101Fuzzer:
                                     else " (NVMe status 없음 — errno/내부 실패)")
             log.info(f"[NVMe RET] rc={rc}{_status_info}")
 
+            # v11.1: 장치 소실 — errno 실패가 '장치 없음/준비 안 됨' 계열이면 컨트롤러 상태를 확인하고,
+            #   사라졌으면 timeout 과 같은 불량 캡처(_handle_timeout_crash)로 넘긴다. 예전엔 rc>0 의
+            #   일반 실패로 계속 돌아 'No such device' 만 끝없이 찍혔다.
+            if rc > 0 and self._last_nvme_status is None:
+                _lost = self._check_device_lost(_status_info)
+                if _lost:
+                    self._device_lost_reason = _lost
+                    log.error(f"[DEVICE LOST] {cmd.name}: {_lost} — 퍼징 중단, 불량 캡처 진입")
+                    return self.RC_TIMEOUT
+
             # Detach(SEL=1) 성공 시 즉시 재부착 — NS 보존이라 inverse(Attach)로 device 복구.
             if (AUTO_REATTACH_NS and rc == 0 and passthru_type == "admin-passthru"
                     and actual_opcode == _NS_ATTACH_OPCODE and (seed.cdw10 & 0xF) == 1):
@@ -16405,6 +16450,8 @@ class _V101Fuzzer:
         _sep = "=" * 64
         log.error(_sep)
         log.error("  !! FAIL CMD !!")
+        if getattr(self, '_device_lost_reason', None):
+            log.error(f"  사유      : 장치 소실 — {self._device_lost_reason} (timeout 아님)")
         log.error(f"  cmd       : {cmd.name} ({cmd.cmd_type.name})")
         log.error(f"  opcode    : 0x{actual_opcode:02x}")
         log.error(f"  device    : {self.config.nvme_device}")
@@ -16436,7 +16483,9 @@ class _V101Fuzzer:
         # 3) crash 저장
         self.crash_inputs.append((fuzz_data, cmd))
         try:
-            self._save_crash(fuzz_data, seed, reason="timeout",
+            self._save_crash(fuzz_data, seed,
+                             reason=("device_lost" if getattr(self, '_device_lost_reason', None)
+                                     else "timeout"),
                              stuck_pcs=stuck_pcs, dmesg_snapshot=dmesg_snapshot,
                              dest_dir=_crash_dir)
             # 경로(버전 폴더 포함)는 로그에 남기지 않음 — 위치는 OUTPUT_DIR 로 알 수 있음.
