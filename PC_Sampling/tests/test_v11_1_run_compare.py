@@ -371,3 +371,59 @@ class ReviewFixes(unittest.TestCase):
         self.assertEqual((o._csfuzz_c1_rewards, o._csfuzz_c2_rewards), ([1, 0], [1, 0]))
         src = Path(fuzzer.__file__).read_text(encoding='utf-8')
         self.assertEqual(src.count('_csfuzz_c2_rewards.append'), 0)          # 재생 루프에서 따로 쌓지 않음
+
+
+class SjtagReauthPrep(unittest.TestCase):
+    """BM9K1 SJTAG 재인증 전에는 APST·keepalive 를 끈다 — [6] 서명 대기 중 저전력 진입으로
+    디버그 AP 쓰기가 막혀(CSW 0x80000000) 인증이 깨지는 것을 막는다."""
+
+    def _obj(self, sampler):
+        o = fuzzer.NVMeFuzzer.__new__(fuzzer.NVMeFuzzer)
+        o.sampler = sampler
+        o._timeout_crash = False
+        o._exception_interrupted = False
+        o.calls = []
+        o._apst_disable = lambda force=False: o.calls.append(('apst', force))
+        o._keepalive_disable = lambda: o.calls.append(('ka',))
+        return o
+
+    def _riscv(self):
+        s = fuzzer.RiscvPcsrSampler.__new__(fuzzer.RiscvPcsrSampler)
+        return s
+
+    def test_fw_commit_reconnect_disables_apst_first(self):
+        s = self._riscv()
+        o = self._obj(s)
+        s._reconnect = lambda: (o.calls.append(('reconnect',)), True)[1]
+        self.assertTrue(o._reconnect_after_fw_commit())
+        self.assertEqual(o.calls, [('apst', True), ('ka',), ('reconnect',)])
+
+    def test_sampling_failure_reinit_disables_apst_first(self):
+        import threading
+        s = self._riscv()
+        o = self._obj(s)
+        ev = threading.Event(); ev.set()
+        s.openocd_error = ev
+        s.stop_sampling = lambda: 7
+        s._reinit_target = lambda: (o.calls.append(('reinit',)), True)[1]
+        self.assertEqual(fuzzer._V101Fuzzer._stop_sampling_checked(o, 't'), (7, True))
+        self.assertEqual(o.calls, [('apst', True), ('ka',), ('reinit',)])
+
+    def test_skipped_for_other_samplers_and_hung_device(self):
+        o = self._obj(Mock())
+        o._prepare_sjtag_reauth('x')
+        o2 = self._obj(self._riscv()); o2._timeout_crash = True
+        o2._prepare_sjtag_reauth('x')
+        self.assertEqual((o.calls, o2.calls), ([], []))
+
+    def test_force_disables_even_if_original_was_zero(self):
+        o = fuzzer.NVMeFuzzer.__new__(fuzzer.NVMeFuzzer)
+        o._orig_apst_cdw11 = 0
+        o._ctrl_device = lambda: '/dev/nvme0'
+        o._record_setfeature_history = lambda *a, **k: None
+        ok = SimpleNamespace(returncode=0, stdout='', stderr='')
+        with patch.object(fuzzer.subprocess, 'run', return_value=ok) as run:
+            o._apst_disable()
+            self.assertFalse(any('set-feature' in c.args[0] for c in run.call_args_list))
+            o._apst_disable(force=True)
+            self.assertTrue(any('set-feature' in c.args[0] for c in run.call_args_list))

@@ -9654,11 +9654,30 @@ class _V101Fuzzer:
                 if len(_r) > 100_000:
                     del _r[:-50_000]
 
+    def _prepare_sjtag_reauth(self, why: str) -> None:
+        """v11.1: BM9K1(RISC-V SJTAG) 재연결·재인증 **전에** APST·keepalive 를 끈다.
+
+        SJTAG 인증은 [6] 서명 단계에서 외부 서명 도구를 기다리느라 디버그 링크가 수 초 쉰다. 그사이
+        APST 가 켜져 있으면 장치가 저전력 PS 로 내려가 디버그 AP 접근이 막히고(CSW 0x80000000 — 'APBAP3
+        쓰기 3회 실패') 인증이 깨진다. 크래시 복구 POR·예외 복귀는 이미 재연결 전에 끈다. FWCommit
+        (펌웨어 활성화)·PM 순환(forced_idle 이 APST 를 잠시 켬)·샘플링 장애 재초기화 경로는 시작 때 꺼 둔
+        상태를 가정했는데, 그 사이 다시 켜졌을 수 있다 → 원래 값과 무관하게 강제로 끈다(force).
+        장치가 멈춘 상태(timeout crash)에서는 명령을 보내지 않는다."""
+        if not isinstance(getattr(self, 'sampler', None), RiscvPcsrSampler) or getattr(self, '_timeout_crash', False):
+            return
+        log.info(f"[Sampler] SJTAG 재인증 준비({why}) — APST·keepalive 끔")
+        try:
+            self._apst_disable(force=True)
+            self._keepalive_disable()
+        except Exception as e:
+            log.warning(f"[Sampler] 재인증 준비 실패(재연결은 계속): {e}")
+
     def _reconnect_after_fw_commit(self):
         """장치 동작은 그대로 두고 재연결 상세/터미널 요약의 출력만 분리."""
         started = time.monotonic()
         with _fw_commit_detail_logging():
             log.info("[Sampler] FWCommit 후 디버그 세션 재확립 시작")
+            self._prepare_sjtag_reauth('FWCommit')
             try:
                 ok = self.sampler._reconnect()
             except Exception:
@@ -9691,6 +9710,7 @@ class _V101Fuzzer:
         label = getattr(self.sampler, 'LINK_LABEL', '[Sampler]')
         log.warning(f"[Sampler] {label} sampling 장애 감지(context={context}) — "
                     "타겟 재초기화 시도")
+        self._prepare_sjtag_reauth(f'sampling 장애: {context}')
         try:
             ok = self.sampler._reinit_target()
         except Exception as e:
@@ -12661,7 +12681,7 @@ class _V101Fuzzer:
             'is_write': bool(data),
         })
 
-    def _apst_disable(self) -> None:
+    def _apst_disable(self, force: bool = False) -> None:
         """NVMe APST(Autonomous Power State Transition) 비활성화.
 
         APST 활성화 상태에서는 NVMe 컨트롤러가 자율적으로 PS 전환을 하면서
@@ -12697,7 +12717,7 @@ class _V101Fuzzer:
             except Exception as e:
                 log.warning(f"[APST] get-feature 실패: {e}")
 
-        if self._orig_apst_cdw11 == 0:
+        if self._orig_apst_cdw11 == 0 and not force:
             log.warning("[APST] 이미 비활성화 상태 — skip")
             return
 
