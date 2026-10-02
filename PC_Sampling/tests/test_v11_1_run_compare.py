@@ -371,3 +371,64 @@ class ReviewFixes(unittest.TestCase):
         self.assertEqual((o._csfuzz_c1_rewards, o._csfuzz_c2_rewards), ([1, 0], [1, 0]))
         src = Path(fuzzer.__file__).read_text(encoding='utf-8')
         self.assertEqual(src.count('_csfuzz_c2_rewards.append'), 0)          # 재생 루프에서 따로 쌓지 않음
+
+
+class StartupPorOrder(unittest.TestCase):
+    """시작 POR 순서 — 실제 run() 의 POR~연결 구간 문장을 잘라 모의 객체로 실행해 호출 순서를 본다.
+
+    BM9K1(riscv_pcsr): 전원 사이클 → 부팅 대기 → rescan → connect(SJTAG 인증). 예전엔 PCSR 제품과 같은
+    경로라 전원 ON 직후 connect 하고, 인증이 실패하면 rescan 까지 가지 못했다.
+    PM9M1(pcsr): 전원 사이클 → connect → boot sweep → rescan(기존 그대로).
+    """
+
+    def run_segment(self, sampler_type, invasive=False, connect_ok=True):
+        import ast
+        from unittest.mock import MagicMock
+        tree = ast.parse(Path(fuzzer.__file__).read_text(encoding='utf-8'))
+        base = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == '_V101Fuzzer')
+        run = next(n for n in base.body if isinstance(n, ast.FunctionDef) and n.name == 'run')
+
+        def calls_attr(st, attr):
+            return any(isinstance(c, ast.Call) and getattr(c.func, 'attr', '') == attr for c in ast.walk(st))
+        start = next(i for i, st in enumerate(run.body) if calls_attr(st, '_power_cycle_ssd'))
+        end = next(i for i, st in enumerate(run.body) if i > start and calls_attr(st, '_collect_boot_coverage'))
+        fn = ast.FunctionDef(name='_seg', args=ast.arguments(
+            posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+            body=run.body[start:end + 1] + [ast.Return(value=ast.Constant(value='reached'))],
+            decorator_list=[], returns=None, type_comment=None)
+        mod = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+        order = []
+        f = MagicMock()
+        f.config.enable_por, f.config.no_jlink = True, False
+        f.config.sampler_type, f.config.pm_inject_prob = sampler_type, 0
+        f.config.por_rescan_delay, f.config.boot_sweep_s = 10.0, 10.0
+        f._pcie_bdf = '0000:02:00.0'
+        f.sampler.INVASIVE = invasive
+        f._power_cycle_ssd.side_effect = lambda: order.append('power_cycle') or True
+        f._por_pcie_rescan.side_effect = lambda: order.append('rescan') or True
+        f.sampler.connect.side_effect = lambda: order.append('connect') or connect_ok
+        f._collect_boot_coverage.side_effect = lambda *a: order.append('boot_sweep') or 0
+        env = dict(vars(fuzzer), self=f)
+        with patch.object(fuzzer.time, 'sleep', side_effect=lambda s: order.append(f'sleep{s:g}')), \
+                patch.object(fuzzer.time, 'monotonic', side_effect=[0.0] + [100.0] * 50):
+            exec(compile(mod, '<run-por-segment>', 'exec'), env)
+            result = env['_seg']()
+        return order, result
+
+    def test_bm9k1_boots_and_rescans_before_sjtag_connect(self):
+        order, result = self.run_segment('riscv_pcsr')
+        self.assertEqual(result, 'reached')
+        self.assertEqual(order, ['power_cycle', 'sleep10', 'rescan', 'connect'])
+
+    def test_bm9k1_rescan_happens_even_if_auth_fails(self):
+        order, result = self.run_segment('riscv_pcsr', connect_ok=False)
+        self.assertIsNone(result)                                   # 연결 실패로 중단
+        self.assertEqual(order[:3], ['power_cycle', 'sleep10', 'rescan'])
+
+    def test_pcsr_products_keep_boot_sweep_order(self):
+        order, _ = self.run_segment('pcsr')
+        self.assertEqual(order, ['power_cycle', 'connect', 'boot_sweep', 'rescan'])
+
+    def test_halt_products_unchanged(self):
+        order, _ = self.run_segment('jlink_halt', invasive=True)
+        self.assertEqual(order, ['power_cycle', 'sleep10', 'rescan', 'connect'])

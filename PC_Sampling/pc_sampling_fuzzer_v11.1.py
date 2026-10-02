@@ -18880,6 +18880,12 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             log.info("[POR] 비활성화됨 (--no-por)")
 
         _is_halt = self.sampler.INVASIVE
+        # v11.1: 부팅 대기 → rescan 을 **연결보다 먼저** 하는 샘플러. halt 계열에 더해 BM9K1(RISC-V
+        #   cJTAG + SJTAG 인증)도 여기에 넣는다. 예전엔 BM9K1 이 PCSR(OpenOCD) 제품과 같은 경로라 전원 ON
+        #   직후 곧바로 connect·SJTAG 인증을 시도했고, 인증이 실패하면 rescan 까지 가지 못하고 중단됐다.
+        #   크래시 복구 POR(부팅 대기 → rescan → 재연결·인증)은 성공하던 순서다. 인증 자체가 수 초 걸려
+        #   부팅 중 PC 수집(boot sweep)도 의미가 없어 생략한다.
+        _boot_first = _is_halt or self.config.sampler_type == 'riscv_pcsr'
 
         def _rescan_and_l0() -> bool:
             """PCIe rescan(+id-ctrl 재검출). 실패 시 샘플러 닫고 False(→ run abort).
@@ -18905,9 +18911,13 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         # (전원 ON 직후 코어가 reset/부팅 전일 수 있음). → device 가 id-ctrl 에 응답
         # (=코어가 펌웨어 실행 중)한 뒤에 connect 하고, 부팅 중 halt 샘플링(boot sweep)은
         # 하지 않는다(코어 미실행 상태에서 halt spam 방지). 비침습 PCSR 은 기존대로.
-        if _is_halt and self.config.enable_por:
-            log.warning("[POR] 침습 halt 샘플러 — device id-ctrl 응답(코어 실행) 확인 후 "
-                        "connect (boot sweep 생략)")
+        if _boot_first and self.config.enable_por:
+            if _is_halt:
+                log.warning("[POR] 침습 halt 샘플러 — device id-ctrl 응답(코어 실행) 확인 후 "
+                            "connect (boot sweep 생략)")
+            else:
+                log.warning("[POR] RISC-V(SJTAG) — 부팅 대기·rescan 으로 device 응답 확인 후 "
+                            "connect·인증 (boot sweep 생략)")
             # SSD boot 대기 — rescan 전에 반드시 필요(2026-07 수정).
             #   설계상 초기 POR 의 부팅 대기는 boot sweep 이 겸하고 있었는데, 이 halt 분기가
             #   sweep 을 생략하면서 **대기까지 함께 사라져** 전원 ON 직후 t=0 에 rescan 이
@@ -18952,8 +18962,8 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             return
 
         # 비침습 PCSR(PM9M1/BM9H1) 경로만: boot sweep(부팅 중 PC 수집) → rescan.
-        # halt 경로는 위에서 rescan 선행 + boot sweep 생략.
-        if not _is_halt:
+        # halt·RISC-V(SJTAG) 경로는 위에서 rescan 선행 + boot sweep 생략.
+        if not _boot_first:
             if not self.config.no_jlink:
                 _sweep_remaining = max(0.0, _swd_deadline - time.monotonic())
                 self._collect_boot_coverage(_sweep_remaining)
