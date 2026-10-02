@@ -94,16 +94,3 @@ state 재생이 **최대로** 선택되던 상태였다.
   '명령 중 LLM 몫'이 실제보다 크게 보였다. 런타임 LLM 시드 보정 명령은 분모에 넣는다.
 - 위 그래프 주황 면적(발견 몫)은 모든 경로를 포함한다(iowl 로 찾은 BB 도 LLM 몫).
 - 실행 기록 `series[]` 에 `found{llm,mutation}`, `sel{llm:[새 BB, 명령], mutation:[…]}`, `totals.bb_at_start` 가 남는다.
-
-## 5. BM9K1 시작 POR 순서 (2026-10-02)
-
-| 제품(샘플러) | 시작 POR 순서 |
-|---|---|
-| BM9K1 (`riscv_pcsr`) | 전원 사이클 → **부팅 대기(`por_rescan_delay`) → rescan** → connect·SJTAG 인증. boot sweep 생략 |
-| P7/P9 (`jlink_halt`) | 같음(기존) |
-| PM9M1·BM9H1 (`pcsr`, OpenOCD) | 전원 사이클 → connect → boot sweep(부팅 중 PC 수집) → rescan (기존 그대로) |
-
-예전엔 BM9K1 이 PCSR 제품 경로를 타서 전원 ON 직후 connect·인증을 시도했고, 인증이 실패하면
-"J-Link connection failed" 로 끝나 **rescan 까지 가지 못했다**. 크래시 복구 POR(부팅 대기 → rescan →
-재연결·인증)은 성공하던 순서라 시작 POR 도 그 순서로 맞췄다. 샘플러 클래스(장치 경로 고정 대상)는
-건드리지 않고 `run()` 안에서 `sampler_type == 'riscv_pcsr'` 로 분기한다. v10.3·v11 파일은 그대로다.
