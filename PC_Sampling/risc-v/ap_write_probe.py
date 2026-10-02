@@ -14,7 +14,11 @@
   APBAP3 만 TAR 불일치          → APBAP3 한정 문제
   TAR 전부 일치인데 STATE 실패   → TAR 이후(DRW/APB 버스) 문제
 
-사용: sudo python3 risc-v/ap_write_probe.py [--power both|dbg-only|sys-only]
+CSW 비트도 풀어 찍는다 — TrInProg(bit7)=1 이면 이전 전송이 끝나지 않고 AP 에 걸려 있다.
+--dap-abort: 시험 전에 DP ABORT.DAPABORT(bit0)로 걸린 AP 전송을 취소하고 전후 상태를 찍는다.
+  (평소 sticky 클리어는 ABORT=0x1E 로 bit0 을 쓰지 않아 멈춘 전송을 풀지 못한다.)
+
+사용: sudo python3 risc-v/ap_write_probe.py [--power both|dbg-only|sys-only] [--dap-abort]
 """
 import argparse
 import os
@@ -25,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sjtag_unlock as sj                                    # noqa: E402
 from sfe76_link import Link, AP_MAP, CORE_BASE_MAIN          # noqa: E402
 from dap_access import (OFF_CSW, OFF_TAR, OFF_IDR,           # noqa: E402
-                        DP_CTRL_STAT, DP_RDBUF, hx)
+                        DP_ABORT, DP_CTRL_STAT, DP_RDBUF, hx)
 
 TAR_PATTERNS = (0x00000004, 0x00000100, 0xA5A5A5A4)
 
@@ -51,13 +55,28 @@ def sticky_bits(v):
     return " ".join(bits) if bits else "에러 없음"
 
 
+def csw_bits(v):
+    """CSW 중 상태 판단에 쓰는 비트만."""
+    if v is None or v == 0x80000000:
+        return "?"
+    return f"TrInProg={(v >> 7) & 1} DeviceEn={(v >> 6) & 1} Size={v & 0x7}"
+
+
+def ap_state(dap, base):
+    dap.clear_sticky()
+    csw = dap.ap_read(base, OFF_CSW)
+    tar = dap.ap_read(base, OFF_TAR)
+    return (f"CSW={hx(csw)} ({csw_bits(csw)})  TAR={hx(tar)}  "
+            f"sticky={sticky_bits(dap.dp_read(DP_CTRL_STAT))}")
+
+
 def probe_ap(dap, name, base):
     """AP 하나: IDR, CSW 쓰기/되읽기, TAR 패턴 쓰기/되읽기. 원래 값 복원."""
     dap.clear_sticky()
     idr = dap.ap_read(base, OFF_IDR)
     csw0 = dap.ap_read(base, OFF_CSW)
     tar0 = dap.ap_read(base, OFF_TAR)
-    print(f"\n  [{name}] IDR={hx(idr)}  CSW={hx(csw0)}  TAR(현재)={hx(tar0)}")
+    print(f"\n  [{name}] IDR={hx(idr)}  CSW={hx(csw0)} ({csw_bits(csw0)})  TAR(현재)={hx(tar0)}")
 
     csw_ok = None
     if csw0 is not None and csw0 != 0x80000000:
@@ -94,6 +113,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--power", choices=("dbg-only", "both", "sys-only"), default="both",
                     help="DAP 전원요청 (퍼저 기본 both)")
+    ap.add_argument("--dap-abort", action="store_true",
+                    help="시험 전에 DP ABORT.DAPABORT(bit0)로 AP 에 걸린 전송을 취소")
     a = ap.parse_args()
 
     if not AP_MAP:
@@ -114,6 +135,13 @@ def main():
             return e.exit_code
         dap = sj.MemDap(lk.jl)
         print(f"  [DP] DPIDR={hx(dap.dp_read(0))}  CTRL/STAT={hx(dap.dp_read(DP_CTRL_STAT))}")
+
+        if a.dap_abort:
+            print(f"\n  [DAPABORT 전] APBAP3 {ap_state(dap, sj.APBAP3_BASE)}")
+            ok = dap.dp_write(DP_ABORT, 0x00000001)              # DAPABORT
+            dap.clear_sticky()
+            print(f"  [DAPABORT] ABORT<=0x1 쓰기={'OK' if ok else '실패'}")
+            print(f"  [DAPABORT 후] APBAP3 {ap_state(dap, sj.APBAP3_BASE)}")
 
         rows = [(name,) + probe_ap(dap, name, base) for name, base, _k in AP_MAP]
 
