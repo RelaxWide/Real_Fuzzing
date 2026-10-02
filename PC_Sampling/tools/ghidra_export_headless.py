@@ -2,6 +2,26 @@
 # -*- coding: utf-8 -*-
 r"""펌웨어 커버리지 추출 — BIN / ELF 공통 진입점 (호스트 Python 3).
 
+======================================================================
+바로 실행 — 제품별 CLI (아래 명령을 그대로 복사)
+======================================================================
+
+[BM9K1] ELF 전체 코어 + overlay + 심볼 자료
+MAXMEM=16G OVL_MAP='/home/ssd/pc_sample/products/BM9K1/*{label}Core_overlay_map.json' python3 /home/ssd/pc_sample/tools/ghidra_export_headless.py symbols /home/ssd/pc_sample/products/BM9K1 all /home/ssd/pc_sample/products/BM9K1
+
+[PM9M1] BIN 앞 0xA4000바이트 제거 -> basic_blocks.txt / functions.txt
+python3 /home/ssd/pc_sample/tools/ghidra_export_headless.py analyze /home/ssd/pc_sample/HPS0NRXM_20260922_Noformat_unsigned.bin /home/ssd/pc_sample/products/PM9M1 --ghidra /home/ssd/ghidra_12.0.1_PUBLIC --processor ARM:LE:32:v7 --cut 0xA4000 --base 0
+
+[P9] CORE_MERGE BIN 전체 -> basic_blocks.txt / functions.txt
+python3 /home/ssd/pc_sample/tools/ghidra_export_headless.py analyze /home/ssd/pc_sample/SYGD0P27-0000_CORE_MERGE.bin /home/ssd/pc_sample/products/P9 --ghidra /home/ssd/ghidra_12.0.1_PUBLIC --processor ARM:LE:32:v7 --cut 0 --base 0
+
+[P7] CORE_MERGE BIN 전체 -> basic_blocks.txt / functions.txt
+python3 /home/ssd/pc_sample/tools/ghidra_export_headless.py analyze /home/ssd/pc_sample/SYGD0P27-0000_CORE_MERGE.bin /home/ssd/pc_sample/products/P7 --ghidra /home/ssd/ghidra_12.0.1_PUBLIC --processor ARM:LE:32:v7 --cut 0 --base 0
+
+======================================================================
+상세 설명 — 필요한 파일 / 옵션 / 출력 형식
+======================================================================
+
 필요한 tools 파일
 ----------------
   BIN만 사용: ghidra_export_headless.py
@@ -16,18 +36,17 @@ r"""펌웨어 커버리지 추출 — BIN / ELF 공통 진입점 (호스트 Pyth
   필요하면 --java-home /path/to/jdk 또는 JAVA_HOME을 지정한다.
   BIN: Ghidra 안에서 이 .py를 실행할 Python/Jython 스크립트 환경 필요.
   ELF: readelf 필요. Java 스크립트가 Ghidra에서 컴파일되어 실행된다.
-  아래 CPU/주소/경로는 예시다. 실제 펌웨어에 맞게 지정해야 한다.
+  실행 환경의 파일명과 설치 경로가 다르면 최상단 명령의 해당 경로를 변경한다.
 
 1) BIN -> basic_blocks.txt / functions.txt
 -----------------------------------------
-  python3 tools/ghidra_export_headless.py analyze /fw/FW.bin /out/bin \
-    --ghidra /opt/ghidra --processor ARM:LE:32:v7 \
-    --cut 0xA4000
+  실행 명령은 최상단 PM9M1/P9/P7 예시를 사용한다.
 
   --cut N: 앞 N바이트를 제거한 임시 파일을 분석한다. 원본은 변경하지 않는다.
            dd bs=1M iflag=skip_bytes skip=N과 같은 바이트 절단이다.
            N은 10진수 또는 0x 접두사의 16진수. 파일 전체를 자르는 값은 거부한다.
-  위 예는 앞 0xA4000바이트를 제거하고, 남은 첫 바이트를 주소 0에 배치한다.
+  PM9M1 예시는 앞 0xA4000바이트를 제거하고, 남은 첫 바이트를 주소 0에 배치한다.
+  P9/P7 예시는 자르지 않고 원본 첫 바이트를 주소 0에 배치한다.
   base가 0이면 --base는 생략한다(BASE 환경변수도 미설정일 때 기본값 0).
   다른 주소가 필요할 때만 --base A를 지정한다. 이 옵션은 파일을 자르지 않는다.
   헤더 제거가 없으면 --cut 0을 사용한다.
@@ -40,13 +59,8 @@ r"""펌웨어 커버리지 추출 — BIN / ELF 공통 진입점 (호스트 Pyth
 
 2) ELF 파일들 -> 코어별 전체 자료
 ---------------------------------
-  MAXMEM=16G OVL_MAP='/maps/FW*{label}Core_overlay_map.json' \
-    python3 tools/ghidra_export_headless.py symbols /fw/elfs all /out/elf
-
-  위 환경변수 대신 옵션으로도 지정할 수 있다:
-  python3 tools/ghidra_export_headless.py symbols /fw/elfs all /out/elf \
-    --ghidra /opt/ghidra --maxmem 16G \
-    --overlay-map '/maps/FW*{label}Core_overlay_map.json'
+  실행 명령은 최상단 BM9K1 예시를 사용한다.
+  환경변수 대신 --maxmem 16G --overlay-map 옵션으로도 지정할 수 있다.
 
   all: ELF 폴더의 FW_*Core.elf를 순회한다(FW_HCore.elf -> label H).
   단일 코어: symbols /fw/FW_HCore.elf H /out/elf
