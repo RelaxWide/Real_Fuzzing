@@ -30,6 +30,8 @@ VTref 열 = 프로브가 잰 1번 핀 전압(mV). 링크가 끊길 때 같이 �
 tx 열 = watch 시작 후 누적 DP/AP 전송 수. --interval 을 바꿔 돌렸을 때 끊기는 시점이
   같은 '초' 에 맞으면 시간 기반(칩 쪽), 같은 'tx' 에 맞으면 전송 기반(링크 동기 상실)이다.
 --speed: cJTAG 속도(kHz). 기본은 sfe76_link 의 값(10000).
+--vtref-mv: VTref 고정(mV, 기본 1800, 0=자동). 시작 로그의 '[Link] VTref …' 줄에 고정 성공 여부와
+  고정 전 측정값이 찍힌다.
 
 사용: sudo python3 risc-v/ap_write_probe.py [--power both|dbg-only|sys-only] [--dap-abort]
       sudo python3 risc-v/ap_write_probe.py --watch 120 [--interval 2]
@@ -212,6 +214,8 @@ def main():
                     help="--watch 반복 간격(초)")
     ap.add_argument("--speed", type=int, default=SPEED_KHZ, metavar="KHZ",
                     help=f"cJTAG 속도(kHz, 기본 {SPEED_KHZ})")
+    ap.add_argument("--vtref-mv", type=int, default=1800, metavar="MV",
+                    help="J-Link VTref 고정값(mV), open 직후·connect 전 적용. 0=자동(측정값 추종)")
     ap.add_argument("--reassert", action="store_true",
                     help="--watch 매 회 ABORT·전원요청을 다시 써서 회복 여부를 본다")
     a = ap.parse_args()
@@ -219,7 +223,7 @@ def main():
     if not AP_MAP:
         print("AP_MAP 비어 있음 — risc-v/sjtag_addrs.json 확인", file=sys.stderr)
         return 9
-    lk = Link(core_base=CORE_BASE_MAIN, speed=a.speed)
+    lk = Link(core_base=CORE_BASE_MAIN, speed=a.speed, vtref_mv=a.vtref_mv)
     try:
         lk.open(tap_script=False)
     except Exception as e:

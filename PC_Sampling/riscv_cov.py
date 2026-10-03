@@ -971,9 +971,10 @@ class PcsrSession:
     import·테스트된다."""
 
     def __init__(self, cores, power="both", tap_script=False, auth_wrapper=None,
-                 verbose=True, auth_timeout=60.0, word_order=None):
+                 verbose=True, auth_timeout=60.0, word_order=None, vtref_mv=1800):
         self.cores = cores            # {core_id: {"name":…, "elf":…, "load_offset":…}}
         self.power, self.tap_script = power, tap_script
+        self.vtref_mv = vtref_mv      # J-Link VTref 고정(mV). None/0 = 자동
         self.auth_wrapper = auth_wrapper
         self.verbose = verbose
         self.lock = threading.RLock()
@@ -1088,7 +1089,8 @@ class PcsrSession:
         self._sj = importlib.import_module("sjtag_unlock")
         link_mod = importlib.import_module("sfe76_link")
         with self.lock:
-            self.lk = link_mod.Link(core_base=link_mod.CORE_BASE_MAIN)
+            self.lk = link_mod.Link(core_base=link_mod.CORE_BASE_MAIN,
+                                    vtref_mv=self.vtref_mv)
             # README: 첫 connect 는 실패하고 2회차에 붙는다
             for attempt in (1, 2):
                 try:

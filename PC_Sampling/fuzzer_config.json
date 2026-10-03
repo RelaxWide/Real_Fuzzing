@@ -335,6 +335,8 @@
       "arch": "riscv",
       "jlink_device": "E76",
       "jlink_speed": 10000,
+      "_comment_jlink_vtref_mv": "J-Link VTref 고정값(mV). J-Link open 직후, connect·SJTAG 인증 전에 적용하고 재연결 때마다 다시 적용한다. null 또는 0이면 자동(1번 핀 측정값 추종). 키를 생략하면 1800. 고정하면 POR로 타깃 전원이 꺼진 동안에도 프로브가 이 레벨로 핀을 구동한다.",
+      "jlink_vtref_mv": 1800,
       "riscv": {
         "_comment": "cores의 elf/load_offset 등 제품 자산은 sjtag_addrs.json의 pcsr.cores 설정을 우선 사용한다. 이 절에는 공유 가능한 구조와 튜닝값을 둔다.",
         "power": "both",

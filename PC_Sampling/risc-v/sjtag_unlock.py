@@ -1859,6 +1859,9 @@ def main():
                     help="DAP 전원요청. dbg-only=CDBG ACK 필수(기존). "
                          "sys-only=CSYS ACK 만으로 진행(secure 타깃: 인증 후 CDBG 열림 가설). "
                          "both=둘 다 ACK 필수")
+    ap.add_argument("--vtref-mv", type=int, default=1800, metavar="MV",
+                    help="J-Link VTref 고정값(mV), open 직후·connect 전 적용. 0=자동(측정값 추종). "
+                         "퍼저 jlink_vtref_mv 와 같은 조건으로 맞출 때 쓴다")
     ap.add_argument("--tap-script", choices=("on", "off"), default="off",
                     help="수동 TAP 체인 선언. 기본 off = CMM 방식(NOKEEPER USEOAC만). "
                          "⚠ STATUS §1.1 은 ScriptFile 경로를 폐기로, sfe76_link 는 "
@@ -2003,7 +2006,8 @@ def main():
           f"word-order={a.word_order}")
 
     lk = Link(core_base=a.core_base, hart=a.hart, device=a.device,
-              serial=a.serial, ap_count=getattr(a, "ap_count", None))
+              serial=a.serial, ap_count=getattr(a, "ap_count", None),
+              vtref_mv=a.vtref_mv)
     # 컨텍스트 매니저(__enter__)는 open(tap_script=True) 를 강제하므로 쓰지 않는다.
     # tap_script 를 우리가 정해서 직접 open 하고, finally 로 close 한다.
     try:

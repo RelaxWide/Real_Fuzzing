@@ -1621,6 +1621,8 @@ class FuzzConfig:
     # v8.1: JLinkHaltSampler(P9) 전용 — pylink 직접 제어 파라미터
     jlink_speed:     int   = 4000                 # J-Link SWD/JTAG 속도 (kHz)
     jlink_ap_index:  int   = 0                    # CoreSight APB-AP 인덱스 (P9: AP[0])
+    jlink_vtref_mv:  Optional[int] = 1800         # J-Link VTref 고정(mV), connect 전 적용. None/0=자동.
+    #                                             pylink 경로(RiscvPcsr/JLinkHalt)만 — OpenOCD 경로는 미적용
     pc_reg_index:    Optional[int] = None         # PC(R15) 레지스터 인덱스. None=connect 시 자동 탐지
     ufas_ini:        Optional[str] = 'PM9M1_A815.ini'  # UFAS --ini (enable_ufas 는 아래 정의)
     ufas_binary:     Optional[str] = None   # UFAS 실행 파일 per-product override(None=paths.ufas_binary). BM9K1=dump/unified_pcie_dump_tool
@@ -4169,6 +4171,33 @@ class JLinkHaltSampler(OpenOCDPCSampler):
             pass
 
     # ── 연결 계층 (pylink) ──────────────────────────────────────────
+    def _apply_vtref(self, jl) -> None:
+        """open 직후·connect 전에 VTref 를 config.jlink_vtref_mv 로 고정한다(None/0=자동).
+
+        실패해도 연결은 계속한다 — J-Link 는 측정값 추종으로 남는다.
+        """
+        mv = self.config.jlink_vtref_mv
+        def _read():
+            try:
+                return int(jl.hardware_status.voltage)
+            except Exception:
+                return None
+        before = _read()
+        if not mv:
+            log.warning(f"[J-Link] VTref 자동 (측정 {before} mV)")
+            return
+        try:
+            jl.exec_command(f"VTREF = {int(mv)}")
+        except Exception as e:
+            log.warning(f"[J-Link] ⚠ VTref {mv} mV 고정 실패: {str(e)[:120]} — "
+                        f"자동(측정 {before} mV)으로 진행")
+            return
+        after = _read()
+        if after is not None and abs(after - int(mv)) <= 100:
+            log.warning(f"[J-Link] VTref {mv} mV 고정 (측정 {before} → {after} mV)")
+        else:
+            log.warning(f"[J-Link] ⚠ VTref {mv} mV 고정 후 확인 불일치: 측정 {before} → {after} mV")
+
     def connect(self) -> bool:
         if _pylink is None:
             log.error("[J-Link] pylink 미설치 — `pip3 install pylink-square` 후 재시도하세요.")
@@ -4191,6 +4220,7 @@ class JLinkHaltSampler(OpenOCDPCSampler):
             #   샘플러 서브프로세스 격리(진행 예정). 그때까지는 가벼운 커스텀 콜백 유지.
             jl = _pylink.JLink(error=self._jlink_dll_msg, warn=self._jlink_dll_msg)
             jl.open()
+            self._apply_vtref(jl)
             tif = (_pylink.enums.JLinkInterfaces.JTAG if self.config.interface == 'jtag'
                    else _pylink.enums.JLinkInterfaces.SWD)
             jl.set_tif(tif)
@@ -4502,7 +4532,8 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             cores=self._cores, power=rv.get('power', 'both'),
             tap_script=bool(rv.get('tap_script', False)),
             auth_timeout=float(rv.get('auth_timeout', 60.0)),
-            word_order=rv.get('word_order'))
+            word_order=rv.get('word_order'),
+            vtref_mv=self.config.jlink_vtref_mv)
         if not self.session.open():
             log.error("[cJTAG/SBA] 세션 열기 실패 — SJTAG 인증/전원 확인 (sudo 필요)")
             return False
@@ -23443,6 +23474,7 @@ if __name__ == "__main__":
         # v8.1: JLinkHaltSampler(P9) 파라미터 — profile 기본값, pc_reg_index 는 CLI override 우선
         jlink_speed=_profile.get('jlink_speed', 4000),
         jlink_ap_index=_profile.get('jlink_ap_index', 0),
+        jlink_vtref_mv=_profile.get('jlink_vtref_mv', 1800),
         pc_reg_index=(args.pc_reg_index if args.pc_reg_index is not None
                       else _profile.get('pc_reg_index')),
         nvme_device=args.nvme,

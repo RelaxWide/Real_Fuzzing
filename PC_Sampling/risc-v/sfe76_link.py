@@ -131,6 +131,43 @@ SPEED_KHZ   = 10000      # 낮추면 cJTAG 활성화 실패
 CJTAG_MODE  = 1
 DEVICE      = 'E76'      # ★ 'RISC-V' 는 connect 자체가 제대로 안 된다(실측)
 APB_INDEX   = 0          # DMI 가 붙은 AP (AddAP 의 Index)
+# VTref 고정값(mV). J-Link 는 기본적으로 1번 핀(VTref)을 재서 I/O 레벨을 맞춘다.
+#   값을 주면 open 직후, connect 전에 이 값으로 고정한다. None/0 = 자동(측정값 추종).
+#   ⚠ 고정하면 타깃 전원이 꺼진 동안(POR)에도 프로브가 그 레벨로 핀을 구동한다.
+VTREF_MV    = 1800
+VTREF_CMD   = "VTREF = {mv}"     # J-Link DLL 명령 문자열 (JLinkExe 의 'VTREF <mV>')
+VTREF_TOL_MV = 100               # 고정 후 다시 읽은 값의 허용 오차
+
+
+def apply_vtref(jl, mv, say=print):
+    """open 직후·connect 전에 VTref 를 mv 로 고정하고 결과를 dict 로 돌려준다.
+
+    실패해도 예외를 올리지 않는다 — J-Link 는 측정값 추종(기본 동작)으로 남는다.
+    before_mv 는 고정 전 측정값 = 타깃 VTref 핀 실측이라 링크 진단에 쓴다.
+    """
+    def _read():
+        try:
+            return int(jl.hardware_status.voltage)
+        except Exception:
+            return None
+    r = {'requested_mv': mv or None, 'before_mv': _read(), 'after_mv': None,
+         'ok': None, 'error': None}
+    if not mv:
+        say(f"  [Link] VTref 자동 (측정 {r['before_mv']} mV)")
+        return r
+    try:
+        jl.exec_command(VTREF_CMD.format(mv=int(mv)))
+    except Exception as e:
+        r['ok'], r['error'] = False, str(e)[:120]
+        say(f"  [Link] ⚠ VTref {mv} mV 고정 실패: {r['error']} — 자동(측정 {r['before_mv']} mV)으로 진행")
+        return r
+    r['after_mv'] = _read()
+    r['ok'] = r['after_mv'] is not None and abs(r['after_mv'] - int(mv)) <= VTREF_TOL_MV
+    if r['ok']:
+        say(f"  [Link] VTref {mv} mV 고정 (측정 {r['before_mv']} → {r['after_mv']} mV)")
+    else:
+        say(f"  [Link] ⚠ VTref {mv} mV 고정 후 확인 불일치: 측정 {r['before_mv']} → {r['after_mv']} mV")
+    return r
 
 
 # ── 기밀 주소/레지스터 맵을 외부 JSON 에서 로드 ─────────────────────
@@ -276,8 +313,10 @@ class Link:
 
     def __init__(self, core_base=CORE_BASE_NCORE, hart=None, device=DEVICE,
                  speed=SPEED_KHZ, serial=None, verbose=True, apb_index=APB_INDEX,
-                 ap_count=None):
+                 ap_count=None, vtref_mv=VTREF_MV):
         self.core_base = core_base
+        self.vtref_mv = vtref_mv
+        self.vtref = None             # 마지막 open 의 apply_vtref 결과
         self.hart = hart
         self.apb_index = apb_index
         # ★ 등록할 AP 개수. 2026-08-10 probe_dap 결과, AP 1개일 때만 DAP 전원이
@@ -325,6 +364,7 @@ class Link:
             'connect_tries_used': self.connect_tries_used,
             'dap_power_ok': self.dap_power_ok,
             'ctrl_stat': (None if self.ctrl_stat is None else f"0x{self.ctrl_stat:08X}"),
+            'vtref': self.vtref,
         }
         if self.jl is not None:
             for k, fn in (('probe', lambda: self.jl.product_name),
@@ -351,6 +391,8 @@ class Link:
             self.jl.open(serial_no=self.serial)
         else:
             self.jl.open()
+        # 재연결(reopen_session)도 이 경로를 타므로 매 open 마다 다시 고정한다
+        self.vtref = apply_vtref(self.jl, self.vtref_mv, self._say)
         if self._tap_path:
             try:
                 self.jl.exec_command(f"ScriptFile = {self._tap_path}")
