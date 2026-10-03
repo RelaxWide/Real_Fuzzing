@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""SF-E76 (RISC-V behind CoreSight DAP) — J-Link 연결 계층. **정식 모듈.**
+
+연결 지식의 단일 출처. 실험 스크립트도, v10.0 샘플러도 **반드시 여기를 쓴다.**
+raw `jl.halt()` / `jl.restart()` 를 직접 부르지 말 것 — 아래 이유 때문이다.
+
+────────────────────────────────────────────────────────────────────────
+★ checked API 를 쓰는 이유
+────────────────────────────────────────────────────────────────────────
+pylink 의 `halt()` / `restart()` 는 실패나 no-op 상황에서 **예외 대신 False 를
+반환**한다. 반환값을 무시하면:
+
+  - `halted == False` 인데 "halt 성공" 으로 기록 → 실행 중인 코어의 일반
+    레지스터를 PC 로 읽어 **거짓 성공**
+  - resume 실패를 성공으로 기록 → **코어가 멈춘 채 남아 SSD 가 hang**
+
+그래서 이 모듈은 **명령 반환값 + 사후 상태를 모두 확인**하는 API 만 노출한다:
+
+    connect_checked / halt_checked / read_pc / resume_checked
+
+────────────────────────────────────────────────────────────────────────
+실측으로 확정된 사실
+────────────────────────────────────────────────────────────────────────
+토폴로지    cJTAG → ARM DP → APB-AP → RISC-V DM(DMI) → hart
+            SEGGER KB(J-Link RISC-V)가 공식 지원하는 hybrid 구성.
+            **"RISC-V 는 ROM table scan 이 없어 AP/DMI 위치를 자동 검출할 수
+            없다"** 고 명시 → 수동 선언 필수.
+
+인터페이스  cJTAG, TIF=7, **10MHz** (1000kHz 로 낮추면 활성화 자체가 실패)
+DP          reg0(DPIDR) = 0x6BA0…  (PARTNO=ARM DAP 계열, DESIGNER≠ARM = 벤더 DAP.
+                                     하위 지문값은 마스킹 — 실값은 실기 로그로 확인)
+전원        CTRL/STAT ← 0x50000000 → 0xF0000000 (CSYSPWRUPACK|CDBGPWRUPACK)
+AP map      T32 의 `DP:0xN0000` 이 그대로 `Addr`.
+            `CORESIGHT_AddAP` 의 `Index` 는 **J-Link 내부 맵 번호**이지 APSEL 아님.
+CoreBase    hcore 계열(4코어 공유) / Ncore — 실제 값은 sjtag_addrs.json (기밀)
+            ⚠ 둘 다 **J-Link connect 후보로 통과**했을 뿐이다.
+              DM register/hart/PC/halt 미검증 — "접근 가능" 이 아니다.
+
+────────────────────────────────────────────────────────────────────────
+⚠ 반드시 지킬 것
+────────────────────────────────────────────────────────────────────────
+1. **한 handle = 한 설정.** 조합을 섞으면 거짓 성공 또는 전체 실패.
+   후보(CoreBase/hart/device)를 바꾸려면 **프로세스를 새로** 시작한다.
+
+2. **첫 connect() 는 실패한다.** 2회차에 붙는다.
+   통제 실험: setup 이중 적용(B)도 대기(C)도 아니고 connect 시도 자체(A)가 필요.
+   유력 **가설**은 RISC-V DM 의 `dmactive` — 직접 관측으로 확정된 것은 아니다
+   (ARM DP 전원 요청이나 J-Link 내부 CPU module 초기화일 수도 있다).
+   범위 제한: **현재 DLL/펌웨어 · generic 'RISC-V' device · 현재 명령 순서 ·
+   현재 보드 상태**에서 관측된 현상. RISC-V 일반의 성질로 일반화하지 말 것.
+
+3. **halt 후 반드시 resume, 그리고 확인.** resume 확인이 실패하면
+   다음 실험을 진행하지 말고 `recovery_required` 를 호출자에게 알린다.
+
+4. **APB 메모리 접근 ≠ RISC-V DMI 레지스터 접근.**
+   `dmcontrol 0x10` 등은 **DMI register address** 이지 APB byte offset 이 아니다.
+   aperture 레이아웃을 확보하기 전에 `core_base + 0x10` 식으로 읽고 쓰면
+   **엉뚱한 장치를 건드릴 수 있다.**
+
+────────────────────────────────────────────────────────────────────────
+사용
+────────────────────────────────────────────────────────────────────────
+    from sfe76_link import Link, CORE_BASE_NCORE, LinkError
+
+    lk = Link(core_base=CORE_BASE_NCORE)
+    try:
+        with lk:
+            lk.connect_checked()
+            lk.halt_checked()
+            pc = lk.read_pc(pc_index)      # 확정된 인덱스만
+            lk.resume_checked()
+    except LinkError as e:
+        ...  # e.exit_code 로 어느 게이트인지 구분
+    if lk.recovery_required:
+        ...  # 보드 복구(POR) 필요
+
+단독 실행:
+    sudo python3 sfe76_link.py --core-base <ncore-base>
+"""
+
+import argparse
+import os
+import sys
+import time
+
+try:
+    import pylink
+except ImportError:
+    sys.exit("pylink 없음 →  pip3 install pylink-square\n"
+             "  (venv 가 아니라 시스템 python3 에 있을 수 있다)")
+
+VERSION = "2026-08-11.3  TAP 수동 선언 스크립트 적용"
+
+# ★ 파일 버전 스큐 감지용. 기능을 추가할 때마다 올린다.
+#   도구들이 시작할 때 이 값을 확인해서, 오래된 sfe76_link.py 를 쓰면
+#   AttributeError 대신 **무엇을 해야 하는지** 알려준다.
+#   실제로 두 번 겪었다: --ap-count 없음, open_dap 없음. 둘 다 pull 누락.
+API_LEVEL = 5
+#   1: checked API (connect_checked/halt_checked/read_pc/resume_checked)
+#   2: + ap_count, CORE_HART, DMI_STRIDE_SHIFT, add_common_args --ap-count
+#   3: + open_dap(전원만 요구), dap_power(전원 직접 요청)
+#   4: CJTAG_MODE 0→1 (SiFive 는 short-form), DEVICE 'RISC-V'→'E76'
+#   5: TAP 수동 선언 JLinkScript 를 raw 경로에도 적용
+
+
+def require_api(level, tool=""):
+    """도구 시작점에서 호출한다. 버전이 낮으면 명확히 알려주고 종료한다."""
+    if API_LEVEL >= level:
+        return
+    import sys as _s
+    print(f"\n{'!' * 64}")
+    print(f" sfe76_link.py 가 오래됐다 — {tool or '이 도구'} 는 API_LEVEL {level} 이 필요한데")
+    print(f" 지금 파일은 {API_LEVEL} 이다. **저장소를 받아오지 않았다.**")
+    print(f"\n   cd {__file__.rsplit('/', 1)[0]}")
+    print("   git pull")
+    print("   grep -n 'API_LEVEL' sfe76_link.py     # 값이 올라갔는지 확인")
+    print(f"{'!' * 64}\n")
+    _s.exit(6)
+
+# ── 연결 파라미터 (전부 실측값) ──────────────────────────────────────
+TIF_CJTAG   = 7          # cJTAG. pylink enum 에 없어 정수로 지정
+SPEED_KHZ   = 10000      # 낮추면 cJTAG 활성화 실패
+# ★★ SetcJTAGInitMode — 브링업 내내 0 을 썼는데 문서가 1 을 지시한다:
+#   0 = Long-form activation, JScan0 boot + OScan1 enter (기본값)
+#   1 = Short-form activation, OScan1 boot
+#       → SEGGER 문서 원문: "**Needed for e.g. SiFive or RISC-V targets**"
+#   2 = Wiliot 전용
+#   증상과 맞는다: J-Link 의 JTAG chain detection 이 Id=0x00000001 (쓰레기)
+#   을 읽고 → TAPId 를 못 알아봐서 → CoreSight DAP 대신 RISC-V JTAG-DTM 으로
+#   오인하고 → dmcontrol 읽기에 실패한다.
+CJTAG_MODE  = 1
+DEVICE      = 'E76'      # ★ 'RISC-V' 는 connect 자체가 제대로 안 된다(실측)
+APB_INDEX   = 0          # DMI 가 붙은 AP (AddAP 의 Index)
+
+
+# ── 기밀 주소/레지스터 맵을 외부 JSON 에서 로드 ─────────────────────
+#   AP 맵·DM(CoreBase)·SJTAG 레지스터 오프셋 등 SF-E76 고유 값은 코드에 박지 않는다.
+#   실제 값: sjtag_addrs.json (★ .gitignore — 커밋 금지). 없으면 sjtag_addrs.example.json
+#   (placeholder — import/테스트만 됨). 실기 실행은 ADDRS_REAL 로 real JSON 유무를 확인한다.
+def _load_riscv_addrs():
+    import json as _j
+    _err = None
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    for _name, _real in (("sjtag_addrs.json", True), ("sjtag_addrs.example.json", False)):
+        _p = os.path.join(_dir, _name)
+        if os.path.exists(_p):
+            try:
+                with open(_p) as _f:
+                    _d = _j.load(_f)
+                _d["_is_real"] = _real
+                if _err:            # 실제 파일이 깨져서 여기로 내려온 경우를 기록
+                    _d["_load_error"] = _err
+                return _d
+            except Exception as _e:
+                # ★ 실제 파일이 있는데 파싱만 실패하면 example(placeholder)로 조용히
+                #   내려앉는다 → sjtag_base 가 "0x0" 이라 '미설정'처럼 보이고 원인을
+                #   못 찾는다. 실기서 실제 겪은 실패라 크게 알린다.
+                if _real:
+                    print("=" * 70)
+                    print(f"[addrs] ★ {_name} 파싱 실패 — placeholder 로 fallback 한다!")
+                    print(f"[addrs]   {_e}")
+                    print("[addrs]   증상: 'sjtag_base 미설정' 처럼 보인다. 쉼표/괄호 확인.")
+                    print("[addrs]   점검: sudo python3 tools/check_bm9k1_setup.py")
+                    print("=" * 70)
+                    _err = str(_e)
+                else:
+                    _err = None
+    _d = {"_is_real": False}
+    try:
+        _d["_load_error"] = _err
+    except NameError:
+        pass
+    return _d
+
+
+def _addr_int(v, default=0):
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        try:
+            return int(v, 0)
+        except ValueError:
+            return default
+    return default
+
+
+RISCV_ADDRS = _load_riscv_addrs()
+ADDRS_REAL = bool(RISCV_ADDRS.get("_is_real"))
+
+CORE_BASE_MAIN  = _addr_int(RISCV_ADDRS.get("core_base_main"))   # 4코어 공유 DM
+CORE_BASE_NCORE = _addr_int(RISCV_ADDRS.get("core_base_ncore"))  # Ncore DM
+
+CORE_BASE_LABEL = {
+    CORE_BASE_MAIN:  "hcore/CMCore/Fcore0/QCore",
+    CORE_BASE_NCORE: "Ncore",
+}
+
+# ★ hart 매핑 — attach.cmm 실물에서 확정 (추측 아님)
+#     SYS.CONFIG CORE <core_idx>. <chip_idx>.
+#     SYS.CONFIG HARTINDEX 0. 1. 2. 3.      ← core_idx 순서대로의 hart 번호
+#   즉 CORE_BASE_MAIN 하나의 DM 에 **하트가 4개** 달려 있고,
+#   Ncore 만 chip 2 = 별도 DM(CORE_BASE_NCORE) 의 hart 0 이다.
+#   → hart 를 0..4 로 넘겨짚을 필요가 없다. 아래가 전부다.
+CORE_HART = {
+    'hcore':  (CORE_BASE_MAIN,  0),   # CORE 1. 1.  ← NVMe 펌웨어 유력
+    'cmcore': (CORE_BASE_MAIN,  1),   # CORE 2. 1.
+    'fcore':  (CORE_BASE_MAIN,  2),   # CORE 3. 1.
+    'qcore':  (CORE_BASE_MAIN,  3),   # CORE 4. 1.
+    'ncore':  (CORE_BASE_NCORE, 0),   # CORE 1. 2.  ← 코드 맵에서 제외되는 코어
+}
+
+# DMI 레지스터의 APB aperture 매핑 (강한 추론, 미검증)
+#   두 DM base 의 간격이 0x1000 = 4KB → DMI 주소 1024개 × 4바이트.
+#   ⇒ APB 주소 = CoreBase + (dmi_addr << 2)
+#   예: dmcontrol(0x10) → CoreBase+0x40,  dmstatus(0x11) → CoreBase+0x44
+DMI_STRIDE_SHIFT = 2
+DM_APERTURE_SIZE = 0x1000
+
+# ★ TAP 수동 선언 — raw 경로에도 적용한다 (2026-08-11)
+#   J-Link 의 자동 체인 검출이 Id=0x00000001 을 읽어 TAP 을 오인한다.
+#   ConfigTargetSettings() 에서 체인을 선언하면 로그 IDCODE 가 선언값이 되고
+#   JTAG-DTM 오인이 사라진다(실측).
+#   ⚠ 지금까지의 raw MEM-AP 측정은 **이 수정 이전**에 잰 것이다.
+#     DP/AP 레지스터 값은 교차검증됐지만(IDR 6/6) 메모리 트랜잭션까지
+#     유효했다는 보장이 없다 → 이 스크립트를 깔고 다시 재야 한다.
+CHAIN_TAP_ID = _addr_int(RISCV_ADDRS.get("chain_tap_id"))
+TAP_SCRIPT = """/* 자동 생성 — sfe76_link */
+void ConfigTargetSettings(void) {
+  JTAG_AllowTAPReset = 1;          /* 1 = 자동 검출 OFF */
+  JLINK_JTAG_SetDeviceId(0, 0x%08X);
+  JLINK_JTAG_IRPre  = 0;
+  JLINK_JTAG_DRPre  = 0;
+  JLINK_JTAG_IRPost = 0;
+  JLINK_JTAG_DRPost = 0;
+  JLINK_JTAG_IRLen  = 4;
+  return 0;
+}
+"""
+
+
+def write_tap_script(tapid=CHAIN_TAP_ID):
+    import tempfile
+    p = os.path.join(tempfile.gettempdir(), f"sfe76_tap_{os.getpid()}.JLinkScript")
+    with open(p, 'w') as f:
+        f.write(TAP_SCRIPT % tapid)
+    return p
+
+
+# T32 SYStem.CONFIG 의 AP 목록 — (이름, CoreSight 주소, J-Link 타입)
+AP_MAP = [(_n, _addr_int(_a), _t) for (_n, _a, _t) in RISCV_ADDRS.get("ap_map", [])]
+
+CONNECT_TRIES  = 3
+STATE_TIMEOUT  = 2.0     # halt/resume 사후 상태 확인 대기(초)
+
+# ── 종료 코드 — 자동화가 실패를 구분할 수 있게 ──────────────────────
+EXIT_OK           = 0
+EXIT_CONNECT_FAIL = 2
+EXIT_HALT_FAIL    = 3
+EXIT_PC_FAIL      = 4
+EXIT_RESUME_FAIL  = 5    # ★ 보드 복구 필요
+EXIT_INSUFFICIENT = 6
+
+
+class LinkError(RuntimeError):
+    """단계 실패. exit_code 로 어느 게이트에서 깨졌는지 구분한다."""
+
+    def __init__(self, msg, exit_code=EXIT_INSUFFICIENT):
+        super().__init__(msg)
+        self.exit_code = exit_code
+
+
+class Link:
+    """J-Link 연결 1개 = 설정 1개. 조합을 섞지 않는다."""
+
+    def __init__(self, core_base=CORE_BASE_NCORE, hart=None, device=DEVICE,
+                 speed=SPEED_KHZ, serial=None, verbose=True, apb_index=APB_INDEX,
+                 ap_count=None):
+        self.core_base = core_base
+        self.hart = hart
+        self.apb_index = apb_index
+        # ★ 등록할 AP 개수. 2026-08-10 probe_dap 결과, AP 1개일 때만 DAP 전원이
+        #   ACK 됐다(6개는 실패). 실재가 확인된 AP 는 APBAP1 하나뿐이므로
+        #   **없는 AP 를 등록하는 것이 해가 될 수 있다.** None = AP_MAP 전부.
+        self.ap_count = len(AP_MAP) if ap_count is None else max(1, min(ap_count, len(AP_MAP)))
+        self.device = device
+        self.speed = speed
+        self.serial = serial
+        self.verbose = verbose
+        self.jl = None
+
+        # 결과 상태와 복구 상태를 분리한다
+        self.connect_tries_used = 0
+        self.recovery_required = False
+        self.cleanup_error = None
+        # 세션 유효성 — connect 성공과 별개다 (dap_power 참조)
+        self.dap_power_ok = None
+        self.ctrl_stat = None
+        self._tap_path = None
+
+    # ── 컨텍스트 매니저 ──────────────────────────────────────────────
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def _say(self, msg):
+        if self.verbose:
+            print(msg)
+
+    def meta(self):
+        """결과 레코드에 남길 연결 메타데이터."""
+        m = {
+            'version': VERSION,
+            'device': self.device, 'tif': TIF_CJTAG, 'speed_khz': self.speed,
+            'cjtag_mode': CJTAG_MODE, 'apb_index': self.apb_index,
+            'core_base': f"0x{self.core_base:X}",
+            'core_base_label': CORE_BASE_LABEL.get(self.core_base, '?'),
+            'hart': self.hart,
+            'ap_count': self.ap_count,
+            'connect_tries_used': self.connect_tries_used,
+            'dap_power_ok': self.dap_power_ok,
+            'ctrl_stat': (None if self.ctrl_stat is None else f"0x{self.ctrl_stat:08X}"),
+        }
+        if self.jl is not None:
+            for k, fn in (('probe', lambda: self.jl.product_name),
+                          ('serial', lambda: self.jl.serial_number),
+                          ('firmware', lambda: self.jl.firmware_version)):
+                try:
+                    m[k] = fn()
+                except Exception:
+                    pass
+        return m
+
+    # ── open / 설정 ──────────────────────────────────────────────────
+    def open(self, tap_script=True):
+        self.jl = pylink.JLink()
+        # ★ TAP 수동 선언을 open 전후 양쪽에서 지정한다 (어느 쪽이 먹는지 불확실)
+        self._tap_path = write_tap_script() if tap_script else None
+        if self._tap_path:
+            try:
+                self.jl.exec_command(f"ScriptFile = {self._tap_path}")
+            except Exception:
+                pass
+        # 여러 probe 가 붙어 있으면 엉뚱한 보드를 잡는다
+        if self.serial:
+            self.jl.open(serial_no=self.serial)
+        else:
+            self.jl.open()
+        if self._tap_path:
+            try:
+                self.jl.exec_command(f"ScriptFile = {self._tap_path}")
+                self._say(f"  [Link] TAP 수동 선언 스크립트 적용 "
+                          f"(TAP ID=0x{CHAIN_TAP_ID:08X})")
+            except Exception as e:
+                self._say(f"  [Link] ScriptFile 지정 실패: {str(e)[:60]}")
+        self._say(f"  [Link] {self.jl.product_name} SN={self.jl.serial_number}")
+        return self
+
+    def apply_settings(self):
+        """connect() 이전에 **1회만** 적용한다.
+
+        retry 마다 다시 부르지 않는다 — 같은 Index 로 `CORESIGHT_AddAP` 를
+        반복 등록하면 DLL 버전에 따라 덮어쓰기/중복/오류가 될 수 있고,
+        분리 실험 A(setup 1회 + connect 2회)와도 어긋난다.
+        """
+        jl = self.jl
+        try:
+            jl.exec_command(f"SetcJTAGInitMode = {CJTAG_MODE}")
+            jl.set_tif(TIF_CJTAG)
+            jl.set_speed(self.speed)
+            for i, (_n, addr, typ) in enumerate(AP_MAP[:self.ap_count]):
+                jl.exec_command(f"CORESIGHT_AddAP = Index={i} Type={typ} Addr=0x{addr:X}")
+            jl.exec_command(
+                f"CORESIGHT_SetIndexAPBAPToUse = {min(self.apb_index, self.ap_count - 1)}")
+            jl.exec_command(f"CORESIGHT_SetCoreBaseAddr = 0x{self.core_base:X}")
+            if self.hart is not None:
+                jl.exec_command(f"RISCV_SetHartSel = {self.hart}")
+            return True
+        except Exception as e:
+            self._say(f"  [Link] 설정 실패: {e}")
+            return False
+
+    # ── G1: connect ──────────────────────────────────────────────────
+    # ── 세션 유효성 판정 ─────────────────────────────────────────────
+    def dap_power(self):
+        """DP CTRL/STAT 를 읽어 (CDBGPWRUPACK, CSYSPWRUPACK) 를 돌려준다.
+
+        **왜 필요한가.** connect() 가 예외 없이 끝나도 DAP 전원이 안 선 세션이
+        있다(2026-08-10: 단발 성공률 6/12). 그 세션에서 잰 값은 측정 실패가
+        아니라 **무효**다. 둘을 섞으면 노이즈를 데이터로 오독하게 된다.
+        모든 측정은 이 게이트를 통과한 세션 안에서만 유효하다.
+        """
+        try:
+            self.jl.coresight_configure(ir_pre=0, dr_pre=0, ir_post=0, dr_post=0,
+                                        ir_len=4, perform_tif_init=False)
+        except Exception:
+            try:
+                self.jl.coresight_configure()
+            except Exception as e:
+                self._say(f"  [Link] coresight_configure 실패: {e}")
+                return (None, None)
+        def _rd():
+            try:
+                v = self.jl.coresight_read(1, ap=False)   # DP CTRL/STAT
+                return None if (v is None or v < 0) else v
+            except Exception:
+                return None
+
+        v = _rd()
+        # ACK 가 없으면 **우리가 직접 전원을 요청한다.**
+        # connect 가 실패한 세션에서는 J-Link 이 이 단계를 안 했을 수 있다.
+        if v is None or not (v & (1 << 29)):
+            try:
+                self.jl.coresight_write(0, 0x0000001E, ap=False)      # ABORT: sticky 클리어
+                self.jl.coresight_write(1, 0x50000000, ap=False)      # CDBG|CSYSPWRUPREQ
+            except Exception:
+                pass
+            for _ in range(30):
+                time.sleep(0.01)
+                v = _rd()
+                if v is not None and (v & (1 << 29)):
+                    break
+        if v is None:
+            self._say("  [Link] CTRL/STAT 읽기 실패")
+            return (None, None)
+        self.ctrl_stat = v
+        return (bool(v & (1 << 29)), bool(v & (1 << 31)))
+
+    def open_dap(self, tries=CONNECT_TRIES):
+        """**raw DAP 작업용 진입점.** connect 성공을 요구하지 않는다.
+
+        ★ 왜 필요한가. DP/AP 레지스터를 직접 두드리는 데 필요한 건 **DAP 전원**
+          뿐이다. J-Link 의 `connect(device)` 는 그 위에서 **CPU 를 식별**하려 하고,
+          우리 칩은 거기서 `Could not find supported CPU` / `dmactive 타임아웃`
+          으로 실패한다 — 그런데 그건 **CPU 계층의 실패**지 DAP 계층의 실패가 아니다.
+
+          실제로 브링업 초기의 DPIDR 도 connect 가 실패한 세션에서 읽었다.
+          그런데 `connect_checked` 를 쓰면서 **connect 실패 = 세션 무효**로
+          묶어버려, CPU 를 못 찾는다는 이유로 **AP 측정 자체를 건너뛰고 있었다.**
+
+        반환: (connect_ok, ctrl_stat)  — 전원이 안 서면 LinkError.
+        """
+        if not self.apply_settings():
+            raise LinkError("설정 단계 실패", EXIT_CONNECT_FAIL)
+
+        connect_ok, last = False, None
+        for t in range(1, tries + 1):
+            try:
+                self.jl.connect(self.device, speed=self.speed)
+                connect_ok = True
+                self.connect_tries_used = t
+                self._say(f"  [Link] connect 성공 ({t}/{tries})")
+                break
+            except Exception as e:
+                last = str(e)
+                self._say(f"  [Link] connect 시도 {t}/{tries} 실패: {str(e)[:80]}")
+                time.sleep(0.25)
+        if not connect_ok:
+            self._say(f"  [Link] connect 는 실패했다 — **CPU 계층 실패다.**")
+            self._say(f"         DAP 전원이 서 있으면 AP 측정은 그대로 진행한다.")
+
+        dbg, sysa = self.dap_power()
+        self.dap_power_ok = bool(dbg)
+        if not dbg:
+            raise LinkError(f"DAP 전원 ACK 없음 (무효 세션). 마지막 connect 오류: {last}",
+                            EXIT_CONNECT_FAIL)
+        self._say(f"  [Link] ✅ DAP 전원 확보 — CDBGPWRUPACK=1 "
+                  f"CSYSPWRUPACK={int(bool(sysa))} "
+                  f"CTRL/STAT=0x{(self.ctrl_stat or 0):08X}  "
+                  f"(connect={'성공' if connect_ok else '실패'})")
+        return connect_ok, self.ctrl_stat
+
+    def connect_checked(self, tries=CONNECT_TRIES, require_power=True):
+        """설정 1회 + connect bounded retry.
+
+        require_power=True 면 **connect 성공만으로 만족하지 않고** DAP 전원
+        ACK 까지 확인하고, 안 서면 그 시도를 실패로 보고 다시 붙는다.
+        연결이 상태 의존적으로 불안정하므로(가설 G) 이게 유일하게 믿을 만한
+        성공 판정이다. 몇 회차에 붙었는지 남긴다.
+        """
+        if not self.apply_settings():
+            raise LinkError("설정 단계 실패", EXIT_CONNECT_FAIL)
+
+        last = None
+        for t in range(1, tries + 1):
+            try:
+                self.jl.connect(self.device, speed=self.speed)
+            except Exception as e:
+                last = e
+                self._say(f"  [Link] connect 시도 {t}/{tries} 실패: {e}")
+                time.sleep(0.2)
+                continue
+
+            if not require_power:
+                self.connect_tries_used = t
+                self._say(f"  [Link] connect 성공 시도 {t}/{tries} (전원 미확인)")
+                return t
+
+            dbg, sysa = self.dap_power()
+            self.dap_power_ok = bool(dbg)
+            if dbg:
+                self.connect_tries_used = t
+                self._say(f"  [Link] ✅ 세션 유효 — 시도 {t}/{tries}, "
+                          f"CDBGPWRUPACK=1 CSYSPWRUPACK={int(bool(sysa))}"
+                          + (f" CTRL/STAT=0x{self.ctrl_stat:08X}"
+                             if self.ctrl_stat is not None else ""))
+                return t
+            last = "connect 는 됐으나 DAP 전원 ACK 없음 (무효 세션)"
+            self._say(f"  [Link] 시도 {t}/{tries}: {last} — 재시도")
+            time.sleep(0.3)
+
+        raise LinkError(f"유효 세션 확보 실패 ({tries}회): {last}", EXIT_CONNECT_FAIL)
+
+    # ── 상태 대기 ────────────────────────────────────────────────────
+    def _wait_halted(self, expected, timeout=STATE_TIMEOUT):
+        end = time.time() + timeout
+        last = None
+        while time.time() < end:
+            try:
+                last = bool(self.jl.halted())
+            except Exception as e:
+                last = None
+                self._say(f"  [Link] halted() 예외: {e}")
+            if last is expected:
+                return True
+            time.sleep(0.02)
+        self._say(f"  [Link] 상태 대기 실패: halted={last}, 기대={expected}")
+        return False
+
+    # ── G2: halt ─────────────────────────────────────────────────────
+    def halt_checked(self, timeout=STATE_TIMEOUT):
+        """명령 반환값 + 사후 상태를 **둘 다** 확인한다."""
+        try:
+            r = self.jl.halt()
+        except Exception as e:
+            raise LinkError(f"halt() 예외: {e}", EXIT_HALT_FAIL)
+        if r is False:
+            raise LinkError("halt() 가 False 반환 (명령 실패)", EXIT_HALT_FAIL)
+        if not self._wait_halted(True, timeout):
+            raise LinkError("halt 명령은 받아들여졌으나 halted 상태로 진입하지 않음",
+                            EXIT_HALT_FAIL)
+        return True
+
+    # ── G3: PC ───────────────────────────────────────────────────────
+    def read_pc(self, pc_index):
+        """**확정된** 인덱스만 받는다.
+
+        인덱스를 추측해 넘기면 실행 중인 코어의 일반 레지스터를 PC 로 기록해
+        G3 를 거짓 통과한다. 확정 근거는 셋 중 하나여야 한다:
+          - J-Link register name 이 PC/DPC 로 확인됨
+          - T32/벤더 자료로 교차 검증됨
+          - 독립적인 PC fingerprint 실험을 통과한 --pc-index
+        """
+        if pc_index is None:
+            raise LinkError("PC 레지스터 인덱스가 확정되지 않았다", EXIT_PC_FAIL)
+        if not self._wait_halted(True, 0.2):
+            raise LinkError("halt 상태가 아닌데 PC 를 읽으려 함", EXIT_PC_FAIL)
+        try:
+            return self.jl.register_read(pc_index) & 0xFFFFFFFF   # E76 = RV32
+        except Exception as e:
+            raise LinkError(f"register_read({pc_index}) 실패: {e}", EXIT_PC_FAIL)
+
+    # ── G4: resume ───────────────────────────────────────────────────
+    def resume_checked(self, timeout=STATE_TIMEOUT):
+        """실패하면 recovery_required 를 세우고 예외를 던진다.
+
+        ⚠ pylink 에 `go()` 는 없다. `restart()` 뿐이고, 문서상
+        **"This is a no-op if the CPU isn't halted"** 라 halt 상태가 아니면
+        False 를 반환한다. 따라서 `restart() == False` 자체는 실패가 아니다 —
+        **이미 running 이면 성공**이다. (이걸 실패로 오판해 '보드 복구 필요'
+        거짓 경보를 냈던 적이 있다.)
+        """
+        try:
+            if not self.jl.halted():
+                return True          # 이미 running — 할 일 없음
+        except Exception:
+            pass                     # 확인 불가 → 아래에서 시도
+
+        try:
+            r = self.jl.restart()
+        except Exception as e:
+            self.recovery_required = True
+            raise LinkError(f"restart() 예외: {e}", EXIT_RESUME_FAIL)
+
+        # 반환값이 아니라 **실제 상태**로 판정한다
+        if self._wait_halted(False, timeout):
+            return True
+
+        self.recovery_required = True
+        raise LinkError(
+            f"resume 실패 — 코어가 halted 로 남았다 (restart 반환={r}). "
+            f"보드 복구(POR) 필요", EXIT_RESUME_FAIL)
+
+    # ── 정리 ─────────────────────────────────────────────────────────
+    def close(self):
+        """어떤 경로로 나가든 resume 을 시도하고, 실패를 숨기지 않는다."""
+        if self.jl is None:
+            return
+        try:
+            try:
+                still_halted = bool(self.jl.halted())
+            except Exception:
+                # 확인 불가 시 억지로 resume 하지 않는다. halt 가 애초에
+                # 실패했으면 멈춘 적이 없고, 그때 restart() 는 no-op False 를
+                # 돌려줘 '복구 필요' 거짓 경보를 만든다.
+                still_halted = False
+            if still_halted:
+                try:
+                    self.resume_checked()
+                    self._say("  [Link] 종료 전 resume 완료")
+                except LinkError as e:
+                    self.cleanup_error = str(e)
+                    self.recovery_required = True
+                    self._say(f"  [Link] ⚠ 종료 전 resume 실패: {e}")
+                    self._say("  [Link] ⚠ 코어가 halt 로 남았다. nvme list 로 확인하고 "
+                              "보드 전원 사이클 필요")
+        finally:
+            try:
+                self.jl.close()
+            except Exception as e:
+                self.cleanup_error = self.cleanup_error or f"close: {e}"
+            self.jl = None
+            if self._tap_path:
+                try:
+                    os.unlink(self._tap_path)
+                except OSError:
+                    pass
+                self._tap_path = None
+            time.sleep(0.3)
+
+
+# ══════════════════════════════════════════════════════════════════
+def add_common_args(ap):
+    ap.add_argument('--core-base', type=lambda x: int(x, 0), default=CORE_BASE_NCORE,
+                    help='기본 Ncore CoreBase (단일 하트로 추정되어 변수가 적다)')
+    ap.add_argument('--hart', type=int, default=None)
+    ap.add_argument('--device', default=DEVICE)
+    ap.add_argument('--serial', default=None, help='J-Link serial (여러 대 연결 시 필수)')
+    ap.add_argument('--tries', type=int, default=CONNECT_TRIES)
+    ap.add_argument('--ap-count', type=int, default=None,
+                    help='등록할 AP 개수 (1=APBAP1 만). 기본은 AP_MAP 전부(6). '
+                         '개수는 전원 ACK 에 영향이 없음이 확인됐다(가설 E 반증) — 재현용')
+    return ap
+
+
+def main():
+    ap = add_common_args(argparse.ArgumentParser(description="연결만 확인한다"))
+    args = ap.parse_args()
+
+    label = CORE_BASE_LABEL.get(args.core_base, "?")
+    print(f"\n{'=' * 62}\n SF-E76 연결 확인 ({VERSION})\n{'=' * 62}")
+    print(f"  CoreBase 0x{args.core_base:X} [{label}]  hart={args.hart}  "
+          f"device={args.device!r}")
+
+    lk = Link(core_base=args.core_base, hart=args.hart, device=args.device,
+              serial=args.serial)
+    rc = EXIT_OK
+    try:
+        with lk:
+            lk.connect_checked(tries=args.tries)
+            print(f"\n  ✅ connect 성공 (시도 {lk.connect_tries_used}회)")
+            print(f"  meta: {lk.meta()}")
+    except LinkError as e:
+        print(f"\n  ❌ {e}")
+        rc = e.exit_code
+    if lk.recovery_required:
+        print("\n  ⚠⚠ 보드 복구 필요 — 전원 사이클 후 nvme list 확인")
+        rc = rc or EXIT_RESUME_FAIL
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main())

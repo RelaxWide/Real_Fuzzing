@@ -1,0 +1,52 @@
+{
+  "_comment": "TEMPLATE — sjtag_addrs.json 으로 복사해 T32/clavis 실제 값으로 채우세요. 실제 파일은 .gitignore 됩니다. 아래는 전부 PLACEHOLDER(실제 SF-E76 주소 아님) — 코드 import/단위테스트만 되게 하는 더미입니다.",
+  "ap_map": [
+    ["APBAP1", "0x1000", "APB-AP"],
+    ["APBAP2", "0x2000", "APB-AP"],
+    ["AXIAP1", "0x3000", "AXI-AP"],
+    ["AHBAP1", "0x4000", "AHB-AP"],
+    ["APBAP3", "0x5000", "APB-AP"],
+    ["APBAP4", "0x6000", "APB-AP"]
+  ],
+  "core_base_main": "0x10000000",
+  "core_base_ncore": "0x10001000",
+  "chain_tap_id": "0x00000000",
+  "apbap3_idr_expect": "0x00000000",
+  "dead_fingerprints": ["0x0", "0xFFFFFFFF"],
+  "sjtag_offsets": {
+    "hw_version": "0x0", "state": "0x4", "chip_id0": "0x8", "chip_id1": "0xC",
+    "resp_domain": "0x10", "resp_lv0": "0x14", "resp_lv1": "0x18",
+    "dbg_control": "0x100", "request": "0x200", "challenge": "0x300", "response": "0x400"
+  },
+  "sjtag_state_bits": {
+    "auth_pass": "0x1", "soft_lock": "0x2", "request_ready": "0x4",
+    "response_ready": "0x8", "state_info_mask": "0x700",
+    "invalid_pubkey": "0x1000", "sw_reset_mask": "0x10"
+  },
+  "runtime": {
+    "_comment": "오케스트레이터 기본값(placeholder). 실기 json 에서 sjtag_base·sign_tool 채움.",
+    "sjtag_base": "0x0",
+    "sign_tool": "/path/to/signer.exe",
+    "tool_prefix": "wine",
+    "word_order": "t32-negative"
+  },
+  "trace": {
+    "_comment": "N-Trace 컴포넌트(placeholder). 실기: te_base/sram_sink_base 채움. mem_type 2=SBA.",
+    "te_base": "0xF0000000",
+    "funnel_base": "0xF0080000",
+    "sram_sink_base": "0xF0080000",
+    "mem_type": 2
+  },
+  "pcsr": {
+    "_comment": "TEMPLATE. 주소 = trace.te_base + core_stride*id + offset. cores[].id 고정(H=0 CM=1 F=2 Q=3) — 커버리지 키와 PCSR 주소에 박힌다. elf 는 절대경로.",
+    "offset": "0x0",
+    "core_stride": "0x1000",
+    "valid_bit": 1,
+    "cores": [
+      {"id": 0, "name": "H",  "elf": "/path/to/HCORE.elf",  "load_offset": "0x0"},
+      {"id": 1, "name": "CM", "elf": "/path/to/CMCore.elf", "load_offset": "0x0"},
+      {"id": 2, "name": "F",  "elf": "/path/to/Fcore.elf",  "load_offset": "0x0"},
+      {"id": 3, "name": "Q",  "elf": "/path/to/QCore.elf",  "load_offset": "0x0"}
+    ]
+  }
+}
