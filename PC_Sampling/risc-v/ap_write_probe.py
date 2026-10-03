@@ -26,6 +26,7 @@ CSW 비트도 풀어 찍는다 — TrInProg(bit7)=1 이면 이전 전송이 끝�
     req=0       → DP 가 리셋돼 요청이 지워짐(디버그 도메인 리셋/전원 강하)
   ※ CTRL/STAT 이 0x80000000 이면 실제 값이 아니라 J-Link 의 읽기 실패 표식이다(링크 끊김).
 --reassert: 매 회 ABORT(0x1E)·전원요청을 다시 써서 회복되는지 본다.
+VTref 열 = 프로브가 잰 1번 핀 전압(mV). 링크가 끊길 때 같이 떨어지면 타깃 IO 기준전압/배선 쪽.
 tx 열 = watch 시작 후 누적 DP/AP 전송 수. --interval 을 바꿔 돌렸을 때 끊기는 시점이
   같은 '초' 에 맞으면 시간 기반(칩 쪽), 같은 'tx' 에 맞으면 전송 기반(링크 동기 상실)이다.
 --speed: cJTAG 속도(kHz). 기본은 sfe76_link 의 값(10000).
@@ -174,7 +175,7 @@ def watch(dap, seconds, interval, reassert=False, req=0x50000000):
     print(f"\n  [watch] {seconds:.0f}초, {interval:.1f}초 간격"
           + (", 매 회 전원요청 재기입" if reassert else "")
           + "  (O=일치 X=불일치 E=링크에러)")
-    print("    t(s)      tx   DPIDR       CTRL/STAT   CDBG CSYS(req/ack)  "
+    print("    t(s)      tx  VTref   DPIDR       CTRL/STAT   CDBG CSYS(req/ack)  "
           + " ".join(f"{n:>7}" for n in names) + "   nvme")
     tx = TxCounter(dap.jl)
     t0 = time.monotonic()
@@ -188,7 +189,11 @@ def watch(dap, seconds, interval, reassert=False, req=0x50000000):
         dpidr = dap.dp_read(0)
         ctrl = dap.dp_read(DP_CTRL_STAT)
         marks = [quick_ap(dap, b) for _n, b, _k in AP_MAP]
-        print(f"    {t:6.1f}  {n0:6d}  {hx(dpidr):>10}  {hx(ctrl):>10}  {pwr_bits(ctrl):>16}  "
+        try:
+            vt = str(int(dap.jl.hardware_status.voltage))      # 프로브가 잰 VTref(mV)
+        except Exception:
+            vt = '?'
+        print(f"    {t:6.1f}  {n0:6d}  {vt:>5}  {hx(dpidr):>10}  {hx(ctrl):>10}  {pwr_bits(ctrl):>16}  "
               + " ".join(f"{m:>7}" for m in marks) + f"   {nvme_state()}", flush=True)
         if t >= seconds:
             return
