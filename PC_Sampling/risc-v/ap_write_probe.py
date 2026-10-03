@@ -30,6 +30,7 @@ VTref 열 = 프로브가 잰 1번 핀 전압(mV). 링크가 끊길 때 같이 �
 tx 열 = watch 시작 후 누적 DP/AP 전송 수. --interval 을 바꿔 돌렸을 때 끊기는 시점이
   같은 '초' 에 맞으면 시간 기반(칩 쪽), 같은 'tx' 에 맞으면 전송 기반(링크 동기 상실)이다.
 --speed: cJTAG 속도(kHz). 기본은 sfe76_link 의 값(10000).
+--aps: 시험할 AP 만 고른다(예: APBAP3). 시스템 버스 AP(AXI/AHB)를 건드리지 않고 보려는 용도.
 --vtref-mv: VTref 고정(mV, 기본 1800, 0=자동). 시작 로그의 '[Link] VTref …' 줄에 고정 성공 여부와
   고정 전 측정값이 찍힌다.
 
@@ -172,8 +173,9 @@ class TxCounter:
         return call
 
 
-def watch(dap, seconds, interval, reassert=False, req=0x50000000):
-    names = [n for n, _b, _k in AP_MAP]
+def watch(dap, seconds, interval, reassert=False, req=0x50000000, aps=None):
+    aps = aps or AP_MAP
+    names = [n for n, _b, _k in aps]
     print(f"\n  [watch] {seconds:.0f}초, {interval:.1f}초 간격"
           + (", 매 회 전원요청 재기입" if reassert else "")
           + "  (O=일치 X=불일치 E=링크에러)")
@@ -190,7 +192,7 @@ def watch(dap, seconds, interval, reassert=False, req=0x50000000):
             dap._select = None
         dpidr = dap.dp_read(0)
         ctrl = dap.dp_read(DP_CTRL_STAT)
-        marks = [quick_ap(dap, b) for _n, b, _k in AP_MAP]
+        marks = [quick_ap(dap, b) for _n, b, _k in aps]
         try:
             vt = str(int(dap.jl.hardware_status.voltage))      # 프로브가 잰 VTref(mV)
         except Exception:
@@ -216,12 +218,19 @@ def main():
                     help=f"cJTAG 속도(kHz, 기본 {SPEED_KHZ})")
     ap.add_argument("--vtref-mv", type=int, default=1800, metavar="MV",
                     help="J-Link VTref 고정값(mV), open 직후·connect 전 적용. 0=자동(측정값 추종)")
+    ap.add_argument("--aps", default="", metavar="NAMES",
+                    help="시험할 AP 이름만(쉼표 구분, 예: APBAP3 또는 APBAP1,APBAP3). 기본 전부")
     ap.add_argument("--reassert", action="store_true",
                     help="--watch 매 회 ABORT·전원요청을 다시 써서 회복 여부를 본다")
     a = ap.parse_args()
 
     if not AP_MAP:
         print("AP_MAP 비어 있음 — risc-v/sjtag_addrs.json 확인", file=sys.stderr)
+        return 9
+    want = {n.strip().upper() for n in a.aps.split(',') if n.strip()}
+    aps = [r for r in AP_MAP if not want or r[0].upper() in want]
+    if not aps:
+        print(f"--aps 에 맞는 AP 없음 (가능: {', '.join(r[0] for r in AP_MAP)})", file=sys.stderr)
         return 9
     lk = Link(core_base=CORE_BASE_MAIN, speed=a.speed, vtref_mv=a.vtref_mv)
     try:
@@ -248,10 +257,10 @@ def main():
 
         if a.watch:
             req = 0x10000000 if a.power == "dbg-only" else 0x50000000
-            watch(dap, a.watch, max(0.2, a.interval), a.reassert, req)
+            watch(dap, a.watch, max(0.2, a.interval), a.reassert, req, aps)
             return 0
 
-        rows = [(name,) + probe_ap(dap, name, base) for name, base, _k in AP_MAP]
+        rows = [(name,) + probe_ap(dap, name, base) for name, base, _k in aps]
 
         # 실제 증상 재현: STATE 1회 읽기(읽기 전용)
         dap.clear_sticky()
