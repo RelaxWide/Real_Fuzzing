@@ -1621,7 +1621,7 @@ class FuzzConfig:
     # v8.1: JLinkHaltSampler(P9) 전용 — pylink 직접 제어 파라미터
     jlink_speed:     int   = 4000                 # J-Link SWD/JTAG 속도 (kHz)
     jlink_ap_index:  int   = 0                    # CoreSight APB-AP 인덱스 (P9: AP[0])
-    jlink_vtref_mv:  Optional[int] = 1800         # J-Link VTref 고정(mV), connect 전 적용. None/0=자동.
+    jlink_vtref_mv:  Optional[int] = None         # J-Link VTref 고정(mV), connect 전 적용. None/0=자동(기본).
     #                                             pylink 경로(RiscvPcsr/JLinkHalt)만 — OpenOCD 경로는 미적용
     pc_reg_index:    Optional[int] = None         # PC(R15) 레지스터 인덱스. None=connect 시 자동 탐지
     ufas_ini:        Optional[str] = 'PM9M1_A815.ini'  # UFAS --ini (enable_ufas 는 아래 정의)
@@ -23490,7 +23490,7 @@ if __name__ == "__main__":
         # v8.1: JLinkHaltSampler(P9) 파라미터 — profile 기본값, pc_reg_index 는 CLI override 우선
         jlink_speed=_profile.get('jlink_speed', 4000),
         jlink_ap_index=_profile.get('jlink_ap_index', 0),
-        jlink_vtref_mv=_profile.get('jlink_vtref_mv', 1800),
+        jlink_vtref_mv=_profile.get('jlink_vtref_mv'),
         pc_reg_index=(args.pc_reg_index if args.pc_reg_index is not None
                       else _profile.get('pc_reg_index')),
         nvme_device=args.nvme,

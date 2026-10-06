@@ -1,4 +1,4 @@
-"""v11.1 — J-Link VTref 를 config(jlink_vtref_mv, 기본 1800) 값으로 open 직후·connect 전에 고정한다.
+"""v11.1 — J-Link VTref 를 config(jlink_vtref_mv, 기본 None=자동) 값으로 open 직후·connect 전에 고정한다.
 
 고정 실패나 확인 불일치는 경고만 남기고 측정값 추종으로 계속한다.
 """
@@ -55,8 +55,8 @@ class LinkApplyVtref(unittest.TestCase):
         self.assertFalse(r['ok'])
         self.assertEqual(r['after_mv'], 3300)
 
-    def test_link_default_is_1800(self):
-        self.assertEqual(sfe76_link.Link().vtref_mv, 1800)
+    def test_link_default_is_auto(self):
+        self.assertIsNone(sfe76_link.Link().vtref_mv)
 
 
 class HaltSamplerVtref(unittest.TestCase):
@@ -78,8 +78,15 @@ class HaltSamplerVtref(unittest.TestCase):
             self.make(1800)._apply_vtref(jl)
         self.assertIn('고정 실패', '\n'.join(cm.output))
 
-    def test_config_default_is_1800(self):
-        self.assertEqual(fuzzer.FuzzConfig.__dataclass_fields__['jlink_vtref_mv'].default, 1800)
+    def test_config_default_is_auto(self):
+        self.assertIsNone(fuzzer.FuzzConfig.__dataclass_fields__['jlink_vtref_mv'].default)
+
+    def test_auto_config_sends_no_command(self):
+        jl = FakeJLink(measured=1790)
+        with self.assertLogs(fuzzer.log, 'WARNING') as cm:
+            self.make(None)._apply_vtref(jl)
+        self.assertEqual(jl.commands, [])
+        self.assertIn('VTref 자동 (측정 1790 mV)', '\n'.join(cm.output))
 
 
 if __name__ == '__main__':

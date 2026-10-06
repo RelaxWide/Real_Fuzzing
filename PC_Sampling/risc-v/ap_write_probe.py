@@ -31,7 +31,7 @@ tx 열 = watch 시작 후 누적 DP/AP 전송 수. --interval 을 바꿔 돌렸�
   같은 '초' 에 맞으면 시간 기반(칩 쪽), 같은 'tx' 에 맞으면 전송 기반(링크 동기 상실)이다.
 --speed: cJTAG 속도(kHz). 기본은 sfe76_link 의 값(10000).
 --aps: 시험할 AP 만 고른다(예: APBAP3). 시스템 버스 AP(AXI/AHB)를 건드리지 않고 보려는 용도.
---vtref-mv: VTref 고정(mV, 기본 1800, 0=자동). 시작 로그의 '[Link] VTref …' 줄에 고정 성공 여부와
+--vtref-mv: VTref 고정(mV, 기본 0=자동). 시작 로그의 '[Link] VTref …' 줄에 고정 성공 여부와
   고정 전 측정값이 찍힌다.
 
 사용: sudo python3 risc-v/ap_write_probe.py [--power both|dbg-only|sys-only] [--dap-abort]
@@ -216,7 +216,7 @@ def main():
                     help="--watch 반복 간격(초)")
     ap.add_argument("--speed", type=int, default=SPEED_KHZ, metavar="KHZ",
                     help=f"cJTAG 속도(kHz, 기본 {SPEED_KHZ})")
-    ap.add_argument("--vtref-mv", type=int, default=1800, metavar="MV",
+    ap.add_argument("--vtref-mv", type=int, default=0, metavar="MV",
                     help="J-Link VTref 고정값(mV), open 직후·connect 전 적용. 0=자동(측정값 추종)")
     ap.add_argument("--aps", default="", metavar="NAMES",
                     help="시험할 AP 이름만(쉼표 구분, 예: APBAP3 또는 APBAP1,APBAP3). 기본 전부")

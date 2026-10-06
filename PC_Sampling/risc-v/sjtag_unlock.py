@@ -1859,8 +1859,8 @@ def main():
                     help="DAP 전원요청. dbg-only=CDBG ACK 필수(기존). "
                          "sys-only=CSYS ACK 만으로 진행(secure 타깃: 인증 후 CDBG 열림 가설). "
                          "both=둘 다 ACK 필수")
-    ap.add_argument("--vtref-mv", type=int, default=1800, metavar="MV",
-                    help="J-Link VTref 고정값(mV), open 직후·connect 전 적용. 0=자동(측정값 추종). "
+    ap.add_argument("--vtref-mv", type=int, default=0, metavar="MV",
+                    help="J-Link VTref 고정값(mV), open 직후·connect 전 적용. 기본 0=자동(측정값 추종). "
                          "퍼저 jlink_vtref_mv 와 같은 조건으로 맞출 때 쓴다")
     ap.add_argument("--tap-script", choices=("on", "off"), default="off",
                     help="수동 TAP 체인 선언. 기본 off = CMM 방식(NOKEEPER USEOAC만). "

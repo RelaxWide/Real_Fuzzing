@@ -971,7 +971,7 @@ class PcsrSession:
     import·테스트된다."""
 
     def __init__(self, cores, power="both", tap_script=False, auth_wrapper=None,
-                 verbose=True, auth_timeout=60.0, word_order=None, vtref_mv=1800):
+                 verbose=True, auth_timeout=60.0, word_order=None, vtref_mv=None):
         self.cores = cores            # {core_id: {"name":…, "elf":…, "load_offset":…}}
         self.power, self.tap_script = power, tap_script
         self.vtref_mv = vtref_mv      # J-Link VTref 고정(mV). None/0 = 자동

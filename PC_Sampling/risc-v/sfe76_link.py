@@ -132,9 +132,10 @@ CJTAG_MODE  = 1
 DEVICE      = 'E76'      # ★ 'RISC-V' 는 connect 자체가 제대로 안 된다(실측)
 APB_INDEX   = 0          # DMI 가 붙은 AP (AddAP 의 Index)
 # VTref 고정값(mV). J-Link 는 기본적으로 1번 핀(VTref)을 재서 I/O 레벨을 맞춘다.
-#   값을 주면 open 직후, connect 전에 이 값으로 고정한다. None/0 = 자동(측정값 추종).
-#   ⚠ 고정하면 타깃 전원이 꺼진 동안(POR)에도 프로브가 그 레벨로 핀을 구동한다.
-VTREF_MV    = 1800
+#   값을 주면 open 직후, connect 전에 이 값으로 고정한다. None/0 = 자동(측정값 추종, 기본).
+#   ⚠ 고정하면 타깃 전원이 꺼진 동안(POR)에도 프로브가 그 레벨로 핀을 구동한다 — BM9K1 은
+#     디버그 핀이 부트 스트랩과 공유되므로 기본은 끈다.
+VTREF_MV    = None
 VTREF_CMD   = "VTREF = {mv}"     # J-Link DLL 명령 문자열 (JLinkExe 의 'VTREF <mV>')
 VTREF_TOL_MV = 100               # 고정 후 다시 읽은 값의 허용 오차
 
