@@ -18956,6 +18956,22 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             log.error(f"[Pre-flight] NVMe 디바이스 {nvme_dev} 에 대한 읽기/쓰기 권한이 없습니다.")
             log.error("  sudo로 실행하거나 권한을 확인하세요.")
             return
+        # v11.1: 첫 장치 명령 전에 응답부터 확인한다. 무응답 장치에서는 id-ctrl 이 커널 안(D 상태)에
+        #   묶이고, subprocess.run(timeout) 은 kill 뒤 그 프로세스를 끝없이 기다려 Pre-flight 가
+        #   커널 admin timeout·컨트롤러 리셋까지 멈췄다(최신 FW BM9K1, 'LBA size 자동 감지' 다음).
+        #   D 상태 안전 래퍼로 nvme_timeouts.command 안에 응답이 없으면 기다리지 않고 중단한다.
+        _probe_ms = self.config.nvme_timeouts.get('command', 8000)
+        _r = _run_nvme_state_cmd(['nvme', 'id-ctrl', self._ctrl_device()],
+                                 timeout_sec=_probe_ms / 1000.0)
+        if _r.returncode != 0:
+            _err = _r.stderr.decode(errors='replace').strip()[:120]
+            if _r.returncode == -1 and _err == 'timeout':
+                log.error(f"[Pre-flight] 장치 무응답 — id-ctrl 이 {_probe_ms / 1000:.1f}s "
+                          f"(nvme_timeouts.command) 안에 응답하지 않음")
+            else:
+                log.error(f"[Pre-flight] 장치 무응답 — id-ctrl 실패 rc={_r.returncode}: {_err}")
+            log.error("  SSD 가 admin 명령에 응답하지 않는 상태입니다. 전원 사이클(POR) 후 다시 실행하세요.")
+            return
         if (NSID_OVERRIDE_POLICY in ('active_only', 'configured_only')
                 and not (1 <= self.config.nvme_namespace <= 0xFFFFFFFE)):
             log.error(f"[Pre-flight] {NSID_OVERRIDE_POLICY} 정책에서 활성 namespace는 "
