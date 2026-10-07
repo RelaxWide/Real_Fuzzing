@@ -22,13 +22,17 @@ CSW 비트도 풀어 찍는다 — TrInProg(bit7)=1 이면 이전 전송이 끝�
   반복하고 한 줄씩 찍는다(전원 ON·부팅 이후 시간에 따라 어떻게 변하는지). 기호:
   O=일치  X=되읽기 불일치(0 등)  E=읽기 실패/0x80000000(링크 수준 에러)
   CTRL/STAT 의 요청(req)·응답(ack) 비트를 따로 찍는다:
-    req=1 ack=0 → 요청은 살아 있는데 칩이 디버그 전원을 회수
-    req=0       → DP 가 리셋돼 요청이 지워짐(디버그 도메인 리셋/전원 강하)
-  ※ CTRL/STAT 이 0x80000000 이면 실제 값이 아니라 J-Link 의 읽기 실패 표식이다(링크 끊김).
+    유효성 확인 뒤에만 req/ack 를 표시한다. 비트 변화만으로 reset/전원 소실을 확정하지 않는다.
+  ※ 0x80000000 은 읽기 실패 의심값(API 계약 아님): SUSPECT 로 남기고 비트를 해석하지 않는다.
+--dp-only: --watch 루프에서 DPIDR·CTRL/STAT 읽기만 수행한다(AP·ABORT·전원요청 쓰기 없음).
+  공통 세션 준비의 TIF 초기화·전원요청 쓰기는 그대로 수행한다. 완전 수동 관찰은 아니다.
+  --reassert/--dap-abort/--aps 와 함께 사용할 수 없다.
+AP watch 는 접근 전(pre)·후(post) DP 상태를 남긴다. 두 읽기는 동시 스냅샷이 아니다.
 --reassert: 매 회 ABORT(0x1E)·전원요청을 다시 써서 회복되는지 본다.
 VTref 열 = 프로브가 잰 1번 핀 전압(mV). 링크가 끊길 때 같이 떨어지면 타깃 IO 기준전압/배선 쪽.
-tx 열 = watch 시작 후 누적 DP/AP 전송 수. --interval 을 바꿔 돌렸을 때 끊기는 시점이
-  같은 '초' 에 맞으면 시간 기반(칩 쪽), 같은 'tx' 에 맞으면 전송 기반(링크 동기 상실)이다.
+tx 열 = watch 시작 후 누적 DLL read/write 호출 수(실제 wire 전송 수와 다를 수 있음).
+  --interval 을 바꿨을 때 장애가 시간/호출 수 중 무엇에 연관되는지 비교하는 단서다.
+  시간 또는 호출 수가 같다는 것만으로 칩/링크 원인을 확정하지 않는다.
 --speed: cJTAG 속도(kHz). 기본은 sfe76_link 의 값(10000).
 --aps: 시험할 AP 만 고른다(예: APBAP3). 시스템 버스 AP(AXI/AHB)를 건드리지 않고 보려는 용도.
 --vtref-mv: VTref 고정(mV, 기본 0=자동). 시작 로그의 '[Link] VTref …' 줄에 고정 성공 여부와
@@ -38,6 +42,9 @@ tx 열 = watch 시작 후 누적 DP/AP 전송 수. --interval 을 바꿔 돌렸�
       sudo python3 risc-v/ap_write_probe.py --watch 120 [--interval 2]
 """
 import argparse
+import inspect
+import math
+import platform
 import os
 import sys
 import time
@@ -66,8 +73,8 @@ def jlink_info(jl):
 
 
 def sticky_bits(v):
-    if v is None:
-        return "CTRL/STAT 읽기 실패"
+    if v is None or v in (0, 0x80000000, 0xFFFFFFFF):
+        return "CTRL/STAT 판정 보류(읽기 실패/의심값)"
     bits = [nm for m, nm in ((1 << 7, 'WDATAERR'), (1 << 5, 'STICKYERR'),
                              (1 << 1, 'STICKYORUN')) if v & m]
     return " ".join(bits) if bits else "에러 없음"
@@ -151,19 +158,40 @@ def nvme_state():
 
 
 def pwr_bits(ctrl):
-    """CTRL/STAT → 'Dr/Da Sr/Sa' (CDBG req/ack, CSYS req/ack)."""
-    if ctrl is None:
-        return '  ?/? ?/?'
+    """Suspect values are not evidence of power/reset state."""
+    if ctrl is None or ctrl in (0, 0x80000000, 0xFFFFFFFF):
+        return '?/? ?/?'
     b = lambda n: (ctrl >> n) & 1
-    return f"  {b(28)}/{b(29)} {b(30)}/{b(31)}"
+    return f'{b(28)}/{b(29)} {b(30)}/{b(31)}'
+
+
+def dp_sample(dap, baseline):
+    """Read once, without recovery writes/retries; retain raw evidence."""
+    dpidr = dap.dp_read(0)
+    ctrl = dap.dp_read(DP_CTRL_STAT)
+    if dpidr is None or ctrl is None:
+        state = 'READ_FAIL'
+    elif (dpidr in (0, 0x80000000, 0xFFFFFFFF) or not dpidr & 1
+          or ctrl in (0, 0x80000000, 0xFFFFFFFF)):
+        state = 'SUSPECT'
+    elif baseline is not None and dpidr != baseline:
+        state = 'DPIDR_CHANGED'
+    else:
+        # Plausibility only, not independent proof of a successful bus transfer.
+        state = 'PLAUSIBLE'
+    return dict(dpidr=dpidr, ctrl=ctrl, state=state,
+                power=pwr_bits(ctrl) if state == 'PLAUSIBLE' else '?/? ?/?')
 
 
 class TxCounter:
-    """jl.coresight_read/write 호출 수를 센다(인스턴스 속성으로 감싼다)."""
+    """Count DLL calls (not physical wire transactions); undo wrappers on exit."""
     def __init__(self, jl):
         self.n = 0
+        self.jl = jl
+        self.originals = {}
         for name in ('coresight_read', 'coresight_write'):
             fn = getattr(jl, name)
+            self.originals[name] = fn
             setattr(jl, name, self._wrap(fn))
 
     def _wrap(self, fn):
@@ -172,36 +200,80 @@ class TxCounter:
             return fn(*a, **k)
         return call
 
+    def close(self):
+        for name, fn in self.originals.items():
+            setattr(self.jl, name, fn)
 
-def watch(dap, seconds, interval, reassert=False, req=0x50000000, aps=None):
-    aps = aps or AP_MAP
+
+def watch(dap, seconds, interval, reassert=False, req=0x50000000, aps=None,
+          dp_only=False):
+    if dp_only and reassert:
+        raise ValueError('DP-only watch cannot reassert power')
+    aps = [] if dp_only else (AP_MAP if aps is None else aps)
     names = [n for n, _b, _k in aps]
-    print(f"\n  [watch] {seconds:.0f}초, {interval:.1f}초 간격"
-          + (", 매 회 전원요청 재기입" if reassert else "")
-          + "  (O=일치 X=불일치 E=링크에러)")
-    print("    t(s)      tx  VTref   DPIDR       CTRL/STAT   CDBG CSYS(req/ack)  "
-          + " ".join(f"{n:>7}" for n in names) + "   nvme")
+    print(f"\n  [watch] mode={'dp-only' if dp_only else 'ap-tar'} "
+          f"kernel={platform.release()} duration={seconds:g}s interval={interval:g}s"
+          + (" reassert=ON" if reassert else " reassert=OFF"), flush=True)
+    print('  PLAUSIBLE=읽기값 형식/DPIDR 일관성만 확인(전원 상태 확정 아님). '
+          'SUSPECT/READ_FAIL/DPIDR_CHANGED는 req/ack 판정 보류.')
+    print('  tx=watch 시작 이후 DLL read/write 호출 수; pre/post는 AP 접근 전후. '
+          'VTref는 느린 프로브 측정값이라 짧은 전압 강하를 배제하지 못함.')
+    print('    t(s)      tx phase  DPIDR       CTRL/STAT   CDBG CSYS   quality'
+          '         VTref  AP-results / nvme', flush=True)
     tx = TxCounter(dap.jl)
     t0 = time.monotonic()
-    while True:
-        t = time.monotonic() - t0
-        n0 = tx.n
-        if reassert:
-            dap.dp_write(DP_ABORT, 0x0000001E)
-            dap.dp_write(DP_CTRL_STAT, req)
-            dap._select = None
-        dpidr = dap.dp_read(0)
-        ctrl = dap.dp_read(DP_CTRL_STAT)
-        marks = [quick_ap(dap, b) for _n, b, _k in aps]
+    baseline = None
+    first = None
+    count = 0
+
+    def emit(phase, row, marks='-'):
+        nonlocal first, count
+        elapsed = time.monotonic() - t0
+        count += 1
         try:
-            vt = str(int(dap.jl.hardware_status.voltage))      # 프로브가 잰 VTref(mV)
+            vt = str(int(dap.jl.hardware_status.voltage))
         except Exception:
             vt = '?'
-        print(f"    {t:6.1f}  {n0:6d}  {vt:>5}  {hx(dpidr):>10}  {hx(ctrl):>10}  {pwr_bits(ctrl):>16}  "
-              + " ".join(f"{m:>7}" for m in marks) + f"   {nvme_state()}", flush=True)
-        if t >= seconds:
-            return
-        time.sleep(interval)
+        print(f"    {elapsed:6.3f}  {tx.n:6d} {phase:5} "
+              f"{hx(row['dpidr']):>10} {hx(row['ctrl']):>10} "
+              f"{row['power']:>9} {row['state']:15} {vt:>5}  {marks} / {nvme_state()}",
+              flush=True)
+        reason = None
+        if row['state'] != 'PLAUSIBLE':
+            reason = row['state']
+        elif row['ctrl'] & req != req:
+            reason = 'REQ_BITS_DIFFER'  # observation, not a reset diagnosis
+        elif row['ctrl'] & (req << 1) != (req << 1):
+            reason = 'ACK_NOT_SET'  # includes an ACK not yet asserted at startup
+        if marks != '-' and any(mark != 'O' for mark in marks.split()):
+            reason = reason or 'AP_CHECK_FAILED'
+        if reason and first is None:
+            first = f't={elapsed:.3f}s tx={tx.n} phase={phase} reason={reason}'
+            print('  [first-anomaly] ' + first, flush=True)
+
+    try:
+        while True:
+            if reassert:
+                dap.dp_write(DP_ABORT, 0x0000001E)
+                dap.dp_write(DP_CTRL_STAT, req)
+                dap._select = None
+            pre = dp_sample(dap, baseline)
+            if baseline is None and pre['state'] == 'PLAUSIBLE':
+                baseline = pre['dpidr']
+            emit('dp' if dp_only else 'pre', pre)
+            if not dp_only:
+                marks = [quick_ap(dap, b) for _n, b, _k in aps]
+                post = dp_sample(dap, baseline)
+                emit('post', post, ' '.join(marks))
+                print('  [aps] ' + ' '.join(f'{n}={m}' for n, m in zip(names, marks)), flush=True)
+            remaining = seconds - (time.monotonic() - t0)
+            if remaining <= 0:
+                return
+            time.sleep(min(interval, remaining))
+    finally:
+        tx.close()
+        print(f"  [summary] samples={count} calls={tx.n} first={first or 'none observed'}",
+              flush=True)
 
 
 def main():
@@ -222,7 +294,15 @@ def main():
                     help="시험할 AP 이름만(쉼표 구분, 예: APBAP3 또는 APBAP1,APBAP3). 기본 전부")
     ap.add_argument("--reassert", action="store_true",
                     help="--watch 매 회 ABORT·전원요청을 다시 써서 회복 여부를 본다")
+    ap.add_argument("--dp-only", action="store_true",
+                    help="--watch 관측 루프에서 DP만 읽음(세션 준비는 전원요청 포함)")
     a = ap.parse_args()
+    if not math.isfinite(a.watch) or a.watch < 0:
+        ap.error('--watch must be finite and >= 0')
+    if not math.isfinite(a.interval) or a.interval < 0.2:
+        ap.error('--interval must be finite and >= 0.2')
+    if a.dp_only and (a.watch <= 0 or a.reassert or a.dap_abort or a.aps):
+        ap.error('--dp-only requires --watch > 0; incompatible with --reassert/--dap-abort/--aps')
 
     if not AP_MAP:
         print("AP_MAP 비어 있음 — risc-v/sjtag_addrs.json 확인", file=sys.stderr)
@@ -232,7 +312,12 @@ def main():
     if not aps:
         print(f"--aps 에 맞는 AP 없음 (가능: {', '.join(r[0] for r in AP_MAP)})", file=sys.stderr)
         return 9
-    lk = Link(core_base=CORE_BASE_MAIN, speed=a.speed, vtref_mv=a.vtref_mv)
+    link_args = dict(core_base=CORE_BASE_MAIN, speed=a.speed)
+    if 'vtref_mv' in inspect.signature(Link).parameters:
+        link_args['vtref_mv'] = a.vtref_mv
+    elif a.vtref_mv:
+        ap.error('installed sfe76_link.Link does not support --vtref-mv; update it first')
+    lk = Link(**link_args)
     try:
         lk.open(tap_script=False)
     except Exception as e:
@@ -257,7 +342,7 @@ def main():
 
         if a.watch:
             req = 0x10000000 if a.power == "dbg-only" else 0x50000000
-            watch(dap, a.watch, max(0.2, a.interval), a.reassert, req, aps)
+            watch(dap, a.watch, a.interval, a.reassert, req, aps, dp_only=a.dp_only)
             return 0
 
         rows = [(name,) + probe_ap(dap, name, base) for name, base, _k in aps]
