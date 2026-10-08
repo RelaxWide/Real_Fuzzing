@@ -726,7 +726,11 @@
   "visualization": {
     "graph_refresh_interval": 5000,
     "_comment_extra_charts": "true면 부가 차트(command_comparison, coverage_heatmap_1d, mutation_chart)도 그린다. 기본은 핵심 차트(coverage_growth: 출처별 몫 포함, firmware_map, csfuzz_dynamics)만.",
-    "extra_charts": false
+    "extra_charts": false,
+    "_comment_breakthrough": "v11.2 coverage_growth 의 LLM 돌파 표시. mutation 이 자기 명령으로 새 BB 를 못 찾은 길이가 max(breakthrough_min_mut_cmds, breakthrough_gap_factor × mutation 평소 발견 간격 중앙값) 이상인 구간에 LLM 계보가 새 BB 를 찾으면 별·음영으로 표시. breakthrough_labels = 글 주석을 붙일 상위 개수(정체 긴 순).",
+    "breakthrough_min_mut_cmds": 1000,
+    "breakthrough_gap_factor": 5.0,
+    "breakthrough_labels": 3
   },
   "mutation": {
     "opcode": 0.1,

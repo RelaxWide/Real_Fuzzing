@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-FUZZER_FILE = ROOT / 'pc_sampling_fuzzer_v11.1.py'
+FUZZER_FILE = ROOT / 'pc_sampling_fuzzer_v11.2.py'
 MODULE = 'fuzzer_active_test'
 
 if MODULE in sys.modules:

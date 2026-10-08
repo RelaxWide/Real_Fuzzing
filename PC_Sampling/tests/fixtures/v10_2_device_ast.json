@@ -84,6 +84,12 @@
       "date": "2026-10-02",
       "base_commit": "2f55e5e",
       "reason": "RiscvPcsrSampler, JLinkHaltSampler: J-Link VTref is fixed to config jlink_vtref_mv (default 1800 mV, null/0 = auto) right after pylink open and before connect/SJTAG auth; RiscvPcsrSampler only forwards the value to PcsrSession -> sfe76_link.Link.open (re-applied on every reopen). Failure to set or a read-back mismatch only logs a warning and leaves J-Link on measured VTref. Reviewed; register/sampling paths unchanged."
+    },
+    {
+      "file": "pc_sampling_fuzzer_v11.2.py",
+      "date": "2026-10-07",
+      "base_commit": "e873ec9",
+      "reason": "v11.2 is a new file copied from v11.1 (PM preflight hang/failure handling). All guarded AST paths are identical to the reviewed v11.1 overrides; no hashes regenerated. v11.1 stays frozen as a legacy check. Future engine changes target v11.2."
     }
   ],
   "overrides_note": "hashes 는 모든 DEVICE_AST_FILES 에 적용되는 기준선이다. overrides 는 검토를 거쳐 **특정 파일에서만** 의도적으로 달라진 경로를 기록한다. v10.2 는 검증된 fallback 이라 계속 기준선 그대로여야 하고, 여기 올라오지 않은 파일·경로는 전부 기준선에 묶인다.",
@@ -97,6 +103,12 @@
       "_V101Fuzzer._send_nvme_command": "7abc961d8a41815a0c354581e6bc8eb89ee0449be5d8baae692dca55ccae61ef"
     },
     "pc_sampling_fuzzer_v11.1.py": {
+      "OpenOCDPCSampler": "48865eb551960624265b061a897ddf8abdc2586862598bc2be3c97a3a69aba04",
+      "_V101Fuzzer._send_nvme_command": "0357c5f8d049a5f11bb1491af57d766508970f4680124247624e441a3b336b24",
+      "RiscvPcsrSampler": "d80278b7f199f26ddf7c19e8f22ec5be033ed2190fe5b8819294229ac64959f0",
+      "JLinkHaltSampler": "e44a432e61c101138e2b97c43f3218d4c2b2033d0d58cd4ed4a9dede6607d250"
+    },
+    "pc_sampling_fuzzer_v11.2.py": {
       "OpenOCDPCSampler": "48865eb551960624265b061a897ddf8abdc2586862598bc2be3c97a3a69aba04",
       "_V101Fuzzer._send_nvme_command": "0357c5f8d049a5f11bb1491af57d766508970f4680124247624e441a3b336b24",
       "RiscvPcsrSampler": "d80278b7f199f26ddf7c19e8f22ec5be033ed2190fe5b8819294229ac64959f0",

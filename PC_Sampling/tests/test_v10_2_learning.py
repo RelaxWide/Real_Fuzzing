@@ -21,7 +21,7 @@ from riscv_cov import CoreMap, CoverageModel, pack
 from fuzzer_target import FUZZER_FILE, fuzzer             # noqa: E402
 # 장치 경로 AST 는 과거 버전까지 같은 기준선으로 계속 검사한다(아래 고정 기준선 시험).
 DEVICE_AST_FILES = (ROOT / 'pc_sampling_fuzzer_v10.2.py', ROOT / 'pc_sampling_fuzzer_v10.3.py',
-                    ROOT / 'pc_sampling_fuzzer_v11.py', FUZZER_FILE)
+                    ROOT / 'pc_sampling_fuzzer_v11.py', ROOT / 'pc_sampling_fuzzer_v11.1.py', FUZZER_FILE)
 
 
 def recipe():
