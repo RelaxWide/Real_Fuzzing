@@ -176,6 +176,7 @@ class Runner(unittest.TestCase):
     def test_hung_child_is_abandoned_and_recorded(self):
         f = v.NVMeFuzzer.__new__(v.NVMeFuzzer)
         f._pm_unresponsive = None
+        f._cmd_history = v._CmdHistory()
         t0 = time.monotonic()
         r = f._pm_nvme_run(['sleep', '30'], 0.3)
         self.assertLess(time.monotonic() - t0, 5.0)
@@ -185,12 +186,15 @@ class Runner(unittest.TestCase):
     def test_error_is_not_unresponsive(self):
         f = v.NVMeFuzzer.__new__(v.NVMeFuzzer)
         f._pm_unresponsive = None
+        f._cmd_history = v._CmdHistory()
         f._pm_nvme_run(['false'], 5.0)
         self.assertIsNone(f._pm_unresponsive)
+        self.assertEqual((f._cmd_history[-1]['argv'], f._cmd_history[-1]['rc']), (['false'], 1))
 
     def test_set_state_timeout_returns_false(self):
         f = v.NVMeFuzzer.__new__(v.NVMeFuzzer)
         f._pm_unresponsive = None
+        f._cmd_history = v._CmdHistory()
         f.config = SimpleNamespace(nvme_device='/dev/nvme0')
         f._cmd_history = deque(maxlen=10)
         with patch('fuzzer_active_test._run_nvme_state_cmd', return_value=TIMEOUT):

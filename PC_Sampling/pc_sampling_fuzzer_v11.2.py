@@ -20,6 +20,7 @@ Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/�
 버전 요약 (한 줄 요약; 상세는 git log / 각 버전 md)
 - v11.2: PM preflight 무응답(D 상태) 멈춤 방지 + 복귀 실패·무응답 시 현상 보존·증거 수집 후 중단.
         coverage_growth 에 LLM 돌파(mutation 정체 중 LLM 이 찾은 BB) 표시.
+        11.2.1: io_patterns 프롬프트가 seeds 모양으로 응답받던 것 수정(출력 모양 명시, 시드용 블록 제외).
 - v11.1: 실행 기록·LLM 몫 그래프·CSFuzz p 수정·장치 소실 감지.
 - v11: 독립 퍼징 엔진 + 예외 주입·사전시험·불량 보존·재개 관측 분리. v10.3 파일 불필요.
 - v10.3: LLM 백엔드를 사내 2노드 Samba 브리지 → **로컬 vLLM** 으로 이관. task별 json_schema
@@ -103,6 +104,7 @@ from pathlib import Path
 from enum import Enum, IntEnum
 import contextlib
 import bisect
+import shlex
 
 # Optional freeze evidence: local nonblocking UDP -> independent PuTTY watcher.
 # This code precedes config/device imports so --freeze-watch needs only stdlib.
@@ -327,7 +329,7 @@ except Exception:
     _pylink = None
 
 # 버전
-FUZZER_VERSION = "11.2.0"
+FUZZER_VERSION = "11.2.1"
 
 # ─────────────────────────────────────────────────────────────────────────
 # USER CONFIGURATION  — 값은 모두 fuzzer_config.json 에서 로드한다 (v8.3).
@@ -2220,6 +2222,30 @@ class NVMeStateDelta:
     def state_buckets(self) -> List[str]:
         """CSFuzz §III-B 적응형 버킷 목록 반환 (pre-computed)."""
         return self.buckets
+
+
+class _CmdHistory(deque):
+    """v11.2.1: 명령 이력 — 명령(kind != 'op')은 최근 MAX_CMDS 개, 그 사이의 PM 저수준 동작(op)도 함께 둔다.
+
+    replay 가 preflight·PM 전환이 실제로 한 setpci·PMU·sysfs·검증 명령을 같은 순서·간격으로 재생하려면
+    그 동작이 명령과 같은 이력에 순서대로 있어야 한다. 명령 수 기준(100)은 예전 deque(maxlen=100) 과 같고,
+    op 는 전체 MAX_TOTAL 안에서 따라간다(앞쪽 명령이 밀려나면 그 앞의 op 도 같이 밀려난다).
+    """
+    MAX_CMDS, MAX_TOTAL = 100, 5000
+
+    def __init__(self, items=()):
+        super().__init__()
+        self._n_cmds = 0
+        for item in items:
+            self.append(item)
+
+    def append(self, item):
+        super().append(item)
+        if item.get('kind') != 'op':
+            self._n_cmds += 1
+        while self._n_cmds > self.MAX_CMDS or len(self) > self.MAX_TOTAL:
+            if self.popleft().get('kind') != 'op':
+                self._n_cmds -= 1
 
 
 @dataclass
@@ -5930,7 +5956,7 @@ class _V101Fuzzer:
 
         self._nvme_input_path: Optional[str] = None
 
-        self._cmd_history: deque = deque(maxlen=100)
+        self._cmd_history: deque = _CmdHistory()
 
         # v7.0: State monitoring
         self.state_monitor    = NVMeStateMonitor(config.nvme_device, config.state_fields)
@@ -7411,7 +7437,8 @@ class _V101Fuzzer:
         "the fuzzer's current coverage gaps and the exact command schemas.\n"
         "HARD RULES:\n"
         " - Output ONLY a single strict-JSON object — no prose, no markdown/code fence, no "
-        "comments. Keys: \"seeds\", \"sequences\", \"evaluations\" (include only what the task asks).\n"
+        "comments. Top-level keys: \"seeds\", \"sequences\", \"evaluations\", \"io_workload\" — "
+        "output ONLY the key(s) the task asks for; never add the others.\n"
         " - Emit only LITERAL JSON values. NEVER use expressions, function calls (e.g. "
         "repeat()), string concatenation, ellipses (...), or trailing commas. A standard JSON "
         "parser must accept your output verbatim.\n"
@@ -7428,9 +7455,12 @@ class _V101Fuzzer:
         f" - \"data_hex\" is a LITERAL lowercase hex string, exactly 2 chars per byte (e.g. "
         f"\"00ff1a\"), at most {MAX_INPUT_LEN} bytes. Write the bytes out literally — NO "
         "expressions, NO repeat(), NO '...'.\n"
-        "JSON shape: {\"seeds\":[{\"command\":str,\"cdw10\":int,...,\"seed_class\":str}], "
+        "Shape of each top-level key (emit only the one(s) the task asks for): "
+        "{\"seeds\":[{\"command\":str,\"cdw10\":int,...,\"seed_class\":str}], "
         "\"sequences\":[{\"commands\":[{\"command\":str,\"cdw10\":int,...}],\"seed_class\":str}], "
-        "\"evaluations\":[{\"seed_id\":int,\"score\":float,\"keep\":bool}]}"
+        "\"evaluations\":[{\"seed_id\":int,\"score\":float,\"keep\":bool}], "
+        "\"io_workload\":{\"pattern\":str,\"lba_span\":int,\"block_size\":int,"
+        "\"hot_fraction\":float,\"read_ratio\":float,\"direction\":str}}"
     )
 
     def _llm_schema_pick(self, names):
@@ -8326,8 +8356,9 @@ class _V101Fuzzer:
             _badline = (f"Your previous io_workload used pattern {json.dumps(_bad)}, which is NOT a "
                         f"valid name, so it was DISCARDED.\n" if _bad is not None else "")
             _params = "; ".join(f"{k} -> {', '.join(v)}" for k, v in IO_WL_PARAM_PATTERNS.items())
-            user = (_gp
-                    + "SSD internal state (telemetry — name = value  [description]):\n"
+            # v11.2.1: grounding(시드 few-shot·명령 제안 지시)은 싣지 않는다 — 워크로드 선택과 무관하고,
+            #   스키마가 없는 경로(rag_bridge)에서 모델이 {"seeds":[],...} 로 답하게 만들었다.
+            user = ("SSD internal state (telemetry — name = value  [description]):\n"
                     + (tele or "  (telemetry unavailable)") + "\n\n"
                     + _table + "\n"
                     + (fb + "\n" if fb else "") + "\n"
@@ -8340,12 +8371,16 @@ class _V101Fuzzer:
                     + _badline
                     + "The \"pattern\" value must be copied EXACTLY, character for character, from "
                       f"this list (no synonyms, no abbreviations): {json.dumps(IO_WL_PATTERNS)}\n"
-                    + "Fields: {\"pattern\": one of the names in that list, \"lba_span\": int LBAs "
-                      "(working set), \"block_size\": int LBAs per command, \"hot_fraction\": 0..1, "
-                      "\"read_ratio\": 0..1, \"direction\": the internal mechanism you target and "
-                      "the telemetry that motivated it}. "
-                    + f"Params apply only to these patterns (ignored elsewhere): {_params}. "
-                      "Return JSON only: a single object with key \"io_workload\".")
+                    + f"Params apply only to these patterns (ignored elsewhere): {_params}.\n"
+                    # v11.2.1: 완성된 출력 모양을 마지막에 그대로 준다. 예전엔 안쪽 필드만 보여 주고
+                    #   감싸는 키는 끝 한 줄에만 있어, 스키마가 없으면 다른 task 모양으로 답했다.
+                    + "Output EXACTLY this JSON shape and nothing else — the only top-level key is "
+                      "\"io_workload\" (do NOT output \"seeds\", \"sequences\" or \"evaluations\"):\n"
+                      "{\"io_workload\": {\"pattern\": \"<one name from the list>\", "
+                      "\"lba_span\": <int LBAs, working set>, \"block_size\": <int LBAs per command>, "
+                      "\"hot_fraction\": <0..1>, \"read_ratio\": <0..1>, "
+                      "\"direction\": \"<the internal mechanism you target and the telemetry that "
+                      "motivated it>\"}}")
             return self._LLM_SYSTEM, user
         return None
 
@@ -10544,7 +10579,9 @@ class _V101Fuzzer:
                             and self.state_monitor.update_cov_map(_delta, self.state_cov_map)
                             and self._cmd_history):
                         _entry = StateCorpusEntry(
-                            sequence = list(self._cmd_history),
+                            # v11.2.1: PM 저수준 동작(op)은 빼고 저장 — state 재생은 nvme 만 쓰고, op 를 담으면
+                            #   항목당 수천 개가 state corpus(최대 50) 메모리에 쌓인다
+                            sequence = [h for h in self._cmd_history if h.get('kind') != 'op'],
                             delta    = _delta,
                             score    = _delta.score,
                             causes   = [b for b in _delta.state_buckets()
@@ -11967,10 +12004,13 @@ class _V101Fuzzer:
     def _pm_timed_out(r) -> bool:
         return r.returncode == -1 and r.stderr == b'timeout'
 
-    def _pm_nvme_run(self, cmd, timeout_sec: float):
+    def _pm_nvme_run(self, cmd, timeout_sec: float, record: bool = True):
+        t0 = time.monotonic()
         r = _run_nvme_state_cmd(cmd, timeout_sec=timeout_sec)
         if self._pm_timed_out(r):
             self._pm_unresponsive = f"{' '.join(cmd[:2])} 가 {timeout_sec:g}s 안에 응답하지 않음"
+        if record:     # v11.2.1: 검증용 get-feature·id-ctrl 도 replay 에서 같은 자리에 보낸다
+            self._op_record(t0, argv=cmd, rc=r.returncode)
         return r
 
     def _pm_set_state(self, ps: int) -> bool:
@@ -11993,7 +12033,7 @@ class _V101Fuzzer:
         ]
         label = f"PS{ps}" if ps > 0 else "PS0(복귀)"
         # 재현 TC 히스토리 기록 (PM 진입/복귀도 포함)
-        self._cmd_history.append({
+        _hist = {
             'kind': 'pm',
             'label': f'PM {label}',
             'passthru_type': 'admin-passthru',
@@ -12004,10 +12044,13 @@ class _V101Fuzzer:
             'cdw10': 0x02, 'cdw11': ps,
             'cdw12': 0, 'cdw13': 0, 'cdw14': 0, 'cdw15': 0,
             'data': None, 'data_len': 0, 'is_write': False,
-        })
+        }
+        self._cmd_history.append(_hist)
         _pm_t0 = time.monotonic()
         try:
-            result = self._pm_nvme_run(nvme_cmd, 5.0)
+            _hist['t0'] = time.monotonic()      # v11.2.1: replay 가 앞뒤 간격을 재현
+            result = self._pm_nvme_run(nvme_cmd, 5.0, record=False)
+            _hist['t1'] = time.monotonic()
             ok = (result.returncode == 0)
             status = ("OK" if ok else "FAIL(무응답 — 5s)" if self._pm_timed_out(result)
                       else f"FAIL(rc={result.returncode})")
@@ -12030,12 +12073,47 @@ class _V101Fuzzer:
         except Exception:
             return None
 
+    # v11.2.1: PM 저수준 동작 기록 — replay 가 preflight·PM 전환과 **같은 동작을 같은 간격**으로 재생하게.
+    #   예전 replay 는 'pcie_state' 같은 요약 항목에서 setpci 를 따로 다시 만들어 순서(EP/RP)·조건(CPM)·
+    #   CLKREQ# assert·ASPM 정책 쓰기·검증 명령(get-feature·lspci)·대기 시간이 실제와 달랐다.
+    def _op_record(self, t0, argv=None, rc=None, sysfs=None, value=None) -> None:
+        what = (f"{sysfs} <= {value}" if sysfs else " ".join(str(a) for a in (argv or ())))
+        self._cmd_history.append({'kind': 'op', 'label': 'op ' + what.replace('"', "'")[:160],
+                                  'argv': list(argv) if argv else None, 'sysfs': sysfs,
+                                  'value': value, 'rc': rc, 't0': t0, 't1': time.monotonic()})
+
+    def _op_run(self, argv, timeout, **kw):
+        """subprocess.run 과 같다(예외도 그대로 올린다). 실행한 argv·rc·시각을 이력에 남긴다.
+        python3 스크립트 경로는 절대 경로로 — replay 는 crash 폴더에서 돈다."""
+        argv = [os.path.abspath(a) if i == 1 and argv[0] == 'python3' and os.path.isfile(a) else a
+                for i, a in enumerate(argv)]
+        t0, rc = time.monotonic(), None
+        try:
+            r = subprocess.run(argv, timeout=timeout, **kw)
+            rc = r.returncode
+            return r
+        finally:
+            self._op_record(t0, argv=argv, rc=rc)
+
+    def _op_sysfs_write(self, path: str, value: str) -> None:
+        """sysfs 쓰기 + 기록. 실패는 예외 그대로(호출부가 기존처럼 처리)."""
+        t0, rc = time.monotonic(), 1
+        try:
+            Path(path).write_text(value)
+            rc = 0
+        finally:
+            self._op_record(t0, sysfs=path, value=value, rc=rc)
+
     def _setpci_read(self, bdf: str, offset: int, width: str = 'l') -> Optional[int]:
         """setpci로 PCI config 레지스터 읽기. 실패 시 None 반환.
         width: 'b'=1B 'w'=2B 'l'=4B
         """
-        r = self._run_cmd(['setpci', '-s', bdf, f'{offset:#x}.{width}'], timeout=3)
-        if r and r.stdout.strip():
+        try:
+            r = self._op_run(['setpci', '-s', bdf, f'{offset:#x}.{width}'], 3,
+                             capture_output=True, text=True)
+        except Exception:
+            return None
+        if r.returncode == 0 and r.stdout.strip():
             return int(r.stdout.strip(), 16)
         return None
 
@@ -12045,8 +12123,8 @@ class _V101Fuzzer:
         nchars = {'b': 2, 'w': 4, 'l': 8}[width]
         spec = f'{offset:#x}.{width}={value & mask:0{nchars}x}:{mask:0{nchars}x}'
         try:
-            r = subprocess.run(['setpci', '-s', bdf, spec],
-                               timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            r = self._op_run(['setpci', '-s', bdf, spec],
+                             timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return r.returncode == 0
         except Exception:
             return False
@@ -12216,7 +12294,7 @@ class _V101Fuzzer:
         """CLKREQ# assert only. PCIe config cleanup is intentionally separate."""
         t0 = time.monotonic()
         try:
-            r = subprocess.run(
+            r = self._op_run(
                 ['python3', self.config.pmu_script,
                  str(self.config.clkreq_assert_pin), '1', '1',
                  str(self.config.clkreq_voltage_mv)],
@@ -12236,7 +12314,7 @@ class _V101Fuzzer:
         """CLKREQ# deassert only. Use after L1SS/LNKCTL/D-state are armed."""
         t0 = time.monotonic()
         try:
-            r = subprocess.run(
+            r = self._op_run(
                 ['python3', self.config.pmu_script,
                  str(self.config.clkreq_deassert_pin), '1', '1',
                  str(self.config.clkreq_voltage_mv)],
@@ -12548,8 +12626,8 @@ class _V101Fuzzer:
                 self._setpci_write(rp, rc + 0x10, 0x0000, 0x0100, 'w')
             # 5. ASPM 정책 복원
             try:
-                Path('/sys/module/pcie_aspm/parameters/policy').write_text(
-                    self._orig_aspm_policy)
+                self._op_sysfs_write('/sys/module/pcie_aspm/parameters/policy',
+                                     self._orig_aspm_policy)
             except Exception:
                 pass
             # 6. 검증: endpoint LNKCTL ASPMC == 0
@@ -12582,7 +12660,7 @@ class _V101Fuzzer:
                 return False
             # 4. 전역 ASPM 정책 → powersave (커널 override 방지)
             try:
-                Path('/sys/module/pcie_aspm/parameters/policy').write_text('powersave')
+                self._op_sysfs_write('/sys/module/pcie_aspm/parameters/policy', 'powersave')
             except Exception:
                 pass
             # 4. LNKCTL ASPMC = ASPMS & 0b10 — EP(downstream) 먼저, RP(upstream) 이후
@@ -12632,7 +12710,7 @@ class _V101Fuzzer:
 
             # Step 2: 전역 ASPM 정책
             try:
-                Path('/sys/module/pcie_aspm/parameters/policy').write_text('powersave')
+                self._op_sysfs_write('/sys/module/pcie_aspm/parameters/policy', 'powersave')
             except Exception:
                 pass
 
@@ -13250,7 +13328,7 @@ class _V101Fuzzer:
         #    컨트롤러가 강제 wake-up되어 NAND 재초기화 transient 전류가 발생함.
         #    PMU 측정은 JTAG 경로(pmu_4_1.py)이므로 NVMe 링크를 건드리지 않음.
         try:
-            r = subprocess.run(
+            r = self._op_run(
                 ['python3', self.config.pmu_script, '3', '1'],
                 capture_output=True, text=True, timeout=3)
             raw = r.stdout.strip()
@@ -13351,7 +13429,7 @@ class _V101Fuzzer:
         # 3d. lspci -vv 로 실제 링크 ASPM 상태 확인 (LnkCtl: ASPM ... line)
         if self._pcie_bdf:
             try:
-                r = subprocess.run(
+                r = self._op_run(
                     ['lspci', '-vv', '-s', self._pcie_bdf],
                     capture_output=True, text=True, timeout=5)
                 for line in r.stdout.splitlines():
@@ -16090,6 +16168,8 @@ class _V101Fuzzer:
             self._generate_seq_replay_sh(_seq_seed)
         self._seq_sink = None
 
+    _REPLAY_GAP_CAP_S = 30.0   # v11.2.1: op 사이 간격 재생 상한(초) — 퍼저 기동 대기 같은 긴 공백은 자른다
+
     def _generate_replay_sh(self, crash_dir: Path, tag: str) -> None:
         """crash 발생 직전 최대 100개 명령어(PM 포함)를 재현 가능한 .sh 파일로 저장.
 
@@ -16111,11 +16191,16 @@ class _V101Fuzzer:
         data_dir_rel = data_dir.name   # 'replay_data_<tag>' — sh_path 와 같은 디렉토리
 
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # v11.2.1: 이력에 PM 저수준 동작(op)이 있으면 그것을 **실제 실행 순서·간격 그대로** 재생하고,
+        #   같은 동작의 요약 항목(pcie_state·pcie_pm_bit·clkreq)은 setpci 를 다시 만들지 않는다(주석만).
+        has_ops = any(e.get('kind') == 'op' for e in history)
+        n_ops = sum(1 for e in history if e.get('kind') == 'op')
         # nvme_core 모듈 타임아웃 — 퍼저와 동일한 값
         _kt_sec = self.config.nvme_kernel_timeout_sec
         lines = [
             "#!/bin/bash",
-            f"# Auto-generated replay script — {len(history)} commands before crash",
+            f"# Auto-generated replay script — {len(history) - n_ops} commands before crash"
+            + (f" (+ {n_ops} PM low-level ops, replayed with recorded timing)" if n_ops else ""),
             f"# Generated : {now_str}",
             f"# Device    : {self.config.nvme_device}",
             f"# Tag       : {tag}",
@@ -16151,6 +16236,12 @@ class _V101Fuzzer:
             "# ────────────────────────────────────────────────────────────────────",
             "",
         ]
+        if has_ops and getattr(self, '_orig_aspm_policy', None):
+            # 퍼저 시작 때의 ASPM 정책에서 출발한다(PM 동작이 정책을 바꾸고 되돌린다)
+            lines += [f"# ASPM 정책을 퍼저 시작 때 값으로 ({self._orig_aspm_policy})",
+                      f"echo {shlex.quote(self._orig_aspm_policy)} | sudo tee "
+                      f"/sys/module/pcie_aspm/parameters/policy > /dev/null", ""]
+        last_t1 = None     # 직전에 재생한 시각 기록 항목의 끝 — 다음 항목과의 간격을 그대로 잔다
 
         for i, entry in enumerate(history, 1):
             label = entry['label']
@@ -16158,6 +16249,32 @@ class _V101Fuzzer:
             marker = "  <- CRASH CMD" if is_last else ""
             step_str = f"[{i:03d}/{len(history)}] {label}{marker}"
             lines.append(f"# {step_str}")
+
+            if entry.get('t0') is not None and last_t1 is not None:
+                _gap = entry['t0'] - last_t1
+                if _gap >= 0.001:
+                    _cap = min(_gap, self._REPLAY_GAP_CAP_S)
+                    lines.append(f"sleep {_cap:.3f}" + (f"  # 원래 {_gap:.1f}s — 상한 {self._REPLAY_GAP_CAP_S:g}s"
+                                                         if _cap < _gap else ""))
+
+            if entry.get('kind') == 'op':
+                if entry.get('sysfs'):
+                    pcmd = (f"echo {shlex.quote(str(entry.get('value')))} | sudo tee "
+                            f"{shlex.quote(entry['sysfs'])} > /dev/null")
+                else:
+                    argv = [str(a) for a in entry.get('argv') or ()]
+                    quiet = argv[:1] == ['lspci'] or argv[:2] == ['nvme', 'id-ctrl']
+                    pcmd = "sudo " + " ".join(shlex.quote(a) for a in argv) + (" > /dev/null" if quiet else "")
+                lines.append(f'echo ">>> {step_str}  (퍼저 rc={entry.get("rc")})"')
+                lines.append(pcmd)
+                lines.append('echo "    rc=$?"')
+                last_t1 = entry.get('t1')
+                continue
+
+            if has_ops and entry.get('kind') in ('pcie_state', 'pcie_pm_bit', 'clkreq'):
+                lines.append(f"# {step_str} — 실제 동작은 앞뒤 op 줄로 재생(요약 항목)")
+                lines.append("")
+                continue
 
             if entry.get('kind') == 'pcie_state':
                 # 진입 실패한 combo는 replay에서 재현 불가 — 스킵
@@ -16419,7 +16536,9 @@ class _V101Fuzzer:
             # stdout(response buffer)은 /dev/null 억제, stderr(에러 메시지)만 출력
             lines.append("sudo " + " \\\n  ".join(cmd_parts) + " > /dev/null")
             lines.append('echo "    rc=$?"')
-            lines.append("sleep 0.1")
+            if entry.get('t1') is None:
+                lines.append("sleep 0.1")
+            last_t1 = entry.get('t1')
             lines.append("")
 
         lines.append('echo "Replay complete."')
@@ -23382,6 +23501,18 @@ class NVMeFuzzer(ExceptionFuzzerMixin, LearningMixin, _V101Fuzzer):
     _learning_max_seqs = RAG_MAX_SEQS
     _learning_stale = RAG_RESULT_STALE
     _learning_parse = staticmethod(_llm_extract_json)
+
+    def _llm_build_learning_request(self, task):
+        """v11.2.1: io_patterns 에는 학습 evidence 블록을 붙이지 않는다.
+
+        그 블록은 프롬프트 **맨 뒤**에 붙어 'target_id 를 seed·sequence·generator 에 붙여라'로 끝나,
+        io_workload 지시를 마지막 문장에서 밀어냈다. io_workload 는 target_id 를 쓰지 않으므로
+        (워크로드는 빈 meta 로 등록) 잃는 정보가 없다. 대상 함수도 넘기지 않아, 쓰이지 않는 대상의
+        제시 횟수(offered)를 올리지 않는다. 공유 모듈(llm_learning)은 그대로 둬 이전 버전 동작을 바꾸지 않는다.
+        """
+        if task == 'io_patterns':
+            return super(LearningMixin, self)._llm_build_request(task)
+        return super()._llm_build_learning_request(task)
 
 
 if __name__ == "__main__":
