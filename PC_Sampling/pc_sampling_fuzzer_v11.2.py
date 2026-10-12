@@ -1684,6 +1684,9 @@ class FuzzConfig:
     jlink_speed:     int   = 4000                 # J-Link SWD/JTAG 속도 (kHz)
     jlink_ap_index:  int   = 0                    # CoreSight APB-AP 인덱스 (P9: AP[0])
     jlink_vtref_mv:  Optional[int] = None         # J-Link VTref 고정(mV), connect 전 적용. None/0=자동(기본).
+    # v11.2.1: PM 동작 중 디버그 세션 분리(제품 설정 pm_detach_sampler). 디버거가 붙은 채 깊은 PS 에
+    #   들어가면 admin 명령이 멈추는 제품(BM9K1)용. --no-jlink 면 꺼진다.
+    pm_detach_sampler:    bool = False
     #                                             pylink 경로(RiscvPcsr/JLinkHalt)만 — OpenOCD 경로는 미적용
     pc_reg_index:    Optional[int] = None         # PC(R15) 레지스터 인덱스. None=connect 시 자동 탐지
     ufas_ini:        Optional[str] = 'PM9M1_A815.ini'  # UFAS --ini (enable_ufas 는 아래 정의)
@@ -4536,6 +4539,12 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
     #   넘으면 그 코어의 bank 판별을 끄고 bank 0 으로 수집한다(시작 때 프로브 실패와 같은 처리).
     #   스왑(앞뒤 bank 다름)은 정상 폐기라 세지 않는다.
     _OVL_FAIL_LIMIT = 32
+    # v11.2.1: 명령 종료로 끊긴 버스트가 전부 읽기 실패면 단발로는 판정하지 않고, 창을 넘겨 연속으로 센다.
+    #   짧은 명령만 이어지면 모든 버스트가 끊겨 전송 장애가 영영 판정되지 않기 때문이다. 읽기가 하나라도
+    #   성공한 버스트가 오면 0. 한도에 이르면 transport 로 판정해 메인 루프가 명령 뒤에 복구한다.
+    _STOPPED_FAIL_LIMIT = 3
+    _stopped_fail_streak = 0
+    _empty_streak = 0                      # 연속 빈 버스트(pin 실패) — 창을 넘겨 센다
 
     def __init__(self, config: 'FuzzConfig') -> None:
         super().__init__(config)
@@ -4583,8 +4592,6 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         self._ovl_kept = 0        # 태깅에 성공한 샘플 — ovl-drop 비율의 분모
         self._ovl_fail_streak = {}   # 코어별 연속 bank 판별 실패(스왑 제외) 버스트 수
         self.collapse_count = 0
-        self.recover_ok = 0
-        self.recover_fail = 0
         # 튜플 길이 회계가 코어 수를 따르도록(로그·saturation 계산이 이걸 본다)
         self._pcsr_addrs = [0] * max(1, len(self._cores))
 
@@ -4878,8 +4885,15 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             self._reset_window_extra()          # _observations 비움
             self._invalid_streak = {}
             self._all_invalid_since = None    # 이전 window의 무효 시간을 이어 세지 않는다
-            cfg, total, empty, bail = self.config, 0, 0, False
+            cfg, total, bail = self.config, 0, False
             limit = max(1, int(cfg.max_samples_per_run))
+            stop = self.stop_event
+
+            def _stop_burst(_o):
+                # ★ 명령이 끝나면(stop_sampling) 버스트 중간이라도 다음 읽기를 하지 않는다.
+                #   예전엔 버스트 경계에서만 봐서, 빠른 명령도 버스트 하나(수백 번의 USB 왕복)를
+                #   다 읽을 때까지 stop_sampling 이 기다렸다 → --no-jlink 와 실행 속도 차이.
+                return stop.is_set()
             try:
                 while not self.stop_event.is_set() and total < limit and not bail:
                     sched = self._rc.build_burst_schedule(self._weights, rng=self._rng)
@@ -4910,16 +4924,35 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                         if _pa is not None:
                             _w0 = self.session.read_word(_pa)
                             _bank = self._resolve_bank(core, _w0)
-                        obs = self.session.burst(core, n, self._valid_bit)
+                            if self.stop_event.is_set():
+                                break
+                        obs = self.session.burst(core, n, self._valid_bit, stop=_stop_burst)
+                        _stopped = self.stop_event.is_set()
                         # transport 실패는 valid=0(WFI)와 별개다. 오버레이 폐기보다
                         # 먼저 확인해야 bank 미검출 continue에 장애가 가려지지 않는다.
                         # 빈 버스트(pin 실패)는 아래 기존 연속 실패 한도를 적용한다.
-                        if obs and self.session.last_fail_kind == 'transport':
+                        # 명령 종료로 끊긴 버스트의 전부 실패는 단발로 판정하지 않고(읽기 몇 번의 일시
+                        # 실패로 재연결이 돌면 안 된다) 창을 넘겨 연속 횟수를 센다(_STOPPED_FAIL_LIMIT).
+                        _all_fail = bool(obs) and self.session.last_fail_kind == 'transport'
+                        if obs:
+                            self._empty_streak = 0         # pin 성공 — 오버레이 폐기 continue 전에 리셋
+                            self._stopped_fail_streak = (self._stopped_fail_streak + 1
+                                                         if _all_fail and _stopped else 0)
+                        if _all_fail and (not _stopped
+                                          or self._stopped_fail_streak >= self._STOPPED_FAIL_LIMIT):
                             self._stopped_reason = 'transport'
-                            log.error(f"[cJTAG/SBA] core{core} 버스트 전송 실패 — "
-                                      "샘플링 중단, 메인 루프에서 링크 복구")
+                            log.error(f"[cJTAG/SBA] core{core} 버스트 전송 실패"
+                                      + (f"(끊긴 버스트 {self._stopped_fail_streak}회 연속)" if _stopped else "")
+                                      + " — 샘플링 중단, 메인 루프에서 링크 복구")
+                            self._stopped_fail_streak = 0
                             self.openocd_error.set()
                             bail = True
+                            break
+                        if _pa is not None and obs and _stopped:
+                            # 명령이 끝난 뒤에는 끝 bank 확인 읽기도 하지 않는다 — 귀속을
+                            # 확정할 수 없는 샘플은 버린다(커버리지보다 실행 속도 우선).
+                            self._ovl_dropped += len(obs)
+                            total += len(obs)
                             break
                         if _pa is not None and obs:
                             # 버스트 도중 스왑이 일어났으면 이 샘플들이 어느 오버레이의
@@ -4942,16 +4975,18 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                             #   while 조건이 영원히 참 → **무한 루프**. 로그도 없이 스레드가
                             #   돌며 세션 lock 을 물어 다음 윈도우까지 막는다(실기서 관측:
                             #   시작 로그 뒤 아무것도 안 찍힘). 진행이 없으면 빠져나온다.
-                            empty += 1
-                            if empty >= self._EMPTY_BURST_LIMIT:
+                            #   v11.2.1: 연속 횟수는 창을 넘겨 센다 — 짧은 명령으로 창이 한도 전에
+                            #   끝나기를 반복하면 pin 실패가 영영 판정되지 않는다.
+                            self._empty_streak += 1
+                            if self._empty_streak >= self._EMPTY_BURST_LIMIT:
                                 self._stopped_reason = 'pin_fail'
-                                log.error(f"[cJTAG/SBA] 빈 버스트 {empty}회 연속(pin 실패) — "
+                                log.error(f"[cJTAG/SBA] 빈 버스트 {self._empty_streak}회 연속(pin 실패) — "
                                           f"샘플링 중단. 세션/오프셋 확인")
+                                self._empty_streak = 0
                                 bail = True
                                 self.openocd_error.set()   # 상위 루프가 재연결 판단
                                 break
                             continue
-                        empty = 0
                         total += len(obs)
                         self._track_collapse(core, obs)
                         for o in obs:
@@ -4967,7 +5002,8 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                                 #   예전엔 _observations 를 필터 없이 채워, range 필터가
                                 #   legacy current_trace 에만 걸리고 v10 판정은 그대로 통과했다.
                                 self._out_of_range_count += 1
-                    self._maybe_recover()
+                    if self._maybe_recover():
+                        bail = True
             except Exception as e:
                 self._stopped_reason = f'exception:{str(e)[:40]}'
                 log.error(f"[cJTAG/SBA] 샘플링 예외: {e}")
@@ -5032,32 +5068,32 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         else:
             self._all_invalid_since = None
 
-    def _maybe_recover(self):
-        # stop_sampling()이 join 중일 때 새 인증/USB 재연결을 시작하지 않는다.
-        # 인증은 수십 초 걸릴 수 있어 공용 join timeout 뒤 메인 복구와 겹친다.
+    def _maybe_recover(self) -> bool:
+        """붕괴를 감지하면 샘플링을 멈추고 메인 루프에 복구를 넘긴다 → 넘겼으면 True.
+
+        v11.2.1: 예전엔 워커가 여기서 바로 session.recover(재오픈·재인증)를 했다. 워커는 NVMe
+        명령과 동시에 돌므로 그 재연결·인증(수십 초, 인증 카운터 소모)이 **명령 실행 도중**에
+        일어났고, APST 를 끄지 않은 채 인증했다. 지금은 openocd_error 만 세운다 →
+        명령이 끝난 뒤 _stop_sampling_checked 가 APST·keepalive 를 끄고(_prepare_sjtag_reauth)
+        재초기화/재연결한다."""
+        # stop_sampling()이 join 중이거나 이미 장애가 보고됐으면 다시 보고하지 않는다.
         if self.stop_event.is_set() or self.openocd_error.is_set():
-            return
+            return False
         sj = self._sj_mod()
         if self._all_invalid_since is None:
-            return
+            return False
         cycles = min(self._invalid_streak.get(c, 0) for c in self._weights)
         if (cycles < sj.PCSR_COLLAPSE_MIN_ALL_CORE_CYCLES
                 or time.time() - self._all_invalid_since < sj.PCSR_COLLAPSE_MIN_SECONDS):
-            return
+            return False
         self.collapse_count += 1
-        log.error(f"[cJTAG/SBA] 세션 붕괴 감지(전 코어 무효 {cycles}사이클) — 재생성 시도 "
-                  f"#{self.collapse_count}")
-        core = next(iter(sorted(self._weights)))
-        r = self.session.recover(core, verify_samples=64)
-        if r.ok:
-            self.recover_ok += 1
-            log.warning(f"[cJTAG/SBA] 복구 성공 {r.elapsed:.1f}s valid={r.valid_samples}")
-        else:
-            self.recover_fail += 1
-            log.error(f"[cJTAG/SBA] 복구 실패 stage={r.stage} {r.detail}")
-            self.openocd_error.set()      # 상위 루프가 세션 재초기화를 판단
+        log.error(f"[cJTAG/SBA] 세션 붕괴 감지(전 코어 무효 {cycles}사이클) #{self.collapse_count}"
+                  " — 샘플링 중단, 명령이 끝난 뒤 메인 루프에서 재초기화")
+        self._stopped_reason = 'collapse'
         self._invalid_streak = {}
         self._all_invalid_since = None
+        self.openocd_error.set()
+        return True
 
     def _sj_mod(self):
         """이미 세션이 올바른 경로로 import 해둔 모듈을 재사용한다.
@@ -5764,6 +5800,9 @@ class _V101Fuzzer:
         self._ps_settle: dict[int, float] = dict(_PS_SETTLE_FALLBACK)
         # v11.2: PM 경로 nvme 명령이 무응답(D 상태)이었으면 그 내용. PM preflight 가 보고 중단한다.
         self._pm_unresponsive: Optional[str] = None
+        # v11.2.1: PM 중 디버그 세션 분리 상태·통계
+        self._pm_detached: bool = False
+        self._pm_detach_stats = dict(count=0, reattach_fail=0, reattach_s=0.0, reauth=0)
 
         self._sa_loaded: bool = False
         self._sa_bb_starts: Optional[list] = None  # sorted BB start addrs (bisect용)
@@ -11995,6 +12034,176 @@ class _V101Fuzzer:
                 if idx >= 0 and pc_key < self._sa_func_ends[idx]:
                     self._sa_entered_funcs.add(self._sa_func_entries[idx])
 
+    # v11.2.1: PM 동작 중 디버그 세션 분리. BM9K1 은 디버거 세션이 열린 채 PS4 에 들어가면 admin 명령에
+    #   응답하지 않았다(--no-jlink 면 정상, 퍼저를 끄고 J-Link 가 닫힌 뒤의 replay 도 정상). 모든 PM 동작
+    #   (PM preflight, 메인 루프 combo·forced_idle·pcie_bit·clkreq 슬롯)을 세션을 닫고(퍼저 종료 때와 같은
+    #   sampler.close) 한 뒤 기존 재연결 경로로 다시 붙인다. 깊은 상태(PS3/PS4·D3·L1.2)는 붙이기 전에 빠져나온다.
+    _PM_DEEP_PS = (3, 4)
+
+    def _pm_detach_wanted(self) -> bool:
+        return bool(getattr(self.config, 'pm_detach_sampler', False))
+
+    def _pm_sampler_closed(self) -> bool:
+        """J-Link 핸들이 실제로 닫혔는지(BM9K1 PcsrSession → Link.jl). 세션이 없어도 닫힌 것으로 본다."""
+        lk = getattr(getattr(self.sampler, 'session', None), 'lk', None)
+        return lk is None or getattr(lk, 'jl', None) is None
+
+    def _pm_sampler_detach(self, why: str) -> bool:
+        """세션을 닫는다. → 닫힘이 확인되면 True. 실패해도 _pm_detached 는 세워 다음 attach 가 새로 연결하게 한다.
+        ※ 확인하는 것은 J-Link 핸들 닫힘이다. 디버그 전원 요청 해제를 쓰거나 확인하지는 않는다."""
+        if self._pm_detached:
+            return self._pm_sampler_closed()
+        try:
+            self.sampler.close()
+        except Exception as e:
+            log.warning(f"[PM-Detach] 세션 닫기 예외({why}): {e}")
+        self._pm_detached = True
+        self._pm_detach_stats['count'] += 1
+        if not self._pm_sampler_closed():
+            log.error(f"[PM-Detach] 세션이 닫히지 않음 — {why}. 이번 PM 동작을 건너뛴다")
+            return False
+        log.info(f"[PM-Detach] 디버그 세션 분리 — {why}")
+        return True
+
+    def _pm_detach_preserve(self, where: str, target: str, reason: str) -> bool:
+        """분리 중 PM 복귀가 실패·무응답 — 디버거를 다시 붙이지 않고 현상 보존·증거 수집 후 중단(False)."""
+        return self._pm_preflight_fail('PM-Detach', where, target, reason, [])
+
+    def _pm_device_alive(self) -> bool:
+        r = self._pm_nvme_run(['nvme', 'id-ctrl', self.config.nvme_device], 5.0)
+        return r.returncode == 0
+
+    def _apst_off_confirmed(self) -> bool:
+        """APST 를 강제로 끄고(get-feature 0x0C) 꺼졌는지 다시 읽어 확인한다."""
+        if not self._apst_disable(force=True):
+            return False
+        r = self._pm_nvme_run(['nvme', 'get-feature', self.config.nvme_device, '-f', '0x0c'], 5.0)
+        m = re.search(r'[Cc]urrent\s+value[:\s]+(?:0x)?([0-9a-fA-F]+)',
+                      (r.stdout + r.stderr).decode(errors='replace'))
+        return r.returncode == 0 and m is not None and (int(m.group(1), 16) & 0x1) == 0
+
+    def _pm_sampler_attach(self, why: str) -> bool:
+        """다시 붙인다. 실패하면 _sampler_recovery_failed 를 세워 메인 루프가 기존 샘플러 장애처럼 멈춘다."""
+        if not self._pm_detached:
+            return True
+        t0 = time.monotonic()
+        try:
+            ok = bool(self.sampler._reconnect())
+        except Exception as e:
+            log.error(f"[PM-Detach] 재연결 예외({why}): {e}")
+            ok = False
+        dt = time.monotonic() - t0
+        self._pm_detach_stats['reattach_s'] += dt
+        if not ok:
+            self._pm_detach_stats['reattach_fail'] += 1
+            self._sampler_recovery_failed = True
+            log.error(f"[PM-Detach] 디버그 세션 재연결 실패 — {why} ({dt:.1f}s). 샘플러 장애로 중단")
+            return False
+        self._pm_detached = False
+        _auth = getattr(getattr(self.sampler, 'session', None), 'auth_count', 0) or 0
+        self._pm_detach_stats['reauth'] += int(_auth > 0)
+        _st = self._pm_detach_stats
+        _msg = (f"[PM-Detach] 재연결 OK — {why} {dt:.1f}s"
+                + (" (재인증 수행)" if _auth else "")
+                + f"  [누적 {_st['count']}회, 재연결 평균 {_st['reattach_s'] / _st['count']:.1f}s, "
+                  f"재인증 {_st['reauth']}회]")
+        (log.warning if _st['count'] <= 3 or _auth else log.info)(_msg)
+        return True
+
+    def _pm_detached_combo(self, combo: 'PowerCombo') -> bool:
+        """메인 루프 combo 슬롯 — 세션을 닫고 진입한 뒤 다시 붙인다. → 다시 붙였으면 True(False 면 메인 루프가 멈춘다).
+
+        동작 상태 조합(PS0~2·L0/L1·D0)은 예전처럼 그 상태에 머문 채 이어서 퍼징한다. 깊은 상태(PS3/PS4, D3·L1.2)는
+        settle 만큼 머문 뒤 직전 동작 상태로 복귀하고 붙인다 — 디버거가 붙은 채 깊은 상태에서 명령을 받지 않게.
+        복귀가 실패·무응답이면 **다시 붙이지 않고** 현상 보존·중단. 상태 변수는 성공을 확인한 뒤에만 갱신한다.
+        이 슬롯의 PC 수집은 생략한다."""
+        if not self._pm_sampler_detach(f'combo {combo.label}'):
+            return self._pm_sampler_attach(f'combo {combo.label} (분리 실패 — PM 생략)')
+        self._pm_unresponsive = None
+        deep = combo.nvme_ps in self._PM_DEEP_PS or self._is_nonop_combo(combo)
+        if combo.nvme_ps not in self._PM_DEEP_PS:   # 원래 규칙(진입 시도 전, PS 기준) — timeout 기준 PS
+            self._prev_op_ps = combo.nvme_ps
+        _set_ok = self._set_power_combo(combo)
+        self.ps_enter_counts[combo.nvme_ps] += 1
+        if _set_ok:
+            self.combo_enter_counts[combo] += 1
+        if _set_ok and not deep:
+            self._prev_op_combo = combo                 # 복귀 목표는 깊은 상태가 아닌 조합만
+            self._current_combo = combo
+            self._current_ps    = combo.nvme_ps
+        elif _set_ok:
+            time.sleep(self._ps_settle.get(combo.nvme_ps, 0.05))
+            _back, ok = self._prev_op_combo, False
+            if self._unresp_ok():
+                if self._is_nonop_combo(combo):
+                    _back, ok = self._nonop_restore_checked(combo)
+                    if ok and _back.nvme_ps in self._PM_DEEP_PS:
+                        # L1.2 복귀는 링크만 L0 로 돌리고 PS 는 그대로 둔다 — 붙이기 전에 동작 PS 로
+                        ok = self._pm_set_state(self._prev_op_ps)
+                        _back = PowerCombo(self._prev_op_ps, _back.pcie_l, _back.pcie_d)
+                else:
+                    ok = self._set_power_combo(_back)
+            if not ok or not self._unresp_ok():
+                self._current_combo, self._current_ps = combo, combo.nvme_ps   # 실제로는 미상 — 진입한 상태로 둔다
+                return self._pm_detach_preserve(
+                    '깊은 상태 복귀', combo.label,
+                    self._pm_unresponsive or f'{combo.label} → {_back.label} 복귀 실패')
+            self._current_combo = _back
+            self._current_ps    = _back.nvme_ps
+        else:
+            # 진입 실패 — L/D 롤백은 _set_pcie_l_state 가 했다(nonop 복귀를 부르지 않는 기존 규칙 유지).
+            #   PS 만 들어갔을 수 있으니 붙이기 전에 원래 PS 로 돌려놓고 응답을 확인한다.
+            log.warning(f"[PM] {combo.label} 진입 실패 — _current_combo 유지")
+            if not self._unresp_ok():
+                # 진입 명령이 무응답이면 추가 명령 없이 보존한다 — 대기 명령을 더 쌓거나 현상을 바꾸지 않게
+                return self._pm_detach_preserve('진입', combo.label, self._pm_unresponsive)
+            if not (self._pm_set_state(self._current_ps) and self._unresp_ok()):
+                return self._pm_detach_preserve(
+                    '진입 실패 뒤 PS 복귀', combo.label,
+                    self._pm_unresponsive or f'PS{self._current_ps} 복귀 실패')
+        if not self._unresp_ok():
+            return self._pm_detach_preserve('진입', combo.label, self._pm_unresponsive)
+        return self._pm_sampler_attach(f'combo {combo.label}')
+
+    def _unresp_ok(self) -> bool:
+        return not self._pm_unresponsive
+
+    def _pm_detached_perturb(self, kind: str) -> bool:
+        """S1 pcie_bit / S2 clkreq 슬롯 — 세션을 닫고 교란한 뒤 다시 붙인다(이 슬롯의 PC 수집은 생략).
+        교란 함수의 False 는 '건너뜀(cap 없음 등)'과 '복귀 실패(PMCSR D0 readback 등)'가 섞여 있으므로,
+        False 면 장치 응답(id-ctrl)을 확인해 응답이 없으면 다시 붙이지 않고 보존·중단한다."""
+        if not self._pm_sampler_detach(kind):
+            return self._pm_sampler_attach(f'{kind} (분리 실패 — PM 생략)')
+        self._pm_unresponsive = None
+        ok = (self._pm_perturb_pcie_bit if kind == 'pcie_bit' else self._pm_perturb_clkreq)()
+        if not ok and not self._pm_device_alive():
+            return self._pm_detach_preserve(kind, kind, self._pm_unresponsive or '교란 뒤 장치 응답 없음(id-ctrl 실패)')
+        if not ok:
+            log.warning(f"[PM-Detach] {kind} 교란 결과 False(건너뜀 또는 부분 실패) — 장치 응답 정상, 재연결")
+        return self._pm_sampler_attach(kind)
+
+    def _pm_detached_forced_idle(self, ps3_ms: int, ps4_ms: int, idle_s: float) -> bool:
+        """forced_idle 슬롯(APST 자율 PS3→PS4) — 세션을 닫고 들어가 APST 를 **강제로** 끄고(원래 0 이어도) 꺼졌는지
+        다시 읽어 확인한 뒤 PS0 로 나와 붙인다. 하나라도 실패·무응답이면 다시 붙이지 않고 보존·중단."""
+        if not self._pm_sampler_detach('forced_idle(APST PS3→PS4)'):
+            return self._pm_sampler_attach('forced_idle (분리 실패 — PM 생략)')
+        self._pm_unresponsive = None
+        if self._apst_enable_short_itpt(ps3_ms, ps4_ms):
+            time.sleep(idle_s)                 # 자율 PS3 → PS4 진입 대기
+            self.ps_enter_counts[3] += 1
+            self.ps_enter_counts[4] += 1
+            if not self._apst_off_confirmed():
+                return self._pm_detach_preserve('forced_idle APST 해제', 'APST',
+                                                self._pm_unresponsive or 'APST 해제 실패 또는 재확인 불일치')
+            if not (self._pm_set_state(0) and self._unresp_ok()):   # 다시 붙이기 전에 PS4 에서 확실히 나온다
+                return self._pm_detach_preserve('forced_idle PS0 복귀', 'PS0',
+                                                self._pm_unresponsive or 'PS0 복귀 실패')
+        else:
+            log.warning("[PM] APST enable 실패 — forced_idle slot skip")
+            if not self._unresp_ok():
+                return self._pm_detach_preserve('forced_idle APST 진입', 'APST', self._pm_unresponsive)
+        return self._pm_sampler_attach('forced_idle')
+
     # v11.2: PM 경로의 nvme 명령은 D 상태 안전 래퍼로 보낸다. subprocess.run(timeout) 은 timeout 뒤
     #   kill 하고 process.wait() 로 기다리는데, 무응답 장치에서 nvme ioctl 이 커널 안(D 상태)에 묶이면
     #   그 wait 가 끝나지 않아 PM preflight 가 멈췄다(0d26edf 의 Pre-flight 멈춤과 같은 원인).
@@ -12936,7 +13145,7 @@ class _V101Fuzzer:
             'is_write': bool(data),
         })
 
-    def _apst_disable(self, force: bool = False) -> None:
+    def _apst_disable(self, force: bool = False) -> bool:
         """NVMe APST(Autonomous Power State Transition) 비활성화.
 
         APST 활성화 상태에서는 NVMe 컨트롤러가 자율적으로 PS 전환을 하면서
@@ -12974,7 +13183,7 @@ class _V101Fuzzer:
 
         if self._orig_apst_cdw11 == 0 and not force:
             log.warning("[APST] 이미 비활성화 상태 — skip")
-            return
+            return True
 
         import tempfile as _tf
         _ok_apst = False
@@ -12985,10 +13194,10 @@ class _V101Fuzzer:
             with _tf.NamedTemporaryFile(suffix='.apst', delete=False) as _f:
                 _f.write(b'\x00' * 256)
                 _fname = _f.name
-            r = subprocess.run(
+            # v11.2.1: D 상태 안전 실행(무응답이면 기다리지 않고 실패) — 디버그 세션 분리 중 PS4 탈출 경로에서도 쓴다
+            r = self._pm_nvme_run(
                 ['nvme', 'set-feature', dev, '-n', '0', '-f', '0x0C', '-v', '0',
-                 '--data-len', '256', '--data', _fname],
-                capture_output=True, text=True, timeout=5)
+                 '--data-len', '256', '--data', _fname], 5.0, record=False)
             if r.returncode == 0:
                 # 원본 캡처가 실패(None)해도 set-feature 성공 자체는 유효하므로
                 # 포맷 예외로 성공 경로를 깨지 않는다(None → 'unknown').
@@ -12999,7 +13208,8 @@ class _V101Fuzzer:
                 self._record_setfeature_history(
                     0x0C, 0, b'\x00' * 256, 'APST disable')
             else:
-                log.warning(f"[APST] set-feature 실패 (rc={r.returncode}): {r.stderr.strip()}")
+                log.warning(f"[APST] set-feature 실패 (rc={r.returncode}): "
+                            f"{r.stderr.decode(errors='replace').strip()}")
         except Exception as e:
             log.warning(f"[APST] set-feature 예외: {e}")
         finally:
@@ -13009,6 +13219,9 @@ class _V101Fuzzer:
                 except OSError:
                     pass
 
+        # v11.2.1: 반환값은 APST set-feature 성공 여부. 아래 sysfs fallback 은 런타임 PM 을 끄는 것이지
+        #   APST 해제가 아니므로 반환값에 넣지 않는다(디버그 세션 재연결 전 안전 조건으로 쓰인다).
+        _sf_ok = _ok_apst
         if not _ok_apst and self._pcie_bdf:
             try:
                 _ctrl = Path(f'/sys/bus/pci/devices/{self._pcie_bdf}/power/control')
@@ -13021,6 +13234,7 @@ class _V101Fuzzer:
 
         if not _ok_apst:
             log.warning("[APST] 비활성화 실패 — APST 자율 PS 전환이 MISMATCH 유발할 수 있음")
+        return _sf_ok
 
     def _apst_enable_short_itpt(self, ps3_ms: int = 500, ps4_ms: int = 2000) -> bool:
         """APST 를 짧은 ITPT 로 활성화 — PM rotation forced_idle slot 전용.
@@ -13054,17 +13268,22 @@ class _V101Fuzzer:
                 _f.write(bytes(table))
                 _fname = _f.name
             # CDW11 bit0=1 (APSTE) — '-v 1'
-            r = subprocess.run(
+            # v11.2.1: D 상태 안전 경로. 무응답(timeout)이면 프로세스를 버리고 _pm_unresponsive 에 남긴다 —
+            #   명령이 거절(rc≠0)된 것과 달리 APST 가 켜졌는지 알 수 없으므로 호출부가 보존·중단한다.
+            r = self._pm_nvme_run(
                 ['nvme', 'set-feature', dev, '-n', '0', '-f', '0x0C', '-v', '1',
-                 '--data-len', '256', '--data', _fname],
-                capture_output=True, text=True, timeout=5)
+                 '--data-len', '256', '--data', _fname], 5.0, record=False)
             if r.returncode == 0:
                 log.warning(f"[APST] enable: ITPT PS0→PS3={ps3_ms}ms, "
                             f"PS3→PS4={ps4_ms}ms")
                 self._record_setfeature_history(
                     0x0C, 1, bytes(table), 'APST enable')
                 return True
-            log.warning(f"[APST] enable 실패 (rc={r.returncode}): {r.stderr.strip()}")
+            if self._pm_timed_out(r):
+                log.error(f"[APST] enable 무응답(5s) — APST 상태 미상")
+            else:
+                log.warning(f"[APST] enable 실패 (rc={r.returncode}): "
+                            f"{(r.stderr or b'').decode(errors='replace').strip()}")
             return False
         except Exception as e:
             log.warning(f"[APST] enable 예외: {e}")
@@ -13291,6 +13510,10 @@ class _V101Fuzzer:
         })
 
     def _nonop_restore(self, combo: PowerCombo) -> PowerCombo:
+        """기존 호출부용 — 복귀 대상만 돌려준다(성공 여부는 _nonop_restore_checked)."""
+        return self._nonop_restore_checked(combo)[0]
+
+    def _nonop_restore_checked(self, combo: PowerCombo) -> Tuple[PowerCombo, bool]:
         """D3hot/L1.2 → NVMe 커맨드 가능 상태 복귀. 복귀 후 PowerCombo 반환.
         복귀 실패 시 경고를 남기고 baseline combo를 반환 (호출부가 NVMe 응답으로 최종 확인).
 
@@ -13305,7 +13528,7 @@ class _V101Fuzzer:
             ok = self._pm_d3_safe_restore()
             if not ok:
                 log.warning("[PM] NonOp restore: D3 복귀 실패 — 장치 응답 불가 상태일 수 있음")
-            return POWER_COMBOS[0]  # PS0+L0+D0
+            return POWER_COMBOS[0], ok  # PS0+L0+D0
 
         log.warning(f"[PM] NonOp restore: {combo.label} → L0")
         ok = self._set_pcie_l_state(PCIeLState.L0)
@@ -13317,7 +13540,7 @@ class _V101Fuzzer:
         self._record_pcie_state_history(
             _restored, ok,
             f'NonOp restore L0 (from {combo.label})')
-        return _restored
+        return _restored, ok
 
     def _pm_verify_combo(self, combo: PowerCombo) -> dict:
         """PM 상태 다중 검증 (PMU/PMCSR/LNKCTL/L1SS/sysfs) → dict 반환."""
@@ -15019,7 +15242,8 @@ class _V101Fuzzer:
     def _read_bm9k1_monitor_pc(self):
         """종료 후 기존 PCSR 세션으로 Core0만 관측. 인증/재연결/복구하지 않는다."""
         session = getattr(self.sampler, 'session', None)
-        if (session is None or session.lk is None or session.dap is None):
+        if (session is None or session.lk is None or session.dap is None
+                or getattr(session.lk, 'jl', None) is None):     # v11.2.1: PM 분리 중 보존 — 닫힌 세션
             return None
         if 0 not in self.sampler._cores:
             return None
@@ -18556,8 +18780,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         _col = getattr(self.sampler, 'collapse_count', 0)
         _col_tag = ""
         if _col:
-            _col_tag = (f" | collapse: {_col}"
-                        f"(복구 {getattr(self.sampler, 'recover_ok', 0)})")
+            _col_tag = f" | collapse: {_col}"
         log.warning(f"[Stats] exec: {stats['executions']:,} | "
                  f"corpus: {stats['corpus_size']}(seq:{_seq_cnt}) | "
                  f"pcs: {stats['coverage_unique_pcs']:,} | "
@@ -19513,11 +19736,18 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             # --pm 활성화 시에만 실행. 진입 실패 조합은 경고만 하고 계속한다.
             # v11.2: 복귀 실패·복귀 뒤 NVMe 실패·무응답(D 상태)이면 현상 보존·증거 수집 뒤 False →
             #   여기서 return 해 finally(타임아웃 crash 와 같은 보존 정리)로 간다.
+            # v11.2.1: 디버그 세션 분리 대상 제품은 PM preflight 전체를 세션을 닫은 채 돈다
+            _pf_detach = self.config.pm_inject_prob > 0 and self._pm_detach_wanted()
+            if _pf_detach and not self._pm_sampler_detach('PM preflight'):
+                log.error("[PM-Detach] 디버그 세션을 닫지 못해 PM preflight 를 디버거가 붙은 채 돌 수 없다 — 중단")
+                return
             if not self._pm_preflight_check():
                 return
 
             # v7.7: S1/S2 perturbation preflight — PCIe bit + CLKREQ# 1회씩 검증.
             if self.config.pm_inject_prob > 0 and not self._pm_preflight_s1_s2():
+                return
+            if _pf_detach and not self._pm_sampler_attach('PM preflight'):
                 return
 
             # nvme_core 모듈 타임아웃 파라미터 설정 (crash 상태 보존).
@@ -19764,7 +19994,14 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                         log.warning(f"[PM] APST 자율 idle 진입 "
                                     f"(PS0→PS3 {_ps3_ms}ms, PS3→PS4 {_ps4_ms}ms, "
                                     f"total {_idle_total_s:.1f}s)")
-                        _apst_ok = self._apst_enable_short_itpt(_ps3_ms, _ps4_ms)
+                        # v11.2.1: 세션을 닫고 들어가 PS4 에서 PS0 로 확실히 나온 뒤 붙인다(이 슬롯의 PC 수집은 생략)
+                        _fi_detach = self._pm_detach_wanted()
+                        if _fi_detach:
+                            if not self._pm_detached_forced_idle(_ps3_ms, _ps4_ms, _idle_total_s):
+                                break
+                            _apst_ok = False      # 아래 수집 경로를 타지 않는다
+                        else:
+                            _apst_ok = self._apst_enable_short_itpt(_ps3_ms, _ps4_ms)
                         if _apst_ok:
                             self.sampler.start_sampling()
                             time.sleep(_idle_total_s)     # 자율 PS3 → PS4 진입 대기
@@ -19783,13 +20020,18 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                             self._apst_disable()
                             self.ps_enter_counts[3] += 1
                             self.ps_enter_counts[4] += 1
-                        else:
+                        elif not _fi_detach:
                             log.warning("[PM] APST enable 실패 — forced_idle slot skip")
                         # current_combo 는 다음 명령 송신 직전 _nonop_restore 가 정리
                         self._current_combo = POWER_COMBOS[0]
                         self._current_ps    = 0
 
                     # ── PCIe config bit perturb slot (v7.7 S1) ──────────
+                    elif _pm_slot in ('pcie_bit', 'clkreq') and self._pm_detach_wanted():
+                        # v11.2.1: 세션을 닫고 교란한 뒤 다시 붙인다
+                        if not self._pm_detached_perturb(_pm_slot):
+                            break
+
                     elif _pm_slot == 'pcie_bit':
                         self.sampler.start_sampling()
                         self._pm_perturb_pcie_bit()
@@ -19820,6 +20062,12 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                             log.info(f"[+][PM-Cov] clkreq +{_pm_new_cnt} new PCs")
 
                     # ── POWER_COMBO slot (기존) ──────────────────────────
+                    if _next_combo is not None and self._pm_detach_wanted():
+                        # v11.2.1: 세션을 닫은 채 진입(깊은 상태면 복귀까지)하고 다시 붙인다(_pm_detached_combo)
+                        if not self._pm_detached_combo(_next_combo):
+                            break
+                        _next_combo = None
+
                     if _next_combo is not None:
                         if _next_combo.nvme_ps not in (3, 4):
                             self._prev_op_ps    = _next_combo.nvme_ps
@@ -23857,6 +24105,7 @@ if __name__ == "__main__":
         jlink_speed=_profile.get('jlink_speed', 4000),
         jlink_ap_index=_profile.get('jlink_ap_index', 0),
         jlink_vtref_mv=_profile.get('jlink_vtref_mv'),
+        pm_detach_sampler=bool(_profile.get('pm_detach_sampler', False)) and not args.no_jlink,
         pc_reg_index=(args.pc_reg_index if args.pc_reg_index is not None
                       else _profile.get('pc_reg_index')),
         nvme_device=args.nvme,

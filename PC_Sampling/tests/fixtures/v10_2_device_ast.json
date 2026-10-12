@@ -90,6 +90,12 @@
       "date": "2026-10-07",
       "base_commit": "e873ec9",
       "reason": "v11.2 is a new file copied from v11.1 (PM preflight hang/failure handling). All guarded AST paths are identical to the reviewed v11.1 overrides; no hashes regenerated. v11.1 stays frozen as a legacy check. Future engine changes target v11.2."
+    },
+    {
+      "file": "pc_sampling_fuzzer_v11.2.py",
+      "date": "2026-10-12",
+      "base_commit": "9d9cb5a",
+      "reason": "RiscvPcsrSampler (BM9K1 only): sampling must not delay NVMe commands. (1) stop_event is checked after every PCSR read via a Python-only stop callback passed to PcsrSession.burst (no extra DAP access/delay in the burst loop), so stop_sampling returns after at most one in-flight read instead of the rest of a ~256-read burst; an overlay core stopped mid-burst skips the end-bank read and drops those samples; a burst truncated by stop is not judged as transport failure on its own, but consecutive all-failed truncated bursts are counted across windows (_STOPPED_FAIL_LIMIT=3) and then reported as transport; the empty-burst (pin failure) streak is likewise carried across windows (_EMPTY_BURST_LIMIT) and reset by any successful pin. (2) _maybe_recover no longer reopens/re-authenticates inside the worker during a command; it sets openocd_error and the main loop recovers after the command via _stop_sampling_checked (APST/keepalive off first). No saturation early exit (it would only cut coverage; reads already stop at command end). Reviewed; PCSR register addresses, pin/unpin and read path unchanged."
     }
   ],
   "overrides_note": "hashes 는 모든 DEVICE_AST_FILES 에 적용되는 기준선이다. overrides 는 검토를 거쳐 **특정 파일에서만** 의도적으로 달라진 경로를 기록한다. v10.2 는 검증된 fallback 이라 계속 기준선 그대로여야 하고, 여기 올라오지 않은 파일·경로는 전부 기준선에 묶인다.",
@@ -111,7 +117,7 @@
     "pc_sampling_fuzzer_v11.2.py": {
       "OpenOCDPCSampler": "48865eb551960624265b061a897ddf8abdc2586862598bc2be3c97a3a69aba04",
       "_V101Fuzzer._send_nvme_command": "0357c5f8d049a5f11bb1491af57d766508970f4680124247624e441a3b336b24",
-      "RiscvPcsrSampler": "d80278b7f199f26ddf7c19e8f22ec5be033ed2190fe5b8819294229ac64959f0",
+      "RiscvPcsrSampler": "a879bf94ef07930f3dfc629120396e543cc57f42384ca507cdb5a7f55efb3eb2",
       "JLinkHaltSampler": "e44a432e61c101138e2b97c43f3218d4c2b2033d0d58cd4ed4a9dede6607d250"
     }
   }

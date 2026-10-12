@@ -337,6 +337,8 @@
       "jlink_speed": 10000,
       "_comment_jlink_vtref_mv": "J-Link VTref 고정값(mV). J-Link open 직후, connect·SJTAG 인증 전에 적용하고 재연결 때마다 다시 적용한다. null 또는 0이면 자동(1번 핀 측정값 추종)이며 기본값이다(키 생략 시도 자동). 고정하면 POR로 타깃 전원이 꺼진 동안에도 프로브가 이 레벨로 핀을 구동하는데, BM9K1은 디버그 핀이 부트 스트랩과 공유되므로 필요할 때만 켠다.",
       "jlink_vtref_mv": null,
+      "_comment_pm_detach_sampler": "v11.2.1 — 디버거 세션이 열린 채 PS4 에 들어가면 admin 명령이 멈추는 현상 회피. 모든 PM 동작(PM preflight 전체, 메인 루프 combo·forced_idle·pcie_bit·clkreq 슬롯)을 디버그 세션을 닫고 한 뒤 다시 연결한다. 동작 상태 조합(PS0~2·L0/L1·D0)은 다시 연결한 뒤 그 상태로 퍼징을 이어가고, 깊은 상태(PS3/PS4·D3·L1.2)는 다시 연결하기 전에 직전 동작 상태로 빠져나온다. PM 동작 중의 PC 는 수집하지 않는다. --no-jlink 면 무시.",
+      "pm_detach_sampler": true,
       "riscv": {
         "_comment": "cores의 elf/load_offset 등 제품 자산은 sjtag_addrs.json의 pcsr.cores 설정을 우선 사용한다. 이 절에는 공유 가능한 구조와 튜닝값을 둔다.",
         "power": "both",

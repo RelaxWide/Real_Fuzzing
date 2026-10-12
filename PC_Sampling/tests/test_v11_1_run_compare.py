@@ -421,9 +421,11 @@ class SjtagReauthPrep(unittest.TestCase):
         o._orig_apst_cdw11 = 0
         o._ctrl_device = lambda: '/dev/nvme0'
         o._record_setfeature_history = lambda *a, **k: None
-        ok = SimpleNamespace(returncode=0, stdout='', stderr='')
-        with patch.object(fuzzer.subprocess, 'run', return_value=ok) as run:
-            o._apst_disable()
+        o._pm_unresponsive = None
+        ok = fuzzer._StateProc(0, b'', b'')
+        # v11.2.1: set-feature 는 D 상태 안전 실행(_run_nvme_state_cmd)으로 나간다
+        with patch.object(fuzzer, '_run_nvme_state_cmd', return_value=ok) as run:
+            self.assertTrue(o._apst_disable())
             self.assertFalse(any('set-feature' in c.args[0] for c in run.call_args_list))
-            o._apst_disable(force=True)
+            self.assertTrue(o._apst_disable(force=True))
             self.assertTrue(any('set-feature' in c.args[0] for c in run.call_args_list))
