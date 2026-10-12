@@ -1895,9 +1895,10 @@ class _FuzzingTerminalFilter(logging.Filter):
 
 class _ReconnectDetailStream:
     """재연결 스레드의 print만 파일 로그로 전달. 긴 줄도 제한된 크기로 배출."""
-    def __init__(self, original, owner):
+    def __init__(self, original, owner, tag='FWCommit/detail'):
         self.original = original
         self.owner = owner
+        self.tag = tag
         self.pending = ''
 
     def write(self, text):
@@ -1910,7 +1911,7 @@ class _ReconnectDetailStream:
             self.pending += chunk
             while '\n' in self.pending:
                 line, self.pending = self.pending.split('\n', 1)
-                log.info("[FWCommit/detail] %s", line.rstrip('\r'))
+                log.info("[%s] %s", self.tag, line.rstrip('\r'))
             if len(self.pending) >= 8192:
                 self.flush()
         return size
@@ -1920,15 +1921,16 @@ class _ReconnectDetailStream:
             return self.original.flush()
         if self.pending:
             line, self.pending = self.pending, ''
-            log.info("[FWCommit/detail] %s", line)
+            log.info("[%s] %s", self.tag, line)
 
     def __getattr__(self, name):
         return getattr(self.original, name)
 
 
 @contextlib.contextmanager
-def _fw_commit_detail_logging():
-    """FWCommit 재연결 상세는 파일로만. 다른 스레드의 터미널 로그는 유지."""
+def _fw_commit_detail_logging(tag='FWCommit/detail'):
+    """FWCommit 재연결 상세는 파일로만. 다른 스레드의 터미널 로그는 유지.
+    v11.2.1: PM 분리·재연결(100명령마다)도 같은 방식으로 쓴다(tag 로 로그 머리표 구분)."""
     owner = threading.get_ident()
 
     class _OtherThreads(logging.Filter):
@@ -1939,8 +1941,8 @@ def _fw_commit_detail_logging():
     handlers = [h for h in log.handlers
                 if isinstance(h, logging.StreamHandler)
                 and not isinstance(h, logging.FileHandler)]
-    out = _ReconnectDetailStream(sys.stdout, owner)
-    err = _ReconnectDetailStream(sys.stderr, owner)
+    out = _ReconnectDetailStream(sys.stdout, owner, tag)
+    err = _ReconnectDetailStream(sys.stderr, owner, tag)
     for handler in handlers:
         handler.addFilter(gate)
     try:
@@ -12126,7 +12128,8 @@ class _V101Fuzzer:
         if self._pm_detached:
             return self._pm_sampler_closed()
         try:
-            self.sampler.close()
+            with _fw_commit_detail_logging('PM-Detach/detail'):     # 닫기 진행 출력은 파일 로그로만
+                self.sampler.close()
         except Exception as e:
             log.warning(f"[PM-Detach] 세션 닫기 예외({why}): {e}")
         self._pm_detached = True
@@ -12159,27 +12162,13 @@ class _V101Fuzzer:
         if not self._pm_detached:
             return True
         t0 = time.monotonic()
-        ok = False
-        # v11.2.1: 같은 펌웨어·전원 구간이라 정합성 게이트·오버레이 재검사를 생략하는 가벼운 경로부터.
-        #   실패하면 기존 전체 재연결(settle·재시도·backoff 포함).
-        _light = getattr(self.sampler, 'reattach', None)
-        if callable(_light):
-            try:
-                ok = bool(_light())
-            except Exception as e:
-                log.warning(f"[PM-Detach] 가벼운 재연결 예외({why}): {e}")
-                ok = False
-            if ok:
-                self._pm_detach_stats['light'] = self._pm_detach_stats.get('light', 0) + 1
-            else:
-                log.warning(f"[PM-Detach] 가벼운 재연결 실패({why}) — 전체 재연결로")
-        if not ok:
-            try:
-                ok = bool(self.sampler._reconnect())
-            except Exception as e:
-                log.error(f"[PM-Detach] 재연결 예외({why}): {e}")
-                ok = False
+        # v11.2.1: 세션 열기 진행 출력([Link] VTref·DM 활성화 등)과 세부 경고는 파일 로그로만 — 100명령마다
+        #   터미널을 덮었다. 결과 요약·실패는 아래에서 터미널로 낸다.
+        with _fw_commit_detail_logging('PM-Detach/detail'):
+            ok, light_failed = self._pm_reattach(why)
         dt = time.monotonic() - t0
+        if light_failed and ok:
+            log.warning(f"[PM-Detach] 가벼운 재연결 실패({why}) — 전체 재연결로 복구 (세부는 파일 로그)")
         self._pm_detach_stats['reattach_s'] += dt
         if not ok:
             self._pm_detach_stats['reattach_fail'] += 1
@@ -12196,6 +12185,30 @@ class _V101Fuzzer:
                   f"재연결 평균 {_st['reattach_s'] / _st['count']:.1f}s, 재인증 {_st['reauth']}회]")
         (log.warning if _st['count'] <= 3 or _auth else log.info)(_msg)
         return True
+
+    def _pm_reattach(self, why: str):
+        """→ (붙었나, 가벼운 경로가 실패했나). 같은 펌웨어·전원 구간이라 정합성 게이트·오버레이 재검사를 생략하는
+        가벼운 경로부터, 실패하면 기존 전체 재연결(settle·재시도·backoff 포함)."""
+        ok = light_failed = False
+        _light = getattr(self.sampler, 'reattach', None)
+        if callable(_light):
+            try:
+                ok = bool(_light())
+            except Exception as e:
+                log.warning(f"[PM-Detach] 가벼운 재연결 예외({why}): {e}")
+                ok = False
+            if ok:
+                self._pm_detach_stats['light'] = self._pm_detach_stats.get('light', 0) + 1
+            else:
+                light_failed = True
+                log.warning(f"[PM-Detach] 가벼운 재연결 실패({why}) — 전체 재연결로")
+        if not ok:
+            try:
+                ok = bool(self.sampler._reconnect())
+            except Exception as e:
+                log.error(f"[PM-Detach] 재연결 예외({why}): {e}")
+                ok = False
+        return ok, light_failed
 
     def _pm_detached_combo(self, combo: 'PowerCombo') -> bool:
         """메인 루프 combo 슬롯 — 세션을 닫고 진입한 뒤 다시 붙인다. → 다시 붙였으면 True(False 면 메인 루프가 멈춘다).

@@ -94,6 +94,63 @@ class AttachUsesLightPathFirst(unittest.TestCase):
         f.sampler._reconnect.assert_called_once()
 
 
+class QuietTerminal(unittest.TestCase):
+    """PM 분리·재연결(100명령마다)의 세션 열기 출력([Link] VTref·DM 활성화 등)은 파일 로그로만, 요약은 터미널로."""
+
+    def capture(self, fn):
+        import io
+        import logging
+        term_buf, file_buf = io.StringIO(), io.StringIO()
+        term = logging.StreamHandler(term_buf)
+        fileh = logging.FileHandler('/dev/null')
+        fileh.stream = file_buf                                # FileHandler 로 취급되는 파일 로그 대역
+        for h in (term, fileh):
+            h.setLevel(logging.INFO)
+            v.log.addHandler(h)
+        old = v.log.level
+        v.log.setLevel(logging.INFO)
+        try:
+            with patch('sys.stdout', io.StringIO()) as out:
+                fn()
+        finally:
+            v.log.setLevel(old)
+            for h in (term, fileh):
+                v.log.removeHandler(h)
+        return term_buf.getvalue(), file_buf.getvalue(), out.getvalue()
+
+    def test_reattach_prints_go_to_file_only(self):
+        f = fuzzer_with(True)
+
+        def noisy():
+            print("  [Link] VTref 자동 (측정 1800 mV)")
+            print("    ✅ DM 활성화 성공")
+            return True
+        f.sampler.reattach = noisy
+        term, filelog, stdout = self.capture(lambda: f._pm_sampler_attach('combo X'))
+        self.assertNotIn('[Link]', term + stdout)
+        self.assertNotIn('DM 활성화', term + stdout)
+        self.assertIn('[PM-Detach/detail]   [Link] VTref 자동', filelog)
+        self.assertIn('[PM-Detach] 재연결 OK', term)           # 요약은 터미널
+
+    def test_close_prints_go_to_file_only(self):
+        f = fuzzer_with(True)
+        f._pm_detached = False
+        f.sampler.close = lambda: print("  [Link] 종료 전 resume 완료")
+        f._pm_sampler_closed = lambda: True
+        term, filelog, stdout = self.capture(lambda: f._pm_sampler_detach('combo X'))
+        self.assertNotIn('[Link]', term + stdout)
+        self.assertIn('[PM-Detach/detail]   [Link] 종료 전 resume 완료', filelog)
+
+    def test_light_failure_summary_still_on_terminal(self):
+        f = fuzzer_with(False)
+        term, _filelog, _ = self.capture(lambda: f._pm_sampler_attach('combo X'))
+        self.assertIn('가벼운 재연결 실패(combo X) — 전체 재연결로 복구', term)
+
+    def test_fw_commit_tag_unchanged(self):
+        import io
+        s = v._ReconnectDetailStream(io.StringIO(), __import__('threading').get_ident())
+        self.assertEqual(s.tag, 'FWCommit/detail')
+
 class TimingLine(unittest.TestCase):
     def test_breakdown(self):
         f = v.NVMeFuzzer.__new__(v.NVMeFuzzer)
