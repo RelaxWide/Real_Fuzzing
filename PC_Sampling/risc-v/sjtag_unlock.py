@@ -837,7 +837,7 @@ _SB_FIFO = _SB32 | (1 << 20) | (1 << 15)              # sba_pin 이 세우는 �
 _SB_FIFO_MASK = (0x7 << 17) | (1 << 20) | (1 << 15)
 
 
-def sba_retarget(dap, ap, cb, addr, polls=8):
+def sba_retarget(dap, ap, cb, addr, polls=8, abort=None):
     """핀 상태(FIFO 모드·CSW 32bit·TAR=sbdata0)를 유지한 채 SBA 주소만 바꾼다 → 성공 여부.
 
     코어 전환·오버레이 bank 읽기에서 실제로 바뀌는 건 sbaddress0 하나다. sba_unpin+sba_pin 은 매번
@@ -850,7 +850,12 @@ def sba_retarget(dap, ap, cb, addr, polls=8):
       3) TAR→sbcs(되읽기 확인), 그 read 의 완료·무에러 확인 (이후 sbdata0 = 새 주소 값)
       4) TAR→sbdata0 고정 + 되읽기
     ★ fail-closed: 한 단계라도 실패하면 False — 호출부가 전체 경로(sba_unpin→sba_pin)로 되돌린다.
-      재시도는 하지 않는다(전체 경로가 에러 클리어부터 다시 한다)."""
+      재시도는 하지 않는다(전체 경로가 에러 클리어부터 다시 한다).
+    abort() 가 참이면 다음 단계로 가지 않고 None 을 돌려준다(명령이 끝나 이 준비가 쓸모없어졌을 때).
+    중간 상태는 미상이지만, 다음 호출이 1)부터 FIFO 모드·진행 중 read·에러를 다시 확인하므로 안전하다."""
+    def _stop():
+        return abort is not None and abort()
+
     def _tar(a):
         if not dap.ap_write(ap, OFF_TAR, a, retry=0):
             return False
@@ -867,13 +872,19 @@ def sba_retarget(dap, ap, cb, addr, polls=8):
             return None if cs & _SB_ERRMASK else cs
         return None
 
+    if _stop():
+        return None
     if not _tar(cb + SBCS_OFF):
         return False
     cs = _wait()
     if cs is None or (cs & _SB_FIFO_MASK) != _SB_FIFO:
         return False
+    if _stop():
+        return None
     if not _tar(cb + SBADDR0_OFF):
         return False
+    if _stop():                                 # 주소를 쓰기 전까지는 멈춰도 된다. 쓴 뒤에는 검증까지 마친다
+        return None
     if not dap.ap_write(ap, OFF_DRW, addr, retry=0):
         return False
     err = dap.dp_sticky_error()                 # posted write flush + CTRL/STAT (mem_write32 와 같은 확인)
@@ -885,6 +896,8 @@ def sba_retarget(dap, ap, cb, addr, polls=8):
     back = dap.ap_read(ap, OFF_DRW, retry=0)    # sbaddress0 읽기는 read 를 시작하지 않는다
     if back is None or back != (addr & 0xFFFFFFFF):
         return False
+    if _stop():
+        return None
     if not _tar(cb + SBCS_OFF):
         return False
     if _wait() is None:

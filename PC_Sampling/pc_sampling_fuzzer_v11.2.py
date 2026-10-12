@@ -4616,10 +4616,16 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
     # ── 연결 / 인증 ──────────────────────────────────────────────────
     def connect(self) -> bool:
         rv = getattr(self.config, 'riscv', None) or {}
-        _sw_prev = (0, 0, 0)
+        if not self._open_session(rv):
+            return False
+        return self._connect_verify()
+
+    def _open_session(self, rv) -> bool:
+        """이전 세션을 닫고 새 세션을 연다(인증 확인·DM 활성·SBA 준비까지). 집계는 이월한다."""
+        _sw_keys = ('switch_fast', 'switch_fast_fail', 'switch_full', 'setup_aborted', 't_setup', 't_read')
+        _sw_prev = {}
         if self.session is not None:          # POR/재연결 시 이전 세션을 흘리지 않는다
-            _sw_prev = tuple(int(getattr(self.session, k, 0) or 0)
-                             for k in ('switch_fast', 'switch_fast_fail', 'switch_full'))
+            _sw_prev = {k: getattr(self.session, k, 0) or 0 for k in _sw_keys}
             try:
                 self.session.close()
             except Exception:
@@ -4633,11 +4639,14 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         # v11.2.1: 코어 전환·bank 읽기를 주소만 바꾸는 짧은 경로로(실패 시 전체 경로). false = 예전 경로
         self.session.fast_switch = bool(((rv.get('sample_plan') or {}).get('fast_switch', True)))
         # 집계는 재연결(PM 분리 포함)을 넘겨 누적한다
-        (self.session.switch_fast, self.session.switch_fast_fail,
-         self.session.switch_full) = _sw_prev
+        for _k, _v in _sw_prev.items():
+            setattr(self.session, _k, _v)
         if not self.session.open():
             log.error("[cJTAG/SBA] 세션 열기 실패 — SJTAG 인증/전원 확인 (sudo 필요)")
             return False
+        return True
+
+    def _connect_verify(self) -> bool:
         # ★ 코어 목록(ELF 경로 포함)은 기밀이라 fuzzer_config.json 이 아니라
         #   risc-v/sjtag_addrs.json 의 pcsr.cores 에서 읽는다.
         if not self._cores:
@@ -4684,6 +4693,44 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         self._init_overlay_probe()
         log.warning(f"[cJTAG/SBA] 세션 OK — PC 정합성 검증 통과 "
                     f"cores={sorted(self._weights)}")
+        return True
+
+    # v11.2.1: PM 분리 뒤 가벼운 재연결 — 코어마다 확인 버스트 크기
+    _REATTACH_CHECK_SAMPLES = 32
+
+    def reattach(self) -> bool:
+        """PM 동작 동안 닫았던 세션을 **가볍게** 다시 연다 → 성공 여부(실패하면 호출부가 전체 재연결).
+
+        connect() 는 매번 코어마다 PC 200개로 ELF 정합성 게이트를 돌리고 오버레이 프로브를 재검사한다(첫 연결·
+        POR·FW 활성화처럼 코어↔ELF 대응이 바뀔 수 있을 때 필요). PM 분리는 같은 펌웨어·같은 전원 구간이라
+        그 대응이 바뀌지 않는다 → 세션 열기(인증 확인 포함)와 핀만 하고, 코어마다 짧은 확인 버스트로 유효 PC 가
+        첫 연결 때 검증된 실행 범위(_ranges) 안인지만 본다. settle 도 하지 않는다(세션은 PM 동작 내내 닫혀 있었다).
+        유효 PC 가 하나도 없거나(판단 불가) 범위 밖 비율이 게이트를 넘으면 실패 → 전체 경로."""
+        if not self._ranges or not self._weights:
+            return False                                 # 첫 연결 정보가 없다
+        rv = getattr(self.config, 'riscv', None) or {}
+        if not self._open_session(rv):
+            return False
+        thr = float(rv.get('gate_threshold', 95.0))
+        valid = inr = 0
+        for cid in sorted(self._weights):
+            if not self.session.pin(cid):
+                log.warning(f"[cJTAG/SBA] 가벼운 재연결: core{cid} pin 실패")
+                return False
+            obs = self.session.burst(cid, self._REATTACH_CHECK_SAMPLES, self._valid_bit)
+            if obs and self.session.last_fail_kind == 'transport':
+                log.warning(f"[cJTAG/SBA] 가벼운 재연결: core{cid} 전송 실패")
+                return False
+            for o in obs:
+                if o.valid and o.pc is not None:
+                    valid += 1
+                    inr += bool(self._in_core_range(cid, o.pc))
+        if not valid:
+            log.warning("[cJTAG/SBA] 가벼운 재연결: 유효 PC 없음(전 코어 halt/WFI?) — 판단 불가")
+            return False
+        if 100.0 * inr / valid < thr:
+            log.warning(f"[cJTAG/SBA] 가벼운 재연결: 실행 범위 안 {100.0 * inr / valid:.0f}% < {thr:.0f}%")
+            return False
         return True
 
     def _verify_ranges(self, cores):
@@ -4929,13 +4976,20 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                         #   에서만 읽는다(핫루프에 넣으면 실측 폴링 제약을 깬다).
                         _pa = self._ovl_probe.get(core)
                         _bank = _w0 = None
+                        # v11.2.1: 버스트 **전** 준비(시작 bank 읽기·pin)는 명령이 끝나면 USB 왕복 하나 단위로
+                        #   그만둔다 — 첫 PC 읽기 전에 명령이 끝났으면 이 창에서 얻을 샘플이 없다. 검증은 그대로
+                        #   (중단된 상태는 세션이 '미상'으로 표시하고 다음 전환이 처음부터 재확인한다).
+                        _abort = self.stop_event.is_set
                         if _pa is not None:
-                            _w0 = self.session.read_word(_pa)
+                            _w0 = self.session.read_word(_pa, abort=_abort)
                             _bank = self._resolve_bank(core, _w0)
                             if self.stop_event.is_set():
                                 break
-                        obs = self.session.burst(core, n, self._valid_bit, stop=_stop_burst)
+                        obs = self.session.burst(core, n, self._valid_bit, stop=_stop_burst,
+                                                 abort=_abort)
                         _stopped = self.stop_event.is_set()
+                        if not obs and _stopped:
+                            break                          # 중단된 준비 — pin 실패로 세지 않는다
                         # transport 실패는 valid=0(WFI)와 별개다. 오버레이 폐기보다
                         # 먼저 확인해야 bank 미검출 continue에 장애가 가려지지 않는다.
                         # 빈 버스트(pin 실패)는 아래 기존 연속 실패 한도를 적용한다.
@@ -4956,12 +5010,9 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                             self.openocd_error.set()
                             bail = True
                             break
-                        if _pa is not None and obs and _stopped:
-                            # 명령이 끝난 뒤에는 끝 bank 확인 읽기도 하지 않는다 — 귀속을
-                            # 확정할 수 없는 샘플은 버린다(커버리지보다 실행 속도 우선).
-                            self._ovl_dropped += len(obs)
-                            total += len(obs)
-                            break
+                        # 명령 종료로 끊긴 버스트도 끝 bank 확인은 한다(짧은 경로로 수십 ms 이하). 예전엔
+                        # 생략하고 버렸더니, 빠른 명령은 거의 모든 창이 버스트 도중 끝나 오버레이 코어(H,
+                        # 가중치 최대·NVMe 처리 코어)의 샘플이 거의 전부 버려져 edge-cov 가 사라졌다.
                         if _pa is not None and obs:
                             # 버스트 도중 스왑이 일어났으면 이 샘플들이 어느 오버레이의
                             # 것인지 알 수 없다 → 틀린 귀속보다 버리는 게 낫다.
@@ -12095,11 +12146,26 @@ class _V101Fuzzer:
         if not self._pm_detached:
             return True
         t0 = time.monotonic()
-        try:
-            ok = bool(self.sampler._reconnect())
-        except Exception as e:
-            log.error(f"[PM-Detach] 재연결 예외({why}): {e}")
-            ok = False
+        ok = False
+        # v11.2.1: 같은 펌웨어·전원 구간이라 정합성 게이트·오버레이 재검사를 생략하는 가벼운 경로부터.
+        #   실패하면 기존 전체 재연결(settle·재시도·backoff 포함).
+        _light = getattr(self.sampler, 'reattach', None)
+        if callable(_light):
+            try:
+                ok = bool(_light())
+            except Exception as e:
+                log.warning(f"[PM-Detach] 가벼운 재연결 예외({why}): {e}")
+                ok = False
+            if ok:
+                self._pm_detach_stats['light'] = self._pm_detach_stats.get('light', 0) + 1
+            else:
+                log.warning(f"[PM-Detach] 가벼운 재연결 실패({why}) — 전체 재연결로")
+        if not ok:
+            try:
+                ok = bool(self.sampler._reconnect())
+            except Exception as e:
+                log.error(f"[PM-Detach] 재연결 예외({why}): {e}")
+                ok = False
         dt = time.monotonic() - t0
         self._pm_detach_stats['reattach_s'] += dt
         if not ok:
@@ -12113,8 +12179,8 @@ class _V101Fuzzer:
         _st = self._pm_detach_stats
         _msg = (f"[PM-Detach] 재연결 OK — {why} {dt:.1f}s"
                 + (" (재인증 수행)" if _auth else "")
-                + f"  [누적 {_st['count']}회, 재연결 평균 {_st['reattach_s'] / _st['count']:.1f}s, "
-                  f"재인증 {_st['reauth']}회]")
+                + f"  [누적 {_st['count']}회(가벼운 경로 {_st.get('light', 0)}), "
+                  f"재연결 평균 {_st['reattach_s'] / _st['count']:.1f}s, 재인증 {_st['reauth']}회]")
         (log.warning if _st['count'] <= 3 or _auth else log.info)(_msg)
         return True
 
@@ -23775,6 +23841,79 @@ class NVMeFuzzer(ExceptionFuzzerMixin, LearningMixin, _V101Fuzzer):
         if task == 'io_patterns':
             return super(LearningMixin, self)._llm_build_request(task)
         return super()._llm_build_learning_request(task)
+
+    # ── v11.2.1: 실행 시간 분해 ([Timing], 100회마다) ─────────────────────────────
+    #   어디서 시간이 드는지 실측으로 가르려고 잰다. 전송 경로의 기준 코드(_V101Fuzzer._send_nvme_command)는
+    #   건드리지 않고 바깥에서 감싼다. monotonic 두 번이라 비용은 무시할 수준이다.
+    def _tm_win(self):
+        w = getattr(self, '_tm', None)
+        if w is None:
+            w = self._tm = dict(n=0, send=0.0, stop=0.0, loop=0.0, nloop=0, last=None, prev=None)
+        return w
+
+    def _send_nvme_command(self, *args, **kwargs):
+        w = self._tm_win()
+        t0 = time.monotonic()
+        if w['last'] is not None:
+            w['loop'] += t0 - w['last']             # 직전 전송 시작부터 = 실행 1건 전체
+            w['nloop'] += 1
+        w['last'] = t0
+        try:
+            return super()._send_nvme_command(*args, **kwargs)
+        finally:
+            w['send'] += time.monotonic() - t0
+            w['n'] += 1
+
+    def _stop_sampling_checked(self, context='command'):
+        w = self._tm_win()
+        t0 = time.monotonic()
+        try:
+            return super()._stop_sampling_checked(context)
+        finally:
+            w['stop'] += time.monotonic() - t0
+
+    def _timing_snapshot(self):
+        ses = getattr(getattr(self, 'sampler', None), 'session', None)
+        pm = getattr(self, '_pm_detach_stats', None) or {}
+        return dict(setup=float(getattr(ses, 't_setup', 0.0) or 0.0),
+                    read=float(getattr(ses, 't_read', 0.0) or 0.0),
+                    aborted=int(getattr(ses, 'setup_aborted', 0) or 0),
+                    pm_n=int(pm.get('count', 0)), pm_s=float(pm.get('reattach_s', 0.0)))
+
+    def _timing_line(self):
+        """직전 창(지난 호출 이후)의 실행당 평균 → 문자열. 창을 비운다. 전송이 없었으면 None."""
+        w = self._tm_win()
+        cur = self._timing_snapshot()
+        prev = w['prev'] or cur
+        n = w['n']
+        line = None
+        if n:
+            ms = lambda v, d: 1000.0 * v / d if d else 0.0
+            pm_n, pm_s = cur['pm_n'] - prev['pm_n'], cur['pm_s'] - prev['pm_s']
+            # 실행 1건(전송 시작 간격) 평균에서 전송·종료 대기 평균과 PM 재연결 몫을 뺀 나머지
+            rest = ((w['loop'] - pm_s) / w['nloop'] - w['send'] / n - w['stop'] / n) if w['nloop'] else 0.0
+            line = (f"[Timing] 실행 {n}건 평균 — 전송(명령 실행) {ms(w['send'], n):.1f}ms | "
+                    f"종료 대기 {ms(w['stop'], n):.1f}ms | 기타(회계·변이·PM 동작) "
+                    f"{1000.0 * max(0.0, rest):.1f}ms")
+            if getattr(getattr(self, 'sampler', None), 'session', None) is not None:
+                line += (f" | SBA 준비 {ms(cur['setup'] - prev['setup'], n):.1f}ms · PC 읽기 "
+                         f"{ms(cur['read'] - prev['read'], n):.1f}ms (워커, 명령과 겹침; 준비 중단 "
+                         f"{cur['aborted'] - prev['aborted']}회)")
+            if pm_n:
+                line += f" | PM 재연결 {pm_n}회 평균 {pm_s / pm_n:.2f}s"
+        last = w['last']
+        w.clear()
+        w.update(n=0, send=0.0, stop=0.0, loop=0.0, nloop=0, last=last, prev=cur)
+        return line
+
+    def _print_status(self, stats, last_samples=0, window_eps=0.0):
+        super()._print_status(stats, last_samples, window_eps)
+        try:
+            line = self._timing_line()
+            if line:
+                log.warning(line)
+        except Exception as e:                       # 계측이 퍼징을 멈추면 안 된다
+            log.debug(f"[Timing] 집계 예외: {e}")
 
 
 if __name__ == "__main__":

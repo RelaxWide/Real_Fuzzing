@@ -329,13 +329,87 @@ class RetargetStopsAtFailedStep(unittest.TestCase):
         ok, _hw = self.run_inject(4)
         self.assertFalse(ok)
 
+class AbortsWhenCommandEnds(unittest.TestCase):
+    """버스트 전 준비(pin·시작 bank 읽기)는 명령이 끝나면 USB 왕복 하나 단위로 그만둔다. 검증은 그대로이고,
+    중단된 상태는 '미상'으로 남겨 다음 전환이 처음부터 재확인한다. 명령 종료 뒤 전체 경로로 넘어가지 않는다."""
+
+    def setUp(self):
+        self.s, self.hw = session()
+        burst(self.s, self.hw, 0)
+        self.hw.settle()
+
+    def abort_after(self, k):
+        start = self.hw.ops
+        return lambda: self.hw.ops - start >= k
+
+    def test_abort_before_start_costs_nothing(self):
+        before = self.hw.ops
+        self.assertFalse(self.s.pin(1, abort=lambda: True))
+        self.assertEqual(self.hw.ops, before)
+        self.assertEqual(self.s._pinned, 0)                   # 상태 그대로
+
+    def test_abort_mid_switch_stops_and_marks_unknown(self):
+        # 짧은 경로의 마지막 중단 지점(새 주소 read 완료 확인 전)보다 앞에서 명령이 끝나는 경우들
+        for k in range(1, 10):
+            with self.subTest(k=k):
+                self.setUp()
+                full0 = self.s.switch_full
+                before = self.hw.ops
+                ok = self.s.pin(1, abort=self.abort_after(k))
+                self.assertFalse(ok)                          # 전체 경로로 이어 붙지 않는다
+                # 진행 중이던 단계까지만 — 가장 긴 구간은 주소 쓰기→posted write·sticky 확인→되읽기(4)
+                self.assertLessEqual(self.hw.ops - before, k + 4)
+                self.assertEqual(self.s.switch_full, full0)          # 전체 경로로 넘어가지 않음
+                self.assertEqual(self.s._pinned, self.s._DIRTY)
+                self.assertGreaterEqual(self.s.setup_aborted, 1)
+                # 다음 전환은 처음부터 재확인해 올바른 코어를 읽는다
+                self.hw.settle()
+                obs = self.s.burst(2, 3)
+                self.assertEqual({o.pc for o in obs}, {2 << 4})
+                self.assertEqual(self.hw.sbcs & sj._SB_ERRMASK, 0)
+
+    def test_burst_with_abort_returns_empty_as_aborted(self):
+        obs = self.s.burst(1, 4, abort=lambda: True)
+        self.assertEqual(obs, [])
+        self.assertEqual(self.s.last_fail_kind, 'aborted')
+
+    def test_read_word_abort(self):
+        self.assertIsNone(self.s.read_word(PROBE, abort=self.abort_after(3)))
+        self.assertEqual(self.s._pinned, self.s._DIRTY)
+        self.hw.settle()
+        self.assertEqual(self.s.read_word(PROBE), self.hw.mem[PROBE])   # 다음엔 정상
+
+    def test_end_bank_read_without_abort_is_not_interrupted(self):
+        self.assertEqual(self.s.read_word(PROBE), self.hw.mem[PROBE])
+
+    def test_timers_accumulate(self):
+        t_s, t_r = self.s.t_setup, self.s.t_read
+        self.hw.settle()
+        self.s.burst(3, 4)
+        self.s.read_word(PROBE)
+        self.assertGreater(self.s.t_setup, t_s)
+        self.assertGreater(self.s.t_read, t_r)
+
 class Wiring(unittest.TestCase):
-    def test_config_flag_and_counters_survive_reconnect(self):
+    def test_config_flag(self):
         src = Path(v.__file__).read_text(encoding='utf-8')
         self.assertIn("self.session.fast_switch = bool(((rv.get('sample_plan') or {}).get('fast_switch', True)))", src)
-        self.assertIn("self.session.switch_full) = _sw_prev", src)
         self.assertIn("sw: fast", src)
 
+    def test_counters_survive_reconnect(self):
+        o = v.RiscvPcsrSampler.__new__(v.RiscvPcsrSampler)
+        o._cores, o.config = {}, type('C', (), {'jlink_vtref_mv': None})()
+        old = riscv_cov.PcsrSession(cores={})
+        old.switch_fast, old.switch_full, old.setup_aborted, old.t_setup, old.t_read = 5, 2, 3, 1.5, 2.5
+        old.close = lambda: None
+        o.session = old
+        new = riscv_cov.PcsrSession(cores={})
+        new.open = lambda: True
+        o._rc = type('R', (), {'PcsrSession': staticmethod(lambda **k: new)})
+        self.assertTrue(o._open_session({}))
+        self.assertIs(o.session, new)
+        self.assertEqual((new.switch_fast, new.switch_full, new.setup_aborted, new.t_setup, new.t_read),
+                         (5, 2, 3, 1.5, 2.5))
 
 if __name__ == '__main__':
     unittest.main()

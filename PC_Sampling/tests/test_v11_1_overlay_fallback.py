@@ -29,7 +29,7 @@ def make(read_words, bank_of, samples=200):
     s.session = NS(burst=Mock(return_value=[NS(valid=True, pc=0x10, core_id=0,
                                                 _replace=lambda **k: NS(valid=True, pc=0x10,
                                                                         core_id=0, **k))]),
-                   read_word=Mock(side_effect=read_words), last_fail_kind=None)
+                   read_word=Mock(side_effect=lambda a, **k: read_words(a)), last_fail_kind=None)
     s._maybe_recover = lambda: None
     return s
 

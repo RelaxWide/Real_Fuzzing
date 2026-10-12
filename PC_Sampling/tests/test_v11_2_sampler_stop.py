@@ -24,7 +24,7 @@ def session(read, pin_ok=lambda core: True):
     s.reads = {}
     cur = {}
 
-    def pin(core):
+    def pin(core, abort=None):
         cur['c'] = core
         return pin_ok(core)
 
@@ -96,7 +96,8 @@ class StopsAtCommandEnd(unittest.TestCase):
         self.assertFalse(t.is_alive())
         self.assertEqual(o.session.reads[0], 50)   # 진행 중이던 읽기 하나로 끝
 
-    def test_overlay_core_skips_end_check_and_drops(self):
+    def test_overlay_core_truncated_burst_keeps_samples_after_end_check(self):
+        # 끊긴 버스트도 끝 bank 를 확인해 같으면 살린다 — 버리면 빠른 명령에서 H 코어 샘플이 전부 사라진다
         o = None
 
         def read(c):
@@ -105,7 +106,35 @@ class StopsAtCommandEnd(unittest.TestCase):
             return pc(NEW)
         o = sampler(read, overlay=True)
         o._sampling_worker()
-        self.assertEqual(o.session.read_word.call_count, 1)   # 시작 bank 확인만, 끝 확인 없음
+        self.assertEqual(o.session.read_word.call_count, 2)   # 시작·끝 bank 확인
+        self.assertEqual((o._ovl_dropped, o._ovl_kept), (0, 5))
+        self.assertEqual(len(o._observations), 5)
+
+    def test_only_pre_burst_bank_read_is_abortable(self):
+        # 시작 bank 읽기·pin 은 명령 종료로 중단 가능, 끝 bank 확인은 샘플을 살리는 단계라 중단하지 않는다
+        o = None
+
+        def read(c):
+            if o.session.reads[c] == 3:
+                o.stop_event.set()
+            return pc(NEW)
+        o = sampler(read, overlay=True)
+        o._sampling_worker()
+        calls = o.session.read_word.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertIs(calls[0].kwargs.get('abort').__self__, o.stop_event)
+        self.assertNotIn('abort', calls[1].kwargs)
+
+    def test_overlay_core_truncated_burst_dropped_on_swap(self):
+        o = None
+
+        def read(c):
+            if o.session.reads[c] == 5:
+                o.stop_event.set()
+            return pc(NEW)
+        o = sampler(read, overlay=True)
+        o.session.read_word = Mock(side_effect=[7, 8])           # 버스트 사이 스왑
+        o._sampling_worker()
         self.assertEqual((o._ovl_dropped, o._ovl_kept), (5, 0))
 
     def test_stop_before_burst_after_bank_read_reads_nothing(self):
@@ -187,7 +216,8 @@ class FailuresAccumulateAcrossWindows(unittest.TestCase):
             flags.append(o.openocd_error.is_set())
             if flags[-1]:
                 break
-        self.assertEqual(flags, [False, False, True])          # 3+3+2 = 한도 8
+        # 창마다 pin 3번 중 마지막은 명령 종료와 겹쳐 '중단된 준비'로 보고 세지 않는다 → 2+2+2+2 = 한도 8
+        self.assertEqual(flags, [False, False, False, True])
         self.assertEqual(o._stopped_reason, 'pin_fail')
 
     def test_successful_pin_resets_pin_failure_count(self):
