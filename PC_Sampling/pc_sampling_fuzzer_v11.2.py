@@ -4616,7 +4616,10 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
     # ── 연결 / 인증 ──────────────────────────────────────────────────
     def connect(self) -> bool:
         rv = getattr(self.config, 'riscv', None) or {}
+        _sw_prev = (0, 0, 0)
         if self.session is not None:          # POR/재연결 시 이전 세션을 흘리지 않는다
+            _sw_prev = tuple(int(getattr(self.session, k, 0) or 0)
+                             for k in ('switch_fast', 'switch_fast_fail', 'switch_full'))
             try:
                 self.session.close()
             except Exception:
@@ -4627,6 +4630,11 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             auth_timeout=float(rv.get('auth_timeout', 60.0)),
             word_order=rv.get('word_order'),
             vtref_mv=self.config.jlink_vtref_mv)
+        # v11.2.1: 코어 전환·bank 읽기를 주소만 바꾸는 짧은 경로로(실패 시 전체 경로). false = 예전 경로
+        self.session.fast_switch = bool(((rv.get('sample_plan') or {}).get('fast_switch', True)))
+        # 집계는 재연결(PM 분리 포함)을 넘겨 누적한다
+        (self.session.switch_fast, self.session.switch_fast_fail,
+         self.session.switch_full) = _sw_prev
         if not self.session.open():
             log.error("[cJTAG/SBA] 세션 열기 실패 — SJTAG 인증/전원 확인 (sudo 필요)")
             return False
@@ -18781,6 +18789,12 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
         _col_tag = ""
         if _col:
             _col_tag = f" | collapse: {_col}"
+        # v11.2.1: BM9K1 주소 전환 — 짧은 경로 성공 / 실패(→전체 경로) / 전체 경로
+        _ss = getattr(getattr(self.sampler, 'session', None), 'switch_fast', None)
+        if isinstance(_ss, int):
+            _s = self.sampler.session
+            _col_tag += (f" | sw: fast {_s.switch_fast:,}/fail {_s.switch_fast_fail:,}"
+                         f"/full {_s.switch_full:,}")
         log.warning(f"[Stats] exec: {stats['executions']:,} | "
                  f"corpus: {stats['corpus_size']}(seq:{_seq_cnt}) | "
                  f"pcs: {stats['coverage_unique_pcs']:,} | "

@@ -833,6 +833,65 @@ def sba_read_pinned(dap):
     return None if v is None or v < 0 else v & 0xFFFFFFFF
 
 
+_SB_FIFO = _SB32 | (1 << 20) | (1 << 15)              # sba_pin 이 세우는 모드: 32bit + readonaddr + readondata
+_SB_FIFO_MASK = (0x7 << 17) | (1 << 20) | (1 << 15)
+
+
+def sba_retarget(dap, ap, cb, addr, polls=8):
+    """핀 상태(FIFO 모드·CSW 32bit·TAR=sbdata0)를 유지한 채 SBA 주소만 바꾼다 → 성공 여부.
+
+    코어 전환·오버레이 bank 읽기에서 실제로 바뀌는 건 sbaddress0 하나다. sba_unpin+sba_pin 은 매번
+    에러 클리어·모드 기록·CSW 를 처음부터 다시 해 약 40~50 왕복이 든다. 여기서는 같은 AP bank 안의
+    TAR/DRW 만 쓴다. 대신 검증은 mem_write32 와 같은 수준으로 유지한다(리뷰: 검증을 빼면 주소 변경이
+    조용히 실패해 **이전 코어의 PC 를 새 코어 값으로** 받는다).
+      1) TAR→sbcs(되읽기 확인), 진행 중인 read(readondata 가 미리 시작한 것) 완료 대기. 에러·모드 불일치면 실패
+      2) TAR→sbaddress0(되읽기 확인), DRW=addr — sbreadonaddr 라 이 쓰기가 새 주소의 첫 read 를 시작한다
+         → posted write 완료·DP sticky 확인(RDBUFF·CTRL/STAT) → sbaddress0 되읽기 == addr
+      3) TAR→sbcs(되읽기 확인), 그 read 의 완료·무에러 확인 (이후 sbdata0 = 새 주소 값)
+      4) TAR→sbdata0 고정 + 되읽기
+    ★ fail-closed: 한 단계라도 실패하면 False — 호출부가 전체 경로(sba_unpin→sba_pin)로 되돌린다.
+      재시도는 하지 않는다(전체 경로가 에러 클리어부터 다시 한다)."""
+    def _tar(a):
+        if not dap.ap_write(ap, OFF_TAR, a, retry=0):
+            return False
+        back = dap.ap_read(ap, OFF_TAR, retry=0)
+        return back is not None and back == (a & 0xFFFFFFFF)
+
+    def _wait():
+        for _ in range(polls):
+            cs = dap.ap_read(ap, OFF_DRW, retry=0)
+            if cs is None:
+                return None
+            if cs & _SB_BUSY:
+                continue
+            return None if cs & _SB_ERRMASK else cs
+        return None
+
+    if not _tar(cb + SBCS_OFF):
+        return False
+    cs = _wait()
+    if cs is None or (cs & _SB_FIFO_MASK) != _SB_FIFO:
+        return False
+    if not _tar(cb + SBADDR0_OFF):
+        return False
+    if not dap.ap_write(ap, OFF_DRW, addr, retry=0):
+        return False
+    err = dap.dp_sticky_error()                 # posted write flush + CTRL/STAT (mem_write32 와 같은 확인)
+    if err is None:
+        return False
+    if err:
+        dap.clear_sticky()
+        return False
+    back = dap.ap_read(ap, OFF_DRW, retry=0)    # sbaddress0 읽기는 read 를 시작하지 않는다
+    if back is None or back != (addr & 0xFFFFFFFF):
+        return False
+    if not _tar(cb + SBCS_OFF):
+        return False
+    if _wait() is None:
+        return False
+    return _tar(cb + SBDATA0_OFF)
+
+
 def sba_unpin(dap, ap, cb):
     """FIFO 모드 해제(sbreadondata off). 성공 여부를 반환한다.
 

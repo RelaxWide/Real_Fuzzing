@@ -980,7 +980,11 @@ class PcsrSession:
         self.lock = threading.RLock()
         self.lk = self.dap = None
         self._ap = self._cb = None
-        self._pinned = None           # 현재 핀된 core_id
+        self._pinned = None           # 현재 핀된 core_id (짧은 경로로 단발 읽기 중이면 ('word', addr))
+        # v11.2.1: 핀된 상태에서 주소만 바꾸는 짧은 경로(sba_retarget). 실패하면 전체 경로로 되돌린다.
+        #   False 면 예전처럼 매번 sba_unpin→sba_pin / _sba_read. 집계는 [Stats] 의 sw: 로 본다.
+        self.fast_switch = True
+        self.switch_fast = self.switch_full = self.switch_fast_fail = 0
         self.auth_ms = 0.0
         self.auth_count = 0
         self.auth_fail = 0
@@ -1170,6 +1174,10 @@ class PcsrSession:
         with self.lock:
             if self._pinned == core_id:
                 return True
+            if self._pinned is not None and self._retarget(self._pcsr_addr(core_id)):
+                self._pinned = core_id
+                return True
+            self.switch_full += 1
             if self._pinned is not None:
                 # 마지막 SBDATA0 read 가 다음 SBA read 를 trigger한 상태일 수 있다.
                 # 코어 전환은 핫루프 밖이므로 여기서 busy 완료+FIFO off 를 확인한다.
@@ -1183,6 +1191,21 @@ class PcsrSession:
                                   self._pcsr_addr(core_id))
             self._pinned = core_id if ok else None
             return ok
+
+    def _retarget(self, addr):
+        """핀 상태를 유지한 채 SBA 주소만 바꾼다(짧은 경로). 실패하면 False — 상태(_pinned)는 그대로 두어
+        호출부의 전체 경로가 sba_unpin(busy 완료 대기·FIFO off)부터 다시 하게 한다."""
+        if not self.fast_switch:
+            return False
+        try:
+            ok = bool(self._sj.sba_retarget(self.dap, self._ap, self._cb, addr))
+        except Exception:
+            ok = False
+        if ok:
+            self.switch_fast += 1
+        else:
+            self.switch_fast_fail += 1
+        return ok
 
     @_handle_locked
     def burst(self, core_id, n, valid_bit=1, stop=None):
@@ -1224,7 +1247,16 @@ class PcsrSession:
         ★ 반드시 **버스트 경계**에서만 부른다. 버스트 핀은 PCSR 주소에 걸려 있어
         여기서 먼저 풀어야 하고, 핫루프(DRW 반복) 안에 넣으면 실측 폴링 제약을 깬다.
         실패는 None 으로 돌려준다 — 호출부가 그 버스트를 버린다.
+
+        v11.2.1: 핀된 상태면 주소만 프로브로 바꿔(짧은 경로) DRW 한 번으로 읽는다. 짧은 경로가
+        새 주소 read 의 완료·무에러를 확인한 뒤라 sbdata0 = 프로브 값이다. 이 읽기가 같은 주소의
+        다음 read 를 하나 더 시작하므로(readondata) 상태는 ('word', addr) — 다음 pin 이 짧은 경로로
+        busy 완료를 기다린 뒤 PCSR 주소로 되돌린다. 실패하면 예전 경로.
         """
+        if self._pinned is not None and self._retarget(addr):
+            self._pinned = ('word', addr)
+            return self._sj.sba_read_pinned(self.dap)
+        self.switch_full += 1
         if self._pinned is not None:
             if not self._sj.sba_unpin(self.dap, self._ap, self._cb):
                 self._pinned = None
