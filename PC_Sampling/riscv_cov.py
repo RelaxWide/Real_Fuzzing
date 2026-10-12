@@ -988,6 +988,9 @@ class PcsrSession:
         # v11.2.1: 명령 종료로 중단한 준비(pin·bank 읽기) 횟수와 시간 분해(준비 vs PC 읽기, 초)
         self.setup_aborted = 0
         self.t_setup = self.t_read = 0.0
+        # 마지막 준비(pin·bank 읽기) 결과: 'ok' | 'aborted'(명령 종료로 그만둠) | 'fail'(실제 SBA 실패).
+        #   종료 신호만 보고 실패를 '중단'으로 접으면, 짧은 명령에서 실제 링크 장애가 영영 안 세진다(리뷰).
+        self.last_setup = 'ok'
         self.auth_ms = 0.0
         self.auth_count = 0
         self.auth_fail = 0
@@ -1184,35 +1187,49 @@ class PcsrSession:
 
     @_handle_locked
     def pin(self, core_id, abort=None):
-        """abort() 가 참이 되면(명령 종료) 준비를 그만두고 False. 이미 핀돼 있으면 비용 없이 True."""
+        """abort() 가 참이 되면(명령 종료) 준비를 그만두고 False. 이미 핀돼 있으면 비용 없이 True.
+        결과 종류는 self.last_setup 에 남긴다('aborted' 와 'fail' 을 구분)."""
         with self.lock:
-            if self._pinned == core_id:
-                return True
-            if self._aborted(abort):
-                return False
-            if self._pinned is not None:
-                r = self._retarget(self._pcsr_addr(core_id), abort)
-                if r:
-                    self._pinned = core_id
-                    return True
-                if r is None or self._aborted(abort):
-                    # 명령이 끝났다 — 전체 경로(수십 왕복)로 넘어가지 않는다
-                    self._pinned = self._DIRTY
-                    return False
-            self.switch_full += 1
-            if self._pinned is not None:
-                # 마지막 SBDATA0 read 가 다음 SBA read 를 trigger한 상태일 수 있다.
-                # 코어 전환은 핫루프 밖이므로 여기서 busy 완료+FIFO off 를 확인한다.
-                # 실패한 상태로 새 SBADDR를 쓰면 sbbusyerror가 연쇄되어 이후 모든
-                # burst가 빈 리스트가 되므로 fail-closed 한다.
-                if not self._sj.sba_unpin(self.dap, self._ap, self._cb):
-                    self._pinned = None
-                    return False
-                self._pinned = None
-            ok = self._sj.sba_pin(self.dap, self._ap, self._cb,
-                                  self._pcsr_addr(core_id))
-            self._pinned = core_id if ok else None
+            ok = self._pin(core_id, abort)
+            if ok:
+                self.last_setup = 'ok'
             return ok
+
+    def _pin(self, core_id, abort):
+        if self._pinned == core_id:
+            return True
+        if self._aborted(abort):
+            self.last_setup = 'aborted'
+            return False
+        if self._pinned is not None:
+            r = self._retarget(self._pcsr_addr(core_id), abort)
+            if r:
+                self._pinned = core_id
+                return True
+            if r is None:                                    # 짧은 경로가 중단됐다
+                self._pinned = self._DIRTY
+                self.last_setup = 'aborted'
+                return False
+            if abort is not None and abort():
+                # 짧은 경로가 **실패**했고 명령도 끝났다 — 실패로 남기되 전체 경로(수십 왕복)로 넘어가지 않는다
+                self._pinned = self._DIRTY
+                self.last_setup = 'fail'
+                return False
+        self.last_setup = 'fail'                             # 아래 전체 경로가 성공하면 pin() 이 'ok' 로 바꾼다
+        self.switch_full += 1
+        if self._pinned is not None:
+            # 마지막 SBDATA0 read 가 다음 SBA read 를 trigger한 상태일 수 있다.
+            # 코어 전환은 핫루프 밖이므로 여기서 busy 완료+FIFO off 를 확인한다.
+            # 실패한 상태로 새 SBADDR를 쓰면 sbbusyerror가 연쇄되어 이후 모든
+            # burst가 빈 리스트가 되므로 fail-closed 한다.
+            if not self._sj.sba_unpin(self.dap, self._ap, self._cb):
+                self._pinned = None
+                return False
+            self._pinned = None
+        ok = self._sj.sba_pin(self.dap, self._ap, self._cb,
+                              self._pcsr_addr(core_id))
+        self._pinned = core_id if ok else None
+        return ok
 
     def _retarget(self, addr, abort=None):
         """핀 상태를 유지한 채 SBA 주소만 바꾼다(짧은 경로). 실패하면 False — 상태(_pinned)는 그대로 두어
@@ -1248,8 +1265,8 @@ class PcsrSession:
             t1 = time.monotonic()
             self.t_setup += t1 - t0
             if not pinned:
-                # 명령 종료로 준비를 그만둔 것은 전송 장애가 아니다
-                self.last_fail_kind = "aborted" if (abort is not None and abort()) else "transport"
+                # 명령 종료로 준비를 **그만둔** 것만 전송 장애가 아니다. 종료와 겹친 실제 실패는 transport 로 남긴다
+                self.last_fail_kind = "aborted" if self.last_setup == 'aborted' else "transport"
                 return obs
             read = self._sj.sba_read_pinned
             dap, prev = self.dap, None
@@ -1296,15 +1313,28 @@ class PcsrSession:
 
     def _read_word(self, addr, abort):
         if self._aborted(abort):
+            self.last_setup = 'aborted'
             return None
         if self._pinned is not None:
             r = self._retarget(addr, abort)
             if r:
                 self._pinned = ('word', addr)
-                return self._sj.sba_read_pinned(self.dap)
-            if r is None or self._aborted(abort):
+                v = self._sj.sba_read_pinned(self.dap)
+                self.last_setup = 'ok' if v is not None else 'fail'
+                return v
+            if r is None:
                 self._pinned = self._DIRTY
+                self.last_setup = 'aborted'
                 return None
+            if abort is not None and abort():
+                self._pinned = self._DIRTY
+                self.last_setup = 'fail'
+                return None
+        v = self._read_word_full(addr)
+        self.last_setup = 'ok' if v is not None else 'fail'
+        return v
+
+    def _read_word_full(self, addr):
         self.switch_full += 1
         if self._pinned is not None:
             if not self._sj.sba_unpin(self.dap, self._ap, self._cb):

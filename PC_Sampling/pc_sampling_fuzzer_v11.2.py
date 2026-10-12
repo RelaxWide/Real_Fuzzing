@@ -4712,7 +4712,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         if not self._open_session(rv):
             return False
         thr = float(rv.get('gate_threshold', 95.0))
-        valid = inr = 0
+        any_valid = False
         for cid in sorted(self._weights):
             if not self.session.pin(cid):
                 log.warning(f"[cJTAG/SBA] 가벼운 재연결: core{cid} pin 실패")
@@ -4721,15 +4721,18 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             if obs and self.session.last_fail_kind == 'transport':
                 log.warning(f"[cJTAG/SBA] 가벼운 재연결: core{cid} 전송 실패")
                 return False
-            for o in obs:
-                if o.valid and o.pc is not None:
-                    valid += 1
-                    inr += bool(self._in_core_range(cid, o.pc))
-        if not valid:
+            pcs = [o.pc for o in obs if o.valid and o.pc is not None]
+            if not pcs:
+                continue                                 # halt/WFI 코어 — 판단 보류(허용)
+            any_valid = True
+            # 코어별로 본다 — 전체 합산이면 정상 코어 표본이 한 코어의 범위 밖 PC 를 가린다(리뷰)
+            inr = sum(1 for pc in pcs if self._in_core_range(cid, pc))
+            if 100.0 * inr / len(pcs) < thr:
+                log.warning(f"[cJTAG/SBA] 가벼운 재연결: core{cid} 실행 범위 안 "
+                            f"{100.0 * inr / len(pcs):.0f}% < {thr:.0f}% ({inr}/{len(pcs)})")
+                return False
+        if not any_valid:
             log.warning("[cJTAG/SBA] 가벼운 재연결: 유효 PC 없음(전 코어 halt/WFI?) — 판단 불가")
-            return False
-        if 100.0 * inr / valid < thr:
-            log.warning(f"[cJTAG/SBA] 가벼운 재연결: 실행 범위 안 {100.0 * inr / valid:.0f}% < {thr:.0f}%")
             return False
         return True
 
@@ -4984,12 +4987,16 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                             _w0 = self.session.read_word(_pa, abort=_abort)
                             _bank = self._resolve_bank(core, _w0)
                             if self.stop_event.is_set():
+                                # 명령 종료와 겹친 **실제** 읽기 실패는 준비 실패로 센다(중단과 구분 — 리뷰)
+                                if (getattr(self.session, 'last_setup', 'ok') == 'fail'
+                                        and self._setup_failed(core)):
+                                    bail = True
                                 break
                         obs = self.session.burst(core, n, self._valid_bit, stop=_stop_burst,
                                                  abort=_abort)
                         _stopped = self.stop_event.is_set()
-                        if not obs and _stopped:
-                            break                          # 중단된 준비 — pin 실패로 세지 않는다
+                        if not obs and self.session.last_fail_kind == 'aborted':
+                            break                          # 명령 종료로 그만둔 준비 — pin 실패로 세지 않는다
                         # transport 실패는 valid=0(WFI)와 별개다. 오버레이 폐기보다
                         # 먼저 확인해야 bank 미검출 continue에 장애가 가려지지 않는다.
                         # 빈 버스트(pin 실패)는 아래 기존 연속 실패 한도를 적용한다.
@@ -5036,14 +5043,8 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                             #   시작 로그 뒤 아무것도 안 찍힘). 진행이 없으면 빠져나온다.
                             #   v11.2.1: 연속 횟수는 창을 넘겨 센다 — 짧은 명령으로 창이 한도 전에
                             #   끝나기를 반복하면 pin 실패가 영영 판정되지 않는다.
-                            self._empty_streak += 1
-                            if self._empty_streak >= self._EMPTY_BURST_LIMIT:
-                                self._stopped_reason = 'pin_fail'
-                                log.error(f"[cJTAG/SBA] 빈 버스트 {self._empty_streak}회 연속(pin 실패) — "
-                                          f"샘플링 중단. 세션/오프셋 확인")
-                                self._empty_streak = 0
+                            if self._setup_failed(core):
                                 bail = True
-                                self.openocd_error.set()   # 상위 루프가 재연결 판단
                                 break
                             continue
                         total += len(obs)
@@ -5113,6 +5114,18 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         return True
 
     # ── 붕괴 감지 / 복구 ─────────────────────────────────────────────
+    def _setup_failed(self, core) -> bool:
+        """준비(pin·bank 읽기) 실제 실패 1회를 창을 넘겨 센다 → 한도에 이르면 장애로 알리고 True."""
+        self._empty_streak += 1
+        if self._empty_streak < self._EMPTY_BURST_LIMIT:
+            return False
+        self._stopped_reason = 'pin_fail'
+        log.error(f"[cJTAG/SBA] 준비 실패(pin/bank 읽기) {self._empty_streak}회 연속(core{core}) — "
+                  f"샘플링 중단. 세션/오프셋 확인")
+        self._empty_streak = 0
+        self.openocd_error.set()   # 상위 루프가 재연결 판단
+        return True
+
     def _track_collapse(self, core, obs):
         """★ 단일 코어 연속 무효로 판정하면 오판한다 — 버스트+무지연이라 한 코어가 잠깐
         halt/wfi 여도 수백 µs 만에 수백 회를 채운다. **전 코어 지속 무효**만 붕괴다."""
@@ -12238,6 +12251,18 @@ class _V101Fuzzer:
         if not self._unresp_ok():
             return self._pm_detach_preserve('진입', combo.label, self._pm_unresponsive)
         return self._pm_sampler_attach(f'combo {combo.label}')
+
+    def _pm_take_slot(self) -> bool:
+        """PM 슬롯 차례면 True 를 돌려주고 다음 예정을 지금부터 PM_ROTATE_INTERVAL 뒤로 잡는다.
+        예정 실행 수를 지났으면(시퀀스 등으로 배수를 건너뛰었어도) 이번 반복에서 돈다. 밀린 횟수만큼
+        연달아 돌지는 않는다. 같은 실행 수에서 반복이 거듭돼도(가드 차단 등) 다시 돌지 않는다."""
+        due = getattr(self, '_pm_next_at', None)
+        if due is None:
+            due = self._pm_next_at = 0
+        if self.executions < due:
+            return False
+        self._pm_next_at = self.executions + PM_ROTATE_INTERVAL
+        return True
 
     def _unresp_ok(self) -> bool:
         return not self._pm_unresponsive
@@ -19991,6 +20016,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             self._window_exec0: int = 0
             # calibration 실행 횟수를 제외하고 main loop 기준으로 카운트 재시작
             self.executions = 0
+            self._pm_next_at = 0     # v11.2.1: 다음 PM 슬롯 예정 실행 수(예전처럼 첫 반복에서 한 번 돈다)
 
             # 퍼징 시작 직전 초기 상태 스냅샷
             self._log_smart()
@@ -20048,9 +20074,12 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
 
                 # PM rotation (PM_ROTATE_INTERVAL 마다): 60% combo / 10% forced_idle /
                 # 20% S1 pcie_bit / 10% S2 clkreq. PM 전이 후 seed 선택.
+                # v11.2.1: '실행 수가 정확히 배수'가 아니라 '예정 실행 수 이상'이면 돈다. 예전엔 한 반복에 여러 명령을
+                #   실행하는 시퀀스·det 묶음이나 워크로드 반복이 배수를 건너뛰면 그 주기 PM 이 통째로 빠졌다(시퀀스가
+                #   많을수록 PM 이 드물어짐). 늦어도 다음 반복에서 돌고, 예정은 그때부터 다시 INTERVAL 뒤.
                 if (self.config.pm_inject_prob > 0
                         and not self._learning_setup_active()
-                        and self.executions % PM_ROTATE_INTERVAL == 0):
+                        and self._pm_take_slot()):
                     _next_combo = None
                     _r = random.random()
                     if   _r < 0.60:
@@ -23848,7 +23877,9 @@ class NVMeFuzzer(ExceptionFuzzerMixin, LearningMixin, _V101Fuzzer):
     def _tm_win(self):
         w = getattr(self, '_tm', None)
         if w is None:
-            w = self._tm = dict(n=0, send=0.0, stop=0.0, loop=0.0, nloop=0, last=None, prev=None)
+            # 기준값은 측정을 시작하는 지금 잡는다 — 첫 출력에서 누적값 차이가 0 이 되지 않게(리뷰)
+            w = self._tm = dict(n=0, send=0.0, stop=0.0, loop=0.0, nloop=0, last=None,
+                                prev=self._timing_snapshot())
         return w
 
     def _send_nvme_command(self, *args, **kwargs):
@@ -23873,18 +23904,21 @@ class NVMeFuzzer(ExceptionFuzzerMixin, LearningMixin, _V101Fuzzer):
             w['stop'] += time.monotonic() - t0
 
     def _timing_snapshot(self):
+        """누적 계수기 스냅샷. 전송 경로에서 불리므로 어떤 샘플러·상태에서도 예외를 내지 않는다(숫자만 읽음)."""
+        def num(obj, key, default=0):
+            v = obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+            return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
         ses = getattr(getattr(self, 'sampler', None), 'session', None)
-        pm = getattr(self, '_pm_detach_stats', None) or {}
-        return dict(setup=float(getattr(ses, 't_setup', 0.0) or 0.0),
-                    read=float(getattr(ses, 't_read', 0.0) or 0.0),
-                    aborted=int(getattr(ses, 'setup_aborted', 0) or 0),
-                    pm_n=int(pm.get('count', 0)), pm_s=float(pm.get('reattach_s', 0.0)))
+        pm = getattr(self, '_pm_detach_stats', None)
+        return dict(setup=float(num(ses, 't_setup')), read=float(num(ses, 't_read')),
+                    aborted=int(num(ses, 'setup_aborted')),
+                    pm_n=int(num(pm, 'count')), pm_s=float(num(pm, 'reattach_s')))
 
     def _timing_line(self):
         """직전 창(지난 호출 이후)의 실행당 평균 → 문자열. 창을 비운다. 전송이 없었으면 None."""
         w = self._tm_win()
         cur = self._timing_snapshot()
-        prev = w['prev'] or cur
+        prev = w['prev']
         n = w['n']
         line = None
         if n:

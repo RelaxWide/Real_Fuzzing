@@ -114,6 +114,12 @@
       "date": "2026-10-12",
       "base_commit": "e48ae6f",
       "reason": "RiscvPcsrSampler (review follow-up): (1) _sampling_worker passes abort=stop_event.is_set to the pre-burst bank read and burst/pin; the session stops the short SBA retarget at step boundaries (never between the address write and its verification), marks the SBA state unknown and does not fall back to the full path after the command ended; an aborted setup is not counted as a pin failure. The post-burst end-bank check is not abortable (it salvages samples). (2) connect() split into _open_session() + _connect_verify() without behavior change; counters carried over now include setup_aborted/t_setup/t_read. (3) New reattach(): light reconnect after a PM detach (open session + pin + 32-sample check that valid PCs fall inside the ranges verified at first connect, gate_threshold); no ELF gate re-run, no overlay probe re-check, no settle. Any failure returns False and the caller uses the unchanged full _reconnect(). Reviewed."
+    },
+    {
+      "file": "pc_sampling_fuzzer_v11.2.py",
+      "date": "2026-10-12",
+      "base_commit": "48c4fc6",
+      "reason": "RiscvPcsrSampler (review): a real pin/bank-read failure that overlaps the command end is no longer folded into 'aborted' — PcsrSession.last_setup distinguishes ok/aborted/fail, burst() reports 'aborted' only for a setup that actually stopped, and the worker counts real failures (including the pre-burst bank read) toward the cross-window setup-failure limit via _setup_failed(). reattach() checks the in-range ratio per core (WFI cores with no valid PC still allowed) instead of pooling all cores. Reviewed."
     }
   ],
   "overrides_note": "hashes 는 모든 DEVICE_AST_FILES 에 적용되는 기준선이다. overrides 는 검토를 거쳐 **특정 파일에서만** 의도적으로 달라진 경로를 기록한다. v10.2 는 검증된 fallback 이라 계속 기준선 그대로여야 하고, 여기 올라오지 않은 파일·경로는 전부 기준선에 묶인다.",
@@ -135,7 +141,7 @@
     "pc_sampling_fuzzer_v11.2.py": {
       "OpenOCDPCSampler": "48865eb551960624265b061a897ddf8abdc2586862598bc2be3c97a3a69aba04",
       "_V101Fuzzer._send_nvme_command": "0357c5f8d049a5f11bb1491af57d766508970f4680124247624e441a3b336b24",
-      "RiscvPcsrSampler": "1fb2282d8fcabb5feab6487ac7abefe6ff7f2ebc656ab400bbbf557dbcd88ef9",
+      "RiscvPcsrSampler": "9da37e4017354c0c4a2786ddcc9f65bddd4db626642ce7ab9fa6772dd02b748e",
       "JLinkHaltSampler": "e44a432e61c101138e2b97c43f3218d4c2b2033d0d58cd4ed4a9dede6607d250"
     }
   }

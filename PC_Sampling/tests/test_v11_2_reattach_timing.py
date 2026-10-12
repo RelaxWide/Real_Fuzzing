@@ -41,6 +41,13 @@ class LightReattach(unittest.TestCase):
     def test_wfi_core_is_fine_if_another_core_has_valid_pcs(self):
         self.assertTrue(sampler({0: [IN] * 32, 1: [None] * 32}).reattach())
 
+    def test_bad_core_not_hidden_by_good_core(self):
+        # 정상 코어 32개 + 범위 밖 1개·무효 31개 코어 — 합산이면 97% 로 통과하던 경우(리뷰)
+        o = sampler({0: [IN] * 32, 1: [OUT] + [None] * 31})
+        with self.assertLogs('pcfuzz', level='WARNING') as cm:
+            self.assertFalse(o.reattach())
+        self.assertIn('core1', '\n'.join(cm.output))
+
     def test_failures_fall_back(self):
         cases = {
             'no first-connect info': dict(ranges=False),
@@ -113,6 +120,33 @@ class TimingLine(unittest.TestCase):
         self.assertIn('준비 중단 1회', line)
         self.assertIn('PM 재연결 1회 평균 0.00s', line)
         self.assertIsNone(f._timing_line())                    # 창을 비웠다
+
+    def test_first_line_without_prior_baseline(self):
+        # 기준값을 미리 잡지 않은 실제 초기 경로 — 첫 출력에서도 SBA·PM 값이 나와야 한다(리뷰)
+        f = v.NVMeFuzzer.__new__(v.NVMeFuzzer)
+        ses = NS(t_setup=10.0, t_read=20.0, setup_aborted=4)     # 측정 전 누적(연결·부팅 수집)
+        f.sampler = NS(session=ses)
+        f._pm_detach_stats = dict(count=2, reattach_s=9.0)
+        with patch.object(v.ExceptionFuzzerMixin, '_send_nvme_command', return_value=0), \
+                patch.object(v.ExceptionFuzzerMixin, '_stop_sampling_checked', return_value=(0, True)):
+            f._send_nvme_command(b'', None)
+            f._stop_sampling_checked()
+        ses.t_setup, ses.t_read, ses.setup_aborted = 12.0, 23.0, 5
+        f._pm_detach_stats.update(count=3, reattach_s=10.5)
+        line = f._timing_line()
+        self.assertIn('SBA 준비 2000.0ms · PC 읽기 3000.0ms', line)
+        self.assertIn('준비 중단 1회', line)
+        self.assertIn('PM 재연결 1회 평균 1.50s', line)
+
+    def test_snapshot_never_raises_on_odd_sampler(self):
+        # 전송 경로에서 불린다 — Mock·None 샘플러여도 예외 없이 0 (v11 예외 시험들이 Mock 샘플러를 쓴다)
+        from unittest.mock import Mock
+        f = v.NVMeFuzzer.__new__(v.NVMeFuzzer)
+        for smp in (Mock(), None, NS(session=None), NS(session=NS(t_setup='x'))):
+            f.sampler = smp
+            f._pm_detach_stats = Mock() if smp is None else None
+            snap = f._timing_snapshot()
+            self.assertEqual(snap['setup'], 0.0)
 
     def test_exception_in_timing_does_not_break_status(self):
         f = v.NVMeFuzzer.__new__(v.NVMeFuzzer)

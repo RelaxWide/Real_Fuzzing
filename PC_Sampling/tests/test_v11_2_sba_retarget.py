@@ -368,10 +368,28 @@ class AbortsWhenCommandEnds(unittest.TestCase):
                 self.assertEqual({o.pc for o in obs}, {2 << 4})
                 self.assertEqual(self.hw.sbcs & sj._SB_ERRMASK, 0)
 
+    def test_real_failure_overlapping_command_end_is_fail_not_aborted(self):
+        # 짧은 경로가 실제로 실패(sberror)했는데 그 사이 명령도 끝났다 — 중단이 아니라 실패로 남긴다(리뷰)
+        self.hw.sbcs |= 0x2 << 12
+        start = self.hw.ops
+        full0 = self.s.switch_full
+        obs = self.s.burst(1, 4, abort=lambda: self.hw.ops - start >= 3)
+        self.assertEqual(obs, [])
+        self.assertEqual(self.s.last_setup, 'fail')
+        self.assertEqual(self.s.last_fail_kind, 'transport')
+        self.assertEqual(self.s.switch_full, full0)            # 명령 종료 뒤 전체 경로로 넘어가지 않는다
+
+    def test_read_word_real_failure_overlapping_end_is_fail(self):
+        self.hw.sbcs |= 0x2 << 12
+        start = self.hw.ops
+        self.assertIsNone(self.s.read_word(PROBE, abort=lambda: self.hw.ops - start >= 3))
+        self.assertEqual(self.s.last_setup, 'fail')
+
     def test_burst_with_abort_returns_empty_as_aborted(self):
         obs = self.s.burst(1, 4, abort=lambda: True)
         self.assertEqual(obs, [])
         self.assertEqual(self.s.last_fail_kind, 'aborted')
+        self.assertEqual(self.s.last_setup, 'aborted')
 
     def test_read_word_abort(self):
         self.assertIsNone(self.s.read_word(PROBE, abort=self.abort_after(3)))

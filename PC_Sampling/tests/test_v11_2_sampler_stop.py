@@ -216,9 +216,43 @@ class FailuresAccumulateAcrossWindows(unittest.TestCase):
             flags.append(o.openocd_error.is_set())
             if flags[-1]:
                 break
-        # 창마다 pin 3번 중 마지막은 명령 종료와 겹쳐 '중단된 준비'로 보고 세지 않는다 → 2+2+2+2 = 한도 8
-        self.assertEqual(flags, [False, False, False, True])
+        # 명령 종료와 겹친 pin 도 **실제 실패**면 센다(중단과 구분 — 리뷰) → 3+3+2 = 한도 8
+        self.assertEqual(flags, [False, False, True])
         self.assertEqual(o._stopped_reason, 'pin_fail')
+
+    def test_real_bank_read_failures_overlapping_end_accumulate(self):
+        # 시작 bank 읽기가 실제로 실패하면서 명령이 끝나는 창이 이어져도 언젠가 장애로 판정한다(리뷰: 예전엔 20창 내내 0)
+        o = sampler(lambda c: pc(NEW), overlay=True)
+
+        def fail_read(addr, abort=None):
+            o.stop_event.set()
+            o.session.last_setup = 'fail'
+            return None
+        o.session.read_word = fail_read
+        flags = []
+        for _ in range(20):
+            o.stop_event.clear()
+            o._sampling_worker()
+            flags.append(o.openocd_error.is_set())
+            if flags[-1]:
+                break
+        self.assertEqual(len(flags), o._EMPTY_BURST_LIMIT)
+        self.assertTrue(flags[-1])
+        self.assertEqual(o._stopped_reason, 'pin_fail')
+
+    def test_aborted_bank_read_is_not_counted(self):
+        o = sampler(lambda c: pc(NEW), overlay=True)
+
+        def aborted_read(addr, abort=None):
+            o.stop_event.set()
+            o.session.last_setup = 'aborted'
+            return None
+        o.session.read_word = aborted_read
+        for _ in range(20):
+            o.stop_event.clear()
+            o._sampling_worker()
+        self.assertFalse(o.openocd_error.is_set())
+        self.assertEqual(o._empty_streak, 0)
 
     def test_successful_pin_resets_pin_failure_count(self):
         # pin 성공이 섞이면 연속이 아니다 — 오버레이 폐기(continue)로 끝나는 버스트도 성공으로 친다
