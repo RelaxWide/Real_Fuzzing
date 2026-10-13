@@ -385,7 +385,7 @@
       "enable_jlink_dump": false,
       "enable_debug_tool_dump": false,
       "state_fields": "bm9k1",
-      "_comment_nvme_timeouts": "퍼저가 crash(타임아웃)로 판정하는 명령별 창(ms). write = Write/WriteUncorrectable/WriteZeroes, flush = Flush, format = FormatNVM, 나머지 명령은 command. 여기 없는 그룹(fw_commit/sanitize/telemetry/dsm/security)도 command 값을 쓴다. BM9K1 비침습 명령의 실제 창 = 값 × 전송 전 추적 PS 배율(PS1:16, PS2:64, 기타:1). 105ms 및 subprocess 2초 마진은 적용하지 않는다. 추적 PS는 순간 실측값이 아니다.",
+      "_comment_nvme_timeouts": "퍼저가 crash(타임아웃)로 판정하는 명령별 창(ms). write = Write/WriteUncorrectable/WriteZeroes, flush = Flush, format = FormatNVM, 나머지 명령은 command. 여기 없는 그룹(fw_commit/sanitize/telemetry/dsm/security)도 command 값을 쓴다. BM9K1 비침습 명령의 실제 창 = 값 × 전송 전 추적 PS 배율(PS1:10, PS2:10, 기타:1). 105ms 및 subprocess 2초 마진은 적용하지 않는다. 추적 PS는 순간 실측값이 아니다.",
       "nvme_timeouts": {
         "command": 8000,
         "write": 30000,

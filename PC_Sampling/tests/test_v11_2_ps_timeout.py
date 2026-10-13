@@ -29,7 +29,7 @@ class PowerTimeout(unittest.TestCase):
                         self.seed.cmd = dataclasses.replace(self.seed.cmd, timeout_group=group)
                         self.f.config.nvme_timeouts[group] = base_ms
                         self.assertEqual(self.send(), 0)
-                        expected = (base_ms * {0: 1, 1: 16, 2: 64}[ps] / 1000
+                        expected = (base_ms * {0: 1, 1: 10, 2: 10}[ps] / 1000
                                     if product == 'BM9K1' else
                                     (base_ms + self.base.PS_ENTRY_EXIT_MARGIN_MS) / 1000 + 2)
                         self.assertAlmostEqual(self.proc.communicate.call_args.kwargs['timeout'], expected)
@@ -37,11 +37,11 @@ class PowerTimeout(unittest.TestCase):
     def test_timeout_preserves_process_and_logs_tracked_ps(self):
         self.prepare(ps=2)
         self.f.config.nvme_timeouts['command'] = 8000
-        self.proc.communicate.side_effect = subprocess.TimeoutExpired('nvme', 512)
+        self.proc.communicate.side_effect = subprocess.TimeoutExpired('nvme', 80)
         with self.assertLogs('pcfuzz', level='INFO') as logs:
             self.assertEqual(self.send(), self.f.RC_TIMEOUT)
-        self.assertIn('tracked_ps=PS2 base=8000ms factor=64', '\n'.join(logs.output))
-        self.assertEqual(self.proc.communicate.call_args.kwargs['timeout'], 512)
+        self.assertIn('tracked_ps=PS2 base=8000ms factor=10', '\n'.join(logs.output))
+        self.assertEqual(self.proc.communicate.call_args.kwargs['timeout'], 80)
         self.proc.kill.assert_not_called()
 
     def test_successful_power_seed_updates_next_command_only(self):
@@ -54,7 +54,7 @@ class PowerTimeout(unittest.TestCase):
         self.assertEqual(self.f._current_ps, 1)
         self.seed.opcode_override = None
         self.assertEqual(self.send(), 0)
-        self.assertEqual(self.proc.communicate.call_args.kwargs['timeout'], 128)
+        self.assertEqual(self.proc.communicate.call_args.kwargs['timeout'], 80)
         self.seed.opcode_override = 0x09
         self.seed.cdw11 = 2
         self.proc.returncode = 1

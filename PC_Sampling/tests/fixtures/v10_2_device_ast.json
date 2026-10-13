@@ -127,6 +127,13 @@
       "date": "2026-10-13",
       "base_commit": "be574c7",
       "reason": "User-requested BM9K1 timeout policy: JSON group timeout times tracked PS factor (PS1=16, PS2=64, other=1), without 105ms or subprocess 2s margins. Log tracked PS and update it after successful actual admin Power Management SetFeatures. Other products keep existing timeout policy. Real transport mocked-subprocess regression tests: test_v11_2_ps_timeout.py."
+    },
+    {
+      "file": "pc_sampling_fuzzer_v11.2.py",
+      "path": "_V101Fuzzer._send_nvme_command",
+      "date": "2026-10-13",
+      "base_commit": "eb6db48",
+      "reason": "User requested BM9K1 PS1 and PS2 timeout multipliers both become 10 (previously 16/64). PS0 and other products unchanged; no fixed margins added. Verified real transport deadlines in test_v11_2_ps_timeout.py."
     }
   ],
   "overrides_note": "hashes 는 모든 DEVICE_AST_FILES 에 적용되는 기준선이다. overrides 는 검토를 거쳐 **특정 파일에서만** 의도적으로 달라진 경로를 기록한다. v10.2 는 검증된 fallback 이라 계속 기준선 그대로여야 하고, 여기 올라오지 않은 파일·경로는 전부 기준선에 묶인다.",
@@ -147,7 +154,7 @@
     },
     "pc_sampling_fuzzer_v11.2.py": {
       "OpenOCDPCSampler": "48865eb551960624265b061a897ddf8abdc2586862598bc2be3c97a3a69aba04",
-      "_V101Fuzzer._send_nvme_command": "04948219ca9329c4f72934e775aa1a3185dbe69e81839990ec45f273243bab82",
+      "_V101Fuzzer._send_nvme_command": "ad2011cacaf77f52f15cb6b3ad1df325354af3b1609a4200b45b2bac9133c10c",
       "RiscvPcsrSampler": "9da37e4017354c0c4a2786ddcc9f65bddd4db626642ce7ab9fa6772dd02b748e",
       "JLinkHaltSampler": "e44a432e61c101138e2b97c43f3218d4c2b2033d0d58cd4ed4a9dede6607d250"
     }

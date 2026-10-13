@@ -14927,7 +14927,7 @@ class _V101Fuzzer:
         _bm_timeout = getattr(self.config, 'product', None) == 'BM9K1'
         _timeout_ps = getattr(self, '_current_ps', 0)
         _timeout_base_ms = timeout_ms
-        _timeout_factor = {1: 16, 2: 64}.get(_timeout_ps, 1) if _bm_timeout else 1
+        _timeout_factor = {1: 10, 2: 10}.get(_timeout_ps, 1) if _bm_timeout else 1
         timeout_ms = (timeout_ms * _timeout_factor if _bm_timeout
                       else timeout_ms + PS_ENTRY_EXIT_MARGIN_MS)
         _subprocess_margin_sec = 0.0 if _bm_timeout else 2.0
@@ -19474,7 +19474,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             self._detect_pcie_info()
             log.warning(f"PM Rotate   : interval={PM_ROTATE_INTERVAL}cmds, "
                         f"combos={len(POWER_COMBOS)}개(PS0~4×L0/L1/L1.2×D0/D3), "
-                        + ("timeout=JSON×PS 배율(PS0:1, PS1:16, PS2:64), 추가 마진 없음"
+                        + ("timeout=JSON×PS 배율(PS0:1, PS1:10, PS2:10), 추가 마진 없음"
                            if self.config.product == 'BM9K1' else
                            f"timeout_margin=+{PS_ENTRY_EXIT_MARGIN_MS}ms(entry/exit latency)"))
         if self.cov is not None and getattr(self.cov, 'loaded', False):
@@ -24048,7 +24048,7 @@ if __name__ == "__main__":
     # PM
     parser.add_argument('--pm', action='store_true', default=False,
                         help=f'PM 로테이션 활성화: {PM_ROTATE_INTERVAL}명령마다 PS0→PS1→PS2→PS3→PS4 순환. '
-                             f'BM9K1 timeout은 PS1 ×16/PS2 ×64, 기타 제품은 +{PS_ENTRY_EXIT_MARGIN_MS}ms 마진')
+                             f'BM9K1 timeout은 PS1 ×10/PS2 ×10, 기타 제품은 +{PS_ENTRY_EXIT_MARGIN_MS}ms 마진')
     parser.add_argument('--allow-no-openocd', action='store_true', default=False,
                         help='OpenOCD 연결 실패 시 --pm 전용 PM preflight/cycle 테스트만 수행하고 종료')
     parser.add_argument('--no-jlink', action='store_true', default=False,
