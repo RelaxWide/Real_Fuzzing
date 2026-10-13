@@ -80,6 +80,54 @@ class PowerTimeout(unittest.TestCase):
         self.assertEqual(f._current_combo, pm.OP)
         self.assertIn('--cdw11=0x1', f._pm_nvme_run.call_args.args[0])
 
+    def test_failed_entry_does_not_restore_into_deep_ps(self):
+        # Tracked PS can be deep after a fuzzed SetFeatures; never reattach after "restoring" to it.
+        import test_v11_2_pm_detach as pm
+        for tracked, expected in ((4, 1), (3, 1), (2, 2), (0, 0)):
+            with self.subTest(tracked=tracked):
+                f, events = pm.engine()
+                f._current_ps, f._prev_op_ps = tracked, 1
+                f._set_power_combo.side_effect = lambda combo: False
+                self.assertTrue(f._pm_detached_combo(pm.OP2))
+                f._pm_set_state.assert_called_once_with(expected)
+                self.assertEqual(events[-1], 'attach')
+
+    def test_por_recovery_resets_tracked_ps(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+        import test_v11_2_pm_detach as pm
+        for pm_on in (True, False):
+            with self.subTest(pm_on=pm_on):
+                f = self.base._V101Fuzzer.__new__(self.base._V101Fuzzer)
+                f.config = SimpleNamespace(pmu_script='pmu.py', por_poweroff_wait=0, boot_sweep_s=0,
+                                           clkreq_voltage_mv=3300, no_jlink=True,
+                                           pm_inject_prob=1 if pm_on else 0)
+                f._crash_nvme_pid = None
+                f._current_ps, f._current_combo = 2, pm.OP2
+                f.sampler = MagicMock()
+                for name in ('_probe_device', '_detect_pcie_info', '_set_pcie_l_state',
+                             '_apst_disable', '_keepalive_disable'):
+                    setattr(f, name, MagicMock())
+                f._por_remove_target = MagicMock(return_value=None)
+                f._por_pcie_rescan = MagicMock(return_value=True)
+                # APST is turned off after the reset, so the tracker must already be PS0 by then.
+                f._apst_disable.side_effect = lambda *a, **k: self.assertEqual(f._current_ps, 0)
+                done = SimpleNamespace(returncode=0, stderr=b'', stdout=b'')
+                with patch.object(self.base.os.path, 'isfile', return_value=True), \
+                        patch.object(self.base.subprocess, 'run', return_value=done), \
+                        patch.object(self.base.time, 'sleep'):
+                    self.assertTrue(f._recover_after_unsupported_skip())
+                self.assertEqual(f._current_ps, 0)
+                self.assertEqual(f._current_combo,
+                                 self.base.POWER_COMBOS[0] if pm_on else pm.OP2)
+                f._por_pcie_rescan.return_value = False
+                f._current_ps = 2
+                with patch.object(self.base.os.path, 'isfile', return_value=True), \
+                        patch.object(self.base.subprocess, 'run', return_value=done), \
+                        patch.object(self.base.time, 'sleep'):
+                    self.assertFalse(f._recover_after_unsupported_skip())
+                self.assertEqual(f._current_ps, 2)  # failed recovery: state unknown, keep
+
     def test_pm_set_state_updates_only_on_success(self):
         self.prepare(ps=2)
         self.f._pm_nvme_run = unittest.mock.Mock(return_value=self.base._StateProc(0, b'', b''))

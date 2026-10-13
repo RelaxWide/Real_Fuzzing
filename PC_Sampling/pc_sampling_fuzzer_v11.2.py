@@ -12221,9 +12221,12 @@ class _V101Fuzzer:
             return self._pm_sampler_attach(f'combo {combo.label} (분리 실패 — PM 생략)')
         self._pm_unresponsive = None
         deep = combo.nvme_ps in self._PM_DEEP_PS or self._is_nonop_combo(combo)
+        # 저수준 PS 성공 추적과 별개로 진입 전 복귀 목표 보존. 추적 PS 가 깊은 상태(퍼징 명령의 SetFeatures 로
+        # PS3/PS4 가 된 경우)면 그리로 돌려놓고 붙이지 않는다 — 직전 동작 PS 로.
+        _restore_ps = (self._current_ps if self._current_ps not in self._PM_DEEP_PS
+                       else self._prev_op_ps)
         if combo.nvme_ps not in self._PM_DEEP_PS:   # 원래 규칙(진입 시도 전, PS 기준) — timeout 기준 PS
             self._prev_op_ps = combo.nvme_ps
-        _restore_ps = self._current_ps  # 저수준 PS 성공 추적과 별개로 진입 전 복귀 목표 보존
         _set_ok = self._set_power_combo(combo)
         self.ps_enter_counts[combo.nvme_ps] += 1
         if _set_ok:
@@ -16012,6 +16015,9 @@ class _V101Fuzzer:
                 self._set_pcie_l_state(PCIeLState.L0)
             except Exception as e:
                 log.warning(f"[UnsupChk] PCIe 상태 재초기화 예외: {e}")
+            self._current_combo = POWER_COMBOS[0]
+        # 전원 사이클 뒤 장치는 PS0 — 추적 PS 를 남겨 두면 BM9K1 timeout 배율이 다음 PM 슬롯까지 잘못 적용된다
+        self._current_ps = 0
         self._apst_disable()
         self._keepalive_disable()
 
