@@ -12223,6 +12223,7 @@ class _V101Fuzzer:
         deep = combo.nvme_ps in self._PM_DEEP_PS or self._is_nonop_combo(combo)
         if combo.nvme_ps not in self._PM_DEEP_PS:   # 원래 규칙(진입 시도 전, PS 기준) — timeout 기준 PS
             self._prev_op_ps = combo.nvme_ps
+        _restore_ps = self._current_ps  # 저수준 PS 성공 추적과 별개로 진입 전 복귀 목표 보존
         _set_ok = self._set_power_combo(combo)
         self.ps_enter_counts[combo.nvme_ps] += 1
         if _set_ok:
@@ -12257,10 +12258,10 @@ class _V101Fuzzer:
             if not self._unresp_ok():
                 # 진입 명령이 무응답이면 추가 명령 없이 보존한다 — 대기 명령을 더 쌓거나 현상을 바꾸지 않게
                 return self._pm_detach_preserve('진입', combo.label, self._pm_unresponsive)
-            if not (self._pm_set_state(self._current_ps) and self._unresp_ok()):
+            if not (self._pm_set_state(_restore_ps) and self._unresp_ok()):
                 return self._pm_detach_preserve(
                     '진입 실패 뒤 PS 복귀', combo.label,
-                    self._pm_unresponsive or f'PS{self._current_ps} 복귀 실패')
+                    self._pm_unresponsive or f'PS{_restore_ps} 복귀 실패')
         if not self._unresp_ok():
             return self._pm_detach_preserve('진입', combo.label, self._pm_unresponsive)
         return self._pm_sampler_attach(f'combo {combo.label}')
@@ -12373,6 +12374,8 @@ class _V101Fuzzer:
             result = self._pm_nvme_run(nvme_cmd, 5.0, record=False)
             _hist['t1'] = time.monotonic()
             ok = (result.returncode == 0)
+            if ok and getattr(self.config, 'product', None) == 'BM9K1':
+                self._current_ps = ps
             status = ("OK" if ok else "FAIL(무응답 — 5s)" if self._pm_timed_out(result)
                       else f"FAIL(rc={result.returncode})")
             _pm_elapsed = time.monotonic() - _pm_t0
@@ -14919,8 +14922,15 @@ class _V101Fuzzer:
             effective_tg,
             self.config.nvme_timeouts.get('command', 8000)
         )
-        # PS entry/exit latency 마진: 어떤 PS 상태에서든 복귀 지연을 흡수
-        timeout_ms += PS_ENTRY_EXIT_MARGIN_MS
+        # BM9K1: 전송 직전 추적 PS에 따라 JSON의 명령별 기준값을 배율 적용한다.
+        # 실제 순간 PS를 읽은 값은 아니다(APST/외부 변경은 관측하지 않음).
+        _bm_timeout = getattr(self.config, 'product', None) == 'BM9K1'
+        _timeout_ps = getattr(self, '_current_ps', 0)
+        _timeout_base_ms = timeout_ms
+        _timeout_factor = {1: 16, 2: 64}.get(_timeout_ps, 1) if _bm_timeout else 1
+        timeout_ms = (timeout_ms * _timeout_factor if _bm_timeout
+                      else timeout_ms + PS_ENTRY_EXIT_MARGIN_MS)
+        _subprocess_margin_sec = 0.0 if _bm_timeout else 2.0
         # nvme-cli --timeout: 커널이 NVMe 명령을 포기하는 시점 (v4.6: 분리)
         # 이 값을 길게 유지하면 crash 시 커널이 controller reset을 하지 않아
         # SSD 펌웨어 상태를 그대로 보존할 수 있다 (JTAG 분석 용이).
@@ -15021,8 +15031,10 @@ class _V101Fuzzer:
             mut_flags.append(f"data_len={data_len}(override)")
         mut_str = f" MUT[{','.join(mut_flags)}]" if mut_flags else ""
 
+        _ps_timeout_log = (f" tracked_ps=PS{_timeout_ps} base={_timeout_base_ms}ms"
+                           f" factor={_timeout_factor}" if _bm_timeout else "")
         log.info(f"[NVMe] {passthru_type} {cmd.name} opcode=0x{actual_opcode:02x} "
-                 f"nsid={actual_nsid} timeout={timeout_ms}ms({effective_tg}) "
+                 f"nsid={actual_nsid} timeout={timeout_ms}ms({effective_tg}){_ps_timeout_log} "
                  f"cdw10=0x{seed.cdw10:08x} cdw11=0x{seed.cdw11:08x} "
                  f"cdw12=0x{seed.cdw12:08x} data_len={data_len}"
                  f" data={data[:16].hex() if data else 'N/A'}"
@@ -15075,8 +15087,8 @@ class _V101Fuzzer:
                     return _exception_rc
             _is_halt = self.sampler.INVASIVE
             if not _is_halt:
-                # 비침습(PCSR)/기타: 코어가 풀스피드 → 벽시계 ≈ 펌웨어시간. 기존 경로 그대로.
-                timeout_sec = max(0.001, timeout_ms / 1000.0 + 2.0 - _exception_elapsed)
+                # 비침습(PCSR)/기타: 벽시계 기준. BM9K1은 추가 대기 없이 PS 배율만 적용.
+                timeout_sec = max(0.001, timeout_ms / 1000.0 + _subprocess_margin_sec - _exception_elapsed)
                 try:
                     stdout, stderr = process.communicate(timeout=timeout_sec)
                 except subprocess.TimeoutExpired:
@@ -15118,6 +15130,11 @@ class _V101Fuzzer:
                          + ("  (halt 오버헤드 지배 — 초고속 명령)" if _freeze > _wall else ""))
 
             rc = process.returncode
+            # 성공한 실제 admin SetFeatures(FID=Power Management)만 다음 명령의 추적 PS로 반영.
+            # opcode mutation도 반영하며, 이 명령 자체의 deadline은 전송 전 PS 기준이다.
+            if (_bm_timeout and rc == 0 and passthru_type == 'admin-passthru'
+                    and actual_opcode == 0x09 and (seed.cdw10 & 0xff) == 0x02):
+                self._current_ps = seed.cdw11 & 0x1f
             _freeze_emit('nvme.returned', child_pid=process.pid, rc=rc)
 
             # FWCommit(0x10) 성공 = 펌웨어 활성화로 R5 코어가 리셋될 수 있고, 그러면 프로브(USB)는
@@ -19457,7 +19474,9 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             self._detect_pcie_info()
             log.warning(f"PM Rotate   : interval={PM_ROTATE_INTERVAL}cmds, "
                         f"combos={len(POWER_COMBOS)}개(PS0~4×L0/L1/L1.2×D0/D3), "
-                        f"timeout_margin=+{PS_ENTRY_EXIT_MARGIN_MS}ms(entry/exit latency)")
+                        + ("timeout=JSON×PS 배율(PS0:1, PS1:16, PS2:64), 추가 마진 없음"
+                           if self.config.product == 'BM9K1' else
+                           f"timeout_margin=+{PS_ENTRY_EXIT_MARGIN_MS}ms(entry/exit latency)"))
         if self.cov is not None and getattr(self.cov, 'loaded', False):
             log.warning(f"StaticAnalysis: RISC-V per-core basic_blocks={self.cov.total_bbs:,}, "
                         f"funcs={self.cov.total_funcs:,}")
@@ -20472,7 +20491,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                     self.combo_exec_counts[self._current_combo] += 1
 
                 # NVMe 커맨드 전송
-                # timeout은 _send_nvme_command 내부에서 PS_ENTRY_EXIT_MARGIN_MS(105ms) 고정 가산
+                # timeout은 _send_nvme_command에서 제품별 정책 적용(BM9K1: 추적 PS 배율)
                 # FWDownload + 실제 청크 목록이 있으면 전체 청크를 순서대로 전송,
                 # exec 카운터는 1만 증가 (CLI 기준 1회 실행)
                 # 회계/리포트(FAIL CMD·crash·replay)용 "실제 전송된" seed/data.
@@ -24029,7 +24048,7 @@ if __name__ == "__main__":
     # PM
     parser.add_argument('--pm', action='store_true', default=False,
                         help=f'PM 로테이션 활성화: {PM_ROTATE_INTERVAL}명령마다 PS0→PS1→PS2→PS3→PS4 순환. '
-                             f'timeout +{PS_ENTRY_EXIT_MARGIN_MS}ms 고정 마진 적용')
+                             f'BM9K1 timeout은 PS1 ×16/PS2 ×64, 기타 제품은 +{PS_ENTRY_EXIT_MARGIN_MS}ms 마진')
     parser.add_argument('--allow-no-openocd', action='store_true', default=False,
                         help='OpenOCD 연결 실패 시 --pm 전용 PM preflight/cycle 테스트만 수행하고 종료')
     parser.add_argument('--no-jlink', action='store_true', default=False,
