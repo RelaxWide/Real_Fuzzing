@@ -311,6 +311,10 @@ class CoverageModel:
         self.cores: dict[int, CoreMap] = {}
         self.covered_bbs: set[int] = set()          # packed key
         self.entered_funcs: set[int] = set()        # packed key(함수 entry)
+        # v11.3: 새 커버리지 **판정용** 집합(명령 관측 ∪ idle 기준선). None 이면 covered_bbs 로 판정(기존 동작).
+        #   백그라운드 관측(observe_background)은 covered_bbs 에만 들어가고 여기에는 안 들어간다 —
+        #   백그라운드가 먼저 본 BB 를 나중에 명령이 밟으면 그 명령의 신규로 친다(방식 B).
+        self.judge_bbs = None
         self.loaded = False
         self.product = ""
         self.warnings: list[str] = []
@@ -531,7 +535,11 @@ class CoverageModel:
         p = self.project(observations)
         cur, considered, dropped = p.seed_keys, p.considered, p.dropped
         self.entered_funcs |= p.func_keys
-        new = cur - self.covered_bbs
+        if self.judge_bbs is None:
+            new = cur - self.covered_bbs
+        else:
+            new = cur - self.judge_bbs
+            self.judge_bbs |= cur
         self.covered_bbs |= cur
         by_core = {}
         for k in new:
@@ -545,6 +553,22 @@ class CoverageModel:
     def update(self, observations):
         """판정 없이 커버리지만 반영(idle/boot/prefill 용)."""
         self.account(observations)
+
+    def enable_judge_set(self):
+        """v11.3: 판정용 집합을 켠다(지금까지의 커버리지 = 시작 시 idle 기준선·불러온 커버리지로 시작). → 켰으면 True."""
+        if self.judge_bbs is None:
+            self.judge_bbs = set(self.covered_bbs)
+            return True
+        return False
+
+    def observe_background(self, observations):
+        """v11.3: 명령에 귀속하지 않는 관측 — 전체 커버리지(covered_bbs·entered_funcs)에만 넣는다.
+        판정용 집합(judge_bbs)은 건드리지 않는다. → 전체 커버리지에 새로 들어간 키 수."""
+        p = self.project(observations)
+        self.entered_funcs |= p.func_keys
+        new = p.seed_keys - self.covered_bbs
+        self.covered_bbs |= p.seed_keys
+        return len(new)
 
     # ── 통계 / 리포트 ──────────────────────────────────────────────────
     def overlay_stats(self):
@@ -1287,6 +1311,64 @@ class PcsrSession:
         #   둘을 뭉뚱그리면 정상 WFI 구간에서 불필요한 재연결이 돈다.
         self.last_fail_kind = "transport" if (obs and raw_fail == len(obs)) else None
         return obs
+
+    # v11.3: 상시 백그라운드 샘플링용. 기존 burst() 는 그대로 두고 샘플마다 **포착 가능 구간**을 함께 낸다.
+    #   SBA FIFO 모드(readondata)에서 i 번째 DRW 읽기가 돌려주는 값은 그 전에 시작된 bus read 의 결과다.
+    #   그 read 가 언제 끝났는지는 확인하지 않으므로(핫루프는 DRW 1회뿐) 구간은
+    #   [그 read 를 시작시킨 호출 직전, 값을 받아 온 호출 직후] 로 보수적으로 잡는다.
+    #   시작 시각("트리거")은 burst 가 아니라 SBA 파이프라인 상태를 따라간다:
+    #     · pin 이 주소를 실제로 다시 썼다 → 그 pin 호출 직전
+    #     · 같은 코어에 이미 핀돼 있었다(_pin 즉시 반환) → 직전 burst_timed 의 마지막 트리거를 이어받는다.
+    #       그 사이 다른 경로가 같은 핀으로 읽었어도 실제 트리거는 더 늦으므로 이어받은 값은 보수적이다.
+    #     · 이어받을 기록이 없다(새 세션, 다른 코어 기록) → 알 수 없음 = 0.0 (어떤 명령 구간에도 들지 않는다)
+    #     · 읽기 실패(None)는 새 read 를 시작했는지 모르므로 트리거를 옮기지 않는다
+    _UNKNOWN_TRIGGER = 0.0
+    _trig = None                      # (core_id, 마지막 트리거 시각)
+
+    @_handle_locked
+    def burst_timed(self, core_id, n, valid_bit=1, stop=None, clock=time.monotonic):
+        """burst() 와 같은 읽기 + 샘플마다 (t_lo, t_hi). → (obs, spans).
+        pin 실패면 ([], []). last_fail_kind·last_setup·t_setup·t_read 는 burst() 와 같은 뜻이다.
+        ★ 루프 본체에 DAP 접근·지연을 넣지 않는다 — 더하는 것은 시각 읽기 2회뿐이다."""
+        obs, spans, raw_fail = [], [], 0
+        with self.lock:
+            t0 = clock()
+            before = self._pinned
+            pinned = self.pin(core_id)
+            t1 = clock()
+            self.t_setup += t1 - t0
+            if not pinned:
+                self._trig = None
+                self.last_fail_kind = "transport"
+                return obs, spans
+            if before == core_id:
+                prev = self._trig
+                trig = prev[1] if (prev is not None and prev[0] == core_id) else self._UNKNOWN_TRIGGER
+            else:
+                trig = t0                                  # 주소를 다시 썼다 — pin 호출 직전부터
+            read = self._sj.sba_read_pinned
+            dap, last = self.dap, None
+            for _ in range(n):
+                a = clock()
+                raw = read(dap)
+                b = clock()
+                if raw is None:
+                    raw_fail += 1
+                    obs.append(Observation(core_id, None, False, False))
+                    spans.append((self._UNKNOWN_TRIGGER, b))
+                else:
+                    valid = bool(raw & valid_bit)
+                    pc = (raw & ~valid_bit) if valid else None
+                    obs.append(Observation(core_id, pc, pc != last, valid))
+                    spans.append((trig, b))
+                    last = pc
+                    trig = a                               # 이 읽기가 다음 bus read 를 시작했다
+                if stop is not None and stop(obs[-1]):
+                    break
+            self._trig = (core_id, trig)
+            self.t_read += clock() - t1
+        self.last_fail_kind = "transport" if (obs and raw_fail == len(obs)) else None
+        return obs, spans
 
     # ── 복구 ─────────────────────────────────────────────────────────
     @_handle_locked

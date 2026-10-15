@@ -372,7 +372,17 @@
             "exponent": 2.0,
             "prior_samples": 2000
           },
-          "jitter_pct": 20.0
+          "jitter_pct": 20.0,
+          "background": {
+            "_comment": "v11.3 상시 백그라운드 샘플링(opt-in). enabled=true이면 샘플링 워커가 명령과 무관하게 계속 돌고, 명령 구간 안에 포착된 샘플만 그 명령의 커버리지로 나눠 준다(나머지는 전체 커버리지에만). 실기 확인 전이라 기본 false — false면 v11.2.1 창 방식 그대로다. 예외 주입(exceptions.enabled)과 함께 켤 수 없다. overlay_burst_len은 오버레이 코어 burst 길이, pending_max는 회계를 기다리는 명령 수 상한, max_lag_sec는 명령이 끝난 뒤 확정이 멈춘 것을 워커 정체로 볼 시간, pause_timeout_sec는 일시정지 확인 신호 제한, flush_timeout_sec는 시퀀스·캘리브레이션·PM·timeout·종료 때 확정을 기다리는 제한, queue_max_samples는 워커 결과 큐 상한이다. docs/V11_3_BACKGROUND_SAMPLING_PLAN.md",
+            "enabled": false,
+            "overlay_burst_len": 64,
+            "pending_max": 256,
+            "max_lag_sec": 5.0,
+            "pause_timeout_sec": 10.0,
+            "flush_timeout_sec": 10.0,
+            "queue_max_samples": 100000
+          }
         }
       },
       "invalid_pc_vals": [],

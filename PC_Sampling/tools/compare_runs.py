@@ -12,6 +12,8 @@
   --metric  bb_pct(기본) | func_pct | bb
   --x       time(기본, 시간) | exec(실행 명령 수)
   --strict  제품·FW·커버리지 분모 등 비교 조건이 다르면 중단(기본은 경고만)
+            샘플링 방식(conditions.sampling_mode, v11.3)이 다르면 --strict 없이도 중단한다.
+            방식끼리 나란히 보려면 --group sampling_mode
 
 산출물(--out, 기본은 첫 입력 폴더 아래 compare/):
   compare_coverage.png  — 그룹별 커버리지 성장(중앙값 + 최소~최대 음영, 실행별 얇은 선)
@@ -34,6 +36,15 @@ SCHEMA = 'pcfuzz-run/1'
 _RUN_LEVEL = {'llm', 'llm_module', 'llm_model', 'retrieval', 'config_sha256', 'version'}
 # 다르면 커버리지 비교 자체가 무의미한 조건
 _MUST_MATCH = ('product', 'commands')
+# v11.3: 측정 방식. 다르면 같은 BB 수치라도 뜻이 다르다(백그라운드 관측 포함 여부·귀속 규칙) —
+#   --strict 가 없어도 비교를 막는다. 이 키가 없는 기록(v11.2 이전)은 창 방식이다.
+#   방식끼리 나란히 보려면 --group sampling_mode 로 나눈다.
+_MEASUREMENT = {'sampling_mode': 'window', 'attribution_policy': None}
+
+
+def cond(rec, key):
+    c = rec.get('conditions') or {}
+    return c.get(key, _MEASUREMENT.get(key))
 
 
 def load_records(inputs):
@@ -93,15 +104,30 @@ def check_comparable(runs, group_key, strict):
     other = set()
     for r in runs:
         for k, v in (r.get('conditions') or {}).items():
-            if k in _RUN_LEVEL or k == group_key or k in _MUST_MATCH or k == 'fw':
+            if (k in _RUN_LEVEL or k == group_key or k in _MUST_MATCH or k == 'fw'
+                    or k in _MEASUREMENT):
                 continue
             other.add(k)
     for k in sorted(other):
         vals = {json.dumps((r.get('conditions') or {}).get(k), sort_keys=True) for r in runs}
         if len(vals) > 1:
             problems.append(f'조건 {k} 가 실행마다 다름: {sorted(vals)}')
+    measurement = []
+    for k in _MEASUREMENT:
+        if k == group_key or (group_key == 'sampling_mode' and k == 'attribution_policy'):
+            continue
+        vals = {}
+        for r in runs:
+            vals.setdefault(json.dumps(cond(r, k), sort_keys=True), []).append(r['run_id'])
+        if len(vals) > 1:
+            measurement.append(f'측정 방식 {k} 가 실행마다 다름: ' +
+                               '; '.join(f'{v} ← {", ".join(ids)}' for v, ids in vals.items()))
+    problems += measurement
     for p in problems:
         print(f'[compare] ⚠ {p}', file=sys.stderr)
+    if measurement:
+        raise SystemExit('[compare] 샘플링 방식이 다른 실행은 한 그룹으로 비교하지 않는다 — '
+                         '방식별로 나누려면 --group sampling_mode')
     if problems and strict:
         raise SystemExit('[compare] --strict: 비교 조건이 달라 중단')
     return problems
@@ -188,7 +214,7 @@ def compare(runs, group_key='llm', metric='bb_pct', xaxis='time', out_dir=None, 
     problems = check_comparable(runs, group_key, strict)
     groups = {}
     for r in runs:
-        groups.setdefault(group_label(group_key, (r.get('conditions') or {}).get(group_key)), []).append(r)
+        groups.setdefault(group_label(group_key, cond(r, group_key)), []).append(r)
     if metric not in ('bb_pct', 'func_pct', 'bb'):
         raise SystemExit(f'[compare] 지원하지 않는 metric: {metric}')
     # 기록 점이 없는 실행(첫 기록 전에 죽음 등)은 비교 전체를 막지 않고 빼고 알린다
