@@ -10564,11 +10564,11 @@ class _V101Fuzzer:
         """v11.3: 디버그 링크 재연결이 끝내 실패했을 때 POR 로 디버그 쪽을 되살리고 이어간다 → 샘플러가 다시 붙었으면 True.
 
         BM9K1 에서 복구 시퀀스가 실패하면 DM AP(APBAP1)가 POR 전까지 응답하지 않는 상태가 있다(컨트롤러는 정상).
-        riscv.link_fail_por=true 일 때만, **컨트롤러가 응답할 때만**(순수 링크 장애) 한다 — 응답이 없으면 펌웨어 행
-        이라 기존대로 POR 없이 증거를 남긴다(_capture_firmware_hang_if_stuck). 횟수 상한 없음(사용자 결정 2026-10-15).
-        예외 주입 캠페인에서는 _recover_after_unsupported_skip 이 막는다."""
-        rv = getattr(self.config, 'riscv', None) or {}
-        if not rv.get('link_fail_por', False):
+        BM9K1(riscv_pcsr)에서 항상 켜져 있다(설정 없음, 사용자 결정 2026-10-16). **컨트롤러가 응답할 때만**(순수 링크 장애)
+        한다 — 응답이 없으면 펌웨어 행이라 기존대로 POR 없이 증거를 남긴다(_capture_firmware_hang_if_stuck).
+        횟수 상한 없음(사용자 결정 2026-10-15). 다른 제품은 하지 않는다. 예외 주입 캠페인에서는
+        _recover_after_unsupported_skip 이 막는다."""
+        if getattr(self.config, 'sampler_type', None) != 'riscv_pcsr':
             return False
         try:
             _d, _err, _rc = self._nvme_id_dict(['nvme', 'id-ctrl', self.config.nvme_device])

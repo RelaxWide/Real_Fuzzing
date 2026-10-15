@@ -1,4 +1,4 @@
-"""v11.3 — 디버그 링크 재연결이 끝내 실패하면(컨트롤러는 정상) POR 후 재연결로 이어간다(riscv.link_fail_por, 기본 꺼짐).
+"""v11.3 — 디버그 링크 재연결이 끝내 실패하면(컨트롤러는 정상) POR 후 재연결로 이어간다(BM9K1 항상, 설정 없음).
 
 BM9K1: 복구 시퀀스 실패 뒤 DM AP(APBAP1)가 POR 전까지 응답하지 않는 상태가 있다. 컨트롤러가 응답하지 않으면
 펌웨어 행이라 기존대로 POR 없이 증거를 남긴다. 횟수 상한 없음.
@@ -13,9 +13,9 @@ from unittest.mock import MagicMock
 from fuzzer_target import fuzzer as v
 
 
-def fuzzer(enabled=True, ctrl_ok=True, por_ok=True, reconnect_ok=True):
+def fuzzer(sampler_type='riscv_pcsr', ctrl_ok=True, por_ok=True, reconnect_ok=True):
     o = v.NVMeFuzzer.__new__(v.NVMeFuzzer)
-    o.config = NS(riscv={'link_fail_por': enabled},
+    o.config = NS(riscv={}, sampler_type=sampler_type,
                   nvme_device='/dev/nvme0', no_jlink=False)
     o.stats = {}
     o._nvme_id_dict = MagicMock(return_value=({'sn': 'x'}, '', 0) if ctrl_ok else ({}, 'EAGAIN', 11))
@@ -28,8 +28,8 @@ def fuzzer(enabled=True, ctrl_ok=True, por_ok=True, reconnect_ok=True):
 
 
 class LinkFailPor(unittest.TestCase):
-    def test_disabled_does_nothing(self):
-        o = fuzzer(enabled=False)
+    def test_other_products_do_nothing(self):
+        o = fuzzer(sampler_type='openocd')
         self.assertFalse(o._link_fail_por('command'))
         o._recover_after_unsupported_skip.assert_not_called()
         o._nvme_id_dict.assert_not_called()
@@ -124,11 +124,13 @@ class Wiring(unittest.TestCase):
         self.assertFalse(r)
         self.assertTrue(o._sampler_recovery_failed)
 
-    def test_config_default_off(self):
+    def test_no_config_switch(self):
+        # 항상 켜짐 — 설정 키가 남아 있으면 끌 수 있는 것처럼 보인다
         cfg = json.loads((Path(v.__file__).parent / 'fuzzer_config.json').read_text(encoding='utf-8'))
         rv = cfg['products']['BM9K1']['riscv']
-        self.assertIs(rv['link_fail_por'], False)
+        self.assertNotIn('link_fail_por', rv)
         self.assertNotIn('link_fail_por_max', rv)
+        self.assertEqual(cfg['products']['BM9K1'].get('sampler_type', 'riscv_pcsr'), 'riscv_pcsr')
 
 
 class PorRoutineRecordsReconnect(unittest.TestCase):
