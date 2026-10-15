@@ -114,6 +114,23 @@ if not sess.open():
     die("세션 open 실패", "위 [pcsr] 로그의 마지막 줄이 원인. 인증/전원/케이블 확인")
 print(f"  ✅ open OK (인증 {sess.auth_count}회, {sess.auth_ms:.0f}ms)")
 
+def sba_state():
+    """읽기 전용: SBCS(busy·sberror·sbbusyerror·FIFO 모드)와 마지막 MEM-AP 사유·DP CTRL/STAT.
+    SBCS 를 읽으면 TAR 이 바뀌므로 핀 상태를 '미상'으로 돌려 다음 pin 이 처음부터 확인하게 한다."""
+    with sess.lock:
+        sj = sess._sj
+        cs = None
+        if sess.dap is not None and sess._ap is not None:
+            cs = sess.dap.mem_read32(sess._ap, sess._cb + sj.SBCS_OFF)
+            sess._pinned = sess._DIRTY
+        if cs is None:
+            sb = "SBCS 읽기 실패"
+        else:
+            sb = (f"SBCS=0x{cs:08X} busy={cs >> 21 & 1} sbbusyerror={cs >> 22 & 1} "
+                  f"sberror={cs >> 12 & 7} readonaddr={cs >> 20 & 1} readondata={cs >> 15 & 1}")
+        return f"{sb} | {sess.link_diag()}"
+
+
 try:
     stage("코어별 pin + 샘플")
     ok_cores, results = [], {}
@@ -121,8 +138,14 @@ try:
         name = cores[cid].get("name", str(cid))
         if not sess.pin(cid):
             print(f"  ❌ core {name}: pin 실패")
+            print(f"     진단: {sba_state()}")
+            print(f"     전환: fast={sess.switch_fast} fast_fail={sess.switch_fast_fail} "
+                  f"full={sess.switch_full}")
             continue
         obs = sess.burst(cid, a.samples)
+        if sess.last_fail_kind == "transport":
+            print(f"  ❌ core {name}: 버스트 {len(obs)}회 읽기 전부 실패(transport)")
+        print(f"     버스트 뒤(busy=1 은 정상 — 마지막 읽기가 다음 read 를 시작): {sba_state()}")
         valid = [o for o in obs if o.valid and o.pc is not None]
         fresh = [o for o in valid if o.fresh]
         pcs = [o.pc for o in valid]
