@@ -10565,14 +10565,10 @@ class _V101Fuzzer:
 
         BM9K1 에서 복구 시퀀스가 실패하면 DM AP(APBAP1)가 POR 전까지 응답하지 않는 상태가 있다(컨트롤러는 정상).
         riscv.link_fail_por=true 일 때만, **컨트롤러가 응답할 때만**(순수 링크 장애) 한다 — 응답이 없으면 펌웨어 행
-        이라 기존대로 POR 없이 증거를 남긴다(_capture_firmware_hang_if_stuck). POR 마다 SJTAG 재인증이 한 번 드므로
-        캠페인당 riscv.link_fail_por_max 회(기본 3)까지만. 예외 주입 캠페인에서는 _recover_after_unsupported_skip 이 막는다."""
+        이라 기존대로 POR 없이 증거를 남긴다(_capture_firmware_hang_if_stuck). 횟수 상한 없음(사용자 결정 2026-10-15).
+        예외 주입 캠페인에서는 _recover_after_unsupported_skip 이 막는다."""
         rv = getattr(self.config, 'riscv', None) or {}
         if not rv.get('link_fail_por', False):
-            return False
-        cap = max(0, int(rv.get('link_fail_por_max', 3)))
-        if self._link_fail_por_count >= cap:
-            log.error(f"[Sampler] 링크 장애 POR 한도({cap}회) 소진 — POR 하지 않음 (context={context})")
             return False
         try:
             _d, _err, _rc = self._nvme_id_dict(['nvme', 'id-ctrl', self.config.nvme_device])
@@ -10584,7 +10580,7 @@ class _V101Fuzzer:
         self._link_fail_por_count += 1
         self.stats['link_fail_por'] = self.stats.get('link_fail_por', 0) + 1
         log.warning(f"[Sampler] 디버그 링크 복구 실패·컨트롤러 정상 → POR 후 재연결 "
-                    f"({self._link_fail_por_count}/{cap}, context={context})")
+                    f"(#{self._link_fail_por_count}, context={context})")
         try:
             self._por_reconnect_ok = None
             ok = bool(self._recover_after_unsupported_skip()) and self._por_reconnect_ok is True
@@ -10592,7 +10588,7 @@ class _V101Fuzzer:
             log.error(f"[Sampler] 링크 장애 POR 예외: {e}")
             ok = False
         if ok:
-            log.warning(f"[Sampler] 링크 장애 POR 복구 성공 ({self._link_fail_por_count}/{cap})")
+            log.warning(f"[Sampler] 링크 장애 POR 복구 성공 (#{self._link_fail_por_count})")
         else:
             log.error(f"[Sampler] 링크 장애 POR 복구 실패 (POR={'완료' if self._por_reconnect_ok is not None else '실패'}, "
                       f"재연결={self._por_reconnect_ok})")

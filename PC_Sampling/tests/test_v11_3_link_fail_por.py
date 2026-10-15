@@ -1,7 +1,7 @@
 """v11.3 — 디버그 링크 재연결이 끝내 실패하면(컨트롤러는 정상) POR 후 재연결로 이어간다(riscv.link_fail_por, 기본 꺼짐).
 
 BM9K1: 복구 시퀀스 실패 뒤 DM AP(APBAP1)가 POR 전까지 응답하지 않는 상태가 있다. 컨트롤러가 응답하지 않으면
-펌웨어 행이라 기존대로 POR 없이 증거를 남긴다. POR 마다 SJTAG 재인증이 들므로 캠페인당 횟수 상한.
+펌웨어 행이라 기존대로 POR 없이 증거를 남긴다. 횟수 상한 없음.
 """
 import json
 import threading
@@ -13,9 +13,9 @@ from unittest.mock import MagicMock
 from fuzzer_target import fuzzer as v
 
 
-def fuzzer(enabled=True, cap=3, ctrl_ok=True, por_ok=True, reconnect_ok=True):
+def fuzzer(enabled=True, ctrl_ok=True, por_ok=True, reconnect_ok=True):
     o = v.NVMeFuzzer.__new__(v.NVMeFuzzer)
-    o.config = NS(riscv={'link_fail_por': enabled, 'link_fail_por_max': cap},
+    o.config = NS(riscv={'link_fail_por': enabled},
                   nvme_device='/dev/nvme0', no_jlink=False)
     o.stats = {}
     o._nvme_id_dict = MagicMock(return_value=({'sn': 'x'}, '', 0) if ctrl_ok else ({}, 'EAGAIN', 11))
@@ -40,7 +40,7 @@ class LinkFailPor(unittest.TestCase):
             self.assertTrue(o._link_fail_por('command'))
         o._recover_after_unsupported_skip.assert_called_once()
         self.assertEqual(o.stats['link_fail_por'], 1)
-        self.assertIn('POR 후 재연결 (1/3', '\n'.join(cm.output))
+        self.assertIn('POR 후 재연결 (#1', '\n'.join(cm.output))
 
     def test_controller_dead_keeps_evidence(self):
         o = fuzzer(ctrl_ok=False)
@@ -59,15 +59,13 @@ class LinkFailPor(unittest.TestCase):
         with self.assertLogs(v.log, 'ERROR'):
             self.assertFalse(o._link_fail_por('command'))
 
-    def test_cap(self):
-        o = fuzzer(cap=2)
+    def test_no_cap(self):
+        o = fuzzer()
         with self.assertLogs(v.log, 'WARNING'):
-            self.assertTrue(o._link_fail_por('a'))
-            self.assertTrue(o._link_fail_por('b'))
-        with self.assertLogs(v.log, 'ERROR') as cm:
-            self.assertFalse(o._link_fail_por('c'))
-        self.assertIn('한도(2회) 소진', '\n'.join(cm.output))
-        self.assertEqual(o._recover_after_unsupported_skip.call_count, 2)
+            for k in range(10):
+                self.assertTrue(o._link_fail_por(str(k)))
+        self.assertEqual(o._recover_after_unsupported_skip.call_count, 10)
+        self.assertEqual(o.stats['link_fail_por'], 10)
 
     def test_exception_campaign_blocks_por(self):
         # 예외 주입 캠페인에서는 override 가 POR 을 막는다(False) → 링크 복구 실패로 끝난다
@@ -130,7 +128,7 @@ class Wiring(unittest.TestCase):
         cfg = json.loads((Path(v.__file__).parent / 'fuzzer_config.json').read_text(encoding='utf-8'))
         rv = cfg['products']['BM9K1']['riscv']
         self.assertIs(rv['link_fail_por'], False)
-        self.assertEqual(rv['link_fail_por_max'], 3)
+        self.assertNotIn('link_fail_por_max', rv)
 
 
 class PorRoutineRecordsReconnect(unittest.TestCase):

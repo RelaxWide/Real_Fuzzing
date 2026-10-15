@@ -350,9 +350,8 @@
         "reconnect_settle_sec": 0.5,
         "reconnect_backoff_sec": 1.0,
         "reconnect_backoff_cap_sec": 3.0,
-        "_comment_link_fail_por": "v11.3. true면 재연결까지 실패했을 때 컨트롤러가 id-ctrl에 응답하는 경우(순수 디버그 링크 장애)에만 PMU POR → PCIe rescan → 재연결로 이어간다. 컨트롤러가 응답하지 않으면 기존처럼 POR 없이 행 증거를 남긴다. POR마다 SJTAG 재인증이 한 번 들어 캠페인당 link_fail_por_max회까지만. PMU 필요. 예외 주입 캠페인에서는 동작하지 않는다.",
+        "_comment_link_fail_por": "v11.3. true면 재연결까지 실패했을 때 컨트롤러가 id-ctrl에 응답하는 경우(순수 디버그 링크 장애)에만 PMU POR → PCIe rescan → 재연결로 이어간다. 컨트롤러가 응답하지 않으면 기존처럼 POR 없이 행 증거를 남긴다. 횟수 제한 없음. PMU 필요. 예외 주입 캠페인에서는 동작하지 않는다.",
         "link_fail_por": false,
-        "link_fail_por_max": 3,
         "sample_plan": {
           "_comment": "weights는 코어별 버스트 배분의 초기 가중치다. 각 관측 구간에서 버스트 순서를 섞어 고정 순서 편향을 줄인다. seed=0이면 실행 시 무작위 seed를 정해 기록하며 동일한 난수 순서가 필요하면 기록된 값을 지정한다.",
           "weights": {
