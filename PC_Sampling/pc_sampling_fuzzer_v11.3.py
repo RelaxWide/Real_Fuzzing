@@ -24287,6 +24287,7 @@ class ExceptionFuzzerMixin:
         if not self._exception_interrupted:
             result = super()._stop_sampling_checked(context)
             if getattr(self, '_exception_recovery_window', False):
+                self._exception_settle_window(context, result[1])
                 observations = (self.sampler.take_observations()
                                 if hasattr(self.sampler, 'take_observations') else [])
                 self._exception_controller.emit('recovery_observation',
@@ -24314,6 +24315,10 @@ class ExceptionFuzzerMixin:
         self._learning_window_valid = False
         self._learning_window_failed = True
         return 0, not self._exception_preserve
+
+    def _exception_settle_window(self, context, ok):
+        """복구 관측 창의 trace 를 증거로 읽기 전에 채운다. 창 방식은 정지 시점에 이미 채워져 있다
+        (백그라운드 방식은 BackgroundSamplingMixin 이 이 구간을 지금 확정한다)."""
 
     def _send_nvme_command(self, *args, **kwargs):
         if self._exception_preserve:
@@ -24501,15 +24506,9 @@ class BackgroundSamplingMixin:
     def __init__(self, config):
         if (getattr(config, 'sampler_type', None) == 'riscv_pcsr' and not getattr(config, 'no_jlink', False)):
             try:
-                _bg = riscv_background_options(config)
+                riscv_background_options(config)
             except ValueError as exc:
                 raise SystemExit(f'[FATAL] v11.3 설정 오류: {exc}') from None
-            _exc = (getattr(self, 'exception_config', None) or {}).get('exceptions', {}) or {}
-            if _bg and _exc.get('enabled') is True:
-                # 첫 구현은 이 조합을 검증하지 않았다 — 지원 조합으로 남겨 두지 않고 기동에서 막는다(§3.16)
-                raise SystemExit('[FATAL] v11.3: riscv.sample_plan.background 와 예외 주입(exceptions.enabled '
-                                 '또는 --exception)은 함께 쓸 수 없다. 둘 중 하나를 끈다 '
-                                 '(docs/V11_3_BACKGROUND_SAMPLING_PLAN.md §3.16)')
         super().__init__(config)
         self._bg = bool(getattr(getattr(self, 'sampler', None), 'BACKGROUND', False))
         self._bg_pending = deque()
@@ -24520,6 +24519,7 @@ class BackgroundSamplingMixin:
         self._bg_next_id = 0
         self._bg_main_window = None       # 메인 경로 명령의 닫힌 구간(회계 전)
         self._bg_hold_t0 = None           # 동기 확정 중인 구간의 시작
+        self._bg_settled_window = None    # 예외 복구 관측 창 — 증거용으로 이미 확정한 구간
         self._bg_finished = False
         self._bg_unconfirmed = []
         self._bg_tally = defaultdict(int)
@@ -24758,8 +24758,9 @@ class BackgroundSamplingMixin:
         finally:
             self._bg_swap_out(saved)
 
-    def _bg_sync_window(self, win, context, rc=None, wait=True):
-        """이 구간을 지금 확정한다 — 대기열을 먼저 비우고 이 구간의 샘플로 창 결과를 채운다."""
+    def _bg_sync_window(self, win, context, rc=None, wait=True, evidence=False):
+        """이 구간을 지금 확정한다 — 대기열을 먼저 비우고 이 구간의 샘플로 창 결과를 채운다.
+        evidence=True(예외 복구 관측): 판정 자격(전송 확인·상태) 없이 관측된 샘플을 채운다 — 보상하지 않는 창이다."""
         if win is None:
             return
         t0, t1 = win
@@ -24772,7 +24773,7 @@ class BackgroundSamplingMixin:
             self._bg_tally['sync'] += 1
             cmd = self._bg_partition(t0, t1) if ok else []
             eligible = ok and not self._bg_overlaps_invalid(t0, t1)
-            if not context.startswith(self._BG_NON_COMMAND_CONTEXTS):
+            if not evidence and not context.startswith(self._BG_NON_COMMAND_CONTEXTS):
                 eligible = (eligible and self._last_cmd_submitted and self._last_nvme_status is not None
                             and rc not in (self.RC_TIMEOUT, self.RC_ERROR, self.RC_SKIP))
             if not eligible:
@@ -24780,7 +24781,7 @@ class BackgroundSamplingMixin:
                 cmd = []
                 if not ok or self._bg_overlaps_invalid(t0, t1):
                     self._bg_tally['unobserved'] += 1
-            self._bg_tally['cmd_samples'] += len(cmd)
+            self._bg_tally['evidence_samples' if evidence else 'cmd_samples'] += len(cmd)
             self.sampler.bg_fill_window(cmd)
         finally:
             self._bg_hold_t0 = None
@@ -24790,6 +24791,7 @@ class BackgroundSamplingMixin:
     def _stop_sampling_checked(self, context='command'):
         if not self._bg:
             return super()._stop_sampling_checked(context)
+        self._bg_settled_window = None
         if self.sampler.bg_unresponsive:
             # 일시정지 확인이 없었다 — 복구(close·재연결)를 하지 않고 캠페인을 끝낸다(§3.5)
             self.sampler.stop_sampling()
@@ -24802,12 +24804,26 @@ class BackgroundSamplingMixin:
             return 0, False
         result = super()._stop_sampling_checked(context)
         win = self.sampler.bg_last_window
+        if win is not None and win == self._bg_settled_window:
+            # 예외 복구 관측 창 — 증거를 남기려고 이미 확정했고 trace 는 보상 제외로 비웠다. 다시 확정하지 않는다
+            self._bg_settled_window = None
+            self._bg_main_window = None
+            return result
         if context.startswith('command:') and result[1]:
             self._bg_main_window = win              # 회계 때 지연할지 정한다
         else:
             self._bg_main_window = None
             self._bg_sync_window(win, context, wait=bool(result[1]))
         return result
+
+    def _exception_settle_window(self, context, ok):
+        """예외 복구 관측 창: 증거(recovery_observation)를 남기기 전에 이 구간 샘플로 trace 를 채운다.
+        회계를 미루면 증거가 빈 목록이 된다. 이 창은 보상하지 않으므로(예외 믹스인이 기록 뒤 비운다) 판정 자격과 무관."""
+        if not self._bg:
+            return super()._exception_settle_window(context, ok)
+        win = self.sampler.bg_last_window
+        self._bg_sync_window(win, context, wait=bool(ok), evidence=True)
+        self._bg_settled_window = win
 
     def _account_command(self, seed, fuzz_data, rc, last_samples, **kwargs):
         if not self._bg:

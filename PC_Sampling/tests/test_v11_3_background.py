@@ -239,6 +239,61 @@ def run_deferred(f, parents, lag_every=3, mutate_after_enqueue=False):
     f._bg_drain()
 
 
+class RecoveryObservation(unittest.TestCase):
+    """예외 주입 뒤 복구 관측 창(복구 직후 명령): 측정 → 증거 기록 → 커버리지 보상 제외. 창 방식과 같은 순서."""
+
+    def setUp(self):
+        self.f = make_fuzzer()
+        self.addCleanup(self.f._tmp.cleanup)
+        self.f._exception_controller = Mock()
+        self.f._seq_sink = None
+
+    def send(self, i, recovery):
+        f = self.f
+        base = time.monotonic()
+        f.sampler._bg_open_t0 = base - 1.0
+        set_send_state(f, i)
+        f._exception_interrupted = False
+        f._exception_window_truncated = recovery
+        f._exception_recovery_window = recovery
+        publish(f, [(base - 0.9, base - 0.8, bb(i)), (base - 0.7, base - 0.6, bb(i + 1))],
+                processed=base + 100)
+        with self.assertLogs(v.log, 'DEBUG'):
+            v.log.debug('send')
+            _, ok = f._stop_sampling_checked('command:Write')
+        self.assertTrue(ok)
+        return f._account_command(seed(i), seed(i).data, 0, 0, source='c1')
+
+    def evidence(self):
+        return [c.kwargs for c in self.f._exception_controller.emit.call_args_list
+                if c.args[0] == 'recovery_observation']
+
+    def test_evidence_has_command_pcs_and_no_reward(self):
+        f = self.f
+        r = self.send(1, recovery=True)
+        self.assertEqual(r, (False, 0, 'continue'))
+        ev = self.evidence()
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]['pcs'], [bb(1), bb(2)], '증거는 이 명령 구간의 PC — 회계를 미루면 빈 목록')
+        self.assertEqual(f.corpus, [])
+        self.assertEqual(sorted(f.cov.covered_bbs), [], '리셋 직후 코드는 보상하지 않는다')
+        self.assertEqual(f.stats['coverage_unobserved'], 1)
+        self.assertEqual(f._bg_tally['sync'], 1, '같은 구간을 두 번 확정하지 않는다')
+        self.assertEqual(f._bg_tally['evidence_samples'], 2)
+        self.assertEqual(f._bg_tally['cmd_samples'], 0)
+        self.assertEqual(f.sampler.current_trace, set())
+
+    def test_next_command_is_deferred_as_usual(self):
+        f = self.f
+        self.send(1, recovery=True)
+        self.assertEqual(self.send(5, recovery=False), (False, 0, 'ok'))
+        self.assertEqual(f._bg_tally['deferred'], 1, '복구 창 다음 명령은 평소처럼 지연 회계 경로')
+        f._bg_drain()
+        self.assertFalse(f._bg_pending)
+        self.assertEqual(sorted(f.cov.covered_bbs), [0x500, 0x600], 'BB 시작 주소')
+        self.assertEqual(len(self.evidence()), 1)
+
+
 class DeferredAccounting(unittest.TestCase):
     def setUp(self):
         self.made = []
@@ -1097,12 +1152,12 @@ class Startup(unittest.TestCase):
         self.assertEqual(on._run_record_conditions()['sampling_mode'], 'background')
         self.assertEqual(off._run_record_conditions()['sampling_mode'], 'window')
 
-    def test_background_with_exception_injection_is_refused(self):
-        """시험 16: 첫 구현이 검증하지 않은 조합은 기동 단계에서 거부."""
-        with self.assertRaises(SystemExit) as cm:
-            self._construct({'enabled': True}, exceptions=True)
-        self.assertIn('함께 쓸 수 없다', str(cm.exception))
-        self._construct(False, exceptions=True)          # 창 방식이면 그대로 허용
+    def test_background_with_exception_injection_is_allowed(self):
+        """시험 16: 예외 주입과 함께 켤 수 있다(복구 관측 창은 RecoveryObservation 시험)."""
+        on = self._construct({'enabled': True}, exceptions=True)
+        self.assertIs(type(on.sampler), v.RiscvBgSampler)
+        self.assertTrue(on._bg)
+        self._construct(False, exceptions=True)
 
     def test_run_settles_pending_before_final_reports(self):
         """시험 8: 메인 루프가 어떻게 끝나든(break·예외·Ctrl+C) finally 첫머리에서 대기 명령을 확정한다."""
