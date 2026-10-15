@@ -105,7 +105,11 @@ class Dap:
         v = self.dp_read(DP_CTRL_STAT)
         if v is None:
             return "CTRL/STAT 읽기 실패"
-        bits = [nm for m, nm in ((1 << 7, 'WDATAERR'), (1 << 5, 'STICKYERR'),
+        if v == SUSPECT:
+            # 실제 CTRL/STAT 이 아니라 DLL 읽기 실패 표식으로 관측되는 값 — 비트로 해석하면 'DBG없음 에러비트 없음'
+            #   처럼 그럴듯한 상태로 오독된다. DP 까지 응답이 없다는 뜻이다.
+            return f"CTRL/STAT 읽기 실패({hx(v)} — DP 무응답)"
+        bits =[nm for m, nm in ((1 << 7, 'WDATAERR'), (1 << 5, 'STICKYERR'),
                                  (1 << 4, 'STICKYCMP'), (1 << 1, 'STICKYORUN'))
                 if v & m]
         pw = ('DBGACK' if v & (1 << 29) else 'DBG없음')

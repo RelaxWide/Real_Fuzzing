@@ -154,5 +154,21 @@ class SetupFailLog(unittest.TestCase):
         self.assertEqual(o._stopped_reason, 'pin_fail')
 
 
+class StickySuspect(unittest.TestCase):
+    """0x80000000 은 CTRL/STAT 값이 아니라 읽기 실패 표식 — 'DBG없음 에러비트 없음'으로 보이면 안 된다."""
+    def dap(self, val):
+        import dap_access
+        jl = type('J', (), {'coresight_read': lambda self, reg, ap=False: val})()
+        return dap_access.Dap(jl, verbose=False)
+
+    def test_suspect_is_read_failure(self):
+        out = self.dap(0x80000000).sticky()
+        self.assertIn("DP 무응답", out)
+        self.assertNotIn("에러비트 없음", out)
+
+    def test_real_value_still_decoded(self):
+        self.assertIn("DBGACK", self.dap(0xF0000000).sticky())
+
+
 if __name__ == '__main__':
     unittest.main()
