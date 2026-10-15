@@ -1055,7 +1055,7 @@ def cfg(bg):
 
 class Startup(unittest.TestCase):
     def test_options(self):
-        """시험 10: 기본은 꺼짐. 켜면 기본값, 모르는 키·잘못된 값은 거부."""
+        """시험 10: 키가 없으면 꺼짐. 켜면 기본값, 모르는 키·잘못된 값은 거부."""
         self.assertIsNone(v.riscv_background_options(NS(riscv={})))
         self.assertIsNone(v.riscv_background_options(cfg(False)))
         self.assertIsNone(v.riscv_background_options(cfg({'enabled': False, 'pending_max': 9})))
@@ -1066,11 +1066,11 @@ class Startup(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 v.riscv_background_options(cfg(bad))
 
-    def test_shipped_config_keeps_background_off(self):
+    def test_shipped_config_turns_background_on(self):
         data = json.loads((ROOT / 'fuzzer_config.json').read_text(encoding='utf-8'))
         plan = data['products']['BM9K1']['riscv']['sample_plan']
-        self.assertIs(plan['background']['enabled'], False)
-        self.assertIsNone(v.riscv_background_options(NS(riscv=data['products']['BM9K1']['riscv'])))
+        self.assertIs(plan['background']['enabled'], True)
+        self.assertIsNotNone(v.riscv_background_options(NS(riscv=data['products']['BM9K1']['riscv'])))
 
     def _construct(self, bg, exceptions=False):
         tmp = tempfile.TemporaryDirectory()
