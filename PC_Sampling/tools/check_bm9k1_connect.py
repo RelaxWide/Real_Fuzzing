@@ -19,6 +19,10 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--root", default=os.environ.get("PCSAMPLE_ROOT") or DEFAULT_ROOT)
 ap.add_argument("--samples", type=int, default=200, help="코어당 시험 샘플 수")
 ap.add_argument("--power", default="both")
+ap.add_argument("--speed", type=int, default=None, metavar="KHZ",
+                help="cJTAG 속도(kHz). 기본은 sfe76_link.SPEED_KHZ(10000). 퍼저는 프로필 jlink_speed 를 쓴다")
+ap.add_argument("--no-fast-switch", action="store_true",
+                help="코어 전환 짧은 경로(sba_retarget)를 끈다 = sample_plan.fast_switch false")
 a = ap.parse_args()
 
 ROOT = Path(a.root).resolve()
@@ -98,7 +102,9 @@ print(f"  ✅ 코어 {len(cores)}개: " + ", ".join(
     f"{c['name']}(id={i})" for i, c in sorted(cores.items())))
 
 stage("세션 open — Link → prepare_session → 인증 → SBA")
-sess = riscv_cov.PcsrSession(cores=cores, power=a.power, verbose=True)
+sess = riscv_cov.PcsrSession(cores=cores, power=a.power, verbose=True, speed_khz=a.speed)
+sess.fast_switch = not a.no_fast_switch
+print(f"  fast_switch={sess.fast_switch}")
 if not sess.open():
     die("세션 open 실패", "위 [pcsr] 로그의 마지막 줄이 원인. 인증/전원/케이블 확인")
 print(f"  ✅ open OK (인증 {sess.auth_count}회, {sess.auth_ms:.0f}ms)")

@@ -995,10 +995,13 @@ class PcsrSession:
     import·테스트된다."""
 
     def __init__(self, cores, power="both", tap_script=False, auth_wrapper=None,
-                 verbose=True, auth_timeout=60.0, word_order=None, vtref_mv=None):
+                 verbose=True, auth_timeout=60.0, word_order=None, vtref_mv=None,
+                 speed_khz=None):
         self.cores = cores            # {core_id: {"name":…, "elf":…, "load_offset":…}}
         self.power, self.tap_script = power, tap_script
         self.vtref_mv = vtref_mv      # J-Link VTref 고정(mV). None/0 = 자동
+        # cJTAG 속도(kHz). None/0 = sfe76_link.SPEED_KHZ. Link 가 들고 있어 재연결(reopen_session)도 같은 속도다.
+        self.speed_khz = speed_khz
         self.auth_wrapper = auth_wrapper
         self.verbose = verbose
         self.lock = threading.RLock()
@@ -1124,7 +1127,9 @@ class PcsrSession:
         link_mod = importlib.import_module("sfe76_link")
         with self.lock:
             self.lk = link_mod.Link(core_base=link_mod.CORE_BASE_MAIN,
-                                    vtref_mv=self.vtref_mv)
+                                    vtref_mv=self.vtref_mv,
+                                    speed=int(self.speed_khz or link_mod.SPEED_KHZ))
+            self._say(f"  [pcsr] cJTAG 속도 {self.lk.speed}kHz")
             # README: 첫 connect 는 실패하고 2회차에 붙는다
             for attempt in (1, 2):
                 try:
@@ -1177,6 +1182,20 @@ class PcsrSession:
         except Exception:
             pass
         self.lk = None
+
+    @_handle_locked
+    def link_diag(self):
+        """준비 실패 판정 시점의 읽기 전용 진단 한 줄 — 마지막 MEM-AP 실패 사유와 DP CTRL/STAT.
+        'TAR 불일치 쓴값=…읽은값=…'(값이 틀어짐 = 비트 오류 쪽)와 '읽기 실패'·CTRL/STAT 읽기 실패
+        (응답 없음 = 링크/전원 쪽)를 로그만으로 가르기 위한 것. 쓰기는 하지 않는다."""
+        if self.dap is None:
+            return "세션 없음"
+        why = (getattr(self.dap, 'last', None) or {}).get('why') or '-'
+        try:
+            st = self.dap.sticky()
+        except Exception as e:
+            st = f"CTRL/STAT 예외 {str(e)[:40]}"
+        return f"마지막 사유={why} | {st}"
 
     @_handle_locked
     def close(self):

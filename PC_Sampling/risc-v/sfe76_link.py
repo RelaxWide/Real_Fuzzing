@@ -119,7 +119,8 @@ def require_api(level, tool=""):
 
 # ── 연결 파라미터 (전부 실측값) ──────────────────────────────────────
 TIF_CJTAG   = 7          # cJTAG. pylink enum 에 없어 정수로 지정
-SPEED_KHZ   = 10000      # 낮추면 cJTAG 활성화 실패
+SPEED_KHZ   = 10000      # BM9K1 기본값. 2026-10-15 실측: 더 낮춰도 활성화는 된다.
+                         #   퍼저는 fuzzer_config.json BM9K1 프로필의 jlink_speed 를 쓴다(없으면 10000).
 # ★★ SetcJTAGInitMode — 브링업 내내 0 을 썼는데 문서가 1 을 지시한다:
 #   0 = Long-form activation, JScan0 boot + OScan1 enter (기본값)
 #   1 = Short-form activation, OScan1 boot

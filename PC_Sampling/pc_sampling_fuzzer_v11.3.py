@@ -4637,7 +4637,10 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             tap_script=bool(rv.get('tap_script', False)),
             auth_timeout=float(rv.get('auth_timeout', 60.0)),
             word_order=rv.get('word_order'),
-            vtref_mv=self.config.jlink_vtref_mv)
+            vtref_mv=self.config.jlink_vtref_mv,
+            # v11.3: 제품 프로필의 jlink_speed(kHz)를 cJTAG 속도로 쓴다(예전엔 BM9K1 에서 안 읽혀 10MHz 고정).
+            #   기본은 10MHz(BM9K1 프로필 값, 키가 없어도 RISC-V 는 10000). 바꾸려면 json 에서.
+            speed_khz=getattr(self.config, 'jlink_speed', None))
         # v11.2.1: 코어 전환·bank 읽기를 주소만 바꾸는 짧은 경로로(실패 시 전체 경로). false = 예전 경로
         self.session.fast_switch = bool(((rv.get('sample_plan') or {}).get('fast_switch', True)))
         # 집계는 재연결(PM 분리 포함)을 넘겨 누적한다
@@ -5122,8 +5125,12 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         if self._empty_streak < self._EMPTY_BURST_LIMIT:
             return False
         self._stopped_reason = 'pin_fail'
+        try:
+            _diag = self.session.link_diag() if self.session is not None else "세션 없음"
+        except Exception as e:
+            _diag = f"진단 실패 {str(e)[:40]}"
         log.error(f"[cJTAG/SBA] 준비 실패(pin/bank 읽기) {self._empty_streak}회 연속(core{core}) — "
-                  f"샘플링 중단. 세션/오프셋 확인")
+                  f"샘플링 중단. 세션/오프셋 확인 [{_diag}]")
         self._empty_streak = 0
         self.openocd_error.set()   # 상위 루프가 재연결 판단
         return True
@@ -25276,7 +25283,8 @@ if __name__ == "__main__":
         go_settle_ms=_resolved_go_settle,
         halt_poll_ms=_resolved_halt_poll,
         # v8.1: JLinkHaltSampler(P9) 파라미터 — profile 기본값, pc_reg_index 는 CLI override 우선
-        jlink_speed=_profile.get('jlink_speed', 4000),
+        # RISC-V(BM9K1) cJTAG 기본은 10MHz — 프로필에 jlink_speed 가 없어도 ARM 기본 4000 으로 내려가지 않게
+        jlink_speed=_profile.get('jlink_speed', 10000 if _profile.get('arch') == 'riscv' else 4000),
         jlink_ap_index=_profile.get('jlink_ap_index', 0),
         jlink_vtref_mv=_profile.get('jlink_vtref_mv'),
         pm_detach_sampler=bool(_profile.get('pm_detach_sampler', False)) and not args.no_jlink,
