@@ -10536,6 +10536,8 @@ class _V101Fuzzer:
             except Exception as e:
                 ok = False
                 log.warning(f"[Sampler] {label} 재연결 예외: {e}")
+        if not ok:
+            ok = self._link_fail_por(context)
         if ok:
             self._sampler_recovery_failed = False
             log.warning(f"[Sampler] {label} 복구 성공 — sampling 재개 가능 "
@@ -10555,6 +10557,46 @@ class _V101Fuzzer:
         except Exception as _fh_exc:
             log.warning(f"[HANG] 처리 예외: {_fh_exc}")
         return last_samples, False
+
+    _link_fail_por_count = 0
+
+    def _link_fail_por(self, context: str) -> bool:
+        """v11.3: 디버그 링크 재연결이 끝내 실패했을 때 POR 로 디버그 쪽을 되살리고 이어간다 → 샘플러가 다시 붙었으면 True.
+
+        BM9K1 에서 복구 시퀀스가 실패하면 DM AP(APBAP1)가 POR 전까지 응답하지 않는 상태가 있다(컨트롤러는 정상).
+        riscv.link_fail_por=true 일 때만, **컨트롤러가 응답할 때만**(순수 링크 장애) 한다 — 응답이 없으면 펌웨어 행
+        이라 기존대로 POR 없이 증거를 남긴다(_capture_firmware_hang_if_stuck). POR 마다 SJTAG 재인증이 한 번 드므로
+        캠페인당 riscv.link_fail_por_max 회(기본 3)까지만. 예외 주입 캠페인에서는 _recover_after_unsupported_skip 이 막는다."""
+        rv = getattr(self.config, 'riscv', None) or {}
+        if not rv.get('link_fail_por', False):
+            return False
+        cap = max(0, int(rv.get('link_fail_por_max', 3)))
+        if self._link_fail_por_count >= cap:
+            log.error(f"[Sampler] 링크 장애 POR 한도({cap}회) 소진 — POR 하지 않음 (context={context})")
+            return False
+        try:
+            _d, _err, _rc = self._nvme_id_dict(['nvme', 'id-ctrl', self.config.nvme_device])
+        except Exception as _e:
+            _d, _err, _rc = {}, str(_e)[:80], -1
+        if not (_rc == 0 and _d):
+            log.error(f"[Sampler] 컨트롤러 미응답(id-ctrl rc={_rc}) — 링크 장애 POR 생략, 행 증거 보존 (context={context})")
+            return False
+        self._link_fail_por_count += 1
+        self.stats['link_fail_por'] = self.stats.get('link_fail_por', 0) + 1
+        log.warning(f"[Sampler] 디버그 링크 복구 실패·컨트롤러 정상 → POR 후 재연결 "
+                    f"({self._link_fail_por_count}/{cap}, context={context})")
+        try:
+            self._por_reconnect_ok = None
+            ok = bool(self._recover_after_unsupported_skip()) and self._por_reconnect_ok is True
+        except Exception as e:
+            log.error(f"[Sampler] 링크 장애 POR 예외: {e}")
+            ok = False
+        if ok:
+            log.warning(f"[Sampler] 링크 장애 POR 복구 성공 ({self._link_fail_por_count}/{cap})")
+        else:
+            log.error(f"[Sampler] 링크 장애 POR 복구 실패 (POR={'완료' if self._por_reconnect_ok is not None else '실패'}, "
+                      f"재연결={self._por_reconnect_ok})")
+        return ok
 
     def _capture_firmware_hang_if_stuck(self, context: str) -> bool:
         """샘플러 복구가 끝내 실패했을 때, 컨트롤러 생존을 확인해 **유형 C(펌웨어 행)**
@@ -12700,6 +12742,8 @@ class _V101Fuzzer:
         if light_failed and ok:
             log.warning(f"[PM-Detach] 가벼운 재연결 실패({why}) — 전체 재연결로 복구 (세부는 파일 로그)")
         self._pm_detach_stats['reattach_s'] += dt
+        if not ok and self._link_fail_por(f'pm-attach: {why}'):
+            ok = True                         # POR 로 PS0·D0 에서 다시 붙었다(추적 상태는 POR 루틴이 초기화)
         if not ok:
             self._pm_detach_stats['reattach_fail'] += 1
             self._sampler_recovery_failed = True
@@ -16552,11 +16596,15 @@ class _V101Fuzzer:
         self._keepalive_disable()
 
         # 4) OpenOCD 재연결 — J-Link 사용 중이었다면
+        #   v11.3: 결과를 남긴다 — 링크 장애 POR 복구(_link_fail_por)는 이게 성공해야 복구로 친다
+        self._por_reconnect_ok = None
         if not self.config.no_jlink:
             try:
-                if not self.sampler._reconnect():
+                self._por_reconnect_ok = bool(self.sampler._reconnect())
+                if not self._por_reconnect_ok:
                     log.warning("[UnsupChk] OpenOCD 재연결 실패 — coverage 만 영향, fuzz 계속")
             except Exception as e:
+                self._por_reconnect_ok = False
                 log.warning(f"[UnsupChk] OpenOCD 재연결 예외: {e}")
 
         log.warning("[UnsupChk] 복구 완료 — 메인 루프 재개")
