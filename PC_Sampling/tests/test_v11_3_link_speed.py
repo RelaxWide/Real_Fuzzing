@@ -73,6 +73,21 @@ class SamplerPassesProfileSpeed(unittest.TestCase):
         cfg = type('C', (), {'jlink_vtref_mv': None})()
         self.assertIsNone(self.make(cfg)['speed_khz'])
 
+    def test_old_riscv_cov_fails_with_clear_log(self):
+        o = v.RiscvPcsrSampler.__new__(v.RiscvPcsrSampler)
+        o._cores, o.session = {}, None
+        o.config = type('C', (), {'jlink_vtref_mv': None, 'jlink_speed': 10000})()
+
+        class OldSession:                       # speed_khz 이전 서명
+            def __init__(self, cores, power="both", tap_script=False, auth_wrapper=None,
+                         verbose=True, auth_timeout=60.0, word_order=None, vtref_mv=None):
+                pass
+        o._rc = type('R', (), {'PcsrSession': OldSession, '__file__': '/x/riscv_cov.py'})
+        with self.assertLogs(v.log, 'ERROR') as cm:
+            self.assertFalse(o._open_session({}))
+        self.assertIn("riscv_cov.py 가 이 퍼저와 버전이 다르다", '\n'.join(cm.output))
+        self.assertIsNone(o.session)
+
     def test_riscv_fallback_is_10mhz_not_arm_4000(self):
         src = Path(v.__file__).read_text(encoding='utf-8')
         self.assertIn("jlink_speed=_profile.get('jlink_speed', 10000 if _profile.get('arch') == 'riscv' else 4000)", src)

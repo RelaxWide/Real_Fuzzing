@@ -51,9 +51,14 @@ def die(why, hint=""):
 stage("모듈 import")
 try:
     import riscv_cov
-    print("  ✅ riscv_cov")
+    print(f"  ✅ riscv_cov ({riscv_cov.__file__})")
 except Exception as e:
     die(f"riscv_cov import 실패: {e}", f"{ROOT}/riscv_cov.py 존재 확인")
+import inspect as _inspect
+if "speed_khz" not in _inspect.signature(riscv_cov.PcsrSession.__init__).parameters:
+    die(f"riscv_cov.py 가 구버전이다(speed_khz 미지원): {riscv_cov.__file__}",
+        "체커·퍼저와 같은 커밋의 riscv_cov.py 로 맞춰라(git pull 또는 파일 복사). "
+        "다른 경로를 가리키면 --root 확인")
 try:
     import sjtag_unlock, sfe76_link, elf_map          # noqa
     print(f"  ✅ sjtag_unlock / sfe76_link / elf_map")

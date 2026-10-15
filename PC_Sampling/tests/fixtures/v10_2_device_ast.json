@@ -146,7 +146,7 @@
       "path": "RiscvPcsrSampler",
       "date": "2026-10-15",
       "base_commit": "d9a4562",
-      "reason": "BM9K1 cJTAG speed now follows the product profile jlink_speed (BM9K1 profile stays 10000 = previous fixed SPEED_KHZ, so default behavior is unchanged); a probe with small signal margin needs a lower speed. _setup_failed adds a read-only link_diag (last MEM-AP failure reason + DP CTRL/STAT) to the 8x setup-failure log. Regression tests: test_v11_3_link_speed.py."
+      "reason": "BM9K1 cJTAG speed now follows the product profile jlink_speed (BM9K1 profile stays 10000 = previous fixed SPEED_KHZ, so default behavior is unchanged); a probe with small signal margin needs a lower speed. _setup_failed adds a read-only link_diag (last MEM-AP failure reason + DP CTRL/STAT) to the 8x setup-failure log. Regression tests: test_v11_3_link_speed.py. _open_session also catches TypeError from an older riscv_cov.PcsrSession (no speed_khz) and logs which file to update instead of crashing."
     }
   ],
   "overrides_note": "hashes 는 모든 DEVICE_AST_FILES 에 적용되는 기준선이다. overrides 는 검토를 거쳐 **특정 파일에서만** 의도적으로 달라진 경로를 기록한다. v10.2 는 검증된 fallback 이라 계속 기준선 그대로여야 하고, 여기 올라오지 않은 파일·경로는 전부 기준선에 묶인다.",
@@ -174,7 +174,7 @@
     "pc_sampling_fuzzer_v11.3.py": {
       "OpenOCDPCSampler": "48865eb551960624265b061a897ddf8abdc2586862598bc2be3c97a3a69aba04",
       "_V101Fuzzer._send_nvme_command": "ad2011cacaf77f52f15cb6b3ad1df325354af3b1609a4200b45b2bac9133c10c",
-      "RiscvPcsrSampler": "d3be417f37cda8437982c4139d230eb808452360ea33c80b6f5ac79717f7e77d",
+      "RiscvPcsrSampler": "b7651d68633836194d22054153301311ea1baa9b90218e9047240b1bf6d2923c",
       "JLinkHaltSampler": "e44a432e61c101138e2b97c43f3218d4c2b2033d0d58cd4ed4a9dede6607d250"
     }
   }

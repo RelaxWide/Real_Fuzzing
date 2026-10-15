@@ -4632,15 +4632,22 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                 self.session.close()
             except Exception:
                 pass
-        self.session = self._rc.PcsrSession(
-            cores=self._cores, power=rv.get('power', 'both'),
-            tap_script=bool(rv.get('tap_script', False)),
-            auth_timeout=float(rv.get('auth_timeout', 60.0)),
-            word_order=rv.get('word_order'),
-            vtref_mv=self.config.jlink_vtref_mv,
-            # v11.3: 제품 프로필의 jlink_speed(kHz)를 cJTAG 속도로 쓴다(예전엔 BM9K1 에서 안 읽혀 10MHz 고정).
-            #   기본은 10MHz(BM9K1 프로필 값, 키가 없어도 RISC-V 는 10000). 바꾸려면 json 에서.
-            speed_khz=getattr(self.config, 'jlink_speed', None))
+        try:
+            self.session = self._rc.PcsrSession(
+                cores=self._cores, power=rv.get('power', 'both'),
+                tap_script=bool(rv.get('tap_script', False)),
+                auth_timeout=float(rv.get('auth_timeout', 60.0)),
+                word_order=rv.get('word_order'),
+                vtref_mv=self.config.jlink_vtref_mv,
+                # v11.3: 제품 프로필의 jlink_speed(kHz)를 cJTAG 속도로 쓴다(예전엔 BM9K1 에서 안 읽혀 10MHz 고정).
+                #   기본은 10MHz(BM9K1 프로필 값, 키가 없어도 RISC-V 는 10000). 바꾸려면 json 에서.
+                speed_khz=getattr(self.config, 'jlink_speed', None))
+        except TypeError as e:
+            # 퍼저 파일만 갱신되고 공유 모듈 riscv_cov.py 가 구버전이면 여기서 난다 — 원인을 바로 알린다
+            self.session = None
+            log.error(f"[cJTAG/SBA] riscv_cov.py 가 이 퍼저와 버전이 다르다({e}) — "
+                      f"{getattr(self._rc, '__file__', '?')} 를 같은 커밋으로 맞출 것")
+            return False
         # v11.2.1: 코어 전환·bank 읽기를 주소만 바꾸는 짧은 경로로(실패 시 전체 경로). false = 예전 경로
         self.session.fast_switch = bool(((rv.get('sample_plan') or {}).get('fast_switch', True)))
         # 집계는 재연결(PM 분리 포함)을 넘겨 누적한다
