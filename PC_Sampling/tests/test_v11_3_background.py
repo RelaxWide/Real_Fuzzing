@@ -1063,6 +1063,34 @@ class SaturationRest(unittest.TestCase):
         self.assertTrue(wait_for(lambda: s.bg_counts['rests'] >= 2), '새 명령에서도 포화면 다시 쉰다')
         s.bg_shutdown()
 
+    def test_counter_spans_commands(self):
+        # 명령이 자주 와도(명령당 샘플 < 기준) 포화는 쌓인다. 포화 뒤엔 명령마다 burst 1회만 읽고 다시 쉰다
+        s = worker_sampler(lambda n: 0x2001, rest_after_samples=64, rest_max_sec=10.0)
+        s.start_sampling()
+        for _ in range(40):
+            s.start_sampling()                       # 명령 시작이 burst 몇 개마다 온다
+            time.sleep(0.002)
+        self.assertTrue(wait_for(lambda: s._bg_resting))
+        self.assertGreaterEqual(s.bg_counts['rests'], 1)
+        for _ in range(5):
+            n = s.count['n']
+            s.start_sampling()
+            self.assertTrue(wait_for(lambda: s.count['n'] > n and s._bg_resting))
+            self.assertLessEqual(s.count['n'] - n, 8, '포화 중엔 명령마다 burst(8) 하나만')
+        s.bg_shutdown()
+
+    def test_new_pc_after_saturation_resumes_reading(self):
+        state = {'new': False}
+        s = worker_sampler(lambda n: ((n << 2) | 1) if state['new'] else 0x2001,
+                           rest_after_samples=32, rest_max_sec=10.0)
+        s.start_sampling()
+        self.assertTrue(wait_for(lambda: s._bg_resting))
+        state['new'] = True
+        n = s.count['n']
+        s.start_sampling()
+        self.assertTrue(wait_for(lambda: s.count['n'] > n + 200), '새 PC 가 나오는 동안은 계속 읽는다')
+        s.bg_shutdown()
+
     def test_new_pcs_keep_reading(self):
         s = worker_sampler(lambda n: (n << 2) | 1, rest_after_samples=32, rest_max_sec=10.0)
         s.start_sampling()
@@ -1104,6 +1132,21 @@ class SaturationRest(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 0.5)
         self.assertFalse(f._bg_invalid, '휴식은 무효 구간이 아니다')
         s.bg_shutdown()
+
+    def test_timing_suffix_reports_rest_and_samples_per_command(self):
+        f = make_fuzzer(rest_after_samples=64)
+        self.addCleanup(f._tmp.cleanup)
+        f._bg_timing_suffix()                          # 첫 창 — 기준만 잡는다
+        f.sampler.bg_counts['samples'] += 500
+        f.sampler.bg_counts['rests'] += 3
+        f.executions += 10
+        line = f._bg_timing_suffix()
+        self.assertIn('샘플 50/명령', line)
+        self.assertIn('포화 휴식 3회', line)
+        off = make_fuzzer()
+        self.addCleanup(off._tmp.cleanup)
+        off._bg_timing_suffix()
+        self.assertIn('포화 휴식 꺼짐', off._bg_timing_suffix())
 
     def test_options(self):
         ok = v.riscv_background_options(cfg({'enabled': True, 'rest_after_samples': 0}))

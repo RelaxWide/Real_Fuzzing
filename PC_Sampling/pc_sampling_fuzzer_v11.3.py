@@ -5303,8 +5303,9 @@ _BG_DEFAULTS = {
     'pause_timeout_sec': 10.0,      # 일시정지 확인 신호 제한 시간(§3.5)
     'flush_timeout_sec': 10.0,      # 동기 확정(캘리브레이션·시퀀스·PM·timeout·종료) 제한 시간(§3.7)
     'queue_max_samples': 100000,    # 워커 결과 큐의 샘플 상한(§3.10)
-    # 포화 휴식(PM9M1 의 포화 조기 종료와 같은 취지): 새 PC 없는 샘플이 이만큼 이어지면 워커가 DAP 에 손대지 않고
-    #   쉰다 → 다음 명령 시작·일시정지·종료·rest_max_sec 중 먼저 오는 것에 깬다. 0 = 끔(쉬지 않음).
+    # 포화 휴식(PM9M1 의 포화 조기 종료와 같은 취지): 새 PC 없는 샘플이 이만큼 이어지면(명령을 넘어 센다) 워커가
+    #   DAP 에 손대지 않고 쉰다 → 다음 명령 시작·일시정지·종료·rest_max_sec 중 먼저 오는 것에 깬다. 깬 뒤 burst 에서도
+    #   새 PC 가 없으면 곧바로 다시 쉰다(포화 중엔 명령마다 burst 1회만 확인). 새 PC 가 나오면 계수 0. 0 = 끔.
     'rest_after_samples': 0,
     'rest_max_sec': 1.0,            # 한 번 쉬는 최대 시간 — 명령 없는 idle 에서도 이 간격으로 새 활동을 확인한다
 }
@@ -5408,12 +5409,14 @@ class RiscvBgSampler(RiscvPcsrSampler):
         self.bg_counts = defaultdict(int)
         self._bg_seen = set()           # 워커가 본 (core, bank, pc) — 포화 판정용(새 PC 여부)
         self._bg_dry = 0                # 새 PC 없이 이어진 샘플 수
-        self._bg_cmd_seq = 0            # 명령 시작마다 +1 (start_sampling) — 휴식을 깨우고 포화 계수를 새로 시작
-        self._bg_dry_seq = 0
+        self._bg_cmd_seq = 0            # 명령 시작마다 +1 (start_sampling) — 휴식을 깨운다
         self._bg_resting = False
         log.warning(f"[cJTAG/SBA] v11.3 상시 백그라운드 샘플링 켬 — 오버레이 burst "
                     f"{self.bg_opts['overlay_burst_len']}, 대기 상한 {self.bg_opts['pending_max']}명령, "
-                    f"정체 판정 {self.bg_opts['max_lag_sec']:g}s, 일시정지 제한 {self.bg_opts['pause_timeout_sec']:g}s")
+                    f"정체 판정 {self.bg_opts['max_lag_sec']:g}s, 일시정지 제한 {self.bg_opts['pause_timeout_sec']:g}s, "
+                    + (f"포화 휴식 새 PC 없이 {self.bg_opts['rest_after_samples']}샘플→휴식(최대 "
+                       f"{self.bg_opts['rest_max_sec']:g}s)" if self.bg_opts.get('rest_after_samples')
+                       else "포화 휴식 꺼짐(rest_after_samples=0 또는 json 에 키 없음)"))
 
     # ── 메인 쪽 API ─────────────────────────────────────────────────────
     def bg_open_t0(self):
@@ -5709,8 +5712,7 @@ class RiscvBgSampler(RiscvPcsrSampler):
             for core in sched:
                 if self._bg_pause_req or self._bg_quit or self.openocd_error.is_set():
                     break
-                if self._bg_dry_seq != self._bg_cmd_seq:
-                    self._bg_dry_seq, self._bg_dry = self._bg_cmd_seq, 0   # 명령마다 포화 계수 새로(PM9M1 창과 같다)
+                # 포화 계수는 명령마다 초기화하지 않는다 — 명령 하나의 샘플(수백)은 기준에 못 미쳐 영영 쉬지 못한다
                 self._bg_burst(core)
                 lim = self.bg_opts.get('rest_after_samples', 0)
                 if lim and self._bg_dry >= lim:
@@ -5748,7 +5750,6 @@ class RiscvBgSampler(RiscvPcsrSampler):
                     break
                 self._bg_cv.wait(rem)
             self._bg_resting = False
-        self._bg_dry = 0
         self.bg_counts['rest_ms'] += int(1000 * (time.monotonic() - t0))
 
     def _bg_burst(self, core):
@@ -24986,9 +24987,14 @@ class BackgroundSamplingMixin:
         if c is not None:
             now, prev = time.monotonic(), getattr(self, '_bg_rest_prev', None)
             if prev is not None and now > prev[0]:
-                share = (c['rest_ms'] - prev[1]) / 1000.0 / (now - prev[0])
-                s += f" · 포화 휴식 {c['rests'] - prev[2]}회({share:.0%})"
-            self._bg_rest_prev = (now, c['rest_ms'], c['rests'])
+                n_exec = max(1, self.executions - prev[3])
+                s += f" · 샘플 {(c['samples'] - prev[4]) / n_exec:.0f}/명령"
+                if (getattr(self.sampler, 'bg_opts', None) or {}).get('rest_after_samples'):
+                    share = (c['rest_ms'] - prev[1]) / 1000.0 / (now - prev[0])
+                    s += f" · 포화 휴식 {c['rests'] - prev[2]}회({share:.0%})"
+                else:
+                    s += " · 포화 휴식 꺼짐"
+            self._bg_rest_prev = (now, c['rest_ms'], c['rests'], self.executions, c['samples'])
         self._bg_win = defaultdict(float)
         return s
 

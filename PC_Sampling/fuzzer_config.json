@@ -384,7 +384,7 @@
             "pause_timeout_sec": 10.0,
             "flush_timeout_sec": 10.0,
             "queue_max_samples": 100000,
-            "_comment_rest": "포화 휴식(PM9M1 포화 조기 종료와 같은 취지). 새 PC 없는 샘플(무효 샘플 포함)이 rest_after_samples 만큼 이어지면 워커가 SBA 읽기를 멈추고 쉰다. 다음 명령 시작·일시정지·종료 또는 rest_max_sec 이 지나면 다시 읽는다. 새 PC 가 나오는 동안은 쉬지 않는다. 0 이면 끔(쉬지 않고 계속 읽음). 값이 작을수록 디버그 트래픽이 줄고(exec/s↑) 늦게 나타나는 코드를 놓칠 수 있다.",
+            "_comment_rest": "포화 휴식(PM9M1 포화 조기 종료와 같은 취지). 새 PC 없는 샘플(무효 샘플 포함)이 명령을 넘어 rest_after_samples 만큼 이어지면 워커가 SBA 읽기를 멈추고 쉰다. 다음 명령 시작·일시정지·종료 또는 rest_max_sec 이 지나면 깨서 burst 1회를 읽고, 새 PC 가 없으면 다시 쉰다. 새 PC 가 나오는 동안은 쉬지 않는다. 0 이면 끔(쉬지 않고 계속 읽음). 값이 작을수록 디버그 트래픽이 줄고(exec/s↑) 늦게 나타나는 코드를 놓칠 수 있다.",
             "rest_after_samples": 2048,
             "rest_max_sec": 1.0
           }
