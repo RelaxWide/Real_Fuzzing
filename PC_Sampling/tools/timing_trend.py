@@ -21,6 +21,8 @@ _RE = {
     'rest': re.compile(r'기타\(회계·변이·PM 동작\) ' + _NUM + 'ms'),
     'setup': re.compile(r'SBA 준비 ' + _NUM + 'ms'),
     'read': re.compile(r'PC 읽기 ' + _NUM + 'ms'),
+    'spawn': re.compile(r'프로세스 생성 ' + _NUM + 'ms'),
+    'rss': re.compile(r'RSS ' + _NUM + 'MB'),
 }
 _TOP = re.compile(r'전송 상위 (.*?)(?: \| |$)')
 _ITEM = re.compile(r'(\S+) ' + _NUM + r'ms×(\d+)')
@@ -67,10 +69,11 @@ def summarize(rows, part=0.1):
     for name, grp in (('early', early), ('late', late)):
         send, stop, rest = (_wavg(grp, x) for x in ('send', 'stop', 'rest'))
         setup, read = _wavg(grp, 'setup'), _wavg(grp, 'read')
+        spawn, rss = _wavg(grp, 'spawn'), _avg([r.get('rss') for r in grp])
         per_exec = sum(v for v in (send, stop, rest) if v is not None)
         busy = ((setup or 0) + (read or 0)) / per_exec if per_exec and setup is not None else None
         out['phase'][name] = dict(exec=(grp[0]['exec'], grp[-1]['exec']), send=send, stop=stop, rest=rest,
-                                  setup=setup, read=read, per_exec=per_exec, busy=busy)
+                                  setup=setup, read=read, per_exec=per_exec, busy=busy, spawn=spawn, rss=rss)
     for name, grp in (('early', early), ('late', late)):
         acc = defaultdict(lambda: [0.0, 0])
         for r in grp:
@@ -93,6 +96,7 @@ def report(s):
     e, l = s['phase']['early'], s['phase']['late']
     p.append(f"{'실행 구간':14}{e['exec'][0]:>6}~{e['exec'][1]:<6}{l['exec'][0]:>6}~{l['exec'][1]:<6}")
     for key, label in (('send', '전송 ms'), ('stop', '종료 대기 ms'), ('rest', '기타 ms'), ('per_exec', '1건 합계 ms'),
+                       ('spawn', '프로세스 생성 ms'), ('rss', 'RSS MB'),
                        ('setup', 'SBA 준비 ms'), ('read', 'PC 읽기 ms')):
         p.append(f"{label:14}{_f(e[key]):>12}{_f(l[key]):>12}")
     p.append(f"{'워커 바쁨 비율':14}{_f(e['busy'], '{:.0%}'):>12}{_f(l['busy'], '{:.0%}'):>12}")
@@ -111,9 +115,14 @@ def report(s):
     send_ratio = (l['send'] / e['send']) if e['send'] and l['send'] else None
     med = sorted(both)[len(both) // 2] if both else None
     p.append(f"판정 재료: 전송 전체 {_f(send_ratio, '{:.2f}x')}, 양쪽에 나온 명령의 중간 배율 {_f(med, '{:.2f}x')}")
+    host = False
+    if e['spawn'] is not None and l['spawn'] is not None and e['send'] and l['send'] and l['send'] > e['send']:
+        host = (l['spawn'] - e['spawn']) >= 0.5 * (l['send'] - e['send'])
     if send_ratio and med:
         if med >= 0.7 * send_ratio:
-            p.append(" → 같은 명령이 비슷한 비율로 느려졌다: 명령 구성보다 장치·환경 쪽(장치 상태 누적 또는 SBA 영향)")
+            p.append(" → 같은 명령이 비슷한 비율로 느려졌다: 명령 구성 변화는 아니다 — "
+                     + ("늘어난 몫 대부분이 nvme-cli 프로세스 생성(호스트, 아래 줄)" if host
+                        else "장치·환경 쪽(장치 상태 누적 또는 SBA 영향)"))
         elif med <= 1.3:
             p.append(" → 같은 명령은 그대로인데 전체만 늘었다: 명령 구성(무거운 명령 비중) 변화")
         else:
@@ -122,7 +131,14 @@ def report(s):
         p.append(f"워커 바쁨 비율 {e['busy']:.0%} → {l['busy']:.0%}: "
                  + ("SBA 트래픽 세기는 비슷 — SBA 간섭이 '늘어서' 느려진 것은 아니다"
                     if abs(l['busy'] - e['busy']) < 0.15 else "SBA 트래픽 세기가 바뀌었다 — 간섭 변화 가능"))
-    p.append("한계: 전송 = nvme-cli 프로세스 시작~끝(호스트 몫 포함). SBA 영향 크기 자체는 --no-jlink 비교로만 잰다.")
+    if e['spawn'] is not None and l['spawn'] is not None and e['send'] and l['send']:
+        d_send, d_spawn = l['send'] - e['send'], l['spawn'] - e['spawn']
+        if d_send > 0:
+            p.append(f"전송 증가 {d_send:.1f}ms 중 프로세스 생성 증가 {d_spawn:.1f}ms ({d_spawn / d_send:.0%})"
+                     + (f", RSS {e['rss']:.0f}→{l['rss']:.0f}MB" if e['rss'] and l['rss'] else '')
+                     + (" → 퍼저 메모리 증가로 nvme-cli 생성이 느려진 것(장치 아님)" if d_spawn >= 0.5 * d_send else ''))
+    p.append("한계: 전송 = nvme-cli 프로세스 시작~끝(호스트 몫 포함, '프로세스 생성' 이 그중 생성 몫). "
+             "SBA 영향 크기 자체는 --no-jlink 비교로만 잰다.")
     return '\n'.join(p)
 
 

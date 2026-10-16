@@ -111,9 +111,29 @@ import shlex
 _freeze_trace = None
 
 
+# v11.3: nvme-cli 프로세스 생성(Popen) 시간 — [Timing] '전송' 중 호스트 몫. fork 기반 생성은 퍼저 메모리(RSS)에
+#   비례해 느려진다(Python 3.8 실측 약 28ms/GB). 메인 스레드만 nvme 명령을 보낸다.
+_SPAWN_STAT = {'n': 0, 's': 0.0, 't0': None}
+
+
 def _freeze_emit(phase, **data):
+    if phase == 'nvme.before_popen':
+        _SPAWN_STAT['t0'] = time.monotonic()
+    elif phase == 'nvme.spawned' and _SPAWN_STAT['t0'] is not None:
+        _SPAWN_STAT['s'] += time.monotonic() - _SPAWN_STAT['t0']
+        _SPAWN_STAT['n'] += 1
+        _SPAWN_STAT['t0'] = None
     if _freeze_trace is not None:
         _freeze_trace.emit(phase, **data)
+
+
+def _self_rss_mb():
+    """퍼저 프로세스 RSS(MB) — 못 읽으면 None."""
+    try:
+        with open('/proc/self/statm') as fh:
+            return int(fh.read().split()[1]) * os.sysconf('SC_PAGE_SIZE') / (1 << 20)
+    except Exception:
+        return None
 
 
 class _FreezeTrace:
@@ -24980,7 +25000,8 @@ class NVMeFuzzer(BackgroundSamplingMixin, ExceptionFuzzerMixin, LearningMixin, _
         pm = getattr(self, '_pm_detach_stats', None)
         return dict(setup=float(num(ses, 't_setup')), read=float(num(ses, 't_read')),
                     aborted=int(num(ses, 'setup_aborted')),
-                    pm_n=int(num(pm, 'count')), pm_s=float(num(pm, 'reattach_s')))
+                    pm_n=int(num(pm, 'count')), pm_s=float(num(pm, 'reattach_s')),
+                    spawn_n=int(_SPAWN_STAT['n']), spawn_s=float(_SPAWN_STAT['s']))
 
     def _timing_line(self):
         """직전 창(지난 호출 이후)의 실행당 평균 → 문자열. 창을 비운다. 전송이 없었으면 None."""
@@ -24997,6 +25018,13 @@ class NVMeFuzzer(BackgroundSamplingMixin, ExceptionFuzzerMixin, LearningMixin, _
             line = (f"[Timing] 실행 {n}건 평균 — 전송(명령 실행) {ms(w['send'], n):.1f}ms | "
                     f"종료 대기 {ms(w['stop'], n):.1f}ms | 기타(회계·변이·PM 동작) "
                     f"{1000.0 * max(0.0, rest):.1f}ms")
+            # 전송 중 호스트 몫: nvme-cli 프로세스 생성 평균(퍼저 RSS 에 비례해 늘 수 있다)
+            sp_n = cur.get('spawn_n', 0) - prev.get('spawn_n', 0)
+            if sp_n > 0:
+                line += f" | 프로세스 생성 {ms(cur['spawn_s'] - prev.get('spawn_s', 0.0), sp_n):.1f}ms"
+            rss = _self_rss_mb()
+            if rss is not None:
+                line += f" · RSS {rss:.0f}MB"
             if getattr(getattr(self, 'sampler', None), 'session', None) is not None:
                 line += (f" | SBA 준비 {ms(cur['setup'] - prev['setup'], n):.1f}ms · PC 읽기 "
                          f"{ms(cur['read'] - prev['read'], n):.1f}ms (워커, 명령과 겹침; 준비 중단 "

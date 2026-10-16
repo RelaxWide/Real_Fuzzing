@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import timing_trend   # noqa: E402
 
 
-def timing_line(n, send_ms, by_cmd, setup_ms=10.0, read_ms=10.0, stop_ms=2.0, rest_ms=5.0):
+def timing_line(n, send_ms, by_cmd, setup_ms=10.0, read_ms=10.0, stop_ms=2.0, rest_ms=5.0, spawn_ms=None):
     """진짜 _timing_line 으로 한 창의 줄을 만든다."""
     o = v.NVMeFuzzer.__new__(v.NVMeFuzzer)
     ses = NS(t_setup=0.0, t_read=0.0, setup_aborted=0)
@@ -21,6 +21,9 @@ def timing_line(n, send_ms, by_cmd, setup_ms=10.0, read_ms=10.0, stop_ms=2.0, re
     o._bg_win = defaultdict(float)
     o._bg_tally = defaultdict(int)
     prev = o._timing_snapshot()
+    if spawn_ms is not None:
+        v._SPAWN_STAT['n'] += n
+        v._SPAWN_STAT['s'] += spawn_ms * n / 1000
     ses.t_setup, ses.t_read = setup_ms * n / 1000, read_ms * n / 1000
     per = (send_ms + stop_ms + rest_ms) / 1000
     o._tm = dict(n=n, send=send_ms * n / 1000, stop=stop_ms * n / 1000, loop=per * n, nloop=n, last=None,
@@ -55,6 +58,16 @@ class TimingTrend(unittest.TestCase):
         self.assertAlmostEqual(s['phase']['early']['busy'], 25 / 27, places=2)
         self.assertIn('SBA 트래픽 세기는 비슷', text)
 
+    def test_spawn_share_of_send_growth(self):
+        s, text = self.run_log((100, 20.0, {'Read': (20.0, 100)}, 15.0, 10.0, 2.0, 5.0, 2.0),
+                               (100, 67.0, {'Read': (67.0, 100)}, 35.0, 35.0, 2.0, 5.0, 50.0))
+        self.assertAlmostEqual(s['phase']['early']['spawn'], 2.0, places=1)
+        self.assertAlmostEqual(s['phase']['late']['spawn'], 50.0, places=1)
+        self.assertIsNotNone(s['phase']['late']['rss'])
+        self.assertIn('퍼저 메모리 증가로 nvme-cli 생성이 느려진 것', text)
+        self.assertIn('nvme-cli 프로세스 생성(호스트', text)
+        self.assertNotIn('장치·환경 쪽', text)
+
     def test_cli(self):
         import tempfile
         with tempfile.NamedTemporaryFile('w', suffix='.log', delete=False, encoding='utf-8') as fh:
@@ -70,3 +83,28 @@ class TimingTrend(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SpawnHook(unittest.TestCase):
+    def test_send_path_brackets_popen_with_hook_events(self):
+        """_send_nvme_command 가 Popen 바로 앞뒤에 before_popen·spawned 를 낸다 — 생성 시간이 그 사이다."""
+        import ast
+        from fuzzer_target import FUZZER_FILE
+        src = FUZZER_FILE.read_text(encoding='utf-8')
+        fn = next(n for c in ast.parse(src).body if isinstance(c, ast.ClassDef) and c.name == '_V101Fuzzer'
+                  for n in c.body if isinstance(n, ast.FunctionDef) and n.name == '_send_nvme_command')
+        seg = ast.get_source_segment(src, fn)
+        a, b, c = seg.index("'nvme.before_popen'"), seg.index('subprocess.Popen('), seg.index("'nvme.spawned'")
+        self.assertLess(a, b)
+        self.assertLess(b, c)
+
+    def test_hook_accumulates(self):
+        n0, s0 = v._SPAWN_STAT['n'], v._SPAWN_STAT['s']
+        v._freeze_emit('nvme.before_popen', argv=['nvme'])
+        v._freeze_emit('nvme.spawned', child_pid=1)
+        v._freeze_emit('nvme.spawned', child_pid=1)      # 짝 없는 spawned 는 세지 않는다
+        self.assertEqual(v._SPAWN_STAT['n'], n0 + 1)
+        self.assertGreaterEqual(v._SPAWN_STAT['s'], s0)
+
+    def test_rss_readable(self):
+        self.assertGreater(v._self_rss_mb(), 1)
