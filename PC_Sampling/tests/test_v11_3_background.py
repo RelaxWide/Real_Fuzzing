@@ -1035,6 +1035,84 @@ class Worker(unittest.TestCase):
         s.bg_shutdown()
 
 
+class SaturationRest(unittest.TestCase):
+    """포화 휴식(rest_after_samples): PM9M1 포화 조기 종료처럼 새 PC 없을 때만 쉬고, 새 명령·idle 확인 주기에 깬다."""
+
+    def test_off_by_default_keeps_reading(self):
+        self.assertEqual(v._BG_DEFAULTS['rest_after_samples'], 0)
+        s = worker_sampler(lambda n: 0x2001)
+        s.start_sampling()
+        self.assertTrue(wait_for(lambda: s.count['n'] > 300))
+        self.assertEqual(s.bg_counts['rests'], 0)
+        s.bg_shutdown()
+
+    def test_rests_only_when_nothing_new_and_wakes_on_next_command(self):
+        s = worker_sampler(lambda n: 0x2001, rest_after_samples=32, rest_max_sec=10.0)
+        s.start_sampling()
+        self.assertTrue(wait_for(lambda: s._bg_resting))
+        self.assertTrue(s.bg_quiescent(), '쉬는 동안 메인은 처리 완료 경계를 기다리지 않는다')
+        n = s.count['n']
+        time.sleep(0.1)
+        self.assertEqual(s.count['n'], n, '쉬는 동안 DAP 읽기 없음')
+        self.assertLess(n, 32 + 8 * 2 + 1, '포화 기준을 넘긴 burst 에서 바로 쉰다')
+        kinds = [b['kind'] for b in s.bg_take()]
+        self.assertEqual(kinds[-1], 'rest')
+        self.assertFalse(s.openocd_error.is_set())
+        s.start_sampling()                                   # 다음 명령
+        self.assertTrue(wait_for(lambda: s.count['n'] > n))
+        self.assertTrue(wait_for(lambda: s.bg_counts['rests'] >= 2), '새 명령에서도 포화면 다시 쉰다')
+        s.bg_shutdown()
+
+    def test_new_pcs_keep_reading(self):
+        s = worker_sampler(lambda n: (n << 2) | 1, rest_after_samples=32, rest_max_sec=10.0)
+        s.start_sampling()
+        self.assertTrue(wait_for(lambda: s.count['n'] > 400))
+        self.assertEqual(s.bg_counts['rests'], 0)
+        s.bg_shutdown()
+
+    def test_invalid_samples_count_as_nothing_new(self):
+        # 코어 WFI·정지(valid 비트 0) 만 나오면 idle — 쉰다
+        s = worker_sampler(lambda n: 0x2000, rest_after_samples=32, rest_max_sec=10.0)
+        s.start_sampling()
+        self.assertTrue(wait_for(lambda: s._bg_resting))
+        s.bg_shutdown()
+
+    def test_idle_rest_wakes_periodically(self):
+        s = worker_sampler(lambda n: 0x2001, rest_after_samples=16, rest_max_sec=0.03)
+        s.start_sampling()
+        self.assertTrue(wait_for(lambda: s.bg_counts['rests'] >= 3), '명령 없이도 rest_max_sec 마다 확인')
+        s.bg_shutdown()
+
+    def test_pause_during_rest_is_acknowledged(self):
+        s = worker_sampler(lambda n: 0x2001, rest_after_samples=16, rest_max_sec=10.0)
+        s.start_sampling()
+        self.assertTrue(wait_for(lambda: s._bg_resting))
+        t0 = time.monotonic()
+        self.assertTrue(s.bg_pause())
+        self.assertLess(time.monotonic() - t0, 1.0)
+        s.bg_shutdown()
+
+    def test_main_does_not_wait_on_resting_worker(self):
+        s = worker_sampler(lambda n: 0x2001, rest_after_samples=16, rest_max_sec=10.0)
+        s.start_sampling()
+        self.assertTrue(wait_for(lambda: s._bg_resting))
+        f = make_fuzzer()
+        self.addCleanup(f._tmp.cleanup)
+        f.sampler, f._bg_opts = s, s.bg_opts
+        t0 = time.monotonic()
+        self.assertTrue(f._bg_wait_processed(time.monotonic(), 2.0))
+        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertFalse(f._bg_invalid, '휴식은 무효 구간이 아니다')
+        s.bg_shutdown()
+
+    def test_options(self):
+        ok = v.riscv_background_options(cfg({'enabled': True, 'rest_after_samples': 0}))
+        self.assertEqual(ok['rest_after_samples'], 0)
+        for bad in ({'enabled': True, 'rest_after_samples': -1}, {'enabled': True, 'rest_max_sec': 0}):
+            with self.assertRaises(ValueError, msg=bad):
+                v.riscv_background_options(cfg(bad))
+
+
 class EndToEnd(unittest.TestCase):
     """진짜 워커 스레드(가짜 DAP) + 진짜 퍼저 회계. 명령마다 펌웨어가 다른 BB 를 돈다고 두고,
     각 명령이 **자기 BB 만** 받는지, 명령 사이 PC 가 백그라운드로만 가는지 본다."""

@@ -5303,7 +5303,12 @@ _BG_DEFAULTS = {
     'pause_timeout_sec': 10.0,      # 일시정지 확인 신호 제한 시간(§3.5)
     'flush_timeout_sec': 10.0,      # 동기 확정(캘리브레이션·시퀀스·PM·timeout·종료) 제한 시간(§3.7)
     'queue_max_samples': 100000,    # 워커 결과 큐의 샘플 상한(§3.10)
+    # 포화 휴식(PM9M1 의 포화 조기 종료와 같은 취지): 새 PC 없는 샘플이 이만큼 이어지면 워커가 DAP 에 손대지 않고
+    #   쉰다 → 다음 명령 시작·일시정지·종료·rest_max_sec 중 먼저 오는 것에 깬다. 0 = 끔(쉬지 않음).
+    'rest_after_samples': 0,
+    'rest_max_sec': 1.0,            # 한 번 쉬는 최대 시간 — 명령 없는 idle 에서도 이 간격으로 새 활동을 확인한다
 }
+_BG_ZERO_OK = ('rest_after_samples',)   # 0 이 '끔' 인 키
 
 
 def riscv_background_options(config):
@@ -5332,7 +5337,7 @@ def riscv_background_options(config):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f'riscv.sample_plan.background.{key} 는 숫자여야 한다: {value!r}')
         value = type(default)(value)
-        if value <= 0:
+        if value < 0 or (value == 0 and key not in _BG_ZERO_OK):
             raise ValueError(f'riscv.sample_plan.background.{key} 는 0 보다 커야 한다: {value!r}')
         opts[key] = value
     return opts if enabled else None
@@ -5401,6 +5406,11 @@ class RiscvBgSampler(RiscvPcsrSampler):
         self.bg_gen = 0                 # 세션 세대 — 재개·재시작마다 +1
         self.bg_unresponsive = False
         self.bg_counts = defaultdict(int)
+        self._bg_seen = set()           # 워커가 본 (core, bank, pc) — 포화 판정용(새 PC 여부)
+        self._bg_dry = 0                # 새 PC 없이 이어진 샘플 수
+        self._bg_cmd_seq = 0            # 명령 시작마다 +1 (start_sampling) — 휴식을 깨우고 포화 계수를 새로 시작
+        self._bg_dry_seq = 0
+        self._bg_resting = False
         log.warning(f"[cJTAG/SBA] v11.3 상시 백그라운드 샘플링 켬 — 오버레이 burst "
                     f"{self.bg_opts['overlay_burst_len']}, 대기 상한 {self.bg_opts['pending_max']}명령, "
                     f"정체 판정 {self.bg_opts['max_lag_sec']:g}s, 일시정지 제한 {self.bg_opts['pause_timeout_sec']:g}s")
@@ -5416,7 +5426,8 @@ class RiscvBgSampler(RiscvPcsrSampler):
         if self.bg_unresponsive:
             return False
         t = self._bg_thread
-        return bool(t is None or not t.is_alive() or self._bg_parked or self._bg_error_parked)
+        return bool(t is None or not t.is_alive() or self._bg_parked or self._bg_error_parked
+                    or self._bg_resting)
 
     def bg_take(self):
         """공개된 묶음을 모두 가져온다(묶음 단위로 원자적)."""
@@ -5491,6 +5502,9 @@ class RiscvBgSampler(RiscvPcsrSampler):
     def start_sampling(self):
         if self.bg_unresponsive:
             return
+        with self._bg_cv:
+            self._bg_cmd_seq += 1             # 새 명령 — 포화 휴식 중이면 깨운다
+            self._bg_cv.notify_all()
         t = self._bg_thread
         alive = t is not None and t.is_alive()
         if not alive or self._bg_pause_req:
@@ -5695,7 +5709,47 @@ class RiscvBgSampler(RiscvPcsrSampler):
             for core in sched:
                 if self._bg_pause_req or self._bg_quit or self.openocd_error.is_set():
                     break
+                if self._bg_dry_seq != self._bg_cmd_seq:
+                    self._bg_dry_seq, self._bg_dry = self._bg_cmd_seq, 0   # 명령마다 포화 계수 새로(PM9M1 창과 같다)
                 self._bg_burst(core)
+                lim = self.bg_opts.get('rest_after_samples', 0)
+                if lim and self._bg_dry >= lim:
+                    self._bg_rest()
+                    break
+
+    def _bg_note_novelty(self, core, obs):
+        """채택한 burst 의 새 PC 여부로 포화 계수를 민다. 무효 샘플(코어 WFI·정지)도 '새것 아님'으로 센다."""
+        seen, new = self._bg_seen, False
+        for o in obs:
+            if o.valid and o.pc is not None and self._in_core_range(core, o.pc):
+                k = (core, o.bank, o.pc)
+                if k not in seen:
+                    seen.add(k)
+                    new = True
+        self._bg_dry = 0 if new else self._bg_dry + len(obs)
+
+    def _bg_rest(self):
+        """포화 휴식 — 새 PC 없는 샘플이 이어졌다. DAP 에 손대지 않고 다음 명령 시작·일시정지·종료·rest_max_sec 까지 쉰다.
+
+        쉬는 동안은 관측이 없을 뿐 장애가 아니다: 처리 완료 경계는 bg_quiescent 로 '지금'이 되고(메인이 기다리지 않음)
+        무효 구간도 내지 않는다(PM9M1 이 포화로 창을 일찍 닫는 것과 같다). 깬 뒤 첫 값은 쉬기 전 읽기가 시작시킨 값이라
+        포착 구간이 길어져 명령 경계에 걸치면 보상에서 빠진다(§3.8)."""
+        t0 = time.monotonic()
+        self.bg_counts['rests'] += 1
+        self._bg_put([], kind='rest')
+        with self._bg_cv:
+            seq = self._bg_cmd_seq
+            self._bg_resting = True
+            self._bg_cv.notify_all()
+            deadline = t0 + self.bg_opts.get('rest_max_sec', 1.0)
+            while not (self._bg_cmd_seq != seq or self._bg_pause_req or self._bg_quit):
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    break
+                self._bg_cv.wait(rem)
+            self._bg_resting = False
+        self._bg_dry = 0
+        self.bg_counts['rest_ms'] += int(1000 * (time.monotonic() - t0))
 
     def _bg_burst(self, core):
         s = self.session
@@ -5760,6 +5814,7 @@ class RiscvBgSampler(RiscvPcsrSampler):
             self._ovl_kept += len(obs)
             obs = [o._replace(bank=bank) for o in obs]
         self._track_collapse(core, obs)
+        self._bg_note_novelty(core, obs)
         self._bg_verified = self._bg_put([(a, b, o) for (a, b), o in zip(spans, obs)], kind='accept')
         self._bg_flush_req = False
         self.bg_counts['accepted'] += 1
@@ -24890,7 +24945,8 @@ class BackgroundSamplingMixin:
                     f"(정체 {t['stall']}회, 만료 {t['expired']}) | 명령 귀속 샘플 {t['cmd_samples']} · "
                     f"경계 걸침 {t['ambiguous']} · 백그라운드 {t['bg_samples']}(전체 커버리지 신규 BB "
                     f"{t['bg_new_bbs']}) | burst {c['bursts']} · 채택 {c['accepted']} · 스왑 폐기 "
-                    f"{c['swap_drop']} · 장애 {c['faults']} · 넘침 샘플 {c['overflow_samples']}")
+                    f"{c['swap_drop']} · 장애 {c['faults']} · 넘침 샘플 {c['overflow_samples']} | 포화 휴식 "
+                    f"{c['rests']}회 {c['rest_ms'] / 1000.0:.0f}s")
         return super()._sampling_finish()
 
     def _read_bm9k1_monitor_pc(self):
@@ -24926,6 +24982,13 @@ class BackgroundSamplingMixin:
         w, t = self._bg_win, self._bg_tally
         s = (f" | BG 대기 최대 {int(w['max_pending'])}명령 · 확정 지연 최대 {1000.0 * w['max_lag']:.0f}ms · "
              f"관측 미확정 누적 {t['unobserved']} · 경계 걸침 누적 {t['ambiguous']}")
+        c = getattr(self.sampler, 'bg_counts', None)
+        if c is not None:
+            now, prev = time.monotonic(), getattr(self, '_bg_rest_prev', None)
+            if prev is not None and now > prev[0]:
+                share = (c['rest_ms'] - prev[1]) / 1000.0 / (now - prev[0])
+                s += f" · 포화 휴식 {c['rests'] - prev[2]}회({share:.0%})"
+            self._bg_rest_prev = (now, c['rest_ms'], c['rests'])
         self._bg_win = defaultdict(float)
         return s
 
