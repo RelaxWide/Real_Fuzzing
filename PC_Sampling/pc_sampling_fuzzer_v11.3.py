@@ -4558,6 +4558,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         plan = rv.get('sample_plan') or {}
         self._weights = {int(k): int(v) for k, v in (plan.get('weights') or {}).items()} \
             or {cid: 1 for cid in self._cores}
+        self._plan_weights = dict(self._weights)     # 시작 계획 — 재연결 때 빠졌던 코어를 되살리는 기준
         self._burst_len = int(plan.get('burst_len', 256))
         self._seed = int(plan.get('seed', 0)) or random.randrange(1 << 30)
         self._rng = random.Random(self._seed)        # ★ 재현용 — 세션 로그에 남긴다
@@ -4581,6 +4582,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         self._policy = str(rv.get('interesting_policy', 'primary'))
         self._primary = int(plan.get('primary_core')) if plan.get('primary_core') is not None \
             else (max(self._weights, key=self._weights.get) if self._weights else 0)
+        self._plan_primary = self._primary           # 재연결로 바뀐 primary 를 코어 복귀 때 되돌리는 기준
         self.session = None
         self._idle_obs: list = []
         self.cov = None                              # CoverageModel (fuzzer 가 주입)
@@ -4673,6 +4675,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
                 return False
             if not self._weights:
                 self._weights = {cid: 1 for cid in self._cores}
+                self._plan_weights = dict(self._weights)
             self._pcsr_addrs = [0] * len(self._cores)
         log.warning(f"[cJTAG/SBA] 링크 준비 완료, PC 검증 전 (SJTAG 인증 {self.session.auth_count}회, "
                     f"{self.session.auth_ms:.0f}ms). 버스트 seed={self._seed} "
@@ -4686,9 +4689,12 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         if not ok_cores:
             self.close()
             return False
-        # 재시도는 이전 샘플링 계획에서 다시 시작한다. 실패한 connect가
-        # self._weights를 비우면 이후 PC가 회복해도 모든 재시도가 실패한다.
-        candidate_weights = {c: w for c, w in self._weights.items() if c in ok_cores}
+        # 재시도·재연결은 **시작 계획의 코어 전체**에서 다시 고른다. 실패한 connect가 self._weights를
+        # 비우면 이후 PC가 회복해도 모든 재시도가 실패하고, 줄인 계획에서 고르면 한 번 빠진 코어(pin·정합성
+        # 일시 실패)가 이번에 통과해도 캠페인 끝까지 돌아오지 않는다. 남아 있던 코어는 학습된 가중치를 유지한다.
+        base = dict(getattr(self, '_plan_weights', None) or self._weights)
+        base.update({c: w for c, w in self._weights.items() if c in base})
+        candidate_weights = {c: w for c, w in base.items() if c in ok_cores}
         bad = self._verify_ranges(ok_cores)
         if bad:
             candidate_weights = {c: w for c, w in candidate_weights.items() if c not in bad}
@@ -4698,8 +4704,15 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             log.error("[cJTAG/SBA] 샘플링 가능한 코어가 없다 — 연결 실패로 처리")
             self.close()
             return False
+        _restored = sorted(set(candidate_weights) - set(self._weights))
+        if _restored:
+            log.warning(f"[cJTAG/SBA] 이전 연결에서 빠졌던 코어 복귀: {_restored}")
         self._weights = candidate_weights
-        if self._primary not in self._weights:
+        _plan_primary = getattr(self, '_plan_primary', None)
+        if _plan_primary in self._weights and self._primary != _plan_primary:
+            self._primary = _plan_primary
+            log.warning(f"[cJTAG/SBA] primary 코어를 시작 계획의 {self._primary} 로 되돌림")
+        elif self._primary not in self._weights:
             self._primary = max(self._weights, key=self._weights.get)
             log.warning(f"[cJTAG/SBA] primary 코어를 {self._primary} 로 재선정")
         # 오버레이 프로브는 세션이 살아 있는 지금 확인한다(재연결마다 다시).
