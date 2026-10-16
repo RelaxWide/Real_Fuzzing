@@ -1682,6 +1682,7 @@ class FuzzConfig:
     #                                             시도↑ → 짧은 펌웨어 실행 창을 잡을 확률↑ (P9 튜닝용).
     # v8.1: JLinkHaltSampler(P9) 전용 — pylink 직접 제어 파라미터
     jlink_speed:     int   = 4000                 # J-Link SWD/JTAG 속도 (kHz)
+    link_fail_por:   bool  = False                # v11.3: 순수 디버그 링크 장애면 POR 후 재연결(제품 프로필)
     jlink_ap_index:  int   = 0                    # CoreSight APB-AP 인덱스 (P9: AP[0])
     jlink_vtref_mv:  Optional[int] = None         # J-Link VTref 고정(mV), connect 전 적용. None/0=자동(기본).
     # v11.2.1: PM 동작 중 디버그 세션 분리(제품 설정 pm_detach_sampler). 디버거가 붙은 채 깊은 PS 에
@@ -10564,11 +10565,11 @@ class _V101Fuzzer:
         """v11.3: 디버그 링크 재연결이 끝내 실패했을 때 POR 로 디버그 쪽을 되살리고 이어간다 → 샘플러가 다시 붙었으면 True.
 
         BM9K1 에서 복구 시퀀스가 실패하면 DM AP(APBAP1)가 POR 전까지 응답하지 않는 상태가 있다(컨트롤러는 정상).
-        BM9K1(riscv_pcsr)에서 항상 켜져 있다(설정 없음, 사용자 결정 2026-10-16). **컨트롤러가 응답할 때만**(순수 링크 장애)
-        한다 — 응답이 없으면 펌웨어 행이라 기존대로 POR 없이 증거를 남긴다(_capture_firmware_hang_if_stuck).
-        횟수 상한 없음(사용자 결정 2026-10-15). 다른 제품은 하지 않는다. 예외 주입 캠페인에서는
+        제품 프로필 link_fail_por=true 일 때(json 은 전 제품 true, 키 생략 시 false — 사용자 결정 2026-10-16),
+        **컨트롤러가 응답할 때만**(순수 링크 장애) 한다 — 응답이 없으면 펌웨어 행이라 기존대로 POR 없이 증거를
+        남긴다(_capture_firmware_hang_if_stuck). 횟수 상한 없음(사용자 결정 2026-10-15). 예외 주입 캠페인에서는
         _recover_after_unsupported_skip 이 막는다."""
-        if getattr(self.config, 'sampler_type', None) != 'riscv_pcsr':
+        if not getattr(self.config, 'link_fail_por', False):
             return False
         try:
             _d, _err, _rc = self._nvme_id_dict(['nvme', 'id-ctrl', self.config.nvme_device])
@@ -25353,6 +25354,7 @@ if __name__ == "__main__":
         # RISC-V(BM9K1) cJTAG 기본은 10MHz — 프로필에 jlink_speed 가 없어도 ARM 기본 4000 으로 내려가지 않게
         jlink_speed=_profile.get('jlink_speed', 10000 if _profile.get('arch') == 'riscv' else 4000),
         jlink_ap_index=_profile.get('jlink_ap_index', 0),
+        link_fail_por=_profile.get('link_fail_por', False) is True,
         jlink_vtref_mv=_profile.get('jlink_vtref_mv'),
         pm_detach_sampler=bool(_profile.get('pm_detach_sampler', False)) and not args.no_jlink,
         pc_reg_index=(args.pc_reg_index if args.pc_reg_index is not None
