@@ -863,3 +863,14 @@ BM9K1 백그라운드 워커는 쉼 없이 SBA(시스템 버스)를 읽었다(�
 - 시험: `test_v11_3_background.SaturationRest`.
 - 실기 미검증 — exec/s·커버리지 균형은 rest_after_samples 로 조정.
 
+
+### 10.8 재연결마다 J-Link DLL 사본 누적 → OOM (2026-10-17)
+- 실기: link_fail_por 켜고 세션 재복구 중 `Out of memory: Killed process (python3) anon-rss:30791176kB`.
+- 원인: pylink 는 DLL 경로에서 버전(`JLink_V…`)을 못 읽으면 `JLink()` 마다 DLL 을 임시 파일로 복사해 새로 올리고,
+  Linux 에선 내리지 않는다(dlclose 없음). `sfe76_link.Link.open` 이 연결 시도마다 `pylink.JLink()` 를 새로 만들어
+  재연결·PM 분리(reattach)·POR 복구마다 사본(정적 메모리·힙·스레드)이 쌓였다. ARM `JLinkHaltSampler.connect` 도 같았다.
+- 수정: 프로세스당 1개를 만들어 재사용(`sfe76_link._acquire_jlink`, API_LEVEL 6 / 퍼저 `_shared_pylink`). 새 세션이 열면
+  남아 있던 연결은 먼저 닫고, 늦게 온 이전 세션의 close 는 새 세션 연결을 건드리지 않는다.
+- 확인: `세션 OK — … | J-Link 객체 N개 · RSS M MB` — N 은 캠페인 내내 1. `구버전 sfe76_link.py` 가 찍히면 공유 파일을 맞출 것.
+- 시험: `test_v11_3_jlink_reuse.py`(가짜 DLL 로 pylink 사본 누적 자체도 재현). 실기 미검증 — DLL 1개를 재사용할 때
+  `CORESIGHT_AddAP` 재등록이 문제 되지 않는지(첫 재연결 성공 여부)를 실기에서 본다.

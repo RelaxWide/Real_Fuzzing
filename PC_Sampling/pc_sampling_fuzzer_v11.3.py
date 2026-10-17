@@ -348,6 +348,18 @@ try:
 except Exception:
     _pylink = None
 
+_PYLINK_SHARED = None
+
+
+def _shared_pylink(**kwargs):
+    """v11.3: 프로세스당 pylink.JLink 1개. pylink 는 DLL 경로에서 버전을 못 읽으면 JLink() 마다 DLL 사본을 새로 올리고
+    Linux 에선 내리지 않는다 — 재연결마다 만들면 사본(정적 메모리·힙·스레드)이 쌓여 OOM kill 된다(2026-10-17 BM9K1 실기,
+    sfe76_link._acquire_jlink 와 같은 이유). 연결은 호출부가 open/close 한다."""
+    global _PYLINK_SHARED
+    if _PYLINK_SHARED is None:
+        _PYLINK_SHARED = _pylink.JLink(**kwargs)
+    return _PYLINK_SHARED
+
 # 버전
 FUZZER_VERSION = "11.3.0"
 
@@ -4330,7 +4342,14 @@ class JLinkHaltSampler(OpenOCDPCSampler):
             #   끄는 시도는 이 DLL 이 NULL 을 무시해 실패했고, 커스텀 콜백을 빼면 pylink 기본
             #   logger.info 콜백으로 떨어져 오히려 더 빨리 크래시했다 → 원복. 근본해법은
             #   샘플러 서브프로세스 격리(진행 예정). 그때까지는 가벼운 커스텀 콜백 유지.
-            jl = _pylink.JLink(error=self._jlink_dll_msg, warn=self._jlink_dll_msg)
+            jl = _shared_pylink(error=self._jlink_dll_msg, warn=self._jlink_dll_msg)   # 재연결마다 새로 만들지 않는다
+            try:
+                for _ in range(4):        # 앞 연결이 닫히지 않고 남았으면(예외 경로) 먼저 닫는다(횟수 제한)
+                    if not jl.opened():
+                        break
+                    jl.close()
+            except Exception:
+                pass
             jl.open()
             self._apply_vtref(jl)
             tif = (_pylink.enums.JLinkInterfaces.JTAG if self.config.interface == 'jtag'
@@ -4737,8 +4756,13 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
             log.warning(f"[cJTAG/SBA] primary 코어를 {self._primary} 로 재선정")
         # 오버레이 프로브는 세션이 살아 있는 지금 확인한다(재연결마다 다시).
         self._init_overlay_probe()
+        # 재연결이 메모리를 쌓지 않는지 매번 보인다 — J-Link 객체 수는 프로세스 내내 1 이어야 한다(DLL 사본 누적 OOM)
+        _lm = sys.modules.get('sfe76_link')
+        _jn = getattr(_lm, 'JLINK_CREATED', None)
         log.warning(f"[cJTAG/SBA] 세션 OK — PC 정합성 검증 통과 "
-                    f"cores={sorted(self._weights)}")
+                    f"cores={sorted(self._weights)} | J-Link 객체 "
+                    + (f"{_jn}개" if _jn is not None else "재사용 안 함(구버전 sfe76_link.py — 재연결마다 메모리 누적, 같은 커밋으로 맞출 것)")
+                    + f" · RSS {_self_rss_mb():.0f}MB")
         return True
 
     # v11.2.1: PM 분리 뒤 가벼운 재연결 — 코어마다 확인 버스트 크기

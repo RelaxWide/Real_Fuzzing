@@ -95,12 +95,13 @@ VERSION = "2026-08-11.3  TAP 수동 선언 스크립트 적용"
 #   도구들이 시작할 때 이 값을 확인해서, 오래된 sfe76_link.py 를 쓰면
 #   AttributeError 대신 **무엇을 해야 하는지** 알려준다.
 #   실제로 두 번 겪었다: --ap-count 없음, open_dap 없음. 둘 다 pull 누락.
-API_LEVEL = 5
+API_LEVEL = 6
 #   1: checked API (connect_checked/halt_checked/read_pc/resume_checked)
 #   2: + ap_count, CORE_HART, DMI_STRIDE_SHIFT, add_common_args --ap-count
 #   3: + open_dap(전원만 요구), dap_power(전원 직접 요청)
 #   4: CJTAG_MODE 0→1 (SiFive 는 short-form), DEVICE 'RISC-V'→'E76'
 #   5: TAP 수동 선언 JLinkScript 를 raw 경로에도 적용
+#   6: pylink.JLink 를 프로세스당 1개만 만들어 재사용(_acquire_jlink, JLINK_CREATED) — DLL 사본 누적 OOM
 
 
 def require_api(level, tool=""):
@@ -302,6 +303,46 @@ EXIT_RESUME_FAIL  = 5    # ★ 보드 복구 필요
 EXIT_INSUFFICIENT = 6
 
 
+# ── 프로세스당 pylink.JLink 1개 ──────────────────────────────────────
+#   pylink 는 DLL 경로에서 버전을 못 읽으면(예: /usr/lib/libjlinkarm.so.7 처럼 JLink_V… 가 없는 경로)
+#   JLink() 마다 DLL 을 임시 파일로 복사해 새로 올리고, Linux 에선 내리지 않는다(dlclose 없음).
+#   open 마다 새로 만들면 재연결·PM 분리·POR 복구마다 DLL 사본(정적 메모리·힙·스레드)이 쌓여
+#   장시간 캠페인에서 RSS 가 수십 GB 로 커져 OOM kill 된다(2026-10-17 실기). 그래서 하나를 만들어 다시 쓴다.
+#   세션은 한 번에 하나다 — 새 Link 가 열면 이전 소유자의 연결은 닫고, 이전 소유자의 close() 는 DLL 을 건드리지 않는다.
+_SHARED_JL = None
+_SHARED_OWNER = None
+JLINK_CREATED = 0             # 만든 pylink.JLink 수(진단·시험용) — 정상이면 프로세스 내내 1
+
+
+def _acquire_jlink(owner):
+    global _SHARED_JL, _SHARED_OWNER, JLINK_CREATED
+    if _SHARED_JL is None:
+        _SHARED_JL = pylink.JLink()
+        JLINK_CREATED += 1
+    jl = _SHARED_JL
+    # 지금 열려 있는 연결은 닫히지 않고 버려진 이전 세션이다 — 새 세션 전에 닫는다(횟수 제한).
+    #   pylink open() 은 이미 열려 있으면 다시 열지 않고 참조 수만 올린다 → 새 세션이 낡은 연결을 쓰게 된다
+    try:
+        for _ in range(4):
+            if not jl.opened():
+                break
+            jl.close()
+    except Exception:
+        pass
+    _SHARED_OWNER = owner
+    return jl
+
+
+def _release_jlink(owner):
+    """owner 가 현재 소유자일 때만 연결을 닫는다 → 닫았으면 True."""
+    global _SHARED_OWNER
+    if _SHARED_OWNER is not owner or _SHARED_JL is None:
+        return False
+    _SHARED_OWNER = None
+    _SHARED_JL.close()
+    return True
+
+
 class LinkError(RuntimeError):
     """단계 실패. exit_code 로 어느 게이트에서 깨졌는지 구분한다."""
 
@@ -380,7 +421,7 @@ class Link:
 
     # ── open / 설정 ──────────────────────────────────────────────────
     def open(self, tap_script=True):
-        self.jl = pylink.JLink()
+        self.jl = _acquire_jlink(self)     # 새로 만들지 않는다 — 위 _SHARED_JL 주석(DLL 사본 누적 → OOM)
         # ★ TAP 수동 선언을 open 전후 양쪽에서 지정한다 (어느 쪽이 먹는지 불확실)
         self._tap_path = write_tap_script() if tap_script else None
         if self._tap_path:
@@ -645,6 +686,10 @@ class Link:
         """어떤 경로로 나가든 resume 을 시도하고, 실패를 숨기지 않는다."""
         if self.jl is None:
             return
+        if _SHARED_OWNER is not self:
+            # 새 세션이 같은 J-Link 를 가져갔다 — 그 세션의 코어 상태를 묻거나 닫지 않는다
+            self.jl = None
+            return
         try:
             try:
                 still_halted = bool(self.jl.halted())
@@ -665,7 +710,7 @@ class Link:
                               "보드 전원 사이클 필요")
         finally:
             try:
-                self.jl.close()
+                _release_jlink(self)        # 이미 새 세션이 가져갔으면 그 연결은 건드리지 않는다
             except Exception as e:
                 self.cleanup_error = self.cleanup_error or f"close: {e}"
             self.jl = None
