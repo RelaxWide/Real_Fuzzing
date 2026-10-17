@@ -871,6 +871,11 @@ BM9K1 백그라운드 워커는 쉼 없이 SBA(시스템 버스)를 읽었다(�
   재연결·PM 분리(reattach)·POR 복구마다 사본(정적 메모리·힙·스레드)이 쌓였다. ARM `JLinkHaltSampler.connect` 도 같았다.
 - 수정: 프로세스당 1개를 만들어 재사용(`sfe76_link._acquire_jlink`, API_LEVEL 6 / 퍼저 `_shared_pylink`). 새 세션이 열면
   남아 있던 연결은 먼저 닫고, 늦게 온 이전 세션의 close 는 새 세션 연결을 건드리지 않는다.
-- 확인: `세션 OK — … | J-Link 객체 N개 · RSS M MB` — N 은 캠페인 내내 1. `구버전 sfe76_link.py` 가 찍히면 공유 파일을 맞출 것.
+- 리뷰 보완: pylink 는 DLL 열림(`opened()`)과 객체 참조 수(`_open_refcount`)를 따로 두고, `open()` 은 참조 수가 남아 있으면
+  DLL 을 열지 않는다. 공유 객체를 넘기기 전 `jlink_reset`(퍼저는 `_pylink_reset`)이 참조 수 기준으로 실제로 닫고, 참조 수 0 인데
+  DLL 이 열려 있으면 DLL 을 직접 닫는다. 정리가 확인되지 않으면 재사용하지 않고 새 객체로 바꾼다(그때만 사본 1개 추가, 경고 로그).
+  `PcsrSession.close()` 는 공유 J-Link 를 새 세션이 가져갔으면 `sba_unpin` 도 하지 않고 참조만 버린다(`Link.owns_jlink`).
+- 확인: `세션 OK — … | J-Link 객체 N개 · DLL 매핑 N · 스레드 N · RSS M MB` — 객체 수는 캠페인 내내 1, 나머지는 재연결을 거듭해도
+  일정해야 한다. `구버전 sfe76_link.py` 가 찍히면 공유 파일을 맞출 것.
 - 시험: `test_v11_3_jlink_reuse.py`(가짜 DLL 로 pylink 사본 누적 자체도 재현). 실기 미검증 — DLL 1개를 재사용할 때
   `CORESIGHT_AddAP` 재등록이 문제 되지 않는지(첫 재연결 성공 여부)를 실기에서 본다.

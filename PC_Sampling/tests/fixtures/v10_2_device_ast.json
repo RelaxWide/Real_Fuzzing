@@ -168,6 +168,20 @@
       "date": "2026-10-17",
       "base_commit": "879dd08",
       "reason": "connect() reuses one process-wide pylink.JLink (_shared_pylink) instead of creating a new one per connect/reconnect; any connection left open is closed first (bounded). Same open/set_tif/connect sequence on the device. Reason: pylink loads a fresh temp copy of the J-Link DLL per JLink() when it cannot read the DLL version from the path and never unloads it on Linux, so every reconnect leaked a DLL copy (BM9K1 OOM kill 2026-10-17, same fix in sfe76_link). Regression tests: test_v11_3_jlink_reuse.py."
+    },
+    {
+      "file": "pc_sampling_fuzzer_v11.3.py",
+      "path": "JLinkHaltSampler",
+      "date": "2026-10-17",
+      "base_commit": "a5fbf14",
+      "reason": "connect() no longer runs its own opened()-only close loop; _shared_pylink now hands over the shared pylink.JLink only after _pylink_reset really closed it (pylink keeps DLL open state and _open_refcount separately and open() skips the DLL open while the refcount is above 0, so an opened()=False/refcount>0 fault state made reconnects reuse the stale connection). If the reset cannot be confirmed the object is replaced instead of reused. Same open/set_tif/connect sequence on the device. Review follow-up; regression tests: test_v11_3_jlink_reuse.RealPylinkFaultStates."
+    },
+    {
+      "file": "pc_sampling_fuzzer_v11.3.py",
+      "path": "RiscvPcsrSampler",
+      "date": "2026-10-17",
+      "base_commit": "a5fbf14",
+      "reason": "The 'session OK' log line also reports the process's J-Link DLL executable mappings and thread count (_proc_link_stats, read from /proc/self), so hardware reconnect loops can confirm that mappings, threads and RSS stay flat, not only the pylink object count. Logging only; no debug access change. Review follow-up; tests: test_v11_3_jlink_reuse."
     }
   ],
   "overrides_note": "hashes 는 모든 DEVICE_AST_FILES 에 적용되는 기준선이다. overrides 는 검토를 거쳐 **특정 파일에서만** 의도적으로 달라진 경로를 기록한다. v10.2 는 검증된 fallback 이라 계속 기준선 그대로여야 하고, 여기 올라오지 않은 파일·경로는 전부 기준선에 묶인다.",
@@ -195,8 +209,8 @@
     "pc_sampling_fuzzer_v11.3.py": {
       "OpenOCDPCSampler": "48865eb551960624265b061a897ddf8abdc2586862598bc2be3c97a3a69aba04",
       "_V101Fuzzer._send_nvme_command": "ad2011cacaf77f52f15cb6b3ad1df325354af3b1609a4200b45b2bac9133c10c",
-      "RiscvPcsrSampler": "f1e9c37043d1e6f8bb0b7d9a37e81d2d781eff7d2717ecde188e124d0a836b64",
-      "JLinkHaltSampler": "110932fa532c876a38c599be49d1746f9c81a4d2432d38664839b85ba0bdbec0"
+      "RiscvPcsrSampler": "dbd345f654ba6361644dc3bdaa423b9846a77c5d3ccd0a34b0f3e7a4ec4b23aa",
+      "JLinkHaltSampler": "6addeca701c4ea5ce33c1a6467045a357a6247b64c10fb9cc59695cdc5881255"
     }
   }
 }

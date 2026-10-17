@@ -314,33 +314,49 @@ _SHARED_OWNER = None
 JLINK_CREATED = 0             # 만든 pylink.JLink 수(진단·시험용) — 정상이면 프로세스 내내 1
 
 
-def _acquire_jlink(owner):
+def jlink_reset(jl):
+    """공유 객체의 연결을 **실제로** 닫는다 → 깨끗해졌으면 True(다시 open 하면 DLL open 이 실제로 일어난다).
+
+    pylink 는 열림을 두 곳에 둔다: DLL 상태(opened() = JLINKARM_IsOpen)와 객체의 참조 수(_open_refcount).
+    open() 은 참조 수가 0 보다 크면 DLL 을 열지 않고 수만 올리고, close() 는 참조 수가 0 이면 아무것도 안 한다.
+    그래서 둘이 어긋나면(장애 경로) opened() 만 보고 정리하면 새 세션이 실제 재연결 없이 낡은 연결을 쓴다.
+    → 참조 수가 남았으면 1 로 줄여 한 번에 실제로 닫고, 참조 수 0 인데 DLL 이 열려 있으면 DLL 을 직접 닫는다."""
+    try:
+        for _ in range(4):
+            if (getattr(jl, '_open_refcount', 0) or 0) <= 0:
+                break
+            jl._open_refcount = 1          # 여러 번 쌓였어도 다음 close() 가 JLINKARM_Close 까지 가게
+            jl.close()
+        if (getattr(jl, '_open_refcount', 0) or 0) > 0:
+            return False
+        if jl.opened():
+            jl._dll.JLINKARM_Close()
+        return not jl.opened()
+    except Exception:
+        return False
+
+
+def _acquire_jlink(owner, say=print):
+    """새 세션용 공유 객체 — 남아 있던 연결은 닫는다(버려진 이전 세션). 정리가 확인되지 않으면 낡은 상태를 재사용하지
+    않고 새 객체로 바꾼다(그 경우만 DLL 사본이 하나 더 생기고 JLINK_CREATED 로 로그에 보인다)."""
     global _SHARED_JL, _SHARED_OWNER, JLINK_CREATED
+    if _SHARED_JL is not None and not jlink_reset(_SHARED_JL):
+        say("  [Link] ⚠ 이전 J-Link 연결 정리 확인 실패 — 새 J-Link 객체로 교체(DLL 사본 1개 추가)")
+        _SHARED_JL = None
     if _SHARED_JL is None:
         _SHARED_JL = pylink.JLink()
         JLINK_CREATED += 1
-    jl = _SHARED_JL
-    # 지금 열려 있는 연결은 닫히지 않고 버려진 이전 세션이다 — 새 세션 전에 닫는다(횟수 제한).
-    #   pylink open() 은 이미 열려 있으면 다시 열지 않고 참조 수만 올린다 → 새 세션이 낡은 연결을 쓰게 된다
-    try:
-        for _ in range(4):
-            if not jl.opened():
-                break
-            jl.close()
-    except Exception:
-        pass
     _SHARED_OWNER = owner
-    return jl
+    return _SHARED_JL
 
 
 def _release_jlink(owner):
-    """owner 가 현재 소유자일 때만 연결을 닫는다 → 닫았으면 True."""
+    """owner 가 현재 소유자일 때만 연결을 닫는다 → 닫았으면 True. 정리가 덜 됐으면 다음 _acquire_jlink 가 다시 보거나 교체한다."""
     global _SHARED_OWNER
     if _SHARED_OWNER is not owner or _SHARED_JL is None:
         return False
     _SHARED_OWNER = None
-    _SHARED_JL.close()
-    return True
+    return jlink_reset(_SHARED_JL)
 
 
 class LinkError(RuntimeError):
@@ -421,7 +437,7 @@ class Link:
 
     # ── open / 설정 ──────────────────────────────────────────────────
     def open(self, tap_script=True):
-        self.jl = _acquire_jlink(self)     # 새로 만들지 않는다 — 위 _SHARED_JL 주석(DLL 사본 누적 → OOM)
+        self.jl = _acquire_jlink(self, self._say)     # 새로 만들지 않는다 — 위 _SHARED_JL 주석(DLL 사본 누적 → OOM)
         # ★ TAP 수동 선언을 open 전후 양쪽에서 지정한다 (어느 쪽이 먹는지 불확실)
         self._tap_path = write_tap_script() if tap_script else None
         if self._tap_path:
@@ -680,6 +696,10 @@ class Link:
         raise LinkError(
             f"resume 실패 — 코어가 halted 로 남았다 (restart 반환={r}). "
             f"보드 복구(POR) 필요", EXIT_RESUME_FAIL)
+
+    def owns_jlink(self):
+        """이 Link 가 공유 J-Link 의 현재 소유자인가. 아니면(새 세션이 가져감) 이 Link 로 장치에 접근하면 안 된다."""
+        return self.jl is not None and _SHARED_OWNER is self
 
     # ── 정리 ─────────────────────────────────────────────────────────
     def close(self):

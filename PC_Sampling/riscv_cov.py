@@ -1200,6 +1200,13 @@ class PcsrSession:
     @_handle_locked
     def close(self):
         with self.lock:
+            # 공유 J-Link 를 새 세션이 가져갔으면(sfe76_link API_LEVEL 6) unpin·close 모두 새 세션 연결로 간다 — 참조만 버린다
+            _owns = getattr(self.lk, 'owns_jlink', None)
+            if self.lk is not None and _owns is not None and not _owns():
+                self.lk = self.dap = None
+                self._ap = self._cb = None
+                self._pinned = None
+                return
             try:
                 if self.dap is not None and self._pinned is not None:
                     self._sj.sba_unpin(self.dap, self._ap, self._cb)

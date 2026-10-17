@@ -136,6 +136,24 @@ def _self_rss_mb():
         return None
 
 
+def _proc_link_stats():
+    """(J-Link DLL 실행 매핑 수, 프로세스 스레드 수) — 못 읽으면 None. pylink 임시 사본은 지워진 파일((deleted))로 남는다.
+    재연결을 거듭해도 둘 다 일정해야 한다(DLL 사본 누적이면 매핑·스레드가 함께 는다)."""
+    maps = threads = None
+    try:
+        with open('/proc/self/maps') as fh:
+            maps = sum(1 for ln in fh if 'r-xp' in ln and ('jlinkarm' in ln.lower() or
+                                                           (ln.rstrip().endswith('(deleted)') and '.so' in ln)))
+    except Exception:
+        pass
+    try:
+        with open('/proc/self/status') as fh:
+            threads = next((int(ln.split()[1]) for ln in fh if ln.startswith('Threads:')), None)
+    except Exception:
+        pass
+    return maps, threads
+
+
 class _FreezeTrace:
     def __init__(self, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -354,11 +372,34 @@ _PYLINK_SHARED = None
 def _shared_pylink(**kwargs):
     """v11.3: 프로세스당 pylink.JLink 1개. pylink 는 DLL 경로에서 버전을 못 읽으면 JLink() 마다 DLL 사본을 새로 올리고
     Linux 에선 내리지 않는다 — 재연결마다 만들면 사본(정적 메모리·힙·스레드)이 쌓여 OOM kill 된다(2026-10-17 BM9K1 실기,
-    sfe76_link._acquire_jlink 와 같은 이유). 연결은 호출부가 open/close 한다."""
+    sfe76_link._acquire_jlink 와 같은 이유). 돌려주기 전에 남은 연결을 **실제로** 닫는다(_pylink_reset) — 정리가 확인되지
+    않으면 낡은 상태를 재사용하지 않고 새 객체로 바꾼다(그 경우만 사본 1개 추가, 경고 로그). 연결은 호출부가 open/close 한다."""
     global _PYLINK_SHARED
+    if _PYLINK_SHARED is not None and not _pylink_reset(_PYLINK_SHARED):
+        log.warning("[J-Link] 이전 연결 정리 확인 실패 — 새 J-Link 객체로 교체(DLL 사본 1개 추가)")
+        _PYLINK_SHARED = None
     if _PYLINK_SHARED is None:
         _PYLINK_SHARED = _pylink.JLink(**kwargs)
     return _PYLINK_SHARED
+
+
+def _pylink_reset(jl):
+    """연결을 실제로 닫는다 → 깨끗하면 True. pylink 는 DLL 열림(opened)과 객체 참조 수(_open_refcount)를 따로 두고,
+    open() 은 참조 수가 남아 있으면 DLL 을 열지 않는다 — 어긋난 채 재사용하면 실제 재연결 없이 낡은 연결을 쓴다
+    (sfe76_link.jlink_reset 과 같은 규칙; 이 파일은 risc-v/ 없이도 돌아야 해서 따로 둔다)."""
+    try:
+        for _ in range(4):
+            if (getattr(jl, '_open_refcount', 0) or 0) <= 0:
+                break
+            jl._open_refcount = 1
+            jl.close()
+        if (getattr(jl, '_open_refcount', 0) or 0) > 0:
+            return False
+        if jl.opened():
+            jl._dll.JLINKARM_Close()
+        return not jl.opened()
+    except Exception:
+        return False
 
 # 버전
 FUZZER_VERSION = "11.3.0"
@@ -4342,14 +4383,8 @@ class JLinkHaltSampler(OpenOCDPCSampler):
             #   끄는 시도는 이 DLL 이 NULL 을 무시해 실패했고, 커스텀 콜백을 빼면 pylink 기본
             #   logger.info 콜백으로 떨어져 오히려 더 빨리 크래시했다 → 원복. 근본해법은
             #   샘플러 서브프로세스 격리(진행 예정). 그때까지는 가벼운 커스텀 콜백 유지.
-            jl = _shared_pylink(error=self._jlink_dll_msg, warn=self._jlink_dll_msg)   # 재연결마다 새로 만들지 않는다
-            try:
-                for _ in range(4):        # 앞 연결이 닫히지 않고 남았으면(예외 경로) 먼저 닫는다(횟수 제한)
-                    if not jl.opened():
-                        break
-                    jl.close()
-            except Exception:
-                pass
+            # 재연결마다 새로 만들지 않는다 — 남은 연결은 _shared_pylink 가 실제로 닫고 넘긴다
+            jl = _shared_pylink(error=self._jlink_dll_msg, warn=self._jlink_dll_msg)
             jl.open()
             self._apply_vtref(jl)
             tif = (_pylink.enums.JLinkInterfaces.JTAG if self.config.interface == 'jtag'
@@ -4762,7 +4797,7 @@ class RiscvPcsrSampler(OpenOCDPCSampler):
         log.warning(f"[cJTAG/SBA] 세션 OK — PC 정합성 검증 통과 "
                     f"cores={sorted(self._weights)} | J-Link 객체 "
                     + (f"{_jn}개" if _jn is not None else "재사용 안 함(구버전 sfe76_link.py — 재연결마다 메모리 누적, 같은 커밋으로 맞출 것)")
-                    + f" · RSS {_self_rss_mb():.0f}MB")
+                    + f" · DLL 매핑 {_proc_link_stats()[0]} · 스레드 {_proc_link_stats()[1]} · RSS {_self_rss_mb():.0f}MB")
         return True
 
     # v11.2.1: PM 분리 뒤 가벼운 재연결 — 코어마다 확인 버스트 크기
