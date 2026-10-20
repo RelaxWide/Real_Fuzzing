@@ -78,6 +78,34 @@ class TheReportedCommandIsBlocked(unittest.TestCase):
         self.assertFalse(blocked(stats))
 
 
+class FuzzedApstEnableIsBlocked(unittest.TestCase):
+    """BM9K1 실측: 퍼징 SetFeatures(FID 0x0C) 가 APST 를 켜 장치가 PS 를 스스로 바꿨는데 추적 PS 는
+    PS0 그대로 → timeout 이 기준값(8s)으로 나갔다. 출하 설정 규칙이 실제 발송 경로에서 막는지 본다."""
+
+    def test_apst_enable_is_skipped(self):
+        rc, stats = send(base='SetFeatures', cdw10=0x0C, cdw11=0x1)
+        self.assertEqual(rc, RC_SKIP, 'APST enable 이 나갔다')
+        self.assertTrue(blocked(stats))
+
+    def test_sv_bit_and_mutated_upper_bits_still_blocked(self):
+        for cdw10 in (0x8000000C, 0x00FF000C):
+            _, stats = send(base='SetFeatures', cdw10=cdw10, cdw11=0x1)
+            self.assertTrue(blocked(stats), f'cdw10=0x{cdw10:08x} 이 통과했다')
+
+    def test_opcode_mutation_into_setfeatures_blocked(self):
+        _, stats = send(opcode=0x09, force_admin=True, cdw10=0x0C, cdw11=0x1)
+        self.assertTrue(blocked(stats), 'opcode 변이로 된 SetFeatures APST 가 통과했다')
+
+    def test_power_management_fid_still_fuzzed(self):
+        _, stats = send(base='SetFeatures', cdw10=0x02, cdw11=0x2)
+        self.assertFalse(blocked(stats), 'FID 0x02(PS) 까지 막았다')
+
+    def test_io_dsm_same_value_passes(self):
+        # io 0x09 = Dataset Management — 같은 CDW10 값이라도 SetFeatures 가 아니다
+        _, stats = send(opcode=0x09, force_admin=False, cdw10=0x0C, cdw11=0x1)
+        self.assertFalse(blocked(stats), 'io DSM 을 막았다')
+
+
 class RuleSemantics(unittest.TestCase):
     def _with(self, rules):
         p = unittest.mock.patch.object(fuzzer, 'BLOCKED_CDW_RULES', tuple(rules))

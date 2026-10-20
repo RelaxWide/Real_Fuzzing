@@ -799,7 +799,7 @@
       "0xEC",
       "0xEF"
     ],
-    "_comment_blocked_cdw_rules": "모든 제품의 실제 전송 경로에서 opcode와 CDW 비트값 조합을 차단한다. 현재 0xC0 + CDW12=0x2 규칙은 디버그 포트 폐쇄 사례 때문에 등록되어 있다. opcode 변이로 생긴 명령에도 적용한다. mask 생략 시 해당 CDW 전체를 비교하며 scope는 admin/io/any(생략 시 any)이다. 값은 정수 또는 16진 문자열로 지정한다.",
+    "_comment_blocked_cdw_rules": "모든 제품의 실제 전송 경로에서 opcode와 CDW 비트값 조합을 차단한다. 현재 0xC0 + CDW12=0x2 규칙은 디버그 포트 폐쇄 사례, admin 0x09 + CDW10[7:0]=0x0C 규칙은 퍼징 SetFeatures 가 APST 를 켜 추적 PS(timeout 배율)가 틀어진 사례(BM9K1 실측) 때문에 등록되어 있다. opcode 변이로 생긴 명령에도 적용한다. mask 생략 시 해당 CDW 전체를 비교하며 scope는 admin/io/any(생략 시 any)이다. 값은 정수 또는 16진 문자열로 지정한다.",
     "blocked_cdw_rules": [
       {
         "opcode": "0xC0",
@@ -807,6 +807,14 @@
         "value": "0x2",
         "scope": "any",
         "why": "디버그 포트 폐쇄"
+      },
+      {
+        "opcode": "0x09",
+        "cdw": 10,
+        "value": "0x0C",
+        "mask": "0xFF",
+        "scope": "admin",
+        "why": "SetFeatures APST(FID 0x0C) — 퍼징이 APST 를 켜면 장치가 PS 를 스스로 바꿔 추적 PS·BM9K1 timeout 배율이 어긋나고 디버그 AP 접근이 막힌다. 퍼저 자체 APST 제어(PM forced_idle·시작 시 해제)는 이 경로를 거치지 않는다"
       }
     ],
     "_comment_namespace_guard": "block_ns_delete=true이면 NamespaceManagement Delete(admin 0x0D, CDW10[3:0]=1)를 전송 시 차단한다. auto_reattach_ns=true이면 NamespaceAttachment Detach 후 attach-ns와 ns-rescan으로 재연결을 시도한다. 삭제 허용이나 재연결 성공을 자동으로 보장하는 설정은 아니다.",
