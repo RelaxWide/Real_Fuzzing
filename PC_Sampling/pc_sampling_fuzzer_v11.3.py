@@ -6369,6 +6369,25 @@ class _V101Fuzzer:
 
     VERSION = FUZZER_VERSION
 
+    # v11.3: 추적 PS. PS3/PS4(non-operational)에서 I/O 가 오면 장치는 '가장 최근 operational PS' 로 스스로
+    #   돌아간다(NVMe Base §8.15) — 그래서 그 PS 를 따로 기억해야 다음 명령 timeout 배율이 맞는다(BM9K1 PS1/2 ×10).
+    #   추적 PS 를 바꾸는 모든 자리(PM·퍼징 SetFeatures·POR·복귀)가 이 setter 를 지나므로 여기서 한 번에 기억한다.
+    #   _prev_op_ps 는 PM 복귀 목표(진입 시도 전에 정함)라 뜻이 달라 따로 둔다.
+    @property
+    def _current_ps(self) -> int:
+        return self.__dict__.get('_tracked_ps', 0)
+
+    @_current_ps.setter
+    def _current_ps(self, ps: int) -> None:
+        self.__dict__['_tracked_ps'] = ps
+        if ps not in (3, 4):
+            self.__dict__['_last_op_ps'] = ps
+
+    def _timeout_basis_ps(self) -> int:
+        """timeout 배율을 정할 PS — 추적 PS 가 PS3/PS4 면 깨어나 돌아갈 직전 operational PS(0~2)."""
+        ps = self._current_ps
+        return self.__dict__.get('_last_op_ps', 0) if ps in (3, 4) else ps
+
     def __init__(self, config: FuzzConfig):
         self.config = config
         self._vmon_prev_used = None           # v8.6: vmon exec-기반 샘플 상태(스레드 없음)
@@ -15646,8 +15665,10 @@ class _V101Fuzzer:
         )
         # BM9K1: 전송 직전 추적 PS에 따라 JSON의 명령별 기준값을 배율 적용한다.
         # 실제 순간 PS를 읽은 값은 아니다(APST/외부 변경은 관측하지 않음).
+        # 추적 PS 가 PS3/PS4 면 장치가 깨어나 돌아갈 직전 operational PS 기준(_timeout_basis_ps).
         _bm_timeout = getattr(self.config, 'product', None) == 'BM9K1'
-        _timeout_ps = getattr(self, '_current_ps', 0)
+        _tracked_ps = self._current_ps
+        _timeout_ps = self._timeout_basis_ps()
         _timeout_base_ms = timeout_ms
         _timeout_factor = {1: 10, 2: 10}.get(_timeout_ps, 1) if _bm_timeout else 1
         timeout_ms = (timeout_ms * _timeout_factor if _bm_timeout
@@ -15753,7 +15774,9 @@ class _V101Fuzzer:
             mut_flags.append(f"data_len={data_len}(override)")
         mut_str = f" MUT[{','.join(mut_flags)}]" if mut_flags else ""
 
-        _ps_timeout_log = (f" tracked_ps=PS{_timeout_ps} base={_timeout_base_ms}ms"
+        _ps_timeout_log = (f" tracked_ps=PS{_tracked_ps}"
+                           + (f"(직전 operational PS{_timeout_ps} 기준)" if _timeout_ps != _tracked_ps else "")
+                           + f" base={_timeout_base_ms}ms"
                            f" factor={_timeout_factor}" if _bm_timeout else "")
         log.info(f"[NVMe] {passthru_type} {cmd.name} opcode=0x{actual_opcode:02x} "
                  f"nsid={actual_nsid} timeout={timeout_ms}ms({effective_tg}){_ps_timeout_log} "
@@ -20894,7 +20917,15 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                             log.warning("[PM] APST enable 실패 — forced_idle slot skip")
                         # current_combo 는 다음 명령 송신 직전 _nonop_restore 가 정리
                         self._current_combo = POWER_COMBOS[0]
-                        self._current_ps    = 0
+                        # 분리 경로는 PS0 를 보내고 나왔다 — BM9K1 은 _pm_set_state 가 이미 추적값을 갱신했다
+                        # (APST 진입 실패로 PS0 를 안 보냈으면 그대로 둔 것이 맞다). 기존 경로는 APST 를 끄기만
+                        # 해 장치가 PS3/PS4 에 남고 다음 I/O 가 APST 이전 operational PS 로 깨운다 → PS4 로 두면
+                        # timeout 이 그 PS 기준(_timeout_basis_ps). APST 진입 실패면 장치·추적값 모두 그대로.
+                        if _fi_detach:
+                            if getattr(self.config, 'product', None) != 'BM9K1':
+                                self._current_ps = 0
+                        elif _apst_ok:
+                            self._current_ps = 4
 
                     # ── PCIe config bit perturb slot (v7.7 S1) ──────────
                     elif _pm_slot in ('pcie_bit', 'clkreq') and self._pm_detach_wanted():

@@ -182,6 +182,13 @@
       "date": "2026-10-17",
       "base_commit": "a5fbf14",
       "reason": "The 'session OK' log line also reports the process's J-Link DLL executable mappings and thread count (_proc_link_stats, read from /proc/self), so hardware reconnect loops can confirm that mappings, threads and RSS stay flat, not only the pylink object count. Logging only; no debug access change. Review follow-up; tests: test_v11_3_jlink_reuse."
+    },
+    {
+      "file": "pc_sampling_fuzzer_v11.3.py",
+      "path": "_V101Fuzzer._send_nvme_command",
+      "date": "2026-10-20",
+      "base_commit": "6c02d1a",
+      "reason": "BM9K1 timeout multiplier uses _timeout_basis_ps(): when the tracked PS is non-operational (PS3/PS4) the basis is the most recent operational PS (0-2), since an I/O command wakes the controller back into that state (NVMe Base 8.15). Previously a PS2->PS4 sequence sent the next command with x1 (8s) while the device executed it in PS2. The [NVMe] log shows tracked and basis PS. Timeout computation and log only; the command bytes sent are unchanged. Tests: test_v11_3_ps_timeout_basis."
     }
   ],
   "overrides_note": "hashes 는 모든 DEVICE_AST_FILES 에 적용되는 기준선이다. overrides 는 검토를 거쳐 **특정 파일에서만** 의도적으로 달라진 경로를 기록한다. v10.2 는 검증된 fallback 이라 계속 기준선 그대로여야 하고, 여기 올라오지 않은 파일·경로는 전부 기준선에 묶인다.",
@@ -208,7 +215,7 @@
     },
     "pc_sampling_fuzzer_v11.3.py": {
       "OpenOCDPCSampler": "48865eb551960624265b061a897ddf8abdc2586862598bc2be3c97a3a69aba04",
-      "_V101Fuzzer._send_nvme_command": "ad2011cacaf77f52f15cb6b3ad1df325354af3b1609a4200b45b2bac9133c10c",
+      "_V101Fuzzer._send_nvme_command": "2283d77648ef93c5200ab85ce4377955af8fcb266d10008b100fb7130477fb75",
       "RiscvPcsrSampler": "dbd345f654ba6361644dc3bdaa423b9846a77c5d3ccd0a34b0f3e7a4ec4b23aa",
       "JLinkHaltSampler": "6addeca701c4ea5ce33c1a6467045a357a6247b64c10fb9cc59695cdc5881255"
     }
