@@ -817,6 +817,13 @@
         "why": "SetFeatures APST(FID 0x0C) — 퍼징이 APST 를 켜면 장치가 PS 를 스스로 바꿔 추적 PS·BM9K1 timeout 배율이 어긋나고 디버그 AP 접근이 막힌다. 퍼저 자체 APST 제어(PM forced_idle·시작 시 해제)는 이 경로를 거치지 않는다"
       }
     ],
+    "_comment_response_coverage": "v11.4 응답 시그니처 커버리지. 장치가 돌려준 완료 응답이 처음 보는 모양이면 새 펌웨어 경로로 보고 corpus 에 넣는다(디버거 없이 쓰는 피드백). 시그니처 = (명령, 완료 status) + dims 에서 고른 축. latency = 완료까지 걸린 시간 구간(latency_edges_ms 경계, ms), dw0 = 완료 결과값 모양(없음/0/CDW11 그대로/유효 바이트 수), prev = 직전 명령과 그 SC-depth. enabled: auto 는 샘플러가 PC 를 못 모을 때(--no-jlink)만 피드백, true 는 항상, false 는 끔. 수집·[Stats]·ledger 기록은 enabled 와 무관하다. max_keys 를 넘으면 더 기록하지 않는다. v11.3 이하는 이 키를 읽지 않는다.",
+    "response_coverage": {
+      "enabled": "auto",
+      "dims": ["latency", "dw0"],
+      "latency_edges_ms": [4, 16, 64, 256, 1024],
+      "max_keys": 4096
+    },
     "_comment_namespace_guard": "block_ns_delete=true이면 NamespaceManagement Delete(admin 0x0D, CDW10[3:0]=1)를 전송 시 차단한다. auto_reattach_ns=true이면 NamespaceAttachment Detach 후 attach-ns와 ns-rescan으로 재연결을 시도한다. 삭제 허용이나 재연결 성공을 자동으로 보장하는 설정은 아니다.",
     "block_ns_delete": true,
     "auto_reattach_ns": true,
