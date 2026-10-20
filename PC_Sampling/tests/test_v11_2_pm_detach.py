@@ -208,8 +208,9 @@ class ForcedIdle(unittest.TestCase):
         with patch.object(v.Path, 'exists', return_value=True), \
                 patch.object(v.Path, 'write_text', return_value=None):
             self.assertFalse(f._apst_disable(force=True))
-        f._orig_apst_cdw11 = 0
-        self.assertTrue(f._apst_disable())                      # force 없이 원래 0 이면 생략 = True(기존 의미)
+        cur0 = MagicMock(returncode=0, stdout='Current value:0x00000000', stderr='')
+        with patch.object(v.subprocess, 'run', return_value=cur0):
+            self.assertTrue(f._apst_disable())                  # force 없이 지금 0 이면 생략 = True
 
 
 @patch('fuzzer_active_test.time.sleep')

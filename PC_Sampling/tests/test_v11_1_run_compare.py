@@ -424,7 +424,10 @@ class SjtagReauthPrep(unittest.TestCase):
         o._pm_unresponsive = None
         ok = fuzzer._StateProc(0, b'', b'')
         # v11.2.1: set-feature 는 D 상태 안전 실행(_run_nvme_state_cmd)으로 나간다
-        with patch.object(fuzzer, '_run_nvme_state_cmd', return_value=ok) as run:
+        # 생략은 '지금 읽은 값' 기준(v11.3) — 현재값 0 을 돌려준다
+        cur0 = Mock(returncode=0, stdout='Current value:0x00000000', stderr='')
+        with patch.object(fuzzer, '_run_nvme_state_cmd', return_value=ok) as run, \
+                patch.object(fuzzer.subprocess, 'run', return_value=cur0):
             self.assertTrue(o._apst_disable())
             self.assertFalse(any('set-feature' in c.args[0] for c in run.call_args_list))
             self.assertTrue(o._apst_disable(force=True))

@@ -14010,35 +14010,40 @@ class _V101Fuzzer:
 
         반복 호출 안전: _orig_apst_cdw11 은 None 일 때만 저장 (이미 캡처된
         '원본' 값을 forced_idle slot 에서 enable→disable 한 후 덮어쓰면 안 됨).
+
+        v11.3: 생략 여부는 **지금 읽은 값**으로 정한다. 예전엔 시작 때 읽은 원본이 0 이면 이후 호출이
+        모두 생략돼, 실행 중 POR 재연결로 커널 드라이버가 APST 를 다시 켜면(default_ps_max_latency_us>0)
+        끄지 못했다 — 이전 실행이 불량 보존으로 끝나 APST=0 이 남은 경우가 그렇다. 원본은 복원용으로만 쓴다.
         """
         dev = self._ctrl_device()   # APST 는 컨트롤러 스코프 → 컨트롤러 char device
-        # 원본 cdw11 캡처는 첫 호출 1회만 — 이후엔 (이미 disable 또는 enable→disable
-        # 가 한 _orig 가 의미 있는) 상태를 건드리지 않음.
+        _cur: Optional[int] = None
+        try:
+            r = subprocess.run(
+                ['nvme', 'get-feature', dev, '-n', '0', '-f', '0x0C'],
+                capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if 'value:' in line.lower() or 'Current value' in line:
+                    import re as _re
+                    # nvme-cli 버전에 따라 'Current value:0x00000000' 또는
+                    # 'Current Value:00000000'(0x 없는 bare hex) 둘 다 나온다.
+                    # 0x 를 강제하면 후자가 파싱 실패 → _orig=None → 아래 성공
+                    # 로그가 {None:#010x} 로 예외. 0x 를 선택적으로 받는다.
+                    m = _re.search(r'value\s*:?\s*(?:0x)?([0-9a-fA-F]+)',
+                                   line, _re.IGNORECASE)
+                    if m:
+                        _cur = int(m.group(1), 16)
+                        break
+            if _cur is None:
+                log.warning(f"[APST] get-feature 파싱 실패 (rc={r.returncode}) "
+                            f"stdout={r.stdout[:200]!r} stderr={r.stderr.strip()[:200]!r}")
+        except Exception as e:
+            log.warning(f"[APST] get-feature 실패: {e}")
+        # 원본 cdw11 캡처는 첫 성공 1회만 — 이후 값은 퍼저(forced_idle 등)·커널이 바꾼 것일 수 있다
         if self._orig_apst_cdw11 is None:
-            try:
-                r = subprocess.run(
-                    ['nvme', 'get-feature', dev, '-n', '0', '-f', '0x0C'],
-                    capture_output=True, text=True, timeout=5)
-                for line in r.stdout.splitlines():
-                    if 'value:' in line.lower() or 'Current value' in line:
-                        import re as _re
-                        # nvme-cli 버전에 따라 'Current value:0x00000000' 또는
-                        # 'Current Value:00000000'(0x 없는 bare hex) 둘 다 나온다.
-                        # 0x 를 강제하면 후자가 파싱 실패 → _orig=None → 아래 성공
-                        # 로그가 {None:#010x} 로 예외. 0x 를 선택적으로 받는다.
-                        m = _re.search(r'value\s*:?\s*(?:0x)?([0-9a-fA-F]+)',
-                                       line, _re.IGNORECASE)
-                        if m:
-                            self._orig_apst_cdw11 = int(m.group(1), 16)
-                            break
-                if self._orig_apst_cdw11 is None:
-                    log.warning(f"[APST] get-feature 파싱 실패 (rc={r.returncode}) "
-                                f"stdout={r.stdout[:200]!r} stderr={r.stderr.strip()[:200]!r}")
-            except Exception as e:
-                log.warning(f"[APST] get-feature 실패: {e}")
+            self._orig_apst_cdw11 = _cur
 
-        if self._orig_apst_cdw11 == 0 and not force:
-            log.warning("[APST] 이미 비활성화 상태 — skip")
+        if _cur == 0 and not force:   # 읽기 실패(None)면 생략하지 않고 끈다
+            log.warning("[APST] 현재 비활성화 상태 — skip")
             return True
 
         import tempfile as _tf

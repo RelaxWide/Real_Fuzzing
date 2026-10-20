@@ -184,5 +184,57 @@ class LegacyForcedIdleSource(unittest.TestCase):
         self.assertNotIn("self._current_ps    = 0", tail[:200])
 
 
+class ApstDisableUsesCurrentValue(unittest.TestCase):
+    """_apst_disable 생략은 시작 때 원본이 아니라 지금 읽은 값 기준. 원본 0(이전 실행이 불량 보존으로
+    APST=0 을 남김) 뒤 실행 중 POR 재연결로 커널이 APST 를 다시 켜면, 예전엔 '이미 비활성화' 로 생략했다."""
+
+    def setUp(self):
+        from fuzzer_target import fuzzer as v
+        self.v = v
+        o = v.NVMeFuzzer.__new__(v.NVMeFuzzer)
+        o._orig_apst_cdw11 = None
+        o._ctrl_device = lambda: '/dev/nvme0'
+        o._record_setfeature_history = lambda *a, **k: None
+        o._pm_unresponsive = None
+        o._pcie_bdf = None
+        self.o, self.sent = o, []
+        self.cur = 0
+
+    def call(self, **kw):
+        read = lambda *a, **k: Mock(returncode=0, stdout=f'Current value:{self.cur:#010x}', stderr='')
+
+        def setf(cmd, *a, **k):
+            self.sent.append(cmd)
+            self.cur = 0
+            return self.v._StateProc(0, b'', b'')
+        with patch.object(self.v.subprocess, 'run', side_effect=read), \
+                patch.object(self.v, '_run_nvme_state_cmd', side_effect=setf):
+            return self.o._apst_disable(**kw)
+
+    def test_kernel_reenable_after_original_zero_is_disabled(self):
+        self.assertTrue(self.call())                 # 시작: 원본 0 → 생략
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.o._orig_apst_cdw11, 0)
+        self.cur = 1                                  # POR 재연결 → 커널이 APST 켬
+        self.assertTrue(self.call())
+        self.assertEqual(len(self.sent), 1, '켜진 APST 를 생략했다')
+        self.assertEqual(self.cur, 0)
+        self.assertEqual(self.o._orig_apst_cdw11, 0, '원본(복원용)을 덮어썼다')
+
+    def test_currently_off_is_skipped(self):
+        self.o._orig_apst_cdw11 = 1                  # 원본은 켜져 있었어도 지금 꺼져 있으면 생략
+        self.cur = 0
+        self.assertTrue(self.call())
+        self.assertEqual(self.sent, [])
+
+    def test_read_failure_still_disables(self):
+        self.o._orig_apst_cdw11 = 0
+        with patch.object(self.v.subprocess, 'run', side_effect=OSError('nvme')), \
+                patch.object(self.v, '_run_nvme_state_cmd',
+                             side_effect=lambda c, *a, **k: self.sent.append(c) or self.v._StateProc(0, b'', b'')):
+            self.assertTrue(self.o._apst_disable())
+        self.assertEqual(len(self.sent), 1)
+
+
 if __name__ == '__main__':
     unittest.main()
