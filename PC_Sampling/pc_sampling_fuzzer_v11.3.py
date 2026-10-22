@@ -6374,8 +6374,8 @@ class _V101Fuzzer:
     #   추적 PS 를 바꾸는 모든 자리(PM·퍼징 SetFeatures·POR·복귀)가 이 setter 를 지나므로 여기서 한 번에 기억한다.
     #   _prev_op_ps 는 PM 복귀 목표(진입 시도 전에 정함)라 뜻이 달라 따로 둔다.
     # 송신 번호 — 실제로 nvme-cli 를 띄운 송신마다 1씩. [NVMe]·[NVMe RET]·[NVMe TIMEOUT]·exec= 줄을 잇는다
-    #   (백그라운드 샘플링은 exec= 회계를 미뤄 RET 와 떨어져 찍힌다). exec 번호는 캘리브레이션 외 보조 송신
-    #   (상태 재현·format 등)을 세지 않아 송신과 1:1 이 아니므로 따로 센다.
+    #   (백그라운드 샘플링은 exec= 회계를 미뤄 RET 와 떨어져 찍힌다). exec 번호는 보조 송신
+    #   (시작 시 FW 사전 기록·FormatNVM·Sanitize, FWDownload 청크)를 세지 않아 송신과 1:1 이 아니므로 따로 센다.
     _send_seq = 0
     _last_send_seq = None
 

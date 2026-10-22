@@ -1,7 +1,7 @@
 """송신 번호(send#) — [NVMe]·[NVMe RET]·exec= 줄을 같은 번호로 잇는다.
 
 백그라운드 샘플링은 exec= 커버리지 회계를 미뤄, exec= 줄이 RET 와 떨어져 몰려 찍힌다. exec 번호는 보조 송신
-(상태 재현·format 등)을 세지 않아 송신과 1:1 이 아니므로 송신은 따로 번호를 매기고 exec= 줄에 그 명령의
+(시작 시 FW 사전 기록·FormatNVM·Sanitize, FWDownload 청크)를 세지 않아 송신과 1:1 이 아니므로 송신은 따로 번호를 매기고 exec= 줄에 그 명령의
 송신 번호를 찍는다.
 """
 import re
