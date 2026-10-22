@@ -1,4 +1,4 @@
-"""송신 번호(send#) — [NVMe]·[NVMe RET]·exec= 줄을 같은 번호로 잇는다.
+"""명령 번호(cmd#) — [NVMe]·[NVMe RET]·exec= 줄을 같은 번호로 잇는다.
 
 백그라운드 샘플링은 exec= 커버리지 회계를 미뤄, exec= 줄이 RET 와 떨어져 몰려 찍힌다. exec 번호는 보조 송신
 (시작 시 FW 사전 기록·FormatNVM·Sanitize, FWDownload 청크)를 세지 않아 송신과 1:1 이 아니므로 송신은 따로 번호를 매기고 exec= 줄에 그 명령의
@@ -32,7 +32,7 @@ class DeferredExecLineKeepsItsSendNumber(unittest.TestCase):
             bgt.publish(f, processed=base + 100)
             f._bg_drain()
         lines = [l for l in logs.output if re.search(r'\bexec=\d+ ', l)]
-        got = [re.search(r'exec=(\d+) send#(\S+)', l).groups() for l in lines]
+        got = [re.search(r'exec=(\d+) cmd#(\S+)', l).groups() for l in lines]
         self.assertEqual(got, [('1', '101'), ('2', '102'), ('3', '103')])
         self.assertEqual(f._last_send_seq, 999, '회계 뒤 현재 값으로 돌아온다')
 
@@ -54,8 +54,8 @@ class SendPathNumbersEachSend(unittest.TestCase):
             with self.assertLogs('pcfuzz', level='INFO') as logs:
                 self.send()
             text = '\n'.join(logs.output)
-            sent = re.search(r'\[NVMe\] send#(\d+) ', text).group(1)
-            ret = re.search(r'\[NVMe RET\] send#(\d+) Identify rc=', text).group(1)
+            sent = re.search(r'\[NVMe\] cmd#(\d+) ', text).group(1)
+            ret = re.search(r'\[NVMe RET\] cmd#(\d+) Identify rc=', text).group(1)
             self.assertEqual(sent, ret)
             self.assertEqual(int(sent), self.f._last_send_seq)
             nums.append(int(sent))

@@ -6373,7 +6373,7 @@ class _V101Fuzzer:
     #   돌아간다(NVMe Base §8.15) — 그래서 그 PS 를 따로 기억해야 다음 명령 timeout 배율이 맞는다(BM9K1 PS1/2 ×10).
     #   추적 PS 를 바꾸는 모든 자리(PM·퍼징 SetFeatures·POR·복귀)가 이 setter 를 지나므로 여기서 한 번에 기억한다.
     #   _prev_op_ps 는 PM 복귀 목표(진입 시도 전에 정함)라 뜻이 달라 따로 둔다.
-    # 송신 번호 — 실제로 nvme-cli 를 띄운 송신마다 1씩. [NVMe]·[NVMe RET]·[NVMe TIMEOUT]·exec= 줄을 잇는다
+    # 송신 번호(로그 표기 cmd#N) — 실제로 nvme-cli 를 띄운 송신마다 1씩. [NVMe]·[NVMe RET]·[NVMe TIMEOUT]·exec= 줄을 잇는다
     #   (백그라운드 샘플링은 exec= 회계를 미뤄 RET 와 떨어져 찍힌다). exec 번호는 보조 송신
     #   (시작 시 FW 사전 기록·FormatNVM·Sanitize, FWDownload 청크)를 세지 않아 송신과 1:1 이 아니므로 따로 센다.
     _send_seq = 0
@@ -11076,7 +11076,7 @@ class _V101Fuzzer:
         src_tag  = f" [{source}]" if source != 'c1' else ""
         mopt_tag = f" mopt={self.mopt_mode}"
         _sq = getattr(self, '_last_send_seq', None)
-        log.info(f"exec={self.executions} send#{_sq if _sq is not None else '-'}{det_tag}{src_tag} cmd={cmd.name} "
+        log.info(f"exec={self.executions} cmd#{_sq if _sq is not None else '-'}{det_tag}{src_tag} cmd={cmd.name} "
                  f"raw_samples={raw_count} pcs_this_run={len(self.sampler.current_trace)} "
                  f"out_of_range={oor_count} new_pcs={new_pcs} "
                  f"global_pcs={len(self.sampler.global_coverage)} "
@@ -15793,7 +15793,7 @@ class _V101Fuzzer:
                            f" factor={_timeout_factor}" if _bm_timeout else "")
         self._send_seq += 1
         self._last_send_seq = _sq = self._send_seq
-        log.info(f"[NVMe] send#{_sq} {passthru_type} {cmd.name} opcode=0x{actual_opcode:02x} "
+        log.info(f"[NVMe] cmd#{_sq} {passthru_type} {cmd.name} opcode=0x{actual_opcode:02x} "
                  f"nsid={actual_nsid} timeout={timeout_ms}ms({effective_tg}){_ps_timeout_log} "
                  f"cdw10=0x{seed.cdw10:08x} cdw11=0x{seed.cdw11:08x} "
                  f"cdw12=0x{seed.cdw12:08x} data_len={data_len}"
@@ -15832,7 +15832,7 @@ class _V101Fuzzer:
                 except OSError:
                     pass
                 self._crash_nvme_pid = process.pid
-                log.warning(f"[NVMe TIMEOUT] send#{_sq} {cmd.name} ({desc}) "
+                log.warning(f"[NVMe TIMEOUT] cmd#{_sq} {cmd.name} ({desc}) "
                             f"— nvme-cli PID={process.pid} 보존 (fd 유지 → SSD 상태 보존)")
                 return self.RC_TIMEOUT
 
@@ -15941,7 +15941,7 @@ class _V101Fuzzer:
                     _raw = [l for l in (_err_txt or _out_txt).splitlines() if l.strip()]
                     _status_info = (f" msg=\"{_raw[0].strip()[:120]}\"" if _raw
                                     else " (NVMe status 없음 — errno/내부 실패)")
-            log.info(f"[NVMe RET] send#{_sq} {cmd.name} rc={rc}{_status_info}")
+            log.info(f"[NVMe RET] cmd#{_sq} {cmd.name} rc={rc}{_status_info}")
 
             # v11.1: 장치 소실 — errno 실패가 '장치 없음/준비 안 됨' 계열이면 컨트롤러 상태를 확인하고,
             #   사라졌으면 timeout 과 같은 불량 캡처(_handle_timeout_crash)로 넘긴다. 예전엔 rc>0 의
