@@ -788,7 +788,7 @@
       "0x7C",
       "0x24"
     ],
-    "_comment_blocked_security_send_secp": "SecuritySend admin opcode 0x81의 SECP(CDW10[31:24]) 값이 아래 차단 목록에 있으면 전송하지 않는다. 잠금 등 상태를 바꿀 수 있는 프로토콜을 제한하기 위한 설정이다. SecurityReceive(0x82)는 이 가드의 대상이 아니다. 미차단 프로토콜의 무해함을 보장하는 목록은 아니다.",
+    "_comment_blocked_security_send_secp": "SecuritySend admin opcode 0x81의 SECP(CDW10[31:24]) 값이 아래 차단 목록에 있으면 전송하지 않는다. 잠금 등 상태를 바꿀 수 있는 프로토콜을 제한하기 위한 설정이다. SecurityReceive(0x82)는 이 가드의 대상이 아니다(Receive SECP 0xEF 는 blocked_cdw_rules 에서 막는다). 미차단 프로토콜의 무해함을 보장하는 목록은 아니다.",
     "blocked_security_send_secp": [
       "0x01",
       "0x02",
@@ -799,7 +799,7 @@
       "0xEC",
       "0xEF"
     ],
-    "_comment_blocked_cdw_rules": "모든 제품의 실제 전송 경로에서 opcode와 CDW 비트값 조합을 차단한다. 현재 0xC0 + CDW12=0x2 규칙은 디버그 포트 폐쇄 사례, admin 0x09 + CDW10[7:0]=0x0C 규칙은 퍼징 SetFeatures 가 APST 를 켜 추적 PS(timeout 배율)가 틀어진 사례(BM9K1 실측) 때문에 등록되어 있다. opcode 변이로 생긴 명령에도 적용한다. mask 생략 시 해당 CDW 전체를 비교하며 scope는 admin/io/any(생략 시 any)이다. 값은 정수 또는 16진 문자열로 지정한다.",
+    "_comment_blocked_cdw_rules": "모든 제품의 실제 전송 경로에서 opcode와 CDW 비트값 조합을 차단한다. 현재 0xC0 + CDW12=0x2 규칙은 디버그 포트 폐쇄 사례, admin 0x09 + CDW10[7:0]=0x0C 규칙은 퍼징 SetFeatures 가 APST 를 켜 추적 PS(timeout 배율)가 틀어진 사례(BM9K1 실측) 때문에, admin 0x82 + CDW10[31:24]=0xEF 규칙은 SecurityReceive ATA Security 뒤 Set Password 가 걸린 사례(실기) 때문에 등록되어 있다. opcode 변이로 생긴 명령에도 적용한다. mask 생략 시 해당 CDW 전체를 비교하며 scope는 admin/io/any(생략 시 any)이다. 값은 정수 또는 16진 문자열로 지정한다.",
     "blocked_cdw_rules": [
       {
         "opcode": "0xC0",
@@ -815,6 +815,14 @@
         "mask": "0xFF",
         "scope": "admin",
         "why": "SetFeatures APST(FID 0x0C) — 퍼징이 APST 를 켜면 장치가 PS 를 스스로 바꿔 추적 PS·BM9K1 timeout 배율이 어긋나고 디버그 AP 접근이 막힌다. 퍼저 자체 APST 제어(PM forced_idle·시작 시 해제)는 이 경로를 거치지 않는다"
+      },
+      {
+        "opcode": "0x82",
+        "cdw": 10,
+        "value": "0xEF000000",
+        "mask": "0xFF000000",
+        "scope": "admin",
+        "why": "SecurityReceive SECP 0xEF(ATA Security) — 실기에서 이 Receive 뒤 ATA Set Password 가 걸려(비휘발) 이후 명령이 0x4015 Operation Denied. Send 0xEF 는 allowed_security_send_secp 로 이미 막혀 있다"
       }
     ],
     "_comment_response_coverage": "v11.4 응답 시그니처 커버리지. 장치가 돌려준 완료 응답이 처음 보는 모양이면 새 펌웨어 경로로 보고 corpus 에 넣는다(디버거 없이 쓰는 피드백). 시그니처 = (명령, 완료 status) + dims 에서 고른 축. latency = 완료까지 걸린 시간 구간(latency_edges_ms 경계, ms), dw0 = 완료 결과값 모양(없음/0/CDW11 그대로/유효 바이트 수), prev = 직전 명령과 그 SC-depth. enabled: auto 는 샘플러가 PC 를 못 모을 때(--no-jlink)만 피드백, true 는 항상, false 는 끔. 수집·[Stats]·ledger 기록은 enabled 와 무관하다. max_keys 를 넘으면 더 기록하지 않는다. v11.3 이하는 이 키를 읽지 않는다.",

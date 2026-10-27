@@ -106,6 +106,36 @@ class FuzzedApstEnableIsBlocked(unittest.TestCase):
         self.assertFalse(blocked(stats), 'io DSM 을 막았다')
 
 
+class SecurityReceiveAtaIsBlocked(unittest.TestCase):
+    """실기: SecurityReceive SECP 0xEF(ATA Security) 뒤 ATA Set Password 가 걸려(비휘발) 이후 명령이
+    0x4015 Operation Denied. Send 0xEF 는 SECP allowlist 가 막지만 Receive 는 그 가드 대상이 아니라
+    출하 설정 규칙(admin 0x82 + CDW10[31:24]=0xEF)으로 막는다."""
+
+    def test_reported_receive_is_skipped(self):
+        rc, stats = send(base='SecurityReceive', cdw10=0xEF000100, cdw11=0x1013)
+        self.assertEqual(rc, RC_SKIP, 'Receive SECP 0xEF 가 나갔다')
+        self.assertTrue(blocked(stats))
+
+    def test_any_spsp_nssf_blocked(self):
+        for cdw10 in (0xEF000000, 0xEFFFFFFF, 0xEF000400):
+            _, stats = send(base='SecurityReceive', cdw10=cdw10, cdw11=0x200)
+            self.assertTrue(blocked(stats), f'cdw10=0x{cdw10:08x} 이 통과했다')
+
+    def test_opcode_mutation_into_receive_blocked(self):
+        _, stats = send(opcode=0x82, force_admin=True, cdw10=0xEF000100)
+        self.assertTrue(blocked(stats), 'opcode 변이로 된 Receive 0xEF 가 통과했다')
+
+    def test_other_secp_still_fuzzed(self):
+        for secp in (0x00, 0x01, 0xEA, 0xEE, 0xFE):
+            _, stats = send(base='SecurityReceive', cdw10=secp << 24, cdw11=0x200)
+            self.assertFalse(blocked(stats), f'SECP 0x{secp:02x} 까지 막았다')
+
+    def test_io_queue_0x82_passes(self):
+        # io 0x82 는 vendor I/O — SecurityReceive 가 아니다(scope=admin)
+        _, stats = send(opcode=0x82, force_admin=False, cdw10=0xEF000100)
+        self.assertFalse(blocked(stats), 'io 0x82 를 막았다')
+
+
 class RuleSemantics(unittest.TestCase):
     def _with(self, rules):
         p = unittest.mock.patch.object(fuzzer, 'BLOCKED_CDW_RULES', tuple(rules))
