@@ -11059,7 +11059,7 @@ class _V101Fuzzer:
         #  불필요하다. 필요한 증거는 위 선저장(로그+at-crash dmesg)+덤프 .bin 으로 충분.)
         log.error("[HANG] SSD 펌웨어 현상 유지(POR/reset/재인증 없음). "
                   f"crash 폴더의 덤프로 분석하세요 → {_logname(_crash_dir)}/  캠페인 종료.")
-        self._qtmgr_report(_crash_dir)
+        self._qtmgr_report(_crash_dir, _t)
         return True
 
     # ------------------------------------------------------------------
@@ -12234,18 +12234,14 @@ class _V101Fuzzer:
                     f"--cdw10={c['cdw10']:#x}", f"--cdw12={c['cdw12']:#x}",
                     f"--data-len={c['data_len']}", f'--timeout={t_ms}']
         w, r = cfg['write'], cfg['read']
-        try:
-            p1 = subprocess.run(_argv(w) + [f'--input-file={sig}', '-w'], timeout=t_ms / 1000 + 5,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if p1.returncode != 0:
-                log.warning(f"[Device Info] RBUF 생략 — VU write 0x{w['opcode']:02x} rc={p1.returncode}: "
-                            f"{p1.stderr.decode(errors='replace').strip()[:120]}")
-                return ''
-            p2 = subprocess.run(_argv(r) + ['-r', '-b'], timeout=t_ms / 1000 + 5,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except Exception as e:
-            log.warning(f"[Device Info] RBUF 생략 — VU 명령 실패: {e}")
+        # 시간 초과 뒤 종료를 기다리지 않는 실행(_run_nvme_state_cmd) — subprocess.run 은 kill 뒤 wait 에
+        # 상한이 없어, nvme-cli 가 D-state 로 남으면 퍼징 시작 단계에서 멈춘다. 시간 초과면 rc=-1.
+        p1 = _run_nvme_state_cmd(_argv(w) + [f'--input-file={sig}', '-w'], timeout_sec=t_ms / 1000 + 5)
+        if p1.returncode != 0:
+            log.warning(f"[Device Info] RBUF 생략 — VU write 0x{w['opcode']:02x} rc={p1.returncode}: "
+                        f"{p1.stderr.decode(errors='replace').strip()[:120]}")
             return ''
+        p2 = _run_nvme_state_cmd(_argv(r) + ['-r', '-b'], timeout_sec=t_ms / 1000 + 5)
         head = p2.stdout[:cfg['chars']]
         if p2.returncode != 0 or len(head) < cfg['chars']:
             log.warning(f"[Device Info] RBUF 생략 — VU read 0x{r['opcode']:02x} rc={p2.returncode} "
@@ -15195,7 +15191,7 @@ class _V101Fuzzer:
         except Exception as e:
             log.warning(f"[ARTIFACT] 수집 중 예외: {e}")
         log.error(f"[{kind}] 증거 폴더: {_logname(dest)}/")
-        self._qtmgr_report(dest)
+        self._qtmgr_report(dest, now)
         return False
 
     def _pm_preflight_s1_s2(self) -> bool:
@@ -17431,10 +17427,12 @@ class _V101Fuzzer:
         log.warning(f"[ARTIFACT] dump 전 선저장 완료 → {_logname(dest)}/ "
                     f"(crash json / replay / log / dmesg — 여기서 중단해도 분석 가능)")
 
-    def _qtmgr_report(self, crash_dir=None) -> None:
+    def _qtmgr_report(self, crash_dir=None, end_time=None) -> None:
         """v11.5: 캠페인 끝 [QTMGR] 보고 — 1회. crash 면 덤프·crash 폴더 수집이 끝난 뒤(crash_dir),
         crash 없이 끝나면 종료 요약 뒤(경로는 N/A). 값은 시작 시 [Device Info](self._devinfo)·
-        마지막 SMART CHECK·json qtmgr 에서 온다. 실패해도 종료 흐름에 영향 없음."""
+        마지막 SMART CHECK·json qtmgr 에서 온다. TTF 끝 = end_time(장애 감지 시각) 또는 run() 종료 시작 시각 —
+        덤프·차트에 걸린 시간은 넣지 않는다. 같은 내용을 qtmgr_report.txt(crash 폴더, 없으면 output_dir)에도
+        저장한다(crash 폴더의 로그 사본은 이 보고 전에 복사된다). 실패해도 종료 흐름에 영향 없음."""
         if self._qtmgr_done:
             return
         self._qtmgr_done = True
@@ -17449,7 +17447,8 @@ class _V101Fuzzer:
                 except OSError:
                     bdf = None
             _t0 = getattr(self, 'start_time', None)
-            ttf = (datetime.now() - _t0).total_seconds() if _t0 else time.time() - _PROCESS_T0
+            _end = end_time or getattr(self, '_run_end_time', None) or datetime.now()
+            ttf = ((_end - _t0).total_seconds() if _t0 else _end.timestamp() - _PROCESS_T0)
             temp = self._last_smart_temp
             dmesg, dumps = [], []
             if crash_dir is not None:
@@ -17488,6 +17487,12 @@ class _V101Fuzzer:
                 log.warning(line)
         except Exception as e:
             log.warning(f"[QTMGR] 보고 실패: {e}")
+            return
+        try:
+            _dir = Path(crash_dir) if crash_dir is not None else Path(self.output_dir)
+            (_dir / 'qtmgr_report.txt').write_text('\n'.join(out) + '\n', encoding='utf-8')
+        except Exception as e:
+            log.warning(f"[QTMGR] qtmgr_report.txt 저장 실패: {e}")
 
     def _collect_crash_artifacts(self, crash_time: datetime) -> None:
         """JLink/UFAS dump 완료 후 관련 파일을 날짜 폴더에 모아 복사한다.
@@ -18470,7 +18475,7 @@ class _V101Fuzzer:
             self._collect_crash_artifacts(_crash_time)
         except Exception as _art_exc:
             log.warning(f"[ARTIFACT] 수집 중 예외: {_art_exc}")
-        self._qtmgr_report(_crash_dir)
+        self._qtmgr_report(_crash_dir, _crash_time)
 
         # 4) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
         log.error(
@@ -21733,6 +21738,7 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
             log.warning("Interrupted by user — 정리 작업 완료 후 종료합니다 (잠시 대기)...")
 
         finally:
+            self._run_end_time = datetime.now()   # v11.5: [QTMGR] TTF 끝 — 종료 정리·차트 시간은 넣지 않는다
             # v11.3: 백그라운드 샘플링의 남은 대기 명령을 통계·보고서보다 먼저 확정한다(창 방식은 아무것도 안 함)
             try:
                 self._sampling_finish()
@@ -24871,7 +24877,7 @@ class ExceptionFuzzerMixin:
         if not controller.powered or controller.asserted or controller.runner.has_pending(supply_only=True):
             controller.emit('dump_unavailable', powered=controller.powered, asserted=controller.asserted,
                             reason='supply not stable or hardware helper pending')
-            self._qtmgr_report(dest)
+            self._qtmgr_report(dest, now)
             return
         for enabled, name, dump in (
                 (self.config.enable_jlink_dump, 'JLINK', self._run_jlink_dump),
@@ -24889,7 +24895,7 @@ class ExceptionFuzzerMixin:
                 controller.emit('dump_returned', backend=name)
             except Exception as exc:
                 controller.emit('dump_error', backend=name, reason=str(exc))
-        self._qtmgr_report(dest)
+        self._qtmgr_report(dest, now)
 
     def _stop_sampling_checked(self, context='command'):
         if not self._exception_interrupted:

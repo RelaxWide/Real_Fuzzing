@@ -112,7 +112,7 @@ class DeviceInfo(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def lines(self, f):
-        with patch.object(v.subprocess, 'run', side_effect=vu_ok) as run, \
+        with patch.object(v, '_run_nvme_state_cmd', side_effect=vu_ok) as run, \
                 self.assertLogs('pcfuzz', level='WARNING') as logs:
             f._log_device_info()
         return [l.split(':', 2)[2] for l in logs.output], run
@@ -162,23 +162,38 @@ class DeviceInfo(unittest.TestCase):
                                           else Mock(returncode=2, stdout=b'', stderr=b'INVALID')),
             'short read': lambda a, **k: Mock(returncode=0, stdout=b'1028', stderr=b''),
             'binary bytes': lambda a, **k: Mock(returncode=0, stdout=b'\x00\x01\x02\x03\x04\x05\x06\x07', stderr=b''),
-            'timeout': Mock(side_effect=v.subprocess.TimeoutExpired('nvme', 35)),
+            'timeout': lambda a, **k: Mock(returncode=-1, stdout=b'', stderr=b'timeout'),
         }
         for name, side in cases.items():
-            with self.subTest(name), patch.object(v.subprocess, 'run', side_effect=side), \
+            with self.subTest(name), patch.object(v, '_run_nvme_state_cmd', side_effect=side), \
                     self.assertLogs('pcfuzz', level='WARNING'):
                 self.assertEqual(make()._query_rbuf(), '')
 
+    def test_timeout_returns_even_if_child_never_exits(self):
+        """D-state nvme-cli: kill 이 안 먹고 wait() 는 영원히 — 호출이 무기한 대기 없이 빈칸으로 돌아와야 한다."""
+        proc = Mock()
+        proc.communicate.side_effect = v.subprocess.TimeoutExpired('nvme', 35)
+        proc.wait.side_effect = AssertionError('timeout 뒤 무기한 wait()')
+        with patch.object(v.subprocess, 'Popen', return_value=proc) as popen, \
+                patch.object(v.subprocess, 'run', side_effect=AssertionError('subprocess.run')), \
+                self.assertLogs('pcfuzz', level='WARNING') as logs:
+            self.assertEqual(make()._query_rbuf(), '')
+        popen.assert_called_once()                       # write 가 시간 초과 → read 는 보내지 않는다
+        self.assertEqual(proc.communicate.call_args.kwargs['timeout'], 35)
+        proc.kill.assert_called_once()
+        proc.wait.assert_not_called()
+        self.assertIn('rc=-1', '\n'.join(logs.output))
+
     def test_missing_sig_file_sends_nothing(self):
         with patch.dict(v.QTMGR['rbuf'], sig_file='/nonexistent/sig2.bin'), \
-                patch.object(v.subprocess, 'run') as run, self.assertLogs('pcfuzz', level='WARNING'):
+                patch.object(v, '_run_nvme_state_cmd') as run, self.assertLogs('pcfuzz', level='WARNING'):
             self.assertEqual(make()._query_rbuf(), '')
         run.assert_not_called()
 
     def test_relative_sig_file_is_next_to_fuzzer(self):
         with patch.dict(v.QTMGR['rbuf'], sig_file='sig2.bin'), \
                 patch.object(v.Path, 'is_file', return_value=True), \
-                patch.object(v.subprocess, 'run', side_effect=vu_ok) as run:
+                patch.object(v, '_run_nvme_state_cmd', side_effect=vu_ok) as run:
             make()._query_rbuf()
         self.assertIn(f"--input-file={Path(v.__file__).parent / 'sig2.bin'}", run.call_args_list[0].args[0])
 
@@ -200,6 +215,7 @@ class Qtmgr(unittest.TestCase):
                       'density_tag': '512GB', 'rbuf': '10282026'}
         f._last_smart_temp = 41
         f.start_time = datetime.now() - timedelta(hours=3, minutes=12)
+        f.output_dir = Path(self.tmp.name)
         return f
 
     def test_crash_report(self):
@@ -224,6 +240,34 @@ class Qtmgr(unittest.TestCase):
             f'[QTMGR] Dmesg Path : {os.path.abspath(cd)}/dmesg_20261028_101010_at_crash.txt',
             f'[QTMGR] UFAS Path : {cd}/jlink_mem.bin', f'[QTMGR] UFAS Path : {cd}/ufas_dump.bin',
             sep])
+
+    def test_ttf_excludes_dump_time(self):
+        """10분에 장애 → 덤프 20분 → 보고. TTF 는 장애 감지 시각까지(10 min)."""
+        f = self.device()
+        crash_at = datetime(2026, 10, 28, 10, 10)
+        f.start_time = crash_at - timedelta(minutes=10)
+        cd = Path(self.tmp.name) / 'crash_t'
+        cd.mkdir()
+        with patch.object(v, 'datetime', Mock(now=Mock(return_value=crash_at + timedelta(minutes=20)))), \
+                patch.object(v, '_pci_slot', return_value=None), self.assertLogs('pcfuzz', level='WARNING') as logs:
+            f._qtmgr_report(cd, crash_at)
+        self.assertIn('[QTMGR] TTF : 10 min', '\n'.join(logs.output))
+
+    def test_normal_end_uses_run_end_time(self):
+        f = self.device()
+        f._run_end_time = f.start_time + timedelta(minutes=45)
+        self.assertIn('[QTMGR] TTF : 45 min', self.report(f))
+
+    def test_report_saved_to_file(self):
+        f = self.device()
+        cd = Path(self.tmp.name) / 'crash_f'
+        cd.mkdir()
+        out = self.report(f, cd)
+        self.assertEqual((cd / 'qtmgr_report.txt').read_text(encoding='utf-8').splitlines(), out)
+        g = self.device()
+        g.output_dir = Path(self.tmp.name)
+        out = self.report(g)                             # crash 없음 → output_dir
+        self.assertEqual((Path(self.tmp.name) / 'qtmgr_report.txt').read_text(encoding='utf-8').splitlines(), out)
 
     def test_once_only(self):
         f = self.device()

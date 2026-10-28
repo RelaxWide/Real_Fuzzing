@@ -25,11 +25,12 @@ nvme admin-passthru /dev/nvmeN --opcode=0xc2 --cdw10=0x4 --cdw12=0x23000003 --da
 ```
 - `sig2.bin` 은 퍼저 실행 파일과 같은 폴더에 둔다(`sig_file` 상대경로 기준). 없으면 명령을 보내지 않고 빈칸.
 - 둘째 명령 응답(raw)의 앞 `chars`(8) 바이트가 출력 가능한 글자가 아니면 빈칸(경고에 hex).
-- 퍼징 송신 경로(가드·cmd#·회계)를 거치지 않는 시작 시 보조 명령이다.
+- 퍼징 송신 경로(가드·cmd#·회계)를 거치지 않는 시작 시 보조 명령이다. 시간 초과(timeout_ms+5s)면 nvme-cli 종료를 기다리지 않고 빈칸(D-state 대비).
 
 ## [QTMGR] (캠페인 끝, 1회)
 - crash(timeout·FW hang·PM preflight 실패·예외 주입 보존)면 **덤프와 crash 폴더 수집이 끝난 직후**(PC 모니터링 전).
 - crash 없이 끝나면(시간 종료·Ctrl+C) 종료 요약·차트 뒤. Dmesg/UFAS Path 는 `N/A`.
+- 같은 내용을 `qtmgr_report.txt` 로도 저장한다 — crash 면 그 crash 폴더(로그 사본은 보고 전에 복사되므로), 아니면 output 폴더.
 
 | 줄 | 값 |
 |---|---|
@@ -41,7 +42,7 @@ nvme admin-passthru /dev/nvmeN --opcode=0xc2 --cdw10=0x4 --cdw12=0x23000003 --da
 | Density | `512 GB`, `1 TB` 형식 |
 | Form Factor | `M_2` |
 | FW Rev / FW Build / MN / SN | Device Info 의 FR / RBUF / Model / Serial |
-| TTF | 퍼징 시작부터 — 60분 미만 `45 min`, 이상 `3.2 hours` |
+| TTF | 퍼징 시작부터 장애 감지 시각(crash) 또는 종료 시작 시각까지 — 덤프·차트 시간 제외. 60분 미만 `45 min`, 이상 `3.2 hours` |
 | Temp ('C) | 마지막 `nvme smart-log` temperature(°C). 없으면 `N/A` |
 | Chamber ('C) | `qtmgr.chamber` (기본 `Not Chamber`) |
 | Dmesg Path | crash 폴더의 `dmesg_*.txt` 전부(절대경로) |
