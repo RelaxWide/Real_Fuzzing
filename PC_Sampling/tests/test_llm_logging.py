@@ -26,7 +26,7 @@ class LlmLoggingTests(unittest.TestCase):
                 vllm_client._log.warning('[LLM/vllm] backend marker')
                 for h in logger.handlers:
                     h.flush()
-                main = next(Path(tmp).glob('fuzzer_*.log')).read_text()
+                main = next(Path(tmp).glob('fuzzer_*_log.txt')).read_text()
                 llm = next((Path(tmp)/'llm').glob('*.log')).read_text()
                 for marker in ['early activation marker', 'retrieval marker', 'backend marker']:
                     self.assertEqual(main.count(marker), 1)

@@ -1004,7 +1004,7 @@ def _parse_qtmgr(raw):
         sys.exit("[FATAL] qtmgr 는 객체여야 합니다.")
     out = {}
     for k, dflt in (('tester', 'TestPC01'), ('application', 'PC'), ('form_factor', 'M_2'),
-                    ('chamber', 'Not Chamber')):
+                    ('chamber', 'Not Chamber'), ('board', 'NA'), ('slot', 'NA'), ('port', 'NA')):
         v = raw.get(k, dflt)
         if not isinstance(v, str):
             sys.exit(f"[FATAL] qtmgr.{k} 는 문자열이어야 합니다 ({v!r} 받음).")
@@ -2240,11 +2240,22 @@ def _config_signature() -> str:
         return "unknown"
 
 
+# v11.5: 타임스탬프를 [] 로 감싼다(사용자 요청) — 파일·LLM 로그·터미널 공통
+LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(message)s'
+
+
+def test_location_line() -> str:
+    q = QTMGR
+    return (f"[ TEST LOCATION : {{ TESTER:{q['tester']}, BOARD:{q['board']}, "
+            f"SLOT:{q['slot']}, PORT:{q['port']} }} ]")
+
+
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     """파일 + 콘솔 동시 로깅 설정 (실행마다 날짜시간 로그 파일 생성)"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = os.path.join(output_dir, f'fuzzer_{timestamp}.log')
+    # v11.5: 파일명 끝 _log, 확장자 .txt(사용자 요청)
+    log_file = os.path.join(output_dir, f'fuzzer_{timestamp}_log.txt')
 
     logger = logging.getLogger('pcfuzz')
     logger.setLevel(logging.DEBUG)
@@ -2253,7 +2264,7 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     logger.handlers.clear()
 
     fmt = _MsFormatter(
-        '%(asctime)s [%(levelname)s] %(message)s',
+        LOG_FORMAT,
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
@@ -2261,7 +2272,10 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     # encoding='utf-8' 명시 — sudo / C locale 환경에서 μ/✓/→/한글 깨짐 방지.
     # 주의: errors='replace' 는 Python 3.9+ 만 지원 → 호환성 위해 사용 안 함.
     # UTF-8 은 모든 Unicode 표현 가능하므로 encode 실패 가능성 없음.
-    fh = logging.FileHandler(log_file, encoding='utf-8')
+    # v11.5: 로그 맨 첫 줄 — 시험 위치(json qtmgr). 타임스탬프 없이 그대로.
+    with open(log_file, 'w', encoding='utf-8') as _lf:
+        _lf.write(test_location_line() + '\n')
+    fh = logging.FileHandler(log_file, encoding='utf-8')   # 이어 쓰기(mode='a')
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
@@ -2297,7 +2311,7 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     # TTY이면 컬러 포매터, 파이프/리다이렉트이면 일반 포매터
     is_tty = hasattr(sys.stderr, 'isatty') and sys.stderr.isatty()
     ch.setFormatter(_ColorFormatter(
-        '%(asctime)s [%(levelname)s] %(message)s',
+        LOG_FORMAT,
         datefmt='%Y-%m-%d %H:%M:%S'
     ) if is_tty else fmt)
     logger.addHandler(ch)

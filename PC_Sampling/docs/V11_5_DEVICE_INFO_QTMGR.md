@@ -54,3 +54,8 @@ nvme admin-passthru /dev/nvmeN --opcode=0xc2 --cdw10=0x4 --cdw12=0x23000003 --da
 ## crash 폴더 정리 (v11.5)
 - dmesg 는 덤프 전 선저장한 `dmesg_<ts>_at_crash.txt` 하나만 남긴다(덤프 후 `dmesg_<ts>.txt` 는 만들지 않는다).
 - `crash_<명령>_<opcode>_<hash>.json` 은 crash 폴더에 넣지 않는다(쓰지 않는 파일) — `crashes/` 루트에만 남는다.
+
+## 로그 파일 (v11.5)
+- 이름: `output/fuzzer_<YYYYmmdd_HHMMSS>_log.txt` (예전 `fuzzer_<ts>.log`). LLM 전용 로그 `output/llm/llm_<ts>.log` 는 그대로.
+- 첫 줄(타임스탬프 없음): `[ TEST LOCATION : { TESTER:TestPC01, BOARD:NA, SLOT:NA, PORT:NA } ]` — json `qtmgr.tester/board/slot/port`.
+- 모든 줄의 타임스탬프를 `[]` 로 감싼다(파일·LLM 로그·터미널): `[2026-10-28 18:53:51.502] [WARNING] …`.
