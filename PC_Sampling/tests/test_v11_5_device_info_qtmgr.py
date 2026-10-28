@@ -34,7 +34,7 @@ def make(product='BM9K1_HP', family='BM9K1', pm=False):
 def vu_ok(argv, **kw):
     if '-w' in argv:
         return Mock(returncode=0, stdout=b'', stderr=b'')
-    return Mock(returncode=0, stdout=b'10282026' + b'\x00' * 504, stderr=b'')
+    return Mock(returncode=0, stdout=bytes.fromhex('10282026') + b'\x00' * 508, stderr=b'')
 
 
 class Helpers(unittest.TestCase):
@@ -82,7 +82,7 @@ class Helpers(unittest.TestCase):
         self.assertEqual(v.QTMGR['ctrl'], {'BM9K1': 'PALAU', 'PM9M1': 'SM2504XT', 'BM9H1': 'SM2269XT',
                                            'P7': 'PS2251_U21', 'P9': 'PS2251_U21'})
         rb = v.QTMGR['rbuf']
-        self.assertEqual((rb['write'], rb['read'], rb['chars'], rb['sig_file']),
+        self.assertEqual((rb['write'], rb['read'], rb['digits'], rb['sig_file']),
                          ({'opcode': 0xC1, 'cdw10': 4, 'cdw12': 0x1, 'data_len': 16},
                           {'opcode': 0xC2, 'cdw10': 4, 'cdw12': 0x23000003, 'data_len': 512}, 8, 'sig2.bin'))
         self.assertIn('PM9M1_LENOVO', v.PRODUCT_CONFIGS)
@@ -90,7 +90,7 @@ class Helpers(unittest.TestCase):
 
     def test_bad_config_fails_loudly(self):
         for bad in ([], {'tester': 3}, {'ctrl': {'BM9K1': 1}}, {'rbuf': {'write': {'opcode': 'x'}}},
-                    {'rbuf': {'chars': 0}}, {'rbuf': {'chars': 999}}):
+                    {'rbuf': {'digits': 0}}, {'rbuf': {'digits': 7}}, {'rbuf': {'digits': 2000}}):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 v._parse_qtmgr(bad)
 
@@ -155,13 +155,21 @@ class DeviceInfo(unittest.TestCase):
         run2.assert_not_called()
         self.assertIn('[Device Info] RBUF : 10282026', out)
 
+    def test_rbuf_is_bcd_hex_of_first_four_bytes(self):
+        """실기 응답(2026-10-28): 버퍼 10 23 20 26 00 00 00 00 … → '10232026'. 글자(ASCII)로 읽으면 안 된다."""
+        def read(argv, **kw):
+            if '-w' in argv:
+                return Mock(returncode=0, stdout=b'', stderr=b'')
+            return Mock(returncode=0, stdout=bytes.fromhex('1023202600000000') + b'\x00' * 504, stderr=b'')
+        with patch.object(v, '_run_nvme_state_cmd', side_effect=read):
+            self.assertEqual(make()._query_rbuf(), '10232026')
+
     def test_rbuf_blank_on_failure(self):
         cases = {
             'write fails': lambda a, **k: Mock(returncode=1, stdout=b'', stderr=b'err'),
             'read fails': lambda a, **k: (Mock(returncode=0, stdout=b'', stderr=b'') if '-w' in a
                                           else Mock(returncode=2, stdout=b'', stderr=b'INVALID')),
-            'short read': lambda a, **k: Mock(returncode=0, stdout=b'1028', stderr=b''),
-            'binary bytes': lambda a, **k: Mock(returncode=0, stdout=b'\x00\x01\x02\x03\x04\x05\x06\x07', stderr=b''),
+            'short read': lambda a, **k: Mock(returncode=0, stdout=b'\x10\x28\x20', stderr=b''),
             'timeout': lambda a, **k: Mock(returncode=-1, stdout=b'', stderr=b'timeout'),
         }
         for name, side in cases.items():

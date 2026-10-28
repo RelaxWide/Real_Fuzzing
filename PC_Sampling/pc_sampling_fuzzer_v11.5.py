@@ -1026,12 +1026,13 @@ def _parse_qtmgr(raw):
             'timeout_ms': _cfg_int(rb.get('timeout_ms', 30000)),
             'write': _cmd('write', {'opcode': 0xC1, 'cdw10': 4, 'cdw12': 0x1, 'data_len': 16}),
             'read': _cmd('read', {'opcode': 0xC2, 'cdw10': 4, 'cdw12': 0x23000003, 'data_len': 512}),
-            'chars': _cfg_int(rb.get('chars', 8)),
+            'digits': _cfg_int(rb.get('digits', 8)),
         }
     except (KeyError, TypeError, ValueError) as e:
         sys.exit(f"[FATAL] qtmgr.rbuf 값이 잘못됐습니다: {e!r}")
-    if out['rbuf']['chars'] <= 0 or out['rbuf']['chars'] > out['rbuf']['read']['data_len']:
-        sys.exit("[FATAL] qtmgr.rbuf.chars 는 1..read.data_len 이어야 합니다.")
+    _d = out['rbuf']['digits']
+    if _d <= 0 or _d % 2 or _d // 2 > out['rbuf']['read']['data_len']:
+        sys.exit("[FATAL] qtmgr.rbuf.digits 는 짝수 2..(read.data_len×2) 여야 합니다(바이트당 hex 2자리).")
     return out
 
 
@@ -12214,8 +12215,8 @@ class _V101Fuzzer:
 
     def _query_rbuf(self) -> str:
         """v11.5: RBUF(FW 빌드 값) — VU 명령 2개(json qtmgr.rbuf)를 **처음 한 번만** 보내고 결과를 재사용한다.
-        write(sig_file 전송) 뒤 read 응답 앞 chars 바이트를 글자 그대로(예 '10282026'). 실패·파일 없음·
-        읽을 수 없는 글자면 빈칸. 퍼징 송신 경로(가드·cmd#·회계)를 거치지 않는 시작 시 보조 명령이다."""
+        write(sig_file 전송) 뒤 read 응답 버퍼의 앞 digits 자리 hex — 값이 바이트당 숫자 두 자리(BCD)라
+        앞 4바이트 10 23 20 26 → '10232026'(MMDDYYYY). 실패·파일 없음·짧은 응답이면 빈칸. 퍼징 송신 경로(가드·cmd#·회계)를 거치지 않는 시작 시 보조 명령이다."""
         if self._rbuf_tried:
             return self._rbuf or ''
         self._rbuf_tried = True
@@ -12243,15 +12244,14 @@ class _V101Fuzzer:
                         f"{p1.stderr.decode(errors='replace').strip()[:120]}")
             return ''
         p2 = _run_nvme_state_cmd(_argv(r) + ['-r', '-b'], timeout_sec=t_ms / 1000 + 5)
-        head = p2.stdout[:cfg['chars']]
-        if p2.returncode != 0 or len(head) < cfg['chars']:
+        _n = cfg['digits'] // 2
+        head = p2.stdout[:_n]
+        if p2.returncode != 0 or len(head) < _n:
             log.warning(f"[Device Info] RBUF 생략 — VU read 0x{r['opcode']:02x} rc={p2.returncode} "
                         f"len={len(p2.stdout)}: {p2.stderr.decode(errors='replace').strip()[:120]}")
             return ''
-        if not all(0x20 <= b < 0x7f for b in head):
-            log.warning(f"[Device Info] RBUF 생략 — 앞 {cfg['chars']}바이트가 글자가 아님 ({head.hex()})")
-            return ''
-        self._rbuf = head.decode('ascii')
+        # 버퍼를 글자(ASCII)로 읽으면 안 된다 — 실기 응답 10 23 20 26 00.. 은 BCD(2026-10-23)다
+        self._rbuf = head.hex().upper()
         return self._rbuf
 
     def _log_device_info(self) -> None:

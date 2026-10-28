@@ -13,7 +13,7 @@
 | `CTRL` | `e` + `qtmgr.ctrl[제품 계열]` — BM9K1 `ePALAU`, PM9M1 `eSM2504XT`, BM9H1 `eSM2269XT`, P7·P9 `ePS2251_U21` |
 | `FormFactor` | `e` + `qtmgr.form_factor` (기본 `eM_2`) |
 | `OEM` | 제품명이 `<계열>_<OEM>` 이면 `e<OEM>`(`PM9M1_HP` → `eHP`, `BM9K1_LENOVO` → `eLENOVO`), 아니면 `eBRAND` |
-| `RBUF` | VU 명령 2개 응답 앞 8바이트를 글자 그대로(예 `10282026`). 실패하면 빈칸 |
+| `RBUF` | VU 명령 2개 응답 버퍼 앞 8자리 hex(예 `10 23 20 26 …` → `10232026`, MMDDYYYY). 실패하면 빈칸 |
 
 제품 계열 = `products.<제품>.family`(생략 시 제품명). PM9M1·PM9M1_LENOVO·PM9M1_HP 는 `PM9M1`, BM9K1 계열은 `BM9K1`.
 
@@ -24,7 +24,7 @@ nvme admin-passthru /dev/nvmeN --opcode=0xc1 --cdw10=0x4 --cdw12=0x1 --data-len=
 nvme admin-passthru /dev/nvmeN --opcode=0xc2 --cdw10=0x4 --cdw12=0x23000003 --data-len=512 --timeout=30000 -r -b
 ```
 - `sig2.bin` 은 퍼저 실행 파일과 같은 폴더에 둔다(`sig_file` 상대경로 기준). 없으면 명령을 보내지 않고 빈칸.
-- 둘째 명령 응답(raw)의 앞 `chars`(8) 바이트가 출력 가능한 글자가 아니면 빈칸(경고에 hex).
+- 둘째 명령 응답(raw) 앞 `digits`(8)자리 = 앞 4바이트를 hex 그대로. 값이 바이트당 숫자 두 자리(BCD)라 글자로 읽지 않는다.
 - 퍼징 송신 경로(가드·cmd#·회계)를 거치지 않는 시작 시 보조 명령이다. 시간 초과(timeout_ms+5s)면 nvme-cli 종료를 기다리지 않고 빈칸(D-state 대비).
 
 ## [QTMGR] (캠페인 끝, 1회)
