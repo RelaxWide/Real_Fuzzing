@@ -124,8 +124,10 @@ class DeviceInfo(unittest.TestCase):
         i = next(n for n, l in enumerate(body) if l.strip().startswith('Serial'))
         self.assertTrue(body[i - 1].strip().startswith('Model'))
         self.assertEqual(body[i + 1:i + 8], [
-            'Density : eDensity_512GB', 'FW Revision : BXV7401Q', 'Application : ePC',
-            'CTRL : ePALAU', 'FormFactor : eM_2', 'OEM : eHP', 'RBUF : 10282026'])
+            '  Density     : eDensity_512GB', '  FW Revision : BXV7401Q', '  Application : ePC',
+            '  CTRL        : ePALAU', '  FormFactor  : eM_2', '  OEM         : eHP', '  RBUF        : 10282026'])
+        # 기존 줄과 같은 들여쓰기·': ' 위치
+        self.assertEqual({l.index(': ') for l in body[i - 1:i + 9]}, {14})
         self.assertTrue(body[i + 8].strip().startswith('Firmware'), '나머지 정보가 이어서 나와야 한다')
         self.assertTrue(any('NSZE' in l for l in body))
 
@@ -137,8 +139,8 @@ class DeviceInfo(unittest.TestCase):
                                            ('BM9K1', 'BM9K1', 'ePALAU', 'eBRAND')):
             with self.subTest(product=product):
                 out, _ = self.lines(make(product, family))
-                self.assertIn(f'[Device Info] CTRL : {ctrl}', out)
-                self.assertIn(f'[Device Info] OEM : {oem}', out)
+                self.assertIn(f'[Device Info]   CTRL        : {ctrl}', out)
+                self.assertIn(f'[Device Info]   OEM         : {oem}', out)
 
     def test_vu_commands_sent_once(self):
         f = make()
@@ -153,7 +155,7 @@ class DeviceInfo(unittest.TestCase):
             self.assertIn(a, r)
         out, run2 = self.lines(f)                     # 주기 재출력
         run2.assert_not_called()
-        self.assertIn('[Device Info] RBUF : 10282026', out)
+        self.assertIn('[Device Info]   RBUF        : 10282026', out)
 
     def test_rbuf_is_bcd_hex_of_first_four_bytes(self):
         """실기 응답(2026-10-28): 버퍼 10 23 20 26 00 00 00 00 … → '10232026'. 글자(ASCII)로 읽으면 안 된다."""

@@ -12263,6 +12263,7 @@ class _V101Fuzzer:
         def _w(s):
             log.warning(f"[Device Info] {s}")
 
+        _rbuf = self._query_rbuf()   # 블록 앞에서 — 실패 경고가 Device Information 블록 중간에 끼지 않게
         _w("=" * 56)
         _w("Device Information")
 
@@ -12298,7 +12299,7 @@ class _V101Fuzzer:
                         fr=str(ctrl.get('fr', '')).strip())
         if dens_tag:
             info.update(density_tag=dens_tag, density=dens_label)
-        info['rbuf'] = self._query_rbuf()
+        info['rbuf'] = _rbuf
 
         if ctrl:
             _model, _serial, _fw = info['mn'], info['sn'], info['fr']
@@ -12320,13 +12321,15 @@ class _V101Fuzzer:
             _w(f"  Model       : {_model}")
             _w(f"  Serial      : {_serial}")
         _ctrl_name = QTMGR['ctrl'].get(fam)
-        _w(f"Density : {'eDensity_' + info['density_tag'] if info.get('density_tag') else ''}")
-        _w(f"FW Revision : {info.get('fr', '')}")
-        _w(f"Application : e{QTMGR['application']}")
-        _w(f"CTRL : {'e' + _ctrl_name if _ctrl_name else ''}")
-        _w(f"FormFactor : e{QTMGR['form_factor']}")
-        _w(f"OEM : e{_product_oem(self.config.product, fam)}")
-        _w(f"RBUF : {info['rbuf']}")
+        # 기존 줄과 같은 들여쓰기·이름 폭("  Model       : ")
+        for _k, _val in (('Density', 'eDensity_' + info['density_tag'] if info.get('density_tag') else ''),
+                         ('FW Revision', info.get('fr', '')),
+                         ('Application', 'e' + QTMGR['application']),
+                         ('CTRL', 'e' + _ctrl_name if _ctrl_name else ''),
+                         ('FormFactor', 'e' + QTMGR['form_factor']),
+                         ('OEM', 'e' + _product_oem(self.config.product, fam)),
+                         ('RBUF', info['rbuf'])):
+            _w(f"  {_k:<12}: {_val}")
         if ctrl:
             _w(f"  Firmware    : {_fw}")
             _w(f"  Vendor ID   : 0x{_vid:04x}  /  Subsys 0x{_ssvid:04x}")
