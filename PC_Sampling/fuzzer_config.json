@@ -327,6 +327,28 @@
     "ffm_field": "ffm_frag",
     "burst_walltime_cap_sec": 120.0
   },
+  "_comment_qtmgr": "v11.5. 시작 시 [Device Info] 추가 항목과 캠페인 끝(덤프·crash 폴더 수집 뒤, crash 가 없으면 종료 요약 뒤)의 [QTMGR] 보고. tester 는 PC 이름(기본 TestPC01). application/form_factor 는 Device Info 에서 앞에 e 를 붙여 찍는다. ctrl 은 제품 계열(products.<제품>.family, 생략 시 제품명)별 컨트롤러 이름. rbuf 는 시작 시 1회 보내는 VU 명령 두 개(write 로 sig_file 을 보내고 read 응답 앞 chars 바이트를 글자 그대로) — sig_file 은 퍼저 폴더 기준 상대경로. 실패하면 빈칸.",
+  "qtmgr": {
+    "tester": "TestPC01",
+    "application": "PC",
+    "form_factor": "M_2",
+    "chamber": "Not Chamber",
+    "ctrl": {
+      "BM9K1": "PALAU",
+      "PM9M1": "SM2504XT",
+      "BM9H1": "SM2269XT",
+      "P7": "PS2251_U21",
+      "P9": "PS2251_U21"
+    },
+    "rbuf": {
+      "enabled": true,
+      "sig_file": "sig2.bin",
+      "timeout_ms": 30000,
+      "write": {"opcode": "0xC1", "cdw10": "0x4", "cdw12": "0x1", "data_len": 16},
+      "read": {"opcode": "0xC2", "cdw10": "0x4", "cdw12": "0x23000003", "data_len": 512},
+      "chars": 8
+    }
+  },
   "products": {
     "BM9K1": {
       "_comment_family": "v11.5. 제품 계열. 같은 family 의 파생형(BM9K1_LENOVO·BM9K1_HP)은 BM9K1 전용 동작(PS 추적·timeout PS 배율·백그라운드 샘플링 판정)과 RISC-V 커버리지 자산 products/<family>/ 를 공유한다. 생략 시 제품명. v11.4 이하는 이 키를 읽지 않고 BM9K1 전용 동작을 제품명 BM9K1 로만 판정하므로 파생형은 v11.5 이상에서 쓴다.",
@@ -610,6 +632,8 @@
       "_comment_variant": "v11.5. BM9K1_LENOVO와 같은 기본 설정에서 state_exclude_lids로 LID 0xDF(223)를 state snapshot 관측에서 제외한다(PM9M1_HP 와 같은 규칙). df_* 필드는 주기 관측에서 빠지지만, 일반 퍼징 명령으로 LID 0xDF를 보내는 것까지 차단하는 설정은 아니다."
     },
     "PM9M1": {
+      "_comment_family": "v11.5. 제품 계열(Device Info·QTMGR 의 CTRL·Product 판정, 파생형 이름 뒤 OEM 추출). 생략 시 제품명.",
+      "family": "PM9M1",
       "_comment_link_fail_por": "v11.3. true면 디버그 링크 재연결까지 실패했을 때 컨트롤러가 id-ctrl에 응답하는 경우(순수 디버그 링크 장애)에만 PMU POR → PCIe rescan → 재연결로 이어간다. 컨트롤러가 응답하지 않으면 POR 없이 행 증거를 남긴다. 횟수 제한 없음. PMU 필요. 예외 주입 캠페인에서는 동작하지 않는다. false면 기존처럼 복구 실패로 끝낸다(키 생략 시 false).",
       "link_fail_por": true,
       "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
@@ -657,7 +681,9 @@
       "enable_jlink_dump": true,
       "state_fields": "r8"
     },
-    "PM9M1_LNB": {
+    "PM9M1_LENOVO": {
+      "_comment_family": "v11.5. 제품 계열(Device Info·QTMGR 의 CTRL·Product 판정, 파생형 이름 뒤 OEM 추출). 생략 시 제품명.",
+      "family": "PM9M1",
       "_comment_link_fail_por": "v11.3. true면 디버그 링크 재연결까지 실패했을 때 컨트롤러가 id-ctrl에 응답하는 경우(순수 디버그 링크 장애)에만 PMU POR → PCIe rescan → 재연결로 이어간다. 컨트롤러가 응답하지 않으면 POR 없이 행 증거를 남긴다. 횟수 제한 없음. PMU 필요. 예외 주입 캠페인에서는 동작하지 않는다. false면 기존처럼 복구 실패로 끝낸다(키 생략 시 false).",
       "link_fail_por": true,
       "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
@@ -707,6 +733,8 @@
       "_comment_variant": "기존 PM9M1과 같은 프로필. state 관측에 LID 0xDF snapshot을 포함한다."
     },
     "PM9M1_HP": {
+      "_comment_family": "v11.5. 제품 계열(Device Info·QTMGR 의 CTRL·Product 판정, 파생형 이름 뒤 OEM 추출). 생략 시 제품명.",
+      "family": "PM9M1",
       "_comment_link_fail_por": "v11.3. true면 디버그 링크 재연결까지 실패했을 때 컨트롤러가 id-ctrl에 응답하는 경우(순수 디버그 링크 장애)에만 PMU POR → PCIe rescan → 재연결로 이어간다. 컨트롤러가 응답하지 않으면 POR 없이 행 증거를 남긴다. 횟수 제한 없음. PMU 필요. 예외 주입 캠페인에서는 동작하지 않는다. false면 기존처럼 복구 실패로 끝낸다(키 생략 시 false).",
       "link_fail_por": true,
       "_comment_timeouts": "제품별 timeout override. nvme_timeouts와 nvme_passthru_timeout_ms는 밀리초, nvme_kernel_timeout_sec는 초 단위다. 지정한 값은 공통 timeouts보다 우선하며 생략한 값은 공통 설정을 사용한다.",
@@ -756,7 +784,7 @@
       "state_exclude_lids": [
         223
       ],
-      "_comment_variant": "PM9M1_LNB와 같은 기본 설정에서 state_exclude_lids로 LID 0xDF(223)를 state snapshot 관측에서 제외한다. df_* 필드는 주기 관측에서 빠지지만, 일반 퍼징 명령으로 LID 0xDF를 보내는 것까지 차단하는 설정은 아니다."
+      "_comment_variant": "PM9M1_LENOVO와 같은 기본 설정에서 state_exclude_lids로 LID 0xDF(223)를 state snapshot 관측에서 제외한다. df_* 필드는 주기 관측에서 빠지지만, 일반 퍼징 명령으로 LID 0xDF를 보내는 것까지 차단하는 설정은 아니다."
     },
     "BM9H1": {
       "_comment_link_fail_por": "v11.3. true면 디버그 링크 재연결까지 실패했을 때 컨트롤러가 id-ctrl에 응답하는 경우(순수 디버그 링크 장애)에만 PMU POR → PCIe rescan → 재연결로 이어간다. 컨트롤러가 응답하지 않으면 POR 없이 행 증거를 남긴다. 횟수 제한 없음. PMU 필요. 예외 주입 캠페인에서는 동작하지 않는다. false면 기존처럼 복구 실패로 끝낸다(키 생략 시 false).",

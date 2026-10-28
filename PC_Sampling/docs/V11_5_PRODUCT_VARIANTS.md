@@ -1,6 +1,6 @@
 # v11.5 — BM9K1 제품 파생형 (BM9K1_LENOVO / BM9K1_HP)
 
-PM9M1(`PM9M1_LNB` / `PM9M1_HP`)처럼 `--product` 로 고른다.
+PM9M1(`PM9M1_LENOVO` / `PM9M1_HP`)처럼 `--product` 로 고른다.
 
 ```bash
 sudo python3 pc_sampling_fuzzer_v11.5.py --product BM9K1_LENOVO ...

@@ -492,7 +492,7 @@ class ProductConfig(unittest.TestCase):
         cfg = json.loads((ROOT / 'fuzzer_config.json').read_text(encoding='utf-8-sig'))
         spec = {n: v.TimingSpec.parse(p.get('exception_timing')) for n, p in cfg['products'].items()}
         self.assertEqual(spec['BM9K1'], v.TimingSpec(None, 0.1, 0.1, 0.5, 20.0, 60))
-        for n in ('PM9M1', 'PM9M1_LNB', 'PM9M1_HP', 'BM9H1'):
+        for n in ('PM9M1', 'PM9M1_LENOVO', 'PM9M1_HP', 'BM9H1'):
             self.assertEqual(spec[n], v.TimingSpec(None, 10.0, 10.0, 10.0, 10.0, 60), n)
         for n in ('P7', 'P9'):
             self.assertEqual(spec[n], v.TimingSpec(None, 30.0, 30.0, 30.0, 30.0, 60), n)

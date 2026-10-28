@@ -1,6 +1,6 @@
 """v11.5 제품 파생형 — BM9K1_LENOVO / BM9K1_HP.
 
-PM9M1(_LNB/_HP)처럼 --product 로 고르는 파생형이다. BM9K1 전용 동작(PS 추적·timeout PS 배율)과
+PM9M1(_LENOVO/_HP)처럼 --product 로 고르는 파생형이다. BM9K1 전용 동작(PS 추적·timeout PS 배율)과
 RISC-V 자산 products/BM9K1/ 은 제품명이 아니라 json products.<제품>.family 로 판정한다.
 실제 송신 경로(_send_nvme_command)·PM 경로(_pm_set_state)·자산 로더(_load_riscv_coverage)를 태운다.
 """
@@ -45,7 +45,9 @@ class ShippedProfiles(unittest.TestCase):
 
 class FamilyResolution(unittest.TestCase):
     def test_missing_family_is_product_name(self):
-        self.assertEqual(v._profile_family('PM9M1_HP', PRODUCTS['PM9M1_HP']), 'PM9M1_HP')
+        self.assertNotIn('family', PRODUCTS['P9'])
+        self.assertEqual(v._profile_family('P9', PRODUCTS['P9']), 'P9')
+        self.assertEqual(v._profile_family('PM9M1_HP', PRODUCTS['PM9M1_HP']), 'PM9M1')
         self.assertEqual(v._profile_family('', {}), '')
 
     def test_bad_family_fails_loudly(self):

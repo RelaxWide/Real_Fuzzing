@@ -31,13 +31,13 @@
 
 | 제품 | 샘플러 | openocd.cfg | BB/func | 비고 |
 |---|---|---|---|---|
-| `PM9M1` | pcsr (swd) | ❌ 배치 필요 | ❌ 배치 필요 | `PM9M1_LNB`/`PM9M1_HP` 가 **이 폴더를 공유** |
+| `PM9M1` | pcsr (swd) | ❌ 배치 필요 | ❌ 배치 필요 | `PM9M1_LENOVO`/`PM9M1_HP` 가 **이 폴더를 공유** |
 | `BM9H1` | pcsr (jtag) | ✅ | ❌ 배치 필요 | |
 | `P7` | jlink_halt | 불필요 | ❌ 배치 필요 | OpenOCD 미사용 |
 | `P9` | jlink_halt | ✅ (미참조) | ❌ 배치 필요 | `openocd.cfg` 는 `sampler_type='halt'` 시절 자산 — 되돌릴 때 사용 |
 | `BM9K1` | sjtag (예정) | 불필요 | ❌ v10 작업 | RISC-V 4코어. **config 레코드 아직 없음** — 샘플러 구현 후 추가 |
 
-`PM9M1_LNB` / `PM9M1_HP` 는 펌웨어가 같아 별도 폴더를 두지 않고 config 에서
+`PM9M1_LENOVO` / `PM9M1_HP` 는 펌웨어가 같아 별도 폴더를 두지 않고 config 에서
 `products/PM9M1/...` 를 가리킨다.
 
 ## 퍼즈 호스트에서 배치할 것

@@ -20,6 +20,8 @@ Fuzzer. 제품별 target profile(PRODUCT_PROFILES)로 interface/코어/주소/�
 버전 요약 (한 줄 요약; 상세는 git log / 각 버전 md)
 - v11.5: 제품 파생형 — BM9K1_LENOVO / BM9K1_HP(--product). json products.<제품>.family 가 같은 계열을 묶고
         BM9K1 전용 동작(PS 추적·timeout 배율·RISC-V 자산 products/BM9K1/)은 제품명 대신 계열로 판정한다.
+        PM9M1_LNB → PM9M1_LENOVO. [DevInfo] → [Device Info] + Density·CTRL·OEM·RBUF(VU) 등, 캠페인 끝 [QTMGR] 보고
+        (json qtmgr). docs/V11_5_DEVICE_INFO_QTMGR.md
 - v11.4: 응답 시그니처 커버리지 — 디버거 없이(--no-jlink) 처음 본 (명령, 완료 status, 처리 시간 구간,
         DW0 모양[, 직전 명령]) 응답을 corpus 피드백으로 쓴다(strategy.response_coverage). PC 를 못 모으는
         샘플러면 [Stats] 에 pcs 대신 resp_sig, [StatCov]·'+0 PCs' 로그 생략. docs/V11_4_RESPONSE_COVERAGE.md
@@ -994,6 +996,104 @@ def _parse_response_coverage(raw):
 
 
 RESPONSE_COVERAGE = _parse_response_coverage(_ST.get('response_coverage', {}))
+
+
+# v11.5: [Device Info] 추가 항목 + 캠페인 끝 [QTMGR] 보고(json qtmgr). 값 규칙은 docs/V11_5_DEVICE_INFO_QTMGR.md.
+def _parse_qtmgr(raw):
+    if not isinstance(raw, dict):
+        sys.exit("[FATAL] qtmgr 는 객체여야 합니다.")
+    out = {}
+    for k, dflt in (('tester', 'TestPC01'), ('application', 'PC'), ('form_factor', 'M_2'),
+                    ('chamber', 'Not Chamber')):
+        v = raw.get(k, dflt)
+        if not isinstance(v, str):
+            sys.exit(f"[FATAL] qtmgr.{k} 는 문자열이어야 합니다 ({v!r} 받음).")
+        out[k] = v
+    ctrl = raw.get('ctrl', {})
+    if not isinstance(ctrl, dict) or not all(isinstance(x, str) for x in ctrl.values()):
+        sys.exit("[FATAL] qtmgr.ctrl 은 {계열: 컨트롤러 이름} 객체여야 합니다.")
+    out['ctrl'] = dict(ctrl)
+    rb = raw.get('rbuf', {}) or {}
+    if not isinstance(rb, dict):
+        sys.exit("[FATAL] qtmgr.rbuf 는 객체여야 합니다.")
+    try:
+        def _cmd(name, dflt):
+            c = rb.get(name, dflt)
+            return {f: _cfg_int(c[f]) for f in ('opcode', 'cdw10', 'cdw12', 'data_len')}
+        out['rbuf'] = {
+            'enabled': bool(rb.get('enabled', True)),
+            'sig_file': str(rb.get('sig_file', 'sig2.bin')),
+            'timeout_ms': _cfg_int(rb.get('timeout_ms', 30000)),
+            'write': _cmd('write', {'opcode': 0xC1, 'cdw10': 4, 'cdw12': 0x1, 'data_len': 16}),
+            'read': _cmd('read', {'opcode': 0xC2, 'cdw10': 4, 'cdw12': 0x23000003, 'data_len': 512}),
+            'chars': _cfg_int(rb.get('chars', 8)),
+        }
+    except (KeyError, TypeError, ValueError) as e:
+        sys.exit(f"[FATAL] qtmgr.rbuf 값이 잘못됐습니다: {e!r}")
+    if out['rbuf']['chars'] <= 0 or out['rbuf']['chars'] > out['rbuf']['read']['data_len']:
+        sys.exit("[FATAL] qtmgr.rbuf.chars 는 1..read.data_len 이어야 합니다.")
+    return out
+
+
+QTMGR = _parse_qtmgr(_CFG.get('qtmgr', {}))
+_PROCESS_T0 = time.time()      # [QTMGR] TTF — 퍼징 시작 전에 끝나면(preflight 실패 등) 프로세스 시작부터
+
+# 공칭 용량(GB, 10^9). NSZE×LBA 크기(OP 를 뺀 사용자 용량)를 가장 가까운 값(로그 비)으로 맞춘다.
+_NOMINAL_GB = (16, 32, 64, 128, 256, 512, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000)
+
+
+def _density_nominal(nbytes):
+    """사용자 용량(bytes) → ('512GB', '512 GB') / ('2TB', '2 TB'). 0·미상이면 ('', '')."""
+    if not nbytes or nbytes <= 0:
+        return '', ''
+    import math
+    gb = nbytes / 1e9
+    n = min(_NOMINAL_GB, key=lambda c: abs(math.log(gb / c)))
+    num, unit = (n, 'GB') if n < 1000 else (n // 1000, 'TB')
+    return f"{num}{unit}", f"{num} {unit}"
+
+
+def _product_oem(product, family):
+    """'PM9M1_HP' → 'HP', 'BM9K1_LENOVO' → 'LENOVO'. 계열 이름만이거나 뒤가 없으면 'BRAND'."""
+    product, family = product or '', family or product or ''
+    if family and product.startswith(family + '_') and len(product) > len(family) + 1:
+        return product[len(family) + 1:]
+    return 'BRAND'
+
+
+def _fmt_ttf(sec):
+    """전체 동작 시간 — 60분 미만은 분, 이상은 시간(소수 1자리)."""
+    m = max(0.0, float(sec or 0)) / 60
+    return f"{m:.0f} min" if m < 60 else f"{m / 60:.1f} hours"
+
+
+_SMART_TEMP_RE = re.compile(r'^\s*temperature\s*:\s*(-?\d+)\s*(°\s*C|C|K(?:elvin)?)?', re.I | re.M)
+
+
+def _smart_temp_c(text):
+    """nvme smart-log 텍스트의 Composite temperature(°C). 'temperature : 35 °C (308 K)' / '308 K'. 없으면 None."""
+    m = _SMART_TEMP_RE.search(text or '')
+    if not m:
+        return None
+    v = int(m.group(1))
+    return v - 273 if (m.group(2) or '').upper().startswith('K') else v
+
+
+def _pci_slot(bdf, slots_root='/sys/bus/pci/slots'):
+    """PCIe BDF(0000:01:00.0) → 메인보드 물리 슬롯 이름. 메인보드가 슬롯 정보를 안 주면 None."""
+    if not bdf:
+        return None
+    want = bdf.rsplit('.', 1)[0].lower()
+    try:
+        for d in sorted(Path(slots_root).iterdir()):
+            try:
+                if (d / 'address').read_text().strip().lower() == want:
+                    return d.name
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return None
 
 # NSID override 정책(값 3종).
 #   fuzz(기본): 0/broadcast/미존재/임의 NSID 변이를 제약 없이 그대로 FW에 전달한다.
@@ -2009,7 +2109,7 @@ class _FuzzingTerminalFilter(logging.Filter):
         r'|\[Exception|\[JLINK\]|\[JLINK DUMP\]|\[MONITOR\]|\[UnsupChk\]|\[POR\]|\[BootSweep\]|\[Probe-'
         r'|\[State-Snap\]|\[SMART\]'   # v8.3: 주기적 SMART/전체 state field 출력 터미널 노출
         r'|\[IO-WL\]'                   # v8.4: IO 워크로드 블록/검증 로그
-        r'|\[DevInfo\]'                 # Device Information(주기 출력) 터미널 노출
+        r'|\[Device Info\]|\[QTMGR\]'  # Device Information(주기 출력)·v11.5 끝 보고 터미널 노출
         r'|\[Taint\]'                   # v8.6: kernel taint 진단(시작/변화). [VMon] 은 파일만(터미널 제외)
         r'|\[Sampler\]'                 # 샘플러 실패→복구 알림 (커버리지 측정 정상 재개 확인)
         r'|\[cJTAG/SBA\]'               # BM9K1 transport/SBA 진단·복구
@@ -6441,6 +6541,11 @@ class _V101Fuzzer:
     #   (시작 시 FW 사전 기록·FormatNVM·Sanitize, FWDownload 청크)를 세지 않아 송신과 1:1 이 아니므로 따로 센다.
     _send_seq = 0
     _last_send_seq = None
+    # v11.5: [Device Info]·[QTMGR] — RBUF 는 시작 시 1회만 보낸다(_rbuf_tried). 끝 보고는 1회(_qtmgr_done).
+    _rbuf = None
+    _rbuf_tried = False
+    _last_smart_temp = None
+    _qtmgr_done = False
 
     @property
     def _current_ps(self) -> int:
@@ -7308,6 +7413,9 @@ class _V101Fuzzer:
 
         if proc.returncode == 0 and stdout_data.strip():
             log.info("[SMART] === NVMe SMART / Health Log ===")
+            _t = _smart_temp_c(stdout_data.decode(errors='replace'))
+            if _t is not None:
+                self._last_smart_temp = _t     # v11.5: 끝 [QTMGR] Temp — 마지막 SMART CHECK 값
             for line in stdout_data.decode(errors='replace').strip().splitlines():
                 log.info(f"[SMART] {line}")
         else:
@@ -10951,6 +11059,7 @@ class _V101Fuzzer:
         #  불필요하다. 필요한 증거는 위 선저장(로그+at-crash dmesg)+덤프 .bin 으로 충분.)
         log.error("[HANG] SSD 펌웨어 현상 유지(POR/reset/재인증 없음). "
                   f"crash 폴더의 덤프로 분석하세요 → {_logname(_crash_dir)}/  캠페인 종료.")
+        self._qtmgr_report(_crash_dir)
         return True
 
     # ------------------------------------------------------------------
@@ -12102,13 +12211,60 @@ class _V101Fuzzer:
         except Exception as e:
             return {}, str(e), -1
 
+    def _query_rbuf(self) -> str:
+        """v11.5: RBUF(FW 빌드 값) — VU 명령 2개(json qtmgr.rbuf)를 **처음 한 번만** 보내고 결과를 재사용한다.
+        write(sig_file 전송) 뒤 read 응답 앞 chars 바이트를 글자 그대로(예 '10282026'). 실패·파일 없음·
+        읽을 수 없는 글자면 빈칸. 퍼징 송신 경로(가드·cmd#·회계)를 거치지 않는 시작 시 보조 명령이다."""
+        if self._rbuf_tried:
+            return self._rbuf or ''
+        self._rbuf_tried = True
+        cfg = QTMGR['rbuf']
+        if not cfg['enabled']:
+            return ''
+        sig = Path(cfg['sig_file'])
+        if not sig.is_absolute():
+            sig = Path(__file__).parent / sig
+        if not sig.is_file():
+            log.warning(f"[Device Info] RBUF 생략 — {sig} 없음")
+            return ''
+        dev, t_ms = self.config.nvme_device, cfg['timeout_ms']
+
+        def _argv(c):
+            return ['nvme', 'admin-passthru', dev, f"--opcode={c['opcode']:#x}",
+                    f"--cdw10={c['cdw10']:#x}", f"--cdw12={c['cdw12']:#x}",
+                    f"--data-len={c['data_len']}", f'--timeout={t_ms}']
+        w, r = cfg['write'], cfg['read']
+        try:
+            p1 = subprocess.run(_argv(w) + [f'--input-file={sig}', '-w'], timeout=t_ms / 1000 + 5,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if p1.returncode != 0:
+                log.warning(f"[Device Info] RBUF 생략 — VU write 0x{w['opcode']:02x} rc={p1.returncode}: "
+                            f"{p1.stderr.decode(errors='replace').strip()[:120]}")
+                return ''
+            p2 = subprocess.run(_argv(r) + ['-r', '-b'], timeout=t_ms / 1000 + 5,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception as e:
+            log.warning(f"[Device Info] RBUF 생략 — VU 명령 실패: {e}")
+            return ''
+        head = p2.stdout[:cfg['chars']]
+        if p2.returncode != 0 or len(head) < cfg['chars']:
+            log.warning(f"[Device Info] RBUF 생략 — VU read 0x{r['opcode']:02x} rc={p2.returncode} "
+                        f"len={len(p2.stdout)}: {p2.stderr.decode(errors='replace').strip()[:120]}")
+            return ''
+        if not all(0x20 <= b < 0x7f for b in head):
+            log.warning(f"[Device Info] RBUF 생략 — 앞 {cfg['chars']}바이트가 글자가 아님 ({head.hex()})")
+            return ''
+        self._rbuf = head.decode('ascii')
+        return self._rbuf
+
     def _log_device_info(self) -> None:
         """nvme id-ctrl / id-ns + PCIe 정보를 한 번에 출력 (시작 시 + 주기적).
-        모든 줄을 [DevInfo] 태그로 출력 → 터미널 필터 통과(=== 만 보이고 내용이 사라지던 문제 해결).
-        실패해도 fuzz 진행에 영향 없음 (best-effort).
+        모든 줄을 [Device Info] 태그로 출력 → 터미널 필터 통과(=== 만 보이고 내용이 사라지던 문제 해결).
+        v11.5: Serial 다음에 Density·FW Revision·Application·CTRL·FormFactor·OEM·RBUF(json qtmgr). 값은
+        끝의 [QTMGR] 보고가 다시 쓰도록 self._devinfo 에 남긴다. 실패해도 fuzz 진행에 영향 없음 (best-effort).
         """
         def _w(s):
-            log.warning(f"[DevInfo] {s}")
+            log.warning(f"[Device Info] {s}")
 
         _w("=" * 56)
         _w("Device Information")
@@ -12122,10 +12278,33 @@ class _V101Fuzzer:
             if _err:
                 _w(f"    stderr : {_err}")
 
+        # id-ns — Density 가 Serial 바로 뒤에 찍히므로 먼저 읽는다
+        _ns = self.config.nvme_namespace or 1
+        _ns_cmd = ['nvme', 'id-ns', self.config.nvme_device, '-n', str(_ns)]
+        ns_info, _ns_err, _ns_rc = self._nvme_id_dict(_ns_cmd)
+        lba_size, cur_idx, nsze = 512, 0, 0
+        if ns_info:
+            try:
+                nsze = int(ns_info.get('nsze', 0))
+                lbafs = ns_info.get('lbafs', [])
+                cur_idx = ns_info.get('flbas', 0) & 0xF
+                if 0 <= cur_idx < len(lbafs):
+                    lba_size = 1 << lbafs[cur_idx].get('ds', 9)   # log2(LBA size)
+            except Exception:
+                nsze = 0
+
+        fam = _product_family(self.config)
+        dens_tag, dens_label = _density_nominal(nsze * lba_size)
+        info = self.__dict__.setdefault('_devinfo', {})   # 인스턴스별 — 끝의 [QTMGR] 가 다시 쓴다
         if ctrl:
-            _model  = str(ctrl.get('mn', '')).strip()
-            _serial = str(ctrl.get('sn', '')).strip()
-            _fw     = str(ctrl.get('fr', '')).strip()
+            info.update(mn=str(ctrl.get('mn', '')).strip(), sn=str(ctrl.get('sn', '')).strip(),
+                        fr=str(ctrl.get('fr', '')).strip())
+        if dens_tag:
+            info.update(density_tag=dens_tag, density=dens_label)
+        info['rbuf'] = self._query_rbuf()
+
+        if ctrl:
+            _model, _serial, _fw = info['mn'], info['sn'], info['fr']
             _vid    = ctrl.get('vid', 0)
             _ssvid  = ctrl.get('ssvid', 0)
             # ieee 는 JSON 에선 int, text 파싱에선 leading-zero 문자열 → 양쪽 통일.
@@ -12143,6 +12322,15 @@ class _V101Fuzzer:
             _tert   = _ver & 0xFF
             _w(f"  Model       : {_model}")
             _w(f"  Serial      : {_serial}")
+        _ctrl_name = QTMGR['ctrl'].get(fam)
+        _w(f"Density : {'eDensity_' + info['density_tag'] if info.get('density_tag') else ''}")
+        _w(f"FW Revision : {info.get('fr', '')}")
+        _w(f"Application : e{QTMGR['application']}")
+        _w(f"CTRL : {'e' + _ctrl_name if _ctrl_name else ''}")
+        _w(f"FormFactor : e{QTMGR['form_factor']}")
+        _w(f"OEM : e{_product_oem(self.config.product, fam)}")
+        _w(f"RBUF : {info['rbuf']}")
+        if ctrl:
             _w(f"  Firmware    : {_fw}")
             _w(f"  Vendor ID   : 0x{_vid:04x}  /  Subsys 0x{_ssvid:04x}")
             _w(f"  IEEE OUI    : {_ieee}")
@@ -12152,29 +12340,16 @@ class _V101Fuzzer:
             if _subnqn:
                 _w(f"  SubNQN      : {_subnqn}")
 
-        # id-ns — JSON 우선, 실패 시 text 파싱 fallback
-        _ns = self.config.nvme_namespace or 1
-        _ns_cmd = ['nvme', 'id-ns', self.config.nvme_device, '-n', str(_ns)]
-        ns_info, _err, _rc = self._nvme_id_dict(_ns_cmd)
         if not ns_info:
-            _w(f"  id-ns rc={_rc}")
+            _w(f"  id-ns rc={_ns_rc}")
             _w(f"    cmd    : {' '.join(_ns_cmd)}")
-            if _err:
-                _w(f"    stderr : {_err}")
+            if _ns_err:
+                _w(f"    stderr : {_ns_err}")
             _w("=" * 56)
             return
         try:
-            nsze = ns_info.get('nsze', 0)
             ncap = ns_info.get('ncap', 0)
             nuse = ns_info.get('nuse', 0)
-            # 현재 활성 LBA format 의 data size
-            lbafs    = ns_info.get('lbafs', [])
-            flbas    = ns_info.get('flbas', 0)
-            cur_idx  = flbas & 0xF
-            lba_size = 512
-            if 0 <= cur_idx < len(lbafs):
-                _ds = lbafs[cur_idx].get('ds', 9)   # log2(LBA size)
-                lba_size = 1 << _ds
             _size_gb = nsze * lba_size / 1e9
             _use_pct = (100 * nuse / ncap) if ncap else 0.0
             _w(f"  Namespace {_ns}")
@@ -15020,6 +15195,7 @@ class _V101Fuzzer:
         except Exception as e:
             log.warning(f"[ARTIFACT] 수집 중 예외: {e}")
         log.error(f"[{kind}] 증거 폴더: {_logname(dest)}/")
+        self._qtmgr_report(dest)
         return False
 
     def _pm_preflight_s1_s2(self) -> bool:
@@ -16539,6 +16715,7 @@ class _V101Fuzzer:
             self._dump_logs = []
         n_logs = len(self._dump_logs)
         before = self._dump_snapshot() if dest_dir is not None else None
+        _in_dest = set(self._files_under(dest_dir))   # v11.5: 이 덤프가 crash 폴더에 남긴 파일 → [QTMGR] UFAS Path
         prev = getattr(self, '_dump_log_dir', None)
         if dest_dir is not None:
             try:
@@ -16555,6 +16732,7 @@ class _V101Fuzzer:
                     self._log_dump_output(path, ltag)
                 except Exception as e:
                     log.warning(f"[ARTIFACT] {tag} 도구 출력 기록 예외: {e}")
+            _tool_logs = {os.path.abspath(pth) for pth, _ in self._dump_logs[n_logs:]}
             del self._dump_logs[n_logs:]
             # timeout 으로 포기한 덤프도 부분 파일을 남긴다 — 없는 것보다 낫다.
             if dest_dir is not None:
@@ -16562,6 +16740,16 @@ class _V101Fuzzer:
                     self._copy_new_dump_files(before, Path(dest_dir), tag)
                 except Exception as e:
                     log.warning(f"[ARTIFACT] {tag} 덤프 수집 예외: {e}")
+                _out = self.__dict__.setdefault('_dump_outputs', [])
+                _out += [(tag, f) for f in self._files_under(dest_dir)
+                         if f not in _in_dest and f not in _tool_logs]
+
+    @staticmethod
+    def _files_under(d) -> list:
+        """d 아래 파일 절대경로(정렬). d 가 None·없음이면 []."""
+        if d is None or not os.path.isdir(d):
+            return []
+        return sorted(os.path.abspath(os.path.join(r, f)) for r, _, fs in os.walk(d) for f in fs)
 
     def _run_jlink_dump(self, dest_dir: Optional[Path] = None) -> None:
         self._run_dump_collected('JLINK', dest_dir, self._run_jlink_dump_body)
@@ -17242,6 +17430,64 @@ class _V101Fuzzer:
             log.warning(f"[ARTIFACT] (선저장) dmesg 저장 실패: {e}")
         log.warning(f"[ARTIFACT] dump 전 선저장 완료 → {_logname(dest)}/ "
                     f"(crash json / replay / log / dmesg — 여기서 중단해도 분석 가능)")
+
+    def _qtmgr_report(self, crash_dir=None) -> None:
+        """v11.5: 캠페인 끝 [QTMGR] 보고 — 1회. crash 면 덤프·crash 폴더 수집이 끝난 뒤(crash_dir),
+        crash 없이 끝나면 종료 요약 뒤(경로는 N/A). 값은 시작 시 [Device Info](self._devinfo)·
+        마지막 SMART CHECK·json qtmgr 에서 온다. 실패해도 종료 흐름에 영향 없음."""
+        if self._qtmgr_done:
+            return
+        self._qtmgr_done = True
+        try:
+            info = getattr(self, '_devinfo', None) or {}
+            fam = _product_family(self.config)
+            bdf = getattr(self, '_pcie_bdf', None)
+            if not bdf:
+                m = re.search(r'(nvme\d+)', self.config.nvme_device or '')
+                try:
+                    bdf = Path(f'/sys/class/nvme/{m.group(1)}/address').read_text().strip() if m else None
+                except OSError:
+                    bdf = None
+            _t0 = getattr(self, 'start_time', None)
+            ttf = (datetime.now() - _t0).total_seconds() if _t0 else time.time() - _PROCESS_T0
+            temp = self._last_smart_temp
+            dmesg, dumps = [], []
+            if crash_dir is not None:
+                cd = os.path.abspath(crash_dir)
+                dmesg = sorted(f for f in self._files_under(cd)
+                               if re.match(r'dmesg_.*\.txt$', os.path.basename(f)))
+                for tag in dict.fromkeys(t for t, _ in getattr(self, '_dump_outputs', [])):
+                    fs = [f for t, f in self._dump_outputs if t == tag and f.startswith(cd + os.sep)]
+                    # 덤프가 파일을 많이 만들면(SnapShot 폴더 등) 파일 대신 폴더를 찍는다
+                    dumps += fs if len(fs) <= 10 else sorted({os.path.dirname(f) for f in fs})
+            sep = "=" * 52
+            out = [sep,
+                   f"[QTMGR] Tester : {QTMGR['tester']}",
+                   f"[QTMGR] Slot : {_pci_slot(bdf) or bdf or ''}",
+                   sep,
+                   "[QTMGR] Test Item : Fuzzer",
+                   f"[QTMGR] Test Case : {'Fuzzing with PM' if self.config.pm_inject_prob > 0 else 'Fuzzing'}",
+                   sep,
+                   f"[QTMGR] Product : e{fam}",
+                   f"[QTMGR] OEM : {_product_oem(self.config.product, fam)}",
+                   f"[QTMGR] Density : {info.get('density', '')}",
+                   f"[QTMGR] Form Factor : {QTMGR['form_factor']}",
+                   f"[QTMGR] FW Rev : {info.get('fr', '')}",
+                   f"[QTMGR] FW Build : {info.get('rbuf', '')}",
+                   f"[QTMGR] MN : {info.get('mn', '')}",
+                   f"[QTMGR] SN : {info.get('sn', '')}",
+                   sep,
+                   f"[QTMGR] TTF : {_fmt_ttf(ttf)}",
+                   f"[QTMGR] Temp ('C) : {temp if temp is not None else 'N/A'} (saved value from last SMART CHECK)",
+                   f"[QTMGR] Chamber ('C) : {QTMGR['chamber']}",
+                   sep]
+            out += [f"[QTMGR] Dmesg Path : {f}" for f in dmesg] or ["[QTMGR] Dmesg Path : N/A"]
+            out += [f"[QTMGR] UFAS Path : {f}" for f in dumps] or ["[QTMGR] UFAS Path : N/A"]
+            out.append(sep)
+            for line in out:
+                log.warning(line)
+        except Exception as e:
+            log.warning(f"[QTMGR] 보고 실패: {e}")
 
     def _collect_crash_artifacts(self, crash_time: datetime) -> None:
         """JLink/UFAS dump 완료 후 관련 파일을 날짜 폴더에 모아 복사한다.
@@ -18224,6 +18470,7 @@ class _V101Fuzzer:
             self._collect_crash_artifacts(_crash_time)
         except Exception as _art_exc:
             log.warning(f"[ARTIFACT] 수집 중 예외: {_art_exc}")
+        self._qtmgr_report(_crash_dir)
 
         # 4) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
         log.error(
@@ -21823,6 +22070,8 @@ function filter(){{const s=q.value.toLowerCase();let n=0;for(const r of rows){{c
                 pass
 
             self._log_process_memory("after-final-charts")
+            # v11.5: crash 로 끝났으면 덤프·수집 직후 이미 찍었다(1회). crash 없이 끝나면 여기서.
+            self._qtmgr_report(None)
 
             # timeout crash: JLink PC 관측 최대 20회 (30초 간격, Ctrl+C로 조기 종료)
             # OpenOCD는 JLink dump 전에 이미 종료됨 → JLink 직접 연결로 PC 읽기
@@ -24622,6 +24871,7 @@ class ExceptionFuzzerMixin:
         if not controller.powered or controller.asserted or controller.runner.has_pending(supply_only=True):
             controller.emit('dump_unavailable', powered=controller.powered, asserted=controller.asserted,
                             reason='supply not stable or hardware helper pending')
+            self._qtmgr_report(dest)
             return
         for enabled, name, dump in (
                 (self.config.enable_jlink_dump, 'JLINK', self._run_jlink_dump),
@@ -24639,6 +24889,7 @@ class ExceptionFuzzerMixin:
                 controller.emit('dump_returned', backend=name)
             except Exception as exc:
                 controller.emit('dump_error', backend=name, reason=str(exc))
+        self._qtmgr_report(dest)
 
     def _stop_sampling_checked(self, context='command'):
         if not self._exception_interrupted:
