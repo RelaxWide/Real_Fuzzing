@@ -121,7 +121,8 @@ class DeviceInfo(unittest.TestCase):
             '  CTRL        : ePALAU', '  FormFactor  : eM_2', '  OEM         : eHP', '  RBUF        : 20261028'])
         # 기존 줄과 같은 들여쓰기·': ' 위치
         self.assertEqual({l.index(': ') for l in body[i - 1:i + 9]}, {14})
-        self.assertTrue(body[i + 8].strip().startswith('Firmware'), '나머지 정보가 이어서 나와야 한다')
+        self.assertTrue(body[i + 8].strip().startswith('Vendor ID'), '나머지 정보가 이어서 나와야 한다')
+        self.assertEqual([l for l in body if 'BXV7401Q' in l], ['  FW Revision : BXV7401Q'], 'FW 는 한 번만')
         self.assertTrue(any('NSZE' in l for l in body))
 
     def test_ctrl_and_oem_per_product(self):

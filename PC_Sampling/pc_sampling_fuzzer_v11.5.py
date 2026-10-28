@@ -12311,7 +12311,7 @@ class _V101Fuzzer:
         info['rbuf'] = _rbuf
 
         if ctrl:
-            _model, _serial, _fw = info['mn'], info['sn'], info['fr']
+            _model, _serial = info['mn'], info['sn']
             _vid    = ctrl.get('vid', 0)
             _ssvid  = ctrl.get('ssvid', 0)
             # ieee 는 JSON 에선 int, text 파싱에선 leading-zero 문자열 → 양쪽 통일.
@@ -12339,8 +12339,7 @@ class _V101Fuzzer:
                          ('OEM', 'e' + _product_oem(self.config.product, fam)),
                          ('RBUF', info['rbuf'])):
             _w(f"  {_k:<12}: {_val}")
-        if ctrl:
-            _w(f"  Firmware    : {_fw}")
+        if ctrl:   # FW 는 위 FW Revision 줄에 이미 있다(Firmware 줄 제거 — 사용자 요청)
             _w(f"  Vendor ID   : 0x{_vid:04x}  /  Subsys 0x{_ssvid:04x}")
             _w(f"  IEEE OUI    : {_ieee}")
             _w(f"  NVMe spec   : {_major}.{_minor}.{_tert}  (raw 0x{_ver:08x})")

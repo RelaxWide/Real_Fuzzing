@@ -3,7 +3,7 @@
 설정: `fuzzer_config.json` 최상위 `qtmgr`. 잘못된 값은 시작 시 `[FATAL]`.
 
 ## [Device Info] (시작 시 + 주기 재출력)
-태그가 `[DevInfo]` → `[Device Info]`. `Model`·`Serial` 다음에 아래 줄, 그 뒤에 기존 줄(Firmware ~ PCIe)이 이어진다.
+태그가 `[DevInfo]` → `[Device Info]`. `Model`·`Serial` 다음에 아래 줄, 그 뒤에 기존 줄(Vendor ID ~ PCIe)이 이어진다. FW 는 `FW Revision` 한 줄만(기존 `Firmware` 줄 제거).
 
 | 줄 | 값 |
 |---|---|
