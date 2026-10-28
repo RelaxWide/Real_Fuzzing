@@ -237,6 +237,13 @@
       "date": "2026-10-22",
       "base_commit": "4c93862",
       "reason": "Log text only: the send number label is renamed from send#N to cmd#N on the [NVMe], [NVMe TIMEOUT] and [NVMe RET] lines (user request). No behavior change. Tests: test_v11_3_send_seq."
+    },
+    {
+      "file": "pc_sampling_fuzzer_v11.5.py",
+      "path": "_V101Fuzzer._send_nvme_command",
+      "date": "2026-10-28",
+      "base_commit": "fdeee3a",
+      "reason": "BM9K1 timeout PS factor is now selected by product family (_product_family(config) == 'BM9K1', json products.<product>.family) instead of the literal product name, so the BM9K1_LENOVO / BM9K1_HP variants get the same x10 PS1/PS2 window. Same result for --product BM9K1 and for every other product. Tests: test_v11_5_product_variants, test_v11_2_ps_timeout."
     }
   ],
   "overrides_note": "hashes 는 모든 DEVICE_AST_FILES 에 적용되는 기준선이다. overrides 는 검토를 거쳐 **특정 파일에서만** 의도적으로 달라진 경로를 기록한다. v10.2 는 검증된 fallback 이라 계속 기준선 그대로여야 하고, 여기 올라오지 않은 파일·경로는 전부 기준선에 묶인다.",
@@ -270,6 +277,12 @@
     "pc_sampling_fuzzer_v11.4.py": {
       "OpenOCDPCSampler": "10ac4c4fbcb5072ff0050803d4d2a56aa01643199cbb139f6e0c3fddc351f4ea",
       "_V101Fuzzer._send_nvme_command": "9fd245f937911447496124cff6cb51d52c0dae8adca2373dcc3caedcde96bc51",
+      "RiscvPcsrSampler": "dbd345f654ba6361644dc3bdaa423b9846a77c5d3ccd0a34b0f3e7a4ec4b23aa",
+      "JLinkHaltSampler": "6addeca701c4ea5ce33c1a6467045a357a6247b64c10fb9cc59695cdc5881255"
+    },
+    "pc_sampling_fuzzer_v11.5.py": {
+      "OpenOCDPCSampler": "10ac4c4fbcb5072ff0050803d4d2a56aa01643199cbb139f6e0c3fddc351f4ea",
+      "_V101Fuzzer._send_nvme_command": "654a26930da59d3d31f0be8ae04be509b92145920a4e5491c288870cb27e50f5",
       "RiscvPcsrSampler": "dbd345f654ba6361644dc3bdaa423b9846a77c5d3ccd0a34b0f3e7a4ec4b23aa",
       "JLinkHaltSampler": "6addeca701c4ea5ce33c1a6467045a357a6247b64c10fb9cc59695cdc5881255"
     }

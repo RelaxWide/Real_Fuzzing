@@ -23,6 +23,7 @@ from fuzzer_target import FUZZER_FILE, fuzzer             # noqa: E402
 DEVICE_AST_FILES = (ROOT / 'pc_sampling_fuzzer_v10.2.py', ROOT / 'pc_sampling_fuzzer_v10.3.py',
                     ROOT / 'pc_sampling_fuzzer_v11.py', ROOT / 'pc_sampling_fuzzer_v11.1.py',
                     ROOT / 'pc_sampling_fuzzer_v11.2.py', ROOT / 'pc_sampling_fuzzer_v11.3.py',
+                    ROOT / 'pc_sampling_fuzzer_v11.4.py',
                     FUZZER_FILE)
 
 

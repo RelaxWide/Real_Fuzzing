@@ -333,8 +333,10 @@ class Wiring(unittest.TestCase):
 
     def test_only_bm9k1_enabled_in_config(self):
         cfg = json.loads((FUZZER_FILE.parent / 'fuzzer_config.json').read_text(encoding='utf-8-sig'))
-        on = sorted(n for n, p in cfg['products'].items() if p.get('pm_detach_sampler'))
-        self.assertEqual(on, ['BM9K1'])
+        on = {n: p.get('family', n) for n, p in cfg['products'].items() if p.get('pm_detach_sampler')}
+        self.assertIn('BM9K1', on)
+        # v11.5: BM9K1 파생형(BM9K1_LENOVO·BM9K1_HP)도 같은 계열이라 켠다. 다른 계열은 끈다.
+        self.assertEqual(set(on.values()), {'BM9K1'}, on)
 
     def test_no_jlink_disables(self):
         self.assertIn("pm_detach_sampler=bool(_profile.get('pm_detach_sampler', False)) and not args.no_jlink",
