@@ -40,8 +40,9 @@ class LogFile(unittest.TestCase):
         path = self.setup()
         self.assertRegex(path.name, r'^fuzzer_\d{8}_\d{6}_log\.txt$')
         lines = path.read_text(encoding='utf-8').splitlines()
-        self.assertEqual(lines[0], '[ TEST LOCATION : { TESTER:TestPC01, BOARD:NA, SLOT:NA, PORT:NA } ]')
-        for line in lines[1:]:
+        self.assertRegex(lines[0], r'^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}\] \[INFO\] '
+                         r'\[ TEST LOCATION : \{ TESTER:TestPC01, BOARD:NA, SLOT:NA, PORT:NA \} \]$')
+        for line in lines:
             self.assertRegex(line, r'^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}\] \[[A-Z]+\] ', line)
         self.assertTrue(any(l.endswith('[WARNING] [Stats] marker') for l in lines))
         self.assertEqual(list(Path(self.tmp.name).glob('fuzzer_*.log')), [])
@@ -49,8 +50,8 @@ class LogFile(unittest.TestCase):
     def test_location_from_json(self):
         with patch.dict(v.QTMGR, tester='TestPC07', board='B2', slot='3', port='1'):
             path = self.setup()
-        self.assertEqual(path.read_text(encoding='utf-8').splitlines()[0],
-                         '[ TEST LOCATION : { TESTER:TestPC07, BOARD:B2, SLOT:3, PORT:1 } ]')
+        self.assertTrue(path.read_text(encoding='utf-8').splitlines()[0].endswith(
+            '] [INFO] [ TEST LOCATION : { TESTER:TestPC07, BOARD:B2, SLOT:3, PORT:1 } ]'))
 
     def test_llm_log_and_terminal_use_same_timestamp_format(self):
         rec = logging.LogRecord('pcfuzz', logging.WARNING, __file__, 1, '[LLM] x', None, None)
