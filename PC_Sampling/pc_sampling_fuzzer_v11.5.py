@@ -1003,13 +1003,17 @@ def _parse_qtmgr(raw):
     if not isinstance(raw, dict):
         sys.exit("[FATAL] qtmgr 는 객체여야 합니다.")
     out = {}
-    for k, dflt in (('tester', 'TestPC01'), ('application', 'PC'), ('form_factor', 'M_2'),
-                    ('chamber', 'Not Chamber'), ('board', 'NA'), ('slot', 'NA'), ('port', 'NA'),
+    for k, dflt in (('tester', 'RS0000-0'), ('application', 'PC'), ('form_factor', 'M_2'),
+                    ('chamber', 'Not Chamber'), ('board', '0'), ('slot', '0'), ('port', '0'),
                     ('config_file', 'Fuzzer.json'), ('project', 'PC_NVME_')):
         v = raw.get(k, dflt)
         if not isinstance(v, str):
             sys.exit(f"[FATAL] qtmgr.{k} 는 문자열이어야 합니다 ({v!r} 받음).")
         out[k] = v
+    # 로그 첫 줄 TEST LOCATION 은 사내 파서가 정규식에 맞는 값만 받는다 — 안 맞으면 조용히 버려지므로 시작 시 멈춘다
+    for k, pat, eg in (('tester', r'RS\d{4}-\d+', 'RS0000-0'), ('board', r'\d+', '0'), ('slot', r'\d+', '0')):
+        if not re.fullmatch(pat, out[k]):
+            sys.exit(f"[FATAL] qtmgr.{k}={out[k]!r} 가 로그 파서 형식 {pat} 에 맞지 않습니다(예 {eg}).")
     ctrl = raw.get('ctrl', {})
     if not isinstance(ctrl, dict) or not all(isinstance(x, str) for x in ctrl.values()):
         sys.exit("[FATAL] qtmgr.ctrl 은 {계열: 컨트롤러 이름} 객체여야 합니다.")
@@ -1079,23 +1083,6 @@ def _smart_temp_c(text):
         return None
     v = int(m.group(1))
     return v - 273 if (m.group(2) or '').upper().startswith('K') else v
-
-
-def _pci_slot(bdf, slots_root='/sys/bus/pci/slots'):
-    """PCIe BDF(0000:01:00.0) → 메인보드 물리 슬롯 이름. 메인보드가 슬롯 정보를 안 주면 None."""
-    if not bdf:
-        return None
-    want = bdf.rsplit('.', 1)[0].lower()
-    try:
-        for d in sorted(Path(slots_root).iterdir()):
-            try:
-                if (d / 'address').read_text().strip().lower() == want:
-                    return d.name
-            except OSError:
-                continue
-    except OSError:
-        pass
-    return None
 
 # NSID override 정책(값 3종).
 #   fuzz(기본): 0/broadcast/미존재/임의 NSID 변이를 제약 없이 그대로 FW에 전달한다.
@@ -17471,13 +17458,6 @@ class _V101Fuzzer:
         try:
             info = getattr(self, '_devinfo', None) or {}
             fam = _product_family(self.config)
-            bdf = getattr(self, '_pcie_bdf', None)
-            if not bdf:
-                m = re.search(r'(nvme\d+)', self.config.nvme_device or '')
-                try:
-                    bdf = Path(f'/sys/class/nvme/{m.group(1)}/address').read_text().strip() if m else None
-                except OSError:
-                    bdf = None
             _t0 = getattr(self, 'start_time', None)
             _end = end_time or getattr(self, '_run_end_time', None) or datetime.now()
             ttf = ((_end - _t0).total_seconds() if _t0 else _end.timestamp() - _PROCESS_T0)
@@ -17494,7 +17474,7 @@ class _V101Fuzzer:
             sep = "=" * 52
             out = [sep,
                    f"[QTMGR] Tester : {QTMGR['tester']}",
-                   f"[QTMGR] Slot : {_pci_slot(bdf) or bdf or ''}",
+                   f"[QTMGR] Slot : {QTMGR['slot']}",          # 로그 첫 줄 TEST LOCATION 과 같은 값
                    sep,
                    "[QTMGR] Test Item : Fuzzer",
                    f"[QTMGR] Test Case : {'Fuzzing with PM' if self.config.pm_inject_prob > 0 else 'Fuzzing'}",

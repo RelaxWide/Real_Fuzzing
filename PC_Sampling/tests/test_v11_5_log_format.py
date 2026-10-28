@@ -41,7 +41,7 @@ class LogFile(unittest.TestCase):
         self.assertRegex(path.name, r'^fuzzer_\d{8}_\d{6}_log\.txt$')
         lines = path.read_text(encoding='utf-8').splitlines()
         self.assertRegex(lines[0], r'^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}\] \[INFO\] '
-                         r'\[ TEST LOCATION : \{ TESTER:TestPC01, BOARD:NA, SLOT:NA, PORT:NA \} \]$')
+                         r'\[ TEST LOCATION : \{ TESTER:RS0000-0, BOARD:0, SLOT:0, PORT:0 \} \]$')
         self.assertTrue(lines[1].endswith('] [INFO] CONFIG FILE : Fuzzer.json'), lines[1])
         self.assertTrue(lines[2].endswith('] [INFO] PROJECT : PC_NVME_'), lines[2])
         for line in lines:
@@ -50,10 +50,20 @@ class LogFile(unittest.TestCase):
         self.assertEqual(list(Path(self.tmp.name).glob('fuzzer_*.log')), [])
 
     def test_location_from_json(self):
-        with patch.dict(v.QTMGR, tester='TestPC07', board='B2', slot='3', port='1'):
+        with patch.dict(v.QTMGR, tester='RS0123-4', board='2', slot='3', port='1'):
             path = self.setup()
         self.assertTrue(path.read_text(encoding='utf-8').splitlines()[0].endswith(
-            '] [INFO] [ TEST LOCATION : { TESTER:TestPC07, BOARD:B2, SLOT:3, PORT:1 } ]'))
+            '] [INFO] [ TEST LOCATION : { TESTER:RS0123-4, BOARD:2, SLOT:3, PORT:1 } ]'))
+
+    def test_location_line_matches_parser_regexes(self):
+        """사내 로그 파서가 받는 정규식(2026-10-28 사용자 제공) 그대로."""
+        line = self.setup().read_text(encoding='utf-8').splitlines()[0]
+        for pat, group, want in ((r'.*TESTER:(?P<tester_id>RS\d{4}-\d+)', 'tester_id', 'RS0000-0'),
+                                 (r'.*BOARD:(?P<board_id>\d+)', 'board_id', '0'),
+                                 (r'.*SLOT:(?P<slot_id>\d+)', 'slot_id', '0')):
+            m = re.match(pat, line)
+            self.assertIsNotNone(m, pat)
+            self.assertEqual(m.group(group), want)
 
     def test_llm_log_and_terminal_use_same_timestamp_format(self):
         rec = logging.LogRecord('pcfuzz', logging.WARNING, __file__, 1, '[LLM] x', None, None)

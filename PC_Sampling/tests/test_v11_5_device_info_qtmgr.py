@@ -68,17 +68,9 @@ class Helpers(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(v._smart_temp_c(text), want)
 
-    def test_pci_slot(self):
-        with tempfile.TemporaryDirectory() as d:
-            for name, addr in (('1', '0000:02:00'), ('3', '0000:01:00')):
-                (Path(d) / name).mkdir()
-                (Path(d) / name / 'address').write_text(addr + '\n')
-            self.assertEqual(v._pci_slot('0000:01:00.0', d), '3')
-            self.assertIsNone(v._pci_slot('0000:05:00.0', d))
-            self.assertIsNone(v._pci_slot('0000:01:00.0', d + '/nope'))
-
     def test_shipped_json(self):
-        self.assertEqual(v.QTMGR['tester'], 'TestPC01')
+        self.assertEqual((v.QTMGR['tester'], v.QTMGR['board'], v.QTMGR['slot'], v.QTMGR['port']),
+                         ('RS0000-0', '0', '0', '0'))
         self.assertEqual(v.QTMGR['ctrl'], {'BM9K1': 'PALAU', 'PM9M1': 'SM2504XT', 'BM9H1': 'SM2269XT',
                                            'P7': 'PS2251_U21', 'P9': 'PS2251_U21'})
         rb = v.QTMGR['rbuf']
@@ -90,7 +82,8 @@ class Helpers(unittest.TestCase):
 
     def test_bad_config_fails_loudly(self):
         for bad in ([], {'tester': 3}, {'ctrl': {'BM9K1': 1}}, {'rbuf': {'write': {'opcode': 'x'}}},
-                    {'rbuf': {'digits': 0}}, {'rbuf': {'digits': 7}}, {'rbuf': {'digits': 2000}}):
+                    {'rbuf': {'digits': 0}}, {'rbuf': {'digits': 7}}, {'rbuf': {'digits': 2000}},
+                    {'tester': 'TestPC01'}, {'tester': 'RS000-1'}, {'board': 'NA'}, {'slot': '0000:01:00.0'}):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 v._parse_qtmgr(bad)
 
@@ -214,8 +207,7 @@ class Qtmgr(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
 
     def report(self, f, crash_dir=None):
-        with patch.object(v, '_pci_slot', return_value=None), \
-                self.assertLogs('pcfuzz', level='WARNING') as logs:
+        with self.assertLogs('pcfuzz', level='WARNING') as logs:
             f._qtmgr_report(crash_dir)
         return [l.split(':', 2)[2] for l in logs.output]
 
@@ -239,7 +231,7 @@ class Qtmgr(unittest.TestCase):
         out = self.report(f, cd)
         sep = '=' * 52
         self.assertEqual(out, [
-            sep, '[QTMGR] Tester : TestPC01', '[QTMGR] Slot : 0000:01:00.0',
+            sep, '[QTMGR] Tester : RS0000-0', '[QTMGR] Slot : 0',
             sep, '[QTMGR] Test Item : Fuzzer', '[QTMGR] Test Case : Fuzzing with PM',
             sep, '[QTMGR] Product : ePM9M1', '[QTMGR] OEM : HP', '[QTMGR] Density : 512 GB',
             '[QTMGR] Form Factor : M_2', '[QTMGR] FW Rev : BXV7401Q', '[QTMGR] FW Build : 10282026',
@@ -259,7 +251,7 @@ class Qtmgr(unittest.TestCase):
         cd = Path(self.tmp.name) / 'crash_t'
         cd.mkdir()
         with patch.object(v, 'datetime', Mock(now=Mock(return_value=crash_at + timedelta(minutes=20)))), \
-                patch.object(v, '_pci_slot', return_value=None), self.assertLogs('pcfuzz', level='WARNING') as logs:
+                self.assertLogs('pcfuzz', level='WARNING') as logs:
             f._qtmgr_report(cd, crash_at)
         self.assertIn('[QTMGR] TTF : 10 min', '\n'.join(logs.output))
 
@@ -336,7 +328,7 @@ class CrashFolderContents(unittest.TestCase):
         self.assertEqual(len([n for n in names if n.startswith('dmesg_')]), 1, names)
         self.assertFalse([n for n in names if n.startswith('crash_') and n.endswith('.json')], names)
         text = (d / 'pcfuzz.log').read_text(encoding='utf-8')
-        self.assertIn('[QTMGR] Tester : TestPC01', text, 'crash 폴더 로그 사본에 [QTMGR] 가 없다')
+        self.assertIn('[QTMGR] Tester : RS0000-0', text, 'crash 폴더 로그 사본에 [QTMGR] 가 없다')
         self.assertIn('[QTMGR] Dmesg Path : ', text)
         self.assertIn('_at_crash.txt', text.split('[QTMGR] Dmesg Path : ', 1)[1].splitlines()[0])
 

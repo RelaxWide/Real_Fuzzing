@@ -327,15 +327,15 @@
     "ffm_field": "ffm_frag",
     "burst_walltime_cap_sec": 120.0
   },
-  "_comment_qtmgr": "v11.5. 시작 시 [Device Info] 추가 항목과 캠페인 끝(덤프·crash 폴더 수집 뒤, crash 가 없으면 종료 요약 뒤)의 [QTMGR] 보고. tester 는 PC 이름(기본 TestPC01). application/form_factor 는 Device Info 에서 앞에 e 를 붙여 찍는다. ctrl 은 제품 계열(products.<제품>.family, 생략 시 제품명)별 컨트롤러 이름. board/slot/port 는 tester 와 함께 로그 맨 첫 줄 [ TEST LOCATION : { TESTER:…, BOARD:…, SLOT:…, PORT:… } ] 에, config_file·project 는 그 아래 'CONFIG FILE : …'·'PROJECT : …' 줄에 그대로 쓴다(실제 설정 파일 이름과 무관한 보고용 값). rbuf 는 시작 시 1회 보내는 VU 명령 두 개(write 로 sig_file 을 보내고 read 응답 버퍼 앞 digits 자리 hex — 바이트당 숫자 두 자리라 10 23 20 26 → 10232026) — sig_file 은 퍼저 폴더 기준 상대경로. 실패하면 빈칸.",
+  "_comment_qtmgr": "v11.5. 시작 시 [Device Info] 추가 항목과 캠페인 끝(덤프·crash 폴더 수집 뒤, crash 가 없으면 종료 요약 뒤)의 [QTMGR] 보고. tester 는 시험 PC ID(로그 파서 형식 RS####-#, 기본 RS0000-0), board·slot 은 숫자(기본 0) — 형식이 안 맞으면 시작 시 [FATAL]. [QTMGR] Tester·Slot 도 이 값. application/form_factor 는 Device Info 에서 앞에 e 를 붙여 찍는다. ctrl 은 제품 계열(products.<제품>.family, 생략 시 제품명)별 컨트롤러 이름. board/slot/port 는 tester 와 함께 로그 맨 첫 줄 [ TEST LOCATION : { TESTER:…, BOARD:…, SLOT:…, PORT:… } ] 에, config_file·project 는 그 아래 'CONFIG FILE : …'·'PROJECT : …' 줄에 그대로 쓴다(실제 설정 파일 이름과 무관한 보고용 값). rbuf 는 시작 시 1회 보내는 VU 명령 두 개(write 로 sig_file 을 보내고 read 응답 버퍼 앞 digits 자리 hex — 바이트당 숫자 두 자리라 10 23 20 26 → 10232026) — sig_file 은 퍼저 폴더 기준 상대경로. 실패하면 빈칸.",
   "qtmgr": {
-    "tester": "TestPC01",
+    "tester": "RS0000-0",
     "application": "PC",
     "form_factor": "M_2",
     "chamber": "Not Chamber",
-    "board": "NA",
-    "slot": "NA",
-    "port": "NA",
+    "board": "0",
+    "slot": "0",
+    "port": "0",
     "config_file": "Fuzzer.json",
     "project": "PC_NVME_",
     "ctrl": {

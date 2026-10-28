@@ -34,8 +34,8 @@ nvme admin-passthru /dev/nvmeN --opcode=0xc2 --cdw10=0x4 --cdw12=0x23000003 --da
 
 | 줄 | 값 |
 |---|---|
-| Tester | `qtmgr.tester` (기본 `TestPC01`) — PC 마다 json 에서 바꾼다 |
-| Slot | 메인보드가 주는 물리 슬롯 번호(`/sys/bus/pci/slots`), 없으면 PCIe BDF |
+| Tester | `qtmgr.tester` (기본 `RS0000-0`, 형식 `RS\d{4}-\d+`) — PC 마다 json 에서 바꾼다 |
+| Slot | `qtmgr.slot` (기본 `0`, 숫자) — 로그 첫 줄 SLOT 과 같은 값 |
 | Test Case | `--pm` 없으면 `Fuzzing`, 있으면 `Fuzzing with PM` |
 | Product | `e` + 제품 계열 (`ePM9M1`, `eBM9K1`, `eBM9H1`, `eP7`, `eP9`) |
 | OEM | 위 OEM 에서 `e` 없이 (`HP`, `LENOVO`, `BRAND`) |
@@ -57,6 +57,7 @@ nvme admin-passthru /dev/nvmeN --opcode=0xc2 --cdw10=0x4 --cdw12=0x23000003 --da
 
 ## 로그 파일 (v11.5)
 - 이름: `output/fuzzer_<YYYYmmdd_HHMMSS>_log.txt` (예전 `fuzzer_<ts>.log`). LLM 전용 로그 `output/llm/llm_<ts>.log` 는 그대로.
-- 첫 줄: `[<타임스탬프>] [INFO] [ TEST LOCATION : { TESTER:TestPC01, BOARD:NA, SLOT:NA, PORT:NA } ]` — json `qtmgr.tester/board/slot/port`.
+- 첫 줄: `[<타임스탬프>] [INFO] [ TEST LOCATION : { TESTER:RS0000-0, BOARD:0, SLOT:0, PORT:0 } ]` — json `qtmgr.tester/board/slot/port`.
+  사내 로그 파서가 정규식에 맞는 값만 받는다: TESTER `RS\d{4}-\d+`, BOARD `\d+`, SLOT `\d+`. 맞지 않으면 시작 시 `[FATAL]`.
 - 둘째·셋째 줄: `[<타임스탬프>] [INFO] CONFIG FILE : Fuzzer.json`, `[<타임스탬프>] [INFO] PROJECT : PC_NVME_` — json `qtmgr.config_file/project`(보고용 값, 실제 설정 파일은 fuzzer_config.json).
 - 모든 줄의 타임스탬프를 `[]` 로 감싼다(파일·LLM 로그·터미널): `[2026-10-28 18:53:51.502] [WARNING] …`.
