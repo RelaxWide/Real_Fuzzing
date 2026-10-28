@@ -58,4 +58,5 @@ nvme admin-passthru /dev/nvmeN --opcode=0xc2 --cdw10=0x4 --cdw12=0x23000003 --da
 ## 로그 파일 (v11.5)
 - 이름: `output/fuzzer_<YYYYmmdd_HHMMSS>_log.txt` (예전 `fuzzer_<ts>.log`). LLM 전용 로그 `output/llm/llm_<ts>.log` 는 그대로.
 - 첫 줄: `[<타임스탬프>] [INFO] [ TEST LOCATION : { TESTER:TestPC01, BOARD:NA, SLOT:NA, PORT:NA } ]` — json `qtmgr.tester/board/slot/port`.
+- 둘째·셋째 줄: `[<타임스탬프>] [INFO] CONFIG FILE : Fuzzer.json`, `[<타임스탬프>] [INFO] PROJECT : PC_NVME_` — json `qtmgr.config_file/project`(보고용 값, 실제 설정 파일은 fuzzer_config.json).
 - 모든 줄의 타임스탬프를 `[]` 로 감싼다(파일·LLM 로그·터미널): `[2026-10-28 18:53:51.502] [WARNING] …`.

@@ -42,6 +42,8 @@ class LogFile(unittest.TestCase):
         lines = path.read_text(encoding='utf-8').splitlines()
         self.assertRegex(lines[0], r'^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}\] \[INFO\] '
                          r'\[ TEST LOCATION : \{ TESTER:TestPC01, BOARD:NA, SLOT:NA, PORT:NA \} \]$')
+        self.assertTrue(lines[1].endswith('] [INFO] CONFIG FILE : Fuzzer.json'), lines[1])
+        self.assertTrue(lines[2].endswith('] [INFO] PROJECT : PC_NVME_'), lines[2])
         for line in lines:
             self.assertRegex(line, r'^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}\] \[[A-Z]+\] ', line)
         self.assertTrue(any(l.endswith('[WARNING] [Stats] marker') for l in lines))

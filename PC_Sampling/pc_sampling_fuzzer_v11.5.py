@@ -1004,7 +1004,8 @@ def _parse_qtmgr(raw):
         sys.exit("[FATAL] qtmgr 는 객체여야 합니다.")
     out = {}
     for k, dflt in (('tester', 'TestPC01'), ('application', 'PC'), ('form_factor', 'M_2'),
-                    ('chamber', 'Not Chamber'), ('board', 'NA'), ('slot', 'NA'), ('port', 'NA')):
+                    ('chamber', 'Not Chamber'), ('board', 'NA'), ('slot', 'NA'), ('port', 'NA'),
+                    ('config_file', 'Fuzzer.json'), ('project', 'PC_NVME_')):
         v = raw.get(k, dflt)
         if not isinstance(v, str):
             sys.exit(f"[FATAL] qtmgr.{k} 는 문자열이어야 합니다 ({v!r} 받음).")
@@ -2244,10 +2245,12 @@ def _config_signature() -> str:
 LOG_FORMAT = '[%(asctime)s] [%(levelname)s] %(message)s'
 
 
-def test_location_line() -> str:
+def log_header_lines() -> list:
     q = QTMGR
-    return (f"[ TEST LOCATION : {{ TESTER:{q['tester']}, BOARD:{q['board']}, "
-            f"SLOT:{q['slot']}, PORT:{q['port']} }} ]")
+    return [f"[ TEST LOCATION : {{ TESTER:{q['tester']}, BOARD:{q['board']}, "
+            f"SLOT:{q['slot']}, PORT:{q['port']} }} ]",
+            f"CONFIG FILE : {q['config_file']}",
+            f"PROJECT : {q['project']}"]
 
 
 def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
@@ -2272,11 +2275,12 @@ def setup_logging(output_dir: str) -> Tuple[logging.Logger, str]:
     # encoding='utf-8' 명시 — sudo / C locale 환경에서 μ/✓/→/한글 깨짐 방지.
     # 주의: errors='replace' 는 Python 3.9+ 만 지원 → 호환성 위해 사용 안 함.
     # UTF-8 은 모든 Unicode 표현 가능하므로 encode 실패 가능성 없음.
-    # v11.5: 로그 맨 첫 줄 — 시험 위치(json qtmgr). 다른 줄과 같은 형식([타임스탬프] [INFO] …).
+    # v11.5: 로그 맨 앞 3줄 — 시험 위치·CONFIG FILE·PROJECT(json qtmgr). 다른 줄과 같은 형식([타임스탬프] [INFO] …).
     #   __init__ 구간 레코드(_early_buffer)보다 앞에 오도록 핸들러를 붙이기 전에 쓴다.
     with open(log_file, 'w', encoding='utf-8') as _lf:
-        _lf.write(fmt.format(logging.LogRecord('pcfuzz', logging.INFO, __file__, 0,
-                                               test_location_line(), None, None)) + '\n')
+        for _line in log_header_lines():
+            _lf.write(fmt.format(logging.LogRecord('pcfuzz', logging.INFO, __file__, 0,
+                                                   _line, None, None)) + '\n')
     fh = logging.FileHandler(log_file, encoding='utf-8')   # 이어 쓰기(mode='a')
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
