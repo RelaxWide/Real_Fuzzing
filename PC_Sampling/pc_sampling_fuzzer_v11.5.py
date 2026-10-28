@@ -12223,7 +12223,7 @@ class _V101Fuzzer:
     def _query_rbuf(self) -> str:
         """v11.5: RBUF(FW 빌드 값) — VU 명령 2개(json qtmgr.rbuf)를 **처음 한 번만** 보내고 결과를 재사용한다.
         write(sig_file 전송) 뒤 read 응답 버퍼의 앞 digits 자리 hex — 값이 바이트당 숫자 두 자리(BCD)라
-        앞 4바이트 10 23 20 26 → '10232026'(MMDDYYYY). 실패·파일 없음·짧은 응답이면 빈칸. 퍼징 송신 경로(가드·cmd#·회계)를 거치지 않는 시작 시 보조 명령이다."""
+        앞 4바이트 10 23 20 26(MMDD YYYY) → 연도를 앞으로 '20261023'(YYYYMMDD). 실패·파일 없음·짧은 응답이면 빈칸. 퍼징 송신 경로(가드·cmd#·회계)를 거치지 않는 시작 시 보조 명령이다."""
         if self._rbuf_tried:
             return self._rbuf or ''
         self._rbuf_tried = True
@@ -12257,8 +12257,10 @@ class _V101Fuzzer:
             log.warning(f"[Device Info] RBUF 생략 — VU read 0x{r['opcode']:02x} rc={p2.returncode} "
                         f"len={len(p2.stdout)}: {p2.stderr.decode(errors='replace').strip()[:120]}")
             return ''
-        # 버퍼를 글자(ASCII)로 읽으면 안 된다 — 실기 응답 10 23 20 26 00.. 은 BCD(2026-10-23)다
-        self._rbuf = head.hex().upper()
+        # 버퍼를 글자(ASCII)로 읽으면 안 된다 — 실기 응답 10 23 20 26 00.. 은 BCD(2026-10-23)다.
+        # 버퍼 순서는 MMDD YYYY 라 연도를 앞으로 돌려 YYYYMMDD 로 찍는다(사용자 요청) — 10232026 → 20261023
+        _h = head.hex().upper()
+        self._rbuf = _h[4:] + _h[:4] if len(_h) == 8 else _h
         return self._rbuf
 
     def _log_device_info(self) -> None:

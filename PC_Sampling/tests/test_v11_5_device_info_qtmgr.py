@@ -118,7 +118,7 @@ class DeviceInfo(unittest.TestCase):
         self.assertTrue(body[i - 1].strip().startswith('Model'))
         self.assertEqual(body[i + 1:i + 8], [
             '  Density     : eDensity_512GB', '  FW Revision : BXV7401Q', '  Application : ePC',
-            '  CTRL        : ePALAU', '  FormFactor  : eM_2', '  OEM         : eHP', '  RBUF        : 10282026'])
+            '  CTRL        : ePALAU', '  FormFactor  : eM_2', '  OEM         : eHP', '  RBUF        : 20261028'])
         # 기존 줄과 같은 들여쓰기·': ' 위치
         self.assertEqual({l.index(': ') for l in body[i - 1:i + 9]}, {14})
         self.assertTrue(body[i + 8].strip().startswith('Firmware'), '나머지 정보가 이어서 나와야 한다')
@@ -148,16 +148,17 @@ class DeviceInfo(unittest.TestCase):
             self.assertIn(a, r)
         out, run2 = self.lines(f)                     # 주기 재출력
         run2.assert_not_called()
-        self.assertIn('[Device Info]   RBUF        : 10282026', out)
+        self.assertIn('[Device Info]   RBUF        : 20261028', out)
 
     def test_rbuf_is_bcd_hex_of_first_four_bytes(self):
-        """실기 응답(2026-10-28): 버퍼 10 23 20 26 00 00 00 00 … → '10232026'. 글자(ASCII)로 읽으면 안 된다."""
+        """실기 응답(2026-10-28): 버퍼 10 23 20 26 00 00 00 00 …(MMDD YYYY) → 연도 먼저 '20261023'.
+        글자(ASCII)로 읽으면 안 된다."""
         def read(argv, **kw):
             if '-w' in argv:
                 return Mock(returncode=0, stdout=b'', stderr=b'')
             return Mock(returncode=0, stdout=bytes.fromhex('1023202600000000') + b'\x00' * 504, stderr=b'')
         with patch.object(v, '_run_nvme_state_cmd', side_effect=read):
-            self.assertEqual(make()._query_rbuf(), '10232026')
+            self.assertEqual(make()._query_rbuf(), '20261023')
 
     def test_rbuf_blank_on_failure(self):
         cases = {
