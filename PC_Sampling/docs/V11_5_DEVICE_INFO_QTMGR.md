@@ -28,9 +28,9 @@ nvme admin-passthru /dev/nvmeN --opcode=0xc2 --cdw10=0x4 --cdw12=0x23000003 --da
 - 퍼징 송신 경로(가드·cmd#·회계)를 거치지 않는 시작 시 보조 명령이다. 시간 초과(timeout_ms+5s)면 nvme-cli 종료를 기다리지 않고 빈칸(D-state 대비).
 
 ## [QTMGR] (캠페인 끝, 1회)
-- crash(timeout·FW hang·PM preflight 실패·예외 주입 보존)면 **덤프와 crash 폴더 수집이 끝난 직후**(PC 모니터링 전).
+- crash(timeout·FW hang·PM preflight 실패·예외 주입 보존)면 **덤프가 끝난 뒤, 로그를 crash 폴더로 복사하기 전** —
+  crash 폴더의 로그 사본에 보고가 들어간다(PC 모니터링 전).
 - crash 없이 끝나면(시간 종료·Ctrl+C) 종료 요약·차트 뒤. Dmesg/UFAS Path 는 `N/A`.
-- 같은 내용을 `qtmgr_report.txt` 로도 저장한다 — crash 면 그 crash 폴더(로그 사본은 보고 전에 복사되므로), 아니면 output 폴더.
 
 | 줄 | 값 |
 |---|---|
@@ -45,8 +45,12 @@ nvme admin-passthru /dev/nvmeN --opcode=0xc2 --cdw10=0x4 --cdw12=0x23000003 --da
 | TTF | 퍼징 시작부터 장애 감지 시각(crash) 또는 종료 시작 시각까지 — 덤프·차트 시간 제외. 60분 미만 `45 min`, 이상 `3.2 hours` |
 | Temp ('C) | 마지막 `nvme smart-log` temperature(°C). 없으면 `N/A` |
 | Chamber ('C) | `qtmgr.chamber` (기본 `Not Chamber`) |
-| Dmesg Path | crash 폴더의 `dmesg_*.txt` 전부(절대경로) |
+| Dmesg Path | crash 폴더의 `dmesg_<ts>_at_crash.txt`(절대경로) |
 | UFAS Path | 그 crash 의 UFAS·JLINK·RDDump 덤프가 crash 폴더에 남긴 파일(도구 출력 .log 제외). 한 덤프가 10개 넘게 만들면 폴더 |
 
 ## 제품 이름 변경
 `PM9M1_LNB` → `PM9M1_LENOVO`. json 키가 바뀌어 **v11.4 이하에서 `--product PM9M1_LNB` 는 더 이상 쓸 수 없다**(`PM9M1` 과 같은 프로필이므로 `PM9M1` 또는 v11.5 `PM9M1_LENOVO`).
+
+## crash 폴더 정리 (v11.5)
+- dmesg 는 덤프 전 선저장한 `dmesg_<ts>_at_crash.txt` 하나만 남긴다(덤프 후 `dmesg_<ts>.txt` 는 만들지 않는다).
+- `crash_<명령>_<opcode>_<hash>.json` 은 crash 폴더에 넣지 않는다(쓰지 않는 파일) — `crashes/` 루트에만 남는다.

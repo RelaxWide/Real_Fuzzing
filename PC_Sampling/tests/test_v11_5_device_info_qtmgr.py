@@ -258,17 +258,6 @@ class Qtmgr(unittest.TestCase):
         f._run_end_time = f.start_time + timedelta(minutes=45)
         self.assertIn('[QTMGR] TTF : 45 min', self.report(f))
 
-    def test_report_saved_to_file(self):
-        f = self.device()
-        cd = Path(self.tmp.name) / 'crash_f'
-        cd.mkdir()
-        out = self.report(f, cd)
-        self.assertEqual((cd / 'qtmgr_report.txt').read_text(encoding='utf-8').splitlines(), out)
-        g = self.device()
-        g.output_dir = Path(self.tmp.name)
-        out = self.report(g)                             # crash 없음 → output_dir
-        self.assertEqual((Path(self.tmp.name) / 'qtmgr_report.txt').read_text(encoding='utf-8').splitlines(), out)
-
     def test_once_only(self):
         f = self.device()
         self.report(f)
@@ -294,6 +283,78 @@ class Qtmgr(unittest.TestCase):
         f._dump_outputs = [('UFAS', str(cd / 'SnapShot' / f'b{i}.bin')) for i in range(30)]
         out = self.report(f, cd)
         self.assertEqual([l for l in out if 'UFAS Path' in l], [f'[QTMGR] UFAS Path : {cd}/SnapShot'])
+
+
+class CrashFolderContents(unittest.TestCase):
+    """crash 폴더: 로그 사본에 [QTMGR] 가 들어 있고(보고가 로그 복사 전), dmesg 는 _at_crash 하나,
+    crash_<명령>_*.json 은 없다. 실제 crash 경로(_capture_firmware_hang_if_stuck, _pm_preflight_fail)를 태운다."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__('shutil').rmtree, self.tmp)
+        self.f = f = make()
+        f.crashes_dir = self.tmp / 'crashes'
+        f.crashes_dir.mkdir()
+        f.output_dir = self.tmp
+        f._log_file = str(self.tmp / 'pcfuzz.log')
+        h = logging.FileHandler(f._log_file, encoding='utf-8')
+        v.log.addHandler(h)
+        self.addCleanup(v.log.removeHandler, h)
+        self.addCleanup(h.close)
+        f._bg = False
+        f._fw_hang_captured = False
+        f._pm_unresponsive = None
+        f.sampler = Mock(USES_JLINK_USB=False)
+        f._generate_replay_sh = Mock()
+        f._capture_dmesg = Mock(return_value='kernel: nvme0 ...')
+        f._dump_snapshot = Mock(return_value={})
+        f._copy_new_dump_files = Mock(return_value=[])
+        f._shutdown_openocd_for_jlink = Mock()
+        f._devinfo = {'mn': CTRL['mn'], 'sn': CTRL['sn'], 'fr': CTRL['fr'], 'rbuf': '10282026'}
+        f.start_time = datetime.now() - timedelta(minutes=5)
+        for k in ('enable_jlink_dump', 'enable_ufas', 'enable_debug_tool_dump'):
+            setattr(f.config, k, False)
+
+    def crash_dir(self):
+        (d,) = [p for p in self.f.crashes_dir.iterdir() if p.is_dir()]
+        return d
+
+    def check(self, d):
+        names = sorted(p.name for p in d.iterdir())
+        self.assertEqual([n for n in names if n.startswith('dmesg_')],
+                         [n for n in names if n.startswith('dmesg_') and n.endswith('_at_crash.txt')])
+        self.assertEqual(len([n for n in names if n.startswith('dmesg_')]), 1, names)
+        self.assertFalse([n for n in names if n.startswith('crash_') and n.endswith('.json')], names)
+        text = (d / 'pcfuzz.log').read_text(encoding='utf-8')
+        self.assertIn('[QTMGR] Tester : TestPC01', text, 'crash 폴더 로그 사본에 [QTMGR] 가 없다')
+        self.assertIn('[QTMGR] Dmesg Path : ', text)
+        self.assertIn('_at_crash.txt', text.split('[QTMGR] Dmesg Path : ', 1)[1].splitlines()[0])
+
+    def test_firmware_hang(self):
+        f = self.f
+        f._nvme_id_dict = lambda cmd: ({}, 'EAGAIN', 1)
+        f.config.enable_ufas = True
+        f._run_ufas_dump = Mock()
+        self.assertTrue(f._capture_firmware_hang_if_stuck('test'))   # assertLogs 는 FileHandler 를 떼어 쓰지 않는다
+        self.check(self.crash_dir())
+
+    def test_pm_preflight_failure(self):
+        f = self.f
+        (f.crashes_dir / 'crash_Read_0x2_abc.json').write_text('{}')     # 예전 경로가 남긴 json
+        (f.crashes_dir / 'crash_nvme_pid.txt').write_text('42')         # 다른 루트 파일은 그대로 옮긴다
+        self.assertFalse(f._pm_preflight_fail('PM', 'entry', 'PS4', 'no response', []))
+        d = self.crash_dir()
+        self.check(d)
+        self.assertTrue((d / 'crash_nvme_pid.txt').exists())
+
+    def test_save_crash_json_stays_in_crashes_root(self):
+        f = self.f
+        d = f.crashes_dir / 'crash_x'
+        d.mkdir()
+        f._seed_meta = Mock(return_value={})
+        f._save_crash(b'', v.Seed(data=b'', cmd=v._NAME_TO_CMD['Read']), dest_dir=d)
+        self.assertEqual(list(d.iterdir()), [])
+        self.assertEqual(len(list(f.crashes_dir.glob('crash_Read_*.json'))), 1)
 
 
 class DumpOutputsAndSmart(unittest.TestCase):

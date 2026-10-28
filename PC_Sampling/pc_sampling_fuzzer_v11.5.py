@@ -11060,6 +11060,7 @@ class _V101Fuzzer:
         log.error("[HANG] SSD 펌웨어 현상 유지(POR/reset/재인증 없음). "
                   f"crash 폴더의 덤프로 분석하세요 → {_logname(_crash_dir)}/  캠페인 종료.")
         self._qtmgr_report(_crash_dir, _t)
+        self._copy_log_into(_crash_dir)        # v11.5: 선저장 로그 사본에 덤프 경과·[QTMGR] 를 더한다
         return True
 
     # ------------------------------------------------------------------
@@ -15186,12 +15187,12 @@ class _V101Fuzzer:
                 dump(dest_dir=dest)
             except Exception as e:
                 log.warning(f"[{name}] 덤프 예외: {e}")
+        log.error(f"[{kind}] 증거 폴더: {_logname(dest)}/")
+        self._qtmgr_report(dest, now)          # v11.5: 최종 수집(로그 복사) 전에
         try:
             self._collect_crash_artifacts(now)
         except Exception as e:
             log.warning(f"[ARTIFACT] 수집 중 예외: {e}")
-        log.error(f"[{kind}] 증거 폴더: {_logname(dest)}/")
-        self._qtmgr_report(dest, now)
         return False
 
     def _pm_preflight_s1_s2(self) -> bool:
@@ -17405,21 +17406,11 @@ class _V101Fuzzer:
         (crash json + replay + fuzzer log + dmesg) 분석이 된다.
 
         dump 산출물은 아직 존재하지 않으므로 대상이 아니다 — 그건 최종 수집의 몫.
-        dmesg 는 crash 직후 시점이 가장 값지므로 최종본과 파일명을 분리해 둘 다 남긴다.
+        dmesg 는 crash 직후 시점이 가장 값지므로 이 _at_crash 본 하나만 남긴다(v11.5: 덤프 후 최종본 없음).
         """
-        import shutil
 
         ts = crash_time.strftime('%Y%m%d_%H%M%S')
-        if self._log_file and os.path.isfile(self._log_file):
-            for h in log.handlers:
-                try:
-                    h.flush()
-                except Exception:
-                    pass
-            try:
-                shutil.copy2(self._log_file, dest / os.path.basename(self._log_file))
-            except Exception as e:
-                log.warning(f"[ARTIFACT] (선저장) 로그 복사 실패: {e}")
+        self._copy_log_into(dest, '(선저장) ')
         try:
             (dest / f"dmesg_{ts}_at_crash.txt").write_text(self._capture_dmesg(lines=200))
         except Exception as e:
@@ -17427,12 +17418,30 @@ class _V101Fuzzer:
         log.warning(f"[ARTIFACT] dump 전 선저장 완료 → {_logname(dest)}/ "
                     f"(crash json / replay / log / dmesg — 여기서 중단해도 분석 가능)")
 
+    def _copy_log_into(self, dest, what='') -> None:
+        """퍼저 로그를 flush 해 dest 로 복사(같은 이름이면 덮어쓴다 — 나중 복사가 더 완전). 예외를 내지 않는다
+        (crash 보존 경로에서 try 밖에서도 부른다)."""
+        import shutil
+        _lf = getattr(self, '_log_file', None)
+        if not (_lf and os.path.isfile(_lf)):
+            return
+        for h in log.handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        try:
+            shutil.copy2(_lf, Path(dest) / os.path.basename(_lf))
+            log.warning(f"[ARTIFACT] {what}로그 복사: {os.path.basename(_lf)}")
+        except Exception as e:
+            log.warning(f"[ARTIFACT] {what}로그 복사 실패: {e}")
+
     def _qtmgr_report(self, crash_dir=None, end_time=None) -> None:
-        """v11.5: 캠페인 끝 [QTMGR] 보고 — 1회. crash 면 덤프·crash 폴더 수집이 끝난 뒤(crash_dir),
+        """v11.5: 캠페인 끝 [QTMGR] 보고 — 1회. crash 면 덤프가 끝난 뒤·crash 폴더 최종 수집 전(crash_dir),
         crash 없이 끝나면 종료 요약 뒤(경로는 N/A). 값은 시작 시 [Device Info](self._devinfo)·
         마지막 SMART CHECK·json qtmgr 에서 온다. TTF 끝 = end_time(장애 감지 시각) 또는 run() 종료 시작 시각 —
-        덤프·차트에 걸린 시간은 넣지 않는다. 같은 내용을 qtmgr_report.txt(crash 폴더, 없으면 output_dir)에도
-        저장한다(crash 폴더의 로그 사본은 이 보고 전에 복사된다). 실패해도 종료 흐름에 영향 없음."""
+        덤프·차트에 걸린 시간은 넣지 않는다. crash 면 로그를 crash 폴더로 복사하기 **전에** 불러 사본에 이 보고가
+        들어가게 한다. 실패해도 종료 흐름에 영향 없음."""
         if self._qtmgr_done:
             return
         self._qtmgr_done = True
@@ -17487,21 +17496,15 @@ class _V101Fuzzer:
                 log.warning(line)
         except Exception as e:
             log.warning(f"[QTMGR] 보고 실패: {e}")
-            return
-        try:
-            _dir = Path(crash_dir) if crash_dir is not None else Path(self.output_dir)
-            (_dir / 'qtmgr_report.txt').write_text('\n'.join(out) + '\n', encoding='utf-8')
-        except Exception as e:
-            log.warning(f"[QTMGR] qtmgr_report.txt 저장 실패: {e}")
 
     def _collect_crash_artifacts(self, crash_time: datetime) -> None:
         """JLink/UFAS dump 완료 후 관련 파일을 날짜 폴더에 모아 복사한다.
 
         수집 대상:
-          - crashes_dir/ 내 crash_{name} 바이너리·JSON·dmesg 파일 (crash_time 이후 생성)
+          - crashes_dir/ 내 crash_time 이후 생성 파일 (crash_<명령>_*.json 은 제외 — v11.5, 쓰지 않는다)
           - 덤프 폴더(dump/ 등, _dump_scan_dirs)에 crash 이후 새로 생긴 파일 전부
           - fuzzer 로그 파일 (self._log_file)
-          - 현재 dmesg 스냅샷
+        dmesg 는 덤프 전 선저장(_snapshot_crash_context)의 _at_crash 본 하나만 둔다(v11.5).
         """
         import shutil
 
@@ -17515,7 +17518,7 @@ class _V101Fuzzer:
         # 1) crashes_dir 내 crash 파일 (crash_time 5초 전부터)
         try:
             for p in sorted(self.crashes_dir.iterdir()):
-                if p.is_dir():
+                if p.is_dir() or (p.name.startswith('crash_') and p.suffix == '.json'):
                     continue
                 if p.stat().st_mtime >= crash_epoch - 5:
                     shutil.copy2(p, dest / p.name)
@@ -17533,25 +17536,7 @@ class _V101Fuzzer:
             self._crash_dump_before = None
 
         # 3) 로그 파일 (flush 후 복사)
-        if self._log_file and os.path.isfile(self._log_file):
-            for h in log.handlers:
-                try:
-                    h.flush()
-                except Exception:
-                    pass
-            try:
-                shutil.copy2(self._log_file, dest / os.path.basename(self._log_file))
-                log.warning(f"[ARTIFACT] 로그 복사: {os.path.basename(self._log_file)}")
-            except Exception as e:
-                log.warning(f"[ARTIFACT] 로그 복사 실패: {e}")
-
-        # 4) dmesg 최신본 저장
-        try:
-            dmesg = self._capture_dmesg(lines=200)
-            (dest / f"dmesg_{ts}.txt").write_text(dmesg)
-            log.warning(f"[ARTIFACT] dmesg 저장: dmesg_{ts}.txt")
-        except Exception as e:
-            log.warning(f"[ARTIFACT] dmesg 저장 실패: {e}")
+        self._copy_log_into(dest)
 
         log.warning(f"[ARTIFACT] 수집 완료 → {_logname(dest)}/")
 
@@ -18105,12 +18090,10 @@ class _V101Fuzzer:
 
         raw fuzz_data binary 와 별도 .dmesg.txt 는 더 이상 저장하지 않음:
           - 명령 데이터: replay_data_<tag>/data_NNN.bin 에 이미 포함됨
-          - dmesg: .json 의 dmesg_snapshot 필드 + dmesg_<ts>.txt (수집 시점) 으로 충분
+          - dmesg: .json 의 dmesg_snapshot 필드 + crash 폴더 dmesg_<ts>_at_crash.txt 로 충분
 
-        dest_dir: 저장 위치. crash 핸들러는 crash_<ts>/ 를 넘겨 **처음부터** 최종
-          폴더에 쓴다(v9.6). 예전에는 crashes_dir 루트에 쓰고 dump 가 다 끝난 뒤
-          _collect_crash_artifacts 가 폴더로 복사했는데, dump 중 중단하면 crash_<ts>/
-          안에 replay 만 남고 json 은 루트에 흩어져 있었다.
+        dest_dir: v11.5 부터 쓰지 않는다 — 이 json 은 crash 폴더로 옮기지 않고 crashes_dir 루트에만
+          남긴다(사용자 결정 2026-10-28: 쓰지 않는 파일). 최종 수집도 crash_*.json 을 거른다.
         """
         # crash 식별자는 data 만이 아니라 명령 파라미터(cdw/override) 전체로 해시한다.
         # data 가 빈 명령(DeviceSelfTest 등)은 md5(b'') 가 상수라, cdw10 만 다른 별개
@@ -18123,7 +18106,8 @@ class _V101Fuzzer:
                   seed.force_admin, seed.data_len_override)
         input_hash = hashlib.md5(repr(_ident).encode()).hexdigest()[:12]
         filename = f"crash_{seed.cmd.name}_{hex(_actual_opcode)}_{input_hash}"
-        filepath = (dest_dir or self.crashes_dir) / filename
+        # v11.5: crash 폴더에는 넣지 않는다(쓰지 않는 파일) — crashes/ 루트에 남긴다
+        filepath = self.crashes_dir / filename
 
         meta = self._seed_meta(seed)
         meta["crash_reason"] = reason
@@ -18470,12 +18454,13 @@ class _V101Fuzzer:
         self._log_process_memory("after-dumps")
 
         # 3.8) 모든 dump 완료 후 artifact 수집 (crash 폴더에 날짜 폴더 생성)
+        # v11.5: [QTMGR] 를 최종 수집(로그 복사) 전에 — crash 폴더 로그 사본에 보고가 들어간다
+        self._qtmgr_report(_crash_dir, _crash_time)
         log.warning("[TIMEOUT] Crash artifact 수집을 시작합니다...")
         try:
             self._collect_crash_artifacts(_crash_time)
         except Exception as _art_exc:
             log.warning(f"[ARTIFACT] 수집 중 예외: {_art_exc}")
-        self._qtmgr_report(_crash_dir, _crash_time)
 
         # 4) SSD 펌웨어를 resume 상태로 유지 (불량 현상 보존)
         log.error(
@@ -24878,6 +24863,7 @@ class ExceptionFuzzerMixin:
             controller.emit('dump_unavailable', powered=controller.powered, asserted=controller.asserted,
                             reason='supply not stable or hardware helper pending')
             self._qtmgr_report(dest, now)
+            self._copy_log_into(dest)
             return
         for enabled, name, dump in (
                 (self.config.enable_jlink_dump, 'JLINK', self._run_jlink_dump),
@@ -24896,6 +24882,7 @@ class ExceptionFuzzerMixin:
             except Exception as exc:
                 controller.emit('dump_error', backend=name, reason=str(exc))
         self._qtmgr_report(dest, now)
+        self._copy_log_into(dest)              # v11.5: 선저장 로그 사본에 덤프 경과·[QTMGR] 를 더한다
 
     def _stop_sampling_checked(self, context='command'):
         if not self._exception_interrupted:
