@@ -392,3 +392,7 @@ PC_Sampling/risc-v/*.bin
 
 # v10.3 로컬 RAG 인덱스 — 내부 스펙 원문이 들어갈 수 있다. 저장소에 넣지 않는다.
 PC_Sampling/rag/index/
+
+# 업스트림 GDBFuzz 사본·옛 퍼저 보관본(루트만) — 디스크에는 두되 리포에서는 추적하지 않는다.
+# PC_Sampling/backup/ 은 추적 대상이라 앞에 / 를 붙여 루트만 지정한다.
+/backup/

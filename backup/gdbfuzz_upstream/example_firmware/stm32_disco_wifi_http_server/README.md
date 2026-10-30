@@ -1,2 +1,0 @@
-Example Application from https://github.com/STMicroelectronics/STM32CubeL4/tree/master/Projects/B-L4S5I-IOT01A/Applications/WiFi/WiFi_HTTP_Server
-plus the picohttpparser from https://github.com/h2o/picohttpparser

@@ -1,1 +1,0 @@
-From https://github.com/espressif/esp-idf/tree/master/examples/protocols/http_server/simple
