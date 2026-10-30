@@ -2,9 +2,10 @@
 
 BM9K1 컨트롤러(SiFive E76, 4코어: HCORE / CMCore / Fcore / QCore)에 **cJTAG + Secure
 JTAG 인증**으로 들어가 **코어를 멈추지 않고 PC 를 샘플링**하기 위한 저수준 모듈과 도구다.
-퍼저(`../pc_sampling_fuzzer_v10.3.py` 의 `RiscvPcsrSampler`)가 이 폴더를 import 해서 쓴다.
+퍼저(`../pc_sampling_fuzzer_v11.5.py` 의 `RiscvPcsrSampler`·`RiscvBgSampler`)가 이 폴더를 import 해서 쓴다.
 
-작성 기준 2026-09-28. 전체 설계는 [`../docs/V10_BM9K1_PLAN.md`](../docs/V10_BM9K1_PLAN.md),
+작성 2026-09-28, 2026-10-30 퍼저 참조를 v11.5 로 갱신(`RiscvBgSampler` 는 v11.3 상시 백그라운드 샘플링 —
+[`../docs/V11_3_BACKGROUND_SAMPLING_PLAN.md`](../docs/V11_3_BACKGROUND_SAMPLING_PLAN.md)). 전체 설계는 [`../docs/V10_BM9K1_PLAN.md`](../docs/V10_BM9K1_PLAN.md),
 실행 준비 자산 규격은 [`../docs/BM9K1_ASSETS.md`](../docs/BM9K1_ASSETS.md).
 
 ---

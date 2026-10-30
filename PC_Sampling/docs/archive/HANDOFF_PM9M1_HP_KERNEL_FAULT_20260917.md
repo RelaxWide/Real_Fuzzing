@@ -222,7 +222,7 @@ stats.sync.exit
 
 관련 위치 (행 번호는 이후 바뀔 수 있음):
 
-- [v10.2 실행 파일](../pc_sampling_fuzzer_v10.2.py): `_apst_enable_short_itpt`, 약 11479행.
+- [v10.2 실행 파일](../../pc_sampling_fuzzer_v10.2.py): `_apst_enable_short_itpt`, 약 11479행.
 - 같은 파일 약 17659행: APST 로그 → 위 함수 → 성공 시 sampling 시작.
 - 같은 파일 약 9015–9022행: 로그 handler flush/fsync와 freeze 이벤트.
 
@@ -315,8 +315,8 @@ R12도 주소 모양만으로 정상임을 증명하지 못한다.
 ### 관련 문서·1차 소스
 
 - [기존 PM9M1_HP 조사와 FreezeWatch 명세](PM9M1_HP_FREEZE_V102.md)
-- [v10.2 구현](pc_sampling_fuzzer_v10.2.md)
-- [v10.2 LLM 구현](V10_2_LLM_IMPLEMENTATION.md)
+- [v10.2 구현](../pc_sampling_fuzzer_v10.2.md)
+- [v10.2 LLM 구현](../V10_2_LLM_IMPLEMENTATION.md)
 - [과거 다른 제품/halt 조사](HANDOFF_osfreeze_investigation.md): P7 등의 결론을 PM9M1_HP에 그대로 적용하지 않는다.
 - [Linux v6.8.12 SLUB](https://raw.githubusercontent.com/gregkh/linux/v6.8.12/mm/slub.c)
 - [Linux v6.8.12 ext4 inode](https://raw.githubusercontent.com/gregkh/linux/v6.8.12/fs/ext4/inode.c)

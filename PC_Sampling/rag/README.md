@@ -1,9 +1,9 @@
 # rag/ — LLM 백엔드 · 로컬 검색 · 스키마 브리지
 
-퍼저(`../pc_sampling_fuzzer_v10.3.py`)가 LLM 에 시드·시퀀스·평가·I/O 워크로드를 요청할 때
+퍼저(`../pc_sampling_fuzzer_v11.5.py`, v10.3 이후 같은 패키지를 공유)가 LLM 에 시드·시퀀스·평가·I/O 워크로드를 요청할 때
 쓰는 패키지다. **퍼저 프로세스 안에서 import 되어 돈다** — 별도 서비스를 띄우지 않는다.
 
-작성 기준 2026-09-28. 운용 절차·함정은 [`../docs/RUNBOOK_v10.3.md`](../docs/RUNBOOK_v10.3.md),
+작성 2026-09-28, 2026-10-30 점검(퍼저 참조·설정 기본값·건수 갱신, 사내 SRAG 절 추가). 운용 절차·함정은 [`../docs/RUNBOOK_v10.3.md`](../docs/RUNBOOK_v10.3.md),
 설계 근거는 [`../docs/V10_3_LLM_BACKEND_PLAN.md`](../docs/V10_3_LLM_BACKEND_PLAN.md),
 구현 현황은 [`../docs/pc_sampling_fuzzer_v10.3.md`](../docs/pc_sampling_fuzzer_v10.3.md).
 
@@ -24,8 +24,35 @@
 
 | 백엔드 | `rag.module_path` | 상태 |
 |---|---|---|
-| 로컬 vLLM (OpenAI 호환) | `rag.vllm_client` | **현행 기본** |
-| 사내 2노드 Samba 브리지 | `rag.rag_bridge_client` | 되돌리기용. `pass_system_prompt=false` 와 함께 쓴다 |
+| 로컬 vLLM (OpenAI 호환) | `rag.vllm_client` | 리포 기본값(`fuzzer_config.json`). 아래 §1-1 의 구조화 출력·로컬 검색을 쓴다 |
+| 사내 SRAG (Samba 브리지) | `rag.rag_bridge_client` | 사내 API 를 쓸 때 선택. `pass_system_prompt=false` 와 함께 쓴다. 호출 흐름은 §1-1 |
+
+어느 백엔드를 쓰는지는 `fuzzer_config.json` 의 `rag.module_path` / `rag.pass_system_prompt` 두 값으로만 정한다(`--no-rag` 면 LLM 자체를 끈다).
+
+### 1-1. 사내 SRAG 브리지 호출 흐름
+
+`rag.module_path = rag.rag_bridge_client`, `pass_system_prompt = false` 일 때. 퍼저는 system 과 user 를
+`system + "\n\n" + user` 한 문자열로 합쳐 보낸다(구조화 출력·meta·진단 없음).
+
+```
+[퍼징 PC]  LlmWorker 스레드 → rag_bridge_client.generate_rag_response(prompt)
+              └─ bridge/requests/req_<id>.json 기록 → bridge/responses/resp_<id>.json 폴링
+                         ⇣ Samba 공유 폴더(양쪽이 같은 물리 폴더)
+[온라인 PC] srag_llm_service.py (상주 폴링)
+              └─ srag_llm_guide.generate_rag_response(prompt)   ← 실물 guide, 리포 밖
+                    ├─ 검색 API (requests)    ← 인덱스·자격증명은 온라인 PC 의 .env
+                    └─ 생성 API (OpenAI SDK)  ← **모델명·base_url 은 guide 안에서 바꾼다**
+              └─ 반환 문자열을 resp_<id>.json 의 "text" 로 기록(오류는 "error")
+```
+
+- **모델을 바꾸려면** 온라인 PC 의 `srag_llm_guide.py` 를 고친다. 리포의 `fuzzer_config.json` 의
+  `rag.vllm.*` 는 이 경로에서 **쓰이지 않는다.** 서비스는 시작할 때 guide 를 한 번만 import 하므로 고친 뒤에는 서비스를 재시작한다.
+  서비스 시작 로그의 `[env] guide = …` 가 실제로 읽는 파일이다.
+- guide 가 반환하는 것은 **문자열 하나**여야 한다. `None`·빈 문자열이면 서비스 로그에 `응답 0자` 로 찍히고 퍼저는 JSON 파싱 실패로 센다.
+- 대기 시간: 서비스 `RAG_CALL_TIMEOUT`(기본 150s) < 퍼저 `RAG_BRIDGE_TIMEOUT`(기본 180s). 서비스 쪽이 항상 짧아야 한다.
+  추론 시간이 길어지는 모델로 바꾸면 두 값을 함께 올린다.
+- 환경변수: 퍼징 PC `RAG_BRIDGE_DIR`(공유 폴더 위치, `sudo -E` 로 넘긴다) · 온라인 PC `RAG_BRIDGE_DIR`, `RAG_LLM_MODULE`, `RAG_LLM_FUNC`, `RAG_IDLE_WARN_SEC`.
+- 이 경로에서는 `rag.vllm.retrieval`(로컬 검색)이 돌지 않는다. 검색은 guide 의 `[참고 문서]` 가 대신한다.
 
 ---
 
@@ -37,13 +64,13 @@
 |---|---|---|
 | `__init__.py` | 14 | **비어 있지 않게 존재해야 한다.** 없으면 `rag` 가 namespace package 가 되어 `sys.path` 뒤쪽의 다른 `rag` 패키지가 이길 수 있고, `No module named 'rag.vllm_client'` 가 원인 모를 채로 난다. 확인: `python3 -c "import rag; print(rag.__file__)"` |
 | `vllm_client.py` | 366 | **현행 백엔드.** 표준 라이브러리(`urllib`)만 쓴다. `generate_rag_response(system, user, meta)` 가 검색 → 스키마 → 생성을 한 **시간 예산** 안에서 수행하고 `{"raw", "diagnostics"}` 를 돌려준다. `meta` 없이 부르면(구버전 계약) 문자열을 주고 실패는 raise 한다 |
-| `rag_retrieval.py` | 274 | 로컬 검색. 인덱스 로드·고정(캠페인 중 버전 불변), 질의 사다리, 임베딩, numpy top-k, 명령 태그 가산점, 기동 전 인덱스 검증(`preflight`) |
+| `rag_retrieval.py` | 292 | 로컬 검색. 인덱스 로드·고정(캠페인 중 버전 불변), 질의 사다리, 임베딩, numpy top-k, 명령 태그 가산점, 기동 전 인덱스 검증(`preflight`) |
 | `retrieval_policy.py` | 210 | 평가 도구와 운영 검색이 **공유하는** 규칙. 명령 → 스펙 이름 정규화, `enhanced_query`(명령·CDW 필드로 검색문 생성), 인덱스의 필드 정의(`Figure N: … Command Dword M` 표) 추출·해석, 청크의 `covers_commands` 태그 |
-| `llm_schema.py` | 156 | task별 `json_schema` 생성. 최상위 키를 task 마다 `required` 로 두어 `{}` 응답을 막는다. 스키마가 퍼저 파서가 **실제로 읽는 키**와 어긋나면 `tests/test_v10_3_backend.py` 가 깨진다 |
+| `llm_schema.py` | 168 | task별 `json_schema` 생성. 최상위 키를 task 마다 `required` 로 두어 `{}` 응답을 막는다. 스키마가 퍼저 파서가 **실제로 읽는 키**와 어긋나면 `tests/test_v10_3_backend.py` 가 깨진다 |
 | `rag_schema.py` | 276 | `SchemaBridge` — LLM 이 낸 시드/시퀀스를 퍼저 발송 기준(`CMD_SCHEMAS`)으로 검증·보정. 퍼저가 `SchemaBridge.from_dict(_llm_schema_dict())` 로 in-process 생성하므로 파일이 필요 없다. `schema_to_prompt` / `is_dangerous` / `validate_and_repair` |
-| `rag_bridge_client.py` | 107 | 구 백엔드의 오프라인 쪽 '배달부'. `bridge/requests/` 에 요청을 쓰고 `bridge/responses/` 를 폴링한다. LLM 을 직접 부르지 않는다 |
+| `rag_bridge_client.py` | 107 | 사내 SRAG 브리지의 오프라인(퍼징 PC) 쪽 '배달부'. `bridge/requests/` 에 요청을 쓰고 `bridge/responses/` 를 폴링한다. LLM 을 직접 부르지 않는다 |
 
-### 온라인 LLM PC 용 (구 브리지 구성에서만 쓴다)
+### 온라인 LLM PC 용 (사내 SRAG 브리지 구성에서 쓴다)
 
 | 파일 | 역할 |
 |---|---|
@@ -55,7 +82,7 @@
 | 경로 | 내용 |
 |---|---|
 | `index/` | `tools/rag_ingest.py` 가 만드는 검색 인덱스(내부 스펙 원문 포함) |
-| `bridge/requests/`, `bridge/responses/` | 구 브리지의 요청/응답 drop-box |
+| `bridge/requests/`, `bridge/responses/` | 브리지의 요청/응답 drop-box |
 
 ---
 
@@ -83,7 +110,10 @@ generate_rag_response(system, user, meta) -> {"raw": "<JSON 문자열>", "diagno
 `diagnostics` 에는 `finish_reason`·`usage`·`reasoning_chars`·`elapsed_sec`·`attempts`·
 `retrieval`(질의·출처·히트·주입 글자 수·잘림 여부)·`effective_user_prompt`(검색 문서가 붙은
 실제 전송본)·`requested_chat_template_kwargs` 가 실린다. `rag.log_responses=true` 면 퍼저가
-요청/응답 원본과 함께 `output/<버전>/llm/llm_io.jsonl` 에 남긴다.
+요청/응답 원본과 함께 `output/<버전>/llm/llm_io_<시각>.jsonl` 에 남긴다(실행마다 새 파일).
+`prompt` 는 백엔드가 알려 준 실제 전송본, `prompt_original` 은 퍼저가 만든 원본, `prompt_source` 는 그 출처
+(`effective_user_prompt` / `original_only`)다. 브리지 백엔드는 진단을 돌려주지 않으므로 둘이 같고
+`original_only` 이며, 이때 `prompt` 에는 퍼저 system 지시·guide 의 system·`[참고 문서]` 가 들어 있지 않다.
 
 ### 실패로 세는 것
 
@@ -162,7 +192,7 @@ rag/index/
   "freeform_retry": false,                     // 스키마 거부(HTTP 4xx) 시 자유 형식 재시도
   "retries": 1,                                // 통신 실패 재시도
   "retrieval": {
-    "enabled": false,                          // 인덱스를 만든 뒤 true
+    "enabled": true,                           // 리포 기본값. 인덱스가 없으면 그 실행만 검색 없이 생성(§4)
     "index_dir": "rag/index",
     "top_k": 5,
     "embed_base_url": "http://192.168.10.1:8001/v1",  // 비우면 생성 서버로 임베딩(경고)
@@ -212,7 +242,7 @@ rag/index/
 | `tests/test_rag_hybrid.py` | 7 | 태그 가산점·명령 없음 폴백·권한 필터·필드 확장 질의·실제 전송 프롬프트 기록 |
 | `tests/test_rag_field_resolution.py` | 6 | 필드 전체명 해석·충돌·별칭 |
 | `tests/test_rag_metadata.py` | 5 | 필드 정의 추출·충돌·권한, 구형 인덱스 태그 1회 계산, ingest 재사용 |
-| `tests/test_rag_preflight.py` | 3 | 기동 전 인덱스 검증(비활성·다른 백엔드는 미검사, revision 불일치 시 CLI 비정상 종료) |
+| `tests/test_rag_preflight.py` | 7 | 기동 전 인덱스 검증(비활성·다른 백엔드는 미검사, revision 불일치 시 CLI 비정상 종료) |
 | `tests/test_rag_retrieval_eval.py` | 4 | 평가 도구 |
 | `tests/test_rag_smoke.py` | 4 | 스모크 도구 |
 | `tests/test_v10_3_blas_threads.py` | 8 | import 순서·BLAS 스레드 고정 |

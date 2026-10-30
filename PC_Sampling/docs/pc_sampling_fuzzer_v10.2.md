@@ -304,7 +304,7 @@ OpenOCD의 read_all_pcs Tcl 응답을 `PCFUZZ_PCSR:r번호:값들:END` 형태로
 선택적 `PCFUZZ_FREEZE_TRACE=47471`과 별도 PuTTY 창의 `--freeze-watch`를 추가했다.
 기본 비활성, 추가 배포 파일/패키지 없음. 마지막 명령과 sampler/통계 fsync/
 learning/차트 단계 및 독립 프로세스 상태를 Windows PuTTY 로그에 남긴다.
-사용법·기존 버전 비교·증거의 한계는 [PM9M1_HP_FREEZE_V102.md](PM9M1_HP_FREEZE_V102.md) 참조.
+사용법·기존 버전 비교·증거의 한계는 [PM9M1_HP_FREEZE_V102.md](archive/PM9M1_HP_FREEZE_V102.md) 참조.
 
 ### PCSR 프레임 앞 NUL 처리 (2026-09-15)
 

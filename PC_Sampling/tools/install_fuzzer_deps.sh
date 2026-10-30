@@ -7,7 +7,7 @@
 # (pip --user 는 호출 계정의 ~/.local 에만 깔려 sudo/root 에서 안 보임)
 #
 # 주의(커널): 5.15 에서는 J-Link halt 샘플링 중 호스트 하드 프리즈가 재현된다(6.8 대비 68배).
-#             상세는 HANDOFF_osfreeze_investigation.md. 6.8 이상을 쓸 것.
+#             상세는 docs/archive/HANDOFF_osfreeze_investigation.md. 6.8 이상을 쓸 것.
 set -euo pipefail
 
 log()  { printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
